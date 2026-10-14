@@ -32,6 +32,7 @@
 //! (`uart_device uart0`): no status, not queryable, just the parsed values for
 //! the passes that follow — the same shape `serial_ports` and `mcu_ids` set.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -212,6 +213,33 @@ pub fn load_can_device(
     _printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(CanPort::new(config)?))
+}
+
+/// The `[mcu]` **names** the config makes a bridge: every port section's
+/// `*_mcu` value, trimmed (`mcu` for the bare section, the sub otherwise).
+///
+/// A bridge is the upstream side of a port, so its own link carries the
+/// downstream devices' frames too; the link passes ask this before deciding
+/// whether that link is addressed by id (`serial_ports`, `host_libraries`).
+/// Like every pre-scan here it reads raw option text (`section().get_text`,
+/// never a tracked getter), so it records no access and does not exempt a
+/// `[mcu]` option from `check_unused` on its own account. Whether a `*_mcu`
+/// names an existing `[mcu]` section is the port factory's check; an unknown
+/// name is still reported here, so a bridge the config never declares cannot
+/// make a path id-addressed by accident.
+pub(crate) fn bridge_mcus(config: &ConfigWrapper) -> BTreeSet<String> {
+    let mut bridges = BTreeSet::new();
+    for (prefix, option) in [("uart_device", "uart_mcu"), ("can_device", "can_mcu")] {
+        for section in config.sibling_prefix_sections(prefix) {
+            if let Some(name) = section.section().get_text(option) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bridges.insert(name.to_string());
+                }
+            }
+        }
+    }
+    bridges
 }
 
 /// The section's sub, required: a port is `[<type> <name>]`, never bare.

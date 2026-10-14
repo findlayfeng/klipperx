@@ -12,8 +12,13 @@
 //!
 //! The rules, per path:
 //!
-//! - one section, no `uuid` — **not** muxed: bare frames, exactly as before;
+//! - one section, no `uuid`, **not a bridge** — **not** muxed: bare frames,
+//!   exactly as before;
 //! - one section, with a `uuid` — muxed;
+//! - one section that a `[uart_device]`/`[can_device]` names as its bridge —
+//!   muxed: a bridge's link carries its downstream devices' frames too, so the
+//!   path must be addressed by id even though one `[mcu]` names it (rule 7,
+//!   `bridge_ports::bridge_mcus`);
 //! - two or more sections — muxed, and **at most one** of them may omit
 //!   `uuid` (it claims the bridge's own device); every other one must write a
 //!   `uuid` to be told apart.
@@ -52,6 +57,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::mcu::bridge_ports::bridge_mcus;
 use crate::core::klippy::mcu::link_grouping::{
     declared_uuid, distinguishability, group_by_key, quoted, Distinguishability, Member,
 };
@@ -104,6 +110,10 @@ impl HostLibraries {
         // duplicate is caught here and the section's own factory reports the
         // bad value.
         let mut claims: Vec<(String, Member)> = Vec::new();
+        // The `[mcu]` names the config makes bridges (port sections' `*_mcu`),
+        // read raw like every claim here: a bridge's path is addressed by id
+        // even when one section names it (`path_is_mux`).
+        let bridges = bridge_mcus(config);
         // Every uuid the config already names, whatever transport carries it, so
         // an assigned identity can never collide with a board that is already
         // addressed by one.
@@ -131,7 +141,10 @@ impl HostLibraries {
         let mut by_path: BTreeMap<String, PathGroup> = BTreeMap::new();
         let mut taken = known;
         for (path, members) in group_by_key(claims) {
-            let is_mux = path_is_mux(&path, &members)?;
+            let has_bridge = members
+                .iter()
+                .any(|member| bridges.contains(member_name(&member.identifier)));
+            let is_mux = path_is_mux(&path, &members, has_bridge)?;
             let identity = assign_identity(&path, &mut taken);
             by_path.insert(
                 path,
@@ -238,17 +251,19 @@ pub fn ensure(
 /// Whether the sections naming `path` need the mux header, rejecting the shapes
 /// that cannot be told apart.
 ///
-/// One section is muxed exactly when it writes a `uuid`. Two or more are always
-/// muxed; with more than one of them omitting `uuid` there is no way to pick
+/// One section is muxed when it writes a `uuid` **or** when it is a bridge
+/// (`has_bridge`): a bridge's link carries its downstream devices' frames, so
+/// the path is addressed by id even alone. Two or more are always muxed; with
+/// more than one of them omitting `uuid` there is no way to pick
 /// which board a bare frame belongs to, and with two writing the same `uuid`
 /// there is no way to tell which of them a header names — both are reported with
 /// the sections involved.
-fn path_is_mux(path: &str, members: &[Member]) -> Result<bool, ConfigError> {
+fn path_is_mux(path: &str, members: &[Member], has_bridge: bool) -> Result<bool, ConfigError> {
     let Some(first) = members.first() else {
         return Ok(false);
     };
     if members.len() == 1 {
-        return Ok(first.uuid.is_some());
+        return Ok(first.uuid.is_some() || has_bridge);
     }
     // At most one member may omit its uuid: it claims the bridge's own device.
     // The verdict is the shared distinguishability judgment
@@ -270,6 +285,12 @@ fn path_is_mux(path: &str, members: &[Member]) -> Result<bool, ConfigError> {
             )))
         }
     }
+}
+
+/// The `[mcu]` **name** a section identifier carries: the sub, or `mcu` for the
+/// bare section — the spelling a port section's `*_mcu` writes.
+fn member_name(identifier: &str) -> &str {
+    identifier.strip_prefix("mcu ").unwrap_or(identifier)
 }
 
 /// Member identifiers as the borrowed list `quoted` joins.
@@ -402,6 +423,43 @@ mod tests {
     fn a_single_section_with_the_canbus_uuid_alias_is_muxed() {
         let libraries = classify(&format!(
             "[mcu]\nhost_library: {LIB}\ncanbus_uuid: 11aa22bb33cc\n"
+        ))
+        .unwrap();
+        assert!(libraries.is_mux(LIB));
+    }
+
+    /// A lone section a port section names as its **bridge** is muxed: the
+    /// bridge's downstream devices' frames travel the path, so it is addressed
+    /// by id even though one `[mcu]` names it (rule 7).
+    #[test]
+    fn a_single_bridge_section_is_muxed() {
+        let libraries = classify(&format!(
+            "[mcu bridge]\nhost_library: {LIB}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n"
+        ))
+        .unwrap();
+        assert!(libraries.is_mux(LIB));
+    }
+
+    /// A lone section no port section names as its bridge stays bare frames:
+    /// only being a bridge makes an otherwise-exclusive path muxed.
+    #[test]
+    fn a_single_section_no_port_names_is_not_muxed() {
+        let libraries = classify(&format!(
+            "[mcu bridge]\nhost_library: {LIB}\n\
+             [uart_device uart0]\nuart_mcu: other\nuart_oid: uart0\n"
+        ))
+        .unwrap();
+        assert!(!libraries.is_mux(LIB));
+    }
+
+    /// The bare `[mcu]` is named as a bridge by its `mcu` spelling: the bridge
+    /// scan and the member names share that spelling.
+    #[test]
+    fn the_bare_mcu_spelling_names_a_bridge() {
+        let libraries = classify(&format!(
+            "[mcu]\nhost_library: {LIB}\n\
+             [can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n"
         ))
         .unwrap();
         assert!(libraries.is_mux(LIB));

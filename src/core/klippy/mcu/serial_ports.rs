@@ -10,6 +10,13 @@
 //! ready before anything connects. Mapping a shared group onto the transport is
 //! the next layer's work.
 //!
+//! Being **addressed by id** is a slightly wider verdict than being shared: a
+//! path a `[uart_device]`/`[can_device]` names as its bridge carries the bridge's
+//! downstream devices' frames too, so a single `[mcu]` on it still needs the
+//! per-id header ([`SerialPorts::is_id_addressed`]). The transport decision asks
+//! that wider question; [`SerialPorts::is_shared`] keeps the narrower one (how
+//! many `[mcu]` sections name the path).
+//!
 //! The one rule is baud, and the rate of a path is the **lowest** `baud` its
 //! sections write — or [`DEFAULT_BAUD`] when none of them writes one. A section
 //! that writes no `baud` has no vote of its own: it follows the rate the path
@@ -38,6 +45,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+use crate::core::klippy::mcu::bridge_ports::bridge_mcus;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use tracing::warn;
 
@@ -66,6 +74,12 @@ struct PathGroup {
     members: Vec<String>,
     /// The rate they share, as [`SerialPorts::effective_baud`] reports it.
     baud: u32,
+    /// Whether one of the path's MCUs is a bridge (a `[uart_device]` /
+    /// `[can_device]` names it as its `*_mcu`). A bridge's link carries its
+    /// downstream devices' frames, so the path is addressed by id even though
+    /// one `[mcu]` names it — an id-addressing reason **besides** being shared
+    /// ([`SerialPorts::is_id_addressed`]).
+    bridge: bool,
 }
 
 impl SerialPorts {
@@ -86,6 +100,10 @@ impl SerialPorts {
         // section writes none, or writes one that does not parse: its own
         // factory reports that, so it takes no part in the choice here.
         let mut groups: BTreeMap<String, Vec<(String, Option<u32>)>> = BTreeMap::new();
+        // The `[mcu]` names the config makes bridges (port sections' `*_mcu`),
+        // read raw like every claim here: a bridge's path is addressed by id
+        // even alone (`is_id_addressed`).
+        let bridges = bridge_mcus(config);
         for section in config
             .sibling("mcu")
             .into_iter()
@@ -103,11 +121,15 @@ impl SerialPorts {
         let mut by_path: BTreeMap<String, PathGroup> = BTreeMap::new();
         for (path, members) in groups {
             let baud = effective_baud_for(&path, &members);
+            let bridge = members
+                .iter()
+                .any(|(identifier, _)| bridges.contains(member_name(identifier)));
             by_path.insert(
                 path,
                 PathGroup {
                     members: members.into_iter().map(|(name, _)| name).collect(),
                     baud,
+                    bridge,
                 },
             );
         }
@@ -115,8 +137,25 @@ impl SerialPorts {
     }
 
     /// Whether two or more MCUs name `path`. A path no MCU names is not shared.
+    ///
+    /// "Shared" is about how many boards are on the wire; it is **not** the
+    /// same question as whether the path is addressed by id — a bridge's path is
+    /// too ([`SerialPorts::is_id_addressed`]).
     pub fn is_shared(&self, path: &str) -> bool {
         self.peers(path).len() >= 2
+    }
+
+    /// Whether `path` is addressed by id: two or more sections name it, **or**
+    /// one of them is a bridge.
+    ///
+    /// A bridge forwards its downstream devices' frames on the same link, so the
+    /// link carries more than one board's traffic even when a single `[mcu]`
+    /// names it — the transport must open it with the per-id header, exactly as a
+    /// shared one. This is the question the transport decision asks; it is
+    /// deliberately not [`SerialPorts::is_shared`], whose answer is about the
+    /// number of `[mcu]` sections alone.
+    pub fn is_id_addressed(&self, path: &str) -> bool {
+        self.is_shared(path) || self.by_path.get(path).is_some_and(|group| group.bridge)
     }
 
     /// The MCUs that name `path`, in declaration order — one for an exclusive
@@ -195,6 +234,12 @@ pub fn path_is_shared(config: &ConfigWrapper, path: &str) -> bool {
         }
     }
     false
+}
+
+/// The `[mcu]` **name** a section identifier carries: the sub, or `mcu` for the
+/// bare section — the spelling a port section's `*_mcu` writes.
+fn member_name(identifier: &str) -> &str {
+    identifier.strip_prefix("mcu ").unwrap_or(identifier)
 }
 
 /// The baud a `[mcu]` section contributes: its `baud` option parsed as a
@@ -352,6 +397,30 @@ mod tests {
         // A path no MCU names is not shared, and has no peers.
         assert!(!ports.is_shared("/dev/ttyACM1"));
         assert!(ports.peers("/dev/ttyACM1").is_empty());
+    }
+
+    /// A path one `[mcu]` names, but which a port section names as its bridge,
+    /// is addressed by id even though it is not shared: the bridge's downstream
+    /// devices' frames travel it (rule 7). `is_shared` stays false — the two are
+    /// different questions.
+    #[test]
+    fn a_single_bridge_path_is_id_addressed_but_not_shared() {
+        let ports = classify(
+            "[mcu bridge]\nserial: /dev/ttyACM0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        );
+        assert!(!ports.is_shared("/dev/ttyACM0"));
+        assert!(ports.is_id_addressed("/dev/ttyACM0"));
+        assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu bridge"]);
+    }
+
+    /// A lone path no port section names as its bridge is addressed by no id at
+    /// all: the change adds a reason, it does not widen every path.
+    #[test]
+    fn a_single_path_without_a_bridge_is_not_id_addressed() {
+        let ports = classify("[mcu]\nserial: /dev/ttyACM0\n");
+        assert!(!ports.is_shared("/dev/ttyACM0"));
+        assert!(!ports.is_id_addressed("/dev/ttyACM0"));
     }
 
     /// A path no `[mcu]` names has no rate at all: `None`, not a default.

@@ -431,3 +431,38 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
   手册已写明。
 - **P4/P5/P6**：P4（下游台数泛化）、P5（CAN 上游这三条命令与端口表的帧形）、P6（多站串口）未动。
 - **真机项**：`TESTING.md` 的 M1-1..M2-3（复位极性/保持、双板接线、旧固件板、无回执确认）。
+
+---
+
+## 8. 固件对象化（2026-10-15）：端口不再是编译期表，而是配置期的 UART 对象列表
+
+**要求（用户拍板）**：① 串口多路复用不是 host 独有，应是**通用配置项**（其他架构尚未实现接线）；
+② 「作为桥设备」也是通用能力，**打开后允许主机把这个 MCU 配置成桥**，且依赖多路复用能力；
+③ **波特率（含串口其它配置）不在固件里写死**，配置期由**主机**下发，**失败要显式**；
+④ 按 klipper 惯例，**资源够就默认启用**，桥的开关不需要用户设置（真正应用由主机配置）；
+⑤ 端口不是「桥专用表」，而是**与桥无关的 UART 对象列表**，端口只是「把某个 UART 对象接给桥」。
+
+### 决断（D15–D19）
+
+| # | 决断 | 理由 | 被否方案 |
+|---|---|---|---|
+| D15 | 固件新增**配置期 UART 对象**（`config_uart oid=%c baud=%u`），oid 由主机发 | klipper 惯例：外设 oid 配置期分配（`config_stepper`/`config_tmcuart` 同形，`src/tmcuart.c:185`） | 端口继续编译期写死（原状：`BRIDGE_PORT_COUNT/_NAME/_TYPE/_PATH`） |
+| D16 | 桥端口 = 主机把某个 UART 对象**接给桥**（`config_bridge_port oid=%c uart=%c`），端口 **index = 声明顺序** | 端口与「是否用于桥」解耦；index 语义（`SET_PORT_NODEID`）不变 | 给桥一张自己声明的端口表；或端口 oid 与 uart oid 合一（桥就不再是「用别人的对象」） |
+| D17 | 参数（baud 等）随对象在配置期下发，**失败走 `shutdown()`** ⇒ 主机在配置阶段看到点名错误 | 端口级命令族（0x02/0x03/0x04）刻意无回执，不该被改；`shutdown` 是固件唯一既有的显式失败通道（`src/command.h:52` → `sched.c:310`） | 给 admin 命令补回执（动协议、动两端）；或静默沿用旧 baud |
+| D18 | `BRIDGE` 改「资源够就默认具备」：`default y if MUX_SERIAL`（`select MUX` 与 `MUX &&` 会成环，故写单条件，等价） | 照本树 `CANBUS`/`WANT_*` 的 `default y if …` 惯例 | 让它保持 host 独占 select（那样「通用能力」不成立） |
+| D19 | `MUX_SERIAL` **不设为 MCU 默认开**：它改变控制台线上格式，与上游 klippy 主机不兼容，必须是刻意选择（host 库由 `HOST_MUX_SERIAL` 选上即可） | 兼容性优先；「资源够」在 host（库）与 MCU（板）含义不同 | MCU 也 `default y if SERIAL`（会破坏所有既有 MCU 固件与 klippy 的互操作） |
+
+### FW-1 落地（子模组 `9b43cc10`/`26987b0a` + 主仓 `56a3830`）
+
+- 固件：新 `src/uart.c`/`uart.h`（`config_uart`、`config_bridge_port`、后端 seam `uart_backend_open`/`uart_backend_port_ops`/`uart_backend_set_port`）；`src/Kconfig` 删 `BRIDGE_PORT_SERIAL_BAUD`、`BRIDGE` 自动开、新增 `UART`/`SERIAL_UART`；`src/host/bridge.c` 重写成 UART 后端（**路径仍是部署事实** `HOST_BRIDGE_SERIAL_PATH`，baud 改配置期）；`src/host/host.c` 的 `klipper_host_init()` **不再因 tty 打不开而失败**；四个 `BRIDGE_PORT_*` 字典键删除。
+- 主机：新 `cmd/uart.rs`（`ConfigUart`/`ConfigBridgePort` + `DEFAULT_UART_BAUD = 250_000`）；`bridge_ports.rs` 把两条命令在配置期排进桥的 `ConfigBuilder` 并取端口 `index`（`UartPort::index()/set_index()`）；`object.rs` 每桥一个端口计数器；`bridge_attach.rs` 去掉字典对账，`[can_device]` 端口**点名拒绝**（属 P5）。
+- 失败文案（固件 `shutdown`，逐字）：`config_uart: baud must be nonzero`、`… the UART cannot be set to the requested baud`、`… this build's UART is already in use`、`… the UART device could not be opened`、`config_bridge_port: no room for another bridge port`。
+- 验收：主仓 `cargo test --workspace` **3220 passed / 0 failed / 14 ignored**、fmt 干净、`--all-targets` 0 告警；子模组 `host`/`host-mux`/`stm32f103-serial` 三配置 `make` rc=0、0 告警。
+- 新测试：`bridge_attach::port_sections_take_their_declaration_order`（声明序⇒index 0/1）、`…::a_missing_port_tty_fails_the_configuration`（**配置期显式失败**，含 `MCU 'bridge'` 与 `config_uart` 文案）、`…::a_can_port_is_refused_by_name`、`bridge_ports::the_port_sections_load_and_hold_no_unused_options` 补 `index` 断言。
+
+### 已知面/限制（写手提出，我采纳）
+
+1. `uart_oid` 目前**没有消费者**（index 由声明序给出，oid 名只用于查端口节）——**保留**，作为 MCU 后端落地时「固件 UART 实例名」的挂点；手册要写明「当前只作文档/查节用」。
+2. host 后端**一条流一个 UART 对象**：`host_library` 桥最多一个端口（板级后端可有多个）；「两个端口节 ⇒ index 0/1」的验收在**串口桥**路径上做。
+3. baud「真的生效」只验到下限（配置期无错 + 端口可用；pty 的 `c_ospeed` 回读不可靠），不可设的波特率会由 `TCSETS2` 失败转成 `UART_OPEN_BAD_BAUD` 的显式 `shutdown`。
+4. **MCU 侧的 mux 接线**（`generic/serial_irq.c` 接 `mux_input`/`mux_send`）是 FW-2 的正身，完成前「MUX_SERIAL 通用」只在 host 成立；真板跑 mux 属真机项。

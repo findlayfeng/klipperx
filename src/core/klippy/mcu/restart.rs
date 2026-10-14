@@ -35,7 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::core::klippy::config::mcu::{BridgeRestart, McuConfig, Transport};
 use crate::core::klippy::error::{ConfigError, KlippyError};
-use crate::core::klippy::interface::devices::host::{HostDevice, HostMux};
+use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{self, ModemLines};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::usb;
@@ -239,15 +239,7 @@ fn open_bridge_link(
                     "host_library {library}: no [mcu] names this path, so it has no mux identity"
                 ))
             })?;
-            let device = HostDevice::load_downstream(
-                library,
-                HostMux {
-                    identity,
-                    named: identity,
-                },
-                mcu_id,
-            )
-            .map_err(|err| {
+            let device = HostDevice::load_downstream(library, identity, mcu_id).map_err(|err| {
                 KlippyError::Connection(format!(
                     "host_library {library}: downstream attach failed: {err}"
                 ))

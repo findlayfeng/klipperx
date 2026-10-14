@@ -48,7 +48,7 @@ use super::{Dictionary, McuObject};
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::interface::devices::host::{HostDevice, HostMux};
+use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{self, MUX_PORT_UNITS};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::printer::Printer;
@@ -223,15 +223,7 @@ pub(crate) fn open(
                     "host_library {library}: no [mcu] names this path, so it has no mux identity"
                 ))
             })?;
-            let device = HostDevice::load_downstream(
-                library,
-                HostMux {
-                    identity,
-                    named: link.named.unwrap_or(identity),
-                },
-                mcu_id,
-            )
-            .map_err(|err| {
+            let device = HostDevice::load_downstream(library, identity, mcu_id).map_err(|err| {
                 KlippyError::Connection(format!(
                     "host_library {library}: downstream attach failed: {err}"
                 ))

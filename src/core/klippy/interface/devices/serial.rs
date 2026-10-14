@@ -1616,7 +1616,7 @@ impl SharedSerialHandle {
     /// # Errors
     /// [`InterfaceError::ConnectionLost`] when this handle or the port has been
     /// shut down, [`InterfaceError::SendError`] when the write fails.
-    pub fn send_unit(&self, arb: u32, payload: &[u8]) -> Result<(), InterfaceError> {
+    pub(crate) fn send_unit(&self, arb: u32, payload: &[u8]) -> Result<(), InterfaceError> {
         if self.stopped.load(Ordering::SeqCst) || self.port.stopped.load(Ordering::SeqCst) {
             return Err(InterfaceError::ConnectionLost);
         }
@@ -1636,7 +1636,7 @@ impl SharedSerialHandle {
     ///
     /// # Errors
     /// The same as [`SharedSerialHandle::send_unit`].
-    pub fn send_admin(&self, payload: &[u8]) -> Result<(), InterfaceError> {
+    pub(crate) fn send_admin(&self, payload: &[u8]) -> Result<(), InterfaceError> {
         self.send_unit(ADMIN_LISTEN, payload)
     }
 

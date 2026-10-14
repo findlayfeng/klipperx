@@ -206,9 +206,9 @@ impl Interface {
     /// The port-level command
     /// ([`set_port_node_id`](devices::serial::set_port_node_id)) travels the
     /// bridge's **admin** channel, so only a link that has one can carry it: a
-    /// shared serial port or a host library. Every other transport has no bridge
-    /// to tell, and the message says so rather than writing the unit on a link
-    /// nobody listens to.
+    /// shared serial port or a muxed host library. Every other transport has no
+    /// bridge to tell, and the message says so rather than writing the unit on a
+    /// link nobody listens to.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -221,10 +221,20 @@ impl Interface {
     ) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_set_port_node_id(index, mcu_id, flags),
-            Transport::Host(device) => device.send_set_port_node_id(index, mcu_id, flags),
+            Transport::Host(device) => {
+                if !device.is_mux() {
+                    return Err(InterfaceError::Other(
+                        "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed \
+                         host library); this host library reference has no mux, so no bridge is \
+                         listening"
+                            .to_string(),
+                    ));
+                }
+                device.send_set_port_node_id(index, mcu_id, flags)
+            }
             _ => Err(InterfaceError::Other(
-                "SET_PORT_NODEID needs a bridge link (a shared serial port or a host library); \
-                 this interface is neither"
+                "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
                     .to_string(),
             )),
         }
@@ -244,10 +254,20 @@ impl Interface {
     pub(crate) fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_reset_device(index),
-            Transport::Host(device) => device.send_reset_device(index),
+            Transport::Host(device) => {
+                if !device.is_mux() {
+                    return Err(InterfaceError::Other(
+                        "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
+                         library); this host library reference has no mux, so no bridge is \
+                         listening"
+                            .to_string(),
+                    ));
+                }
+                device.send_reset_device(index)
+            }
             _ => Err(InterfaceError::Other(
-                "RESET_DEVICE needs a bridge link (a shared serial port or a host library); \
-                 this interface is neither"
+                "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
                     .to_string(),
             )),
         }
@@ -267,10 +287,20 @@ impl Interface {
     pub(crate) fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_reset_port(index),
-            Transport::Host(device) => device.send_reset_port(index),
+            Transport::Host(device) => {
+                if !device.is_mux() {
+                    return Err(InterfaceError::Other(
+                        "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
+                         library); this host library reference has no mux, so no bridge is \
+                         listening"
+                            .to_string(),
+                    ));
+                }
+                device.send_reset_port(index)
+            }
             _ => Err(InterfaceError::Other(
-                "RESET_PORT needs a bridge link (a shared serial port or a host library); \
-                 this interface is neither"
+                "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
                     .to_string(),
             )),
         }
@@ -764,5 +794,38 @@ mod tests {
             );
         });
         outer.shutdown_timeout(std::time::Duration::from_millis(50));
+    }
+
+    /// The three bridge commands travel a bridge's admin channel; an interface
+    /// with no such link says so (`_` arm of each `send_*`) instead of writing a
+    /// unit nobody listens to — the message is asserted verbatim.
+    #[tokio::test]
+    async fn test_bridge_commands_need_a_bridge_link() {
+        let interface = Interface::new(FrameMock::new(vec![]));
+
+        assert_eq!(
+            interface.send_set_port_node_id(1, 2, 0).unwrap_err(),
+            InterfaceError::Other(
+                "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            interface.send_reset_device(1).unwrap_err(),
+            InterfaceError::Other(
+                "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            interface.send_reset_port(1).unwrap_err(),
+            InterfaceError::Other(
+                "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
+                 library); this interface is neither"
+                    .to_string()
+            )
+        );
     }
 }

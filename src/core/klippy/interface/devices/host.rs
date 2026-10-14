@@ -285,6 +285,18 @@ struct HostLibrary {
     /// it must join.
     stopped: Arc<AtomicBool>,
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// Serializes one unit's bytes across **every reference** on this library.
+    ///
+    /// The console input is a byte stream: in a debug build
+    /// [`HostDevice::write_raw`] feeds it one byte per `klipper_host_input`
+    /// call, so two references writing at once interleave their bytes and the
+    /// bridge resyncs on a header it never sent — silently dropping a unit that
+    /// has no receipt (a `SET_PORT_NODEID`, a reset). One lock for the library,
+    /// not one per reference, is what makes that hold when the writers are two
+    /// references on the same library (the bridge and a downstream device). It
+    /// is taken only around one unit's bytes and never across a wait, and the
+    /// read path never takes it, so the two cannot deadlock.
+    write_lock: Mutex<()>,
 }
 
 impl HostLibrary {
@@ -444,6 +456,7 @@ impl HostLibrary {
             output,
             stopped,
             threads: Mutex::new(threads),
+            write_lock: Mutex::new(()),
         }))
     }
 }
@@ -624,7 +637,7 @@ impl HostDevice {
     /// **for a device behind a bridge port**, and do **not** attach it.
     ///
     /// This is [`HostDevice::load_mux`]'s first half only: the library is given
-    /// `mux`'s identity before klipper comes up, and the reference is addressed
+    /// `identity` before klipper comes up, and the reference is addressed
     /// by `mcu_id` (`MuxRoute::for_id`) — but there is no attach, because there
     /// is no handshake a device behind a port could answer. The bridge's own
     /// device is what `load_mux` names over the admin channel; a device behind
@@ -637,8 +650,9 @@ impl HostDevice {
     /// which port the device sits behind. Until it does, `mcu_id` names no port
     /// and units sent under it go nowhere, silently.
     ///
-    /// `mux.named` is not used: only the bridge's own device is named in a
-    /// `SET_KLIPPER_NODEID` unit, and that is `load_mux`'s job.
+    /// Only the bridge's own device is named in a `SET_KLIPPER_NODEID` unit, and
+    /// that is `load_mux`'s job — so this takes the path's `identity` alone, not
+    /// a name to give the device.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does —
@@ -646,13 +660,13 @@ impl HostDevice {
     /// another identity — and when `mcu_id` is outside the addressable range.
     pub fn load_downstream(
         path: impl AsRef<Path>,
-        mux: HostMux,
+        identity: [u8; 6],
         mcu_id: u32,
     ) -> Result<Arc<HostDevice>, InterfaceError> {
         Ok(Arc::new(Self::open(
             path.as_ref(),
             OutputMode::Mux,
-            Some(mux.identity),
+            Some(identity),
             Some(mcu_id),
         )?))
     }
@@ -686,6 +700,15 @@ impl HostDevice {
     /// Path of the library this reference was loaded from.
     pub fn library_path(&self) -> &Path {
         &self.library.library_path
+    }
+
+    /// Whether this reference is muxed: only a muxed one is addressed by an id,
+    /// and only a bridge addresses its device by one — so only a muxed reference
+    /// has the admin channel the bridge commands ([`HostDevice::send_admin`] and
+    /// the family built on it) are written to. A bare reference
+    /// ([`HostDevice::load`]) is the device itself, with no bridge to tell.
+    pub(crate) fn is_mux(&self) -> bool {
+        self.mux.is_some()
     }
 
     /// Read raw protocol bytes from the library, for a bench scan.
@@ -737,10 +760,21 @@ impl HostDevice {
     /// sees the stream the way a real link would deliver it; a release build
     /// gives it the block in one call. The caller has already framed the bytes —
     /// a bare [`Frame`], a mux unit, or a handshake unit — so this only writes.
+    ///
+    /// The whole call goes in under the library's write lock, so another
+    /// reference on the same library cannot split this unit's header from its
+    /// frame: in a debug build each byte is its own `klipper_host_input` call,
+    /// and a bridge that sees a header it never sent resyncs and drops the unit.
+    /// The lock covers exactly one call, so the caller frames what it passes
+    /// ([`HostDevice::send_admin`], [`HostDevice::attach`]).
     fn write_raw(&self, bytes: &[u8]) -> Result<(), InterfaceError> {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(InterfaceError::ConnectionLost);
         }
+        // Held across the bytes of this one call and released before returning,
+        // so no wait ever runs inside it: the read path (`receive`,
+        // `wait_for_assignment`) takes no write lock, so the two cannot deadlock.
+        let _writing = self.library.write_lock.lock().unwrap();
         #[cfg(debug_assertions)]
         let written = {
             let mut taken = 0;
@@ -766,7 +800,8 @@ impl HostDevice {
 
     /// Send one admin-channel unit to the bridge: the [`ADMIN_LISTEN`] header,
     /// then `payload` — one `KXID` frame — handed to the library's input as one
-    /// whole unit.
+    /// whole unit, under the library's write lock so another reference on the
+    /// same library cannot split its header from its frame.
     ///
     /// The admin channel belongs to the bridge: it is how a device with no admin
     /// channel of its own is named behind a port. The unit carries this
@@ -845,6 +880,11 @@ impl HostDevice {
     /// order**, because only it knows the port. A device whose route does not
     /// exist yet is reached by nothing, so the handshake times out like any
     /// other unanswered one.
+    ///
+    /// Only a reference the bridge addresses by id can complete this: the mux is
+    /// what answers the assignment, so a bare reference ([`HostDevice::load`],
+    /// no mux) waits [`ASSIGN_ATTACH_ATTEMPTS`] × [`ASSIGN_ATTACH_TIMEOUT`] for
+    /// nothing and times out.
     ///
     /// # Errors
     /// An id the wire cannot address, a write that fails, or
@@ -2100,15 +2140,8 @@ mod host_tests {
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let downstream_id = 7u32;
-        let mut device = HostDevice::load_downstream(
-            mux_library_path(),
-            HostMux {
-                identity,
-                named: identity,
-            },
-            downstream_id,
-        )
-        .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
+            .expect("a downstream reference loads without a handshake");
 
         let mut pending = Vec::new();
         let window = Duration::from_secs(5);
@@ -2231,12 +2264,8 @@ mod host_tests {
         // this a device behind a port.
         let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
         let downstream_id = 7u32;
-        let device = HostDevice::load_downstream(
-            mux_library_path(),
-            HostMux { identity, named },
-            downstream_id,
-        )
-        .expect("a downstream reference loads without a handshake");
+        let device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
+            .expect("a downstream reference loads without a handshake");
 
         // The route first: port 0 owns id 7, and its device speaks units — it
         // answers the admin channel itself, which is what a named device does.
@@ -2471,7 +2500,7 @@ mod host_tests {
         }
     }
 
-    /// M1-P3's end-to-end shape: a device with **no mux** sits behind a bridge
+    /// The end-to-end shape: a device with **no mux** sits behind a bridge
     /// port, and the host reaches it *through* the bridge.
     ///
     /// The bridge is the real firmware build (`make`'s mux target, loaded
@@ -2517,15 +2546,8 @@ mod host_tests {
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let downstream_id = 7u32;
-        let mut device = HostDevice::load_downstream(
-            mux_library_path(),
-            HostMux {
-                identity,
-                named: identity,
-            },
-            downstream_id,
-        )
-        .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
+            .expect("a downstream reference loads without a handshake");
 
         // The bridge's port table: port 0 holds a legacy device at id 7. This is
         // the route — until it is in, nothing sent under id 7 reaches any port.

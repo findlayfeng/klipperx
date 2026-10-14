@@ -282,9 +282,10 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 
 **P1（配置面）与 P2（固件端口表 + 端口级命令）已于 2026-10-13 落地。** 本节同时记两期；
 为避免 P1/P2 两条分支对同一段落的合并冲突，记录统一写在 P1 分支
-（`agents/feat-m1-port-config`），P2 分支只带 `serial-mux-protocol.md` 与探针相关文档。
+（`agents/feat-m1-port-config`），P2 分支只带 `serial-mux-protocol.md`、`testing.md` 的覆盖行
+与探针相关改动。
 
-### P1 配置面（分支 `agents/feat-m1-port-config`，4 提交）
+### P1 配置面（分支 `agents/feat-m1-port-config`，7 提交：4 代码 + 3 文档）
 
 - **落地范围**：`[uart_device <名>]`/`[can_device <名>]` 端口节（`mcu/bridge_ports.rs`，order 19，
   10 测）；端口分组与跨节冲突校验（`mcu/port_grouping.rs`，注册名 `port_groups`，14 测）；
@@ -304,7 +305,7 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 
 ### P2 固件端口表 + 端口级命令 + M2 固件半边（子模组分支 `agents/feat-m1-port-firmware`）
 
-- **落地范围**（子模组 2 提交）：`SET_PORT_NODEID [0x03][index][id][flags]`（0x03，
+- **落地范围**（子模组前 2 提交）：`SET_PORT_NODEID [0x03][index][id][flags]`（0x03，
   `MUX_PORT_UNITS=0x01`；建表、幂等、无回执、不下发；`bridge_admin_unit` 返回消费标志，
   `mux_unit` 据此短路本机设备半，0x00/0x01 行为逐位不变）；`single_device` 编译期标志退役为
   端口运行期 `flags`（默认 legacy = 现行为，逐点语义反映射核对）；identify 字典端口表
@@ -312,10 +313,19 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
   `RESET_DEVICE 0x02 [0x02][index]`（桥只转发到该口；无桥板设备半照 canserial 模式执行）与
   `RESET_PORT 0x04 [0x04][index]`（桥消费，经 `bridge_port_ops.reset` 钩子做 DTR/RTS 线脉冲；
   host 侧用延迟恢复的 poll 状态机保持任务循环非阻塞）。
-- **主仓侧（3 提交）**：`set_port_node_id` builder 与命令字节常量（`serial.rs`，+1 测）；
-  真库探针 `test_the_bridge_port_commands_over_the_real_library`（`host.rs`，+1 测：字典端口表
-  可读、legacy 剥头/加头逐字节、UNITS 原样转发、未登记 id 不路由、无回执不下发、复位族消费性、
-  库不被误复位）；gitlink 指向子模组 `d56f9f6f`。
+- **子模组共 4 提交**：前两提交为上述端口命令族与复位族；第三提交 `bdb42f89` 是
+  `src/host/README.md` 的端口级命令文档；第四提交 `host: guard the reset pulse against re-entry
+  during its hold` 修掉评审发现的锁存缺陷——保持窗内再来一次 `RESET_PORT` 会把已断言的
+  DTR\|RTS 读回当「原状态」，释放时恢复断言态、设备被永久按住，现在入口
+  `if (bridge_reset_active) return 0;` 把在飞脉冲内的请求按已完成处理。子模组最终 HEAD =
+  `2f1635e1`。
+- **主仓侧（6 提交）**：1 代码（`serial.rs` 的 `set_port_node_id` builder 与命令字节常量，+1 测）
+  + 1 探针测试（`host.rs` 的真库探针 `test_the_bridge_port_commands_over_the_real_library`，+1 测：
+  字典端口表可读、legacy 剥头/加头逐字节、UNITS 原样转发、未登记 id 不路由、无回执不下发、
+  `RESET_PORT` 连发两次均只消费无输出、`SET_PORT_NODEID` 越界 index 与短载荷静默丢弃、
+  库不被误复位）+ 1 文档（`serial-mux-protocol.md` 命令族与字典端口表、`testing.md` 覆盖行）
+  + 2 次 gitlink 同步 + 1 评审修复（复位脉冲重入锁存修复与探针负例/常量断言，
+  终值 gitlink = 子模组最终 HEAD）。
 - **验收实测**：m1-p2 `cargo test --workspace` **3131 passed / 0 failed**（含新固件构建的全部
   字典——即「新固件不破坏既有测试」的回归证明）；三配置（全关/仅 mux/mux+桥）构建基线与改后
   均 **0 告警**；dict 四键在 mux+桥构建、另两配置不含（护栏生效）；非 host 配置

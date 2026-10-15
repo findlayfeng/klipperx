@@ -742,6 +742,81 @@ mod tests {
         }
     }
 
+    /// The child's bare `identify` request in `bytes`, if it is there: the
+    /// whole frame with the mux header stripped and its payload led by the
+    /// host-defined `identify` message id (`0x01`, `identify.rs`) — the traffic
+    /// a bridge port is proven to carry with.
+    fn identify_request(bytes: &[u8]) -> Option<&[u8]> {
+        bare_frames(bytes)
+            .into_iter()
+            .find(|frame| frame[2] == 0x01)
+    }
+
+    /// Redirect the process's stderr into a file for as long as this lives, so
+    /// a test can see what the host library reported **there**.
+    ///
+    /// A tty the bridge cannot open is named by the library's own `bridge_errno`
+    /// (`third_party/klipper/src/host/bridge.c`), written straight to file
+    /// descriptor 2: the firmware's shutdown message is a compile-time string
+    /// and cannot carry a path, so stderr is the only place the tty that was
+    /// tried appears. `std`'s printing is captured per test thread by libtest,
+    /// before it reaches the descriptor, so this takes the library's writes and
+    /// little else; everything it collected is handed back to the real stderr on
+    /// drop, so nothing is lost.
+    ///
+    /// The swap is process-wide, so it is only built while
+    /// [`HOST_LIBRARY_TEST_LOCK`] is held — the one lock every test that loads a
+    /// host library takes, and the reason no other library is writing to the
+    /// descriptor while it is redirected. Taking the guard as a parameter is
+    /// what makes that structural rather than a comment.
+    struct StderrCapture {
+        saved: libc::c_int,
+        path: std::path::PathBuf,
+    }
+
+    impl StderrCapture {
+        fn start(_lock: &std::sync::MutexGuard<'_, ()>, tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "klipperx-{tag}-{}-{:?}.stderr",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .expect("the capture file opens");
+            let saved = unsafe { libc::dup(2) };
+            assert!(saved >= 0, "dup(2): {}", std::io::Error::last_os_error());
+            assert_eq!(
+                unsafe { libc::dup2(file.as_raw_fd(), 2) },
+                2,
+                "dup2: {}",
+                std::io::Error::last_os_error()
+            );
+            Self { saved, path }
+        }
+
+        /// Everything written to stderr since `start`.
+        fn text(&self) -> String {
+            std::fs::read_to_string(&self.path).unwrap_or_default()
+        }
+    }
+
+    impl Drop for StderrCapture {
+        fn drop(&mut self) {
+            let text = std::fs::read(&self.path).unwrap_or_default();
+            unsafe {
+                libc::dup2(self.saved, 2);
+                libc::close(self.saved);
+            }
+            use std::io::Write;
+            let _ = std::io::stderr().write_all(&text);
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
     /// Every whole, CRC-checked frame in `bytes`, scanning past whatever mux
     /// headers or partial writes are mixed in.
     ///
@@ -821,14 +896,13 @@ mod tests {
             !bytes.is_empty(),
             "the bridge port received nothing; SET_PORT_NODEID did not route the child"
         );
-        let frames = bare_frames(&bytes);
-        let request = frames.iter().find(|frame| frame[2] == 0x01);
-        assert!(
-            request.is_some(),
-            "the port must receive the child's bare identify request (a frame with the mux \
-             header stripped, its payload led by the identify message id); it got {bytes:02x?}"
-        );
-        let frame = Frame::parse(request.unwrap()).expect("the bytes are one whole frame");
+        let request = identify_request(&bytes).unwrap_or_else(|| {
+            panic!(
+                "the port must receive the child's bare identify request (a frame with the mux \
+                 header stripped, its payload led by the identify message id); it got {bytes:02x?}"
+            )
+        });
+        let frame = Frame::parse(request).expect("the bytes are one whole frame");
         assert!(
             !frame.payload().is_empty(),
             "the identify request carries a payload"
@@ -1080,6 +1154,149 @@ mod tests {
         );
 
         // Same teardown contract as the legacy test: leave the path unloaded.
+        printer.teardown();
+        drop(printer);
+        wait_for_mux_library_unload(&library);
+        let _ = std::fs::remove_file(&bridge_path);
+    }
+
+    // -----------------------------------------------------------------------
+    // The tty a port opens is the host's to say at run time
+    // (`[uart_device <name>] uart_path:`, third_party/klipper/src/host/).
+    // -----------------------------------------------------------------------
+
+    /// A port opens the tty its `uart_path:` names, not the one the library was
+    /// built with.
+    ///
+    /// Two ptys say which one it was: `runtime` is the port's `uart_path:`, and
+    /// the path the library baked in (`CONFIG_HOST_BRIDGE_SERIAL_PATH`) is linked
+    /// to the second. The bridge comes up over the library exactly as in
+    /// `the_config_driven_legacy_route_reaches_the_bridge_port`, so the child's
+    /// bare identify request has to arrive on the **runtime** pty while the other
+    /// one stays silent. A host that ignored `uart_path:` would open the baked
+    /// path, which turns both assertions red.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ports_uart_path_is_the_tty_the_bridge_opens() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let runtime = Pty::new();
+        let baked = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                baked.path.display()
+            )
+        });
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
+             [mcu child]\nuart: uart0\n",
+            library.display(),
+            runtime.path.display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        printer.load_config(&config).expect("the config loads");
+
+        // Bounded: the child's identify never answers, so the bring-up is
+        // interrupted once the child has certainly spoken.
+        let _ = tokio::time::timeout(Duration::from_secs(6), printer.bring_up()).await;
+
+        let bytes = read_pty(&runtime.master, 1, Duration::from_secs(3));
+        assert!(
+            identify_request(&bytes).is_some(),
+            "the port's uart_path is the tty it opens, so the child's bare identify request \
+             arrives there; the pty at {} got {bytes:02x?}",
+            runtime.path.display()
+        );
+        // Enough time for the task loop to have opened anything it was going to.
+        assert!(
+            read_pty(&baked.master, 1, Duration::from_millis(500)).is_empty(),
+            "the tty the library was built with must not be opened at all once the port names \
+             its own"
+        );
+
+        printer.teardown();
+        drop(printer);
+        wait_for_mux_library_unload(&library);
+        let _ = std::fs::remove_file(&bridge_path);
+    }
+
+    /// A port whose `uart_path:` is not there fails the **configuration**, and
+    /// fails it because of the path the **host** named: the library's stderr line
+    /// names that tty, and the firmware's own `config_uart` message is what the
+    /// bring-up reports.
+    ///
+    /// The path the library was built with is linked to a live pty here, so a
+    /// host that fell back to it would open that one and come up. The failure
+    /// itself is therefore the evidence that the run-time path was adopted, and
+    /// the stderr line says which tty was tried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_uart_path_tty_fails_the_configuration() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The build's own path is a live tty, so it is not the reason for the
+        // failure below.
+        let baked = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                baked.path.display()
+            )
+        });
+
+        let missing = "/nonexistent/klipperx-missing-port-tty";
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             uart_path: {missing}\n",
+            library.display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        printer.load_config(&config).expect("the config loads");
+
+        // Bounded: the firmware fails the configuration on the first run, and a
+        // stopped firmware is retried a fixed number of times before the
+        // bring-up reports it.
+        let capture = StderrCapture::start(&_serial, "uart-path");
+        let _ = tokio::time::timeout(Duration::from_secs(60), printer.bring_up()).await;
+        let stderr = capture.text();
+        drop(capture);
+
+        let state = printer.get_state_message();
+        assert!(
+            state.message.contains("MCU 'bridge'"),
+            "the failure names the bridge: {}",
+            state.message
+        );
+        assert!(
+            state.message.contains("config_uart"),
+            "the failure carries the firmware's reason: {}",
+            state.message
+        );
+        assert!(
+            stderr.contains(missing),
+            "the library names the tty it could not open ({missing}), which is the host's path \
+             and not the build's: {stderr}"
+        );
+
         printer.teardown();
         drop(printer);
         wait_for_mux_library_unload(&library);

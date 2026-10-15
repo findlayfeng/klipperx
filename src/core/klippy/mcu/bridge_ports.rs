@@ -9,7 +9,8 @@
 //! at configuration time instead: [`load_uart_device`] queues the
 //! `config_uart` / `config_bridge_port` pair on the bridge's builder and takes
 //! the port's **index** (its declaration order among the bridge's ports) from
-//! the bridge. Grouping ports with the `[mcu]` sections that reference them, and
+//! the bridge — the same number `config_uart` travels with, and the same one
+//! the host names the port's tty with. Grouping ports with the `[mcu]` sections that reference them, and
 //! everything transport-shaped, is later work — this module only parses each
 //! port section once and holds the answers.
 //!
@@ -20,7 +21,17 @@
 //! | `uart_mcu` / `can_mcu` | the `[mcu]` this port sits on; a section name, `mcu` for the bare `[mcu]` (required) |
 //! | `uart_oid` / `can_oid` | the name the host knows this port by (required, non-empty) |
 //! | `uart_baud` | the port's line rate, a positive integer (optional; `250000` when absent) |
+//! | `uart_path` | the tty the bridge's **host library** opens for this port, a non-empty string (optional) |
 //! | `uart_restart_method` | the **line-level** reset the bridge gives a legacy device on this port — `arduino` (DTR) or `cheetah` (RTS/DTR); any other value is a config error (optional) |
+//!
+//! `uart_path` is only meaningful on a port whose bridge is a host library
+//! (`[mcu] host_library:`): that library is what opens the tty, at run time and
+//! per port, with the path the host names before the firmware comes up
+//! (`third_party/klipper/src/host/klipper_host.h`, `klipper_host_port`). It is
+//! the deployment fact a host moves between machines without rebuilding the
+//! library; a bridge that is not a host library opens no such stream, so writing
+//! one there is a config error ([`wire_bridge_port`]). A port that writes none
+//! keeps the path the library was built with.
 //!
 //! The `*_mcu` target is a **config-section** existence check
 //! ([`ConfigWrapper::has_sibling`]), not a printer-object lookup: the section
@@ -43,6 +54,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart, DEFAULT_UART_BAUD};
+use crate::core::klippy::config::mcu::Transport;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -69,11 +81,16 @@ pub struct UartPort {
     oid: String,
     /// The port's line rate, when the config writes one.
     baud: Option<u32>,
+    /// The tty the bridge's host library opens for this port, when the config
+    /// writes one. Meaningless on a bridge that is not a host library, which
+    /// the loader refuses ([`wire_bridge_port`]).
+    path: Option<String>,
     /// The line-level reset the bridge gives a legacy device on this port, when
     /// the config writes one.
     restart_method: Option<McuRestartMethod>,
     /// The port's index on its bridge: its declaration order among the bridge's
-    /// ports, which is what the port-level `SET_PORT_NODEID` travels with.
+    /// ports, which is what the port-level `SET_PORT_NODEID` travels with — and
+    /// the slot `config_uart` carries.
     ///
     /// `None` until the loader's factory has wired the port to its bridge
     /// ([`load_uart_device`], which queues the `config_uart` /
@@ -121,14 +138,15 @@ impl UartPort {
     ///
     /// # Errors
     /// A missing or empty required option, an `uart_mcu` that names no `[mcu]`
-    /// section, a non-positive or unparsable `uart_baud`, or a
-    /// `uart_restart_method` that is not a line-level method — each message
-    /// names the section (and the target, for an unknown MCU).
+    /// section, a non-positive or unparsable `uart_baud`, an empty
+    /// `uart_path`, or a `uart_restart_method` that is not a line-level method —
+    /// each message names the section (and the target, for an unknown MCU).
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let name = section_name(config, "uart_device")?;
         let mcu = require_mcu(config, "uart_mcu")?;
         let oid = require_text(config, "uart_oid")?;
         let baud = parse_baud(config, "uart_baud")?;
+        let path = parse_path(config)?;
         let restart_method = match config.get_str("uart_restart_method") {
             None => None,
             Some(text) => Some(Self::parse_restart_method(config, &text)?),
@@ -138,6 +156,7 @@ impl UartPort {
             mcu,
             oid,
             baud,
+            path,
             restart_method,
             index: None,
         })
@@ -162,6 +181,12 @@ impl UartPort {
     /// The port's line rate, when the config writes one.
     pub fn baud(&self) -> Option<u32> {
         self.baud
+    }
+
+    /// The tty the bridge's host library opens for this port, when the config
+    /// writes `uart_path:`.
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
     }
 
     /// The line-level reset the bridge gives a legacy device on this port,
@@ -282,11 +307,17 @@ pub fn load_can_device(
 /// The firmware has no port of its own to report: the host creates it. So this
 /// queues the pair `cmd::uart` defines on the **bridge's** builder, in order —
 /// `config_uart` creates the byte stream at the section's rate (`250000` when
-/// the section wrote none) and `config_bridge_port` hands it to the router as a
-/// downstream port — and takes the next port index from the bridge. Both
-/// commands and the index have to agree: the bridge numbers ports by the order
-/// its `config_bridge_port` commands arrive, so the section-declaration order
-/// the loader calls this in is the port's index.
+/// the section wrote none) on the port's slot, and `config_bridge_port` hands it
+/// to the router as a downstream port — and takes the next port index from the
+/// bridge. Both commands and the index have to agree: the bridge numbers ports
+/// by the order its `config_bridge_port` commands arrive, so the
+/// section-declaration order the loader calls this in is the port's index.
+///
+/// The index is also the **slot** the port's tty was named with, so the two are
+/// one number rather than two counters: `config_uart` carries it, and a
+/// host-library bridge is told `(slot, uart_path)` before the library comes up
+/// ([`McuObject::add_host_port_path`], read back by
+/// `McuObject::connect`).
 ///
 /// The `[mcu]` a port named is a config-section existence check in
 /// [`require_mcu`]; the object lookup here is the next step — the builder the
@@ -294,15 +325,16 @@ pub fn load_can_device(
 /// loader guarantees for a config it accepted.
 ///
 /// # Errors
-/// [`ConfigError`] when the bridge's object cannot be found or its builder
-/// refuses another command or port (oid exhaustion, or a bridge already at its
-/// port limit).
+/// [`ConfigError`] when the bridge's object cannot be found, when the port
+/// writes a `uart_path:` its bridge cannot open (a bridge that is not a host
+/// library), or when the bridge's builder refuses another command or port (oid
+/// exhaustion, or a bridge already at its port limit).
 fn wire_bridge_port(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
     port: &mut UartPort,
 ) -> Result<(), ConfigError> {
-    let bridge_name = port.mcu();
+    let bridge_name = port.mcu().to_string();
     let identifier = if bridge_name == "mcu" {
         "mcu".to_string()
     } else {
@@ -316,6 +348,17 @@ fn wire_bridge_port(
                 config.identifier()
             ))
         })?;
+    // `uart_path:` names the tty the bridge's host library opens for this port,
+    // and only a host-library bridge has a library that opens one. Anywhere else
+    // the option would sit there unfollowed, so it is refused by name instead.
+    if port.path().is_some() && !bridge_opens_its_ports(&bridge) {
+        return Err(ConfigError::new(format!(
+            "Section '{}': uart_path: is only meaningful for a port whose bridge is a host \
+             library ([mcu] host_library:), because only that library opens the port's tty; \
+             '{bridge_name}' is not one",
+            config.identifier()
+        )));
+    }
     let builder = bridge.config();
     let on = |err: crate::core::klippy::mcu::McuError| {
         ConfigError::new(format!(
@@ -325,11 +368,20 @@ fn wire_bridge_port(
     };
     let uart_oid = builder.create_oid().map_err(on)?;
     let port_oid = builder.create_oid().map_err(on)?;
+    // The port's index is its declaration order among the bridge's ports
+    // (`McuObject::next_bridge_port_index`); it is taken before the commands are
+    // queued because `config_uart` carries it as the port's slot.
+    let index = bridge.next_bridge_port_index(&config.identifier())?;
+    port.set_index(index);
+    if let Some(path) = port.path() {
+        bridge.add_host_port_path(index, path.to_string());
+    }
     let baud = port.baud().unwrap_or(DEFAULT_UART_BAUD);
     builder
         .add_config_cmd(&ConfigUart {
             oid: uart_oid,
             baud,
+            path: index,
         })
         .map_err(on)?;
     builder
@@ -338,9 +390,20 @@ fn wire_bridge_port(
             uart: uart_oid,
         })
         .map_err(on)?;
-    let index = bridge.next_bridge_port_index(&config.identifier())?;
-    port.set_index(index);
     Ok(())
+}
+
+/// Whether `bridge` opens its ports itself: its own transport is a host library,
+/// the only bridge that reads a port's `uart_path:` at run time.
+///
+/// A section parsed outside the loader carries no transport description
+/// ([`McuObject::parsed_config`]), and such a bridge cannot be a host library
+/// either — the loader never built it — so it answers `false`.
+fn bridge_opens_its_ports(bridge: &McuObject) -> bool {
+    matches!(
+        bridge.parsed_config().map(|config| config.transport),
+        Some(Transport::Host { .. })
+    )
 }
 
 /// The `[mcu]` **names** the config makes a bridge: every port section's
@@ -381,6 +444,30 @@ fn section_name(config: &ConfigWrapper, kind: &str) -> Result<String, ConfigErro
             config.identifier()
         ))
     })
+}
+
+/// `uart_path`, the tty this port's bridge opens for it, when the config writes
+/// one.
+///
+/// Optional: a port on a bridge that is not a host library has no such stream to
+/// name (and writing one is a config error, [`wire_bridge_port`]), and a
+/// host-library port that writes none keeps the path the library was built with.
+///
+/// # Errors
+/// An `uart_path` that is written but empty — a path is named or the option is
+/// left out, never blank.
+fn parse_path(config: &ConfigWrapper) -> Result<Option<String>, ConfigError> {
+    let Some(text) = config.get_str("uart_path") else {
+        return Ok(None);
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::new(format!(
+            "Option 'uart_path' in section '{}' must not be empty",
+            config.identifier()
+        )));
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 /// A required, non-empty string option, read through the tracked getter.
@@ -670,5 +757,120 @@ mod tests {
             .lookup_object_as::<CanPort>("can_device can0")
             .expect("the can port registered");
         assert_eq!(can.oid(), "can0");
+    }
+
+    /// Load `text` through the real loader — the same walk a config file takes,
+    /// so the port factory's bridge wiring runs.
+    fn load(text: &str) -> Result<Arc<Printer>, ConfigError> {
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer.load_config(&config)?;
+        Ok(printer)
+    }
+
+    /// The `(slot, path)` pairs the `[mcu <name>]` bridge collected from its
+    /// ports, in declaration order.
+    fn host_port_paths(printer: &Arc<Printer>, name: &str) -> Vec<(u8, String)> {
+        printer
+            .lookup_object_as::<McuObject>(name)
+            .expect("the bridge registered")
+            .host_port_paths()
+    }
+
+    #[test]
+    fn a_uart_port_takes_a_path() {
+        let config = with_mcu(
+            "[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
+             uart_path:  /dev/serial/by-id/usb-board\n",
+        );
+
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.path(), Some("/dev/serial/by-id/usb-board"));
+    }
+
+    #[test]
+    fn a_uart_port_without_a_path_has_none() {
+        let config = with_mcu("[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n");
+
+        let port = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap();
+
+        assert_eq!(port.path(), None);
+    }
+
+    #[test]
+    fn an_empty_uart_path_is_refused() {
+        let config = with_mcu("[uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\nuart_path: \n");
+
+        let err = UartPort::new(&wrap(&config, "uart_device uart0")).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'uart_path' in section 'uart_device uart0' must not be empty"
+        );
+    }
+
+    /// `uart_path:` names the tty the bridge's **host library** opens, so a
+    /// bridge that is not one has nothing to open it with: the load fails,
+    /// naming the section and the bridge, instead of leaving the option read and
+    /// unfollowed.
+    #[test]
+    fn uart_path_on_a_bridge_that_is_not_a_host_library_is_refused() {
+        let err = load(
+            "[mcu bridge]\nserial: /dev/not-opened\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             uart_path: /dev/serial/by-id/usb-board\n",
+        )
+        .err()
+        .expect("a serial bridge cannot open a port's tty from the host's word");
+
+        assert_eq!(
+            err.to_string(),
+            "Section 'uart_device uart0': uart_path: is only meaningful for a port whose \
+             bridge is a host library ([mcu] host_library:), because only that library opens \
+             the port's tty; 'bridge' is not one"
+        );
+    }
+
+    /// The port index is the number both the port's tty and `config_uart` travel
+    /// with: the loader hands the bridge one pair per `uart_path:` port, keyed by
+    /// the index its port was given — the second port's slot is 1, not 0, and a
+    /// port that writes no path contributes nothing.
+    #[test]
+    fn a_host_library_bridge_registers_its_ports_paths_under_their_index() {
+        let printer = load(
+            "[mcu bridge]\nhost_library: /lib/libklipper_host.so\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [uart_device uart1]\nuart_mcu: bridge\nuart_oid: uart1\n\
+             uart_path: /dev/serial/by-id/usb-board\n",
+        )
+        .expect("a host-library bridge takes the port's path");
+
+        assert_eq!(
+            host_port_paths(&printer, "mcu bridge"),
+            vec![(1, "/dev/serial/by-id/usb-board".to_string())]
+        );
+        // The two counters are one: the port's index — which the port-level
+        // `SET_PORT_NODEID` carries — is what the path is keyed by.
+        assert_eq!(
+            printer
+                .lookup_object_as::<UartPort>("uart_device uart1")
+                .expect("the port registered")
+                .index(),
+            Some(1)
+        );
+    }
+
+    /// A host-library bridge with no `uart_path:` on any port collects nothing:
+    /// every port keeps the tty the library was built with.
+    #[test]
+    fn a_host_library_bridge_without_port_paths_registers_none() {
+        let printer = load(
+            "[mcu bridge]\nhost_library: /lib/libklipper_host.so\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        )
+        .expect("a host-library bridge loads without a path");
+
+        assert!(host_port_paths(&printer, "mcu bridge").is_empty());
     }
 }

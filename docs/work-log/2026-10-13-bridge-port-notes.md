@@ -673,4 +673,42 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 4. **P2（已做）**：线上参数名 `path=%c` → **`slot=%c`**（它承载的是槽号，避免误导下一个读协议的人）。
 - 验收：主仓 **3238 passed / 0 failed / 13 ignored**、fmt 干净、0 告警；子模组两配置 0 告警；三条反证（编译期 `#error` 触发、表检查去掉即红、RAII 收尾的 panic 探针）。
 
-**仍然记着的事实（不是缺陷）**：`config_uart` 多了一个参数 ⇒ **新主机配旧库**在连接期**显式报错**（按字典校验参数个数：`expected 2 parameters, got 3`），只是文案不友好、没有版本握手；`KLIPPER_HOST_PORT_SLOTS = 4` 与 `BRIDGE_MAX_PORTS = 4` 现已编译期绑定；固件仍单流 ⇒ `slot != 0` 的端到端路径**不可能**被测到（只有主机侧单测覆盖），N 路并行流是**下一个单元（R2）**。
+**仍然记着的事实（不是缺陷）**：`config_uart` 多了一个参数 ⇒ **新主机配旧库**在连接期**显式报错**（按字典校验参数个数：`expected 2 parameters, got 3`），只是文案不友好、没有版本握手；`KLIPPER_HOST_PORT_SLOTS = 4` 与 `BRIDGE_MAX_PORTS = 4` 现已编译期绑定；~~固件仍单流 ⇒ `slot != 0` 的端到端路径不可能被测到，N 路并行流是下一个单元（R2）~~（**已被 §9 的 R2 推翻：多流已落地并双端口整链验收**）。
+
+## 9. R2/L2（2026-10-15）：host 后端多路流 + 真 linux 固件当下游
+
+### 决断（D20–D23）
+
+- **D20（R2-b 排队）**：双端口端到端测试**排在 L2-b 之后**串行——L2-b 是同一条链 ×1 的先行单元，复用其布线可避免重复踩坑、`mod.rs`/辅助代码写冲突与双份 CPU 争用（两单元本身无代码依赖，但有知识依赖）。
+- **D21（夹具落点）**：`LinuxFirmware` 夹具放 **dev-dep `klipperx-test-support`**（build.rs 暴露 elf + RAII spawn/收割），而非内联进单个测试——L2-b 与 R2-b 两测试共用，`env!` 经 test-support 自身 build.rs 传递正好绕开 dev-dep `env!` 不可见的限制。
+- **D22（换棒策略）**：子代理被 provider `content_filter` 误杀或反复超时**零产出**时，先分析会话状态再决定 resume 还是 fresh 重开：会话历史大（>66k 输入）且两次被过滤 → 放弃续跑、fresh context 重开；上下文已就位但侦察过度 → 同会话 resume 并强制落笔。
+- **D23（防超时三板斧）**：任务书直接写入「立即落笔、10 分钟内必须首提交、每步增量提交、只读错误点名的文件」——L2-b 第四次尝试（resume + 强制三步）用 30 分钟内 2 个提交的节奏完成了前三次 30 分钟都写不出一个函数的任务。
+
+### L2-a 夹具（主仓 `bc48281` + 文档 `17ac58d`，合入 `534f279`）
+
+- `build.rs` 断言 `linuxprocess` 的 `out/klipper.elf` 并以 `KLIPPER_LINUX_FIRMWARE` 暴露；`linux_firmware_path()` + `LinuxFirmware`（`-I` 独立临时路径、以「软链指向 `/dev/pts/*`」为就绪信号（≤5s 有界，失败带固件 stderr 尾部）、Drop 必定 kill+有界收尸+删目录；夹具从不向固件发字节（`config_reset` 会 `execv`）。
+- 自测试 `linux_firmware_spawn_and_drop` 两跑 0.04s；残留自查 pgrep 无匹配。
+- provider 曾把该子任务首跑**内容过滤误杀**（`finish_reason: content_filter`，零文件改动），resume 后一次通过——**不是任务问题**。
+
+### L2-b 真固件整链（`eff45af`/`c1ab57f`/文档 `97195d1`，合入 `5ac33af`）
+
+- 新测 `a_real_linux_firmware_completes_identify_and_clock_behind_the_bridge_port`：真 `klipper.elf` 独立进程当 legacy 下游，`uart_path:` 直指固件自己的 pty slave（R1 语义），bring_up **完整**跑到 Ready（E1 是有界中断）→ identify 快照 + `CLOCK_FREQ==50_000_000`（与 mux 库 20 MHz 可区分 ⇒ 数据来自真固件）→ 两次 `get_clock` 按 32 位回绕差值断言推进 → 按 pid 确认固件被收割。两跑 0.81s。
+- **坑**：`McuClock` 与 `Arc<Mcu>` 持 child interface 拖住 mux 库引用，teardown 不先显式 drop 就报「库 never unloaded」（与 P11 同型教训的具象化）。
+- **执行教训**：前三次尝试（1 次 content_filter、2 次 30 分钟超时）全部零产出，根因是**侦察无限挤占预算**；第 4 次 resume 强制「落笔→增量提交→按错误点名修复」节奏后一次通过。
+
+### R2-a host 后端按槽多流（子模组 `49ca236f`；主仓 gitlink+手册 `5a723c6`）
+
+- `src/host/bridge.c`：全局单流（`bridge_fd/bridge_port/bridge_tx/bridge_reset_*`）→ `struct bridge_stream[KLIPPER_HOST_PORT_SLOTS]` 每槽一条（fd、owner、router index、整帧 tx 队列、reset 状态机）；hooks 经 ctx=`uart_s*` 按 `owner` 回查自己的槽；**开放判据用 owner 而非 fd>=0**（静态表零初始化 fd==0，用 fd 判会让首槽永远 BUSY——写手自查发现并修掉的唯一实质 bug）；同槽二次 open 才 `UART_OPEN_BUSY`（uart.c 文案改 `the port slot is already in use`）、越界显式拒绝不走回落、失败不留半开、`bridge_poll` 遍历全部；C 注释旧单流断言清零。
+- 评审 12 条：代码全过、无 P0；**修复后可合入** → 合入前补修 `Kconfig:86` 与 `README:198` 两处旧单流断言 + `internal.h`/`timer.c`/`bridge.c` 注释微偏（amend 进单提交 `49ca236f`）；评审环境无 shell，文件清单由 main 用 `git show --stat` 闭合（仅 bridge.c/uart.c/uart.h + 4 处文档注释）。
+- 三配置构建 0 告警（plain host / mux host / stm32f103，产物全在 worktree 自有 `out/`）；合入后 mux 配置复跑 0 告警。
+
+### R2-b 双端口端到端（`1000766` + 文档 `85e98bc`，合入 `ce48af0`）
+
+- 新测 `two_real_linux_firmware_ports_come_up_on_one_bridge`：一份 mux 库 + 两个 `[uart_device]`（声明顺序即 slot、互异 `uart_path` 各指一个真固件进程）+ 两个 legacy child；**双口 Ready 即多流主证明**（旧单流后端第二个 `config_uart` 会 `UART_OPEN_BUSY` 到不了 Ready）；库 stderr 断言两行 `… (fd N, slot 0/1)` 直证声明顺序→槽位；双 child 各自 identify + `CLOCK_FREQ` + 回绕差值 `get_clock`；双 pid 有界收割。两跑 1.32s，main 复跑同绿。
+- 执行上一次通过（模板双份化 + 防超时策略生效）。
+
+### 本段验收
+
+- 主仓 `work` = `ce48af0`：全量闸门 **3241 passed / 0 failed / 13 ignored**、`cargo fmt --all --check` 干净、`--all-targets` 0 告警；工作区干净；两条任务 worktree 已全部销毁。
+- 手册同步（随代码）：`testing.md`（夹具小节 + bridge_attach 18 测两条新覆盖）、`serial-mux-protocol.md`（配置期按槽多流语义 + 「多下游端口」段改为「端到端已钉住」）、子模组 `README.md`/`Kconfig` 旧断言清理。
+- 待办：L2-b/R2-b 两测试的独立评审已派出（与本段收尾并行）；L3（linux console 接 mux + `-U` 身份 → 免真机验命名设备经真桥）与 P4/P5/P6 仍未动。

@@ -119,35 +119,63 @@
 
 ## M1/M2（桥下游端口 + admin 复位）——**统一真机测试（后移）**
 
+> **P5（CAN）与 P6（RS-485）余项统一按「待测（硬件）」处理，不阻塞主线进度**：
+> CAN/485 两类设备的全部未落地项（`[can_device]` 端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach
+> 端到端、`vcan` 夹具、P6 多站串口）都已挂在本节，等硬件就绪再跑；软件侧该做的已做完
+> （见台账 §10）。
+
 **测试策略（2026-10-14 拍板）**：M1（桥下游端口模块化）与 M2（admin 流程复位）的**真机/外设项
 一律后移**——先让全部代码路径在软件侧（pty + 回环夹具 + 假固件/裸帧库）说得通、单测与集成测
 全绿，等 **M1+M2 全部落地**后再把下面这几项**一次跑完**。期间不因缺真机而停下任何一期的开发，
 也不把「未上真板」当成未完成（与本文开头「不阻塞 `TODO.md` 开发任务」同一条约定）。
 
-- [ ] **M1-1 桥下游端口 attach（legacy）** —— 一块板做桥（固件开 `CONFIG_BRIDGE`），其 uart 端口接
+- [x] **M1-1 桥下游端口 attach（legacy）** —— 一块板做桥（固件开 `CONFIG_BRIDGE`），其 uart 端口接
   一台**没有 mux 的旧固件**板（无 admin）。真实测试：宿主按 `[uart_device]` + 无 `uuid:` 的 `[mcu]`
   连上，桥收到 `SET_PORT_NODEID(index, id, flags=0)` 后把该 id 的数据单元剥头下发、把下游原始帧
   加上应答头上行。判定：identify + `get_clock` 跑通，下游板全程不参与 admin，日志无 `!!`。
-- [ ] **M1-2 桥下游端口 attach（命名设备）** —— 端口上那台**能答 admin** 的设备带 `uuid:`：主机对桥
+  **2026-10-15 真机结论**：以「宿主库当桥 + 真板（旧/普通固件）当下游」形态验过（见下面「真机结果」）。
+  仍未验的是**板做桥**那一半：MCU 侧还没有 UART 端口后端（`CONFIG_SERIAL_UART` 只有 host 库实现），
+  所以「一块板做桥、其 uart 接下游」目前无法配置。
+- [x] **M1-2 桥下游端口 attach（命名设备）** —— 端口上那台**能答 admin** 的设备带 `uuid:`：主机对桥
   发 `SET_PORT_NODEID(index, id, MUX_PORT_UNITS)`，对设备发 `SET_KLIPPER_NODEID` + 重确认握手，
   之后按整单元原样转发。判定：同上跑通，且能与 M1-1 共存于同一桥（一条端口一种形态）。
-- [ ] **M1-3 端口配置期的显式失败与 `index` 一致**（M1-P7 起取代旧的「端口表对账」）—— 端口由主机在
+  **2026-10-15 真机通过**：真板（stm32f103xe，USB CDC 控制台 + `CONFIG_MUX_SERIAL`，身份
+  `e512c60ac0e6` = 其 UID 的 chipid 派生值）当命名下游挂在一份宿主库桥后面：`MCU 'bridge'
+  identified: 22 messages` / `MCU 'child' identified: 135 messages` / 库 stderr `bridge serial:
+  /dev/ttyACM1 open at 250000 baud (fd N, slot 0)`。仍未验：**板做桥**（同上缺 UART 端口后端）、
+  两台真设备同桥、真板上的 `irq_save()` 时序与冲突处理。
+- [x] **M1-3 端口配置期的显式失败与 `index` 一致**（M1-P7 起取代旧的「端口表对账」）—— 端口由主机在
   配置期用 `config_uart`/`config_bridge_port` 声明，`index` = 端口节声明顺序。判定：把端口 tty
   指向不存在的设备（或写一个不可设的 baud）时，主机在**配置阶段**报出点名错误（含桥名与
   `config_uart` 原因），而不是 init 失败或静默；两个端口节时 `index` 0/1 与线上命令一致。
+  **2026-10-15 真机通过**（前半）：`uart_path: /dev/klipperx-does-not-exist` ⇒ `MCU 'bridge'
+  shutdown during connect: config_uart: the UART device could not be opened`（点名 + 配置阶段）。
+  两个端口节的 `index` 0/1 一致性只由单测覆盖（本机只有一块下游板）。
 - [ ] **M2-1 `RESET_PORT` 的电气极性与保持** —— 桥对某端口断言 **DTR\|RTS 250 ms** 能否真把下游
   板复位（取决于板子是 DTR 还是 RTS 敏感、高电平还是低电平有效）。判定：下游确实重启并重新
   identify；同时确认**桥自己**没被按在复位上（连续两条 `RESET_PORT` 也不锁存）。
   **部分结论（2026-10-15，代码证据）**：本机这台 `usb-Klipper_stm32f103xe_…-if00` 是**原生 USB CDC**（klipper 自带 USB 栈），
   固件**不把 DTR/RTS 当复位**（`src/generic/usb_cdc.c:452-459,485-494`：只记 `line_control_state`，唯一消费是「1200 波特 + DTR 低」进 bootloader），
   所以 `RESET_PORT` 的 250 ms 脉冲在这类板子上**静默无效**（内核照常接受 ioctl）⇒ 该项在**原生 USB 板**上判「不适用」，
-  其判定只对 **USB-串口桥接板**（DTR\|RTS 接复位脚）有意义；原生 USB 的 legacy 设备需靠 `RESET_DEVICE`（命名/mux 设备）或断电。
+    其判定只对 **USB-串口桥接板**（DTR\|RTS 接复位脚）有意义；原生 USB 的 legacy 设备需靠 `RESET_DEVICE`（命名/mux 设备）或断电。
+  **真机观察（2026-10-15）**：在「宿主库当桥 + 真板（原生 USB CDC）当下游」形态下，`RESET_PORT`
+  就是桥对该 tty 做 DTR/RTS 脉冲——命令发出、板子**无任何反应**（不重启、不丢会话），与上面结论一致。
 
-- [ ] **M2-2 `RESET_DEVICE` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x02][index]` 转发给
+- [x] **M2-2 `RESET_DEVICE` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x02][index]` 转发给
   它（不扇出、不本地执行）。判定：只有该端口那台重启，其它端口与桥不受影响。
-- [ ] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
+  **2026-10-15 真机结论（控制路径已验 / 设备侧有前置条件）**：主机日志 `MCU 'child': resetting
+  bridge port 0 with RESET_DEVICE`（先重申 `SET_PORT_NODEID(0,id,1)` 再发），桥侧代码按端口路由整单元。
+  **但设备侧不一定真复位**：stm32 的 `bootloader_request()`（`src/stm32/stm32f1.c:247`）只有
+  `try_request_canboot()` 与 `FLASH_START_800` / `FLASH_START_2000` 两种 USB bootloader 路径；本板是
+  `CONFIG_STM32_FLASH_START_0000` 且未开 CAN ⇒ **它是设计内的 no-op**，所以实测中板子没重启。
+  要把「点名复位某台设备」真实验成，下游固件必须带**可软件进入的 bootloader**（CanBoot，或
+  USB-HID/Arduino 式在 0x800/0x2000），否则只能走线级 `RESET_PORT` 或断电。
+- [x] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
   （重握手 / 等 `NEED_NODEID` / 重新 identify）。判定：`FIRMWARE_RESTART` 后会话确实重建，不出现
   「命令发了但设备没重启」的静默假成功；旧固件（不能答 admin）仍回退到 `command`。
+  **2026-10-15 真机通过**：恰好拿到「设备没真重启」的反例——主机没有假成功，而是点名报出
+  `cannot configure MCU: Failed automated reset: MCU 'child' is still configured (CRC 0x890098f7)`，
+  并先走会话接管路径（`Firmware is still in an earlier session (sequence 6); taking it over`）。
 - [ ] **M1-4 CAN 上游 attach（P5 余项）** —— 桥经 CAN 连（固件 `CONFIG_MUX_CAN`，主机需走
   `interface/devices/canserial.rs` 的端口级单元发送路径）。真实测试：先经单帧 admin `0x3f0` 指派
   node id，再经**单元**完成 mux 扫描/采纳（`SET_KLIPPER_NODEID`）、确认本节点回帧带应答头、
@@ -162,6 +190,35 @@
   admin 单元属点火不管）的频率也需观察。
 - **M1-2 的软件侧等价物已永久入库**（真 `klipper.elf` 当命名下游走真桥，`-U` 身份 = 配置 `uuid:`），
   所以上面 M1-2 真机项只需验**真板/真时序**（扫描/指派/冲突、`irq_save()` 时序、两个真设备同桥）。
+
+### 真机结果（2026-10-15，第一次上板）
+
+板子：`usb-Klipper_stm32f103xe_39FFD7054D47323924610951` → `/dev/ttyACM1`（STM32F103ZE，SWD 刷入：
+`./venv/bin/pyocd load --target stm32f103ze third_party/klipper/out/klipper.elf`）。
+
+**为这次上板补的固件改动**（子模组）：USB CDC 控制台接 mux（`src/generic/usb_cdc.c` 的 rx/tx 两个
+接点与 `mux_send`）、`MUX_SERIAL` 依赖放宽为 `SERIAL || USBSERIAL`（此前 USB 控制台的板子 `SERIAL=n`，
+根本选不了 mux）、以及 `Makefile` 的 `src-y := $(sort $(src-y))`（`chipid.c` 被多载体各列一次 ⇒ 重复
+定义 + 重复 `compile_time_request`）。板子 `.config` 现为 `CONFIG_USBSERIAL=y + CONFIG_MUX_SERIAL=y`。
+
+**跑成的**：① `klipperx scan --port /dev/ttyACM1` → `uuid=e512c60ac0e6`（= 该板 UID 的 chipid 派生，
+已用仓库自带 C 版 fasthash64 独立复算一致）⇒ 真机 mux 扫描与身份；② M1-2（宿主库当桥 + 真板命名
+下游）整链 identify（bridge 22 / child 135）；③ M1-3（点名配置错误）；④ M2-3（主机对「复位没发生」
+的显式判定）；⑤ M2-2 控制路径（`RESET_DEVICE` 经桥转发）。
+
+**上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
+B) `RESET_DEVICE` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）；
+C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」还需 MCU 侧 **UART 端口后端**
+（`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
+
+**两条语义要分清（真机实测）**：
+- `restart_method: admin`（`RESET_DEVICE`）＝**请求 bootloader**（面向刷写/恢复），无 bootloader 的下游它是 no-op。
+- `restart_method: command`（下游桥端口的默认）＝**重启固件本身**：主机把固件的 `reset` 命令当普通帧经**桥按 id 转发**给那台设备（固件侧 `command_reset` → `NVIC_SystemReset()`），**不需要 bootloader**。真机验过：`MCU 'child': resetting the firmware with the 'reset' command` ⇒ 板子确实重启（USB 重新枚举，`ttyACM1` → `ttyACM2`），复位后 `klipperx scan --port /dev/ttyACM2` 仍报同一身份 `e512c60ac0e6`（身份是 chipid 派生，跨复位稳定）。
+- **但 USB CDC 下游的复位会拖累宿主库桥**：下游重新枚举后 `/dev/ttyACM1` 消失（可能换号），而桥的 `klipper_host_port()` 只能在 `init` 前登记、本会话无法重开 ⇒
+  `bridge serial: /dev/ttyACM1 failed: (2)No such file or directory` → `MCU 'bridge' shutdown during connect:
+  config_uart: the UART device could not be opened`。结论：**宿主机库桥 + USB CDC 下游**这个拓扑里，
+  「复位下游」不可能在同一会话内恢复（要么重启主机并改路径，要么下游走 UART——那正是
+  「板做桥」拓扑，也是它真正的价值所在）。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 

@@ -739,3 +739,44 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 - **P5-D（子模组 `50fda1cf` + 收口 `3b23c8ea`）**：`config MUX_CAN`（`depends on CANBUS && HAVE_CHIPID`、`select MUX`、`不默认开`）、`BRIDGE` 改 `default y if MUX_SERIAL || MUX_CAN`、`src/Makefile` 改 `src-$(CONFIG_MUX) += mux.c`（两种载体共用一份；互斥是各 arch 通信接口 `choice` 的源码事实，已写进 Kconfig 注释）、`canserial.c` 收端（`command_find_block()` 前、`irq_save()` 段内）接 `mux_input`、发端 `mux_out_header` + 整单元 `mux_send`、`canserial_set_uuid` → `mux_set_uuid`。评审 **可合入**（无 P0/P1）；收口含注释口径修正、`src/host/README.md` 旧断言、新增 `test/configs/stm32f103-can-mux.config`（让闸门真的编 `CONFIG_MUX_CAN` 的代码路径——此前全仓无任何 CAN 目标）。
 - **诚实边界**：本环境无 CAN 外设，P5-D 只有**构建级**验证（候选 B 的帧形是设计一致性结论，不是对已跑通 CAN 桥的实测）；主仓侧新臂在**当前产品路径不可达**（`bridge_attach` 仍拒绝 CAN 上游与 `[can_device]` 端口）。
 - **P5 尚余（真机/后续）**：`[can_device]` 下游端口节（`CanPort` 拿 `index` + 配置期下发）与固件 **`BRIDGE_PORT_CAN` 端口后端**（新的 `bridge_port_ops`：CAN 收发 + 按下游 id/uuid 过滤）；CAN 上游 attach 端到端（先 `0x3f0` 单帧指派 node id，再经单元扫描/采纳/路由；脚本化总线可做一部分，真总线必需真机）；`vcan` 夹具（需 `CAP_NET_ADMIN`，本仓无先例）；`send_bytes` 目前无写锁（每器件单写者；P5 接线时需决定单写者或加锁——与 D11 在 host 侧同类）。
+
+## 11. 第一次上板（2026-10-15）：USB CDC 接 mux + M1/M2 真机项
+
+用户提供硬件：STM32F103ZE 板（SWD 经 ST-Link，刷写命令 `./venv/bin/pyocd load --target stm32f103ze
+third_party/klipper/out/klipper.elf`，构建配置在子模组 `.config`）。用户同时拍板：**P5/P6 全部挂
+「待测（硬件）」，不阻塞进度**。
+
+### 决断（D28–D30）
+
+- **D28（USB CDC 控制台接 mux）**：此前 mux 接线只在 `serial_irq.c`（USART）、`canserial.c`、linux、host
+  四处，且 `MUX_SERIAL depends on SERIAL`——而 stm32 的通信接口是 choice，USB CDC 控制台 ⇒ `SERIAL=n`
+  ⇒ **这块板根本选不了 mux**。先在 `src/generic/usb_cdc.c` 补上同样的两个接点 + `mux_send`，并把依赖
+  放宽为 `SERIAL || USBSERIAL`（载体的存在就是依赖）。这是 M1-2 真机的前置。
+- **D29（Makefile 去重）**：放宽后 `stm32f103 + USBSERIAL + MUX_SERIAL` 链接失败（`chipid.o` 重复定义）
+  ——`chipid.c` 被 USB/CAN/USBCANBUS/MUX 四条 `src-$(CONFIG_*) +=` 各列一次。修法不是逐 arch 打补丁，
+  而是在 arch include 之后一行 `src-y := $(sort $(src-y))`（同时修掉重复链接与重复
+  `compile_time_request` 两个问题）。代价：丢掉了「重复列入」这个本来就不会编译报错的信号（记入代价）。
+- **D30（`RESET_DEVICE` 的前置条件）**：真机上控制路径全通（主机重申 `SET_PORT_NODEID(0,id,1)` → 桥按
+  端口转发整单元），但 stm32 的 `bootloader_request()`（`src/stm32/stm32f1.c:247`）只有 CanBoot 与
+  `FLASH_START_800/2000` 两种 USB bootloader 路径；本板 `FLASH_START_0000` 且未开 CAN ⇒ **设计内 no-op**。
+  结论：per-device 硬复位要求下游固件带**可软件进入的 bootloader**；否则只能 `RESET_PORT`（线级，对原生
+  USB CDC 板无效——与既有结论一致）或断电。
+
+### 真机结果
+
+| 项 | 结果 | 关键证据 |
+|---|---|---|
+| mux 扫描/身份 | ✅ | `klipperx scan --port /dev/ttyACM1` → `uuid=e512c60ac0e6`；= 板 UID（`39ffd705…`）的 `chipid_uuid` 派生，用仓库自带 C 版 fasthash64 独立复算一致 |
+| M1-2 命名下游经真桥 | ✅ | 宿主库当桥：`bridge identified: 22`、`child identified: 135`、库 stderr `open at 250000 baud (fd N, slot 0)`（`/dev/ttyACM1`） |
+| M1-3 配置期点名失败 | ✅ | `uart_path` 指向不存在设备 ⇒ `MCU 'bridge' shutdown during connect: config_uart: the UART device could not be opened` |
+| M2-2 控制路径 | ✅（设备侧 no-op） | `MCU 'child': resetting bridge port 0 with RESET_DEVICE`；设备未重启（见 D30） |
+| M2-3 无回执确认路径 | ✅ | 主机没有假成功：`Failed automated reset: MCU 'child' is still configured (CRC 0x890098f7)`，并先走 `Firmware is still in an earlier session (sequence 6); taking it over` |
+| M1-1 legacy 下游 | ✅（宿主机当桥形态，早前已验；**板做桥**未验） | 见 §7 P8 与本节；板做桥需 MCU 侧 UART 端口后端 |
+
+### 仍未验 / 缺件（真机与后续）
+
+1. **板做桥**（M1-1/M1-2 的另一半）：MCU 侧没有 UART 端口后端（`CONFIG_SERIAL_UART` 只有 host 库实现）⇒
+   「一块板当桥、其 uart 接下游」今天配置不出来。
+2. `RESET_DEVICE` 的**正向**验收：需要一块带 CanBoot/USB-HID bootloader 的下游板。
+3. 两台真设备同桥、真板上的指派/冲突、`irq_save()` 段内时序与丢帧率。
+4. P5（CAN）/P6（485）全部待硬件（见 §10）。

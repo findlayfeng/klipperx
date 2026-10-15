@@ -88,6 +88,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `[verify_heater <不存在的 heater>]` | 报 `Unknown heater` | 报装载器的 `Section '…' is not a valid config section` | [配置手册](../user-manual/config.md) |
 | `[virtual_sdcard]` 细节 | `path` 做 `expanduser`/`normpath`；回放让出用 `gcode.get_mutex().test()`；有 `stats` | `path` 原样用于目录列举；让出用 `tokio::task::yield_now()`；无 `stats` | [模块表](README.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 | MCU 连接 `restart_method` | — | 只对串口 MCU 有意义；CAN 与 `host_library` 一律按 `command` 处理 | [MCU 连接方式](../user-manual/mcu-connection.md) |
+| 固件构建的源文件去重 | 每个 `src-$(CONFIG_*) +=` 各列各的；各载体在上游天然互斥，从不重复 | 架构 makefile include 之后加一行 `src-y := $(sort $(src-y))`：本仓的 `MUX_SERIAL` 可与 `USBSERIAL` 同开，而多个载体都会列 `<arch>/chipid.c` ⇒ 重复链接（并让 `compile_time_request` 计入两次）；一处去重修掉两类 | `third_party/klipper/Makefile` |
 | API 若干已知差异 | 上游 `machine`/`calibration`/`get_status` 等更完整 | 缺 `probe_path`/`rapid_path`、部分 `get_status` 字段未返回等 | [API 参考](../third-party-dev/api-reference.md) |
 
 ## 3. 暂缓/未实现（本仓没做，方向上不排除）

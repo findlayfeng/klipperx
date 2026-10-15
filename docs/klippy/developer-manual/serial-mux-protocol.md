@@ -279,15 +279,14 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 ## 尚未落地
 
-- **微控制器架构的串口 mux 已接线**（M1-P7 的 FW-2/FW-3）：`MUX_SERIAL` 现在是公共的、**有 prompt**
-  能力（`depends on SERIAL`），选上后 MCU 控制台在架构无关层 `src/generic/serial_irq.c` 接
-  `mux_input`/`mux_send`（与 host 逐字同构），身份由各 arch 的 `chipid_init` 按
-  `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**linux 进程控制台也已接线**
-  （`src/linux/console.c`：读后先 `mux_input`、发端 `mux_out_header` + 自己的一份 `mux_send`（有界整单元队列）；
-  `src/linux/main.c` 新增 `-U <12 hex>` 作为它的身份来源，`test/configs/linuxprocess-mux.config` 是构建目标），
-  `MUX_SERIAL` 的身份依赖随之放宽为 `HAVE_CHIPID || MACH_HOST || MACH_LINUX`。**默认不开**：单元格式不是
-  上游 klippy 主机说的格式，必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板扫描/指派/冲突
-  与 `irq_save()` 段内时序仍属真机项。
+- **微控制器架构的串口 mux 已接线**：`MUX_SERIAL` 现在是公共的、**有 prompt**
+  能力（`depends on SERIAL || USBSERIAL`——载体接在哪里，选项就在哪里可见），选上后 MCU 控制台在架构
+  无关层 `src/generic/serial_irq.c` 接 `mux_input`/`mux_send`（与 host 逐字同构），身份由各 arch 的
+  `chipid_init` 按 `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**USB CDC 控制台也已接线**
+  （`src/generic/usb_cdc.c`：同样的两个接点 + `mux_send`；已在 stm32f103xe 真板上验过扫描/身份/经桥 identify），
+  **linux 进程控制台**同样（`src/linux/console.c` + `src/linux/main.c` 的 `-U <12 hex>` 身份来源，
+  `test/configs/linuxprocess-mux.config` 是构建目标）。**默认不开**：单元格式不是上游 klippy 主机说的格式，
+  必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板上的指派/冲突处理、`irq_save()` 段内时序仍属真机项。
 - **CAN 承载也已接线**（`MUX_CAN`）：`src/generic/canserial.c` 的字节流收发接同一套
   `mux_input`/`mux_send`（收端在 `command_find_block()` 之前、`irq_save()` 段内；发端 `console_sendf`
   预留 `MUX_HEADER_BYTES` + `mux_out_header`，`mux_send` 整单元入队），身份由 `canserial_set_uuid` →

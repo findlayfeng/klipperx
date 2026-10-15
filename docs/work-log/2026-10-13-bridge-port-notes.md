@@ -712,3 +712,28 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 - 主仓 `work` = `ce48af0`：全量闸门 **3241 passed / 0 failed / 13 ignored**、`cargo fmt --all --check` 干净、`--all-targets` 0 告警；工作区干净；两条任务 worktree 已全部销毁。
 - 手册同步（随代码）：`testing.md`（夹具小节 + bridge_attach 18 测两条新覆盖）、`serial-mux-protocol.md`（配置期按槽多流语义 + 「多下游端口」段改为「端到端已钉住」）、子模组 `README.md`/`Kconfig` 旧断言清理。
 - 两测试的独立评审均已完成：L2-b **OK（P0/P1 无，三条 P2 当场跟进进 `2690ded`）**；R2-b **无须返工（P2 三条：串行 get_clock 措辞、251M 余量、文件清单——均已在后续提交闭合）**；L3（linux console 接 mux + `-U` 身份 → 免真机验命名设备经真桥）与 P4/P5/P6 仍未动。
+
+## 10. L3/P4/P5（2026-10-15，同一轮）：linux 当命名下游、规则 7 计数、CAN 帧形
+
+### 决断（D24–D27）
+
+- **D24（L3 就绪：can“命名设备经真桥”从真机项降为软件可验）**：给 linux 进程控制台接 mux（`src/linux/console.c` 收/发两个接点 + 自己的有界 `mux_send`）并新增 `-U <12 hex>` 身份来源（`src/linux/main.c`，在 `console_setup()` 前 `mux_set_uuid`），Kconfig 把 `MUX_SERIAL` 身份依赖放宽为 `HAVE_CHIPID || MACH_HOST || MACH_LINUX`（linux 新增 `config SERIAL default y` 仅本机型生效）。于是 M1-2 的“命名设备经真桥”有了**真固件独立进程**的整链测试；真板项（扫描/指派/冲突、`irq_save()` 时序、真桥上的双设备冲突）仍属真机。
+- **D25（新配置不污染 legacy 固件）**：新增 `test/configs/linuxprocess-mux.config`（`MACH_LINUX + MUX_SERIAL`），**不动** `linuxprocess.config`——后者是 L2-b/R2-b 夹具的字节基准；两份 elf 分别以 `KLIPPER_LINUX_FIRMWARE` / `KLIPPER_LINUX_MUX_FIRMWARE` 暴露，夹具新增 `spawn_named(uuid)`（现有 `spawn()` 逐字不变）。
+- **D26（F-6 裁决：规则 7 计入下游台数，但 0 台下游仍按 id 寻址）**：`is_id_addressed = 共享 ∨ 下游设备数 ≥ 1 ∨ 是桥`（`host_libraries::path_is_mux` 同口径）。保留 bridge 项的理由是**机制而非保守**：桥/宿主库只要被 mux 化就有身份，`mux_out_header` 会给它的输出加帧头；若因“0 台下游”判成非 id 寻址，主机会用裸帧去解带身份 mux 设备的输出 ⇒ 解析错位。字面计数项作为**独立且可审计**的判据加入，台数由 `bridge_ports::bridge_downstream_counts` 零 access 预扫提供（`downstream_devices(path)` 可查）；因 `下游 ≥ 1 ⇒ 是桥`，此项在现实中不可观测地改变行为——价值 = 字面判据 + 可查计数 + 文档（评审确认）。
+- **D27（P5 帧形：CAN 上游走 mux 单元，候选 B）**：桥经 CAN 连接时，三条端口级命令与下游设备数据**都作为 mux `KXID` 单元跑在字节流里**（经典 CAN 8 字节切帧由 `CanSerialLink`/`canserial.c` 承担），新增 `CONFIG_MUX_CAN`（与 `MUX_SERIAL` 同形，`BRIDGE` 改为 `default y if MUX_SERIAL || MUX_CAN`）。**候选 A（CAN 单帧 admin 命令）被否**：① 它只能承载三条命令、无法承载下游设备数据（N 台下游复用到一条字节流，无头就分不清归属——正是规则 7 的本质）；② `0x02` 与 CAN 既有 `REQUEST_BOOTLOADER` 载荷位冲突，需另造帧形。候选 B 零新帧形、零冲突（单帧 admin 通道 `0x3f0` 与字节流内头字段是两条通道），且串口/CAN/host 库三种上游统一为一套单元。
+
+### L3 落地（子模组 `77019792` + 评审跟进 `628438d2`；主仓 gitlink/手册 `158dd1c`；测试 `afa3dec`）
+
+- 子模组：Kconfig（linux `SERIAL default y`、身份依赖放宽、注释/help 同步）、`src/linux/console.c`（读后先 `mux_input`、发端预留 `MUX_HEADER_BYTES` + `mux_out_header`、`mux_send` 走 4KB 有界整单元队列，满时丢新单元并报 stderr）、`src/linux/main.c`（`-U`，非法即 usage + `-1`，`#if` 守卫写法保证非 mux 构建逐字回退）、新配置。构建三例零告警；worker 自建探针证明 `-U` 三态（指定/大写/缺省）应答 uuid 正确。
+- 主仓测试（`afa3dec`）：`a_named_real_linux_firmware_completes_handshake_behind_the_bridge_port`（两跑 1.28s/0.74s，main 复跑 0.93s 绿）——身份常量一处定义、同时喂固件 `-U` 与配置 `uuid:`（防漂移）；断言含库 stderr `open at … slot 0`（桥真在固件 pty 上开口）、Ready、真固件快照 `CLOCK_FREQ==50_000_000`、`get_clock` 回绕差值、pid 收割。
+- 评审（`77019792`）：**OK with notes**，无 P0/P1 代码缺陷；P1 属主仓手册（`regression-tests.md` 目标 40→41、linux 行 1→2、字典 37→38、没被引用 10→11），四条 P2 一行修（console.c 注释口径、`main.c` 返回码、`src/Kconfig:77` 措辞、`mux.h` 承载枚举、README 行号）已随 `628438d2` 落地。
+
+### P4 落地（`6815a08`）
+
+- `bridge_ports::bridge_downstream_counts` 零 access 预扫（与 `port_grouping::port_reference` 逐项同构：裸/前缀两种 `[mcu]` 拼写、`uart:`/`can:` 两键、端口节不存在则跳过、同节双键先写胜）+ `PathGroup.downstream` + `serial_ports::is_id_addressed` 显式含计数项 + `host_libraries::path_is_mux` 同口径；新测 `one_mcu_with_three_downstream_devices_is_id_addressed`（**钉住计数 = 3**，不只钉布尔）。
+- 评审：**无 P0/P1**；P2 三条已收口——`host_libraries` 新测是**空证**（`has_bridge` 分支恒真，删新项仍绿）已删并改在既有桥测旁注释说明“计数项在此不可隔离、计数在 `serial_ports` 侧钉住”；`testing.md` 的 `host_libraries.rs` 计数修正为 21（删空证后与实现一致）；开发手册**模块表**两行旧断言（`serial_ports.rs` 的“1 颗 = 独占”、`host_libraries.rs` 的“1 节无 uuid = 裸帧”）补上桥例外（源：上一次提交漏同步）。
+
+### P5 进行中
+
+- 本轮做**免真机可验收**的三件：主机侧 CAN admin 单元发送 API（`canserial.rs` 三个发送方法 + `interface/mod.rs` 臂，socket-free 逐字节测试）、固件 `MUX_CAN`（`canserial.c` 字节流收发接 `mux_input`/`mux_send`，构建级验证）、帧形裁定写进协议文档。
+- **尚未落地（真机/后续单元）**：`[can_device]` 下游端口节与固件 CAN 端口后端（需要新的 `bridge_port_ops` 实现 + CAN 硬件）、CAN 上游 attach 端到端（脚本化总线可做一部分，真实总线需真机）、`vcan` 夹具（需 `CAP_NET_ADMIN`）；P6 多站串口（RS-485，后置）。

@@ -27,7 +27,7 @@
 // registers and dispatches them.
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
@@ -247,6 +247,17 @@ pub struct Printer {
     ///
     /// [`ConfigWrapper`]: crate::core::klippy::config::ConfigWrapper
     config_access: Mutex<Arc<AccessTracking>>,
+    /// The MCUs that have already spent the one bridge-port recovery a bring-up
+    /// gets, keyed by section identifier.
+    ///
+    /// It has to live here rather than on the `[mcu]` object: a restart rebuilds
+    /// every object ([`Printer::reset_for_restart`]), and the budget is exactly
+    /// what has to survive that — otherwise a port tty that is **there** but
+    /// cannot be opened (a directory, a node without permission) would ask for a
+    /// restart on every bring-up, forever. [`Printer::claim_bridge_port_recovery`]
+    /// takes it, [`Printer::clear_bridge_port_recovery`] gives it back once the
+    /// MCU comes up.
+    bridge_port_recoveries: Mutex<HashSet<String>>,
 }
 
 /// A registered event handler.
@@ -354,6 +365,7 @@ impl Printer {
             objects: Mutex::new(Vec::new()),
             config_overrides: Mutex::new(HashMap::new()),
             config_access: Mutex::new(AccessTracking::shared()),
+            bridge_port_recoveries: Mutex::new(HashSet::new()),
         }
     }
 
@@ -406,6 +418,29 @@ impl Printer {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Take the one bridge-port recovery `identifier` has left, if any.
+    ///
+    /// Returns `true` only for the bring-up that gets to ask the printer for the
+    /// restart that reopens a lost bridge port; every later failure of the same
+    /// section returns `false`, so a port that cannot be opened at all stays a
+    /// reported error instead of a restart loop. The budget is given back by
+    /// [`Printer::clear_bridge_port_recovery`] when the MCU actually connects,
+    /// so the next **real** loss still recovers once.
+    pub fn claim_bridge_port_recovery(&self, identifier: &str) -> bool {
+        self.bridge_port_recoveries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(identifier.to_string())
+    }
+
+    /// Give `identifier` its bridge-port recovery back: its session came up.
+    pub fn clear_bridge_port_recovery(&self, identifier: &str) {
+        self.bridge_port_recoveries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(identifier);
     }
 
     /// Register the toolhead's restart handle (`RestartHooks`).

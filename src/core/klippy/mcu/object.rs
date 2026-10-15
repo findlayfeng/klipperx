@@ -1079,6 +1079,79 @@ impl McuObject {
         }
     }
 
+    /// Ask for a plain restart when a host-library bridge lost its port tty.
+    ///
+    /// A bridge port's tty is opened by the **library** when the firmware's
+    /// `config_uart` arrives, and the library cannot be re-initialised in place:
+    /// the failed open leaves the firmware shut down, and this host build's
+    /// firmware has neither `reset` nor `config_reset` to clear it
+    /// (`mcu/config.rs::reset_firmware` reports that as unrecoverable). What
+    /// re-runs `init` is a fresh mapping, and that is what the printer's restart
+    /// path gives: teardown drops every reference, the library unloads, and the
+    /// next bring-up loads it again and re-names its ports (`host.rs`'s
+    /// registry).
+    ///
+    /// So this is only the **decision**: when the failure is the port that could
+    /// not be opened and every tty the config named is back within
+    /// [`bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT`], ask the printer for a
+    /// **plain** restart (`request_exit("restart")`) — a `firmware_restart`
+    /// would reset the downstream device again, and its re-enumeration is what
+    /// lost the tty. A tty that does not come back is a configuration error: the
+    /// bring-up reports it unchanged, with no restart.
+    ///
+    /// The restart is budgeted **once per incident**
+    /// ([`Printer::claim_bridge_port_recovery`]): a tty that is there but cannot
+    /// be opened (a directory, a node without permission) is back from the wait
+    /// at once, and an unbudgeted restart would loop forever. The budget is the
+    /// printer's, so it survives the restart; a session that comes up gives it
+    /// back (`connect`'s success path), so the next real loss recovers once more.
+    async fn recover_lost_bridge_port(&self, config: &McuConfig, err: KlippyError) -> KlippyError {
+        // Only a host-library bridge names its ports; only a port that could not
+        // be opened is worth waiting for; and only the reason this very session
+        // recorded counts — anything else is reported as it is.
+        if !matches!(config.transport, Transport::Host { .. }) || config.host_port_paths.is_empty()
+        {
+            return err;
+        }
+        let Some(reason) = self.connect_shutdown() else {
+            return err;
+        };
+        if !bridge_attach::is_port_open_failure(&reason) {
+            return err;
+        }
+        let paths: Vec<String> = config
+            .host_port_paths
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect();
+        if !bridge_attach::wait_for_port_paths(&paths, bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
+            .await
+        {
+            return err;
+        }
+        // One restart per incident: a tty that is **there** but cannot be opened
+        // (a directory, a node without permission) satisfies the wait at once,
+        // and without this the bring-up would restart forever. The budget lives
+        // on the printer, so it survives the restart the claim buys, and it is
+        // given back if the MCU connects (`connect`'s success path).
+        let Some(printer) = self.printer.upgrade() else {
+            return err;
+        };
+        if !printer.claim_bridge_port_recovery(&self.section.identifier()) {
+            warn!(
+                "MCU '{}': the bridge port tty still cannot be opened; not restarting again",
+                config.name
+            );
+            return err;
+        }
+        info!(
+            "MCU '{}': the bridge port tty came back; restarting the printer to reopen it",
+            config.name
+        );
+        printer.request_exit("restart");
+        err
+    }
+
     /// Whether a failed handshake round is worth another in-place firmware
     /// reset, with `resets` of them already done.
     ///
@@ -1535,9 +1608,17 @@ impl PrinterObject for McuObject {
                 McuError::Config(message) => KlippyError::Config(ConfigError::new(message)),
                 other => KlippyError::Internal(other.to_string()),
             })?;
-            let (mcu, configured) = self
+            let (mcu, configured) = match self
                 .handshake_with_in_place_resets(&config, mcu, built)
-                .await?;
+                .await
+            {
+                Ok(pair) => pair,
+                // A host-library bridge whose port tty could not be opened is
+                // the one failure a plain restart can mend: the library cannot
+                // be re-initialised in place, so unloading and loading it again
+                // is what re-runs `init` ([`McuObject::recover_lost_bridge_port`]).
+                Err(err) => return Err(self.recover_lost_bridge_port(&config, err).await),
+            };
             // A board that just rebooted has a sequence that starts over and no
             // configuration: the transport had nothing to take over
             // (`Mcu::took_over_session`), and the firmware was neither configured
@@ -1574,6 +1655,11 @@ impl PrinterObject for McuObject {
                 ),
             }
             self.set_status(&mcu);
+            // This session is up: an MCU that had spent its one bridge-port
+            // recovery has it back for the next time its port tty goes away.
+            if let Some(printer) = self.printer.upgrade() {
+                printer.clear_bridge_port_recovery(&self.section.identifier());
+            }
             Ok(())
         })
     }

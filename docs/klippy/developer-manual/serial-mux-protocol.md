@@ -282,7 +282,10 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 - **微控制器架构的串口 mux 已接线**（M1-P7 的 FW-2/FW-3）：`MUX_SERIAL` 现在是公共的、**有 prompt**
   能力（`depends on SERIAL`），选上后 MCU 控制台在架构无关层 `src/generic/serial_irq.c` 接
   `mux_input`/`mux_send`（与 host 逐字同构），身份由各 arch 的 `chipid_init` 按
-  `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**默认不开**：单元格式不是
+  `src/generic/chipid_uuid.h`（与 CAN 同一派生）设进 `mux_set_uuid()`。**linux 进程控制台也已接线**
+  （`src/linux/console.c`：读后先 `mux_input`、发端 `mux_out_header` + 自己的一份 `mux_send`（有界整单元队列）；
+  `src/linux/main.c` 新增 `-U <12 hex>` 作为它的身份来源，`test/configs/linuxprocess-mux.config` 是构建目标），
+  `MUX_SERIAL` 的身份依赖随之放宽为 `HAVE_CHIPID || MACH_HOST || MACH_LINUX`。**默认不开**：单元格式不是
   上游 klippy 主机说的格式，必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板扫描/指派/冲突
   与 `irq_save()` 段内时序仍属真机项。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没

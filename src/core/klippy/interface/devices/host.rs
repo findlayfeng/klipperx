@@ -30,6 +30,15 @@
 //! library unloaded (a later load maps it afresh, exactly as if the board had
 //! been power-cycled).
 //!
+//! **One library per process.** One process may hold only one library, on one
+//! path: klipper stops its main loop through a process-wide `SIGUSR1` handler
+//! that every library installs over the last one, so a second path's library is
+//! refused ([`refuse_a_second_library`]) rather than left to crash or hang the
+//! process on the way out. The rule is per **live** path, not per config: many
+//! references on the one path are fine, and a path may be loaded again once its
+//! last reference is gone. The config layer refuses a config that names two
+//! paths up front (`mcu/host_libraries.rs`).
+//!
 //! **One reader, one slot per addressed reference.** The library's output is a
 //! single byte stream, so the library has **one** reader thread — and that
 //! thread is the router: on a muxed path it cuts whole units out of the stream
@@ -107,13 +116,16 @@ fn library_registry() -> &'static Mutex<HashMap<PathBuf, Weak<HostLibrary>>> {
     LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Serialises the tests that load the real host library.
+/// Serialises the tests that load — or try to load — the real host library.
 ///
 /// The library registry is a per-path process-wide singleton, so two tests
 /// sharing the one `.so` must not overlap: the second would meet — or, at the
-/// end, unload — the first's library mid-handshake. A loaded library's output
-/// mode and identity are fixed too ([`library_for`]), which puts a scan test
-/// and an identify test on the same `.so` in exactly that pair.
+/// end, unload — the first's library mid-handshake. A load now also consults
+/// the registry for a **different** live path (one host library per process,
+/// [`refuse_a_second_library`]), so an attempt on a path that does not exist
+/// takes the lock too. A loaded library's output mode and identity are fixed
+/// too ([`library_for`]), which puts a scan test and an identify test on the
+/// same `.so` in exactly that pair.
 #[cfg(test)]
 pub(crate) static HOST_LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -168,6 +180,7 @@ fn library_for(
     mode: OutputMode,
     identity: Option<[u8; 6]>,
 ) -> Result<Arc<HostLibrary>, InterfaceError> {
+    refuse_a_second_library(path)?;
     let library = resource_for(library_registry(), path, |path| {
         HostLibrary::open(path, mode, identity)
     })?;
@@ -180,6 +193,47 @@ fn library_for(
         )));
     }
     Ok(library)
+}
+
+/// Refuse to load `path` while a **different** host library is live in this
+/// process.
+///
+/// A klipper host library stops its main loop through a **process-wide**
+/// `SIGUSR1` handler that every library installs over the last one
+/// (`third_party/klipper/src/host/host.c`), so a second library in one process
+/// makes the process crash or hang on the way out, whichever of the two is
+/// unloaded first (see [`one_library_per_process`]). The registry's live entries
+/// ([`Weak::upgrade`]) say which other path — if any — is loaded right now, so
+/// the rule is **by path**: any number of references on the one live path (a
+/// mux, a device behind a port) load as before, and a path whose library has
+/// been unloaded loads again — "one at a time", not "one ever".
+///
+/// # Errors
+/// [`InterfaceError::Other`] naming both paths when another path is live.
+fn refuse_a_second_library(path: &Path) -> Result<(), InterfaceError> {
+    let registry = library_registry().lock().unwrap();
+    let live_other = registry
+        .iter()
+        .find(|(loaded, weak)| loaded.as_path() != path && weak.upgrade().is_some());
+    match live_other {
+        None => Ok(()),
+        Some((loaded, _)) => Err(InterfaceError::Other(one_library_per_process(path, loaded))),
+    }
+}
+
+/// The message a load of `requested` gets when `loaded` is already live: one
+/// host library per process, and why.
+fn one_library_per_process(requested: &Path, loaded: &Path) -> String {
+    format!(
+        "klipper host library {} cannot be loaded: {} is already loaded in this process, and \
+         only one host library per process is allowed. klipper stops its main loop through a \
+         process-wide SIGUSR1 handler that each library installs over the last one, so two \
+         libraries in one process meet either a jump into unloaded code (a crash) or a join \
+         whose signal another library consumed (a hang); use several references on the one \
+         library (a mux), or run the firmware images in separate processes",
+        requested.display(),
+        loaded.display()
+    )
 }
 
 // ===========================================================================
@@ -1318,6 +1372,13 @@ mod host_tests {
 
     #[test]
     fn test_load_reports_a_missing_library() {
+        // The loader consults the process-wide registry (one host library per
+        // process), so even an attempt on a path that does not exist must not
+        // race another test's live library — it takes the same serialization
+        // every host-library test does.
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let err = HostDevice::load("/nonexistent/libklipper_host.so").unwrap_err();
         match err {
             InterfaceError::Other(message) => {
@@ -1362,6 +1423,60 @@ mod host_tests {
         // the live library, not about the path.
         drop(named);
         HostDevice::load(library_path()).expect("the library is not loaded any more");
+    }
+
+    /// One host library per process: a second, **different** `host_library:`
+    /// path cannot be loaded while another library is live, because klipper
+    /// stops its main loop through a process-wide `SIGUSR1` handler that each
+    /// library installs over the last one — two in one process meet a crash or a
+    /// join that never returns, depending on which is unloaded first.
+    ///
+    /// The guard is **by path**: several references on the one live path (the
+    /// mux shape) load as before, and once the first library has been unloaded
+    /// another path loads as its own fresh image would.
+    #[test]
+    fn test_a_second_host_library_path_is_refused_while_one_is_live() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // Several references on the one path are one library, not two.
+        let first = HostDevice::load_bytes(library_path(), None).expect("the first library loads");
+        let same =
+            HostDevice::load_bytes(library_path(), None).expect("the same path is one library");
+
+        // A **different** path while that one is live is refused, naming both.
+        let err = HostDevice::load_bytes(mux_library_path(), None)
+            .expect_err("a second host library path is not allowed in one process");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(
+                    message.contains("one host library per process"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&library_path().display().to_string()),
+                    "{message}"
+                );
+                assert!(
+                    message.contains(&mux_library_path().display().to_string()),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        // Unloading the live library frees the process for another path: the
+        // guard is about still-live libraries, not about a path being used at
+        // all.
+        drop(same);
+        drop(first);
+        wait_for_unload_blocking(&library_path());
+
+        let mux =
+            HostDevice::load_bytes(mux_library_path(), None).expect("a later path loads again");
+        drop(mux);
+        wait_for_unload_blocking(&mux_library_path());
     }
 
     /// A muxed attach to a library that does not run the mux firmware sends the

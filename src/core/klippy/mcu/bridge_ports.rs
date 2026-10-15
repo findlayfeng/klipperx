@@ -381,7 +381,7 @@ fn wire_bridge_port(
         .add_config_cmd(&ConfigUart {
             oid: uart_oid,
             baud,
-            path: index,
+            slot: index,
         })
         .map_err(on)?;
     builder

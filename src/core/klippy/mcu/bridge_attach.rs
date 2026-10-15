@@ -742,6 +742,57 @@ mod tests {
         }
     }
 
+    /// Tears a host-library bring-up down when it drops, so a test that panics
+    /// before its own cleanup leaves neither the machine (and so the library)
+    /// alive for the next test on the path nor the bridge's tty symlink behind.
+    ///
+    /// `teardown` drops the parts the config loaded and the event handlers they
+    /// registered; without it the `SAVE_CONFIG` handler's strong `Arc<Printer>`
+    /// keeps the machine — and so the bridge's open library — alive, and the
+    /// next test on this path meets a live firmware rather than a fresh one.
+    ///
+    /// The guard **owns** the printer and is declared **before** the test's own
+    /// handle to it, so it drops after that handle has gone: the unload below
+    /// needs the guard's release to be the last reference. A test therefore
+    /// takes its handle with [`BridgeTeardown::printer`].
+    struct BridgeTeardown {
+        printer: Option<Arc<Printer>>,
+        library: std::path::PathBuf,
+        bridge_path: std::path::PathBuf,
+    }
+
+    impl BridgeTeardown {
+        fn new(
+            printer: Arc<Printer>,
+            library: std::path::PathBuf,
+            bridge_path: std::path::PathBuf,
+        ) -> Self {
+            Self {
+                printer: Some(printer),
+                library,
+                bridge_path,
+            }
+        }
+
+        /// The test's own handle to the printer the guard owns.
+        fn printer(&self) -> Arc<Printer> {
+            Arc::clone(self.printer.as_ref().expect("the guard holds the printer"))
+        }
+    }
+
+    impl Drop for BridgeTeardown {
+        fn drop(&mut self) {
+            if let Some(printer) = self.printer.take() {
+                printer.teardown();
+                // Release the guard's reference, the last one: the library
+                // unloads with it, which the wait below confirms.
+                drop(printer);
+            }
+            wait_for_mux_library_unload(&self.library);
+            let _ = std::fs::remove_file(&self.bridge_path);
+        }
+    }
+
     /// The child's bare `identify` request in `bytes`, if it is there: the
     /// whole frame with the mux header stripped and its payload led by the
     /// host-defined `identify` message id (`0x01`, `identify.rs`) — the traffic
@@ -884,7 +935,12 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(reactor));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(reactor)),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
         // Bounded: the child's identify never answers, so the bring-up is
@@ -907,15 +963,6 @@ mod tests {
             !frame.payload().is_empty(),
             "the identify request carries a payload"
         );
-
-        // `teardown` drops the parts the config loaded and the event handlers
-        // they registered; without it the `SAVE_CONFIG` handler's strong
-        // `Arc<Printer>` keeps the machine (and so the bridge's open library)
-        // alive, and the next test on this path meets a live firmware.
-        printer.teardown();
-        drop(printer);
-        wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 
     /// A port whose tty is not there fails the **configuration**, naming the MCU
@@ -946,7 +993,12 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(reactor));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(reactor)),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
         // Bounded: the firmware fails the configuration on the first run, and a
@@ -965,10 +1017,6 @@ mod tests {
             "the failure carries the firmware's reason: {}",
             state.message
         );
-
-        printer.teardown();
-        drop(printer);
-        wait_for_mux_library_unload(&library);
     }
 
     // -----------------------------------------------------------------------
@@ -1122,7 +1170,12 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(reactor));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(reactor)),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
         // Bounded: the child's handshake times out (nothing answers the pty),
@@ -1152,12 +1205,6 @@ mod tests {
             "the routed assignment request must follow the naming unit — and it only reaches the \
              port because SET_PORT_NODEID built the route first; it got {bytes:02x?}"
         );
-
-        // Same teardown contract as the legacy test: leave the path unloaded.
-        printer.teardown();
-        drop(printer);
-        wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 
     // -----------------------------------------------------------------------
@@ -1204,7 +1251,12 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(reactor));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(reactor)),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
         // Bounded: the child's identify never answers, so the bring-up is
@@ -1224,11 +1276,6 @@ mod tests {
             "the tty the library was built with must not be opened at all once the port names \
              its own"
         );
-
-        printer.teardown();
-        drop(printer);
-        wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 
     /// A port whose `uart_path:` is not there fails the **configuration**, and
@@ -1269,7 +1316,12 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let printer = Arc::new(Printer::new(reactor));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(reactor)),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
         // Bounded: the firmware fails the configuration on the first run, and a
@@ -1296,10 +1348,5 @@ mod tests {
             "the library names the tty it could not open ({missing}), which is the host's path \
              and not the build's: {stderr}"
         );
-
-        printer.teardown();
-        drop(printer);
-        wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 }

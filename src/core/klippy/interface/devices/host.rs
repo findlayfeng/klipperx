@@ -167,15 +167,17 @@ pub struct HostMux {
     pub named: [u8; 6],
 }
 
-/// The live library for `path` in `mode` with `identity`, loading it (and
-/// starting its threads) if the registry holds no live one.
+/// The live library for `path` in `mode` with `identity` and the bridge port
+/// table `host_port_paths`, loading it (and starting its threads) if the
+/// registry holds no live one.
 ///
 /// # Errors
 /// Returns [`InterfaceError`] when opening fails, and when a live library on
-/// `path` disagrees with `mode` or `identity`: both are fixed when the library
-/// is opened (the mode picks its reader, the identity is set before klipper
-/// comes up), so reusing it under other ones would silently answer as the
-/// wrong thing.
+/// `path` disagrees with `mode`, `identity` or `host_port_paths`: all three are
+/// fixed when the library is opened (the mode picks its reader, the identity is
+/// set, and the ports are named, all before klipper comes up), so reusing it
+/// under other ones would silently answer as the wrong thing — another port
+/// table would leave the ports on the path the library was built with.
 fn library_for(
     path: &Path,
     mode: OutputMode,
@@ -194,7 +196,36 @@ fn library_for(
             library.router.library_path.display()
         )));
     }
+    // A port's tty is fixed when the library is opened too, so a reference that
+    // names its own ports can only be served by the load that opens it. A
+    // reference that names none — a device behind a bridge port — is served by
+    // any live library, which is why only a non-empty table is checked.
+    if !host_port_paths.is_empty() && library.port_paths.as_slice() != host_port_paths {
+        return Err(InterfaceError::Other(format!(
+            "klipper host library {} is already loaded with a different set of bridge port \
+             ttys (loaded: {}; asked: {}), so the asked ttys cannot be named: a port's tty is \
+             fixed when the library is opened, because klipper_host_port() must be called \
+             before klipper_host_init()",
+            library.router.library_path.display(),
+            describe_port_paths(&library.port_paths),
+            describe_port_paths(host_port_paths),
+        )));
+    }
     Ok(library)
+}
+
+/// A bridge port table as one line for an error: `0=/dev/ttyUSB0,
+/// 1=/dev/ttyUSB1`, or `none` for the empty table (a library opened with no
+/// ports named).
+fn describe_port_paths(paths: &[(u8, String)]) -> String {
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+    paths
+        .iter()
+        .map(|(slot, tty)| format!("{slot}={tty}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Refuse to load `path` while a **different** host library is live in this
@@ -261,6 +292,13 @@ type SetUuidFn = unsafe extern "C" fn(*const c_uchar) -> c_int;
 /// `klipper_host_port(int slot, const char *path)` — the tty bridge port `slot`
 /// opens, which the host names before klipper comes up.
 type SetPortFn = unsafe extern "C" fn(c_int, *const c_char) -> c_int;
+/// How many bridge port ttys the library takes, `slot` being
+/// `0..HOST_PORT_SLOTS` — `KLIPPER_HOST_PORT_SLOTS` in
+/// `third_party/klipper/src/host/klipper_host.h`, the count the bridge's
+/// `BRIDGE_MAX_PORTS` must not exceed (`third_party/klipper/src/bridge.c`).
+/// Named in the error a refused `klipper_host_port` gets, so the slot it was
+/// given need not be guessed at.
+const HOST_PORT_SLOTS: i32 = 4;
 /// One read from the library: bytes into `buf`, up to `buf_size`, waiting up to
 /// `timeout_ms`. Both the byte-stream and the frame API have this shape.
 type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
@@ -359,6 +397,15 @@ struct HostLibrary {
     /// when none was ([`HostLibrary::open`]). Printed by the firmware and
     /// answered to the mux, so a request for another one is refused.
     identity: [u8; 6],
+    /// The bridge port ttys this library was opened with, as `(slot, tty)` in
+    /// the order they were named, empty when it was opened with none
+    /// ([`HostLibrary::open`]).
+    ///
+    /// Ports are fixed at `klipper_host_init`, so a later reference that names
+    /// its own table cannot be served ([`library_for`]); keeping the table is
+    /// what tells such a reference apart from one that names none — a device
+    /// behind a bridge port — which the same library serves.
+    port_paths: Vec<(u8, String)>,
     /// The one output channel a **bare** path's references share: bytes (or
     /// whole frames) from Klipper, in arrival order, the reader the only
     /// producer and every bare reference holding a clone of the receiver. A
@@ -504,8 +551,10 @@ impl HostLibrary {
                 let result = unsafe { set_port(c_int::from(*slot), tty.as_ptr()) };
                 if result != 0 {
                     return Err(InterfaceError::Other(format!(
-                        "klipper_host_port({slot}, {}) returned {result}",
-                        tty.to_string_lossy()
+                        "klipper_host_port({slot}, {}) returned {result}: the slot is outside \
+                         the range this build takes (0..={}), or the path does not fit",
+                        tty.to_string_lossy(),
+                        HOST_PORT_SLOTS - 1
                     )));
                 }
             }
@@ -570,6 +619,7 @@ impl HostLibrary {
             }),
             read_output,
             identity,
+            port_paths: host_port_paths.to_vec(),
             output,
             stopped,
             threads: Mutex::new(vec![runtime]),
@@ -1544,6 +1594,72 @@ mod host_tests {
             HostDevice::load_bytes(mux_library_path(), None).expect("a later path loads again");
         drop(mux);
         wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// A live library is opened once, with one bridge port table: a later
+    /// reference that names its own ttys cannot replace it, so it is refused by
+    /// name instead of silently keeping the table the first load named — or,
+    /// when that load named none, the path the library was built with.
+    ///
+    /// This is the reference-order trap of a muxed `host_library:` path: a
+    /// device behind a bridge port names no ports of its own, so it may open the
+    /// library before the bridge does; the bridge's ports would then be quietly
+    /// ignored, which is exactly the fallback to `CONFIG_HOST_BRIDGE_SERIAL_PATH`
+    /// a run-time port path exists to remove.
+    #[tokio::test]
+    async fn test_a_live_library_refuses_a_different_bridge_port_table() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mux = HostMux {
+            identity,
+            named: identity,
+        };
+        let table = vec![(0u8, "/dev/klipperx-port-0".to_string())];
+
+        // The load that opens the library names the ports, fixing the table.
+        let first = HostDevice::load_mux(mux_library_path(), mux, 1, &table)
+            .expect("the mux library opens with the port table");
+
+        // The same table, and no table at all, reuse the live library: a
+        // reference that names none is a device behind a bridge port, which
+        // names nothing and is served either way.
+        let same = HostDevice::load_mux(mux_library_path(), mux, 2, &table)
+            .expect("the same port table reuses the library");
+        let downstream = HostDevice::load_mux(mux_library_path(), mux, 3, &[])
+            .expect("a reference that names no ports reuses the library");
+
+        // Another table is what the live library cannot serve: the ttys are
+        // fixed when it was opened, so the reference is refused by name rather
+        // than silently met by the table the first load named.
+        let err = HostDevice::load_mux(
+            mux_library_path(),
+            mux,
+            4,
+            &[(0u8, "/dev/klipperx-port-other".to_string())],
+        )
+        .expect_err("a live library cannot take another reference's port table");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(
+                    message.contains("already loaded with a different set of bridge port ttys"),
+                    "{message}"
+                );
+                assert!(
+                    message
+                        .contains("klipper_host_port() must be called before klipper_host_init()"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        drop(downstream);
+        drop(same);
+        drop(first);
+        wait_for_unload(&mux_library_path()).await;
     }
 
     /// A muxed attach to a library that does not run the mux firmware sends the

@@ -1288,7 +1288,10 @@ pub fn attach(
         None => handle.run_handshake(None, timeout),
     };
     if let Err(e) = handshake {
-        port.slots.lock().unwrap().remove(&mcu_id);
+        // The slot this attach opened goes down through the same guarded
+        // unregister the teardown paths use; the `ptr_eq` check only removes
+        // the slot this handle registered.
+        handle.unregister();
         return Err(e);
     }
     Ok(handle)
@@ -1788,6 +1791,34 @@ impl SharedSerialHandle {
         }
         Err(InterfaceError::Timeout)
     }
+
+    /// Take this handle's slot out of the port's map — only when the entry
+    /// there is still the slot **this** handle registered.
+    ///
+    /// The one place a slot is unregistered: [`Drop`] (whichever thread drops
+    /// the handle's last reference), [`Device::shutdown`] (the thread stopping
+    /// this handle) and [`attach`]'s failure path (the attaching thread) all
+    /// come here, each before the handle's last reference goes. The `ptr_eq`
+    /// check keeps a handle from taking down a slot a later attach on the same
+    /// id registered: two attaches on one id are not supported, but the
+    /// failure path runs after a handshake another thread can race past, so the
+    /// guard has to be the same everywhere.
+    ///
+    /// Once the entry is gone, `push_frame` finds no slot for this id and drops
+    /// its frames — the "a failed `Sender` drops the frame" behaviour of the
+    /// host side, and what keeps a shut-down handle's stream from growing
+    /// unbounded (`FrameStream` is an unbounded `Vec`).
+    fn unregister(&self) {
+        let Ok(mut slots) = self.port.slots.lock() else {
+            return; // a poisoned map is not repaired from a teardown
+        };
+        if slots
+            .get(&self.mcu_id)
+            .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+        {
+            slots.remove(&self.mcu_id);
+        }
+    }
 }
 
 impl Drop for SharedSerialHandle {
@@ -1797,21 +1828,14 @@ impl Drop for SharedSerialHandle {
     /// in the map after its handle is gone only accumulates bytes nobody will
     /// read (`push_frame` cannot tell an abandoned slot from a live one), for as
     /// long as any **other** handle keeps the port up. This runs on whichever
-    /// thread drops the handle's last reference, under the map lock, so it
-    /// cannot race `attach`'s insert: the `ptr_eq` check only takes down the
-    /// slot **this** handle registered, never one a later attach on the same id
-    /// registered since. `attach`'s failure path already removed its own slot —
-    /// this then finds no entry to take down and leaves the port as it found it.
+    /// thread drops the handle's last reference; [`SharedSerialHandle::unregister`]
+    /// holds the map lock and the `ptr_eq` guard, so it cannot race `attach`'s
+    /// insert nor take down a slot a later attach registered. `shutdown` and
+    /// `attach`'s failure path have already unregistered by the time this runs
+    /// — the unregister then finds no entry to take down and leaves the port as
+    /// it found it.
     fn drop(&mut self) {
-        let Ok(mut slots) = self.port.slots.lock() else {
-            return; // a poisoned map is not repaired from a drop
-        };
-        if slots
-            .get(&self.mcu_id)
-            .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
-        {
-            slots.remove(&self.mcu_id);
-        }
+        self.unregister();
     }
 }
 
@@ -1855,6 +1879,12 @@ impl Device for SharedSerialHandle {
     fn shutdown(&self) {
         // Only this handle: the port stays up for every other MCU on it.
         self.stopped.store(true, Ordering::SeqCst);
+        // A stopped handle never reads its slot again (`receive` returns `None`),
+        // so the slot goes with it: otherwise `push_frame` would keep pushing
+        // this id's frames into a stream nobody drains, for as long as the port
+        // lives (`FrameStream` is an unbounded `Vec`). Frames for this id are
+        // dropped from here on, like a failed `Sender` on the host side.
+        self.unregister();
         let _guard = self.slot.incoming.lock().unwrap();
         self.slot.cv.notify_all();
     }
@@ -2492,6 +2522,73 @@ mod mux_tests {
         );
     }
 
+    /// `shutdown` unregisters the slot, not just the handle's stopped flag.
+    ///
+    /// A stopped handle never reads its slot again (`receive` returns `None`),
+    /// so a slot left in the map only gives `push_frame` a place to pile up
+    /// bytes nobody drains — for as long as the port lives. The slot must go
+    /// with the shutdown, the port's other ids must be untouched, and the
+    /// shut-down id's units must then be dispatched nowhere. The `Drop` path is
+    /// the other caller of the same unregister; this pins the `shutdown` one.
+    #[test]
+    fn a_shutdown_handle_unregisters_its_slot_and_stops_being_fed() {
+        let pty = Pty::new();
+        let handle4 = attach_with_reply(&pty, 4);
+        let handle5 = attach_with_reply(&pty, 5);
+        // Keeps the port up through the asserts, so its registry entry is a
+        // live `Weak` and there is a slot map left to look at.
+        let port = Arc::clone(&handle5.port);
+
+        handle4.shutdown();
+        assert_eq!(
+            handle4.receive(),
+            None,
+            "a shut-down handle delivers nothing"
+        );
+        {
+            let slots = port.slots.lock().unwrap();
+            assert!(
+                slots.get(&4).is_none(),
+                "shutdown must unregister the handle's slot"
+            );
+            assert!(slots.contains_key(&5), "another MCU's slot is untouched");
+        }
+
+        // The unit for the shut-down id sits in front of id 5's frame, so the
+        // reader has already read it by the time the marker arrives: its bytes
+        // are consumed and dropped, not queued in the orphaned slot.
+        let mut wire = device_unit(4, &Frame::encode(4, b"stale"));
+        wire.extend_from_slice(&device_unit(5, &Frame::encode(7, b"alive")));
+        master_write(&pty.master, &wire);
+        assert!(
+            wait_for_frame(
+                &handle5.slot,
+                &Frame::new(7, b"alive".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the still-registered id must keep receiving"
+        );
+        assert!(
+            handle4.slot.incoming.lock().unwrap().next_frame().is_none(),
+            "a shut-down handle's slot must not be fed"
+        );
+        assert!(
+            port.slots.lock().unwrap().get(&4).is_none(),
+            "the shut-down id must stay unregistered after the write"
+        );
+
+        // The port is untouched: still open, still registered, still serving id 5.
+        assert!(
+            port_registry()
+                .lock()
+                .unwrap()
+                .get(&pty.path)
+                .and_then(Weak::upgrade)
+                .is_some(),
+            "shutdown must not take the port down"
+        );
+    }
+
     /// Drop `pty`'s last two handles while the reader is inside `dispatch`
     /// holding the strong port reference it upgraded, and report the reader
     /// thread's id (in the `{:?}` form a panic hook reports it, which is what
@@ -2563,7 +2660,9 @@ mod mux_tests {
     /// taken it, so a panic on it fails nothing and is invisible in the test
     /// result — a hook is the only way to assert on one. Every panic still goes
     /// to the hook that was in place, so panics from other tests (`#[should_panic]`
-    /// ones run in the same process) behave exactly as they did.
+    /// ones run in the same process) behave exactly as they did. The hook is
+    /// restored even when `body` panics: the panic is caught only long enough to
+    /// put the hook back, then resumed.
     fn record_panics_during<T>(body: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
         /// Every panic seen while the hook below is installed.
         static PANICS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
@@ -2580,10 +2679,16 @@ mod mux_tests {
                 ));
             forward(info);
         }));
-        let value = body();
+        // `catch_unwind` so the hook is restored even when `body` panics;
+        // otherwise it would stay installed past this test and forward later
+        // panics through `previous` here.
+        let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         std::panic::set_hook(Box::new(move |info| previous(info)));
         let seen = std::mem::take(&mut *PANICS.lock().unwrap());
-        (value, seen)
+        match value {
+            Ok(value) => (value, seen),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     /// The reader can be the thread that drops the port.

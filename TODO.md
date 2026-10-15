@@ -112,7 +112,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位 → P6 多站串口（RS-485，后置）） | — |
 | M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——**并入 M1 一起做**：固件命令族落 **P2**（与 `SET_PORT_NODEID` 同机制）、主机侧 `restart_method` 接入落 **P3** | M1 |
-| M3 | **CAN-FD 链路层（主线）与 CAN ISO-TP（验证用）**：主线是 **`cans + CAN-FD`**——主机侧 `canserial.rs` 的 72 B `canfd_frame` + 固件 `struct canbus_msg` 8→64 + 三份 `fdcan.c`（FDF/BRS/ESI/DLC 编码/DBTP）+ `linux` 目标 SocketCAN（vcan 端到端）+ 真机。ISO-TP **降级为「验证可用」**（只做主机侧纯状态机与内核 `can-isotp` 互操作矩阵，**不做固件从站**）。规划、规格与逐处落点见 [work-log](docs/work-log/2026-10-16-can-isotp-notes.md) | — |
+| M3 | **CAN-FD 链路层（给 FD 设备）与 CAN ISO-TP（给标准 CAN 设备）**：按设备类型选路、两模式不叠加——**FD 设备用 `cans + CAN-FD`**（64 B 帧直接装下 64 B 的 Klipper 消息，保持当前帧模式）；**标准 CAN 设备用 `isotp + classical`**（用 ISO-TP 承载大于 8 B 帧的 Klipper 帧）；`cans + classical` 为今天默认零变；`isotp + FD` 保留可能性但不实现不验证。主机侧 72 B `canfd_frame` + ISO-TP 纯状态机，固件侧 `struct canbus_msg` 8→64 + 三份 `fdcan.c` + ISO-TP 从站，再走 `linux` 目标 SocketCAN（vcan）与真机。规划、规格与逐处落点见 [work-log](docs/work-log/2026-10-16-can-isotp-notes.md) | — |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、

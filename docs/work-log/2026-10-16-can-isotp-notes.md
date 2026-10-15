@@ -3,16 +3,30 @@
 写作当天：2026-10-16。**规格未知已侦察完毕**，本文是设计定稿 + 阶段拆分 + 文件级落点。
 末尾「实施记录」是唯一随实现推进更新的回填节。
 
-> ## ⚑ 主线修订（2026-10-16，用户追加指示）
+> ## ⚑ 架构定稿（2026-10-16，用户两条指示合并）
 >
-> **`cans + CAN-FD` 是主线交付物**；ISO-TP **降级为「验证可用即可」**，且 **不做 ISO-TP+FD 组合**。
+> **按设备类型选路，两种模式互不叠加**（不搞 `isotp + FD`）：
 >
-> - 因此 §7.4 的排期已作废，改用 §9 的顺序：**FD 链路层先上，ISO-TP 后置且不出固件从站**。
-> - ISO-TP 的定位从此是**验证工具/互操作对端**（内核 `can-isotp` + can-utils 是严格参照实现），
->   不是第二条产品传输。
-> - §4 的帧数对照在 FD 下一律变成「1 帧/消息」（`cans + FD` 与 `isotp + FD` 都一样），
->   所以 ISO-TP 在 FD 上并无性能优势——这正是主线定为 `cans + FD` 的理由。
-> - §8 记录侦察到的 FD 落地细节与**六个未验证项**（其中「FD 收发器在哪块板」仓库内无依据，需你给型号）。
+> | 设备 | 链路层 | 传输层 | 状态 |
+> |---|---|---|---|
+> | **支持 FD 的设备** | CAN-FD（64 B/帧） | **`cans`（can-serial，保持当前帧模式）** | 落地（不走 ISO-TP；但**保留可能性**） |
+> | **标准 CAN 设备** | classical（8 B/帧） | **`isotp`** | 落地 |
+> | 今天 | classical | `cans` | 默认，零变 |
+> | `isotp + FD` | CAN-FD | ISO-TP | **保留可能性，不做/不验证** |
+>
+> 理由（用户口径）：Klipper 消息块可达 64 B，**大于一张 CAN 帧**。FD 用 64 B 帧就直接装下了，
+> 不需要额外协议（保持现状最简）；标准 CAN 只有 8 B，需要 ISO-TP 来承载大于一帧的 Klipper 帧。
+>
+> **事实核对（写进手册前要弄清）**：canser 的**字节流本已能承载 >帧 的消息**（`canserial.c:79` 按 8
+> 字节切片、接收侧拼接）。所以 ISO-TP 在 classical 上的实质增益是
+> **消息边界 + 逐消息错误隔离 + 与标准工具/设备的互操作**，而不是「能不能装下大消息」。
+> 如果背后还有一台具体的标准 CAN 第三方设备要对接，请告知型号/协议，会影响阶段 5 的验收基线。
+>
+> 因此：
+> - §7.4 的排期作废，用 §9。
+> - §9 的「ISO-TP 降级」**推翻**：ISO-TP 回到主线（**限 classical**），**固件 ISO-TP 从站要做**。
+> - §4 的帧数对照就是 ISO-TP 在 classical 上的真实代价（`queue_step` 档 2×）；FD 在 `cans` 下
+>   一律 1 帧/消息。
 
 ---
 
@@ -408,17 +422,36 @@ ISO-TP over CAN-FD（`CAN_ISOTP_LL_OPTS` 的 `mtu = CANFD_MTU`、`tx_dl = 64`）
 
 ---
 
-## 9. 修订后的主线与阶段（取代 §6 与 §7.4）
+## 9. 阶段与支持矩阵（取代 §6 与 §7.4）
 
-| 阶段 | 内容 | 验收 |
+### 9.1 支持矩阵（配置的两个正交键，但只验证三个组合）
+
+```ini
+canbus_protocol: cans | isotp     # 传输层；默认 cans
+canbus_fd: true | false           # 链路层；默认 false
+```
+
+| 组合 | 用途 | 验收 |
 |---|---|---|
-| 0 | 分支 + 本文档 + `TODO.md` 条目 | ✅ `33afc7a` |
-| **1（主线）** | **主机侧 `canserial.rs` FD 化**：`CAN_RAW_FD_FRAMES`、72 B `canfd_frame`、`CAN_DATA_BYTES`/切帧上限可配、配置键 `canbus_fd`、重写 §8.5 列的失效测试 | 无硬件下按 72 B 重排的 socketpair 假总线双向通；`cargo test --workspace` 全绿 |
-| **2（主线）** | **固件侧 FD 链路层**（独立分支）：`struct canbus_msg` 8→64 + `CANMSG_DATA_LEN` + `canserial.c:79` 切片 + 三份 `fdcan.c`（FDF/BRS/ESI/DLC 编码/RX 解码/`DBTP`）+ Kconfig `CANBUS_FD`/`CANBUS_DATA_FREQUENCY` | 构建级覆盖目标让闸门真的编 FD 路径；`upstream-deviations.md` 登记 |
-| 2.5 | `linux` 目标加 SocketCAN（**现在带 FD**）| `vcan0` 上真 `klipper.elf` 以 `cans + FD` 当从站完成 identify——这是主线的软件端到端 |
-| 3 | vcan + 真机（`cans + FD`）；`candump` 看帧、内核 `can-isotp` 当**严格校验对端**验证 FD 帧格式（FDF/BRS/DLC 编码 9..15） | 每消息帧数实测（预期 1 帧/消息）；抖动/积压与旧 classical 对比 |
-| 4 | 文档收口 | 按 `doc-sync` 逐条 |
-| **ISO-TP（降级，不阻塞主线）** | 主机侧纯状态机（已派）+ 内核 `can-isotp` 互操作矩阵。**不做固件 ISO-TP 从站、不做 isotp+FD 组合、不做配置键接线**（除非主线跑通后你改主意） | 状态机单测全绿；与内核对打矩阵全绿 |
+| `cans` + classical | 今天的行为（默认） | 现有测试，零回归 |
+| **`isotp` + classical** | 标准 CAN 设备 | 主机 ISO-TP 状态机单测 + 固件从站 + vcan/真机端到端 |
+| **`cans` + FD** | 支持 FD 的设备 | 主机 72 B `canfd_frame` 单测 + 固件 FD 链路 + vcan/真机端到端 |
+| `isotp` + FD | **保留可能性，不实现不验证** | 配置允许（因为两轴正交），但文档不承诺；需在手册里写成「未验证」 |
+
+### 9.2 阶段
+
+| 阶段 | 内容 | 验收 | 依赖 |
+|---|---|---|---|
+| 0 | 分支 + 本文档 + `TODO.md` 条目 | ✅ `33afc7a` / `19b885d` | — |
+| **1a** | **主机侧 CAN-FD 链路**（`canserial.rs`：72 B `canfd_frame`、`CAN_RAW_FD_FRAMES`、按 wire 切帧） | 无硬件 socketpair 按 72 B 双向 + 重写失效测试 | 已在跑 |
+| **1b** | **主机侧 ISO-TP 纯状态机**（`isotp_proto.rs`） | 纯单测（SF/FF/CF/FC/SN/超时/转义式） | 已在跑 |
+| **2a** | **固件 FD 链路层**（`canbus_msg` 8→64 + 三份 `fdcan.c` + `CANBUS_FD`/`CANBUS_DATA_FREQUENCY`） | 构建级覆盖（H743 fragment） | 已在跑 |
+| **2b** | **固件 ISO-TP 从站**（can-serial 的 CAN 承载层可切换：`generic/isotp.c` + `canbus.c:29` 分派 + `canserial.c` 两处承载点） | 构建级覆盖；admin/`uuid`/`MUX_CAN` 保持可用 | **等 2a 落**（同改 `canserial.c`/`Kconfig`，不能并行） |
+| **3a** | 配置面：`canbus_protocol` + `canbus_fd` 两个键 + `config::Transport` 变体 + `Interface` 接线 | 配置解析/互斥/非法组合测试 | 等 1a + 1b |
+| **3b** | 固件侧接线与非法组合拒绝（如 `isotp` 在不能 ISO-TP 的硬件上） | 编译覆盖 | 等 2a + 2b |
+| 4 | `linux` 目标加 SocketCAN（两种模式都要能跑） | `vcan0` 上真 `klipper.elf` 当从站，两条模式各自 identify | 需先侦察控制台选择机制 |
+| 5 | vcan + 真机 | FD 板跑 `cans+FD`；标准 CAN 板跑 `isotp+classical`；记录帧数/抖动 | — |
+| 6 | 文档收口 | 按 `doc-sync` 逐条 | — |
 
 ### 新增/变更风险
 

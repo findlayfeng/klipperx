@@ -206,9 +206,10 @@ impl Interface {
     /// The port-level command
     /// ([`set_port_node_id`](devices::serial::set_port_node_id)) travels the
     /// bridge's **admin** channel, so only a link that has one can carry it: a
-    /// shared serial port or a muxed host library. Every other transport has no
-    /// bridge to tell, and the message says so rather than writing the unit on a
-    /// link nobody listens to.
+    /// shared serial port, a muxed host library, or a CAN link (the node behind
+    /// it is the bridge, and the channel is the mux unit inside the byte stream).
+    /// Every other transport has no bridge to tell, and the message says so
+    /// rather than writing the unit on a link nobody listens to.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -221,6 +222,7 @@ impl Interface {
     ) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_set_port_node_id(index, mcu_id, flags),
+            Transport::CanSerial(device) => device.send_set_port_node_id(index, mcu_id, flags),
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
@@ -246,7 +248,8 @@ impl Interface {
     ///
     /// The reset a **named** bridge-port device gets: it answers the bridge's mux
     /// itself, so it has an admin channel to receive this. Like `SET_PORT_NODEID`
-    /// the command travels that channel, so only a bridge link carries it.
+    /// the command travels that channel, so only a bridge link carries it (a
+    /// shared serial port, a muxed host library, or a CAN link).
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -254,6 +257,7 @@ impl Interface {
     pub(crate) fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_reset_device(index),
+            Transport::CanSerial(device) => device.send_reset_device(index),
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
@@ -279,7 +283,8 @@ impl Interface {
     /// The reset a **legacy** bridge-port device gets: it has no admin channel of
     /// its own, so its bridge's port is the only thing that can reset it. Like
     /// `SET_PORT_NODEID` the command travels the bridge's admin channel, so only
-    /// a bridge link carries it.
+    /// a bridge link carries it (a shared serial port, a muxed host library, or a
+    /// CAN link).
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -287,6 +292,7 @@ impl Interface {
     pub(crate) fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_reset_port(index),
+            Transport::CanSerial(device) => device.send_reset_port(index),
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
@@ -580,7 +586,11 @@ mod trace_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::devices::canserial::read_wire;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::devices::serial::{
+        admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT, MUX_PORT_UNITS,
+    };
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
@@ -803,9 +813,44 @@ mod tests {
         outer.shutdown_timeout(std::time::Duration::from_millis(50));
     }
 
+    /// A CAN link **is** a bridge link: the node behind it is the bridge, and the
+    /// port-level commands go out as the serial side's units cut into CAN frames —
+    /// the same `0x02`/`0x03`/`0x04` units, not a CAN frame shape of their own.
+    /// Measured off the wire the device writes.
+    #[tokio::test]
+    async fn test_a_can_link_carries_the_bridge_commands() {
+        let (device, mut wire) = CanSerialDevice::test_wire(3);
+        let interface = Interface::with_transport(Transport::CanSerial(Arc::new(device)));
+
+        interface
+            .send_set_port_node_id(1, 2, MUX_PORT_UNITS)
+            .unwrap();
+        interface.send_reset_device(1).unwrap();
+        interface.send_reset_port(1).unwrap();
+
+        let sent: Vec<u8> = read_wire(&mut wire)
+            .iter()
+            .flat_map(|frame| frame.data().to_vec())
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                set_port_node_id(1, 2, MUX_PORT_UNITS),
+                admin_unit(&[CMD_RESET_DEVICE, 1]),
+                admin_unit(&[CMD_RESET_PORT, 1]),
+            ]
+            .concat(),
+            "the three units, byte for byte on the CAN byte stream"
+        );
+    }
+
     /// The three bridge commands travel a bridge's admin channel; an interface
     /// with no such link says so (`_` arm of each `send_*`) instead of writing a
     /// unit nobody listens to — the message is asserted verbatim.
+    ///
+    /// A CAN link is one of the links that do carry them (its node is the bridge,
+    /// see [`test_a_can_link_carries_the_bridge_commands`]), so this pins the
+    /// wording for the transports with no bridge at all.
     #[tokio::test]
     async fn test_bridge_commands_need_a_bridge_link() {
         let interface = Interface::new(FrameMock::new(vec![]));

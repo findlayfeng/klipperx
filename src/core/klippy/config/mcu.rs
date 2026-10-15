@@ -15,13 +15,14 @@ use tracing::warn;
 /// Resolved at config time into [`McuConfig::bridge_restart`]. A bridge-port
 /// device has no transport of its own — it is spoken to on the bridge's link —
 /// so its reset is a port-level command the bridge receives over its admin
-/// channel (`mcu/restart.rs`, `interface/devices::serial::send_reset_*`).
+/// channel (`mcu/restart.rs`, `interface/devices::serial::send_restart_device`,
+/// `send_reset_port`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BridgeRestart {
-    /// The device resets itself: the host sends `RESET_DEVICE` and the bridge
-    /// forwards it to the port. Only a **named** device (a `uuid:` on the child,
-    /// `restart_method: admin`) has the admin channel this needs.
-    Device,
+    /// The device restarts its own firmware: the host sends `RESTART_DEVICE` and
+    /// the bridge forwards it to the port. Only a **named** device (a `uuid:` on
+    /// the child, `restart_method: admin`) has the admin channel this needs.
+    Firmware,
     /// The bridge pulses the port's lines (`RESET_PORT`): the only reset a
     /// **legacy** (uuid-less) device can get, from the **port section's**
     /// `uart_restart_method` (`mcu/bridge_ports.rs`).
@@ -53,7 +54,7 @@ pub struct McuConfig {
     /// other than `admin` — a named device resets itself only under `admin`, and
     /// has no port-level reset to fall back to. The two bridge-port shapes learn
     /// it differently: a **named** device writes `restart_method: admin` itself
-    /// ([`BridgeRestart::Device`]), while a **legacy** one has no admin channel
+    /// ([`BridgeRestart::Firmware`]), while a **legacy** one has no admin channel
     /// of its own and takes the **port section's** `uart_restart_method`
     /// ([`BridgeRestart::Port`]). The command travels the bridge's link, not a
     /// transport of this device's own.
@@ -507,11 +508,11 @@ impl McuConfig {
     /// Resolve a bridge-port device's reset.
     ///
     /// A **named** device (a `uuid:` on the child) answers the bridge's mux
-    /// itself, so it has an admin channel to be told to reset itself:
-    /// `restart_method: admin` is the one value that means something on such a
-    /// section, and it becomes [`BridgeRestart::Device`]. `admin` on any other
-    /// bridge-port section is a config error — a legacy device has no channel
-    /// to forward to.
+    /// itself, so it has an admin channel to be told to restart its own
+    /// firmware: `restart_method: admin` is the one value that means something on
+    /// such a section, and it becomes [`BridgeRestart::Firmware`]. `admin` on any
+    /// other bridge-port section is a config error — a legacy device has no
+    /// channel to forward to.
     ///
     /// A **legacy** device (no `uuid:`) has no channel of its own, so only its
     /// bridge can reset it, by pulsing the port's lines; that is the **port
@@ -553,7 +554,7 @@ impl McuConfig {
             }
         };
         let restart = if method == McuRestartMethod::Admin {
-            Some(BridgeRestart::Device)
+            Some(BridgeRestart::Firmware)
         } else if !named && kind == PortKind::Uart {
             Self::legacy_port_restart(section, port)
         } else {
@@ -2521,7 +2522,7 @@ mod tests {
 
     /// A named (uuid-bearing) bridge-port device takes `restart_method: admin`:
     /// it answers the bridge's mux itself, so it has the admin channel the
-    /// command needs, and the bridge forwards the reset.
+    /// command needs, and the bridge forwards the restart to its port.
     #[test]
     fn a_named_bridge_port_child_takes_admin() {
         let config = parse_section(
@@ -2531,7 +2532,7 @@ mod tests {
         .expect("a named bridge-port child with admin parses");
 
         assert_eq!(config.restart_method, McuRestartMethod::Admin);
-        assert_eq!(config.bridge_restart, Some(BridgeRestart::Device));
+        assert_eq!(config.bridge_restart, Some(BridgeRestart::Firmware));
     }
 
     /// `admin` on a legacy (uuid-less) child is refused: there is no admin

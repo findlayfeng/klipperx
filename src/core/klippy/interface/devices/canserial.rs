@@ -55,7 +55,7 @@ use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
-    admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT,
+    admin_unit, set_port_node_id, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -596,7 +596,7 @@ impl CanSerialDevice {
     /// - reusing the serial side's unit means no new frame shape on the wire, and
     ///   no collision with the CAN admin broadcast above: that one is a
     ///   single-frame conversation on arbitration id `0x3f0`, a different channel
-    ///   from these bytes, so the `0x02` of a reset here cannot be read as that
+    ///   from these bytes, so the port-level family here cannot be read as that
     ///   channel's `REQUEST_BOOTLOADER`;
     /// - serial ports, CAN links and the host library then carry one and the same
     ///   unit ([`set_port_node_id`] is the builder all three call).
@@ -613,14 +613,14 @@ impl CanSerialDevice {
         self.send_bytes(&set_port_node_id(index, mcu_id, flags))
     }
 
-    /// Ask the device behind bridge port `index` to reset itself:
-    /// [`CMD_RESET_DEVICE`]'s unit, on the byte stream like
+    /// Ask the device behind bridge port `index` to restart its firmware:
+    /// [`CMD_RESTART_DEVICE`]'s unit, on the byte stream like
     /// [`CanSerialDevice::send_set_port_node_id`].
     ///
     /// # Errors
     /// The same as [`Device::send`].
-    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_bytes(&admin_unit(&[CMD_RESET_DEVICE, index]))
+    pub fn send_restart_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_bytes(&admin_unit(&[CMD_RESTART_DEVICE, index]))
     }
 
     /// Ask the bridge to pulse the lines of port `index`: [`CMD_RESET_PORT`]'s
@@ -630,6 +630,16 @@ impl CanSerialDevice {
     /// The same as [`Device::send`].
     pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
         self.send_bytes(&admin_unit(&[CMD_RESET_PORT, index]))
+    }
+
+    /// Ask the device behind bridge port `index` to enter its bootloader:
+    /// [`CMD_REQUEST_BOOTLOADER`]'s unit — the flashing tool's command — on the
+    /// byte stream like [`CanSerialDevice::send_set_port_node_id`].
+    ///
+    /// # Errors
+    /// The same as [`Device::send`].
+    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_bytes(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index]))
     }
 }
 
@@ -1558,7 +1568,7 @@ mod tests {
 
     #[test]
     fn test_the_port_commands_are_the_serial_sides_units_on_the_wire() {
-        // The three port-level commands on a CAN link: what the device puts on
+        // The port-level commands on a CAN link: what the device puts on
         // the bus is `devices::serial`'s unit — the same bytes a shared serial
         // port carries, cut into CAN frames by the link.
         let (device, mut wire) = CanSerialDevice::test_wire(3);
@@ -1568,15 +1578,21 @@ mod tests {
         device.send_set_port_node_id(1, 2, MUX_PORT_UNITS).unwrap();
         assert_unit_on_the_wire(&device, &mut wire, &set_port);
 
-        // RESET_DEVICE (0x02): for the device behind the port.
-        let reset_device = admin_unit(&[CMD_RESET_DEVICE, 1]);
-        device.send_reset_device(1).unwrap();
-        assert_unit_on_the_wire(&device, &mut wire, &reset_device);
+        // RESTART_DEVICE (0x05): for the device behind the port.
+        let restart_device = admin_unit(&[CMD_RESTART_DEVICE, 1]);
+        device.send_restart_device(1).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &restart_device);
 
         // RESET_PORT (0x04): for the bridge's own port.
         let reset_port = admin_unit(&[CMD_RESET_PORT, 1]);
         device.send_reset_port(1).unwrap();
         assert_unit_on_the_wire(&device, &mut wire, &reset_port);
+
+        // REQUEST_BOOTLOADER (0x02): the flashing tool's command, the same
+        // shape aimed at the device rather than at a port of its own.
+        let bootloader = admin_unit(&[CMD_REQUEST_BOOTLOADER, 1]);
+        device.send_request_bootloader(1).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &bootloader);
     }
 
     #[test]

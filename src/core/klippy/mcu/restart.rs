@@ -9,7 +9,7 @@
 //! | method | here | elsewhere |
 //! |---|---|---|
 //! | `command` | nothing before the port opens | `reset` on the **live** connection, from `McuObject::before_firmware_restart`, before the parts come down; `config_reset` from the handshake (`mcu/object.rs`, `mcu/config.rs`) |
-//! | `admin` | nothing on this device's transport: the port-level `RESET_DEVICE` the bridge forwards ([`reset_bridge_firmware`]) | — |
+//! | `admin` | nothing on this device's transport: the port-level `RESTART_DEVICE` the bridge forwards ([`reset_bridge_firmware`]) | — |
 //! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | RTS/DTR sequence at 2400 baud — **untested on hardware**, and reported; the connection itself also needs RTS deasserted (`McuConfig::open`) | — |
 //! | `rpi_usb` | cut and restore the USB port's power — **untested on hardware**, and reported | `interface/usb.rs` |
@@ -112,10 +112,11 @@ pub async fn reset_firmware(
 ///
 /// Such a device has no transport of its own: it is reached on the bridge's link
 /// (`mcu/bridge_attach.rs`), and its reset travels the same way. Which reset is
-/// [`McuConfig::bridge_restart`]'s answer — `Device` lets the device reset
-/// itself (`RESET_DEVICE`, which the bridge forwards to the port), `Port` asks
-/// the bridge to pulse the port's lines (`RESET_PORT`). Both need the port's
-/// `index`, which only the bridge's firmware port table has: [`bridge_attach::resolve`]
+/// [`McuConfig::bridge_restart`]'s answer — `Firmware` has the device restart
+/// its own firmware (`RESTART_DEVICE`, which the bridge forwards to the port),
+/// `Port` asks the bridge to pulse the port's lines (`RESET_PORT`). Both need
+/// the port's `index`, which only the bridge's firmware port table has:
+/// [`bridge_attach::resolve`]
 /// is where that is reconciled, so an old firmware (no port table), or a
 /// section whose oid the bridge does not report, is refused there before
 /// anything is sent.
@@ -151,7 +152,7 @@ pub(crate) fn reset_bridge_firmware(
     })?;
     let interface = open_bridge_link(printer, &link, mcu_id)?;
     let sent = match restart {
-        BridgeRestart::Device => device_reset(&interface, &link, mcu_id),
+        BridgeRestart::Firmware => device_reset(&interface, &link, mcu_id),
         BridgeRestart::Port => interface.send_reset_port(link.index),
     };
     sent.map_err(|err| {
@@ -165,21 +166,21 @@ pub(crate) fn reset_bridge_firmware(
         config.name,
         link.index,
         match restart {
-            BridgeRestart::Device => "RESET_DEVICE",
+            BridgeRestart::Firmware => "RESTART_DEVICE",
             BridgeRestart::Port => "RESET_PORT",
         }
     );
     Ok(())
 }
 
-/// The two commands a **named** child's reset needs, in order.
+/// The two commands a **named** child's restart needs, in order.
 ///
-/// A device reset reaches the device only when the bridge forwards the unit
+/// A restart reaches the device only when the bridge forwards the unit
 /// **whole**, and whether it does depends on the port's flags — bridge-side
 /// state the host cannot assume: a bridge that has not been told where this id
 /// lives still has the port in its default legacy mode and would strip the unit
 /// header off, leaving the device a bare KXID frame its parser rejects, so the
-/// reset would never happen. The route command is idempotent ([`mux.h`]: no
+/// restart would never happen. The route command is idempotent ([`mux.h`]: no
 /// receipt, no copy downstream — the bridge consumes it), so saying it again is
 /// the cheap way to be sure.
 ///
@@ -190,7 +191,7 @@ fn device_reset(
     mcu_id: u32,
 ) -> Result<(), InterfaceError> {
     interface.send_set_port_node_id(link.index, mcu_id as u8, link.flags)?;
-    interface.send_reset_device(link.index)
+    interface.send_restart_device(link.index)
 }
 
 /// Open a temporary downstream handle on `link`'s bridge link, without a route.
@@ -724,11 +725,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::core::klippy::config::Config;
-    use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
+    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT, MUX_PORT_UNITS,
+        admin_unit, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE, MUX_PORT_UNITS,
     };
     use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::mcu::bridge_attach::wait_for_mux_library_unload;
     use crate::core::klippy::mcu::McuObject;
     use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
     use std::io::Read;
@@ -784,27 +786,6 @@ mod tests {
         while Instant::now() < deadline && !read_pty(master, 1, quiet).is_empty() {}
     }
 
-    /// Block (bounded) until the process-wide library on `path` is unloaded, so
-    /// the next test on it meets a fresh firmware.
-    fn wait_for_mux_library_unload(path: &std::path::Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
-                Ok(probe) => {
-                    drop(probe);
-                    return;
-                }
-                Err(_) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the mux host library never unloaded"
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
-    }
-
     /// A pty standing in for the bridge's own link, with a hand-built
     /// [`BridgePortLink`] and no firmware on the other end: the host's bytes are
     /// all this asserts.
@@ -839,16 +820,16 @@ mod tests {
             "the port reset is exactly the admin unit the firmware's mux.h spells"
         );
 
-        // The device reset is the same shape, one command byte apart.
-        let reset = admin_unit(&[CMD_RESET_DEVICE, link.index]);
+        // The device restart is the same shape, one command byte apart.
+        let reset = admin_unit(&[CMD_RESTART_DEVICE, link.index]);
         let interface = open_bridge_link(&printer, &link, 2).expect("the bridge link opens");
         interface
-            .send_reset_device(link.index)
-            .expect("the device reset goes out");
+            .send_restart_device(link.index)
+            .expect("the device restart goes out");
         assert_eq!(
             read_pty(&pty.master, reset.len(), Duration::from_secs(3)),
             reset,
-            "the device reset is exactly the admin unit the firmware's mux.h spells"
+            "the device restart is exactly the admin unit the firmware's mux.h spells"
         );
     }
 
@@ -977,26 +958,26 @@ mod tests {
         };
 
         let interface = open_bridge_link(&printer, &link, 9).expect("the bridge link opens");
-        device_reset(&interface, &link, 9).expect("the device reset goes out");
+        device_reset(&interface, &link, 9).expect("the device restart goes out");
 
         let mut expected = set_port_node_id(link.index, 9, MUX_PORT_UNITS);
-        expected.extend_from_slice(&admin_unit(&[CMD_RESET_DEVICE, link.index]));
+        expected.extend_from_slice(&admin_unit(&[CMD_RESTART_DEVICE, link.index]));
         assert_eq!(
             read_pty(&pty.master, expected.len(), Duration::from_secs(3)),
             expected,
-            "the route is restated, then the device reset"
+            "the route is restated, then the device restart"
         );
     }
 
-    /// A **named** child's reset is forwarded to the device, whole.
+    /// A **named** child's restart is forwarded to the device, whole.
     ///
-    /// The deferred half of the reset family, and the reason the host says the
+    /// The deferred half of the restart family, and the reason the host says the
     /// route again before it: whether the bridge forwards the unit whole or
     /// strips its header depends on the port's flags, which live in the bridge
-    /// and may still be the default legacy ones when the host asks for a reset.
-    /// The port therefore shows both commands, exactly as `mux.h` spells them —
-    /// the route ([`set_port_node_id`], idempotent) and then
-    /// [`CMD_RESET_DEVICE`] — and the bridge's own line pulse is never asked
+    /// and may still be the default legacy ones when the host asks for a
+    /// restart. The port therefore shows both commands, exactly as `mux.h`
+    /// spells them — the route ([`set_port_node_id`], idempotent) and then
+    /// [`CMD_RESTART_DEVICE`] — and the bridge's own line pulse is never asked
     /// for.
     ///
     /// **Multi-thread runtime, deliberately** (as production builds:
@@ -1053,19 +1034,19 @@ mod tests {
             .expect("the child registered")
             .mcu_config()
             .expect("the child's section parses");
-        assert_eq!(child.bridge_restart, Some(BridgeRestart::Device));
+        assert_eq!(child.bridge_restart, Some(BridgeRestart::Firmware));
         assert_eq!(child.restart_method, McuRestartMethod::Admin);
         let _child_id = child.id.expect("the child has an id") as u8;
 
-        reset_bridge_firmware(&printer, &child, BridgeRestart::Device)
-            .expect("the device reset goes out through the real bridge");
+        reset_bridge_firmware(&printer, &child, BridgeRestart::Firmware)
+            .expect("the device restart goes out through the real bridge");
 
-        let mut expected = admin_unit(&[CMD_RESET_DEVICE, 0]);
+        let mut expected = admin_unit(&[CMD_RESTART_DEVICE, 0]);
         let _ = &mut expected;
         assert_eq!(
             read_pty(&pty.master, expected.len(), Duration::from_secs(3)),
             expected,
-            "the device reset is forwarded to the port whole, not stripped"
+            "the device restart is forwarded to the port whole, not stripped"
         );
         // The route command the host restates first is the bridge's own: it is
         // consumed there and never appears on the port (which is why the flag
@@ -1073,7 +1054,7 @@ mod tests {
         // `the_device_reset_restates_the_route_first`).
         assert!(
             read_pty(&pty.master, 1, Duration::from_millis(300)).is_empty(),
-            "only the forwarded reset reaches the port"
+            "only the forwarded restart reaches the port"
         );
 
         printer.teardown();

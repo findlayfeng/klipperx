@@ -809,11 +809,12 @@ pub const ADMIN_REPLY: u32 = 0x3f1;
 pub const CMD_QUERY_UNASSIGNED: u8 = 0x00;
 /// The frame body byte that hands a board the node id it is to take.
 pub const CMD_SET_KLIPPER_NODEID: u8 = 0x01;
-/// The frame body byte that asks the device behind a bridge port to reset
-/// itself — CAN's `CANBUS_CMD_REQUEST_BOOTLOADER` by value and meaning. A
-/// bridge routes it by the port index that follows; on a board with no bridge
-/// the device half runs it itself.
-pub const CMD_RESET_DEVICE: u8 = 0x02;
+/// The frame body byte that asks the device behind a bridge port to enter its
+/// bootloader — CAN's `CANBUS_CMD_REQUEST_BOOTLOADER` by value and meaning,
+/// and the **flashing tool's** command: a board in its bootloader is what a
+/// firmware write is addressed to. A bridge routes it by the port index that
+/// follows; on a board with no bridge the device half runs it itself.
+pub const CMD_REQUEST_BOOTLOADER: u8 = 0x02;
 /// The frame body byte of the port-level command that names the device behind
 /// a bridge port: `[CMD_SET_PORT_NODEID][index][id][flags]`. The bridge builds
 /// its port tables from it and consumes it — no receipt, never forwarded.
@@ -821,6 +822,12 @@ pub const CMD_SET_PORT_NODEID: u8 = 0x03;
 /// The frame body byte that asks a bridge to pulse the lines of the port that
 /// follows — the only reset a device with no admin channel of its own can get.
 pub const CMD_RESET_PORT: u8 = 0x04;
+/// The frame body byte that asks the device behind a bridge port to restart
+/// its firmware: `[CMD_RESTART_DEVICE][index]`, the command a
+/// `restart_method: admin` child's `FIRMWARE_RESTART` sends. A bridge routes it
+/// by the port index that follows; on a board with no bridge the device half
+/// runs it itself.
+pub const CMD_RESTART_DEVICE: u8 = 0x05;
 /// The first body byte of an unassigned board's answer.
 pub const RESP_NEED_NODEID: u8 = 0x20;
 /// The application id CanBoot reports instead of Klipper's own
@@ -1693,18 +1700,19 @@ impl SharedSerialHandle {
         self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
     }
 
-    /// Ask the device behind port `index` to reset itself: [`CMD_RESET_DEVICE`]'s
-    /// admin unit, which the bridge forwards to that port and the device acts on.
+    /// Ask the device behind port `index` to restart its firmware:
+    /// [`CMD_RESTART_DEVICE`]'s admin unit, which the bridge forwards to that
+    /// port and the device acts on.
     ///
-    /// The reset a **named** bridge-port device gets — the one that answers the
+    /// The restart a **named** bridge-port device gets — the one that answers the
     /// mux itself. No receipt: the bridge routes the command and the device
-    /// either resets or does not, so the caller confirms it by whether the
+    /// either restarts or does not, so the caller confirms it by whether the
     /// device can be reached again (`mcu/restart.rs`).
     ///
     /// # Errors
     /// The same as [`SharedSerialHandle::send_unit`].
-    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_admin(&admin_unit(&[CMD_RESET_DEVICE, index])[HEADER_BYTES..])
+    pub fn send_restart_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESTART_DEVICE, index])[HEADER_BYTES..])
     }
 
     /// Ask the bridge to pulse the lines of port `index` — [`CMD_RESET_PORT`]'s
@@ -1712,12 +1720,27 @@ impl SharedSerialHandle {
     ///
     /// The reset a **legacy** bridge-port device gets: it has no admin channel of
     /// its own, so its bridge's port is the only thing that can reset it. No
-    /// receipt, like [`SharedSerialHandle::send_reset_device`].
+    /// receipt, like [`SharedSerialHandle::send_restart_device`].
     ///
     /// # Errors
     /// The same as [`SharedSerialHandle::send_unit`].
     pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
         self.send_admin(&admin_unit(&[CMD_RESET_PORT, index])[HEADER_BYTES..])
+    }
+
+    /// Ask the device behind port `index` to enter its bootloader:
+    /// [`CMD_REQUEST_BOOTLOADER`]'s admin unit, the command a **flashing tool**
+    /// addresses a board with. The bridge routes it to that port, so a device
+    /// behind a bridge is reached the same way one on a plain port is.
+    ///
+    /// Nothing in the restart path sends this: a restart reloads a firmware
+    /// that is running, while this command is for the case where it is about to
+    /// be replaced.
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
     }
 
     /// Complete the frame-level id handshake on this already-open handle: name
@@ -2185,6 +2208,21 @@ mod mux_tests {
             .send_set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
             .expect("the admin unit goes out");
         assert_eq!(read_n(&pty.master, command.len()), command);
+
+        // The device-address commands of the same family: the restart a named
+        // bridge-port device's `admin` method sends, and the bootloader request
+        // the flashing tool sends.
+        let restart = admin_unit(&[CMD_RESTART_DEVICE, 0]);
+        handle
+            .send_restart_device(0)
+            .expect("the restart unit goes out");
+        assert_eq!(read_n(&pty.master, restart.len()), restart);
+
+        let bootloader = admin_unit(&[CMD_REQUEST_BOOTLOADER, 0]);
+        handle
+            .send_request_bootloader(0)
+            .expect("the bootloader request goes out");
+        assert_eq!(read_n(&pty.master, bootloader.len()), bootloader);
     }
 
     /// A downstream device joins the **same** port singleton an attached MCU
@@ -3508,15 +3546,40 @@ mod mux_tests {
         );
     }
 
+    /// `REQUEST_BOOTLOADER` (0x02) is the **flashing tool's** contract: the byte
+    /// a device behind port 1 is addressed with when its firmware is about to be
+    /// written, inside the same admin unit the port-level family travels as.
+    #[test]
+    fn the_bootloader_request_is_the_flashing_tools_command() {
+        assert_eq!(CMD_REQUEST_BOOTLOADER, 0x02);
+        assert_eq!(
+            admin_unit(&[CMD_REQUEST_BOOTLOADER, 1]),
+            [0xe8, 0x3f, 0x0b, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x02, 0x01, 0x10, 0x2f, 0x7e]
+        );
+    }
+
+    /// `RESTART_DEVICE` (0x05) is what a named bridge-port device's
+    /// `restart_method: admin` sends: the device restarts its firmware rather
+    /// than entering a bootloader.
+    #[test]
+    fn the_restart_device_command_is_the_firmwares_byte() {
+        assert_eq!(CMD_RESTART_DEVICE, 0x05);
+        assert_eq!(
+            admin_unit(&[CMD_RESTART_DEVICE, 1]),
+            [0xe8, 0x3f, 0x0b, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x05, 0x01, 0x5d, 0x27, 0x7e]
+        );
+    }
+
     #[test]
     fn set_port_node_id_is_the_port_level_admin_unit() {
-        // The three port-level command bytes are the firmware's mux.h table
-        // (0x02 RESET_DEVICE / 0x03 SET_PORT_NODEID / 0x04 RESET_PORT) — pinned
-        // here so a drift from the C side fails on the host too, not only in the
-        // real-library probe.
-        assert_eq!(CMD_RESET_DEVICE, 0x02);
+        // The port-level command bytes are the firmware's mux.h table
+        // (0x02 REQUEST_BOOTLOADER / 0x03 SET_PORT_NODEID / 0x04 RESET_PORT /
+        // 0x05 RESTART_DEVICE) — pinned here so a drift from the C side fails
+        // on the host too, not only in the real-library probe.
+        assert_eq!(CMD_REQUEST_BOOTLOADER, 0x02);
         assert_eq!(CMD_SET_PORT_NODEID, 0x03);
         assert_eq!(CMD_RESET_PORT, 0x04);
+        assert_eq!(CMD_RESTART_DEVICE, 0x05);
         // The bytes on the wire, exactly: the admin listen id as a checked
         // header, then the `KXID` frame carrying `[0x03][index][id][flags]` —
         // the firmware's mux.h command table (SET_PORT_NODEID, payload

@@ -420,6 +420,40 @@ fn config_error(message: String) -> KlippyError {
     KlippyError::Config(ConfigError::new(message))
 }
 
+/// Block (bounded) until the process-wide library on `path` is unloaded, so the
+/// next test on it meets a fresh firmware.
+///
+/// A load in a mode/identity the live library cannot serve fails while it is
+/// still up; a successful one means it was already unloaded, and dropping that
+/// one reference unloads it again. A timeout **warns and returns** instead of
+/// asserting: this runs from `BridgeTeardown::drop` and from the end of the
+/// tests in `mcu/restart.rs`, where a panic while the test is already unwinding
+/// would abort the whole test binary — the next test meeting the live library
+/// fails loudly instead.
+#[cfg(test)]
+pub(crate) fn wait_for_mux_library_unload(path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match HostDevice::load_bytes(path, Some([0x5a; 6])) {
+            Ok(probe) => {
+                drop(probe);
+                return;
+            }
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "teardown: mux host library still loaded after 10s: {} \
+                         (continuing; the next test on it will fail loudly)",
+                        path.display()
+                    );
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -724,38 +758,6 @@ mod tests {
             }
         }
         out
-    }
-
-    /// Block (bounded) until the process-wide library on `path` is unloaded, so
-    /// the next test on it meets a fresh firmware.
-    ///
-    /// A load in a mode/identity the live library cannot serve fails while it is
-    /// still up; a successful one means it was already unloaded, and dropping
-    /// that one reference unloads it again. A timeout **warns and returns**
-    /// instead of asserting: this runs from `BridgeTeardown::drop`, and a panic
-    /// there while the test is already unwinding would abort the whole test
-    /// binary — the next test meeting the live library fails loudly instead.
-    fn wait_for_mux_library_unload(path: &std::path::Path) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
-                Ok(probe) => {
-                    drop(probe);
-                    return;
-                }
-                Err(_) => {
-                    if Instant::now() >= deadline {
-                        eprintln!(
-                            "teardown: mux host library still loaded after 10s: {} \
-                             (continuing; the next test on it will fail loudly)",
-                            path.display()
-                        );
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-            }
-        }
     }
 
     /// Tears a host-library bring-up down when it drops, so a test that panics

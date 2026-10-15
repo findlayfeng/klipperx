@@ -242,35 +242,35 @@ impl Interface {
         }
     }
 
-    /// Ask the device behind bridge port `index` to reset itself
-    /// ([`CMD_RESET_DEVICE`](devices::serial::CMD_RESET_DEVICE)), the bridge
+    /// Ask the device behind bridge port `index` to restart its firmware
+    /// ([`CMD_RESTART_DEVICE`](devices::serial::CMD_RESTART_DEVICE)), the bridge
     /// forwarding the command to that port.
     ///
-    /// The reset a **named** bridge-port device gets: it answers the bridge's mux
-    /// itself, so it has an admin channel to receive this. Like `SET_PORT_NODEID`
-    /// the command travels that channel, so only a bridge link carries it (a
-    /// shared serial port, a muxed host library, or a CAN link).
+    /// The restart a **named** bridge-port device gets: it answers the bridge's
+    /// mux itself, so it has an admin channel to receive this. Like
+    /// `SET_PORT_NODEID` the command travels that channel, so only a bridge link
+    /// carries it (a shared serial port, a muxed host library, or a CAN link).
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
     /// is not a bridge link.
-    pub(crate) fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
+    pub(crate) fn send_restart_device(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
-            Transport::SharedSerial(handle) => handle.send_reset_device(index),
-            Transport::CanSerial(device) => device.send_reset_device(index),
+            Transport::SharedSerial(handle) => handle.send_restart_device(index),
+            Transport::CanSerial(device) => device.send_restart_device(index),
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "RESET_DEVICE needs a bridge link (a shared serial port, a muxed \
+                        "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed \
                          host library, or a CAN link); this host library reference has no mux, \
                          so no bridge is listening"
                             .to_string(),
                     ));
                 }
-                device.send_reset_device(index)
+                device.send_restart_device(index)
             }
             _ => Err(InterfaceError::Other(
-                "RESET_DEVICE needs a bridge link (a shared serial port, a muxed host \
+                "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed host \
                  library, or a CAN link); this interface is none of them"
                     .to_string(),
             )),
@@ -589,7 +589,7 @@ mod tests {
     use crate::core::klippy::interface::devices::canserial::read_wire;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT, MUX_PORT_UNITS,
+        admin_unit, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE, MUX_PORT_UNITS,
     };
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
@@ -815,7 +815,7 @@ mod tests {
 
     /// A CAN link **is** a bridge link: the node behind it is the bridge, and the
     /// port-level commands go out as the serial side's units cut into CAN frames —
-    /// the same `0x02`/`0x03`/`0x04` units, not a CAN frame shape of their own.
+    /// the same `0x03`/`0x04`/`0x05` units, not a CAN frame shape of their own.
     /// Measured off the wire the device writes.
     #[tokio::test]
     async fn test_a_can_link_carries_the_bridge_commands() {
@@ -825,7 +825,7 @@ mod tests {
         interface
             .send_set_port_node_id(1, 2, MUX_PORT_UNITS)
             .unwrap();
-        interface.send_reset_device(1).unwrap();
+        interface.send_restart_device(1).unwrap();
         interface.send_reset_port(1).unwrap();
 
         let sent: Vec<u8> = read_wire(&mut wire)
@@ -836,7 +836,7 @@ mod tests {
             sent,
             [
                 set_port_node_id(1, 2, MUX_PORT_UNITS),
-                admin_unit(&[CMD_RESET_DEVICE, 1]),
+                admin_unit(&[CMD_RESTART_DEVICE, 1]),
                 admin_unit(&[CMD_RESET_PORT, 1]),
             ]
             .concat(),
@@ -864,9 +864,9 @@ mod tests {
             )
         );
         assert_eq!(
-            interface.send_reset_device(1).unwrap_err(),
+            interface.send_restart_device(1).unwrap_err(),
             InterfaceError::Other(
-                "RESET_DEVICE needs a bridge link (a shared serial port, a muxed host \
+                "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed host \
                  library, or a CAN link); this interface is none of them"
                     .to_string()
             )

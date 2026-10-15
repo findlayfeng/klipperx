@@ -105,7 +105,7 @@ use tracing::{debug, info, trace, warn};
 use super::serial::{
     admin_unit, assignment_request, encode_header, parse_assignment_ack, set_node_id_for,
     set_port_node_id, UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT,
-    CMD_RESET_DEVICE, CMD_RESET_PORT, HEADER_BYTES,
+    CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, HEADER_BYTES,
 };
 use super::shared::resource_for;
 
@@ -1178,17 +1178,18 @@ impl HostDevice {
         self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
     }
 
-    /// Ask the device behind port `index` to reset itself: [`CMD_RESET_DEVICE`]'s
-    /// admin unit, which the bridge forwards to that port and the device acts on.
+    /// Ask the device behind port `index` to restart its firmware:
+    /// [`CMD_RESTART_DEVICE`]'s admin unit, which the bridge forwards to that
+    /// port and the device acts on.
     ///
-    /// The reset a **named** bridge-port device gets — the one that answers the
+    /// The restart a **named** bridge-port device gets — the one that answers the
     /// mux itself. No receipt: the caller confirms it by whether the device can
     /// be reached again (`mcu/restart.rs`).
     ///
     /// # Errors
     /// The same as [`HostDevice::send_admin`].
-    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_admin(&admin_unit(&[CMD_RESET_DEVICE, index])[HEADER_BYTES..])
+    pub fn send_restart_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_RESTART_DEVICE, index])[HEADER_BYTES..])
     }
 
     /// Ask the bridge to pulse the lines of port `index` — [`CMD_RESET_PORT`]'s
@@ -1196,12 +1197,24 @@ impl HostDevice {
     ///
     /// The reset a **legacy** bridge-port device gets: it has no admin channel of
     /// its own, so its bridge's port is the only thing that can reset it. No
-    /// receipt, like [`HostDevice::send_reset_device`].
+    /// receipt, like [`HostDevice::send_restart_device`].
     ///
     /// # Errors
     /// The same as [`HostDevice::send_admin`].
     pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
         self.send_admin(&admin_unit(&[CMD_RESET_PORT, index])[HEADER_BYTES..])
+    }
+
+    /// Ask the device behind port `index` to enter its bootloader:
+    /// [`CMD_REQUEST_BOOTLOADER`]'s admin unit, the command a **flashing tool**
+    /// addresses a board with. Nothing in the restart path sends it: a restart
+    /// reloads a firmware that is running, while this command is for the case
+    /// where it is about to be replaced.
+    ///
+    /// # Errors
+    /// The same as [`HostDevice::send_admin`].
+    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
     }
 
     /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and
@@ -1472,8 +1485,8 @@ mod host_tests {
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, assignment_request, decode_header, discovery_query, encode_header,
         set_node_id_for, set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY,
-        ASSIGN_ATTACH_ATTEMPTS, CMD_RESET_DEVICE, CMD_RESET_PORT, CMD_SET_PORT_NODEID,
-        HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
+        ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
+        CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::SimulatorDevice;
@@ -2594,11 +2607,13 @@ mod host_tests {
             "a short payload carries no receipt"
         );
 
-        // `[0x02][0]` is forwarded to port 0 alone. Port 0 speaks units since
-        // step E, so the `KXID` frame goes down headed with the arb it arrived
-        // on — the admin listen id.
-        let reset = admin_unit(&[CMD_RESET_DEVICE, 0]);
-        device.write(&reset).expect("RESET_DEVICE goes in");
+        // The flashing tool's `[0x02][0]` is forwarded to port 0 alone. Port 0
+        // speaks units since step E, so the `KXID` frame goes down headed with
+        // the arb it arrived on — the admin listen id.
+        let reset = admin_unit(&[CMD_REQUEST_BOOTLOADER, 0]);
+        device
+            .send_request_bootloader(0)
+            .expect("REQUEST_BOOTLOADER goes in");
         let down = read_pty(&pty.master, reset.len(), window);
         let (arb, frame) = unit_parts(&down);
         assert_eq!(
@@ -2608,21 +2623,37 @@ mod host_tests {
         assert_eq!(
             frame,
             &reset[HEADER_BYTES..],
-            "the RESET_DEVICE KXID frame travels unchanged"
+            "the REQUEST_BOOTLOADER KXID frame travels unchanged"
+        );
+
+        // And the restart command the named child's `admin` method sends:
+        // `[0x05][0]`, the same shape one command byte apart, reaching the port
+        // whole for the same reason.
+        let restart = admin_unit(&[CMD_RESTART_DEVICE, 0]);
+        device
+            .send_restart_device(0)
+            .expect("RESTART_DEVICE goes in");
+        let down = read_pty(&pty.master, restart.len(), window);
+        let (arb, frame) = unit_parts(&down);
+        assert_eq!(arb, ADMIN_LISTEN, "the restart unit keeps its header too");
+        assert_eq!(
+            frame,
+            &restart[HEADER_BYTES..],
+            "the RESTART_DEVICE KXID frame travels unchanged"
         );
 
         // `[0x02][99]` names no port: dropped in silence.
         device
-            .write(&admin_unit(&[CMD_RESET_DEVICE, 99]))
-            .expect("RESET_DEVICE goes in");
+            .write(&admin_unit(&[CMD_REQUEST_BOOTLOADER, 99]))
+            .expect("REQUEST_BOOTLOADER goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
             "an out-of-range port index reaches no port"
         );
 
-        // And none of the reset commands touched the library itself: the
-        // bridge consumed every one of them, so the device half never ran
-        // `RESET_DEVICE` (the same symbol the device-half test pins).
+        // And none of the port-level commands touched the library itself: the
+        // bridge consumed every one of them, so the device half never ran a
+        // bootloader request of its own — the shutdown `is_shutdown` reads.
         let is_shutdown = is_shutdown_symbol(&device);
         assert_eq!(
             unsafe { is_shutdown() },

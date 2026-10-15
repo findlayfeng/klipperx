@@ -17,6 +17,14 @@
 //! that wider question; [`SerialPorts::is_shared`] keeps the narrower one (how
 //! many `[mcu]` sections name the path).
 //!
+//! Rule 7 counts the downstream devices a bridge carries
+//! ([`SerialPorts::downstream_devices`], from [`bridge_downstream_counts`]),
+//! and that count is one reason a path is addressed by id. Being a bridge is a
+//! **separate** reason that stays even at zero downstream devices: a muxed
+//! bridge frames its output whatever is hanging on it, so decoding that output
+//! as bare frames would misparse the per-id header. The zero-device case is
+//! therefore a deliberate conservative reading, not an oversight.
+//!
 //! The one rule is baud, and the rate of a path is the **lowest** `baud` its
 //! sections write — or [`DEFAULT_BAUD`] when none of them writes one. A section
 //! that writes no `baud` has no vote of its own: it follows the rate the path
@@ -45,7 +53,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
-use crate::core::klippy::mcu::bridge_ports::bridge_mcus;
+use crate::core::klippy::mcu::bridge_ports::{bridge_downstream_counts, bridge_mcus};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use tracing::warn;
 
@@ -80,6 +88,13 @@ struct PathGroup {
     /// one `[mcu]` names it — an id-addressing reason **besides** being shared
     /// ([`SerialPorts::is_id_addressed`]).
     bridge: bool,
+    /// How many `[mcu]` destinations hang on this path's bridge(s): the sections
+    /// that reference a `[uart_device]`/`[can_device]` port whose `*_mcu` is an
+    /// MCU on the path. Rule 7's count, kept **beside** `bridge` rather than
+    /// instead of it — a bridge with zero downstream devices is still muxed
+    /// (the conservative reading), so `bridge` and `downstream >= 1` are two
+    /// reasons, not one.
+    downstream: usize,
 }
 
 impl SerialPorts {
@@ -104,6 +119,9 @@ impl SerialPorts {
         // read raw like every claim here: a bridge's path is addressed by id
         // even alone (`is_id_addressed`).
         let bridges = bridge_mcus(config);
+        // How many downstream devices each bridge has: rule 7's count, read raw
+        // like every other claim here.
+        let downstream_counts = bridge_downstream_counts(config);
         for section in config
             .sibling("mcu")
             .into_iter()
@@ -124,12 +142,17 @@ impl SerialPorts {
             let bridge = members
                 .iter()
                 .any(|(identifier, _)| bridges.contains(member_name(identifier)));
+            let downstream = members
+                .iter()
+                .filter_map(|(identifier, _)| downstream_counts.get(member_name(identifier)))
+                .sum();
             by_path.insert(
                 path,
                 PathGroup {
                     members: members.into_iter().map(|(name, _)| name).collect(),
                     baud,
                     bridge,
+                    downstream,
                 },
             );
         }
@@ -146,7 +169,8 @@ impl SerialPorts {
     }
 
     /// Whether `path` is addressed by id: two or more sections name it, **or**
-    /// one of them is a bridge.
+    /// one or more downstream devices hang on a bridge on it, **or** one of its
+    /// sections is a bridge with no downstream devices.
     ///
     /// A bridge forwards its downstream devices' frames on the same link, so the
     /// link carries more than one board's traffic even when a single `[mcu]`
@@ -154,8 +178,31 @@ impl SerialPorts {
     /// shared one. This is the question the transport decision asks; it is
     /// deliberately not [`SerialPorts::is_shared`], whose answer is about the
     /// number of `[mcu]` sections alone.
+    ///
+    /// Rule 7 counts downstream devices, and that count is written out here as
+    /// its own reason ([`SerialPorts::downstream_devices`]); the `bridge` term
+    /// stays as well, because a muxed bridge frames its output **whatever** is
+    /// hanging on it — a bridge with zero downstream devices is addressed by id
+    /// on purpose, and decoding its output as bare frames would misparse the
+    /// per-id header it writes.
     pub fn is_id_addressed(&self, path: &str) -> bool {
-        self.is_shared(path) || self.by_path.get(path).is_some_and(|group| group.bridge)
+        self.is_shared(path)
+            || self.downstream_devices(path) >= 1
+            || self.by_path.get(path).is_some_and(|group| group.bridge)
+    }
+
+    /// How many downstream `[mcu]` devices hang on `path`'s bridge: the
+    /// sections that reference a `[uart_device]`/`[can_device]` port whose
+    /// `*_mcu` names an MCU on this path. `0` when no `[mcu]` names `path`, or
+    /// when its bridge has no downstream devices.
+    ///
+    /// This is rule 7's count, and the reason
+    /// [`SerialPorts::is_id_addressed`] names on its own. It is reported for a
+    /// shared port too — the number is about the bridge's ports, not about how
+    /// many sections name the path — so a caller can tell a bridge's downstream
+    /// fan-out from an empty one.
+    pub fn downstream_devices(&self, path: &str) -> usize {
+        self.by_path.get(path).map_or(0, |group| group.downstream)
     }
 
     /// The MCUs that name `path`, in declaration order — one for an exclusive
@@ -412,6 +459,25 @@ mod tests {
         assert!(!ports.is_shared("/dev/ttyACM0"));
         assert!(ports.is_id_addressed("/dev/ttyACM0"));
         assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu bridge"]);
+        assert_eq!(ports.downstream_devices("/dev/ttyACM0"), 0);
+    }
+
+    /// Rule 7's count: a path one `[mcu]` names, whose bridge carries three
+    /// downstream `[mcu]` devices, is addressed by id — the count is 3, and
+    /// `is_shared` stays false because only one section names the path itself.
+    #[test]
+    fn one_mcu_with_three_downstream_devices_is_id_addressed() {
+        let ports = classify(
+            "[mcu bridge]\nserial: /dev/ttyACM0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [mcu d1]\nuart: uart0\n\
+             [mcu d2]\nuart: uart0\n\
+             [mcu d3]\nuart: uart0\n",
+        );
+        assert!(!ports.is_shared("/dev/ttyACM0"));
+        assert!(ports.is_id_addressed("/dev/ttyACM0"));
+        assert_eq!(ports.peers("/dev/ttyACM0"), ["mcu bridge"]);
+        assert_eq!(ports.downstream_devices("/dev/ttyACM0"), 3);
     }
 
     /// A lone path no port section names as its bridge is addressed by no id at

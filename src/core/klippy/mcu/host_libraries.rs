@@ -18,7 +18,11 @@
 //! - one section that a `[uart_device]`/`[can_device]` names as its bridge —
 //!   muxed: a bridge's link carries its downstream devices' frames too, so the
 //!   path must be addressed by id even though one `[mcu]` names it (rule 7,
-//!   `bridge_ports::bridge_mcus`);
+//!   `bridge_ports::bridge_mcus`); one or more downstream devices on that
+//!   bridge (`bridge_ports::bridge_downstream_counts`) is rule 7's count, kept
+//!   as a separate reason **beside** being a bridge rather than instead of it —
+//!   a muxed bridge frames its output whatever is hanging on it, so the
+//!   zero-device case is a deliberate conservative reading;
 //! - two or more sections — muxed, and **at most one** of them may omit
 //!   `uuid` (it claims the bridge's own device); every other one must write a
 //!   `uuid` to be told apart.
@@ -65,7 +69,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::mcu::bridge_ports::bridge_mcus;
+use crate::core::klippy::mcu::bridge_ports::{bridge_downstream_counts, bridge_mcus};
 use crate::core::klippy::mcu::link_grouping::{
     declared_uuid, distinguishability, group_by_key, quoted, Distinguishability, Member,
 };
@@ -122,6 +126,9 @@ impl HostLibraries {
         // read raw like every claim here: a bridge's path is addressed by id
         // even when one section names it (`path_is_mux`).
         let bridges = bridge_mcus(config);
+        // Rule 7's count: how many downstream devices each bridge has, read raw
+        // like every other claim here.
+        let downstream_counts = bridge_downstream_counts(config);
         // Every uuid the config already names, whatever transport carries it, so
         // an assigned identity can never collide with a board that is already
         // addressed by one.
@@ -152,7 +159,11 @@ impl HostLibraries {
             let has_bridge = members
                 .iter()
                 .any(|member| bridges.contains(member_name(&member.identifier)));
-            let is_mux = path_is_mux(&path, &members, has_bridge)?;
+            let downstream = members
+                .iter()
+                .filter_map(|member| downstream_counts.get(member_name(&member.identifier)))
+                .sum();
+            let is_mux = path_is_mux(&path, &members, has_bridge, downstream)?;
             let identity = assign_identity(&path, &mut taken);
             by_path.insert(
                 path,
@@ -290,19 +301,28 @@ pub fn ensure(
 /// Whether the sections naming `path` need the mux header, rejecting the shapes
 /// that cannot be told apart.
 ///
-/// One section is muxed when it writes a `uuid` **or** when it is a bridge
-/// (`has_bridge`): a bridge's link carries its downstream devices' frames, so
-/// the path is addressed by id even alone. Two or more are always muxed; with
-/// more than one of them omitting `uuid` there is no way to pick
+/// One section is muxed when it writes a `uuid`, **or** when it is a bridge
+/// (`has_bridge`), **or** when one or more downstream devices hang on that
+/// bridge (`downstream >= 1`): a bridge's link carries its downstream devices'
+/// frames, so the path is addressed by id even alone. The `downstream` term is
+/// rule 7's count written out, kept beside `has_bridge` on purpose: a muxed
+/// bridge with zero downstream devices is still addressed by id (conservative
+/// reading), and its output is framed accordingly. Two or more are always muxed;
+/// with more than one of them omitting `uuid` there is no way to pick
 /// which board a bare frame belongs to, and with two writing the same `uuid`
 /// there is no way to tell which of them a header names — both are reported with
 /// the sections involved.
-fn path_is_mux(path: &str, members: &[Member], has_bridge: bool) -> Result<bool, ConfigError> {
+fn path_is_mux(
+    path: &str,
+    members: &[Member],
+    has_bridge: bool,
+    downstream: usize,
+) -> Result<bool, ConfigError> {
     let Some(first) = members.first() else {
         return Ok(false);
     };
     if members.len() == 1 {
-        return Ok(first.uuid.is_some() || has_bridge);
+        return Ok(first.uuid.is_some() || has_bridge || downstream >= 1);
     }
     // At most one member may omit its uuid: it claims the bridge's own device.
     // The verdict is the shared distinguishability judgment
@@ -475,6 +495,19 @@ mod tests {
         let libraries = classify(&format!(
             "[mcu bridge]\nhost_library: {LIB}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n"
+        ))
+        .unwrap();
+        assert!(libraries.is_mux(LIB));
+    }
+
+    /// Rule 7's count, from the same table the serial grouping uses: a lone
+    /// section whose bridge carries a downstream `[mcu]` is muxed.
+    #[test]
+    fn a_lone_bridge_section_with_a_downstream_device_is_muxed() {
+        let libraries = classify(&format!(
+            "[mcu bridge]\nhost_library: {LIB}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [mcu child]\nuart: uart0\n"
         ))
         .unwrap();
         assert!(libraries.is_mux(LIB));

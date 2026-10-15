@@ -8,7 +8,7 @@
 | `uuid` | MCU 芯片的唯一 ID（12 位十六进制） | CAN 模式必给（Klipper 旧名 `canbus_uuid` 兼容，同节双写报错）；写在 `serial` 节上则连接期用它指派 id（见下节「共享串口」，独占串口忽略它） |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
-| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**一进程只允许一份 host 库**：配置里出现**两个不同 `host_library:` 路径**会在装载期**点名报错**，装载期也有按路径的守卫兜底（原因是 klipper 通过**进程级** `SIGUSR1` handler 停主循环，每份库都会覆盖上一份的 handler ⇒ 两份库同进程会得到「跳进已卸载代码（崩溃）」或「join 等一个被别的库吃掉的信号（挂死）」）；要跑两个固件请用**同一份库的多引用（mux）**，或把它们放到**独立进程**（固件侧 `linux` 目标就是一个可独立运行的固件进程）。**可写 `uuid:`**（12 位十六进制，旧名 `canbus_uuid` 兼容，同节双写报错）：它指明这条路径上被寻址的是**哪块设备**。判定为 **mux** 的路径连接时**按 id 寻址**：先发 `SET_KLIPPER_NODEID`（节上写了 `uuid:` 就用它点名**桥下游那台板子**；没写就用**装载期为该路径指派的那条自身份**，它同时是主机在 `init` 前交给库的身份），再走重确认握手，之后收发都带帧头；非 mux 路径照旧裸帧。判定按配置事实（`mcu/host_libraries.rs`）：同路径 **1 节且无 `uuid:`** 走**裸帧**（今天的行为）；**1 节有 `uuid:`**、或同路径 **≥2 节** 则**按 id 寻址**——≥2 节时**最多一节可省略 `uuid:`**（它认领桥自身的设备），其余必须写 `uuid:`；**≥2 节都省略**、或**两节写同一个 uuid** 都在装载期报错并点名涉及的节 |
+| `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**一进程只允许一份 host 库**：配置里出现**两个不同 `host_library:` 路径**会在装载期**点名报错**，装载期也有按路径的守卫兜底（原因是 klipper 通过**进程级** `SIGUSR1` handler 停主循环，每份库都会覆盖上一份的 handler ⇒ 两份库同进程会得到「跳进已卸载代码（崩溃）」或「join 等一个被别的库吃掉的信号（挂死）」）；要跑两个固件请用**同一份库的多引用（mux）**，或把它们放到**独立进程**（固件侧 `linux` 目标就是一个可独立运行的固件进程）。**可写 `uuid:`**（12 位十六进制，旧名 `canbus_uuid` 兼容，同节双写报错）：它指明这条路径上被寻址的是**哪块设备**。判定为 **mux** 的路径连接时**按 id 寻址**：先发 `SET_KLIPPER_NODEID`（节上写了 `uuid:` 就用它点名**桥下游那台板子**；没写就用**装载期为该路径指派的那条自身份**，它同时是主机在 `init` 前交给库的身份），再走重确认握手，之后收发都带帧头；非 mux 路径照旧裸帧。判定按配置事实（`mcu/host_libraries.rs`）：同路径 **1 节且无 `uuid:`、也不是桥** 走**裸帧**；**1 节有 `uuid:`**、**该节是桥**（含 0 或 ≥1 台下游设备）、或同路径 **≥2 节** 则**按 id 寻址**——≥2 节时**最多一节可省略 `uuid:`**（它认领桥自身的设备），其余必须写 `uuid:`；**≥2 节都省略**、或**两节写同一个 uuid** 都在装载期报错并点名涉及的节 |
 | `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥 |
 | `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥 |
 
@@ -38,7 +38,7 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 ## 共享串口（同一 `serial:` 路径被多颗 MCU 引用）
 
-同一个 `serial:` 路径被**两颗及以上** `[mcu]` 引用，就是**共享串口**：主机只把它打开一次，每颗 MCU 用自己的 **MCU 层 id** 给帧加一个地址头，收发按 id 分派（装载期按路径分组的是 `mcu/serial_ports.rs`，端口/reader/分派是 `interface/devices/serial.rs`）。只被一颗引用时仍是**独占**，行为与 Klipper 一样：**不发任何指派帧、线上不带任何头**。
+同一个 `serial:` 路径被**两颗及以上** `[mcu]` 引用，就是**共享串口**：主机只把它打开一次，每颗 MCU 用自己的 **MCU 层 id** 给帧加一个地址头，收发按 id 分派（装载期按路径分组的是 `mcu/serial_ports.rs`，端口/reader/分派是 `interface/devices/serial.rs`）。只被一颗引用、且这颗**不是桥**时仍是**独占**，行为与 Klipper 一样：**不发任何指派帧、线上不带任何头**（被引用的是桥时见下面「桥的上游链路」段）。
 
 ```ini
 [mcu]
@@ -53,6 +53,8 @@ serial: /dev/ttyUSB0
 - **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
 - **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库；单次广播查询 + 截止窗口 + 按 uuid 去重，三种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
+
+**桥的上游链路也是复用**：被 `[uart_device]`/`[can_device]` 的 `*_mcu` 指为桥的那颗 `[mcu]`，其 `serial:`/`host_library:` 路径**按 id 寻址**，与引用颗数无关——这条链路上还跑着桥下游设备的帧（规则 7）。判定式是 `按 id 寻址 = 共享 ∨ 下游设备数 ≥ 1 ∨ 是桥`（`mcu/serial_ports.rs::is_id_addressed`，host 库侧同构 `mcu/host_libraries.rs::path_is_mux`）；**下游设备数**是挂在桥端口节（`uart:`/`can:`）上的 `[mcu]` 个数（`mcu/bridge_ports.rs::bridge_downstream_counts`）。**0 台下游的桥仍按 id 寻址**是刻意口径：桥被 mux 化后输出就带帧头，按裸帧解会错位。
 
 > 设备端**设备半与桥半都已实现，但没有架构默认启用它们**：`src/mux.c` 的设备半（就地解析、答扫描、采纳 node id、id 冲突照 CAN 弃号、剥头交付）与 `src/bridge.c` 的桥半（端口表、`uuid → 端口`/`id → 端口` 路由、扇出、单设备路径剥头加头）都在，host 库还有下游串口端口与 unit 收发接口；**mux 路径的真端到端 attach 已有永久测试**。但 `MUX_SERIAL` 目前只由 host 的开关选上，**微控制器还没启用**（刻意留后续）——所以今天的共享**串口**固件仍不回执、必然握手超时、连不上。这是预期状态：误配到旧固件只会连接失败，不会搞乱会话。
 

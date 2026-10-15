@@ -48,7 +48,7 @@
 //! (`uart_device uart0`): no status, not queryable, just the parsed values for
 //! the passes that follow — the same shape `serial_ports` and `mcu_ids` set.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -431,6 +431,79 @@ pub(crate) fn bridge_mcus(config: &ConfigWrapper) -> BTreeSet<String> {
         }
     }
     bridges
+}
+
+/// How many `[mcu]` sections hang on each bridge's downstream ports: bridge
+/// name → the number of devices that reference one of its
+/// `[uart_device]`/`[can_device]` ports.
+///
+/// This is rule 7's **count** — the second half of the "is the link addressed
+/// by id" verdict ([`serial_ports::is_id_addressed`](super::serial_ports),
+/// [`host_libraries::path_is_mux`](super::host_libraries)): a bridge's own link
+/// carries its downstream devices' frames, so a link with one or more of them
+/// is addressed by id even though one `[mcu]` names it. A bridge with **zero**
+/// downstream devices still counts as a bridge in [`bridge_mcus`], and the two
+/// link passes keep that conservative reading deliberately — a muxed bridge
+/// frames its output whatever is hanging on it.
+///
+/// Like every pre-scan here it reads raw option text (`section().get_text`,
+/// never a tracked getter), so it records no access and does not exempt a
+/// `[mcu]` option from `check_unused` on its own account. A `uart:`/`can:`
+/// reference naming no port section, or a `*_mcu` naming no existing `[mcu]`
+/// section, is left out — those are the port section's and the transport
+/// parse's own errors to report.
+///
+/// Mapping a `[mcu]`'s reference to its port uses `port_grouping`'s
+/// `port_reference` reading; the count is keyed by the port **section
+/// identifier** (`uart_device uart0`), so a uart and a can port sharing a sub
+/// stay apart.
+pub(crate) fn bridge_downstream_counts(config: &ConfigWrapper) -> BTreeMap<String, usize> {
+    // port section identifier → the bridge (`*_mcu`) it names.
+    let mut bridge_of_port: BTreeMap<String, String> = BTreeMap::new();
+    for (prefix, option) in [("uart_device", "uart_mcu"), ("can_device", "can_mcu")] {
+        for section in config.sibling_prefix_sections(prefix) {
+            if let Some(name) = section.section().get_text(option) {
+                let name = name.trim();
+                if !name.is_empty() {
+                    bridge_of_port.insert(section.identifier(), name.to_string());
+                }
+            }
+        }
+    }
+    // Each `[mcu]` referencing a port counts once under that port's bridge.
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for section in config
+        .sibling("mcu")
+        .into_iter()
+        .chain(config.sibling_prefix_sections("mcu"))
+    {
+        let Some((section_type, sub)) = referenced_port(&section) else {
+            continue;
+        };
+        let identifier = format!("{section_type} {sub}");
+        if let Some(bridge) = bridge_of_port.get(&identifier) {
+            *counts.entry(bridge.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// The port a `[mcu]` section references, if it references one: the port
+/// section's type and the sub it names, trimmed. The first reference written
+/// wins when the section writes both `uart:` and `can:` — the double reference
+/// itself is the transport parse's conflict to report. The same reading as
+/// `port_grouping`'s `port_reference`, kept here because the count pre-scan
+/// runs before (and without) the port grouping.
+fn referenced_port(section: &ConfigWrapper) -> Option<(&'static str, String)> {
+    for (option, section_type) in [("uart", "uart_device"), ("can", "can_device")] {
+        if let Some(text) = section.section().get_text(option) {
+            let sub = text.trim();
+            if !sub.is_empty() {
+                return Some((section_type, sub.to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// The section's sub, required: a port is `[<type> <name>]`, never bare.

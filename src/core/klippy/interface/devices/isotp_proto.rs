@@ -639,7 +639,11 @@ impl IsotpState {
 ///
 /// `0x00..=0x7F` are milliseconds and `0xF1..=0xF9` are 100…900 microseconds.
 /// The reserved ranges `0x80..=0xF0` and `0xFA..=0xFF` are treated as `0x7F`,
-/// that is 127 ms, as ISO 15765-2 requires of a receiver.
+/// that is 127 ms, as ISO 15765-2 requires of a receiver. This is not a guess:
+/// the Linux kernel does exactly the same thing when it reads a peer's flow
+/// control frame (`net/can/isotp.c`, `isotp_rcv_fc()`: `if (stmin > 0x7F &&
+/// (stmin < 0xF1 || stmin > 0xF9)) stmin = 0x7F;`), so our sender and a
+/// kernel peer agree byte for byte on this branch.
 fn decode_stmin(raw: u8) -> Duration {
     match raw {
         0x00..=0x7f => Duration::from_millis(u64::from(raw)),

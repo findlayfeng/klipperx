@@ -238,6 +238,26 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 映射，数据单元按同一套 `0x100+2*id` 头路由到口（`bridge_route_unit`），口上再按该口的 `flags`
 决定剥/加头。两级互不相干：第一级寻址不需要知道下游有哪些设备，下游也不需要 admin 能力。
 
+## 设计规则总表（从决断提取）
+
+这一节把散在各处的**规范性运行机制**收敛成一张表——每条一行、指向它的实现落点；判据、常量、
+线上字节仍以本页其余小节与源码为准，这里不重复叙述。动这块代码前先核对本表：改的是哪条规则。
+
+| # | 规则 | 落点 |
+|---|------|------|
+| 1 | **两级寻址互不相干**：第一级「上游链路是否按 id 加帧头」由**配置事实**判定，**不需要知道下游有哪些设备**；第二级「桥 ↔ 下游某口」由桥自己的 `id → 端口` 表判定 | `mcu/serial_ports.rs::is_id_addressed`、`mcu/host_libraries.rs::path_is_mux`、`SET_PORT_NODEID` |
+| 2 | **端口 `index` = 端口节声明顺序**；`config_uart` 的载槽参数 `slot` 与它**一处计数** | `mcu/bridge_ports.rs::wire_bridge_port`、固件 `bridge_add_port` |
+| 3 | `SET_PORT_NODEID` 的 `flags` bit0 = `MUX_PORT_UNITS`（`0x01`）置位 = 该口设备**说单元**；保留位忽略；命令**幂等**；**旧映射不撤销**（`bridge_map_id` 只增不删——同一口改登记别的 id 后旧 id 仍路由到该口） | 固件 `src/bridge.c` |
+| 4 | **桥半对设备命令的穿透规则**：`[0x02]/[0x05][index]` 只有 `index` 指到**本机在用端口**才消费，否则**穿透给本机设备半**——每个 mux 构建自己也是桥构建（`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`），「主机经别的桥找上我」时命令本就该由我执行 | 固件 `src/bridge.c::bridge_admin_unit` |
+| 5 | **面向桥自己的端口级命令族全无回执**（`0x02`/`0x03`/`0x04`/`0x05`）：参数不足/越界**静默丢弃**；确认只有两个手段——**复位后能否重新握手/identify**、连不上就按配置阶段报错。设备级的 `0x00`/`0x01` 不在此列（设备用 `0x20` 应答 / 重确认握手回答） | 命令族表、`mcu/bridge_attach.rs` |
+| 6 | **`0x02` 与 `0x05` 分工**：`0x02 REQUEST_BOOTLOADER` = 请求**进引导**（刷写工具的命令，**不进** `restart_method`；无 bootloader 的板是设计内 no-op）；`0x05 RESTART_DEVICE` = **重启固件本身**（`mcu_restart()`，`restart_method: admin` 走它）。两者都只转发到 `index` 口、不扇出 | 固件 `src/mux.c`、`src/bridge.c` |
+| 7 | **一条链路一个读者、每引用自己的槽**：共享串口与 host 库同构（`SharedSerialPort`/`McuSlot`、`HostLibrary` 的 `Router`）——读者按 `assign::mcu_id_from_arb` 投槽，**无 id 的 admin 单元丢弃**（否则两个活引用会把字节流瓜分、谁都拼不齐帧）；读者**不持**强引用，避免「最后一个 `Drop` 落在读者线程 ⇒ `pthread_join(self)`」 | `devices/serial.rs`、`devices/host.rs` |
+| 8 | **一进程一份 host 库**：配置层按**路径**点名拒绝第二条（两个不同的 `host_library:` 路径），运行期在 `library_for` 最前面再按路径守卫一次（只读既有注册表的 `Weak`，不引入第二个静态表；同路径复用与「先卸 A 再载 B」不受影响）。**为什么**：每份库都覆盖**进程级** `SIGUSR1` handler ⇒ 两份同进程要么跳进已卸载代码（crash）、要么 join 的信号被另一份消费（hang）。要两个固件 → **同一份库的多引用（mux）** 或**独立进程** | `mcu/host_libraries.rs::reject_a_second_path`、`devices/host.rs::refuse_a_second_library` |
+| 9 | **端口 tty 路径在库 `init` 前登记、运行期可注入**：`klipper_host_port(slot, path)`（`slot` = 端口 `index`，槽数 `KLIPPER_HOST_PORT_SLOTS = 4`，与固件 `BRIDGE_MAX_PORTS` 编译期绑定）；该槽未登记则回落构建期默认 `CONFIG_HOST_BRIDGE_SERIAL_PATH`（降级为兜底默认）；**同一路径的库在端口表不一致时拒绝复用**（`klipper_host_port()` 必须在 `init` 前调用——不做「表按路径合并」，那会让两条桥的槽号互相覆盖） | 固件 `src/host/host.c`、主机 `mcu/bridge_ports.rs` / `cmd/uart.rs` |
+| 10 | **口形态判据是「设备说不说单元」，与台数无关**：legacy（无 `uuid:` + uart）⇒ 该口剥头/加头；命名（写了 `uuid:`）⇒ 整单元原样转发；**多站口**（同一端口节被 ≥2 台命名设备引用，如 RS-485）⇒ 都带头、各自走自己的 `uuid → id`。**legacy 只允许出现在单设备端口上**（它与邻居无法区分 ⇒ 在共享端口上声明 legacy 是配置错） | 两级寻址一节、[MCU 连接方式](../user-manual/mcu-connection.md) |
+| 11 | **恢复预算：一次机会、归还条件明确**。桥 bring-up 因端口 `open` 失败、或 child 在连接期间被 `0x05` 重启而连不上 ⇒ **有界等 `uart_path` 回来**（`BRIDGE_PORT_RETURN_TIMEOUT` = 10 s、`BRIDGE_PORT_POLL` = 100 ms），回来就请求一次 **plain** restart（不是 `firmware_restart`，免得把子设备再点一次 `0x05` ⇒ 循环）。预算挂在 **`Printer`** 上**按节名**记（桥侧记桥节、child 侧记 child 节），**成功 connect 后归还**——所以「路径一直在但打不开」（目录/无权限/被占/槽越界）只重启**一次**便稳定 error，不会变成常驻重启风暴 | `mcu/object.rs`、`printer.rs::claim_bridge_port_recovery` / `clear_bridge_port_recovery` |
+| 12 | **`MUX_SERIAL`/`MUX_CAN` 的载体条件与「不默认开」**：`MUX_SERIAL depends on SERIAL \|\| USBSERIAL`（载体存在才可见）+ 身份来源 `HAVE_CHIPID \|\| MACH_HOST \|\| MACH_LINUX`；`MUX_CAN depends on CANBUS && HAVE_CHIPID`；两者都 `select MUX`，`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`。**都不默认开**：单元格式不是上游 klippy 主机说的格式，必须是刻意选择（host 库由 `HOST_MUX_SERIAL` 选上） | 固件 `src/Kconfig` |
+
 ## 主机侧的行为约定
 
 - **端口只开一次**：按 `serial:` 路径复用（`Weak` 注册表），第二颗 MCU 只是 attach 到同一个

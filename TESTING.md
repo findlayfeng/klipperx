@@ -157,11 +157,11 @@
   **部分结论（2026-10-15，代码证据）**：本机这台 `usb-Klipper_stm32f103xe_…-if00` 是**原生 USB CDC**（klipper 自带 USB 栈），
   固件**不把 DTR/RTS 当复位**（`src/generic/usb_cdc.c:452-459,485-494`：只记 `line_control_state`，唯一消费是「1200 波特 + DTR 低」进 bootloader），
   所以 `RESET_PORT` 的 250 ms 脉冲在这类板子上**静默无效**（内核照常接受 ioctl）⇒ 该项在**原生 USB 板**上判「不适用」，
-    其判定只对 **USB-串口桥接板**（DTR\|RTS 接复位脚）有意义；原生 USB 的 legacy 设备需靠 `RESET_DEVICE`（命名/mux 设备）或断电。
+    其判定只对 **USB-串口桥接板**（DTR\|RTS 接复位脚）有意义；原生 USB 的 legacy 设备（不能答 admin）目前**没有**经桥的硬复位手段（命名/mux 设备走 `restart_method: admin` 的 `RESTART_DEVICE (0x05)`），只能断电 / `rpi_usb`。
   **真机观察（2026-10-15）**：在「宿主库当桥 + 真板（原生 USB CDC）当下游」形态下，`RESET_PORT`
   就是桥对该 tty 做 DTR/RTS 脉冲——命令发出、板子**无任何反应**（不重启、不丢会话），与上面结论一致。
 
-- [x] **M2-2 `RESET_DEVICE` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x02][index]` 转发给
+- [x] **M2-2 `RESTART_DEVICE (0x05)` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x05][index]` 转发给
   它（不扇出、不本地执行）。判定：只有该端口那台重启，其它端口与桥不受影响。
   **2026-10-15 真机通过（已按拆分后的命令号重验）**：命令族已拆为 **`REQUEST_BOOTLOADER (0x02)`（刷写
   工具用：请引导）与 `RESTART_DEVICE (0x05)`（重启固件）**；`restart_method: admin` 走 **0x05**。
@@ -174,12 +174,17 @@
   **只有 index 指到本机在用端口时才消费，否则穿透给本机设备半**（`src/bridge.c`）。
   仍未验：真桥板带下游端口时的「只那台重启、其它不受影响」；无 bootloader 的板子上 `0x02` 仍是
   设计内 no-op（该命令给刷写工具用）。
-- [x] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
+- [x] **M2-3 复位后的确认路径（无回执）** —— 端口级命令（`0x02`–`0x05`）都没有回执，主机如何知道复位已发生
   （重握手 / 等 `NEED_NODEID` / 重新 identify）。判定：`FIRMWARE_RESTART` 后会话确实重建，不出现
   「命令发了但设备没重启」的静默假成功；旧固件（不能答 admin）仍回退到 `command`。
   **2026-10-15 真机通过**：恰好拿到「设备没真重启」的反例——主机没有假成功，而是点名报出
   `cannot configure MCU: Failed automated reset: MCU 'child' is still configured (CRC 0x890098f7)`，
   并先走会话接管路径（`Firmware is still in an earlier session (sequence 6); taking it over`）。
+- [ ] **M2-4 `REQUEST_BOOTLOADER (0x02)` 的正向验收（需一块带 bootloader 的板）** —— 本机这台 stm32f103ze
+  是 `FLASH_START_0000` 且未开 CAN，`bootloader_request()` 没有可走的路径 ⇒ 0x02 目前只验到「命令上到
+  线上、设备不响应」这一半（见下面「上板发现的前置条件 B」）。真实测试：换一块下游固件带**可软件进入的
+  bootloader**（CanBoot / USB-HID）的板，对它的端口发 `0x02`。判定：该板真的停在 bootloader 里（刷写工具
+  能连上，或板子自报 bootloader 内容），桥与同桥其它端口不受影响。
 - [ ] **M1-4 CAN 上游 attach（P5 余项）** —— 桥经 CAN 连（固件 `CONFIG_MUX_CAN`，主机需走
   `interface/devices/canserial.rs` 的端口级单元发送路径）。真实测试：先经单帧 admin `0x3f0` 指派
   node id，再经**单元**完成 mux 扫描/采纳（`SET_KLIPPER_NODEID`）、确认本节点回帧带应答头、
@@ -192,6 +197,15 @@
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
   admin 单元属点火不管）的频率也需观察。
+- [ ] **M1-5 板做桥（MCU 侧 UART 端口后端）** —— M1-1/M1-2 验的都是「宿主库当桥 + 真板当下游」，「一块
+  真板当桥、其 uart 接下游」今天配置不出来：`CONFIG_SERIAL_UART`（UART 对象层）只有 host 库后端
+  （`src/host/bridge.c`），MCU 侧没有 `bridge_port_ops` 实现。真实测试（待端口后端落地后）：真板开
+  `CONFIG_BRIDGE` + 一个下游端口，下游分别接旧固件板（legacy）与能答 admin 的板（命名）各一次。判定：
+  同 M1-1/M1-2 的 identify + `get_clock`，命令经真板的桥半转发，且 `irq_save()` 段内时序无丢帧。
+- [ ] **P6 多站串口（RS-485 一类）** —— 端口后端（半双工收发 + 方向控制）尚未实现，主机侧「一个串口
+  端口节被多颗命名 `[mcu]` 引用」的分组与判定已有（都带头、各自走自己的 `uuid → id`）。真实测试（待后端
+  落地 + 485 硬件/收发器）：一条多站线挂 ≥2 台说单元的设备，各自的 id 分配与数据帧都正确路由；对照：
+  单设备 legacy 端口仍是剥头/加头。判定：两侧会话都稳定、无串扰。
 - **M1-2 的软件侧等价物已永久入库**（真 `klipper.elf` 当命名下游走真桥，`-U` 身份 = 配置 `uuid:`），
   所以上面 M1-2 真机项只需验**真板/真时序**（扫描/指派/冲突、`irq_save()` 时序、两个真设备同桥）。
 
@@ -202,13 +216,13 @@
 
 **为这次上板补的固件改动**（子模组）：USB CDC 控制台接 mux（`src/generic/usb_cdc.c` 的 rx/tx 两个
 接点与 `mux_send`）、`MUX_SERIAL` 依赖放宽为 `SERIAL || USBSERIAL`（此前 USB 控制台的板子 `SERIAL=n`，
-根本选不了 mux）、以及 `Makefile` 的 `src-y := $(sort $(src-y))`（`chipid.c` 被多载体各列一次 ⇒ 重复
-定义 + 重复 `compile_time_request`）。板子 `.config` 现为 `CONFIG_USBSERIAL=y + CONFIG_MUX_SERIAL=y`。
+根本选不了 mux）、以及 `Makefile` 的 `src-y := $(call uniq,$(src-y))`（保留首次出现的**保序去重**；
+`chipid.c` 被多载体各列一次 ⇒ 重复定义 + 重复 `compile_time_request`）。板子 `.config` 现为 `CONFIG_USBSERIAL=y + CONFIG_MUX_SERIAL=y`。
 
 **跑成的**：① `klipperx scan --port /dev/ttyACM1` → `uuid=e512c60ac0e6`（= 该板 UID 的 chipid 派生，
 已用仓库自带 C 版 fasthash64 独立复算一致）⇒ 真机 mux 扫描与身份；② M1-2（宿主库当桥 + 真板命名
 下游）整链 identify（bridge 22 / child 135）；③ M1-3（点名配置错误）；④ M2-3（主机对「复位没发生」
-的显式判定）；⑤ M2-2 控制路径（`RESET_DEVICE` 经桥转发）。
+的显式判定）；⑤ M2-2 控制路径（`RESTART_DEVICE` 经桥转发）。
 
 **上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
 B) `REQUEST_BOOTLOADER (0x02)` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）
@@ -221,8 +235,9 @@ C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「�
 ——默认频率下刷写会**静默失败**（报成功但板上还是旧镜像），chip erase + halt + 1 MHz 才可靠；
 另外**核心处于 sleep 时经 SWD 读内存会全返回 `0xFF`**（必须先 `halt`），否则会误判「flash 是空的」。
 
-**两条语义要分清（真机实测）**：
-- `restart_method: admin`（`RESET_DEVICE`）＝**请求 bootloader**（面向刷写/恢复），无 bootloader 的下游它是 no-op。
+**三条语义要分清（真机实测）**：
+- `REQUEST_BOOTLOADER (0x02)`＝**请求进 bootloader**（面向刷写/恢复，**不属** `restart_method` 的取值）；无 bootloader 的下游它是设计内 no-op。
+- `restart_method: admin`＝经桥转发 **`RESTART_DEVICE (0x05)`**，让下游**命名设备重启自己的固件**（不是进引导）。
 - `restart_method: command`（下游桥端口的默认）＝**重启固件本身**：主机把固件的 `reset` 命令当普通帧经**桥按 id 转发**给那台设备（固件侧 `command_reset` → `NVIC_SystemReset()`），**不需要 bootloader**。真机验过：`MCU 'child': resetting the firmware with the 'reset' command` ⇒ 板子确实重启（USB 重新枚举，`ttyACM1` → `ttyACM2`），复位后 `klipperx scan --port /dev/ttyACM2` 仍报同一身份 `e512c60ac0e6`（身份是 chipid 派生，跨复位稳定）。
 - **USB CDC 下游的复位会拖累宿主库桥，但现在会自恢复**：下游重新枚举期间 `/dev/ttyACM1` 消失（可能换号），
   桥那一侧此时 `config_uart` 打不开 tty ⇒ `MCU 'bridge' shutdown during connect: config_uart: the UART

@@ -792,6 +792,37 @@ linux 用 `execv`、host 库 no-op）+ `3bd1df7d`（两个 MCU mux 矩阵目标�
 4. 修后真机验证：`FIRMWARE_RESTART` → `resetting bridge port 0 with RESTART_DEVICE` → 板子 USB
    **重新枚举**（`ttyACM2` → `ttyACM1`）⇒ 点名重启真的生效了。
 
+### 11.2 桥端口 tty 丢失后的自动恢复（2026-10-15 晚）
+
+背景：11.1 的真机验证里，设备被 0x05 重启后**USB 重新枚举**，宿主库桥这一刻 `config_uart` 打不开 tty
+⇒ 固件锁存 shutdown ⇒ 整台打印机进 error（旧结论：「这个拓扑下不可能在同一会话内恢复」）。用户要求：
+**给 host 也提供重启能力（重走 init），并用固定 by-id/by-path 打开**。
+
+**D31（选 B）**：不做新缝口、不改 `third_party/`。宿主库的「重走 init」就是既有生命周期——最后一个
+引用析构 → `klipper_host_shutdown` + 卸载 → 下次装载**重新映射 + 重新 `init`**，端口表每次 bring-up
+都会按 `uart_path:` 重新登记；所以只需：**桥 bring-up 因端口打不开而失败时，有界等路径回来（≤10s/100ms），
+再请求一次 plain restart**（plain 而非 `firmware_restart`，避免把子设备再点一次 0x05 ⇒ 循环）。
+否掉 A（给 `McuChip` 加 `detach` seam 做「只重启桥会话」：价值不足、跨层新缝口）；C（库侧补 `config_reset`
+让 host 能原地复活会话）**记为独立后续议题**——库字典里既无 `reset` 也无 `config_reset`（只有
+`clear_shutdown`）、`oid_alloc` 拒重复 oid ⇒ 同映射确实无法原地重配置。
+
+**提交**：主机 `76161c4` + P1 修复 `f79aab7`（合入 `49ea8fb`）。
+
+**评审抓出的 P1（真问题，已修）**：恢复**没有预算** ⇒ 「路径**存在**但 `open` 失败」（`uart_path` 指到
+目录 EISDIR / 无权限 / 被占 / 槽越界——固件一律同一条 NO_DEVICE 文案）会变成 **~1s 周期永不停歇的
+restart 循环**（比改前的稳定 error 更糟）。修法：恢复预算挂在 **`Printer`** 上按节名记
+（`claim_bridge_port_recovery` / `clear_bridge_port_recovery`——不能挂每轮重建的 `McuObject`），请求重启前
+claim、该 MCU **成功 connect 后归还**：真实丢端口仍能恢复一次，“一直在但打不开”只重启一次便稳定 error。
+新增对照测试（`uart_path` 指目录 ⇒ 至多一次重启）4.8s 绿。
+
+**验收**：三条新测试串行 1.8s / 12.3s / 4.8s（全程有界，不再有上次那种挂死）；`bridge_attach` 22 测、
+`object` 36、`restart` 14；全量闸门 3252 passed / 0 failed / 13 ignored；fmt 干净、`--all-targets` 0 告警。
+
+**仍未覆盖（登记为后续）**：设备在 **child 连接期间**被 0x05 重启（桥已 up、fd 已死）时**不**触发本
+恢复（本单元的触发面是“桥自己的 bring-up 失败”）；这种情况要等下一次 `FIRMWARE_RESTART`，那时才会命中
+恢复。可选后续：把同一判定（能辨识到那个端口路径）加到 child 侧。另：若一次恢复请求了重启但重启后始终
+没能 connect，预算不会被归还 ⇒ 同一打印机内不再自动恢复第二次（需人工 `FIRMWARE_RESTART`）。
+
 ### 仍未验 / 缺件（真机与后续）
 
 1. **板做桥**（M1-1/M1-2 的另一半）：MCU 侧没有 UART 端口后端（`CONFIG_SERIAL_UART` 只有 host 库实现）⇒

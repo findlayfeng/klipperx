@@ -116,7 +116,7 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 | `arduino` | 以 2400 波特打开串口，翻转 DTR | 串口**缺省**值；Arduino 及克隆板 |
 | `cheetah` | 以 2400 波特做一串 RTS/DTR 时序 | Fysetc Cheetah v1.2 等采用状态机 bootloader 电路的板子 |
 | `rpi_usb` | 切断再恢复该 USB 端口的供电 | 树莓派等能给 USB 口断电的机器 |
-| `admin` | 经桥转发 `RESTART_DEVICE (0x05)`，让该设备**重启自己的固件**（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **仅用于桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」 |
+| `admin` | 经桥转发 `RESTART_DEVICE (0x05)`，让该设备**重启自己的固件**（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **仅用于桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」。**设备重启会重新枚举 USB**：下游是 USB CDC 时，宿主库桥会因打不开该端口而失败——主机会**有界等 `uart_device` 的 `uart_path` 回来**（≤10s，建议写 by-id/by-path），回来就请求一次 plain restart（重走库会话、按配置重新登记端口）从而自动恢复；每个 MCU 只有一次这样的恢复预算（成功连上即归还），所以「路径在但一直打不开」只会重启一次便停在 error |
 
 ```ini
 [mcu]

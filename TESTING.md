@@ -224,11 +224,16 @@ C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「�
 **两条语义要分清（真机实测）**：
 - `restart_method: admin`（`RESET_DEVICE`）＝**请求 bootloader**（面向刷写/恢复），无 bootloader 的下游它是 no-op。
 - `restart_method: command`（下游桥端口的默认）＝**重启固件本身**：主机把固件的 `reset` 命令当普通帧经**桥按 id 转发**给那台设备（固件侧 `command_reset` → `NVIC_SystemReset()`），**不需要 bootloader**。真机验过：`MCU 'child': resetting the firmware with the 'reset' command` ⇒ 板子确实重启（USB 重新枚举，`ttyACM1` → `ttyACM2`），复位后 `klipperx scan --port /dev/ttyACM2` 仍报同一身份 `e512c60ac0e6`（身份是 chipid 派生，跨复位稳定）。
-- **但 USB CDC 下游的复位会拖累宿主库桥**：下游重新枚举后 `/dev/ttyACM1` 消失（可能换号），而桥的 `klipper_host_port()` 只能在 `init` 前登记、本会话无法重开 ⇒
-  `bridge serial: /dev/ttyACM1 failed: (2)No such file or directory` → `MCU 'bridge' shutdown during connect:
-  config_uart: the UART device could not be opened`。结论：**宿主机库桥 + USB CDC 下游**这个拓扑里，
-  「复位下游」不可能在同一会话内恢复（要么重启主机并改路径，要么下游走 UART——那正是
-  「板做桥」拓扑，也是它真正的价值所在）。
+- **USB CDC 下游的复位会拖累宿主库桥，但现在会自恢复**：下游重新枚举期间 `/dev/ttyACM1` 消失（可能换号），
+  桥那一侧此时 `config_uart` 打不开 tty ⇒ `MCU 'bridge' shutdown during connect: config_uart: the UART
+device could not be opened`。主机会**有界等该端口路径回来**（≤10s、100ms 轮询；`uart_path:` 用
+  **by-id/by-path** 这种稳定路径），回来就请求一次 **plain restart**（不是 `firmware_restart`，避免把子设备
+  再点一次 `RESTART_DEVICE`）——进程级重启会 `klipper_host_shutdown` + 卸载 + 重新映射 + 重新 `init`，
+  并按配置重新登记端口，于是下一轮 bring-up 拿到已回来的 tty ⇒ **自动恢复**。每个 MCU 只有一份恢复
+  预算（`Printer::claim_bridge_port_recovery`，成功 connect 后归还）：所以「tty 在、但 open 一直失败」
+  （目录/无权限/被占/槽越界）只会重启**一次**、随后稳定停在 error，不会重启风暴；路径始终不存在则
+  有界等待后仍点名报错（M1-3 行为不变）。尚未覆盖：设备是在 **child 连接期间**被 0x05 重启
+  （桥已 up、fd 已死）时不触发本恢复，下一次 `FIRMWARE_RESTART` 才能命中（见台账 §11.2）。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 

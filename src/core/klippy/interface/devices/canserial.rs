@@ -2,20 +2,25 @@
 //!
 //! Klipper does not put its protocol *on* CAN: the firmware takes the same byte
 //! stream it would write to a serial port (length, sequence, CRC, SYNC — see
-//! [`Frame`]) and chops it into 8-byte CAN frames (`src/generic/canserial.c`).
+//! [`Frame`]) and chops it into CAN frames (`src/generic/canserial.c`).
 //! The bus contributes exactly two things, the arbitration id that picks a node
-//! and eight data bytes per frame, which is why this module sits next to the
-//! serial device: reassembly is the same [`FrameStream`] every byte-stream device
-//! uses, and the CAN part is a chunking rule plus addressing.
+//! and a fixed number of data bytes per frame, which is why this module sits next
+//! to the serial device: reassembly is the same [`FrameStream`] every byte-stream
+//! device uses, and the CAN part is a chunking rule plus addressing.
+//!
+//! How many bytes a frame carries is the link's *wire* ([`CanWire`]): a classical
+//! CAN link cuts the stream every 8 bytes, a CAN FD one every 64. The two are not
+//! interchangeable — the kernel's frame structs are 16 and 72 bytes, and a socket
+//! reads a datagram by its length — so a link says which wire it is once, and
+//! everything downstream of it is sized from that.
 //!
 //! Addressing follows Klipper (`klippy/serialhdl.py`): a node id maps to an
 //! arbitration id through the mapping every transport shares
 //! ([`crate::core::klippy::assign::arb_id`]), the host writes to that id, and the
-//! MCU answers on the next one. Only classical frames are used: 11-bit ids and 8
-//! data bytes, never extended ids or CAN FD.
+//! MCU answers on the next one. Both wires use 11-bit ids, never extended ones.
 //!
 //! ```text
-//!   send(Frame) ─► bytes ─► 8 byte CAN frames (id = tx_id) ──────► can0
+//!   send(Frame) ─► bytes ─► 8/64 byte CAN frames (id = tx_id) ──────► can0
 //!   receive()   ◄── FrameStream ◄── data bytes (id = tx_id + 1) ◄─ can0
 //! ```
 //!
@@ -76,9 +81,17 @@ use tracing::{debug, info, trace, warn};
 /// Data bytes in one classical CAN frame.
 pub const CAN_DATA_BYTES: usize = 8;
 
-/// Size of the kernel's `struct can_frame`, which is what a raw socket reads and
-/// writes one datagram at a time.
+/// Data bytes in one CAN FD frame.
+pub const CAN_FD_DATA_BYTES: usize = 64;
+
+/// Size of the kernel's `struct can_frame`, which is what a classical raw socket
+/// reads and writes one datagram at a time.
 const CAN_FRAME_SIZE: usize = 16;
+
+/// Size of the kernel's `struct canfd_frame`: four bytes of header, then 64 data
+/// bytes. Its `len` sits at the same offset 4 and its data at the same offset 8 as
+/// the classical struct's, so one layout serves both and only the length differs.
+const CAN_FD_FRAME_SIZE: usize = 72;
 
 /// Klipper's admin arbitration id, and the commands and answers that travel on
 /// it (`klippy/serialhdl.py`, `src/generic/canserial.c`): the one that tells an
@@ -101,6 +114,7 @@ const CAN_RTR_FLAG: u32 = 0x4000_0000;
 const CAN_RAW: libc::c_int = 1;
 const SOL_CAN_RAW: libc::c_int = 101;
 const CAN_RAW_FILTER: libc::c_int = 1;
+const CAN_RAW_FD_FRAMES: libc::c_int = 5;
 
 /// `struct sockaddr_can`, whose address union is unused for raw sockets.
 #[repr(C)]
@@ -117,24 +131,94 @@ struct CanFilter {
     can_mask: u32,
 }
 
-/// One classical CAN frame: an 11-bit arbitration id and up to 8 data bytes.
+/// The shape of a CAN link: which kernel frame struct it carries, and with it how
+/// many data bytes one frame holds.
+///
+/// A link is one wire or the other, never both. The kernel reads a datagram by its
+/// length — `can_frame` at 16 bytes, `canfd_frame` at 72 — and a socket that has
+/// not asked for CAN FD drops FD frames rather than failing loudly, so which wire a
+/// link speaks is decided once, when its socket is opened
+/// ([`CanSerialDevice::open`] for the classical wire,
+/// [`CanSerialDevice::open_with_wire`] for either).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CanWire {
+    /// Classical CAN: `struct can_frame`, eight data bytes.
+    Classical,
+    /// CAN FD: `struct canfd_frame`, sixty-four data bytes.
+    Fd,
+}
+
+impl CanWire {
+    /// How many data bytes one frame on this wire carries.
+    pub fn data_bytes(self) -> usize {
+        match self {
+            Self::Classical => CAN_DATA_BYTES,
+            Self::Fd => CAN_FD_DATA_BYTES,
+        }
+    }
+
+    /// How many bytes this wire's kernel frame struct is: the size of one
+    /// datagram, read or written.
+    fn frame_size(self) -> usize {
+        match self {
+            Self::Classical => CAN_FRAME_SIZE,
+            Self::Fd => CAN_FD_FRAME_SIZE,
+        }
+    }
+
+    /// The wire's name, as logs and errors spell it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Classical => "classical CAN",
+            Self::Fd => "CAN FD",
+        }
+    }
+}
+
+/// One frame as the kernel lays it out, ready to be written as a single datagram.
+///
+/// Both wires share the layout — native-endian id, the length at offset 4, the data
+/// from offset 8 — and differ only in length, so the bytes are held in the larger
+/// struct and the wire says how much of it goes out. Keeping the length with the
+/// bytes is what stops a classical frame from leaving as 72 bytes, which the kernel
+/// would read back as a CAN FD frame.
+#[derive(Debug)]
+struct AbiFrame {
+    wire: CanWire,
+    bytes: [u8; CAN_FD_FRAME_SIZE],
+}
+
+impl AbiFrame {
+    /// The datagram: `wire`'s own number of bytes.
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.wire.frame_size()]
+    }
+}
+
+/// One CAN frame: an 11-bit arbitration id and up to [`CAN_FD_DATA_BYTES`] data
+/// bytes.
+///
+/// The type holds the largest frame either wire has. How many of those bytes a
+/// frame may actually carry is the wire's business, and is enforced where a frame
+/// meets one ([`CanFrame::to_abi`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanFrame {
     id: u32,
     len: u8,
-    data: [u8; CAN_DATA_BYTES],
+    data: [u8; CAN_FD_DATA_BYTES],
 }
 
 impl CanFrame {
-    /// A frame carrying `data`, which has to fit in one CAN frame.
+    /// A frame carrying `data`, which has to fit in one CAN frame: sixty-four
+    /// bytes, the larger of the two wires'.
     pub fn new(id: u32, data: &[u8]) -> Result<Self, InterfaceError> {
-        if data.len() > CAN_DATA_BYTES {
+        if data.len() > CAN_FD_DATA_BYTES {
             return Err(InterfaceError::Other(format!(
                 "{} bytes do not fit in one CAN frame",
                 data.len()
             )));
         }
-        let mut bytes = [0u8; CAN_DATA_BYTES];
+        let mut bytes = [0u8; CAN_FD_DATA_BYTES];
         bytes[..data.len()].copy_from_slice(data);
         Ok(Self {
             id,
@@ -153,29 +237,41 @@ impl CanFrame {
         &self.data[..self.len as usize]
     }
 
-    /// The kernel's layout: native-endian id, length, three reserved bytes, then
-    /// the eight data bytes.
-    fn to_abi(self) -> [u8; CAN_FRAME_SIZE] {
-        let mut raw = [0u8; CAN_FRAME_SIZE];
-        raw[..4].copy_from_slice(&self.id.to_ne_bytes());
-        raw[4] = self.len;
-        raw[8..].copy_from_slice(&self.data);
-        raw
+    /// The kernel's layout for `wire`: native-endian id, length, reserved bytes,
+    /// then the data — sixteen bytes for classical CAN, seventy-two for CAN FD.
+    ///
+    /// # Errors
+    /// A frame whose data does not fit `wire` has no such layout, its length byte
+    /// being unable to describe it, and is refused rather than truncated or padded.
+    /// This is where the two layouts are kept from crossing.
+    fn to_abi(self, wire: CanWire) -> Result<AbiFrame, InterfaceError> {
+        if self.len as usize > wire.data_bytes() {
+            return Err(InterfaceError::Other(format!(
+                "{} bytes do not fit a {} frame",
+                self.len,
+                wire.name()
+            )));
+        }
+        let mut bytes = [0u8; CAN_FD_FRAME_SIZE];
+        bytes[..4].copy_from_slice(&self.id.to_ne_bytes());
+        bytes[4] = self.len;
+        bytes[8..wire.frame_size()].copy_from_slice(&self.data[..wire.data_bytes()]);
+        Ok(AbiFrame { wire, bytes })
     }
 
-    /// Parse the kernel's layout. Ids longer than 11 bits are extended frames,
-    /// which nothing here uses.
-    fn from_abi(raw: &[u8; CAN_FRAME_SIZE]) -> Self {
+    /// Parse the kernel's layout for `wire`. Ids longer than 11 bits are extended
+    /// frames, which nothing here uses.
+    fn from_abi(wire: CanWire, raw: &[u8; CAN_FD_FRAME_SIZE]) -> Self {
         let id = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]) & CAN_SFF_MASK;
-        let len = raw[4].min(CAN_DATA_BYTES as u8);
-        let mut data = [0u8; CAN_DATA_BYTES];
-        data.copy_from_slice(&raw[8..]);
+        let len = raw[4].min(wire.data_bytes() as u8);
+        let mut data = [0u8; CAN_FD_DATA_BYTES];
+        data[..wire.data_bytes()].copy_from_slice(&raw[8..wire.frame_size()]);
         Self { id, len, data }
     }
 }
 
-/// One CAN frame as the bus carries it: its arbitration id, then its eight data
-/// bytes — a *slice* of a message block rather than a block of its own.
+/// One CAN frame as the bus carries it: its arbitration id, then its data bytes —
+/// a *slice* of a message block rather than a block of its own.
 ///
 /// The block is described with [`describe_frame`](crate::core::klippy::interface::describe_frame) once its
 /// slices are together again; this is the other half of the story, and the two
@@ -244,16 +340,21 @@ impl CanSerialLink {
         self.tx_id + 1
     }
 
-    /// Split an outgoing byte stream into CAN frames.
+    /// Split an outgoing byte stream into CAN frames for `wire`.
     ///
-    /// This is the whole of the CAN framing: the stream is cut every eight bytes,
-    /// because the bus carries eight bytes per frame. Where a message block begins
-    /// and ends is the block header's business, not the bus's.
-    pub fn frames<'a>(&'a self, bytes: &'a [u8]) -> impl Iterator<Item = CanFrame> + 'a {
+    /// This is the whole of the CAN framing: the stream is cut every
+    /// [`wire.data_bytes()`](CanWire::data_bytes) bytes, because that is how many
+    /// the bus carries per frame. Where a message block begins and ends is the
+    /// block header's business, not the bus's.
+    pub fn frames<'a>(
+        &'a self,
+        bytes: &'a [u8],
+        wire: CanWire,
+    ) -> impl Iterator<Item = CanFrame> + 'a {
         let tx_id = self.tx_id;
-        bytes
-            .chunks(CAN_DATA_BYTES)
-            .map(move |chunk| CanFrame::new(tx_id, chunk).expect("chunks are at most eight bytes"))
+        bytes.chunks(wire.data_bytes()).map(move |chunk| {
+            CanFrame::new(tx_id, chunk).expect("a chunk is at most one frame's worth")
+        })
     }
 
     /// Take one frame off the bus.
@@ -459,12 +560,14 @@ pub fn query_unassigned(
 /// repository's test environment — it has no CAN interface and `vcan` needs
 /// privileges to load — so it is covered by compilation only. Its shape is the
 /// usual SocketCAN recipe: raw socket, bind to the interface index, kernel filter
-/// for the MCU's answer id, one `can_frame` per read and write.
+/// for the MCU's answer id, one frame per read and write, sized by [`CanWire`].
 pub struct CanSerialDevice {
     socket: File,
     interface: String,
     uuid: [u8; 6],
     nodeid: u32,
+    /// The link's shape: what one frame holds and how large a datagram is.
+    wire: CanWire,
     link: Mutex<CanSerialLink>,
     stopped: AtomicBool,
 }
@@ -479,18 +582,40 @@ impl CanSerialDevice {
         )
     }
 
-    /// Open `interface` and bring the MCU `uuid` up as node `nodeid`.
+    /// Open `interface` and bring the MCU `uuid` up as node `nodeid` — the
+    /// classical CAN link.
     ///
     /// The node id lives in the host, not in the MCU: this sends Klipper's admin
     /// frame before any traffic, and the MCU starts answering on the node's
-    /// arbitration id only after it has seen its UUID and new id.
+    /// arbitration id only after it has seen its UUID and new id. This is
+    /// [`CanSerialDevice::open_with_wire`] on [`CanWire::Classical`].
+    ///
+    /// # Errors
+    /// The same as [`CanSerialDevice::open_with_wire`].
+    pub fn open(interface: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
+        Self::open_with_wire(interface, uuid, nodeid, CanWire::Classical)
+    }
+
+    /// Open `interface` on `wire` and bring the MCU `uuid` up as node `nodeid`.
+    ///
+    /// The wire is what the link is *sized* by: a CAN FD link carries sixty-four
+    /// data bytes per frame and every datagram on its socket is seventy-two bytes.
+    /// It is therefore not a preference but a pairing with the other end — an MCU
+    /// built without CAN FD and a host that opened the FD wire (or the other way
+    /// round) cannot hear each other, because the kernel drops the frames instead
+    /// of reporting them.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the node id is outside `1..=MAX_MCU_ID`
     /// (`0xff`), the interface does not exist, the socket cannot be created (no
-    /// CAN support), it cannot be bound or filtered, or the node id could not be
-    /// handed over.
-    pub fn open(interface: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
+    /// CAN support), it cannot be bound or filtered, CAN FD cannot be enabled on
+    /// it, or the node id could not be handed over.
+    pub fn open_with_wire(
+        interface: &str,
+        uuid: [u8; 6],
+        nodeid: u32,
+        wire: CanWire,
+    ) -> Result<Self, InterfaceError> {
         // Checked before the socket is opened: an unaddressable node id is a
         // configuration mistake, not a bus one, and the bus is not touched for it.
         let tx_id = assign::arb_id(nodeid).ok_or_else(|| {
@@ -500,18 +625,19 @@ impl CanSerialDevice {
         })?;
         let link = CanSerialLink::with_arbitration_id(tx_id);
         let index = interface_index(interface)?;
-        let socket = open_socket()?;
+        let socket = open_socket(wire)?;
         bind_interface(&socket, index)?;
         filter_answers(&socket, link.rx_id())?;
 
         let assignment = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, nodeid))?;
         (&socket)
-            .write_all(&assignment.to_abi())
+            .write_all(assignment.to_abi(wire)?.as_bytes())
             .map_err(|e| InterfaceError::Other(format!("failed to send the node id: {e}")))?;
 
         info!(
-            "can serial link ready on {interface}: node {nodeid} assigned, writing to {:#x}, \
-             reading {:#x}",
+            "can serial link ready on {interface} ({}): node {nodeid} assigned, writing to \
+             {:#x}, reading {:#x}",
+            wire.name(),
             link.tx_id(),
             link.rx_id()
         );
@@ -520,6 +646,7 @@ impl CanSerialDevice {
             interface: interface.to_string(),
             uuid,
             nodeid,
+            wire,
             link: Mutex::new(link),
             stopped: AtomicBool::new(false),
         })
@@ -560,7 +687,7 @@ impl CanSerialDevice {
         }
 
         trace!("tx frame [{}]: {}", self.id(), describe_frame(bytes));
-        let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(bytes).collect();
+        let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(bytes, self.wire).collect();
         for can_frame in &frames {
             // The block's bytes as the bus sees them, one CAN frame at a time.
             trace!(
@@ -569,7 +696,7 @@ impl CanSerialDevice {
                 describe_can_frame(can_frame.id(), can_frame.data())
             );
             (&self.socket)
-                .write_all(&can_frame.to_abi())
+                .write_all(can_frame.to_abi(self.wire)?.as_bytes())
                 .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))?;
         }
         debug!(
@@ -659,7 +786,9 @@ impl Device for CanSerialDevice {
     }
 
     fn receive(&self) -> Option<Frame> {
-        let mut raw = [0u8; CAN_FRAME_SIZE];
+        // The largest datagram either wire delivers; a classical read fills the
+        // first sixteen bytes of it.
+        let mut raw = [0u8; CAN_FD_FRAME_SIZE];
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
@@ -683,8 +812,8 @@ impl Device for CanSerialDevice {
             }
 
             match (&self.socket).read(&mut raw) {
-                Ok(read) if read >= CAN_FRAME_SIZE => {
-                    let can_frame = CanFrame::from_abi(&raw);
+                Ok(read) if read >= self.wire.frame_size() => {
+                    let can_frame = CanFrame::from_abi(self.wire, &raw);
                     if self.link.lock().unwrap().accept(&can_frame) {
                         // One CAN frame's worth of the block, as the bus carried
                         // it; the assembled block is logged above, on its way out.
@@ -725,13 +854,21 @@ impl Device for CanSerialDevice {
 /// [`AdminBus`] rather than a socket.
 #[cfg(test)]
 impl CanSerialDevice {
+    /// A device on the classical wire's fake bus.
     pub(crate) fn test_wire(nodeid: u32) -> (Self, UnixStream) {
-        let (wire, reader) = UnixStream::pair().expect("a socket pair");
+        Self::test_wire_on(nodeid, CanWire::Classical)
+    }
+
+    /// The same on `wire`: a CAN FD link's fake bus carries seventy-two byte
+    /// records, and its device reads the same.
+    pub(crate) fn test_wire_on(nodeid: u32, wire: CanWire) -> (Self, UnixStream) {
+        let (socket, reader) = UnixStream::pair().expect("a socket pair");
         let device = Self {
-            socket: File::from(OwnedFd::from(wire)),
+            socket: File::from(OwnedFd::from(socket)),
             interface: "test0".to_string(),
             uuid: [0; 6],
             nodeid,
+            wire,
             link: Mutex::new(
                 CanSerialLink::for_node(nodeid).expect("a test node id is in the CAN range"),
             ),
@@ -742,16 +879,24 @@ impl CanSerialDevice {
 }
 
 /// Every CAN record the device on a [`test wire`](CanSerialDevice::test_wire) has
-/// written, taken off the reader end the way a receiving link reads the bus.
+/// written, taken off the reader end the way a receiving link reads the classical
+/// bus.
+#[cfg(test)]
+pub(crate) fn read_wire(wire: &mut UnixStream) -> Vec<CanFrame> {
+    read_wire_on(wire, CanWire::Classical)
+}
+
+/// The same for a device on `can_wire`'s wire: a CAN FD link's records are
+/// seventy-two bytes each, not sixteen.
 ///
 /// A socket pair is a *stream*, so one read can come back short: this drains until
 /// the wire is empty, then parses whole records out of the bytes.
 #[cfg(test)]
-pub(crate) fn read_wire(wire: &mut UnixStream) -> Vec<CanFrame> {
+fn read_wire_on(wire: &mut UnixStream, can_wire: CanWire) -> Vec<CanFrame> {
     wire.set_nonblocking(true)
         .expect("the test wire takes a non-blocking flag");
     let mut raw = Vec::new();
-    let mut buf = [0u8; CAN_FRAME_SIZE];
+    let mut buf = [0u8; CAN_FD_FRAME_SIZE];
     loop {
         match wire.read(&mut buf) {
             Ok(0) => break,
@@ -761,15 +906,15 @@ pub(crate) fn read_wire(wire: &mut UnixStream) -> Vec<CanFrame> {
         }
     }
     assert_eq!(
-        raw.len() % CAN_FRAME_SIZE,
+        raw.len() % can_wire.frame_size(),
         0,
         "the device writes whole CAN records"
     );
-    raw.chunks(CAN_FRAME_SIZE)
+    raw.chunks(can_wire.frame_size())
         .map(|record| {
-            let mut abi = [0u8; CAN_FRAME_SIZE];
-            abi.copy_from_slice(record);
-            CanFrame::from_abi(&abi)
+            let mut abi = [0u8; CAN_FD_FRAME_SIZE];
+            abi[..can_wire.frame_size()].copy_from_slice(record);
+            CanFrame::from_abi(can_wire, &abi)
         })
         .collect()
 }
@@ -789,26 +934,44 @@ pub(crate) fn read_wire(wire: &mut UnixStream) -> Vec<CanFrame> {
 pub struct CanbusAdminSocket {
     socket: File,
     interface: String,
+    /// The link's shape, as for [`CanSerialDevice`]: an admin scan on a CAN FD
+    /// bus reads and writes seventy-two byte datagrams.
+    wire: CanWire,
 }
 
 impl CanbusAdminSocket {
-    /// Open `interface` and listen for answers to the admin broadcast.
+    /// Open `interface` and listen for answers to the admin broadcast — the
+    /// classical CAN link.
+    ///
+    /// # Errors
+    /// The same as [`CanbusAdminSocket::open_with_wire`].
+    pub fn open(interface: &str) -> Result<Self, InterfaceError> {
+        Self::open_with_wire(interface, CanWire::Classical)
+    }
+
+    /// Open `interface` on `wire` and listen for answers to the admin broadcast.
+    ///
+    /// The broadcast itself is the same either way — one data byte on the admin
+    /// id, and the answers the same seven or eight — but the frames that carry it
+    /// are the wire's size, so a scan has to be told which bus it is on.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the interface does not exist, or the
-    /// socket cannot be created, bound or filtered.
-    pub fn open(interface: &str) -> Result<Self, InterfaceError> {
+    /// socket cannot be created, bound, filtered, or given CAN FD frames.
+    pub fn open_with_wire(interface: &str, wire: CanWire) -> Result<Self, InterfaceError> {
         let index = interface_index(interface)?;
-        let socket = open_socket()?;
+        let socket = open_socket(wire)?;
         bind_interface(&socket, index)?;
         filter_answers(&socket, ADMIN_ID + 1)?;
         debug!(
-            "admin socket ready on {interface}, listening for {:#x}",
+            "admin socket ready on {interface} ({}), listening for {:#x}",
+            wire.name(),
             ADMIN_ID + 1
         );
         Ok(Self {
             socket,
             interface: interface.to_string(),
+            wire,
         })
     }
 }
@@ -833,12 +996,14 @@ impl AdminBus for CanbusAdminSocket {
             describe_can_frame(frame.id(), frame.data())
         );
         (&self.socket)
-            .write_all(&frame.to_abi())
+            .write_all(frame.to_abi(self.wire)?.as_bytes())
             .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))
     }
 
     fn receive(&mut self, wait: Duration) -> Result<Option<CanFrame>, InterfaceError> {
-        let mut raw = [0u8; CAN_FRAME_SIZE];
+        // The largest datagram either wire delivers; a classical read fills the
+        // first sixteen bytes of it.
+        let mut raw = [0u8; CAN_FD_FRAME_SIZE];
         loop {
             match wait_readable(self.socket.as_raw_fd(), wait) {
                 Wait::Readable => {}
@@ -850,7 +1015,9 @@ impl AdminBus for CanbusAdminSocket {
                 Wait::Closed => return Err(InterfaceError::ConnectionLost),
             }
             match (&self.socket).read(&mut raw) {
-                Ok(read) if read >= CAN_FRAME_SIZE => return Ok(Some(CanFrame::from_abi(&raw))),
+                Ok(read) if read >= self.wire.frame_size() => {
+                    return Ok(Some(CanFrame::from_abi(self.wire, &raw)))
+                }
                 // A datagram socket delivers whole frames, and the filter keeps
                 // everything but the admin answers out; treat a short read as
                 // someone else's frame rather than guessing.
@@ -925,8 +1092,9 @@ fn interface_index(interface: &str) -> Result<libc::c_uint, InterfaceError> {
     Ok(index)
 }
 
-/// Create a raw CAN socket.
-fn open_socket() -> Result<File, InterfaceError> {
+/// Create a raw CAN socket, CAN FD datagrams enabled when `wire` is
+/// [`CanWire::Fd`].
+fn open_socket(wire: CanWire) -> Result<File, InterfaceError> {
     // SAFETY: a plain socket(2) call; the returned descriptor is checked and then
     // owned by the `File` below.
     let fd = unsafe { libc::socket(libc::AF_CAN, libc::SOCK_RAW, CAN_RAW) };
@@ -937,7 +1105,41 @@ fn open_socket() -> Result<File, InterfaceError> {
         )));
     }
     // SAFETY: `fd` is a fresh descriptor owned by this process.
-    Ok(unsafe { File::from_raw_fd(fd) })
+    let socket = unsafe { File::from_raw_fd(fd) };
+    if wire == CanWire::Fd {
+        enable_fd_frames(&socket)?;
+    }
+    Ok(socket)
+}
+
+/// Ask the kernel to pass CAN FD frames on this socket.
+///
+/// Without the option the socket takes only `struct can_frame`: CAN FD traffic
+/// from the bus is not delivered to it, and a CAN FD frame cannot be sent from
+/// it. The option is part of a link's *shape* and is therefore set once, when the
+/// socket is opened, rather than per frame. A socket that has it still carries
+/// classical frames, so this is not what makes a CAN FD link talk to a classical
+/// peer: the two wires are meant to be chosen on both ends
+/// ([`CanSerialDevice::open_with_wire`]).
+fn enable_fd_frames(socket: &File) -> Result<(), InterfaceError> {
+    let on: libc::c_int = 1;
+    // SAFETY: the option value is an `int` of the length passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            SOL_CAN_RAW,
+            CAN_RAW_FD_FRAMES,
+            &on as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(InterfaceError::Other(format!(
+            "failed to enable CAN FD frames on the socket: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// Bind the socket to one CAN interface.
@@ -964,7 +1166,8 @@ fn bind_interface(socket: &File, index: libc::c_uint) -> Result<(), InterfaceErr
     Ok(())
 }
 
-/// Ask the kernel for only the frames the MCU sends: the answer id, classical.
+/// Ask the kernel for only the frames the MCU sends: the answer id, standard
+/// (11-bit) form.
 fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
     let filter = CanFilter {
         can_id: rx_id,
@@ -997,6 +1200,7 @@ fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::frame::MESSAGE_PAYLOAD_MAX;
     use crate::core::klippy::interface::devices::serial::{
         decode_header, HeaderScan, ADMIN_LISTEN, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC,
         MUX_PORT_UNITS,
@@ -1055,7 +1259,7 @@ mod tests {
         let link = CanSerialLink::for_node(3).unwrap();
         let bytes: Vec<u8> = (0..20).collect();
 
-        let frames: Vec<CanFrame> = link.frames(&bytes).collect();
+        let frames: Vec<CanFrame> = link.frames(&bytes, CanWire::Classical).collect();
 
         // 20 bytes is two full frames and a remainder, all addressed to the MCU.
         assert_eq!(frames.len(), 3);
@@ -1065,7 +1269,27 @@ mod tests {
         assert!(frames.iter().all(|f| f.id() == link.tx_id()));
 
         // A block that is an exact multiple of eight does not get an empty tail.
-        assert_eq!(link.frames(&bytes[..16]).count(), 2);
+        assert_eq!(link.frames(&bytes[..16], CanWire::Classical).count(), 2);
+    }
+
+    #[test]
+    fn test_a_block_is_cut_into_sixty_four_byte_frames_on_the_can_fd_wire() {
+        let link = CanSerialLink::for_node(3).unwrap();
+        let bytes: Vec<u8> = (0..130).map(|byte| byte as u8).collect();
+
+        let frames: Vec<CanFrame> = link.frames(&bytes, CanWire::Fd).collect();
+
+        // 130 bytes is two full CAN FD frames and a two byte tail, all addressed
+        // to the MCU: the same rule as the classical cut, with a wider frame.
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].data(), &bytes[0..CAN_FD_DATA_BYTES]);
+        assert_eq!(frames[1].data(), &bytes[64..128]);
+        assert_eq!(frames[2].data(), &bytes[128..130]);
+        assert_eq!(frames[2].data().len(), 2, "the tail is what is left");
+        assert!(frames.iter().all(|f| f.id() == link.tx_id()));
+
+        // An exact multiple of sixty-four does not get an empty tail either.
+        assert_eq!(link.frames(&bytes[..128], CanWire::Fd).count(), 2);
     }
 
     #[test]
@@ -1079,7 +1303,7 @@ mod tests {
         assert_eq!(bytes.len(), 7);
 
         let link = CanSerialLink::for_node(5).unwrap();
-        let slices: Vec<CanFrame> = link.frames(&bytes).collect();
+        let slices: Vec<CanFrame> = link.frames(&bytes, CanWire::Classical).collect();
         assert_eq!(slices.len(), 1, "one CAN frame carries the whole block");
 
         assert_eq!(
@@ -1106,7 +1330,7 @@ mod tests {
         // back on `rx_id` models a round trip.
         let block = message(1, &[0xaa; 30]).raw_bytes();
         let frames: Vec<CanFrame> = sender
-            .frames(&block)
+            .frames(&block, CanWire::Classical)
             .map(|chunk| CanFrame::new(receiver.rx_id(), chunk.data()).unwrap())
             .collect();
         // 30 payload bytes plus the 5 byte block overhead: 35 bytes, five frames.
@@ -1140,33 +1364,97 @@ mod tests {
     }
 
     #[test]
-    fn test_a_frame_carries_at_most_eight_bytes() {
-        assert!(CanFrame::new(0x100, &[0; CAN_DATA_BYTES]).is_ok());
-        let err = CanFrame::new(0x100, &[0; CAN_DATA_BYTES + 1]).unwrap_err();
+    fn test_a_frame_carries_at_most_its_wire_s_allowed_bytes() {
+        // Sixty-four bytes is what the type holds, CAN FD's frame being the
+        // larger of the two; one more has nowhere to go.
+        assert!(CanFrame::new(0x100, &[0; CAN_FD_DATA_BYTES]).is_ok());
+        let err = CanFrame::new(0x100, &[0; CAN_FD_DATA_BYTES + 1]).unwrap_err();
         assert!(err.to_string().contains("do not fit"), "{err}");
+
+        // A classical frame holds eight, and the rest of the type's storage is not
+        // a licence to use it: nine bytes fit CAN FD and are refused by the
+        // classical wire rather than truncated into a 16 byte datagram.
+        assert_eq!(CAN_DATA_BYTES, 8, "the classical wire's width is unchanged");
+        let nine = CanFrame::new(0x100, &[0; CAN_DATA_BYTES + 1]).expect("nine fit CAN FD");
+        let err = nine.to_abi(CanWire::Classical).unwrap_err();
+        assert!(
+            err.to_string().contains("do not fit a classical CAN frame"),
+            "{err}"
+        );
+        assert_eq!(nine.to_abi(CanWire::Fd).unwrap().as_bytes().len(), 72);
     }
 
     #[test]
     fn test_can_frame_layout_matches_the_kernel() {
-        // One datagram per frame, so the sizes and field offsets are the ABI. This
-        // checks the layout against itself; agreement with the kernel is what a
-        // machine with a CAN interface would have to confirm.
+        // One datagram per frame, so the sizes and field offsets are the ABI. Two
+        // independent facts: how long each wire's frame struct is, and how long
+        // the address struct is — which is not the frame's size on either wire.
+        // Agreement with the kernel is what a machine with a CAN interface would
+        // have to confirm.
         assert_eq!(CAN_FRAME_SIZE, 16);
-        assert_eq!(std::mem::size_of::<SockAddrCan>(), CAN_FRAME_SIZE);
+        assert_eq!(CAN_FD_FRAME_SIZE, 72);
+        assert_eq!(std::mem::size_of::<SockAddrCan>(), 16);
         assert_eq!(std::mem::size_of::<CanFilter>(), 8);
 
         let frame = CanFrame::new(0x1ab, &[1, 2, 3]).unwrap();
-        let raw = frame.to_abi();
-        assert_eq!(u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]), 0x1ab);
-        assert_eq!(raw[4], 3);
-        assert_eq!(&raw[8..11], &[1, 2, 3]);
-        assert_eq!(CanFrame::from_abi(&raw), frame);
+        let raw = frame.to_abi(CanWire::Classical).unwrap();
+        let abi = raw.as_bytes();
+        assert_eq!(
+            abi.len(),
+            CAN_FRAME_SIZE,
+            "a classical datagram is 16 bytes"
+        );
+        assert_eq!(u32::from_ne_bytes([abi[0], abi[1], abi[2], abi[3]]), 0x1ab);
+        assert_eq!(abi[4], 3);
+        assert_eq!(&abi[8..11], &[1, 2, 3]);
+        assert_eq!(
+            CanFrame::from_abi(CanWire::Classical, &abi_array(abi)),
+            frame
+        );
 
         // Extended ids are not part of this transport: only the low 11 bits are
         // read back.
-        let mut extended = raw;
+        let mut extended = abi_array(abi);
         extended[..4].copy_from_slice(&(0x1ab | CAN_EFF_FLAG).to_ne_bytes());
-        assert_eq!(CanFrame::from_abi(&extended).id(), 0x1ab);
+        assert_eq!(
+            CanFrame::from_abi(CanWire::Classical, &extended).id(),
+            0x1ab
+        );
+    }
+
+    #[test]
+    fn test_the_can_fd_frame_layout_matches_the_kernel() {
+        // `struct canfd_frame`: same header shape, sixty-four data bytes. The two
+        // fields that matter downstream sit where the classical struct has them.
+        let data = [0x11u8; CAN_FD_DATA_BYTES];
+        let frame = CanFrame::new(0x1ab, &data).unwrap();
+        let raw = frame.to_abi(CanWire::Fd).unwrap();
+        let abi = raw.as_bytes();
+
+        assert_eq!(
+            abi.len(),
+            CAN_FD_FRAME_SIZE,
+            "a CAN FD datagram is 72 bytes"
+        );
+        assert_eq!(u32::from_ne_bytes([abi[0], abi[1], abi[2], abi[3]]), 0x1ab);
+        assert_eq!(abi[4], CAN_FD_DATA_BYTES as u8, "the length is at offset 4");
+        assert_eq!(
+            abi[5], 0,
+            "no flags: the kernel sets FDF for a 72 byte write"
+        );
+        assert_eq!(&abi[6..8], [0, 0], "the reserved bytes stay zero");
+        assert_eq!(&abi[8..], data, "the data starts at offset 8");
+
+        // Reading back gives the frame again: the same layout, the wire's size.
+        assert_eq!(CanFrame::from_abi(CanWire::Fd, &abi_array(abi)), frame);
+    }
+
+    /// The datagram as [`CanFrame::from_abi`] takes it: a whole kernel struct,
+    /// zero filled beyond the bytes `abi` holds.
+    fn abi_array(abi: &[u8]) -> [u8; CAN_FD_FRAME_SIZE] {
+        let mut raw = [0u8; CAN_FD_FRAME_SIZE];
+        raw[..abi.len()].copy_from_slice(abi);
+        raw
     }
 
     #[test]
@@ -1188,8 +1476,14 @@ mod tests {
             "{err}"
         );
 
-        // The admin socket is the same first step, and reports it the same way.
+        // The admin socket is the same first step, and reports it the same way —
+        // on either wire, since the interface is looked up before the socket.
         let err = CanbusAdminSocket::open("can99").unwrap_err();
+        assert!(
+            err.to_string().contains("no CAN interface named 'can99'"),
+            "{err}"
+        );
+        let err = CanbusAdminSocket::open_with_wire("can99", CanWire::Fd).unwrap_err();
         assert!(
             err.to_string().contains("no CAN interface named 'can99'"),
             "{err}"
@@ -1236,11 +1530,13 @@ mod tests {
         assert_eq!(frame.id(), 0x3f0);
         assert_eq!(frame.data(), [0x00]);
 
-        let raw = frame.to_abi();
-        assert_eq!(u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]), 0x3f0);
-        assert_eq!(raw[4], 1, "one data byte");
-        assert_eq!(&raw[8..9], [0x00]);
-        assert_eq!(&raw[9..], [0; CAN_DATA_BYTES - 1], "no padding is sent");
+        let raw = frame.to_abi(CanWire::Classical).unwrap();
+        let abi = raw.as_bytes();
+        assert_eq!(abi.len(), CAN_FRAME_SIZE);
+        assert_eq!(u32::from_ne_bytes([abi[0], abi[1], abi[2], abi[3]]), 0x3f0);
+        assert_eq!(abi[4], 1, "one data byte");
+        assert_eq!(&abi[8..9], [0x00]);
+        assert_eq!(&abi[9..], [0; CAN_DATA_BYTES - 1], "no padding is sent");
     }
 
     #[test]
@@ -1555,7 +1851,7 @@ mod tests {
         assert_eq!(
             frames.len(),
             unit.len().div_ceil(CAN_DATA_BYTES),
-            "eight data bytes fit in one CAN frame"
+            "a classical CAN frame holds eight data bytes"
         );
         let tx_id = device.link.lock().unwrap().tx_id();
         assert!(
@@ -1604,7 +1900,7 @@ mod tests {
         assert_eq!(unit.len(), 15, "the boundary case this test is for");
 
         let link = CanSerialLink::for_node(3).unwrap();
-        let slices: Vec<CanFrame> = link.frames(&unit).collect();
+        let slices: Vec<CanFrame> = link.frames(&unit, CanWire::Classical).collect();
         assert_eq!(slices.len(), 2);
         assert_eq!(slices[0].data(), &unit[..CAN_DATA_BYTES]);
         assert_eq!(slices[1].data(), &unit[CAN_DATA_BYTES..]);
@@ -1629,6 +1925,94 @@ mod tests {
         assert_eq!(
             &rejoined[8..12],
             &[CMD_SET_PORT_NODEID, 1, 2, MUX_PORT_UNITS]
+        );
+    }
+
+    // ========================================================================
+    // The CAN FD wire
+    // ========================================================================
+
+    /// The longest message the protocol carries: [`MESSAGE_PAYLOAD_MAX`] payload
+    /// bytes, sixty-four with the header and trailer — exactly one CAN FD frame.
+    fn longest_message(seq: u8) -> Frame {
+        message(seq, &[0x5a; MESSAGE_PAYLOAD_MAX])
+    }
+
+    #[test]
+    fn test_the_can_fd_wire_writes_seventy_two_byte_records() {
+        // Two whole messages, each as large as the protocol allows, on a link
+        // whose frame is wide enough for one of them: on the wire that is two 72
+        // byte `canfd_frame` records, where a classical link would need ten 16
+        // byte ones. The record size is what `read_wire_on` parses by, so a link
+        // that wrote classical frames here would fail its own chunking.
+        let (device, mut wire) = CanSerialDevice::test_wire_on(7, CanWire::Fd);
+        let first = longest_message(1);
+        let second = longest_message(2);
+        assert_eq!(first.raw_bytes().len(), CAN_FD_DATA_BYTES);
+
+        device.send(&first).unwrap();
+        device.send(&second).unwrap();
+
+        let records = read_wire_on(&mut wire, CanWire::Fd);
+        assert_eq!(records.len(), 2, "one record per message");
+        let tx_id = device.link.lock().unwrap().tx_id();
+        assert!(records.iter().all(|record| record.id() == tx_id));
+        assert_eq!(records[0].data(), first.raw_bytes().as_slice());
+        assert_eq!(records[1].data(), second.raw_bytes().as_slice());
+        assert_eq!(records[0].data().len(), CAN_FD_DATA_BYTES);
+    }
+
+    #[test]
+    fn test_the_can_fd_wire_reads_seventy_two_byte_records() {
+        // The same record coming the other way. The device polls its socket, so
+        // the fake bus's far end writes the whole record first and `receive` then
+        // finds a complete message in it.
+        let (device, mut wire) = CanSerialDevice::test_wire_on(7, CanWire::Fd);
+        let block = longest_message(3);
+
+        let record = CanFrame::new(device.rx_id(), &block.raw_bytes()).unwrap();
+        (&mut wire)
+            .write_all(record.to_abi(CanWire::Fd).unwrap().as_bytes())
+            .unwrap();
+
+        assert_eq!(device.receive(), Some(block));
+    }
+
+    #[test]
+    fn test_the_admin_socket_reads_and_writes_by_wire() {
+        // An admin scan speaks the wire it was opened on: on CAN FD the broadcast
+        // leaves as a 72 byte record and an answer arrives as one.
+        let (socket, mut wire) = UnixStream::pair().expect("a socket pair");
+        let mut admin = CanbusAdminSocket {
+            socket: File::from(OwnedFd::from(socket)),
+            interface: "test0".to_string(),
+            wire: CanWire::Fd,
+        };
+
+        admin.send(&query_unassigned_frame()).unwrap();
+        let records = read_wire_on(&mut wire, CanWire::Fd);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id(), ADMIN_ID);
+        assert_eq!(records[0].data(), [CMD_QUERY_UNASSIGNED]);
+
+        // The answer is the same frame shape as ever — the response byte, the six
+        // UUID bytes — in the wire's larger envelope.
+        let reply = CanFrame::new(
+            ADMIN_ID + 1,
+            &[RESP_NEED_NODEID, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66],
+        )
+        .unwrap();
+        (&mut wire)
+            .write_all(reply.to_abi(CanWire::Fd).unwrap().as_bytes())
+            .unwrap();
+        let received = admin
+            .receive(Duration::from_millis(100))
+            .expect("the fake bus does not fail")
+            .expect("the record was there before the wait");
+        assert_eq!(received, reply);
+        assert_eq!(
+            UnassignedNode::from_reply(&received).unwrap().uuid_hex(),
+            "112233445566"
         );
     }
 }

@@ -995,17 +995,17 @@ mod tests {
     /// [`CMD_RESET_DEVICE`] — and the bridge's own line pulse is never asked
     /// for.
     ///
-    /// **Ignored: known reference-lifetime defect.** On a *host-library* bridge
-    /// this flow leaves the library loaded after `teardown` (the probe in
-    /// `wait_for_mux_library_unload` still reports "already loaded" ten seconds
-    /// later), which would lock the path for every test that follows it in the
-    /// same binary. The suspicion is the named handshake on a host link
-    /// (`HostDevice::attach`/`wait_for_assignment`) leaving a reader thread
-    /// parked on the library — the legacy path, which never handshakes, unloads
-    /// cleanly. Un-ignore this once that lifetime is fixed; it is the acceptance
-    /// test for that fix.
-    #[ignore = "known: the named handshake on a host-library bridge leaves the library loaded (see work-log §7); the M1-P8 single-reader fix did not change it — re-checked 2026-10-15"]
-    #[tokio::test]
+    /// **Multi-thread runtime, deliberately** (as production builds:
+    /// `klippy.rs`'s `new_multi_thread`, and the legacy sibling below). The
+    /// bridge's two transport tasks each hold a clone of its `Interface`
+    /// (`Mcu::from_parts`), and so of the downstream `Arc<HostDevice>`; only
+    /// the last reference's drop unloads the library. `teardown` aborts those
+    /// tasks, but an aborted task is dropped by the runtime, not by `abort` —
+    /// on a current-thread runtime the bounded, *blocking* wait here never
+    /// lets the runtime run them again, so the library would look permanently
+    /// loaded. Nothing about the named path is special: the aborted-task
+    /// release is the same one the legacy test relies on.
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_named_childs_reset_is_forwarded_to_its_port_whole() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()

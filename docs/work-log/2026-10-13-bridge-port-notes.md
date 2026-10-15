@@ -414,10 +414,8 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
    的映射）；先卸桥库 → `HostLibrary::drop` 的 `join()` **无限挂住**。最小复现：同进程 `load_downstream`
    载入 mux 库 + `load_bytes` 载入裸帧库，不发流量，依次 drop（日志 `/tmp/m1p3fx-t2.log`、`t3.log`）。
    影响面：仅「同进程两份 host 库」的嵌入/测试场景（生产桥拓扑是两块板）。
-2. **命名设备的握手在宿主库桥上不释放库**：`HostDevice::attach`/`wait_for_assignment` 之后，即使
-   `teardown` + drop 掉全部引用，库在 10s 后仍报「already loaded」。已保留一条
-   `#[ignore]` 的复现与其验收测试（`a_named_childs_reset_is_forwarded_to_its_port_whole`）——
-   它就是修好后的验收测试。
+2. ~~**命名设备的握手在宿主库桥上不释放库**~~ —— **该诊断已在 P11（2026-10-15）被推翻并修掉**：
+   真正的原因是**测试的 tokio 运行时口径**（默认 current-thread），与「命名」无关。见下「P11」一节。
 
 ### 欠项
 
@@ -616,3 +614,34 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
   结论仍保留在手册里（`config.md` 的 `uart_restart_method`、`serial-mux-protocol.md` 的 `RESET_PORT`、
   `TESTING.md` M2-1），供后来人参考；实现缺口本身作为**已知缺口**留档：原生 USB 的 legacy 设备目前没有
   经桥的硬复位手段（只能命名设备 `restart_method: admin` 或断电）。
+
+### P11（2026-10-15）：`#[ignore]` 那条验收测——**推翻原诊断**，真因是测试的运行时口径
+
+**原诊断（错）**：以为是「命名设备在宿主库桥上握手后库不卸载」（缺陷②），并据此挂了 `#[ignore]`。
+**P11 的诊断（对）**：与「命名」无关，真正变量是 **tokio 运行时口径**：
+
+- 桥自己的两个传输任务（`Mcu::from_parts` 的 `interface_for_send`/`interface_for_recv`，
+  `mcu/mod.rs:1669`/`:1920`）各持一个 `Interface` 克隆 ⇒ `Arc<HostDevice>` ⇒ `Arc<HostLibrary>`。
+- `Mcu::close`（`mcu/mod.rs:2867`）会 abort 这些任务，但 `abort()` 只在运行时**下次跑任务时**才生效；
+  而那条测试的 `wait_for_mux_library_unload` 是**阻塞式**等待（`std::thread::sleep` + `HostDevice::load_bytes`），
+  在**current-thread** 运行时上它把运行时线程占住 ⇒ 被 abort 的任务永远没机会释放 `Arc<HostDevice>`，
+  库的最后一个引用只能等到**测试结束、运行时析构**时才掉。生产用 `new_multi_thread`（`src/klippy.rs:292`），
+  而**同族的 legacy 测试本来就是 `flavor = "multi_thread"`**（`restart.rs:886`）——这就是它「通过」、命名那条
+  「不通过」的真实差别（不是命名、更不是 P8 的读者）。
+- **插桩证据**（临时 `HostDevice`/`HostLibrary` 计数，已还原）：current-thread 下 `teardown`+`drop(printer)`
+  之后 `MCU DROP bridge` 触发但 ref=1（桥的任务）仍在、探针 10s 超时；加一次运行时 poll（临时 `sleep(500ms).await`）
+  即卸载；`flavor = "multi_thread"` 直接通过（×3）。下游句柄（`load_downstream`）与复位临时句柄
+  （`open_bridge_link`）**每次都干净释放** ⇒ `attach`/`wait_for_assignment`/`open_bridge_link` **不泄漏**。
+
+**修法（`ae6a7af`，只动测试）**：`#[tokio::test]` → `#[tokio::test(flavor = "multi_thread")]`、
+**解除 `#[ignore]`**、把测试注释里那段错解释换成真解释。**反证**：把属性改回 `#[tokio::test]` 即复现
+`the mux host library never unloaded`；改回 multi_thread 即绿。生产语义无需改动。
+验收：`cargo test --workspace` **3226 passed / 0 failed / 13 ignored**（ignored 14→13）、
+`mcu::restart::tests` 14 passed / 0 ignored、fmt 干净、`--all-targets` 0 告警。
+
+**可迁移的教训**（已写进 `testing.md` 的对应行）：**测试里若用阻塞式等待去观察「被 abort 的任务应释放的资源」，
+必须用 `multi_thread` 运行时**——current-thread 下运行时线程被阻塞，abort 永远不生效；这类症状会被
+误读成「资源生命周期缺陷」（我们这次就误读了）。
+
+**仍然开着的另一条（与本次无关）**：缺陷①「两份 host 库同进程无法一起退出」（`host.c` 进程级 SIGUSR1 与
+`sched.c` 的 longjmp 退出路径），本轮未动。

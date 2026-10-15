@@ -872,8 +872,9 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
-             attach is M5/P5"
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+             carrier and the port-command units exist, but the host-side attach is not \
+             wired yet"
         );
     }
 

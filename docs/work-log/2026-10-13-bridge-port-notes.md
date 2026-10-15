@@ -733,7 +733,9 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 - `bridge_ports::bridge_downstream_counts` 零 access 预扫（与 `port_grouping::port_reference` 逐项同构：裸/前缀两种 `[mcu]` 拼写、`uart:`/`can:` 两键、端口节不存在则跳过、同节双键先写胜）+ `PathGroup.downstream` + `serial_ports::is_id_addressed` 显式含计数项 + `host_libraries::path_is_mux` 同口径；新测 `one_mcu_with_three_downstream_devices_is_id_addressed`（**钉住计数 = 3**，不只钉布尔）。
 - 评审：**无 P0/P1**；P2 三条已收口——`host_libraries` 新测是**空证**（`has_bridge` 分支恒真，删新项仍绿）已删并改在既有桥测旁注释说明“计数项在此不可隔离、计数在 `serial_ports` 侧钉住”；`testing.md` 的 `host_libraries.rs` 计数修正为 21（删空证后与实现一致）；开发手册**模块表**两行旧断言（`serial_ports.rs` 的“1 颗 = 独占”、`host_libraries.rs` 的“1 节无 uuid = 裸帧”）补上桥例外（源：上一次提交漏同步）。
 
-### P5 进行中
+### P5 落地（本轮 = 免真机可验收的三件；其余归真机/后续）
 
-- 本轮做**免真机可验收**的三件：主机侧 CAN admin 单元发送 API（`canserial.rs` 三个发送方法 + `interface/mod.rs` 臂，socket-free 逐字节测试）、固件 `MUX_CAN`（`canserial.c` 字节流收发接 `mux_input`/`mux_send`，构建级验证）、帧形裁定写进协议文档。
-- **尚未落地（真机/后续单元）**：`[can_device]` 下游端口节与固件 CAN 端口后端（需要新的 `bridge_port_ops` 实现 + CAN 硬件）、CAN 上游 attach 端到端（脚本化总线可做一部分，真实总线需真机）、`vcan` 夹具（需 `CAP_NET_ADMIN`）；P6 多站串口（RS-485，后置）。
+- **P5-C（主仓 `78a6c9c`）**：`CanSerialDevice` 新增 `send_set_port_node_id`/`send_reset_device`/`send_reset_port`（纯委派到串口侧同一构造器 ⇒ 与串口**逐字节相同**；私有 `send_bytes` 抽出、公开 `send` 行为不变）、`interface/mod.rs` 三条 `match` 加 CAN 臂；`_` 臂「需要桥链路」文案改为含三种链路（含三条逐字断言）。测试 socket-free（socket pair 冒充 CAN socket，`#[cfg(test)]` 接缝），含跨 8 字节帧重组。评审 **OK with notes**（无 P0/P1）。
+- **P5-D（子模组 `50fda1cf` + 收口 `3b23c8ea`）**：`config MUX_CAN`（`depends on CANBUS && HAVE_CHIPID`、`select MUX`、`不默认开`）、`BRIDGE` 改 `default y if MUX_SERIAL || MUX_CAN`、`src/Makefile` 改 `src-$(CONFIG_MUX) += mux.c`（两种载体共用一份；互斥是各 arch 通信接口 `choice` 的源码事实，已写进 Kconfig 注释）、`canserial.c` 收端（`command_find_block()` 前、`irq_save()` 段内）接 `mux_input`、发端 `mux_out_header` + 整单元 `mux_send`、`canserial_set_uuid` → `mux_set_uuid`。评审 **可合入**（无 P0/P1）；收口含注释口径修正、`src/host/README.md` 旧断言、新增 `test/configs/stm32f103-can-mux.config`（让闸门真的编 `CONFIG_MUX_CAN` 的代码路径——此前全仓无任何 CAN 目标）。
+- **诚实边界**：本环境无 CAN 外设，P5-D 只有**构建级**验证（候选 B 的帧形是设计一致性结论，不是对已跑通 CAN 桥的实测）；主仓侧新臂在**当前产品路径不可达**（`bridge_attach` 仍拒绝 CAN 上游与 `[can_device]` 端口）。
+- **P5 尚余（真机/后续）**：`[can_device]` 下游端口节（`CanPort` 拿 `index` + 配置期下发）与固件 **`BRIDGE_PORT_CAN` 端口后端**（新的 `bridge_port_ops`：CAN 收发 + 按下游 id/uuid 过滤）；CAN 上游 attach 端到端（先 `0x3f0` 单帧指派 node id，再经单元扫描/采纳/路由；脚本化总线可做一部分，真总线必需真机）；`vcan` 夹具（需 `CAP_NET_ADMIN`，本仓无先例）；`send_bytes` 目前无写锁（每器件单写者；P5 接线时需决定单写者或加锁——与 D11 在 host 侧同类）。

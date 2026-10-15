@@ -288,6 +288,16 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
   `MUX_SERIAL` 的身份依赖随之放宽为 `HAVE_CHIPID || MACH_HOST || MACH_LINUX`。**默认不开**：单元格式不是
   上游 klippy 主机说的格式，必须刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。真板扫描/指派/冲突
   与 `irq_save()` 段内时序仍属真机项。
+- **CAN 承载也已接线**（`MUX_CAN`）：`src/generic/canserial.c` 的字节流收发接同一套
+  `mux_input`/`mux_send`（收端在 `command_find_block()` 之前、`irq_save()` 段内；发端 `console_sendf`
+  预留 `MUX_HEADER_BYTES` + `mux_out_header`，`mux_send` 整单元入队），身份由 `canserial_set_uuid` →
+  `mux_set_uuid()`（与 CAN uuid 同六个字节）。**CAN 单帧 admin 通道（`id=0x3f0`）不变**——单元跑在
+  **节点自己仲裁 id 的字节流**里，与单帧通道是两条不同的通道（`0x02` 不会撞 `REQUEST_BOOTLOADER`）。
+  **CAN 上游必须跑单元**：N 台下游设备的帧都复用到这一条字节流上，没有头就说不出哪台发的（串口上游
+  可能只有一台，CAN 不会）；故选用「载荷内同一套单元」而非「单帧 admin 命令」（后者承载不了下游数据）。
+  `depends on CANBUS && HAVE_CHIPID`、**不默认开**；`src-$(CONFIG_MUX) += mux.c` 让两种载体共用一份
+  `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。CAN 端到端（真总线或
+  `vcan` 特权环境）与 `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）仍属未落地。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

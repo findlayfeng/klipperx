@@ -115,7 +115,7 @@ connect_file(输出文件, 字典):
 |----|------|
 | `.test` 文件 | 37 |
 | 运行（`CONFIG` 块） | 239（`printers.test` 占 203） |
-| `test/configs/*.config` 目标 | 40 |
+| `test/configs/*.config` 目标 | 41 |
 | 被 `.test` 引用的目标 | 28 |
 
 按 `CONFIG_MACH_<FAMILY>` 聚合（`目标` 为该架构的 kconfig 片段数，`引用` 为声明该架构字典
@@ -126,7 +126,7 @@ connect_file(输出文件, 字典):
 | `avr` | 7 | 34 | 默认字典（几乎所有功能用例） |
 | `stm32` | 17 | 1 | `printers.test` |
 | `avr` | 7 | 33 | 默认字典（`tmc.test` 批 #39 已摘出） |
-| `linux` | 1 | 2 | `linuxtest.test`、`printers.test`；**本地可编，默认启用** |
+| `linux` | 2 | 2 | `linuxtest.test`、`printers.test`；**本地可编，默认启用**（`linuxprocess` + `linuxprocess-mux`） |
 | `atsam` | 5 | 1 | `printers.test` |
 | `atsamd` | 2 | 1 | `printers.test` |
 | `hc32f460` | 2 | 1 | `printers.test` |
@@ -178,8 +178,8 @@ connect_file(输出文件, 字典):
 | `z_tilt.test` | 1 | `avr` |
 | `z_virtual_endstop.test` | 1 | `avr` |
 
-默认列表（`linux` + `avr` + 各 ARM 家族）会构建 37 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
-全部具备（另有 10 份没被引用的目标也一并编出，作为编译覆盖）。引用 `pru` 的运行只有 2 条（`printers.test`
+默认列表（`linux` + `avr` + 各 ARM 家族）会构建 38 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
+全部具备（另有 11 份没被引用的目标也一并编出，作为编译覆盖）。引用 `pru` 的运行只有 2 条（`printers.test`
 里 `DICTIONARY pru.dict host=linuxprocess.dict` 那一组），它们因字典未构建被跳过。
 
 ### 当前状态

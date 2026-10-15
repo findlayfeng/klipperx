@@ -490,24 +490,19 @@ mod tests {
     /// A lone section a port section names as its **bridge** is muxed: the
     /// bridge's downstream devices' frames travel the path, so it is addressed
     /// by id even though one `[mcu]` names it (rule 7).
+    /// A lone section whose port section names it a bridge is muxed.
+    ///
+    /// Rule 7's count term (`downstream >= 1`) cannot be isolated from this
+    /// judgement: any config that has a downstream device also has the bridge
+    /// on the path, so `has_bridge` already answers it. The count itself is
+    /// pinned where it is computed (`serial_ports`
+    /// `one_mcu_with_three_downstream_devices_is_id_addressed` asserts the
+    /// number, from the same `bridge_downstream_counts` table this uses).
     #[test]
     fn a_single_bridge_section_is_muxed() {
         let libraries = classify(&format!(
             "[mcu bridge]\nhost_library: {LIB}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n"
-        ))
-        .unwrap();
-        assert!(libraries.is_mux(LIB));
-    }
-
-    /// Rule 7's count, from the same table the serial grouping uses: a lone
-    /// section whose bridge carries a downstream `[mcu]` is muxed.
-    #[test]
-    fn a_lone_bridge_section_with_a_downstream_device_is_muxed() {
-        let libraries = classify(&format!(
-            "[mcu bridge]\nhost_library: {LIB}\n\
-             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
-             [mcu child]\nuart: uart0\n"
         ))
         .unwrap();
         assert!(libraries.is_mux(LIB));

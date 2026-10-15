@@ -1,8 +1,9 @@
 // KlipperX Test Support Library
 //
 // This crate provides test utilities for KlipperX. Its build.rs builds the
-// klipper host shared library (libklipper_host.so) the interface tests load, and
-// one data dictionary per enabled MCU target.
+// klipper host shared library (libklipper_host.so) the interface tests load,
+// one data dictionary per enabled MCU target, and the linux process firmware
+// (`klipper.elf`) the `linux_firmware` fixture runs.
 
 /// Absolute path to the klipper checkout the tests read: the `.test` cases,
 /// their configs, and the kconfig fragments.
@@ -87,3 +88,20 @@ pub fn klipper_host_mux_dictionary_path() -> std::path::PathBuf {
 pub fn test_dicts_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPERX_TEST_DICTS"))
 }
+
+/// Absolute path to the built linux process firmware (`klipper.elf`).
+///
+/// The `test/configs/linuxprocess.config` target (`CONFIG_MACH_LINUX=y`),
+/// built into this crate's `OUT_DIR` like the dictionaries, and the binary
+/// [`linux_firmware::LinuxFirmware`] runs as a standalone process.
+///
+/// `build.rs` asserts the file exists when the default architecture set builds
+/// it; with a `KLIPPERX_ARCHES` that leaves `linux` out the path still resolves
+/// but the file is absent, and spawning then reports the missing file.
+pub fn linux_firmware_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_LINUX_FIRMWARE"))
+}
+
+/// The linux firmware process fixture (spawn / reap, see [`LinuxFirmware`]).
+pub mod linux_firmware;
+pub use linux_firmware::LinuxFirmware;

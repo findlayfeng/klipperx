@@ -38,7 +38,7 @@ KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test --workspace
 > `init` 前投递 → `SET_NODEID` + 重确认握手 → identify + `get_clock`）。**代价**：新库变体冷构建
 > 约 +1.6s，热跑无感。
 
-构建**不复用 klipper 子模块的 `.config` 与 `out/`**（那是开发者给自己编固件用的），而是把它们放在 build script 自己的 `OUT_DIR` 下（`target/debug/build/klipperx-test-support-*/out/klipper-host/`），并把路径通过 `cargo:rustc-env=KLIPPER_HOST_LIB` 传给测试。配置片段在 `build.rs` 里写明——kconfig 的机型 `choice` **没有默认值**（空配置会选中第一项 AVR，编出个 `klipper.elf`），而 `CONFIG_HOST_AR_LIBRARY` **默认是静态库**（产出 `libklipper_host.a` 而非 `.so`），两条都必须显式声明：
+构建**不复用 klipper 子模块的 `.config` 与 `out/`**（那是开发者给自己编固件用的），而是把它们放在 build script 自己的 `OUT_DIR` 下（`target/debug/build/klipperx-test-support-*/out/klipper-host/`），并把路径通过 `cargo:rustc-env=KLIPPER_HOST_LIB` 传给测试。同一批构建还断言 `test/configs/linuxprocess.config` 产出的 `out/klipper.elf`，以 `cargo:rustc-env=KLIPPER_LINUX_FIRMWARE` 交给测试：配合 `klipperx_test_support::LinuxFirmware`（在独立临时路径上 `klipper.elf -I <path>` 起独立进程、以该路径是指向 `/dev/pts/*` 的符号链接为就绪信号、`Drop` 必定 kill 并有界收尸），测试可以拿**真实的 linux 固件进程**当下游夹具（见下面覆盖范围的 `klipperx-test-support` 一节）。配置片段在 `build.rs` 里写明——kconfig 的机型 `choice` **没有默认值**（空配置会选中第一项 AVR，编出个 `klipper.elf`），而 `CONFIG_HOST_AR_LIBRARY` **默认是静态库**（产出 `libklipper_host.a` 而非 `.so`），两条都必须显式声明：
 
 ```
 CONFIG_MACH_HOST=y
@@ -680,6 +680,12 @@ git config core.hooksPath .githooks
 | `frame_mock.rs` | 夹具自身：单次/多次收发、帧不匹配报错、无映射条目、多输出、空输出、无匹配不发、负载保真、并发收发 |
 | `responder_mcu.rs` | （响应器式假 MCU 夹具，无独立测试；由 `toolhead.rs` 的两 MCU 端到端与 `simulator.rs` 的 `linked_fake_mcus_forward_the_move_but_nothing_else` 消费，`d14ce6a`） |
 | `pty.rs` | （仅 `cfg(test)` 的夹具，无独立测试；串口测试用它开真 pty） |
+
+### `klipperx-test-support`（构建脚本与测试夹具）
+
+| 模块 | 覆盖 |
+|------|------|
+| `crates/test-support/src/linux_firmware.rs`（1 测） | **linux 固件进程夹具** `linux_firmware_spawn_and_drop`：spawn 后 `/proc/<pid>` 存在且 `-I` 路径是指向 `/dev/pts/*` 的符号链接（就绪信号，有界等待 ≤5s，失败带固件 stderr 尾部），drop 后进程被 kill 并收尸、临时目录被删（同样有界，无挂死路径）；夹具全程不向固件发任何字节。`build.rs` 侧以 `KLIPPER_LINUX_FIRMWARE` 暴露 `linuxprocess` 的 `klipper.elf`（`linux_firmware_path()` 读它），路径缺失即构建期断言失败 |
 
 ### 上游语料（`src/core/klippy/upstream.rs`）
 

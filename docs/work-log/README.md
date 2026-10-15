@@ -13,4 +13,4 @@
 |---|---|
 | 2026-09-23 09:10 | [H2（风扇与通用输出）动工前调查](2026-09-23-h2-notes.md) — 上游 fan/heater_fan/controller_fan 等 21 个文件的依赖盘点、344 次「运行×缺口」测算、GCodeRequestQueue/heater 注册表/tachometer 三处差距与 H2-1…H2-7 拆分 |
 | 2026-09-23 10:03 | [G4/H10（gcode_move）动工前调查](2026-09-23-gcode-move-notes.md) — 上游 g-code 坐标系的状态/命令/事件模型、`G0`/`G1` 从 toolhead 搬家的差距、`Move out of range` 49 次的算账、G4-1/G4-2 拆分与六个拍板点 |
-| 2026-10-16 07:10 | [CAN ISO-TP 动工前调查与实施规划](2026-10-16-can-isotp-notes.md) — 九个拍板点（自研用户态状态机、`canbus_protocol` 键、11 位正常寻址 BS=0/STmin=0、一帧一消息、linux SocketCAN、**CAN-FD 作为正交链路层轴**）、ISO-TP 字段级规格（含 CAN-FD 单帧转义式 62 B）、**帧数开销对照（`queue_step` 档 classical 下 2×，FD 下归零）**、主机/固件/2.5/2.6 四处文件级落点与十条风险 |
+| 2026-10-16 07:10 | [CAN ISO-TP / CAN-FD 动工前调查与实施规划](2026-10-16-can-isotp-notes.md) — **主线＝`cans + CAN-FD`**（ISO-TP 降为验证可用）：ISO-TP 字段级规格（含 FD 单帧转义式 62 B）、**帧数开销对照（classical 下 `queue_step` 档 2×，FD 下 1 帧/消息）**、CAN-FD 落地细节（`struct canbus_msg` 8→64 的逐处清单、三份 `fdcan.c` 寄存器级缺口、哪些架构不能 FD、主机侧 72B `canfd_frame` 落点、六个未验证项）、主机/固件/2.5 四处文件级落点与十四条风险 |

@@ -112,7 +112,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 |---|---|---|
 | M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位 → P6 多站串口（RS-485，后置）） | — |
 | M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——**并入 M1 一起做**：固件命令族落 **P2**（与 `SET_PORT_NODEID` 同机制）、主机侧 `restart_method` 接入落 **P3** | M1 |
-| M3 | **CAN ISO-TP 传输与 CAN-FD 链路层**（两个正交轴，与 `canbus_protocol: cans` 并存）：主机侧自研用户态 ISO-TP 状态机（可无硬件单测）→ 固件 `CONFIG_ISOTP`（can-serial 的 CAN 承载层可切换，admin/`uuid`/`MUX_CAN` 全部复用）→ `linux` 目标加 SocketCAN（vcan 端到端）→ **CAN-FD 链路层（`struct canbus_msg` 8→64，单独一期）** → 真机量化。规划、ISO-TP 规格与**帧数开销对照**见 [work-log](docs/work-log/2026-10-16-can-isotp-notes.md) | — |
+| M3 | **CAN-FD 链路层（主线）与 CAN ISO-TP（验证用）**：主线是 **`cans + CAN-FD`**——主机侧 `canserial.rs` 的 72 B `canfd_frame` + 固件 `struct canbus_msg` 8→64 + 三份 `fdcan.c`（FDF/BRS/ESI/DLC 编码/DBTP）+ `linux` 目标 SocketCAN（vcan 端到端）+ 真机。ISO-TP **降级为「验证可用」**（只做主机侧纯状态机与内核 `can-isotp` 互操作矩阵，**不做固件从站**）。规划、规格与逐处落点见 [work-log](docs/work-log/2026-10-16-can-isotp-notes.md) | — |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、

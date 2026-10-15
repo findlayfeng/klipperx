@@ -3,6 +3,17 @@
 写作当天：2026-10-16。**规格未知已侦察完毕**，本文是设计定稿 + 阶段拆分 + 文件级落点。
 末尾「实施记录」是唯一随实现推进更新的回填节。
 
+> ## ⚑ 主线修订（2026-10-16，用户追加指示）
+>
+> **`cans + CAN-FD` 是主线交付物**；ISO-TP **降级为「验证可用即可」**，且 **不做 ISO-TP+FD 组合**。
+>
+> - 因此 §7.4 的排期已作废，改用 §9 的顺序：**FD 链路层先上，ISO-TP 后置且不出固件从站**。
+> - ISO-TP 的定位从此是**验证工具/互操作对端**（内核 `can-isotp` + can-utils 是严格参照实现），
+>   不是第二条产品传输。
+> - §4 的帧数对照在 FD 下一律变成「1 帧/消息」（`cans + FD` 与 `isotp + FD` 都一样），
+>   所以 ISO-TP 在 FD 上并无性能优势——这正是主线定为 `cans + FD` 的理由。
+> - §8 记录侦察到的 FD 落地细节与**六个未验证项**（其中「FD 收发器在哪块板」仓库内无依据，需你给型号）。
+
 ---
 
 ## 1. 范围定稿
@@ -289,6 +300,8 @@ ISO-TP over CAN-FD（`CAN_ISOTP_LL_OPTS` 的 `mtu = CANFD_MTU`、`tx_dl = 64`）
 
 ### 7.4 排期建议
 
+> **本条已被 §9 取代**（用户 2026-10-16 追加指示：`cans + FD` 为主，ISO-TP 降级为验证）。以下原文保留作决策遗迹。
+
 1. **现在**：ISO-TP 在 classical CAN 上做完（阶段 1–2.5 **与 FD 无关**），唯一要提前做的是 **D7 参数化**
    （状态机的每帧数据上限当参数），成本几乎为 0。
 2. **阶段 2.6**：CAN-FD 单独一期、单独分支（D8），先只做**链路层 8→64**（`cans + FD` 先跑通就验证了整条链路），
@@ -297,6 +310,127 @@ ISO-TP over CAN-FD（`CAN_ISOTP_LL_OPTS` 的 `mtu = CANFD_MTU`、`tx_dl = 64`）
 
 ---
 
-## 8. 实施记录
+## 8. CAN-FD 落地细节（侦察结果，2026-10-16）
+
+> 全部来自仓库内只读侦察，`third_party/klipper` 未改动。
+
+### 8.1 关键结论：**必须动 `struct canbus_msg`**
+
+若要在 classical 载荷上只用 FD 帧格式（FDF=1 但 DLC≤8），结构可以不改——但**那样几乎没有吞吐收益**。
+真 FD 数据段（>8 B/帧）⇒ 必须改：
+
+| 位置 | 内容 |
+|---|---|
+| `generic/canbus.h:6-13` | `struct canbus_msg`：`data[8]`/`data32[2]` → `data[64]`/`data32[16]` |
+| `generic/canbus.h:18` | `CANMSG_DATA_LEN(msg)` 的 `dlc > 8 ? 8 : dlc` 截断——**全局唯一的「一张帧最多 8 字节」钉点** |
+| `generic/canserial.c:79` | `now = avail > 8 ? 8 : avail` —— 发送切片的硬编码 8 |
+| `generic/canserial.c:49` | `admin_queue[8]` 按整个结构存盘 ⇒ 内存 8×（8×56B≈448B vs 现在 128B） |
+| `generic/usb_canbus.c:81-97,124,139-147,274-278` | gs_usb 信封固定 8 字节 + `canhw_queue[32]` 按结构存 ⇒ 内存 32×；**若不做 gs_usb 的 FD 扩展，USB-CAN 桥保持 classical** |
+| `generic/canserial.c:216-221,241-243,191-194` | admin 应答/`can_check_uuid` 的固定 8 字节布局——**admin 继续走 classical 小帧，不要跟着变长** |
+| `generic/canserial.c:50-51,292` | `transmit_buf[192]`/`receive_buf[192]` 与 `RECEIVE_WINDOW=192`：语义上仍够用（一条 message ≤ 64 B），切片逻辑改后**不必扩** |
+
+**好消息**：`mux.c`/`mux.h`/`bridge.c` 全程按字节流工作，用 `MUX_HEADER_BYTES`/`MESSAGE_MAX`
+而不是 8（`bridge.c:96` 的 `in[2*(MUX_HEADER_BYTES+MESSAGE_MAX)]`）⇒ **FD 不波及 mux/bridge**。
+`Makefile` 也**不必动**（改动全在既有文件内，不新增源文件，**也不建议把 FD 切片拆成新文件**）。
+`MESSAGE_MAX=64` 不变——FD 只是把「一条 message 跨多帧」变成「可能 1 帧」。
+
+### 8.2 三份 FDCAN 驱动的缺口（驱动层）
+
+三份驱动现在都是「**用 FDCAN 外设跑 classical 帧**」：`(msg->dlc & 0x0f) << 16` 埋 DLC，
+只写 `data[0]/data[1]`（=8 B），**FDF/BRS/ESI 全为 0**。逐处：
+
+| 驱动 | TX 缺口 | RX 缺口 |
+|---|---|---|
+| `stm32/fdcan.c` | `:141` 补 BRS(bit20)/FDF(bit21) + FD DLC 编码（9..15→12/16/20/24/32/48/64）；`:142-143` 写满 `data[0..15]`；`:138-140` 补 ESI(bit31) | `:245` FD DLC 解码 + FDF 判帧型；`:246-247` 读 `data[2..15]` |
+| `atsam/fdcan.c` | `:103` / `:104-105` / `:96-99` | `:204` / `:205-206` |
+| `atsamd/fdcan.c` | `:120` / `:121-122` / `:113-116` | `:220` / `:221-222` |
+
+- 比特率：三份都**只写 nominal**（`NBTP`：`stm32/fdcan.c:350`、`atsam/fdcan.c:322`、`atsamd/fdcan.c:334`），
+  **均未写 `DBTP`** ⇒ 需要新的数据段波特率 Kconfig。
+- 消息 RAM：`data[64/4]` 已预留，RXESC/TXESC=7 在 H7（`stm32/fdcan.c:356-359`）、atsam（`:332-338`）、
+  atsamd（`:342-345`）已设；**stm32 G0/G4 未设**（`:355` 的 ifdef 只含 H7）—— 需补，见未验证项。
+- `canhw_set_filter` 只看 id，**不用改**。
+
+### 8.3 哪些架构不能 FD（硬件限制，必须在 Kconfig 上挡住）
+
+| 架构 | 控制器 | FD |
+|---|---|---|
+| stm32 F0/F1/F2/F4 | bxCAN | ❌ 经典 CAN 控制器，无 FDF/BRS 寄存器 |
+| lpc176x | LPC CAN（SJA1000 血统） | ❌ DLC 只到 8 |
+| rp2040 / rp235x | can2040（PIO 位敲） | ❌ 库结构就是 `data[8]`（`lib/can2040/can2040.h:6-12`） |
+| stm32 H7/G0B1/G4 | FDCAN | ✅ 驱动已就位 |
+| atsam SAME70 | MCAN | ✅ |
+| atsamd SAMC21/SAME51/SAME54 | MCAN | ✅（**SAMD51 不在 CANBUS 列表内**） |
+
+### 8.4 Kconfig（建议名，待拍板）
+
+- `CANBUS_FD`（bool，**default n**）：总开关。建议默认关以保持与上游 classical 网络兼容。
+- `CANBUS_DATA_FREQUENCY`（int）：FD 数据段波特率，喂 `DBTP`；仅 FDCAN 架构可见。
+- `CANBUS_FD` 必须 `depends on` 三家的 FDCAN 符号（`HAVE_STM32_FDCANBUS` `src/stm32/Kconfig:165-166`、
+  `HAVE_SAM_CANBUS` `src/atsam/Kconfig:53`、`HAVE_SAMD_CANBUS` `src/atsamd/Kconfig:89`），
+  **不得**在 lpc176x/rp2040 的 CAN choice 上暴露。
+- 现有 `CANSERIAL`/`CANBUS`/`CANBUS_FREQUENCY`/`CANBUS_FILTER` 在 `src/Kconfig:429-440`。
+
+### 8.5 主机侧落点（`src/core/klippy/interface/devices/canserial.rs`）
+
+| 位置 | 改动 |
+|---|---|
+| `:929-940` `open_socket()` 之后、`bind_interface()` 之前 | `setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FD_FRAMES=5, &1, 4)`（libc 未导出，需自定常量，紧邻 `:101-104` 现有常量） |
+| `:81` `CAN_FRAME_SIZE = 16` | FD 的 `struct canfd_frame` 是 **72 字节**（id4 + len1 + flags1 + 保留2 + data64）；`len` 仍在 offset 4，**data 仍在 offset 8** |
+| `:121-125,141-148` `CanFrame` | `data: [u8; 64]`、`new()` 上限 64 |
+| `:156-175` `to_abi/from_abi` | 按 72 字节重排（`raw[4]=len`、`raw[8..]`） |
+| `:250-258` `CanSerialLink::frames()` | `chunks(CAN_DATA_BYTES)` 的切帧上限 |
+| `:662,683-691,754-772,841` | 读写缓冲 `[u8; CAN_FRAME_SIZE]` 与 `>= CAN_FRAME_SIZE` 断言 |
+| `:802-853` `CanbusAdminSocket` | 同经 `open_socket`/`to_abi`，一并受影响 |
+
+**会连带失效的测试**（必须重写，否则闸门红）：`:1150-1170` `test_can_frame_layout_matches_the_kernel`
+（断 `CAN_FRAME_SIZE == 16` 与 `size_of::<SockAddrCan>() == CAN_FRAME_SIZE`——FD 下两者不再相等，
+要拆成两个独立断言）、`:1143-1148` `test_a_frame_carries_at_most_eight_bytes`、
+`:1237-1245` `test_the_query_frame_is_the_admin_broadcast`（`&raw[9..]` 的 no-padding 断言）、
+`:1557` 与 `:1609-1610` 的切片断言。
+
+### 8.6 硬件现实（仓库内可确证者）
+
+- FDCAN 芯片目标：`test/configs/` 里有 `stm32h743/h723/g0b1/g431/g474/same70q20b`（**均未启用 CANBUS**，
+  纯 MCU 选择），`samd51p20` 不在 CANBUS 列表内。
+- **FD 收发器在哪块板：仓库内无任何依据**（无原理图/板级文档；`test/configs` 里 CAN 相关只有 classical 的
+  `stm32f103-can-mux.config`）。
+- 从代码成熟度看，**`stm32/fdcan.c` 最完整**（H7 分支已设 RXESC/TXESC），是首发首选；atsam/atsamd 次之。
+
+### 8.7 六个未验证项（落地前必须收口）
+
+1. **stm32 G0/G4 的 RXESC/TXESC 默认元素尺寸**是否够 64 B（`stm32/fdcan.c:355-359` 只在 H7 设）——需查参考手册。
+2. **FD 收发器在哪些板上**——仓库内无依据，需你给型号/原理图。
+3. **can2040 是否有 FD 实现**——仓库内无依据（上游需查）。
+4. **`CAN_RAW_FD_FRAMES` 在 classical 接口上的行为**（与古典固件混跑）——需 vcan/真机实测。
+5. **RAM 预算**：`admin_queue[8]`（8×）与 `canhw_queue[32]`（32×）会同步放大，小 RAM 的 MCU 要核算。
+6. **vcan 是否支持 FD**（`ip link set vcan0 type can fd on`）——主机侧无硬件验收路径的前提。
+
+---
+
+## 9. 修订后的主线与阶段（取代 §6 与 §7.4）
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| 0 | 分支 + 本文档 + `TODO.md` 条目 | ✅ `33afc7a` |
+| **1（主线）** | **主机侧 `canserial.rs` FD 化**：`CAN_RAW_FD_FRAMES`、72 B `canfd_frame`、`CAN_DATA_BYTES`/切帧上限可配、配置键 `canbus_fd`、重写 §8.5 列的失效测试 | 无硬件下按 72 B 重排的 socketpair 假总线双向通；`cargo test --workspace` 全绿 |
+| **2（主线）** | **固件侧 FD 链路层**（独立分支）：`struct canbus_msg` 8→64 + `CANMSG_DATA_LEN` + `canserial.c:79` 切片 + 三份 `fdcan.c`（FDF/BRS/ESI/DLC 编码/RX 解码/`DBTP`）+ Kconfig `CANBUS_FD`/`CANBUS_DATA_FREQUENCY` | 构建级覆盖目标让闸门真的编 FD 路径；`upstream-deviations.md` 登记 |
+| 2.5 | `linux` 目标加 SocketCAN（**现在带 FD**）| `vcan0` 上真 `klipper.elf` 以 `cans + FD` 当从站完成 identify——这是主线的软件端到端 |
+| 3 | vcan + 真机（`cans + FD`）；`candump` 看帧、内核 `can-isotp` 当**严格校验对端**验证 FD 帧格式（FDF/BRS/DLC 编码 9..15） | 每消息帧数实测（预期 1 帧/消息）；抖动/积压与旧 classical 对比 |
+| 4 | 文档收口 | 按 `doc-sync` 逐条 |
+| **ISO-TP（降级，不阻塞主线）** | 主机侧纯状态机（已派）+ 内核 `can-isotp` 互操作矩阵。**不做固件 ISO-TP 从站、不做 isotp+FD 组合、不做配置键接线**（除非主线跑通后你改主意） | 状态机单测全绿；与内核对打矩阵全绿 |
+
+### 新增/变更风险
+
+| # | 风险 | 处置 |
+|---|---|---|
+| **R11** | `struct canbus_msg` 变大会波及 `admin_queue`（8×）与 `canhw_queue`（32×）的内存预算 | 阶段 2 先核算 RAM；必要时把 admin 队列改成独立的 8 字节小结构 |
+| **R12** | `CANBUS_FD` 默认关，但一旦打开就必须**两端同时是 FD**（一 classical 一 FD 会直接通信失败） | 文档写清；主机侧 `canbus_fd` 与固件 `CONFIG_CANBUS_FD` 必须配对；错误文案要点名 |
+| **R13** | 三份 `fdcan.c` 同时改，回归面广（但它们已被现有古典 CAN 测试覆盖不到——都是构建级） | 三份改动分开提交；构建级覆盖目标覆盖 stm32/atsam/atsamd 三路径 |
+| R14 | DLC 编码 9..15 → 12/16/20/24/32/48/64 的换算出错会造成长度错位（静默数据损坏） | 沿用上游口径：**`msg->dlc` 始终表示原始字节数**（不是 DLC 编码），编码/解码只在驱动层；加单测钉住映射表 |
+
+---
+
+## 10. 实施记录
 
 （随实现推进回填：各阶段完成状态、提交号、实测帧数/抖动数字、与推算的偏差、余项。）

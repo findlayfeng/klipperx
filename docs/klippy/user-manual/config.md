@@ -232,7 +232,7 @@ max_accel: 3000
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)） |
+| `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)）；**一个进程只允许一份 host 库**——两个不同路径会在装载期点名报错（要两个固件请用同一路径的多引用，或用独立进程） |
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
 | `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**端口在配置期由主机声明**：主机为该端口节发 `config_uart`（带本节的 `uart_baud`）与 `config_bridge_port`（把该 UART 对象接给桥），**端口 `index` = 端口节的声明顺序**；`uart_baud` 缺省 250000，写错/端口打不开等由固件 `shutdown` ⇒ **主机在配置阶段显式报错**（不再有「编译期端口表」）。**顺序约束**：桥必须**先于**本子节连接；而裸 `[mcu]` 在同一阶段总是先于 `[mcu <名>]` 装载，所以桥是裸 `[mcu]` 时本子节**必须**写成 `[mcu <名>]`（否则报点名错误） |
 | `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。**桥经 CAN 上游的下游 attach 尚未接线（属 P5）**，现在会点名报错 |

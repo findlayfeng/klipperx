@@ -408,14 +408,7 @@ d. **M2 的复位命令**：名字与参数（要不要带"复位到哪一层"�
 
 ### 发现（本期不修，留档）
 
-1. **两份 host 库同进程无法一起退出**：`host.c:40-46/76-81/104-114` 每次 `klipper_host_init` 都覆盖
-   进程级 `SIGUSR1` handler，而 handler 用的是**每库各自**的 `g_shutdown_requested`/`g_main_jmp`，
-   `sched.c` 的 `run_tasks` 唯一退出路径就是那次 `longjmp`。⇒ 先卸裸帧库 → **SIGSEGV**（跳进已 unmap
-   的映射）；先卸桥库 → `HostLibrary::drop` 的 `join()` **无限挂住**。最小复现：同进程 `load_downstream`
-   载入 mux 库 + `load_bytes` 载入裸帧库，不发流量，依次 drop（日志 `/tmp/m1p3fx-t2.log`、`t3.log`）。
-   影响面：仅「同进程两份 host 库」的嵌入/测试场景（生产桥拓扑是两块板）。
-2. ~~**命名设备的握手在宿主库桥上不释放库**~~ —— **该诊断已在 P11（2026-10-15）被推翻并修掉**：
-   真正的原因是**测试的 tokio 运行时口径**（默认 current-thread），与「命名」无关。见下「P11」一节。
+1. **两份 host 库同进程无法一起退出**（**已按用户拍板改成「一进程一份库」的明确规则并落成守卫**，见下「L1」一节；它**不是** M1 的缺陷——M1 的产品拓扑最多一份库：桥是一块板，或桥是唯一那份库 + 真板下游）。
 
 ### 欠项
 
@@ -645,3 +638,17 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 
 **仍然开着的另一条（与本次无关）**：缺陷①「两份 host 库同进程无法一起退出」（`host.c` 进程级 SIGUSR1 与
 `sched.c` 的 longjmp 退出路径），本轮未动。
+
+### L1（2026-10-15）：一进程一份 host 库（规则 + 两道守卫）
+
+用户拍板：**明确 host 只能存在一份**；需要两个固件时改用**同一份库的多引用（mux）**或**独立进程**（固件侧 `linux` 目标可独立运行）。
+
+**落地（`f85c1cc`，主仓）**：
+
+- **配置层**：`HostLibraries::reject_a_second_path`（`mcu/host_libraries.rs:221`）在 `validate`（`:263-264`，由 `[mcu]` 的 host 传输解析调用，`config/mcu.rs:687`）里点名拒绝「≥2 条不同 `host_library:` 路径」。
+- **运行期**：`refuse_a_second_library`（`interface/devices/host.rs:213`）在 `library_for`（`:183`）最前面按**路径**守卫——读的是既有注册表的 `Weak`（死条目永不被当成活库，**不引入第二个静态表**）；同路径复用（mux/下游引用）不受影响，**先后载入**（先卸 A 再载 B）照旧允许。
+- **文案（逐字，点名两条路径 + 原因）**：配置层 `host library: one host library per process, but the config names '<a>', '<b>'. klipper stops its main loop through a process-wide SIGUSR1 handler that each library installs over the last one, so two libraries in one process meet either a jump into unloaded code (a crash) or a join whose signal another library consumed (a hang); name one path from several sections, or run the firmware images in separate processes`；运行期同口径、把 `<requested>`/`<loaded>` 换进去。
+- **测试**（3 条，判别性）：`host_libraries::validate_rejects_a_second_host_library_path`、`config::mcu::a_config_with_two_host_library_paths_is_rejected`、`host::host_tests::test_a_second_host_library_path_is_refused_while_one_is_live`（同路径两引用**仍装载**→不同路径**被拒**→卸掉 A 后 B **可载**）。
+  **反证**：去掉两道守卫 ⇒ 三条新测全红，且运行期那条**进程直接 SIGSEGV**（正是缺陷本身的表现）。
+- 既有测试必要调整 1 处（已说明）：`test_load_reports_a_missing_library` 现在也取 `HOST_LIBRARY_TEST_LOCK`——装载现在会查进程级注册表，否则「载不存在的路径」会与别的测试的活库竞速、报成「一进程一份库」而不是「failed to load」。
+- 验收：`cargo test --workspace` **3229 passed / 0 failed / 13 ignored**、fmt 干净、`--all-targets` 0 告警；「不误伤」面（同路径 mux、两条引用共用一份库、先后载入、多路径身份互异）全部既有测试绿。

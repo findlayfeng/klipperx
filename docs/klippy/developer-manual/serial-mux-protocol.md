@@ -19,7 +19,7 @@
 > `can_id_conflict` 弃号并 `shutdown`；已采纳 id 后自己发出的帧带应答头。`src/bridge.c`
 > （`CONFIG_BRIDGE`）有**桥半**：端口表、`uuid → 端口` 与 `id → 端口` 两张路由表、admin 扇出
 > （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**；**M1-P2 起**
-> 又加上**端口级命令族**（`SET_PORT_NODEID`/`RESET_DEVICE`/`RESET_PORT`，面向桥自己、无回执，
+> 又加上**端口级命令族**（`SET_PORT_NODEID`/`REQUEST_BOOTLOADER`/`RESTART_DEVICE`/`RESET_PORT`，面向桥自己、无回执，
 > 见下节「端口级命令族」）；**M1-P7 起端口改为配置期由主机声明的 UART 对象**
 > （`config_uart`/`config_bridge_port`，字典表退役），「单设备」由主机下发的 `flags` 运行期告知
 > 而非编译期标志。host 库还有
@@ -170,7 +170,8 @@ CAN 侧的同族常量在 `canserial.rs`。
 |-----------|------|------|------|
 | `QUERY_UNASSIGNED` | `0x00` | 主机 → 全部 | `[头(0x3f0)][len][0x20]["KXID"][0x00][crc16][0x7e]`（`discovery_query()`） |
 | `SET_KLIPPER_NODEID` | `0x01` | 主机 → 点名 | `[头(0x3f0)][len][0x20]["KXID"][0x01][uuid 大端 6 字节][nodeid][crc16][0x7e]`（`set_node_id_for(uuid, id)`，id 越界返回 `None`，校验同 CAN） |
-| `RESET_DEVICE` | `0x02` | 主机 → 桥 → 单口 | `[头(0x3f0)][len][0x20]["KXID"][0x02][index][crc16][0x7e]`（M1-P2；对照 CAN `CMD_REQUEST_BOOTLOADER` 同值同义，见下节） |
+| `REQUEST_BOOTLOADER` | `0x02` | 主机 → 桥 → 单口 | `[头(0x3f0)][len][0x20]["KXID"][0x02][index][crc16][0x7e]`（M1-P2；对照 CAN `CMD_REQUEST_BOOTLOADER` 同值同义）——**刷写工具的命令**：让那台设备去 bootloader |
+| `RESTART_DEVICE` | `0x05` | 主机 → 桥 → 单口 | 同上形状，`[0x05][index]`——**重启那台设备的固件**（`mcu_restart()`，即 `reset` 命令的身体），设备自己起来而不是停在引导里 |
 | `SET_PORT_NODEID` | `0x03` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x03][index][id][flags][crc16][0x7e]`（`set_port_node_id(index, id, flags)`，见下节） |
 | `RESET_PORT` | `0x04` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x04][index][crc16][0x7e]`（M1-P2，见下节） |
 | `NEED_NODEID` | `0x20` | 设备 → 主机 | `[头(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
@@ -213,14 +214,14 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 
 命令同样走 `0x3f0` 的 `KXID` 伪帧，但**面向桥自己**——桥是端口的拥有者，主机把「哪个 id 的设备
 在哪条端口上」直接告诉桥，**下游设备全程不参与、不答任何 admin**（这就是「与没有 admin 的设备
-共存」的机制）。全部**无回执**、参数不足/越界**静默丢弃**；除 `RESET_DEVICE` 外**不下发任何
+共存」的机制）。全部**无回执**、参数不足/越界**静默丢弃**；除上面两条设备命令外**不下发任何
 下游端口**（桥的 admin 处理函数以「是否消费」返回值短路本机设备半，`0x00`/`0x01` 的行为与扇出
 逐位不变）。
 
 | 命令 | 载荷 | 语义 |
 |------|------|------|
 | `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（= 该端口节的**声明顺序**，配置期由 `config_bridge_port` 登记）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
-| `RESET_DEVICE` | `[0x02][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体、不触发本机设备半；无桥的板（纯 mux 构建）由设备半自己执行（照 `canserial.c` 的 `can_process_request_bootloader` 模式，`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫，index 字节设备忽略） |
+| `REQUEST_BOOTLOADER` / `RESTART_DEVICE` | `[0x02][index]` / `[0x05][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体；**但「index 指不到本机任何在用的端口」时不消费、穿透给本机设备半**（`BRIDGE` 是 `default y if MUX_SERIAL` ⇒ 每个 mux 设备自己也是桥构建，而「主机经别的桥找上我」时命令就是该由我执行的）——这正是「单设备 mux 板能被点名重启」的关键：设备半执行 `[0x02]`→`bootloader_request()`（`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫）、`[0x05]`→`mcu_restart()`，index 字节设备忽略 |
 | `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲（**只对 USB-串口桥接板有效**：原生 USB CDC 板记下控制线状态但不当复位，见 `config.md` 的 `uart_restart_method`），用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
 
 **端口不再上报字典表**（M1-P7 起）：`BRIDGE_PORT_COUNT`/`BRIDGE_PORT<n>_NAME`/`_TYPE`/`_PATH`
@@ -262,9 +263,10 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
      `SET_KLIPPER_NODEID` + 重确认握手，之后按**整单元**收发（§4.5 的「两条都要发」）。
   顺序由调用方（`mcu/bridge_attach.rs`）持有，`serial.rs`/`host.rs` 只提供入口（`attach_downstream`/
   `load_downstream` + `handshake`/`attach` + `send_set_port_node_id`）。
-- **复位命令的主机接线**（M2 主机半边）：命名设备用 `restart_method: admin`——先重申
-  `SET_PORT_NODEID`（端口 `flags` 是桥侧状态，未置位时 `RESET_DEVICE` 会被桥**剥头**、设备收到
-  裸 `KXID` 帧而拒绝执行），再发 `RESET_DEVICE [0x02][index]`；legacy 设备由端口节
+- **复位/重启命令的主机接线**（M2 主机半边）：命名设备用 `restart_method: admin`——先重申
+  `SET_PORT_NODEID`（端口 `flags` 是桥侧状态，未置位时该命令会被桥**剥头**、设备收到
+  裸 `KXID` 帧而拒绝执行），再发 `RESTART_DEVICE [0x05][index]`（重启固件；`0x02` 是刷写工具
+  的进引导请求，不进 `restart_method`）；legacy 设备由端口节
   `uart_restart_method`（只认 `arduino`/`cheetah`）声明，主机只发 `RESET_PORT [0x04][index]`
   （桥自己消费、做线脉冲，**不下发**）。两条都无回执 ⇒ 确认靠「复位后能否重新握手/identify」。
 

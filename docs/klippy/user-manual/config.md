@@ -240,7 +240,7 @@ max_accel: 3000
 | `uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex）：CAN 模式必给；写在 `serial` 节上则共享串口连接期按它先发 SET_NODEID 再握手（独占串口忽略）。历史键名 `canbus_uuid` 仍兼容，同节两个都写会报错；**写在 `host_library` 节上**则指明这条库路径上被寻址的是哪块设备（判定见 [MCU 连接方式](mcu-connection.md)：同路径 1 节有 `uuid`、或 ≥2 节即按 id 寻址；不写 `uuid:` 的节认领桥自身设备，用装载期为该路径指派的身份点名） |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
 | `canbus_nodeid` | 整数 (1..=255) | 否 | 由 `[mcu_ids]` 分配 | **MCU 层 id**，**只有 CAN 节能写它**（写到其它节会被判为"第二个接口"报错；配置键名沿用 Klipper；在 CAN 上就是节点号，见下）。**不写就由分配器发**（`4` 起的最小空位，上限 255——CAN admin 报文只给它留了 1 字节）；写了就用写的那个——分配器装载时**预扫全配置**把显式号保留下来、自动号绕开，所以显式号写在哪个位置都生效、也不会被自动号占用。装载期只在两种情况报错：两个 `[mcu]` 写了同一个号，或 `4..=255` 已占满（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
-| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` / `admin` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级）。**桥下游端口上的设备另有一套**：命名设备（写了 `uuid:`）可用 **`admin`**——命令经桥转发 `RESET_DEVICE`、由设备自己进 bootloader；legacy 设备的复位由**端口节**的 `uart_restart_method` 决定（见下）。三条端口级命令都**无回执**，主机靠「复位后能否重新握手/identify」确认 |
+| `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` / `admin` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级）。**桥下游端口上的设备另有一套**：命名设备（写了 `uuid:`）可用 **`admin`**——命令经桥转发 `RESTART_DEVICE (0x05)`、由设备自己重启固件（**不是**进 bootloader：进引导是刷写工具的命令 `REQUEST_BOOTLOADER (0x02)`，不进 `restart_method`）；legacy 设备的复位由**端口节**的 `uart_restart_method` 决定（见下）。端口级命令都**无回执**，主机靠「复位后能否重新握手/identify」确认 |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
 
 > 详细参数说明见 [MCU 连接方式](mcu-connection.md)。

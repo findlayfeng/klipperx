@@ -163,13 +163,17 @@
 
 - [x] **M2-2 `RESET_DEVICE` 经桥转发** —— 下游是**能答 admin** 的设备，桥只把 `[0x02][index]` 转发给
   它（不扇出、不本地执行）。判定：只有该端口那台重启，其它端口与桥不受影响。
-  **2026-10-15 真机结论（控制路径已验 / 设备侧有前置条件）**：主机日志 `MCU 'child': resetting
-  bridge port 0 with RESET_DEVICE`（先重申 `SET_PORT_NODEID(0,id,1)` 再发），桥侧代码按端口路由整单元。
-  **但设备侧不一定真复位**：stm32 的 `bootloader_request()`（`src/stm32/stm32f1.c:247`）只有
-  `try_request_canboot()` 与 `FLASH_START_800` / `FLASH_START_2000` 两种 USB bootloader 路径；本板是
-  `CONFIG_STM32_FLASH_START_0000` 且未开 CAN ⇒ **它是设计内的 no-op**，所以实测中板子没重启。
-  要把「点名复位某台设备」真实验成，下游固件必须带**可软件进入的 bootloader**（CanBoot，或
-  USB-HID/Arduino 式在 0x800/0x2000），否则只能走线级 `RESET_PORT` 或断电。
+  **2026-10-15 真机通过（已按拆分后的命令号重验）**：命令族已拆为 **`REQUEST_BOOTLOADER (0x02)`（刷写
+  工具用：请引导）与 `RESTART_DEVICE (0x05)`（重启固件）**；`restart_method: admin` 走 **0x05**。
+  真机：宿主库当桥 + 真板（USB CDC + mux）当命名下游，`FIRMWARE_RESTART` 后日志
+  `MCU 'child': resetting bridge port 0 with RESTART_DEVICE`，且**板子确实重启**（USB 重新枚举：
+  `/dev/ttyACM2` → `/dev/ttyACM1`）。
+  **本轮修掉的真缺陷**：每个 mux 构建自己也是桥构建（`BRIDGE` 是 `default y if MUX_SERIAL`），而
+  `bridge_admin_unit` 对 `[0x02]/[0x05][index]` 原本**无条件消费**——板子自己就是设备时，命令被它
+  自己的桥半吞掉、永远到不了本机设备半（表现：桥把单元发到了线上、板子却不重启）。修法：
+  **只有 index 指到本机在用端口时才消费，否则穿透给本机设备半**（`src/bridge.c`）。
+  仍未验：真桥板带下游端口时的「只那台重启、其它不受影响」；无 bootloader 的板子上 `0x02` 仍是
+  设计内 no-op（该命令给刷写工具用）。
 - [x] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
   （重握手 / 等 `NEED_NODEID` / 重新 identify）。判定：`FIRMWARE_RESTART` 后会话确实重建，不出现
   「命令发了但设备没重启」的静默假成功；旧固件（不能答 admin）仍回退到 `command`。
@@ -207,9 +211,15 @@
 的显式判定）；⑤ M2-2 控制路径（`RESET_DEVICE` 经桥转发）。
 
 **上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
-B) `RESET_DEVICE` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）；
+B) `REQUEST_BOOTLOADER (0x02)` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）
+——不带就是设计内 no-op，它属**刷写工具**；「重启固件」用 `RESTART_DEVICE (0x05)`（`restart_method: admin`）；
 C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」还需 MCU 侧 **UART 端口后端**
 （`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
+
+**刷写这台板的正确姿势（本轮踩过，写下来）**：`./venv/bin/pyocd load -O connect_mode=halt
+-O frequency=1000000 -e chip --target stm32f103ze third_party/klipper/out/klipper.elf`
+——默认频率下刷写会**静默失败**（报成功但板上还是旧镜像），chip erase + halt + 1 MHz 才可靠；
+另外**核心处于 sleep 时经 SWD 读内存会全返回 `0xFF`**（必须先 `halt`），否则会误判「flash 是空的」。
 
 **两条语义要分清（真机实测）**：
 - `restart_method: admin`（`RESET_DEVICE`）＝**请求 bootloader**（面向刷写/恢复），无 bootloader 的下游它是 no-op。

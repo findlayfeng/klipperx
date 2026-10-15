@@ -773,6 +773,25 @@ third_party/klipper/out/klipper.elf`，构建配置在子模组 `.config`）。�
 | M2-3 无回执确认路径 | ✅ | 主机没有假成功：`Failed automated reset: MCU 'child' is still configured (CRC 0x890098f7)`，并先走 `Firmware is still in an earlier session (sequence 6); taking it over` |
 | M1-1 legacy 下游 | ✅（宿主机当桥形态，早前已验；**板做桥**未验） | 见 §7 P8 与本节；板做桥需 MCU 侧 UART 端口后端 |
 
+### 11.1 M2-2 续（2026-10-15 晚）：命令拆分 + 真机重启打通
+
+用户拍板：**`0x02` 保留为「进引导」**（属刷写工具，不进配置面），**新增 `0x05 RESTART_DEVICE`** 用于「重启固件」，
+`restart_method: admin` 改走 0x05。子模组 `b7856e0d`（命令表、`mcu_restart()` 成为 `command_reset` 的唯一实现；
+linux 用 `execv`、host 库 no-op）+ `3bd1df7d`（两个 MCU mux 矩阵目标）+ `5919539f`（下一条）；主仓 `ed0aaec`
+（主机侧改名/新发发送/测试断言）。
+
+**排障链（值得复用）**：
+1. 真机反复「日志说重启了、板子却没重启」→ 用 `socat` 中继抓桥↔板的字节，证明 **0x05 单元确实上了线**；
+   直接向板子 tty 写同一单元也无效 ⇒ 问题在设备侧。
+2. 怀疑固件没刷上 → pyocd 默认频率下 `load` **静默失败**（报成功但板上是旧镜像）；用
+   `-O connect_mode=halt -O frequency=1000000 -e chip` 才真刷上（此后设备自报 `mcu_version=609f1732` 与
+   本地构建一致）。另发现 **sleep 态经 SWD 读内存全返回 0xFF**（必先 `halt`）——一度误判「flash 是空的」。
+3. 真正的设计缺陷：**每个 mux 构建自己也是桥构建**（`BRIDGE` 是 `default y if MUX_SERIAL`），而
+   `bridge_admin_unit` 对 `[0x02]/[0x05][index]` **无条件消费**——板子自己就是设备时命令被它自己的桥半吞掉，
+   永远到不了本机设备半。修法（`5919539f`）：**只有 index 指到本机在用端口才消费，否则穿透给本机设备半**。
+4. 修后真机验证：`FIRMWARE_RESTART` → `resetting bridge port 0 with RESTART_DEVICE` → 板子 USB
+   **重新枚举**（`ttyACM2` → `ttyACM1`）⇒ 点名重启真的生效了。
+
 ### 仍未验 / 缺件（真机与后续）
 
 1. **板做桥**（M1-1/M1-2 的另一半）：MCU 侧没有 UART 端口后端（`CONFIG_SERIAL_UART` 只有 host 库实现）⇒

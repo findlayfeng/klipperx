@@ -65,10 +65,26 @@ pub const CLASSICAL_FRAME_BYTES: usize = 8;
 pub const CAN_FD_FRAME_BYTES: usize = 64;
 
 /// N_Bs: how long the sender waits for a flow control frame.
-pub const N_BS_TIMEOUT: Duration = Duration::from_millis(1000);
+///
+/// 25 ms is this project's existing patience for one CAN hop: it is Klipper's
+/// `MIN_RTO` (`klippy/chelper/serialqueue.c:107`), the floor the retransmit
+/// timeout is clamped to — and that estimator already covers CAN links (the
+/// same file switches on `SQT_CAN`). This host mirrors it as
+/// `MIN_RTO`/`mcu/mod.rs`. The ISO value is 1000 ms, which is sized for a
+/// diagnostic link shared with strangers; both ends here are ours, and a
+/// worst-case 64 byte message is ~11 frames (~1.2 ms at 1 Mbit/s), so 25 ms
+/// leaves a ~20x margin while failing fast.
+///
+/// ISO 15765-2 also asks the receiver's `N_Cs` (time to emit the flow control
+/// frame) to stay under `0.9 * N_Bs`, so the firmware must answer within
+/// ~22 ms.
+pub const N_BS_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// N_Cr: how long the receiver waits for the next consecutive frame.
-pub const N_CR_TIMEOUT: Duration = Duration::from_millis(1000);
+///
+/// Same 25 ms as [`N_BS_TIMEOUT`] and for the same reason; the peer's `N_Br`
+/// must stay under `0.9 * N_Cr`.
+pub const N_CR_TIMEOUT: Duration = Duration::from_millis(25);
 
 /// Default number of consecutive `FC.WAIT` frames accepted before the transfer
 /// is abandoned (the peer's `wftmax`).
@@ -834,24 +850,22 @@ mod tests {
         let mut tx = IsotpState::new(IsotpConfig::classical());
         tx.step(Duration::ZERO, Input::Send(&message));
 
-        // WAIT restarts the N_Bs deadline without sending anything.
-        let actions = tx.step(
-            Duration::from_millis(600),
-            Input::Frame(&[0x31, 0x00, 0x00]),
-        );
+        // Both steps land at the same instant, halfway to the deadline: a WAIT
+        // restarts N_Bs from there, and the CTS that follows in that same
+        // instant is accepted. Times are derived from the timeout so this test
+        // does not pin the constant's value.
+        let mid = N_BS_TIMEOUT / 2;
+        let actions = tx.step(mid, Input::Frame(&[0x31, 0x00, 0x00]));
         assert!(error_of(&actions).is_none());
         assert!(transmits(&actions).is_empty());
         assert_eq!(
             actions.last(),
             Some(&Action::Wait {
-                next_poll: Duration::from_millis(1600)
+                next_poll: mid + N_BS_TIMEOUT
             })
         );
 
-        let actions = tx.step(
-            Duration::from_millis(600),
-            Input::Frame(&[0x30, 0x00, 0x00]),
-        );
+        let actions = tx.step(mid, Input::Frame(&[0x30, 0x00, 0x00]));
         assert_eq!(transmits(&actions).len(), 2);
     }
 

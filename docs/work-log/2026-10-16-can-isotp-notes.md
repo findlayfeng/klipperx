@@ -96,9 +96,17 @@
 - **SN**：从 1 起、+1 递增、模 16（…F,0,1…）。内核实现为准（`isotp.c` 的 `sn++ % 16`）。
 - **STmin**：`0x00–0x7F` = 0–127 ms；`0xF1–0xF9` = 100–900 µs；其余保留。
 - **BS=0** = 剩余帧一口气发完、不再等 FC。
-- **超时**：N_As / N_Ar / N_Bs / N_Cr = **1000 ms**；N_Br / N_Cs 不是定时器而是性能不等式
+- **超时**：ISO 默认 N_As / N_Ar / N_Bs / N_Cr = **1000 ms**；N_Br / N_Cs 不是定时器而是性能不等式
   （`N_Br+N_Ar < 0.9·N_Bs`、`N_Cs+N_As < 0.9·N_Cr`）。
-  ⚠️ 这组数值来自二手 UDS 知识库（ISO 原文付费且不可检索）——**写进手册要标「非一手」**。
+  ⚠️ 这组数值来自二手 UDS 知识库（ISO 原文付费且不可检索）。
+  **本项目采用 25 ms（不是 1000 ms）**——对齐本仓既有的「一个 CAN 往返」耐心值：
+  `klippy/chelper/serialqueue.c:107` 的 `MIN_RTO 0.025`（本仓镜像 `src/core/klippy/mcu/mod.rs` 的
+  `MIN_RTO: Duration = Duration::from_millis(25)`），而同一份文件以 `#define SQT_CAN 'c'`
+  分派 CAN 链路 ⇒ 25 ms 本来就是这个项目在 CAN 上的取值。依据：两端都是我们自己的固件，
+  最大 64 B 消息约 11 帧（1 Mbit/s 下 ~1.2 ms），25 ms 留 ~20 倍余量又能快速失败。
+  固件侧的 `N_Cs` / `N_Br` 须分别 < `0.9 × 25 ms`。
+  （另一个 25 ms 与之同名但不同事：`klippy/mcu.py:279` 的 `TRSYNC_TIMEOUT`，本仓镜像在
+  `mcu/resource/trsync.rs:42`，是多 MCU 同步派发的截止时间。）
 - **内核的两个硬语义（固件从站必须对齐）**：① 内核**不发 WAIT 帧**，收端在收到 FF 时一次性决定
   能否收下整包；② 内核发送侧等 FC 超时 1 s 后报 `-ECOMM`。我们的消息上限 64 B，天然满足「FF 处
   一次性分配」。
@@ -442,15 +450,15 @@ canbus_fd: true | false           # 链路层；默认 false
 
 | 阶段 | 内容 | 验收 | 依赖 |
 |---|---|---|---|
-| 0 | 分支 + 本文档 + `TODO.md` 条目 | ✅ `33afc7a` / `19b885d` | — |
-| **1a** | **主机侧 CAN-FD 链路**（`canserial.rs`：72 B `canfd_frame`、`CAN_RAW_FD_FRAMES`、按 wire 切帧） | 无硬件 socketpair 按 72 B 双向 + 重写失效测试 | 已在跑 |
-| **1b** | **主机侧 ISO-TP 纯状态机**（`isotp_proto.rs`） | 纯单测（SF/FF/CF/FC/SN/超时/转义式） | 已在跑 |
-| **2a** | **固件 FD 链路层**（`canbus_msg` 8→64 + 三份 `fdcan.c` + `CANBUS_FD`/`CANBUS_DATA_FREQUENCY`） | 构建级覆盖（H743 fragment） | 已在跑 |
-| **2b** | **固件 ISO-TP 从站**（can-serial 的 CAN 承载层可切换：`generic/isotp.c` + `canbus.c:29` 分派 + `canserial.c` 两处承载点） | 构建级覆盖；admin/`uuid`/`MUX_CAN` 保持可用 | **等 2a 落**（同改 `canserial.c`/`Kconfig`，不能并行） |
-| **3a** | 配置面：`canbus_protocol` + `canbus_fd` 两个键 + `config::Transport` 变体 + `Interface` 接线 | 配置解析/互斥/非法组合测试 | 等 1a + 1b |
-| **3b** | 固件侧接线与非法组合拒绝（如 `isotp` 在不能 ISO-TP 的硬件上） | 编译覆盖 | 等 2a + 2b |
-| 4 | `linux` 目标加 SocketCAN（两种模式都要能跑） | `vcan0` 上真 `klipper.elf` 当从站，两条模式各自 identify | 需先侦察控制台选择机制 |
-| 5 | vcan + 真机 | FD 板跑 `cans+FD`；标准 CAN 板跑 `isotp+classical`；记录帧数/抖动 | — |
+| 0 | 分支 + 本文档 + `TODO.md` 条目 | ✅ `33afc7a` / `19b885d` / `a2db7c0` | — |
+| **1a** | **主机侧 CAN-FD 链路**（`canserial.rs`：72 B `canfd_frame`、`CAN_RAW_FD_FRAMES`、按 wire 切帧） | ✅ `7ea3c51`；can serial 30 测 / interface 171 测 / scan 22 测全绿 | — |
+| **1b** | **主机侧 ISO-TP 纯状态机**（`isotp_proto.rs`） | ✅ `0085b2c`（22 测）+ `af1b87d`（超时改 25 ms） | — |
+| **2a** | 固件 FD 链路层（`canbus_msg` 8→64 + 三份 `fdcan.c` + 两 Kconfig） | ⏸ **用户 2026-10-16 指示挂起**（「FD 的只先做主机侧实现，后续等条件」） | — |
+| **2b** | **固件 ISO-TP 从站**（can-serial 的 CAN 承载层可切换：`generic/isotp.c` + `canbus.c:29` 分派 + `canserial.c` 两处承载点） | 待开工。**不依赖 2a**：classical 上每帧仍 8 B，不碰 `struct canbus_msg`/驱动/mux/bridge；重装缓冲自成一块 | — |
+| **3a** | 配置面：`canbus_protocol` + `canbus_fd` 两个键 + `config::Transport` 变体 + `Interface` 接线 | 等 1a + 1b（✅ 已就绪） | — |
+| **3b** | 固件侧接线与非法组合点名拒绝 | 等 2b | — |
+| 4 | `linux` 目标加 SocketCAN（两种模式都要能跑） | 需先侦察控制台选择机制 | — |
+| 5 | vcan + 真机 | FD 板跑 `cans+FD`；**classical 板跑 `isotp+classical`（对端就是我们自己的固件）**；记录帧数/抖动 | — |
 | 6 | 文档收口 | 按 `doc-sync` 逐条 | — |
 
 ### 新增/变更风险
@@ -466,4 +474,39 @@ canbus_fd: true | false           # 链路层；默认 false
 
 ## 10. 实施记录
 
-（随实现推进回填：各阶段完成状态、提交号、实测帧数/抖动数字、与推算的偏差、余项。）
+### 2026-10-16：阶段 1a + 1b 完成（已合并进 `agents/feat-can-isotp`）
+
+**1b — 主机侧 ISO-TP 纯状态机**（`0085b2c`，22 测；`af1b87d` 把超时改成 25 ms）
+
+- 新增 `src/core/klippy/interface/devices/isotp_proto.rs`（1155 行含测试）+ `devices/mod.rs` 一行。
+- 公开 API：`IsotpConfig{frame_bytes, max_wait_frames}`（`classical()` 8 B / `can_fd()` 64 B，
+  `sf_max`/`ff_max`/`cf_max`）；`Input{Poll, Send(&[u8]), Frame(&[u8])}`；
+  `Action{Transmit(Vec<u8>), Received(Vec<u8>), Wait{next_poll}, Failed(IsotpError)}`；
+  `IsotpState::new/reset/step(now, input)`。**`Transmit` 可能一次给多张，调用方必须按序发。**
+- 实现者自己定、规格未钉死的选择：STmin 保留值（`0x80–0xF0`/`0xFA–0xFF`）当作 127 ms 而非报错；
+  空消息 ⇒ `EmptyMessage`；上一消息未发完时 `Send` ⇒ `TxBusy`（不排队）；FF 声明长度 ≤ `sf_max`
+  或为 0 ⇒ `InvalidPci`；classical 上出现转义形式 ⇒ `InvalidPci`；`max_wait_frames` 默认 4；
+  收端固定回 `CTS/BS=0/STmin=0`。
+- **超时改成 25 ms**（见 §3.2 的依据）；测试不写死该值（从常量派生），所以改常量不会假红。
+- 未接线：设备层（socket + `Device` trait）、配置键、固件从站——都在后续阶段。
+
+**1a — 主机侧 CAN-FD 链路**（`7ea3c51`，仅 `canserial.rs`）
+
+- 帧容量从全局常量变成每设备持有的 `CanWire{Classical, Fd}`（`data_bytes()` = 8/64）；
+  `to_abi`/`from_abi`、读写缓冲与数据报长度断言全部按 wire 走；FD 在 bind 前
+  `setsockopt(SOL_CAN_RAW, CAN_RAW_FD_FRAMES)`。
+- **签名变更**：`CanSerialLink::frames()` 多一个 `wire` 参数；`CanFrame::new` 名/形不变但上限 8→64
+  （宽度检查在 `to_abi(wire)`，超宽返 `Err`、绝不截断）。
+- 兼容性：`CanSerialDevice::open()` 与 `CanbusAdminSocket::open()` 语义不变（classical），
+  FD 走新增的 `open_with_wire()`；`test_wire`/`read_wire` 保留为 classical 包装 ⇒
+  `interface/mod.rs`、`scan.rs` 零改动。
+- 验证：canserial 30 测、interface 171 测、scan 22 测、`cargo test -p klipperx --lib` = **3018 passed / 0 failed / 13 ignored**（99 s，main 合并后复跑）。
+- 下游要知道的坑：**FD socket 与 classical 接口混跑**尚无实测（开 `CAN_RAW_FD_FRAMES` 后读到的
+  数据报形态、以及对端仍为 classical 时的行为），归阶段 5 实测。
+
+**2a — 固件 FD 链路层：搁置**
+
+- 用户 2026-10-16 指示：「FD 的只先做主机侧实现，后续等条件」。
+- 已派出并已停止；worktree 干净、分支零提交（**一个字节未写**），故无 `abandoned/` 需要留档，
+  只回收 worktree。改动清单一字未动地留在 §8.1–§8.4，恢复时直接照它下任务书。
+- **挂起只影响 FD 的固件半边**；2b 不受影响（见 §9.2 的阶段表）。

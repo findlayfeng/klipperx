@@ -232,8 +232,13 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   并按配置重新登记端口，于是下一轮 bring-up 拿到已回来的 tty ⇒ **自动恢复**。每个 MCU 只有一份恢复
   预算（`Printer::claim_bridge_port_recovery`，成功 connect 后归还）：所以「tty 在、但 open 一直失败」
   （目录/无权限/被占/槽越界）只会重启**一次**、随后稳定停在 error，不会重启风暴；路径始终不存在则
-  有界等待后仍点名报错（M1-3 行为不变）。尚未覆盖：设备是在 **child 连接期间**被 0x05 重启
-  （桥已 up、fd 已死）时不触发本恢复，下一次 `FIRMWARE_RESTART` 才能命中（见台账 §11.2）。
+  有界等待后仍点名报错（M1-3 行为不变）。**两条触发都覆盖**：桥自己的 bring-up 失败（预算记在桥节）与
+  **设备在 child 连接期间被 0x05 重启**（桥已 up、fd 已死 ⇒ child 自己的 connect 失败；预算记在
+  **child 节**）——两者都走同一套「有界等路径 + 一次 plain restart」。**真机全链已验**（2026-10-15）：
+  `RESTART_DEVICE` ⇒ 设备重新枚举（`ttyACM2`→`ttyACM1`）⇒ child 侧超时失败（照实报一次 error）⇒
+  `the bridge port tty came back; restarting the printer to reopen it` ⇒ plain restart ⇒ **bridge 22 /
+  child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
+  没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 

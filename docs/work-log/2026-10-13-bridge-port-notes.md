@@ -818,10 +818,19 @@ claim、该 MCU **成功 connect 后归还**：真实丢端口仍能恢复一次
 **验收**：三条新测试串行 1.8s / 12.3s / 4.8s（全程有界，不再有上次那种挂死）；`bridge_attach` 22 测、
 `object` 36、`restart` 14；全量闸门 3252 passed / 0 failed / 13 ignored；fmt 干净、`--all-targets` 0 告警。
 
-**仍未覆盖（登记为后续）**：设备在 **child 连接期间**被 0x05 重启（桥已 up、fd 已死）时**不**触发本
-恢复（本单元的触发面是“桥自己的 bring-up 失败”）；这种情况要等下一次 `FIRMWARE_RESTART`，那时才会命中
-恢复。可选后续：把同一判定（能辨识到那个端口路径）加到 child 侧。另：若一次恢复请求了重启但重启后始终
-没能 connect，预算不会被归还 ⇒ 同一打印机内不再自动恢复第二次（需人工 `FIRMWARE_RESTART`）。
+**仍未覆盖（登记为后续）**：in-place reset（`reconnect` 在 `handshake_with_in_place_resets` 内）里的 child 失败不走这条恢复。
+
+**11.2.1 child 侧触发（已补，缺口关闭）**：真机复验发现 `FIRMWARE_RESTART` 的顺序是「桥先起 → 再发 child 的
+`RESTART_DEVICE`」，于是失败落在 **child 侧**（`SET_KLIPPER_NODEID handshake … Receive timeout` + `write
+failed: (5)IO`）——上面的缺口。补法（`3e42390`，合入 `2b24696`）：**同一套手段扩到 child 触发**——
+`bridge_attach::host_bridge_port_path` 只认「`Transport::BridgePort` + Uart + 端口节有 `uart_path` +
+桥是 host 库」，有界等该路径 + **按 child 自己的节名**领预算 + 一次 plain restart；桥侧逻辑与桥节预算不变。
+三条新测试（4.8s 恢复 / 13.8s 路径不回来不重启 / 9.3s 路径在但连不上只重启一次）均在 main 侧复跑绿。
+**真机全链通过**（`host-recover2.log`）：`RESTART_DEVICE` ⇒ 设备重新枚举（ttyACM2→ttyACM1）⇒ child 侧超时
+失败（照实报一次 error）⇒ `the bridge port tty came back; restarting the printer to reopen it` ⇒
+plain restart ⇒ `bridge 22` / `child 135` 重新起来、**state=ready**（全链约 40s，~35s 是 child 会话自身超时）。
+**待办**：本轮 child 侧改动 `3e42390` 尚未经独立评审（同一套已被评审的模式的小扩展），列入里程碑末的
+统一评审；另：若一次恢复请求后重启始终连不上，预算不归还（需人工 `FIRMWARE_RESTART`）。
 
 ### 仍未验 / 缺件（真机与后续）
 

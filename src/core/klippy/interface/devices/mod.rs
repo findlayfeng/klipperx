@@ -19,6 +19,7 @@ pub mod canserial;
 #[cfg(test)]
 pub mod frame_mock;
 pub mod host;
+pub mod isotp_proto;
 #[cfg(test)]
 pub mod responder_mcu;
 pub mod serial;

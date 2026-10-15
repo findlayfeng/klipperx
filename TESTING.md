@@ -148,6 +148,20 @@
 - [ ] **M2-3 复位后的确认路径（无回执）** —— 三条端口级命令都没有回执，主机如何知道复位已发生
   （重握手 / 等 `NEED_NODEID` / 重新 identify）。判定：`FIRMWARE_RESTART` 后会话确实重建，不出现
   「命令发了但设备没重启」的静默假成功；旧固件（不能答 admin）仍回退到 `command`。
+- [ ] **M1-4 CAN 上游 attach（P5 余项）** —— 桥经 CAN 连（固件 `CONFIG_MUX_CAN`，主机需走
+  `interface/devices/canserial.rs` 的端口级单元发送路径）。真实测试：先经单帧 admin `0x3f0` 指派
+  node id，再经**单元**完成 mux 扫描/采纳（`SET_KLIPPER_NODEID`）、确认本节点回帧带应答头、
+  `uuid` 冲突时 `shutdown`；然后一台桥经 CAN 上游带 N 台下游设备（UNITS 口/legacy 口两种）并跑
+  `SET_PORT_NODEID`/`RESET_PORT`。判定：同 M1-1/M1-2 的 identify + `get_clock`，且**单元不被截断**。
+  **缺件（软件侧也已声明）**：`[can_device]` 下游端口节与固件 `BRIDGE_PORT_CAN` 端口后端未实现
+  （配置期点名拒绝）；本环境无 CAN 外设，固件 `MUX_CAN` 目前只有**构建级**验证
+  （`test/configs/stm32f103-can-mux.config` 让闸门真的编那段代码）。无真板时可在
+  `CAP_NET_ADMIN` 容器里用 `vcan` 搭两节点（本仓无此夹具先例，属可选）。
+  **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
+  CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
+  admin 单元属点火不管）的频率也需观察。
+- **M1-2 的软件侧等价物已永久入库**（真 `klipper.elf` 当命名下游走真桥，`-U` 身份 = 配置 `uuid:`），
+  所以上面 M1-2 真机项只需验**真板/真时序**（扫描/指派/冲突、`irq_save()` 时序、两个真设备同桥）。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 

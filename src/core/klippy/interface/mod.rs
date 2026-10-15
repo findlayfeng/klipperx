@@ -226,17 +226,17 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed \
-                         host library); this host library reference has no mux, so no bridge is \
-                         listening"
+                        "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed \
+                         host library, or a CAN link); this host library reference has no mux, \
+                         so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_set_port_node_id(index, mcu_id, flags)
             }
             _ => Err(InterfaceError::Other(
-                "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string(),
             )),
         }
@@ -261,17 +261,17 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
-                         library); this host library reference has no mux, so no bridge is \
-                         listening"
+                        "RESET_DEVICE needs a bridge link (a shared serial port, a muxed \
+                         host library, or a CAN link); this host library reference has no mux, \
+                         so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_reset_device(index)
             }
             _ => Err(InterfaceError::Other(
-                "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "RESET_DEVICE needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string(),
             )),
         }
@@ -296,17 +296,17 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
-                         library); this host library reference has no mux, so no bridge is \
-                         listening"
+                        "RESET_PORT needs a bridge link (a shared serial port, a muxed \
+                         host library, or a CAN link); this host library reference has no mux, \
+                         so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_reset_port(index)
             }
             _ => Err(InterfaceError::Other(
-                "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "RESET_PORT needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string(),
             )),
         }
@@ -858,24 +858,24 @@ mod tests {
         assert_eq!(
             interface.send_set_port_node_id(1, 2, 0).unwrap_err(),
             InterfaceError::Other(
-                "SET_PORT_NODEID needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string()
             )
         );
         assert_eq!(
             interface.send_reset_device(1).unwrap_err(),
             InterfaceError::Other(
-                "RESET_DEVICE needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "RESET_DEVICE needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string()
             )
         );
         assert_eq!(
             interface.send_reset_port(1).unwrap_err(),
             InterfaceError::Other(
-                "RESET_PORT needs a bridge link (a shared serial port or a muxed host \
-                 library); this interface is neither"
+                "RESET_PORT needs a bridge link (a shared serial port, a muxed host \
+                 library, or a CAN link); this interface is none of them"
                     .to_string()
             )
         );

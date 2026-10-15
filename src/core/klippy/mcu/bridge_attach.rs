@@ -38,14 +38,18 @@
 //!   drops them and the handshake times out with nothing downstream.
 //!
 //! A CAN port (`[can_device]`) has no configuration-time object yet (the
-//! firmware side of MUX_CAN does not exist), so a `can:` device is refused by
-//! name instead of being given a route to a port the bridge does not have.
+//! firmware's CAN *port backend* - `BRIDGE_PORT_CAN`, a `bridge_port_ops` that
+//! drives a CAN transceiver - does not exist; the CAN mux carrier `MUX_CAN`
+//! itself does), so a `can:` device is refused by name instead of being given a
+//! route to a port the bridge does not have.
 //!
 //! The bridge's own transport decides how the downstream handle is opened, and
 //! the two kinds it can be are exactly the two mux links: a shared serial port
 //! ([`serial::attach_downstream`]) or a host library
 //! ([`HostDevice::load_downstream`]). A bridge reached over CAN carries its
-//! downstream frames inside the CAN payload (M5/P5), so it is refused here.
+//! downstream frames inside the CAN payload: the firmware carrier (`MUX_CAN`)
+//! and the port-command units exist, but the host-side attach and the CAN
+//! *port* backend (`BRIDGE_PORT_CAN`) do not, so it is refused here.
 
 use super::bridge_ports::{CanPort, UartPort};
 use super::host_libraries::{HostLibraries, HOST_LIBRARIES_OBJECT};
@@ -114,17 +118,20 @@ pub(crate) fn resolve(
             config.name
         )));
     };
-    // A CAN downstream port has no configuration-time object yet: the firmware
-    // side of MUX_CAN does not exist, so there is no port the child could be
-    // routed to. Refuse it by name instead of sending a route to a port the
-    // bridge does not have (which would drop it in silence).
+    // A CAN downstream port has no configuration-time object yet: the firmware's
+    // CAN port backend (`BRIDGE_PORT_CAN`) does not exist, so there is no port
+    // the child could be routed to. (The CAN mux carrier `MUX_CAN` does exist -
+    // it carries units over a CAN *upstream*; a CAN *downstream* port is a
+    // separate `bridge_port_ops`.) Refuse it by name instead of sending a route
+    // to a port the bridge does not have (which would drop it in silence).
     if *kind == PortKind::Can {
         let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
             config_error(format!("MCU '{}': no port section '{port}'", config.name))
         })?;
         return Err(config_error(format!(
             "MCU '{}': bridge '{}' cannot host port '{}' (a [can_device]): a CAN downstream \
-             port is not created at configuration time yet (MUX_CAN does not exist)",
+             port is not created at configuration time yet (the firmware's CAN port backend, \
+             BRIDGE_PORT_CAN, does not exist)",
             config.name,
             section.mcu(),
             section.name()
@@ -320,8 +327,9 @@ fn open_link_handle(
             ))
         }
         Transport::Can { .. } => Err(config_error(
-            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
-             attach is M5/P5"
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+             carrier and the port-command units exist, but the host-side attach is not \
+             wired yet"
                 .to_string(),
         )),
         other => Err(config_error(format!(
@@ -610,7 +618,7 @@ mod tests {
             text.contains("bridge 'bridge' cannot host port 'can0'"),
             "{text}"
         );
-        assert!(text.contains("MUX_CAN does not exist"), "{text}");
+        assert!(text.contains("BRIDGE_PORT_CAN"), "{text}");
     }
 
     // -----------------------------------------------------------------------
@@ -649,8 +657,8 @@ mod tests {
     }
 
     /// A bridge reached over CAN is refused with the one message the attach pass
-    /// and the reset path share, and never through `{:?}`: its downstream frames
-    /// would ride the CAN payload (M5/P5).
+    /// and the reset path share, and never through `{:?}`: its host-side attach
+    /// is not wired yet.
     #[test]
     fn a_can_bridge_is_refused_with_the_shared_message() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
@@ -668,8 +676,9 @@ mod tests {
 
         assert_eq!(
             err.to_string(),
-            "a bridge reached over CAN cannot carry a downstream device yet: the CAN upstream \
-             attach is M5/P5"
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+             carrier and the port-command units exist, but the host-side attach is not \
+             wired yet"
         );
     }
 

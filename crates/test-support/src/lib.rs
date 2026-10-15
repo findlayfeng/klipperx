@@ -102,6 +102,18 @@ pub fn linux_firmware_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_LINUX_FIRMWARE"))
 }
 
+/// Absolute path to the built linux process firmware with the serial mux
+/// (`test/configs/linuxprocess-mux.config`: `CONFIG_MACH_LINUX=y` +
+/// `CONFIG_MUX_SERIAL=y`) — the binary [`linux_firmware::LinuxFirmware::spawn_named`]
+/// runs with an identity.
+///
+/// `build.rs` treats it exactly like [`linux_firmware_path`]: it asserts the
+/// file when the default architecture set builds it, and with a `KLIPPERX_ARCHES`
+/// that leaves `linux` out the path still resolves but the file is absent.
+pub fn linux_mux_firmware_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_LINUX_MUX_FIRMWARE"))
+}
+
 /// The linux firmware process fixture (spawn / reap, see [`LinuxFirmware`]).
 pub mod linux_firmware;
 pub use linux_firmware::LinuxFirmware;

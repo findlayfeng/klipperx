@@ -1113,6 +1113,178 @@ mod tests {
         }
     }
 
+    /// The whole config-driven chain against the **real** linux process
+    /// firmware as a **named** downstream: `[mcu bridge]` over the host mux
+    /// library, `[uart_device uart0]` with `uart_path:` on the firmware's own
+    /// pty, and a `[mcu child]` whose `uuid:` is the identity the firmware was
+    /// started with (`-U`). The port groups as named, so the host scans it, the
+    /// firmware answers with that identity, and the two complete the mux
+    /// handshake — the named counterpart of
+    /// `a_real_linux_firmware_completes_identify_and_clock_behind_the_bridge_port`,
+    /// and the software-side equivalent of a named device that is real
+    /// hardware.
+    ///
+    /// One identity constant feeds both the firmware's `-U` and the child's
+    /// `uuid:`: the bytes have to be the same, or the scan finds no match and
+    /// the handshake times out instead of failing clearly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_real_linux_firmware_completes_handshake_behind_the_bridge_port() {
+        use crate::core::klippy::cmd::{ClockSync, McuClock};
+        use crate::core::klippy::printer::PrinterState;
+
+        // One definition, two consumers, so the firmware's identity and the
+        // child's `uuid:` cannot drift apart.
+        const NAMED_DOWNSTREAM_UUID: [u8; 6] = [0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c];
+        let uuid_hex: String = NAMED_DOWNSTREAM_UUID
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The real named downstream: started with the identity, its pty slave
+        // (hung at the `-I` path) is the tty the port opens through
+        // `uart_path:`. Never written to directly.
+        let firmware = klipperx_test_support::LinuxFirmware::spawn_named(NAMED_DOWNSTREAM_UUID)
+            .expect("the mux firmware process starts");
+
+        // The bridge keeps its build-baked tty as a live pty, so the only
+        // difference from the legacy chain is the port's own path.
+        let baked = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                baked.path.display()
+            )
+        });
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
+             [mcu child]\nuart: uart0\nuuid: {uuid_hex}\n",
+            library.display(),
+            firmware.serial_path().display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor: Arc<dyn crate::core::klippy::reactor::Reactor> =
+            Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(Arc::clone(&reactor))),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
+
+        // The library's own stderr is where the downstream port reports the tty
+        // it opened (`bridge.c`'s `open at … (fd N, slot 0)`) — the route's far
+        // end. Captured from before the config loads through the bring-up,
+        // because the port may open either side of that call.
+        let capture = StderrCapture::start(&_serial, "named-real-firmware");
+        printer.load_config(&config).expect("the config loads");
+
+        // Everything answers here: the named handshake completes instead of
+        // being interrupted at a silent child.
+        tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+            .await
+            .expect("the named real firmware answers every step of the chain");
+        let stderr = capture.text();
+        drop(capture);
+
+        let state = printer.get_state_message();
+        assert_eq!(
+            state.category,
+            PrinterState::Ready,
+            "the whole chain came up: {}",
+            state.message
+        );
+        // The port handle as well as `Ready`: the bridge opened a downstream
+        // tty on slot 0, which is the routing end the handshake travelled to.
+        assert!(
+            stderr.contains("open at") && stderr.contains("slot 0"),
+            "the bridge opened its route's downstream port on the firmware's tty; \
+             library stderr:\n{stderr}"
+        );
+
+        let child = printer
+            .lookup_object_as::<McuObject>("mcu child")
+            .expect("the printer has [mcu child]")
+            .mcu()
+            .expect("the child connected");
+        assert!(
+            child.is_identified(),
+            "the child completed identify, so the scan matched the firmware's identity"
+        );
+
+        // The identify payload is the firmware's own: the version string it
+        // reports, and the CLOCK_FREQ only this linux build carries (the mux
+        // host library is built at 20 MHz).
+        let status = printer
+            .status_of("mcu child", 0.0)
+            .expect("the child has a status snapshot");
+        let version = status
+            .get("mcu_version")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            !version.is_empty(),
+            "the firmware's own version came through identify: {status}"
+        );
+        assert_eq!(
+            status["mcu_constants"]["CLOCK_FREQ"].as_f64(),
+            Some(50_000_000.0),
+            "CLOCK_FREQ is the linux firmware's own constant: {status}"
+        );
+
+        // One `get_clock` round trip over the port, and a second to see the
+        // counter advance at CLOCK_FREQ. The value is the low 32 bits (it wraps
+        // at ~86 s at 50 MHz), so the pair is checked by its delta rather than
+        // against an absolute bound (the 5s timeout plus the 20ms sleep bounds
+        // any possible stall at ≈ 251M ticks).
+        let clock = McuClock::new(Arc::clone(&child), reactor);
+        let first = tokio::time::timeout(Duration::from_secs(5), clock.get_clock())
+            .await
+            .expect("get_clock is answered over the bridge port")
+            .expect("get_clock after identify");
+        assert!(first.clock > 0, "the firmware counter is running");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), clock.get_clock())
+            .await
+            .expect("the second get_clock is answered")
+            .expect("get_clock twice");
+        let advanced = second.clock.wrapping_sub(first.clock);
+        assert!(
+            advanced > 0 && advanced < 251_000_000,
+            "the counter advances by a plausible tick delta: {first:?} → {second:?}"
+        );
+
+        // No firmware process outlives the test: the fixture kills and reaps on
+        // drop, after the printer and the mux library have let go. The clock
+        // and the mcu handle hold the child's interface — and through it the mux
+        // library — so they go first, or the unload wait still finds the library
+        // loaded.
+        let pid = firmware.pid();
+        drop(clock);
+        drop(child);
+        drop(printer);
+        drop(teardown);
+        drop(firmware);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "firmware {pid} is still running after drop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// One bridge with **two** ports online at once, each hung on its own real
     /// linux firmware process: `[uart_device uart0]` on the first firmware's
     /// tty, `[uart_device uart1]` on the second's, and a uuidless `[mcu child]`

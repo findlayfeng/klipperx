@@ -64,6 +64,26 @@ impl LinuxFirmware {
     /// stderr tail rather than hanging the test run. The half-started process
     /// and its directory are cleaned up on that path too.
     pub fn spawn() -> io::Result<Self> {
+        Self::spawn_elf(crate::linux_firmware_path(), None)
+    }
+
+    /// Start the mux-flavoured `klipper.elf` (built from
+    /// `test/configs/linuxprocess-mux.config`) with a six-byte identity, and
+    /// wait until its console is up.
+    ///
+    /// `-U <12 hex digits>` sets the identity the firmware answers a discovery
+    /// scan with (`third_party/klipper/src/linux/main.c`), so a bridge told the
+    /// same bytes in a child's `uuid:` can scan, match, and hand the device its
+    /// node id — the named counterpart of [`spawn`], which leaves the identity
+    /// all zero and speaks the legacy bare-frame protocol.
+    pub fn spawn_named(uuid: [u8; 6]) -> io::Result<Self> {
+        Self::spawn_elf(crate::linux_mux_firmware_path(), Some(hex_uuid(&uuid)))
+    }
+
+    /// The shared body of [`spawn`] and [`spawn_named`]: run `elf` with the
+    /// fixture's own `-I` path (and `-U identity` when given), then wait as
+    /// the doc on [`spawn`] describes.
+    fn spawn_elf(elf: PathBuf, identity: Option<String>) -> io::Result<Self> {
         let dir = std::env::temp_dir().join(format!(
             "klipperx-linux-firmware-{}-{}",
             std::process::id(),
@@ -88,10 +108,12 @@ impl LinuxFirmware {
                 ));
             }
         };
-        let elf = crate::linux_firmware_path();
-        let mut child = match Command::new(&elf)
-            .arg("-I")
-            .arg(&serial_path)
+        let mut command = Command::new(&elf);
+        command.arg("-I").arg(&serial_path);
+        if let Some(identity) = &identity {
+            command.arg("-U").arg(identity);
+        }
+        let mut child = match command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -190,6 +212,12 @@ impl Drop for LinuxFirmware {
         }
         let _ = fs::remove_dir_all(&self.dir);
     }
+}
+
+/// The 12 lowercase hex digits `-U` takes for a six-byte identity (the
+/// firmware accepts either case and no `0x` prefix, `src/linux/main.c`).
+fn hex_uuid(uuid: &[u8; 6]) -> String {
+    uuid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Is the firmware's serial link up: a symlink at `path` pointing into
@@ -300,6 +328,39 @@ mod tests {
             )
             .is_err()),
             "the fixture's directory should be gone with it"
+        );
+    }
+
+    /// The mux-flavoured firmware starts with a `-U` identity and reaps the
+    /// same way. What the identity does on the wire is the bridge test's
+    /// subject; this checks the fixture can start that elf at all.
+    #[test]
+    fn linux_mux_firmware_spawn_named_and_drop() {
+        let elf = crate::linux_mux_firmware_path();
+        assert!(
+            elf.exists(),
+            "{} is missing — the default KLIPPERX_ARCHES builds the linuxprocess-mux target",
+            elf.display()
+        );
+
+        let firmware = LinuxFirmware::spawn_named([0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c])
+            .expect("the mux firmware fixture should start");
+        let pid = firmware.pid();
+
+        assert!(
+            process_exists(pid),
+            "firmware {pid} should run right after spawn_named"
+        );
+        assert!(
+            serial_link_ready(firmware.serial_path()),
+            "spawn_named should have waited for the -I symlink"
+        );
+
+        drop(firmware);
+
+        assert!(
+            eventually(Duration::from_secs(5), || !process_exists(pid)),
+            "firmware {pid} should be killed and reaped by drop"
         );
     }
 }

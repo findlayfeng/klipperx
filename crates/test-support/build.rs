@@ -146,6 +146,7 @@ fn main() {
     std::fs::create_dir_all(&dicts).expect("failed to create the dictionary directory");
     let mut built = 0usize;
     let mut linux_firmware = None;
+    let mut linux_mux_firmware = None;
     for config in
         std::fs::read_dir(klipper_dir.join("test/configs")).expect("test/configs is readable")
     {
@@ -166,14 +167,21 @@ fn main() {
 
         let target_out = build(&klipper_dir, &build_dir.join("mcu").join(&name), &text);
         let dictionary = require_dict(&target_out);
-        // The linux process firmware: the fixture in `src/linux_firmware.rs`
-        // runs this `klipper.elf` as a standalone process, so its presence is
-        // asserted right where it is built (the default architecture set
-        // contains `linux`, so the default build always gets here).
-        if name == "linuxprocess" {
+        // The linux process firmware, in two shapes: the fixture in
+        // `src/linux_firmware.rs` runs these `klipper.elf` files as standalone
+        // processes, so their presence is asserted right where they are built
+        // (the default architecture set contains `linux`, so the default build
+        // always gets here). `linuxprocess` is the base target;
+        // `linuxprocess-mux` adds the serial mux (`CONFIG_MUX_SERIAL=y`), which
+        // is what lets a fixture give the process an identity with `-U`.
+        if name == "linuxprocess" || name == "linuxprocess-mux" {
             let elf = target_out.join("klipper.elf");
             assert!(elf.exists(), "make did not produce {}", elf.display());
-            linux_firmware = Some(elf);
+            if name == "linuxprocess" {
+                linux_firmware = Some(elf);
+            } else {
+                linux_mux_firmware = Some(elf);
+            }
         }
         std::fs::copy(&dictionary, dicts.join(format!("{name}.dict")))
             .unwrap_or_else(|e| panic!("failed to collect {}: {e}", dictionary.display()));
@@ -201,6 +209,23 @@ fn main() {
     println!(
         "cargo:rustc-env=KLIPPER_LINUX_FIRMWARE={}",
         linux_firmware.display()
+    );
+
+    // The mux-flavoured firmware's `klipper.elf`, exposed the same way and with
+    // the same degenerate behaviour: with `linux` left out of `KLIPPERX_ARCHES`
+    // the file is absent while the path still points at where a default build
+    // would put it, so `LinuxFirmware::spawn_named` reports the missing file
+    // instead of the build failing here.
+    let linux_mux_firmware = linux_mux_firmware.unwrap_or_else(|| {
+        build_dir
+            .join("mcu")
+            .join("linuxprocess-mux")
+            .join("out")
+            .join("klipper.elf")
+    });
+    println!(
+        "cargo:rustc-env=KLIPPER_LINUX_MUX_FIRMWARE={}",
+        linux_mux_firmware.display()
     );
 
     // Upstream's `test/klippy/*.test` corpus, turned into individual

@@ -196,7 +196,7 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 | `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲（**只对 USB-串口桥接板有效**：原生 USB CDC 板记下控制线状态但不当复位，见 `config.md` 的 `uart_restart_method`），用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
 
 **端口不再上报字典表**（M1-P7 起）：`BRIDGE_PORT_COUNT`/`BRIDGE_PORT<n>_NAME`/`_TYPE`/`_PATH`
-四键已**删除**。端口由**主机在配置期声明**——`config_uart oid=%c baud=%u` 建一个 UART 对象，
+四键已**删除**。端口由**主机在配置期声明**——`config_uart oid=%c baud=%u slot=%c` 建一个 UART 对象（`slot` = 要用哪个端口槽，与下面的 `index` 同源一处计数；该槽没有运行期登记的 tty 时回落库构建期的默认路径），
 `config_bridge_port oid=%c uart=%c` 把它接成桥的一个端口；**端口 `index` = 该端口节的声明顺序**
 （固件 `bridge_add_port` 取表内首个空位，与主机的下发顺序一致），`SET_PORT_NODEID` 的 `index`
 就是它。配置失败（baud 不可设、端口打不开、端口数超限）由固件 `shutdown` ⇒ 主机在**配置阶段**

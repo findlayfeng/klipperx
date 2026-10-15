@@ -357,19 +357,19 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 ### M1 桥下游端口模块化与「无 admin 设备」共存
 
-设计、拍板点与六期开发计划全部记在 [桥下游端口模块化与「无 admin 设备」共存（2026-10-13）](docs/work-log/2026-10-13-bridge-port-notes.md)（`docs/work-log/`）。
+设计、拍板点与六期开发计划原记在 `docs/work-log/2026-10-13-bridge-port-notes.md`（已删，内容已全部进手册；要回溯历史用 `git log -- docs/work-log/`）；现行行为以[串口复用协议](docs/klippy/developer-manual/serial-mux-protocol.md)、[配置手册](docs/klippy/user-manual/config.md)与[MCU 连接方式](docs/klippy/user-manual/mcu-connection.md)为准。
 
 一句话范围：端口按 klipper 一贯的设备节形式定义（`[uart_device <名>]` / `[can_device <名>]`，
 `i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
 都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
-"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，见笔记 §9）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4）、P6 多站串口（RS-485）**整体挂「待测（硬件）」**（需 485 设备，不阻塞进度）。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见笔记 §7）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见笔记 §8「L1」。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 §8「P11」。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
+"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，覆盖见 [`testing.md`](docs/klippy/developer-manual/testing.md)）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4）、P6 多站串口（RS-485）**整体挂「待测（硬件）」**（需 485 设备，不阻塞进度）。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见 [`TESTING.md`](TESTING.md) 的 M2-1）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见开发手册模块表的 `host_libraries.rs` 行。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 `testing.md` 的 `restart.rs` 行。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
 
 ### M2 通过 **admin 流程复位固件**（per-device reset）——已并入 M1
 
-设计与分期见 [M1 笔记](docs/work-log/2026-10-13-bridge-port-notes.md)：复位与端口级命令是**同一套机制**
-（都分"面向设备"与"面向端口/桥"两条），固件命令族落 **§5 P2**（与 `SET_PORT_NODEID` 同期，共用
-`KXID` 帧形与端口 `index`），主机侧 `restart_method` 接入落 **§5 P3**。✅ 固件命令族已落地
+复位与端口级命令是**同一套机制**
+（都分"面向设备"与"面向端口/桥"两条，现行形状见[串口复用协议](docs/klippy/developer-manual/serial-mux-protocol.md)的命令表
+与[MCU 连接方式](docs/klippy/user-manual/mcu-connection.md)的 `restart_method` 节）。✅ 固件命令族已落地
 （2026-10-13，见笔记 §6）：`RESET_DEVICE 0x02 [0x02][index]` 只转发到该口、`RESET_PORT 0x04
 [0x04][index]` 由桥做 DTR/RTS 线脉冲（poll 状态机非阻塞），均无回执；✅ **主机半边也已落地**（笔记 §7 的 P3-D）：命名设备用 `restart_method: admin`（命令经桥转发 `RESET_DEVICE`），legacy 由**端口节** `uart_restart_method`（只认 `arduino`/`cheetah`，线级）决定走 `RESET_PORT`；无回执 ⇒ 沿用「复位后重开+重连」确认；旧固件/非桥由 `resolve` 的点名错误自然降级为 `command`。
 真机项（复位极性与保持、双板接线）**已按统一策略后移**，见上面 M1 段的测试策略。

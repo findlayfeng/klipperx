@@ -80,6 +80,11 @@
    放弃原因、可挖掘点与日期。`abandoned/*` **不参与主线**：不合并、不在其上继续开发、
    不作为验收依据，只作素材来源；删除条目或从中取料继续做都要用户点头，执行仍由 main 完成。
    取料进主线时按正常流程重做新分支（可编译、带测试、手册同步），提交信息里注明来源分支。
+9. **评审证据由 main 补齐**：评审/侦察子代理若声明「没有 shell」（它们只能读文件、跑不了 `git`），
+   它的逐文件结论需要 main 补一次 `git show --stat <commit>` / `git show <commit> -- <file>`
+   并把输出贴回去；别拿「内容比对」当文件清单证据。
+10. **合入门槛**：评审裁定的 **P0/P1 必修完才合入**（修入原提交或紧接一个跟进提交）；P2 建议可随同批
+   收口。评审“修复后可合入”时，先在分支上修完、重跑验收，再合并。
 
 ### 提交信息风格
 
@@ -127,6 +132,11 @@ git config core.hooksPath .githooks
 提交前自查：手册里关于被改对象的每句话，现在还能对着源码成立吗？细则见
 [测试 → 文档同步](docs/klippy/developer-manual/testing.md#文档同步)。
 
+**删档案前先分流**：删除工作记录/调研笔记一类过程档案前，先把「唯它才有的规范信息」分类搬进规范文档
+——运行机制 → 协议/开发手册、与上游差异 → `upstream-deviations.md`、硬件受限项 → `TESTING.md`、
+未完成待办 → `TODO.md`、操作手法 → 对应 skill；然后清掉所有指向它的引用（**只留一句非链接的溯源说明**，
+写清「原件已删、用 `git log --diff-filter=D -- docs/work-log/` 回溯」），并确认删除后没有死链。
+
 ## 派侦察（scout）的准则
 
 - **规格未知才派**：写任务书前若不确定上游语义、本仓落点或依赖链，先派**只读 scout** 产出「可直接
@@ -158,7 +168,34 @@ git config core.hooksPath .githooks
   `cargo fmt --all` / `git status` 这类命令也会让双方看到对方的中间态，进而误判或误清。
   并行单元一律各建 worktree；确需共用时，任务书里必须写明「本 worktree 只有你一个写者」
   并明确禁止上述破坏性操作。
-- 该四条同样适用于 worker 任务书：main 写任务书时必须把本节纪律写进约束节。main（主代理）不受此限。
+- **任务书自带防超时三板斧**：给写手的任务书必须写「立即落笔（读完模板就写第一版）/ 10 分钟内
+  必须首个提交（WIP 也算）/ 每步增量提交 / 只读错误点名的文件、禁探索式 grep」——曾有一个单元前
+  三次尝试各 30 分钟**零产出**（侦察挤爆预算），加上这三句后 30 分钟内 2 个提交完成。
+- **命令形式纪律**：bash 一律**单条命令**，禁 `2>&1`、`|`、`>`、`;`（要几步就几步）；改文件用
+  `edit`/`write`，禁 heredoc / `sed -i`；跑测试用**窄过滤 + `timeout`**（如 `timeout 300 cargo test …`），
+  普通测试禁开 `KLIPPERX_TRACE=1`（全量 trace 会灌爆 harness）。
+- **测试必须整体有界**：新增/改造测试一律加总体 `tokio::time::timeout`（或等价兜底），**禁止**写出
+  能挂住 CI 的用例；交互测试用 `--test-threads=1` 复现挂死。排查挂死先看线程状态：**全线程
+  `futex_wait` + CPU≈0 = 在等**（不是死循环）。细则见 [测试](docs/klippy/developer-manual/testing.md)。
+- **改 `third_party/`（上游子模组）或固件前先报告**：worker 不得擅自改子模组/固件的代码、`Kconfig`、
+  `Makefile`（本仓对上游有偏移，需登记与验证口径），先把「要改什么、为什么必须改」报给 main 裁决；
+  批准后仍只在自己的 worktree/分支内提交。
+- **真机/刷板纪律**：刷固件、SWD 排障按 [`.agents/skills/flash-firmware`](.agents/skills/flash-firmware/SKILL.md)
+  skill 执行（**SWD 频率必须保守、按设备调整，过高会静默刷写失败；读内存前必须 `halt`**）；
+  真机跑完必须清理残留进程与临时文件（`pgrep -x klipper.elf` 自查——`kill -9` 夹具会漏子进程）。
+- 本节各条同样适用于 worker 任务书：main 写任务书时必须把本节纪律写进约束节。main（主代理）不受此限。
+
+## 技能（skills）
+
+项目级 skill 放在 **`.agents/skills/<名>/SKILL.md`**（随仓库走，pi 从工作目录向上发现，到仓库根为止）；
+需要时用 `/skill:<名>` 显式加载。当前两份：
+
+| skill | 何时用 |
+|-------|--------|
+| [`flash-firmware`](.agents/skills/flash-firmware/SKILL.md) | 给板子构建/刷写固件、SWD 排障、验证「固件到底刷上没有」——**含频率/`halt`/回读校验的完整手法** |
+| [`subagent-rescue`](.agents/skills/subagent-rescue/SKILL.md) | 子代理卡住/超时/零产出、provider `content_filter` 误杀、测试挂死时的救援流程 |
+
+新手法（工具/设备/流程）沉淀优先考虑做成 skill；**规则与纪律**（本节各节）仍写在 `AGENTS.md`。
 
 ## 读什么
 

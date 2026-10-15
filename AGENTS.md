@@ -22,28 +22,12 @@
 ### 规则
 
 1. **基线**：从 `work`（当前开发主线）切出。不要直接在 `work` / `master` 上提交。
-2. **并行任务用 worktree 隔离**：同一仓库同时开多个任务时，为每条分支建独立 worktree，
-   避免互相污染检出状态；每个 worktree 内独立构建、独立提交：
-
-   ```bash
-   git worktree add ../klipperx.worktrees/<短名> -b agents/<分支名> work
-   ```
-
-   现有布局：主检出 `…/klipperx` → `work`；并行任务在 `…/klipperx.worktrees/<短名>`。
-   此命令只由 main 执行，见规则 5。
-
-   **不拷子模组**：worktree 里 `third_party/klipper` 保持空目录即可——既不 `git submodule
-   update`（属规则 6 禁止的远程交互），也不拷贝主检出的子模组（拷贝会让子模组的相对 gitfile
-   失效，worktree 里任何 `git status` 都会报「不是 Git 仓库」）。需要语料/构建时用环境变量
-   指向主检出：
-
-   ```bash
-   KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper cargo test …
-   ```
-
-   共享同一份检出是安全的：构建只写各自 `OUT_DIR`（`KCONFIG_CONFIG`/`OUT` 显式外移），
-   不碰子模组自己的文件。该变量由 `crates/test-support`（`build.rs` 与 `klipper_dir()`）
-   与 `src/core/klippy/upstream.rs` 统一解析。
+2. **并行任务用 worktree 隔离**：同一仓库同时开多个任务时，为每条分支建独立 worktree，各自独立构建、
+   独立提交。worktree 里 `third_party/klipper` 保持**空目录**——不 `git submodule update`（属规则 6 禁止的
+   远程交互），**也不拷**主检出的子模组（相对 gitfile 会失效）；构建/语料用
+   `KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper` 指向主检出（共享同一份检出是安全的：只写各自
+   `OUT_DIR`）。**命令、目录布局、子模组 worktree、并发构建与收尾见
+   [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md)。**此命令只由 main 执行，见规则 5。
 3. **开工前先看状态**：`git status` 确认工作区干净再切分支；发现已有未提交改动先报告，
    不要替用户 stash 或丢弃。
 4. **任务完成后**：提交到自己的分支（提交信息遵循仓库现有风格，见下），**不自动合入 `work`**；
@@ -51,16 +35,10 @@
    worker/子代理不得自行 `git merge`/`rebase`/`cherry-pick` 到其他分支，只负责在自己的
    分支上提交。
 
-   **合并方式：ff 优先**。main 合入前依次判断：
-
-   1. **先判断能否合并**：确认待合并分支能干净合入（无冲突）；不可合并时先定位并解决
-      冲突，不进入后续判断。
-   2. 可合并后，按提交数选定合并方式：
-      - 分支**相对合并基底只有一个提交** → 采用 **ff 方式合并**（`git merge --ff-only`），
-        **不产生** `Merge branch …` 合并提交，历史保持线性；
-      - 分支含多个提交、或属于多分支合并时，才保留普通合并提交。
-   3. **ff 合并不重跑全量测试**：ff 合并只是把主线快进到分支头，树内容与分支验收时完全一致，
-      **无需再做全量测试**；只有普通合并（合并提交改变树内容）才需要重跑对应验收测试。
+   **合并方式：main 合入前先确认能干净合入，再按提交数判定**——相对合并基底**只有一个提交 ⇒ ff**
+   （不产生合并提交，树未变、无需重跑全量测试）；**多个提交或多分支合并 ⇒ 保留普通合并提交**
+   （树变了，重跑对应验收）。命令、误用 ff 的补救与并发构建见
+   [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md)。
 5. **worktree 生命周期只归 main**：git 工作空间的**开辟**（`git worktree add`）
    与**验收后的销毁**（任务合并或放弃、验收通过后执行 `git worktree remove <路径>`，
    避免 `.worktrees/` 下堆积僵尸目录）都由 main（主代理）统一完成；**worker/子代理
@@ -106,36 +84,20 @@ git config core.hooksPath .githooks
 执行分工：**worker 不自行改文档**——改动代码后报告受影响文档与需同步要点，
 由 **main 代 worker 完成**并随代码一起提交（见上文「任务与分支」规则 7）。
 
-改什么，就同步哪本：
+改什么就同步哪本、提交前自查、以及删档案前分流的分类去处：见
+[`doc-sync`](.agents/skills/doc-sync/SKILL.md)（含改动→手册映射表）。
 
-| 改动 | 同步到 |
-|------|--------|
-| `src/core/klippy/` 的行为、结构、模块增删 | [开发手册](docs/klippy/developer-manual/README.md)对应页（模块表 + 专题页） |
-| G-Code 命令增删改、配置节/选项增删改 | [G-Code 命令参考](docs/klippy/user-manual/gcode-commands.md) / [配置文件参考](docs/klippy/user-manual/config.md) |
-| 客户端交互、日志行为 | [客户端使用](docs/klippy/user-manual/client.md) / [日志与调试](docs/klippy/user-manual/logging.md) |
-| `klippy-api` / `klippy-client`、线上形状、端点 | [第三方开发手册](docs/klippy/third-party-dev/README.md)（`api-reference.md` 与端点状态表要一起改） |
-| 新增模块或测试、覆盖变化 | [测试](docs/klippy/developer-manual/testing.md)的覆盖清单 |
-| 回归数字、忽略列表、转绿状态 | [回归测试](docs/klippy/developer-manual/regression-tests.md) |
+三条硬要求（细则与自查清单同见该 skill）：
 
-三条硬要求：
+1. **写死的数字与名字必须重核**：测试名、端点条数、计数、二进制大小、工单号——逐个对回源码/实测。
+2. **旧断言随实现一起改**：手册与源码注释里的「尚未实现 / 待办 / 属某工单」一并改成现状，不留两种说法。
+3. **已完成的任务标号不得再被引用**：`TODO.md`/`docs/work-log/` 里的 `D3`/`F8b`/`T3`/`Q2`/`H1-3` 之类
+   一旦完成，不得再出现在其他文档与源码注释里（豁免这两个台账自身）。
 
-1. **写死的数字与名字必须重核**：测试名、端点条数、计数、二进制大小、工单号——
-   提交前逐个对回源码/实测（悬空的工单号与“已完成当待办”的引用同样是过时）。
-2. **旧断言随实现一起改**：功能落地、工单完成、行为变更时，把手册与源码注释里
-   对应的“尚未实现 / 待办 / 属某工单”一并改成现状，不要留下新旧两种说法。
-3. **已完成的任务标号不得再被引用**：`TODO.md` 与 `docs/work-log/` 里的任务/问答
-   标号（如 `D3`、`F8b`、`T3`、`Q2`、`H1-3`），一旦对应任务完成，就不得再出现在
-   **其他文档与源码注释**中——引用处改为陈述现状，或注明“已归档”；连带的“见
-   TODO X”“属 X”“X 待办”一并清理。**豁免范围**：`TODO.md` 与 `docs/work-log/`
-   自身是台账与档案，其中的历史标号照旧保留，本条不适用于这两个位置。
+提交前自查：手册里关于被改对象的每句话，现在还能对着源码成立吗？
 
-提交前自查：手册里关于被改对象的每句话，现在还能对着源码成立吗？细则见
-[测试 → 文档同步](docs/klippy/developer-manual/testing.md#文档同步)。
-
-**删档案前先分流**：删除工作记录/调研笔记一类过程档案前，先把「唯它才有的规范信息」分类搬进规范文档
-——运行机制 → 协议/开发手册、与上游差异 → `upstream-deviations.md`、硬件受限项 → `TESTING.md`、
-未完成待办 → `TODO.md`、操作手法 → 对应 skill；然后清掉所有指向它的引用（**只留一句非链接的溯源说明**，
-写清「原件已删、用 `git log --diff-filter=D -- docs/work-log/` 回溯」），并确认删除后没有死链。
+**删档案前先分流**：删过程档案前，先把「唯它才有的规范信息」分类搬进规范文档，清掉所有引用、只留一句
+非链接的溯源说明（分类去处见 [`doc-sync`](.agents/skills/doc-sync/SKILL.md)）。
 
 ## 派侦察（scout）的准则
 
@@ -194,6 +156,9 @@ git config core.hooksPath .githooks
 |-------|--------|
 | [`flash-firmware`](.agents/skills/flash-firmware/SKILL.md) | 给板子构建/刷写固件、SWD 排障、验证「固件到底刷上没有」——**含频率/`halt`/回读校验的完整手法** |
 | [`subagent-rescue`](.agents/skills/subagent-rescue/SKILL.md) | 子代理卡住/超时/零产出、provider `content_filter` 误杀、测试挂死时的救援流程 |
+| [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md) | 开任务分支/worktree、子模组 worktree、`KLIPPERX_KLIPPER_DIR` 构建、ff vs `--no-ff` 判定、`abandoned/*` 归档、并发构建与收尾 |
+| [`doc-sync`](.agents/skills/doc-sync/SKILL.md) | 改完同步手册的**清单**：改动→手册映射表、写死数字重核、旧断言/已完成标号清理、删档案前分流 |
+| [`subagent-briefing`](.agents/skills/subagent-briefing/SKILL.md) | 写子代理任务书：六要素模板、纪律块、防超时三板斧、worker/scout/reviewer 分工与路由 |
 
 新手法（工具/设备/流程）沉淀优先考虑做成 skill；**规则与纪律**（本节各节）仍写在 `AGENTS.md`。
 

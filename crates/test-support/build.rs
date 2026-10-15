@@ -145,6 +145,7 @@ fn main() {
     let dicts = build_dir.join("dicts");
     std::fs::create_dir_all(&dicts).expect("failed to create the dictionary directory");
     let mut built = 0usize;
+    let mut linux_firmware = None;
     for config in
         std::fs::read_dir(klipper_dir.join("test/configs")).expect("test/configs is readable")
     {
@@ -165,6 +166,15 @@ fn main() {
 
         let target_out = build(&klipper_dir, &build_dir.join("mcu").join(&name), &text);
         let dictionary = require_dict(&target_out);
+        // The linux process firmware: the fixture in `src/linux_firmware.rs`
+        // runs this `klipper.elf` as a standalone process, so its presence is
+        // asserted right where it is built (the default architecture set
+        // contains `linux`, so the default build always gets here).
+        if name == "linuxprocess" {
+            let elf = target_out.join("klipper.elf");
+            assert!(elf.exists(), "make did not produce {}", elf.display());
+            linux_firmware = Some(elf);
+        }
         std::fs::copy(&dictionary, dicts.join(format!("{name}.dict")))
             .unwrap_or_else(|e| panic!("failed to collect {}: {e}", dictionary.display()));
         built += 1;
@@ -175,6 +185,23 @@ fn main() {
          (KLIPPERX_ALL_ARCHES builds every target)"
     );
     println!("cargo:rustc-env=KLIPPERX_TEST_DICTS={}", dicts.display());
+
+    // The linux process firmware's `klipper.elf`. When `KLIPPERX_ARCHES`
+    // leaves `linux` out, the file is simply absent and the path below still
+    // points at where a default build would put it, so this crate keeps
+    // compiling; `LinuxFirmware::spawn` then fails with the missing file
+    // instead of the build failing here.
+    let linux_firmware = linux_firmware.unwrap_or_else(|| {
+        build_dir
+            .join("mcu")
+            .join("linuxprocess")
+            .join("out")
+            .join("klipper.elf")
+    });
+    println!(
+        "cargo:rustc-env=KLIPPER_LINUX_FIRMWARE={}",
+        linux_firmware.display()
+    );
 
     // Upstream's `test/klippy/*.test` corpus, turned into individual
     // `#[test]`s with every fixture (config path, dictionary paths, g-code)

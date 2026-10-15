@@ -518,3 +518,44 @@ canbus_fd: true | false           # 链路层；默认 false
 - 已派出并已停止；worktree 干净、分支零提交（**一个字节未写**），故无 `abandoned/` 需要留档，
   只回收 worktree。改动清单一字未动地留在 §8.1–§8.4，恢复时直接照它下任务书。
 - **挂起只影响 FD 的固件半边**；2b 不受影响（见 §9.2 的阶段表）。
+
+### ⏸ 暂停点（2026-10-16，用户指示「暂存工作」）
+
+**状态已固定，没有任何未提交改动；未跑 `git stash`、未丢弃任何东西。**
+
+| 位置 | 状态 |
+|---|---|
+| `agents/feat-can-isotp`（worktree `../klipperx.worktrees/can-isotp`） | ✅ 干净，HEAD `78693c0`，含 5 个提交 + 2 个 merge |
+| 主检出 | ✅ 在 `work` @ `4d7e9e9`，干净（本任务从未在 `work` 上提交） |
+| 子模组 `third_party/klipper` | ✅ 在 `klipperx` @ `91f7db42`，**gitlink 未改**（FD 固件单元被停时零产出，2b 也零产出） |
+| 子模组 worktree | 已全部回收（`can-isotp-fw` / `can-fd-linux` 两个空 worktree + 空分支已删，零提交零改动，无需 `abandoned/` 留档） |
+| 残留进程 | 无（`pgrep -x klipper.elf` 无命中） |
+| 构建缓存 | `/tmp/t-can-isotp-main`、`/tmp/t-canfd-host`、`/tmp/t-can-isotp-proto` 保留（续做时直接复用，省重编） |
+
+**已验证到什么程度**
+
+- `cargo test -p klipperx --lib`（在 feature worktree）：**3018 passed / 0 failed / 13 ignored**（99 s）。
+- 分项：`isotp_proto` 22、`canserial` 30、`interface` 171、`scan` 22。
+- ❌ **全量闸门 `cargo test --workspace` 未在以本分支为 HEAD 的 worktree 里跑过**（它会重编全部架构固件，很慢）。**这是合入 `work` 前的第一件事。**
+
+**没做的（不是失败，是没开工）**
+
+| 单元 | 状态 |
+|---|---|
+| 2b 固件 ISO-TP 从站 | 已派出任务书，运行中被停，**零产出**（worktree 干净、分支零提交）。任务书内容与冻结规格留档在本节与 §5.2，可直接重发——重建一个子模组 worktree（`git -C third_party/klipper worktree add <路径> -b agents/can-isotp-firmware HEAD`）即可 |
+| 3a 配置面（`canbus_protocol`/`canbus_fd` 两个键） | 未开工。1a+1b 已就绪，无前置 |
+| 4 `linux` 目标 SocketCAN | 未开工，**需先侦察**控制台角色的选择机制与接口名怎么传（未派） |
+| 5 真机 / vcan | 未开工。卡在**两个输入**：真机 STM32 型号（决定阶段 5 验收板）、`vcan` 需用户一次性 `sudo ip link add dev vcan0 type vcan` |
+
+**续做的第一件事（命令级）**
+
+1. 全量闸门：`cd /home/fengcheng/project/klipperx.worktrees/can-isotp && KLIPPERX_KLIPPER_DIR=/home/fengcheng/project/klipperx/third_party/klipper cargo test --workspace`
+2. 合入由用户决定；相对 `work` 是**多提交 + 多分支** ⇒ 用 `--no-ff` 保留合并提交（见 [`task-branch-flow`](../../../.agents/skills/task-branch-flow/SKILL.md)）。本任务的 worktree 在验收后才能销毁。
+3. 续派 2b / 3a / 4 时，任务书直接照本节与 §5.2、§9.2 写。
+
+**还挂着等你拍的问题**
+
+1. 真机 **STM32 具体型号**（bxCAN 的 F1/F4 还是 FDCAN 的 H7/G4/G0 跑 classical）——决定阶段 5 验收板。
+2. ISO-TP 的 25 ms 要不要做成配置键（只有当将来出现**慢对端**时才需要；见 §3.2 的边界条件）。
+3. `isotp + FD` 那个保留组合：已知只缺 `padlen` 约 3 行（§9.1），做不做。
+4. ~~STmin 保留值~~ —— **已关**（与内核 `isotp_rcv_fc()` 逐字节核对一致）。

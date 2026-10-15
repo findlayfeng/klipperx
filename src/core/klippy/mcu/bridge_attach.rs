@@ -965,6 +965,137 @@ mod tests {
         );
     }
 
+    /// The whole config-driven chain against the **real** linux process
+    /// firmware as the legacy downstream: `[mcu bridge]` over the host mux
+    /// library, `[uart_device uart0]` with `uart_path:` on the firmware's own
+    /// pty, and a uuidless `[mcu child]` — the port groups as legacy, so the
+    /// attach sends only the bridge's route and the firmware itself answers
+    /// identify and `get_clock` (the chain of
+    /// `the_config_driven_legacy_route_reaches_the_bridge_port`, with the
+    /// hand-built answer replaced by a real firmware's).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_real_linux_firmware_completes_identify_and_clock_behind_the_bridge_port() {
+        use crate::core::klippy::cmd::{ClockSync, McuClock};
+        use crate::core::klippy::printer::PrinterState;
+
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The real downstream: its pty slave (hung at the `-I` path) is the
+        // tty the port opens through `uart_path:`. Never written to directly.
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn().expect("the firmware process starts");
+
+        // The bridge keeps its build-baked tty as a live pty, so the only
+        // difference from the E1 chain is the port's own path.
+        let baked = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                baked.path.display()
+            )
+        });
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
+             [mcu child]\nuart: uart0\n",
+            library.display(),
+            firmware.serial_path().display()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let teardown = BridgeTeardown::new(
+            Arc::new(Printer::new(Arc::clone(&reactor))),
+            library.clone(),
+            bridge_path.clone(),
+        );
+        let printer = teardown.printer();
+        printer.load_config(&config).expect("the config loads");
+
+        // Everything answers here: unlike the E1 chain, bring-up runs to
+        // completion instead of being interrupted at the silent child.
+        tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+            .await
+            .expect("the real firmware answers every step of the chain");
+        let state = printer.get_state_message();
+        assert_eq!(
+            state.category,
+            PrinterState::Ready,
+            "the whole chain came up: {}",
+            state.message
+        );
+
+        let child = printer
+            .lookup_object_as::<McuObject>("mcu child")
+            .expect("the printer has [mcu child]")
+            .mcu()
+            .expect("the child connected");
+        assert!(child.is_identified(), "the child completed identify");
+
+        // The identify payload is the firmware's own: the version string it
+        // reports, and the CLOCK_FREQ only this linux build carries (the mux
+        // host library is built at 20 MHz).
+        let status = printer
+            .status_of("mcu child", 0.0)
+            .expect("the child has a status snapshot");
+        let version = status
+            .get("mcu_version")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            !version.is_empty(),
+            "the firmware's own version came through identify: {status}"
+        );
+        assert_eq!(
+            status["mcu_constants"]["CLOCK_FREQ"].as_f64(),
+            Some(50_000_000.0),
+            "CLOCK_FREQ is the linux firmware's own constant: {status}"
+        );
+
+        // One `get_clock` round trip over the port, and a second to see the
+        // counter advance at CLOCK_FREQ. The value is the low 32 bits (it
+        // wraps at ~86 s at 50 MHz), so the pair is checked by its delta
+        // rather than against an absolute bound.
+        let clock = McuClock::new(Arc::clone(&child), reactor);
+        let first = tokio::time::timeout(Duration::from_secs(5), clock.get_clock())
+            .await
+            .expect("get_clock is answered over the bridge port")
+            .expect("get_clock after identify");
+        assert!(first.clock > 0, "the firmware counter is running");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let second = tokio::time::timeout(Duration::from_secs(5), clock.get_clock())
+            .await
+            .expect("the second get_clock is answered")
+            .expect("get_clock twice");
+        let advanced = second.clock.wrapping_sub(first.clock);
+        assert!(
+            advanced > 0 && advanced < 50_000_000,
+            "the counter advances by a plausible tick delta: {first:?} → {second:?}"
+        );
+
+        // No firmware process outlives the test: the fixture kills and reaps
+        // on drop, after the printer and the mux library have let go.
+        let pid = firmware.pid();
+        drop(printer);
+        drop(teardown);
+        drop(firmware);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists() {
+            assert!(
+                Instant::now() < deadline,
+                "firmware {pid} is still running after drop"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// A port whose tty is not there fails the **configuration**, naming the MCU
     /// and the reason — not the library init, and not a bridge that comes up
     /// without its port.

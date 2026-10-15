@@ -515,7 +515,7 @@ fresh-context 只读复审对「①–⑤ 都成立」给了逐条证据（端�
 
 ### P8（2026-10-15）：真机实测暴露的宿主库读端缺陷 + 修复
 
-**真机场景**（用户提供：`/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00`
+**真机场景**（用户提供：`/dev/serial/by-id/usb-Klipper_stm32f103xe_…-if00`
 = `/dev/ttyACM0`，一台**旧固件**板子）：宿主库当桥（以其 tty 路径构建、`CONFIG_BRIDGE`/`MUX_SERIAL`
 /`UART` 自动具备），配置 `[mcu bridge] host_library:` + `[uart_device uart0]` + `[mcu child] uart: uart0`
 （legacy 下游）。
@@ -582,7 +582,7 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 
 **真机结论（DTR/RTS）**——回答「这块板是 USB 虚拟串口，DTR/RTS 到底有没有被处理」：
 
-- 这台 `usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00` 是**原生 USB CDC**（klipper 自带 USB 栈）。
+- 这台 `usb-Klipper_stm32f103xe_…-if00` 是**原生 USB CDC**（klipper 自带 USB 栈）。
 - 固件侧（`third_party/klipper/src/generic/usb_cdc.c`）：`USB_CDC_REQ_SET_CONTROL_LINE_STATE` →
   `usb_req_set_line()`（`:485-494`）**只是把 `wValue` 记进 `line_control_state` 并 ACK**，不做复位；
   唯一消费者是 `check_reboot()`（`:452-459`）：**波特率 1200 且 DTR 为低**时才 `bootloader_request()`

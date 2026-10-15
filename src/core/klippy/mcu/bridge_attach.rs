@@ -1010,7 +1010,8 @@ mod tests {
             firmware.serial_path().display()
         );
         let config = Config::from_text(&text).expect("the config parses").0;
-        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let reactor: Arc<dyn crate::core::klippy::reactor::Reactor> =
+            Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let teardown = BridgeTeardown::new(
             Arc::new(Printer::new(Arc::clone(&reactor))),
             library.clone(),
@@ -1081,8 +1082,13 @@ mod tests {
         );
 
         // No firmware process outlives the test: the fixture kills and reaps
-        // on drop, after the printer and the mux library have let go.
+        // on drop, after the printer and the mux library have let go. The
+        // clock and the mcu handle hold the child's interface — and through
+        // it the mux library — so they go first, or the unload wait below
+        // still finds the library loaded.
         let pid = firmware.pid();
+        drop(clock);
+        drop(child);
         drop(printer);
         drop(teardown);
         drop(firmware);

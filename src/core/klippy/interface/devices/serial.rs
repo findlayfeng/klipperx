@@ -1177,8 +1177,10 @@ pub struct SharedSerialPort {
     /// being dropped — see the reader).
     port: Arc<File>,
     /// One slot per attached MCU, keyed by the MCU id. A slot is registered by
-    /// the attach that opens the id and unregistered by that handle's last
-    /// reference going away ([`SharedSerialHandle`]).
+    /// the attach that opens the id, and taken down again by
+    /// [`SharedSerialHandle::unregister`] — a `shutdown`, the handle's last
+    /// reference going away, or a failed attach — so a stopped id's frames are
+    /// dropped instead of piling up in a slot nobody reads.
     slots: Mutex<HashMap<u32, Arc<McuSlot>>>,
     /// Serializes the handshakes on this port: two MCUs attaching together must
     /// not interleave their requests and answers.
@@ -1739,7 +1741,8 @@ impl SharedSerialHandle {
     /// [`InterfaceError::SendError`] when a write fails, and
     /// [`InterfaceError::Timeout`] when the device never answers. A failure
     /// leaves the handle live: its slot stays registered and the port keeps
-    /// round-tripping frames.
+    /// round-tripping frames — unless this very handle has already been shut
+    /// down, which unregisters that slot.
     pub fn handshake(&self, uuid: [u8; 6], timeout: Duration) -> Result<(), InterfaceError> {
         self.run_handshake(Some(uuid), timeout)
     }
@@ -2586,6 +2589,53 @@ mod mux_tests {
                 .and_then(Weak::upgrade)
                 .is_some(),
             "shutdown must not take the port down"
+        );
+    }
+
+    /// The `ptr_eq` guard keeps a **stale** handle from unregistering a slot a
+    /// newer attach owns: every attach replaces the map entry, so the older
+    /// handle's `shutdown` (and its later `Drop`) must leave the live one
+    /// alone. Both the `shutdown` teardown and the guarded attach-failure path
+    /// depend on that branch.
+    #[test]
+    fn a_stale_handle_leaves_the_newer_attachs_slot_alone() {
+        let pty = Pty::new();
+        let first = attach_with_reply(&pty, 4);
+        let second = attach_with_reply(&pty, 4);
+        let port = Arc::clone(&second.port);
+
+        first.shutdown();
+        {
+            let slots = port.slots.lock().unwrap();
+            let live = slots
+                .get(&4)
+                .expect("the newer attach's slot is still registered");
+            assert!(
+                Arc::ptr_eq(live, &second.slot),
+                "a stale handle must not take the newer slot down"
+            );
+        }
+
+        master_write(&pty.master, &device_unit(4, &Frame::encode(3, b"live")));
+        assert!(
+            wait_for_frame(
+                &second.slot,
+                &Frame::new(3, b"live".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the newer attach's handle must still be fed"
+        );
+
+        // Dropping the stale handle is the same guard from the other caller.
+        drop(first);
+        master_write(&pty.master, &device_unit(4, &Frame::encode(4, b"still")));
+        assert!(
+            wait_for_frame(
+                &second.slot,
+                &Frame::new(4, b"still".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the live slot survives the stale handle's Drop too"
         );
     }
 

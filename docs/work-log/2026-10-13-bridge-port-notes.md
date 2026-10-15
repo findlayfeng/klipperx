@@ -597,3 +597,22 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
   `TESTING.md` 的 **M2-1** 判定（该项在原生 USB 板上判「不适用」，其真机验证只对桥接板有意义）。
 - **留下的设计缺口**（记为欠项）：既没有「CDC 感知」的端口复位（例如把端口切到 1200 + DTR 低进 bootloader、
   或明确报「此端口不支持线级复位」），也没有按 `by-id` 命名识别原生 USB 并给出告警。
+
+### P10（2026-10-15）：注销槽位收敛 + 用户否掉的方案
+
+- **P10（`e5c91b7`）**：把「注销槽位」收敛成一个私有、`Arc::ptr_eq` 守卫的 `unregister()`
+  （`serial.rs:1811`），三处共用：`attach` 失败路径（原为无条件 `remove`）、`Drop for SharedSerialHandle`、
+  **`SharedSerialHandle::shutdown()`（新增）**。`shutdown` 原先只置 `stopped`，于是「已 shutdown 但句柄未析构」
+  期间 `push_frame` 仍往无人读的槽 `Vec::extend`（`FrameStream` 无界）⇒ 现在找不到槽即丢帧，与 host 侧
+  「Sender 失败即丢」同构。`receive` 仍先交付积压再返 `None`；`handshake` 失败**不**注销（与 attach 失败相反）
+  的既有区分不变。验收：`--workspace` **3224 passed / 0 failed / 14 ignored**、fmt 干净、0 告警；复审**可合入**。
+- 复审要求的文档同步（同批）：`serial-mux-protocol.md` 与 dev-manual `README.md` 的「引用计数关闭」段
+  （`shutdown` 与析构**都**注销槽）、`testing.md` 计数 43/10/55 → **44/11/56** 与新测清单。
+- 复审另报两条「加守卫后才可达」的小洞，我已同批补：`slots` 字段注释（注销主体）、`handshake` 文档的
+  绝对表述，并**新增守卫分支的判别性测试** `a_stale_handle_leaves_the_newer_attachs_slot_alone`
+  （同 id 二次 attach ⇒ 旧句柄 `shutdown`/`Drop` 不得摘掉新槽；**去掉守卫即红**，已实测）。
+- **被否方案（用户 2026-10-15 明确否掉）**：CDC 感知的端口复位（把端口切到 1200 + DTR 低以进 bootloader，
+  或显式报「此端口不支持线级复位」）与按 `by-id` 命名（`usb-Klipper_*` = 原生 USB）给出告警——**不改**。
+  结论仍保留在手册里（`config.md` 的 `uart_restart_method`、`serial-mux-protocol.md` 的 `RESET_PORT`、
+  `TESTING.md` M2-1），供后来人参考；实现缺口本身作为**已知缺口**留档：原生 USB 的 legacy 设备目前没有
+  经桥的硬复位手段（只能命名设备 `restart_method: admin` 或断电）。

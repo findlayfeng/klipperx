@@ -26,6 +26,17 @@
 //! [`CanbusAdminSocket`], which asks every unassigned board to identify itself and
 //! reads the answers.
 //!
+//! The byte stream carries an admin channel of *its own*, and it is the one the
+//! port-level commands travel: the units that name and reset the devices behind a
+//! bridge's ports ([`crate::core::klippy::interface::devices::serial`]) go out as
+//! ordinary units on the stream, which is what
+//! [`CanSerialDevice::send_set_port_node_id`] and the two resets below write. A
+//! bridge multiplexes N downstream devices onto one upstream link, so a
+//! port-level command has to be *inside* the stream — with the mux header saying
+//! which address the unit belongs to — rather than a frame of its own; the
+//! id-`0x3f0` admin conversation above is a separate CAN channel and stays
+//! outside it.
+//!
 //! # Naming
 //!
 //! This is the *can serial* transport: Klipper's serial link, carried over CAN.
@@ -43,13 +54,20 @@
 use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
+use crate::core::klippy::interface::devices::serial::{
+    admin_unit, set_port_node_id, CMD_RESET_DEVICE, CMD_RESET_PORT,
+};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
 use std::ffi::CString;
 use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
+#[cfg(test)]
+use std::os::fd::OwnedFd;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+#[cfg(test)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -528,29 +546,21 @@ impl CanSerialDevice {
     pub fn rx_id(&self) -> u32 {
         self.link.lock().unwrap().rx_id()
     }
-}
 
-impl fmt::Debug for CanSerialDevice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CanSerialDevice")
-            .field("interface", &self.interface)
-            .field("nodeid", &self.nodeid)
-            .field("stopped", &self.stopped.load(Ordering::Relaxed))
-            .finish_non_exhaustive()
-    }
-}
-
-impl Device for CanSerialDevice {
-    fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
+    /// Write `bytes` to this node as a burst of CAN frames: the byte-stream half
+    /// of [`Device::send`], shared with the port-level commands below.
+    ///
+    /// The kernel queues the frames, so a full bus costs latency rather than a
+    /// lost one. What is logged is the block formatter's view of the bytes, and
+    /// a unit — a mux header followed by a block, rather than a block of its own
+    /// — falls back to plain runs there ([`describe_frame`]).
+    fn send_bytes(&self, bytes: &[u8]) -> Result<(), InterfaceError> {
         if self.stopped.load(Ordering::Relaxed) {
             return Err(InterfaceError::ConnectionLost);
         }
 
-        // The message block goes out as a burst of CAN frames; the kernel queues
-        // them, so a full bus costs latency rather than a lost frame.
-        let bytes = frame.raw_bytes();
-        trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
-        let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(&bytes).collect();
+        trace!("tx frame [{}]: {}", self.id(), describe_frame(bytes));
+        let frames: Vec<CanFrame> = self.link.lock().unwrap().frames(bytes).collect();
         for can_frame in &frames {
             // The block's bytes as the bus sees them, one CAN frame at a time.
             trace!(
@@ -569,6 +579,73 @@ impl Device for CanSerialDevice {
             self.link.lock().unwrap().tx_id()
         );
         Ok(())
+    }
+
+    /// Tell the bridge which id the device behind port `index` answers to:
+    /// [`set_port_node_id`]'s unit, byte for byte, cut into CAN frames.
+    ///
+    /// The port-level commands travel a bridge's admin channel, and on CAN that
+    /// channel is *inside the byte stream* — the unit's header
+    /// ([`ADMIN_LISTEN`](crate::core::klippy::interface::devices::serial::ADMIN_LISTEN),
+    /// `0x3f0`) is what names it. There is no separate CAN frame shape for them,
+    /// for three reasons:
+    ///
+    /// - a bridge multiplexes N downstream devices onto one upstream link and
+    ///   has to say which of them a unit is for, which is exactly what the mux
+    ///   header is; without it the CAN side could not tell whose frame it read;
+    /// - reusing the serial side's unit means no new frame shape on the wire, and
+    ///   no collision with the CAN admin broadcast above: that one is a
+    ///   single-frame conversation on arbitration id `0x3f0`, a different channel
+    ///   from these bytes, so the `0x02` of a reset here cannot be read as that
+    ///   channel's `REQUEST_BOOTLOADER`;
+    /// - serial ports, CAN links and the host library then carry one and the same
+    ///   unit ([`set_port_node_id`] is the builder all three call).
+    ///
+    /// # Errors
+    /// The same as [`Device::send`]: a stopped device is a lost connection, and a
+    /// failed socket write is an [`InterfaceError::SendError`].
+    pub fn send_set_port_node_id(
+        &self,
+        index: u8,
+        mcu_id: u8,
+        flags: u8,
+    ) -> Result<(), InterfaceError> {
+        self.send_bytes(&set_port_node_id(index, mcu_id, flags))
+    }
+
+    /// Ask the device behind bridge port `index` to reset itself:
+    /// [`CMD_RESET_DEVICE`]'s unit, on the byte stream like
+    /// [`CanSerialDevice::send_set_port_node_id`].
+    ///
+    /// # Errors
+    /// The same as [`Device::send`].
+    pub fn send_reset_device(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_bytes(&admin_unit(&[CMD_RESET_DEVICE, index]))
+    }
+
+    /// Ask the bridge to pulse the lines of port `index`: [`CMD_RESET_PORT`]'s
+    /// unit, on the byte stream like [`CanSerialDevice::send_set_port_node_id`].
+    ///
+    /// # Errors
+    /// The same as [`Device::send`].
+    pub fn send_reset_port(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_bytes(&admin_unit(&[CMD_RESET_PORT, index]))
+    }
+}
+
+impl fmt::Debug for CanSerialDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CanSerialDevice")
+            .field("interface", &self.interface)
+            .field("nodeid", &self.nodeid)
+            .field("stopped", &self.stopped.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Device for CanSerialDevice {
+    fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
+        self.send_bytes(&frame.raw_bytes())
     }
 
     fn receive(&self) -> Option<Frame> {
@@ -626,6 +703,65 @@ impl Device for CanSerialDevice {
     fn shutdown(&self) {
         self.stopped.store(true, Ordering::SeqCst);
     }
+}
+
+/// The device on a **wire a test can read**: a socket pair stands in for the CAN
+/// socket, and the returned end carries the records the device writes, read back
+/// with [`read_wire`].
+///
+/// Opening a real CAN interface needs privileges this repository's test
+/// environment does not have, and the port-level commands use the device's write
+/// half only — a socket pair serves that, the same way the admin scan takes an
+/// [`AdminBus`] rather than a socket.
+#[cfg(test)]
+impl CanSerialDevice {
+    pub(crate) fn test_wire(nodeid: u32) -> (Self, UnixStream) {
+        let (wire, reader) = UnixStream::pair().expect("a socket pair");
+        let device = Self {
+            socket: File::from(OwnedFd::from(wire)),
+            interface: "test0".to_string(),
+            uuid: [0; 6],
+            nodeid,
+            link: Mutex::new(
+                CanSerialLink::for_node(nodeid).expect("a test node id is in the CAN range"),
+            ),
+            stopped: AtomicBool::new(false),
+        };
+        (device, reader)
+    }
+}
+
+/// Every CAN record the device on a [`test wire`](CanSerialDevice::test_wire) has
+/// written, taken off the reader end the way a receiving link reads the bus.
+///
+/// A socket pair is a *stream*, so one read can come back short: this drains until
+/// the wire is empty, then parses whole records out of the bytes.
+#[cfg(test)]
+pub(crate) fn read_wire(wire: &mut UnixStream) -> Vec<CanFrame> {
+    wire.set_nonblocking(true)
+        .expect("the test wire takes a non-blocking flag");
+    let mut raw = Vec::new();
+    let mut buf = [0u8; CAN_FRAME_SIZE];
+    loop {
+        match wire.read(&mut buf) {
+            Ok(0) => break,
+            Ok(read) => raw.extend_from_slice(&buf[..read]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => panic!("reading the test wire failed: {e}"),
+        }
+    }
+    assert_eq!(
+        raw.len() % CAN_FRAME_SIZE,
+        0,
+        "the device writes whole CAN records"
+    );
+    raw.chunks(CAN_FRAME_SIZE)
+        .map(|record| {
+            let mut abi = [0u8; CAN_FRAME_SIZE];
+            abi.copy_from_slice(record);
+            CanFrame::from_abi(&abi)
+        })
+        .collect()
 }
 
 /// A raw CAN socket for Klipper's **admin** frames: the broadcast that finds the
@@ -851,6 +987,10 @@ fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::devices::serial::{
+        decode_header, HeaderScan, ADMIN_LISTEN, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC,
+        MUX_PORT_UNITS,
+    };
 
     /// An encoded Klipper frame to feed through the link.
     fn message(seq: u8, payload: &[u8]) -> Frame {
@@ -1389,5 +1529,90 @@ mod tests {
         let err = query_unassigned(&mut FailingBus, Duration::from_secs(2), |_| {})
             .expect_err("the read failed");
         assert_eq!(err, InterfaceError::ConnectionLost);
+    }
+
+    // ========================================================================
+    // The port-level commands on the byte stream
+    // ========================================================================
+
+    /// The unit `device` has just written, as it came off the wire: whole CAN
+    /// records, all of them this node's, joining back into `unit` byte for byte.
+    ///
+    /// This is the "no new frame shape" claim measured rather than asserted: the
+    /// expected bytes come from the serial side's own builders.
+    fn assert_unit_on_the_wire(device: &CanSerialDevice, wire: &mut UnixStream, unit: &[u8]) {
+        let frames = read_wire(wire);
+        assert_eq!(
+            frames.len(),
+            unit.len().div_ceil(CAN_DATA_BYTES),
+            "eight data bytes fit in one CAN frame"
+        );
+        let tx_id = device.link.lock().unwrap().tx_id();
+        assert!(
+            frames.iter().all(|frame| frame.id() == tx_id),
+            "every slice is this node's: {frames:?}"
+        );
+        let joined: Vec<u8> = frames.iter().flat_map(|f| f.data().to_vec()).collect();
+        assert_eq!(joined, unit, "the unit is the serial side's own bytes");
+    }
+
+    #[test]
+    fn test_the_port_commands_are_the_serial_sides_units_on_the_wire() {
+        // The three port-level commands on a CAN link: what the device puts on
+        // the bus is `devices::serial`'s unit — the same bytes a shared serial
+        // port carries, cut into CAN frames by the link.
+        let (device, mut wire) = CanSerialDevice::test_wire(3);
+
+        // SET_PORT_NODEID (0x03): names the device behind port 1.
+        let set_port = set_port_node_id(1, 2, MUX_PORT_UNITS);
+        device.send_set_port_node_id(1, 2, MUX_PORT_UNITS).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &set_port);
+
+        // RESET_DEVICE (0x02): for the device behind the port.
+        let reset_device = admin_unit(&[CMD_RESET_DEVICE, 1]);
+        device.send_reset_device(1).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &reset_device);
+
+        // RESET_PORT (0x04): for the bridge's own port.
+        let reset_port = admin_unit(&[CMD_RESET_PORT, 1]);
+        device.send_reset_port(1).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &reset_port);
+    }
+
+    #[test]
+    fn test_a_unit_longer_than_a_can_frame_is_cut_and_rejoins() {
+        // A unit is 15 bytes here, so it does not fit one CAN frame: the cut at
+        // eight bytes lands *inside* the `KXID` block (the mux header shifts it),
+        // six bytes into the block rather than between units.
+        let unit = set_port_node_id(1, 2, MUX_PORT_UNITS);
+        assert_eq!(unit.len(), 15, "the boundary case this test is for");
+
+        let link = CanSerialLink::for_node(3).unwrap();
+        let slices: Vec<CanFrame> = link.frames(&unit).collect();
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[0].data(), &unit[..CAN_DATA_BYTES]);
+        assert_eq!(slices[1].data(), &unit[CAN_DATA_BYTES..]);
+        assert_eq!(slices[0].data()[HEADER_BYTES..].len(), 6);
+
+        // Rejoined, the slices carry the very same bytes, and they still read as
+        // the admin unit they were built as: the checked header names the admin
+        // id, and the command bytes sit inside the block. A unit is not a Klipper
+        // message block — the `KXID` sequence byte fails `Frame::check` on purpose,
+        // so a device cannot parse one by accident — which is why the command is
+        // read by position here and not through a parsed `Frame`.
+        let rejoined: Vec<u8> = slices.iter().flat_map(|f| f.data().to_vec()).collect();
+        assert_eq!(rejoined, unit, "the cut loses nothing");
+        assert_eq!(
+            decode_header(&rejoined),
+            HeaderScan::Complete {
+                arb: ADMIN_LISTEN,
+                consumed: HEADER_BYTES,
+            }
+        );
+        assert_eq!(&rejoined[4..8], MAGIC);
+        assert_eq!(
+            &rejoined[8..12],
+            &[CMD_SET_PORT_NODEID, 1, 2, MUX_PORT_UNITS]
+        );
     }
 }

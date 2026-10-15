@@ -92,8 +92,9 @@ use crate::core::klippy::interface::{describe_frame, Device};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use libloading::Library;
 use std::collections::HashMap;
+use std::ffi::CString;
 use std::fmt;
-use std::os::raw::{c_int, c_long, c_uchar};
+use std::os::raw::{c_char, c_int, c_long, c_uchar};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -166,23 +167,26 @@ pub struct HostMux {
     pub named: [u8; 6],
 }
 
-/// The live library for `path` in `mode` with `identity`, loading it (and
-/// starting its threads) if the registry holds no live one.
+/// The live library for `path` in `mode` with `identity` and the bridge port
+/// table `host_port_paths`, loading it (and starting its threads) if the
+/// registry holds no live one.
 ///
 /// # Errors
 /// Returns [`InterfaceError`] when opening fails, and when a live library on
-/// `path` disagrees with `mode` or `identity`: both are fixed when the library
-/// is opened (the mode picks its reader, the identity is set before klipper
-/// comes up), so reusing it under other ones would silently answer as the
-/// wrong thing.
+/// `path` disagrees with `mode`, `identity` or `host_port_paths`: all three are
+/// fixed when the library is opened (the mode picks its reader, the identity is
+/// set, and the ports are named, all before klipper comes up), so reusing it
+/// under other ones would silently answer as the wrong thing — another port
+/// table would leave the ports on the path the library was built with.
 fn library_for(
     path: &Path,
     mode: OutputMode,
     identity: Option<[u8; 6]>,
+    host_port_paths: &[(u8, String)],
 ) -> Result<Arc<HostLibrary>, InterfaceError> {
     refuse_a_second_library(path)?;
     let library = resource_for(library_registry(), path, |path| {
-        HostLibrary::open(path, mode, identity)
+        HostLibrary::open(path, mode, identity, host_port_paths)
     })?;
     let identity = identity.unwrap_or([0; 6]);
     if library.router.mode != mode || library.identity != identity {
@@ -192,7 +196,36 @@ fn library_for(
             library.router.library_path.display()
         )));
     }
+    // A port's tty is fixed when the library is opened too, so a reference that
+    // names its own ports can only be served by the load that opens it. A
+    // reference that names none — a device behind a bridge port — is served by
+    // any live library, which is why only a non-empty table is checked.
+    if !host_port_paths.is_empty() && library.port_paths.as_slice() != host_port_paths {
+        return Err(InterfaceError::Other(format!(
+            "klipper host library {} is already loaded with a different set of bridge port \
+             ttys (loaded: {}; asked: {}), so the asked ttys cannot be named: a port's tty is \
+             fixed when the library is opened, because klipper_host_port() must be called \
+             before klipper_host_init()",
+            library.router.library_path.display(),
+            describe_port_paths(&library.port_paths),
+            describe_port_paths(host_port_paths),
+        )));
+    }
     Ok(library)
+}
+
+/// A bridge port table as one line for an error: `0=/dev/ttyUSB0,
+/// 1=/dev/ttyUSB1`, or `none` for the empty table (a library opened with no
+/// ports named).
+fn describe_port_paths(paths: &[(u8, String)]) -> String {
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+    paths
+        .iter()
+        .map(|(slot, tty)| format!("{slot}={tty}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Refuse to load `path` while a **different** host library is live in this
@@ -256,6 +289,16 @@ type InputFn = unsafe extern "C" fn(*const c_uchar, usize) -> c_long;
 /// `klipper_host_set_uuid(const uint8_t uuid[6])` — the identity the device
 /// answers the serial mux with, which the host sets before klipper comes up.
 type SetUuidFn = unsafe extern "C" fn(*const c_uchar) -> c_int;
+/// `klipper_host_port(int slot, const char *path)` — the tty bridge port `slot`
+/// opens, which the host names before klipper comes up.
+type SetPortFn = unsafe extern "C" fn(c_int, *const c_char) -> c_int;
+/// How many bridge port ttys the library takes, `slot` being
+/// `0..HOST_PORT_SLOTS` — `KLIPPER_HOST_PORT_SLOTS` in
+/// `third_party/klipper/src/host/klipper_host.h`, the count the bridge's
+/// `BRIDGE_MAX_PORTS` must not exceed (`third_party/klipper/src/bridge.c`).
+/// Named in the error a refused `klipper_host_port` gets, so the slot it was
+/// given need not be guessed at.
+const HOST_PORT_SLOTS: i32 = 4;
 /// One read from the library: bytes into `buf`, up to `buf_size`, waiting up to
 /// `timeout_ms`. Both the byte-stream and the frame API have this shape.
 type OutputFn = unsafe extern "C" fn(*mut c_uchar, usize, u32) -> usize;
@@ -274,6 +317,10 @@ struct Symbols {
     /// could name the device — an identity is then refused rather than ignored
     /// (see [`HostLibrary::open`]).
     set_uuid: Option<SetUuidFn>,
+    /// `klipper_host_port`, absent from a library built before the host could
+    /// name a port's tty — naming one is then refused rather than half-applied
+    /// (see [`HostLibrary::open`]).
+    set_port: Option<SetPortFn>,
     input: InputFn,
     /// `klipper_host_output_wait`, the byte stream, in **every** build: what a
     /// debug build reads by default and what `OutputMode::Bytes` always reads.
@@ -301,6 +348,13 @@ impl Symbols {
             // this. An identity asked of one that does not is an error, not a
             // silently unnamed device (see [`HostLibrary::open`]).
             set_uuid: unsafe { library.get::<SetUuidFn>(b"klipper_host_set_uuid\0") }
+                .ok()
+                .map(|symbol| *symbol),
+            // Optional, like the identity: only a library that can open a
+            // bridge port's tty at the host's word exports this. Naming one to
+            // a library that does not is an error, not a silent fallback to the
+            // path the library was built with.
+            set_port: unsafe { library.get::<SetPortFn>(b"klipper_host_port\0") }
                 .ok()
                 .map(|symbol| *symbol),
             input: unsafe { get(library, b"klipper_host_input\0")? },
@@ -343,6 +397,15 @@ struct HostLibrary {
     /// when none was ([`HostLibrary::open`]). Printed by the firmware and
     /// answered to the mux, so a request for another one is refused.
     identity: [u8; 6],
+    /// The bridge port ttys this library was opened with, as `(slot, tty)` in
+    /// the order they were named, empty when it was opened with none
+    /// ([`HostLibrary::open`]).
+    ///
+    /// Ports are fixed at `klipper_host_init`, so a later reference that names
+    /// its own table cannot be served ([`library_for`]); keeping the table is
+    /// what tells such a reference apart from one that names none — a device
+    /// behind a bridge port — which the same library serves.
+    port_paths: Vec<(u8, String)>,
     /// The one output channel a **bare** path's references share: bytes (or
     /// whole frames) from Klipper, in arrival order, the reader the only
     /// producer and every bare reference holding a clone of the receiver. A
@@ -426,6 +489,7 @@ impl HostLibrary {
         path: &Path,
         mode: OutputMode,
         identity: Option<[u8; 6]>,
+        host_port_paths: &[(u8, String)],
     ) -> Result<Arc<Self>, InterfaceError> {
         let library_path = path.to_path_buf();
         let library = unsafe { Library::new(&library_path) }.map_err(|e| {
@@ -457,6 +521,42 @@ impl HostLibrary {
                 return Err(InterfaceError::Other(format!(
                     "klipper_host_set_uuid() returned {result}"
                 )));
+            }
+        }
+
+        // Where each of the bridge's ports is, likewise fixed once the device is
+        // up (a port's tty opens when the host's `config_uart` arrives, after
+        // nothing at all at init), so the pairs go in here, before `init`, with
+        // the identity. A port the config named nothing for is simply absent
+        // and opens the path the library was built with.
+        if !host_port_paths.is_empty() {
+            let set_port = match symbols.set_port {
+                Some(set_port) => set_port,
+                None => {
+                    return Err(InterfaceError::Other(format!(
+                        "klipper host library {} does not support run-time port paths: it was \
+                         built without klipper_host_port",
+                        library_path.display()
+                    )))
+                }
+            };
+            for (slot, tty) in host_port_paths {
+                let tty = CString::new(tty.as_str()).map_err(|e| {
+                    InterfaceError::Other(format!(
+                        "klipper host library {}: the tty for bridge port {slot} is not a \
+                         C string: {e}",
+                        library_path.display()
+                    ))
+                })?;
+                let result = unsafe { set_port(c_int::from(*slot), tty.as_ptr()) };
+                if result != 0 {
+                    return Err(InterfaceError::Other(format!(
+                        "klipper_host_port({slot}, {}) returned {result}: the slot is outside \
+                         the range this build takes (0..={}), or the path does not fit",
+                        tty.to_string_lossy(),
+                        HOST_PORT_SLOTS - 1
+                    )));
+                }
             }
         }
 
@@ -519,6 +619,7 @@ impl HostLibrary {
             }),
             read_output,
             identity,
+            port_paths: host_port_paths.to_vec(),
             output,
             stopped,
             threads: Mutex::new(vec![runtime]),
@@ -773,7 +874,7 @@ impl HostDevice {
     /// Returns [`InterfaceError`] when the library cannot be loaded, does not
     /// export the expected symbols, or fails to initialize.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, InterfaceError> {
-        Self::open(path.as_ref(), OutputMode::Default, None, None)
+        Self::open(path.as_ref(), OutputMode::Default, None, None, &[])
     }
 
     /// Open a communication reference on the klipper host library at `path`
@@ -799,7 +900,7 @@ impl HostDevice {
         path: impl AsRef<Path>,
         identity: Option<[u8; 6]>,
     ) -> Result<Self, InterfaceError> {
-        Self::open(path.as_ref(), OutputMode::Bytes, identity, None)
+        Self::open(path.as_ref(), OutputMode::Bytes, identity, None, &[])
     }
 
     /// Open a communication reference on the klipper host library at `path`
@@ -817,6 +918,14 @@ impl HostDevice {
     /// does not speak the mux never answers the handshake, so the attach times
     /// out — the same failure a shared serial port misses its handshake on.
     ///
+    /// `host_port_paths` is the tty each of this MCU's bridge ports opens, as
+    /// `(slot, path)` — the port index and the `uart_path:` the config wrote for
+    /// it (`mcu/bridge_ports.rs`). It is handed to the library **before**
+    /// klipper comes up (`klipper_host_port`), so a port's stream is what the
+    /// host says it is rather than what the library was built with; the paths
+    /// are only read when this call is the one that loads the library, exactly
+    /// as the identity is.
+    ///
     /// # Errors
     /// Returns [`InterfaceError`] for the reasons [`HostDevice::load`] does,
     /// when `mcu_id` is outside the addressable range, and
@@ -826,12 +935,14 @@ impl HostDevice {
         path: impl AsRef<Path>,
         mux: HostMux,
         mcu_id: u32,
+        host_port_paths: &[(u8, String)],
     ) -> Result<Self, InterfaceError> {
         let device = Self::open(
             path.as_ref(),
             OutputMode::Mux,
             Some(mux.identity),
             Some(mcu_id),
+            host_port_paths,
         )?;
         device.attach(mux.named, mcu_id)?;
         Ok(device)
@@ -872,17 +983,23 @@ impl HostDevice {
             OutputMode::Mux,
             Some(identity),
             Some(mcu_id),
+            &[],
         )?))
     }
 
     /// Wrap the live library on `path` as a reference in `mode`.
+    ///
+    /// `host_port_paths` reaches the library only when this call opens it (see
+    /// [`HostDevice::load_mux`]): the paths are fixed at `klipper_host_init`, so
+    /// every other caller — a bare load, a downstream reference — passes none.
     fn open(
         path: &Path,
         mode: OutputMode,
         identity: Option<[u8; 6]>,
         mcu_id: Option<u32>,
+        host_port_paths: &[(u8, String)],
     ) -> Result<Self, InterfaceError> {
-        let library = library_for(path, mode, identity)?;
+        let library = library_for(path, mode, identity, host_port_paths)?;
         let reference = NEXT_REFERENCE.fetch_add(1, Ordering::Relaxed);
         let mux = match (mode, mcu_id) {
             (OutputMode::Mux, Some(mcu_id)) => Some(MuxRoute::for_id(mcu_id)?),
@@ -1479,6 +1596,72 @@ mod host_tests {
         wait_for_unload_blocking(&mux_library_path());
     }
 
+    /// A live library is opened once, with one bridge port table: a later
+    /// reference that names its own ttys cannot replace it, so it is refused by
+    /// name instead of silently keeping the table the first load named — or,
+    /// when that load named none, the path the library was built with.
+    ///
+    /// This is the reference-order trap of a muxed `host_library:` path: a
+    /// device behind a bridge port names no ports of its own, so it may open the
+    /// library before the bridge does; the bridge's ports would then be quietly
+    /// ignored, which is exactly the fallback to `CONFIG_HOST_BRIDGE_SERIAL_PATH`
+    /// a run-time port path exists to remove.
+    #[tokio::test]
+    async fn test_a_live_library_refuses_a_different_bridge_port_table() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mux = HostMux {
+            identity,
+            named: identity,
+        };
+        let table = vec![(0u8, "/dev/klipperx-port-0".to_string())];
+
+        // The load that opens the library names the ports, fixing the table.
+        let first = HostDevice::load_mux(mux_library_path(), mux, 1, &table)
+            .expect("the mux library opens with the port table");
+
+        // The same table, and no table at all, reuse the live library: a
+        // reference that names none is a device behind a bridge port, which
+        // names nothing and is served either way.
+        let same = HostDevice::load_mux(mux_library_path(), mux, 2, &table)
+            .expect("the same port table reuses the library");
+        let downstream = HostDevice::load_mux(mux_library_path(), mux, 3, &[])
+            .expect("a reference that names no ports reuses the library");
+
+        // Another table is what the live library cannot serve: the ttys are
+        // fixed when it was opened, so the reference is refused by name rather
+        // than silently met by the table the first load named.
+        let err = HostDevice::load_mux(
+            mux_library_path(),
+            mux,
+            4,
+            &[(0u8, "/dev/klipperx-port-other".to_string())],
+        )
+        .expect_err("a live library cannot take another reference's port table");
+        match err {
+            InterfaceError::Other(message) => {
+                assert!(
+                    message.contains("already loaded with a different set of bridge port ttys"),
+                    "{message}"
+                );
+                assert!(
+                    message
+                        .contains("klipper_host_port() must be called before klipper_host_init()"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Other, got {other:?}"),
+        }
+
+        drop(downstream);
+        drop(same);
+        drop(first);
+        wait_for_unload(&mux_library_path()).await;
+    }
+
     /// A muxed attach to a library that does not run the mux firmware sends the
     /// handshake and never hears back, so it fails with a timeout — the same
     /// failure a shared serial port misses its handshake on, and never a broken
@@ -1495,7 +1678,7 @@ mod host_tests {
             identity: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
             named: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
         };
-        let err = HostDevice::load_mux(library_path(), mux, 1)
+        let err = HostDevice::load_mux(library_path(), mux, 1, &[])
             .expect_err("a plain library never answers the mux handshake");
         assert!(
             matches!(err, InterfaceError::Timeout),
@@ -1873,9 +2056,14 @@ mod host_tests {
     }
 
     /// Create the bridge's port 0 on a freshly loaded library: the oid table,
-    /// the UART object at the tty path this build baked in, and the port that
-    /// carries it — the pair of configuration commands the loader queues
-    /// (`mcu/bridge_ports.rs`, `third_party/klipper/src/uart.c`).
+    /// the UART object on slot 0, and the port that carries it — the pair of
+    /// configuration commands the loader queues (`mcu/bridge_ports.rs`,
+    /// `third_party/klipper/src/uart.c`).
+    ///
+    /// The UART object travels with slot 0, the port's index on the bridge: the
+    /// tty it opens is the one the library was told for that slot before it came
+    /// up (`HostDevice::load_mux`), or the path this build baked in when the
+    /// caller told it nothing.
     ///
     /// The bridge has no compile-time port, so every test that wants port 0
     /// starts here — after the tty exists. The three frames use advancing
@@ -1891,7 +2079,11 @@ mod host_tests {
             ("allocate_oids", vec![ArgValue::UInt8(2)]),
             (
                 "config_uart",
-                vec![ArgValue::UInt8(0), ArgValue::UInt32(250_000)],
+                vec![
+                    ArgValue::UInt8(0),
+                    ArgValue::UInt32(250_000),
+                    ArgValue::UInt8(0),
+                ],
             ),
             (
                 "config_bridge_port",

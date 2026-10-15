@@ -232,7 +232,7 @@ max_accel: 3000
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
 |------|------|------|--------|------|
-| `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)）；**一个进程只允许一份 host 库**——两个不同路径会在装载期点名报错（要两个固件请用同一路径的多引用，或用独立进程） |
+| `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)）；桥的各端口 tty 由主机在库 `init` 前按端口槽登记（`[uart_device] uart_path:`），不是编译期烘死；**一个进程只允许一份 host 库**——两个不同路径会在装载期点名报错（要两个固件请用同一路径的多引用，或用独立进程） |
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
 | `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**端口在配置期由主机声明**：主机为该端口节发 `config_uart`（带本节的 `uart_baud`）与 `config_bridge_port`（把该 UART 对象接给桥），**端口 `index` = 端口节的声明顺序**；`uart_baud` 缺省 250000，写错/端口打不开等由固件 `shutdown` ⇒ **主机在配置阶段显式报错**（不再有「编译期端口表」）。**顺序约束**：桥必须**先于**本子节连接；而裸 `[mcu]` 在同一阶段总是先于 `[mcu <名>]` 装载，所以桥是裸 `[mcu]` 时本子节**必须**写成 `[mcu <名>]`（否则报点名错误） |
 | `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。**桥经 CAN 上游的下游 attach 尚未接线（属 P5）**，现在会点名报错 |
@@ -284,6 +284,7 @@ CAN MCU、本仓把它泛化成所有接口共用一个序列；
 |------|--------|------|------|------|
 | `uart_mcu` | `uart_device` | 字符串 | 是 | 这条 uart 口长在哪颗 `[mcu]` 上（裸 `[mcu]` 写 `mcu`，命名节写名字）。必须指向配置里存在的 `[mcu]`，否则装载报错 |
 | `uart_oid` | `uart_device` | 字符串 | 是 | 该端口的名字（如 `uart0`）。固件不再上报端口表，`index` 由**声明顺序**给出；这个名字现在只用于人机对照与查端口节（MCU 后端落地后将成为固件 UART 实例名的挂点） |
+| `uart_path` | `uart_device` | 字符串 | 否 | **只对「桥经 `host_library:` 连接」的端口有意义**：这条端口该开哪个 tty（例如 `/dev/serial/by-id/…`）。主机在库 `init` **之前**按端口槽把它登记给库（`klipper_host_port(slot, path)`），`slot` 就是端口 `index`（= 声明顺序）。**不写**则回落库构建期的默认路径（`CONFIG_HOST_BRIDGE_SERIAL_PATH`）；桥不是 host 库却写了它 ⇒ **装载期点名报错**；路径打不开 ⇒ **配置期点名报错**（固件 `shutdown`，库 stderr 里有该路径）。这也意味着一份库可以配多条端口路径，不必为每条 tty 重建固件 |
 | `uart_baud` | `uart_device` | 整数 | 否 | 端口自身的线参数；**配置期由主机下发给固件**（`config_uart baud=…`），缺省 250000；非零校验，固件设置失败会 `shutdown` ⇒ 配置阶段显式报错 |
 | `uart_restart_method` | `arduino` / `cheetah` | 否 | — | 声明**该端口的板子怎么被线级复位**（写其它值报错）。声明了它，挂在该端口上的 **legacy 子设备**（无 `uuid:`）在 `FIRMWARE_RESTART` 时由桥对该口做 DTR\|RTS 脉冲（`RESET_PORT 0x04`）；不声明则子设备沿用 `command`。注意：桥的链路按 id 寻址（共享串口或“它是桥”），所以桥自己走 `serial:` + `restart_method: cheetah` 时**不会驱 RTS**（与非桥的独占串口不同，配置层会告警）。⚠️ **只对 USB-串口桥接板有效**（CH340/CP2102/FTDI 这类，DTR\|RTS 接在复位脚上）：**原生 USB CDC 板**（klipper 自带 USB 栈，设备名形如 `usb-Klipper_<board>_<serial>-if00`）**不把 DTR/RTS 当复位**——固件只把控制线状态记进 `line_control_state`，唯一消费是「波特率 1200 且 DTR 为低」时进 bootloader（`src/generic/usb_cdc.c:452-459,485-494`），所以 250 ms 的 DTR\|RTS 脉冲在那类板子上是**静默无效**的（内核照常接受 ioctl）；这类 legacy 设备目前**没有**经桥的硬复位手段，要用命名设备 + `restart_method: admin`（设备自身复位）或断电 |
 | `can_mcu` | `can_device` | 字符串 | 是 | 同 `uart_mcu` |

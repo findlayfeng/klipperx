@@ -171,6 +171,17 @@ pub struct McuObject {
     ///
     /// [`Interface::host_mux`]: crate::core::klippy::interface::Interface::host_mux
     host_mux: Mutex<Option<HostMux>>,
+    /// The tty the host has to name for each of this bridge's ports before the
+    /// firmware comes up, as `(slot, path)` — the slot being the port's index.
+    ///
+    /// Filled while the config loads, by the port sections' factory
+    /// (`mcu/bridge_ports.rs`, which also assigns the index), and read back by
+    /// `connect`: the host library is told every pair before
+    /// `klipper_host_init` (`HostDevice::load_mux`), so the port's tty is a
+    /// deployment fact rather than one baked into the library. Empty for every
+    /// MCU that is not a host-library bridge, and for a port that writes no
+    /// `uart_path:` (its port keeps the library's own default).
+    host_port_paths: Mutex<Vec<(u8, String)>>,
     /// The restart method of the connection currently up.
     ///
     /// [`McuObject::before_firmware_restart`] runs on the live connection and has
@@ -259,6 +270,7 @@ impl McuObject {
             id: Mutex::new(None),
             shared_baud: Mutex::new(None),
             host_mux: Mutex::new(None),
+            host_port_paths: Mutex::new(Vec::new()),
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
@@ -352,6 +364,27 @@ impl McuObject {
             .host_mux
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = mux;
+    }
+
+    /// Record the tty this bridge's port `slot` opens at run time.
+    ///
+    /// Called by the port section's factory while the config loads
+    /// (`mcu/bridge_ports.rs`), before anything connects: the library is told
+    /// every pair before it comes up, so a port's tty has to be known by then.
+    /// `slot` is the port's index — the same number `config_uart` carries.
+    pub fn add_host_port_path(&self, slot: u8, path: String) {
+        self.host_port_paths
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push((slot, path));
+    }
+
+    /// The `(slot, path)` pairs this bridge's ports named, in declaration order.
+    pub fn host_port_paths(&self) -> Vec<(u8, String)> {
+        self.host_port_paths
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
     }
 
     /// Whether this firmware is stopped (or the host has marked it so).
@@ -448,6 +481,7 @@ impl McuObject {
         config.id = self.id();
         config.shared_baud = self.shared_baud();
         config.host_mux = self.host_mux();
+        config.host_port_paths = self.host_port_paths();
         Ok(config)
     }
 
@@ -1329,12 +1363,13 @@ impl PrinterObject for McuObject {
                     config.name
                 ))
             })?);
-            // Same pattern as the id: the shared-port baud and the host-mux
-            // attach were decided for the whole config at load, so connecting
-            // only reads them back rather than reclassifying every `[mcu]`
-            // section again.
+            // Same pattern as the id: the shared-port baud, the host-mux attach
+            // and the tty each bridge port opens were decided for the whole
+            // config at load, so connecting only reads them back rather than
+            // reclassifying every `[mcu]` section again.
             config.shared_baud = self.shared_baud();
             config.host_mux = self.host_mux();
+            config.host_port_paths = self.host_port_paths();
             info!(
                 "MCU '{}' restart method: {}",
                 config.name,

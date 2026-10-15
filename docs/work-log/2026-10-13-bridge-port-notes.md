@@ -652,3 +652,25 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
   **反证**：去掉两道守卫 ⇒ 三条新测全红，且运行期那条**进程直接 SIGSEGV**（正是缺陷本身的表现）。
 - 既有测试必要调整 1 处（已说明）：`test_load_reports_a_missing_library` 现在也取 `HOST_LIBRARY_TEST_LOCK`——装载现在会查进程级注册表，否则「载不存在的路径」会与别的测试的活库竞速、报成「一进程一份库」而不是「failed to load」。
 - 验收：`cargo test --workspace` **3229 passed / 0 failed / 13 ignored**、fmt 干净、`--all-targets` 0 告警；「不误伤」面（同路径 mux、两条引用共用一份库、先后载入、多路径身份互异）全部既有测试绿。
+
+### R1/R1b（2026-10-15）：桥端口 tty 改为**运行期**由主机按端口槽登记
+
+**动机**：真机那次为了指到板子的 tty，专门重建了一份库（把 by-id 路径烘进 Kconfig）。改成一份库 + 运行期给路径。
+
+**R1（子模组 `a96368d9` + 主仓 `e13b937`）**
+
+- 固件：`int klipper_host_port(int slot, const char *path)`（`init` 前调用，槽数 `KLIPPER_HOST_PORT_SLOTS = 4`）、内部 `klipper_host_port_path(slot)`；`config_uart oid=%c baud=%u slot=%c`；
+  后端 `src/host/bridge.c` 按槽取路径、**没登记就回落** `CONFIG_HOST_BRIDGE_SERIAL_PATH`（该 Kconfig 从「唯一事实」降级为**兜底默认**）；仍**只服务一路流**（第二路 `UART_OPEN_BUSY`）。
+- 主机：`[uart_device] uart_path:`（字符串，host-only）；桥那台 `[mcu]` 在 `klipper_host_init` **之前**把各端口 `(slot=端口 index, path)` 交给库——`slot`/`index`/`SET_PORT_NODEID` **一处计数**（`bridge_ports::wire_bridge_port`）。非宿主库桥写 `uart_path:` ⇒ 装载期点名报错。
+- 验收：主仓 **3237 passed / 0 failed / 13 ignored**、fmt 干净、0 告警；子模组 `host`/`host-mux` 0 告警；反证（后端改回只读 Kconfig）两条新测均红。
+- 最有判别力的一条测试：**把构建默认路径做成活 pty**，仍然失败 ⇒ 证明采纳的是运行期路径（并断言库 stderr 含用户写的那条路径）。
+
+**R1b（子模组 `573c3eaf`/`5dbd8d0c` + 主仓 `8769f4a`）**——收 R1 复审 findings：
+
+1. **P1 缺口（已修）**：同一条 `host_library:` 路径上若有**非桥成员先连接**（`host_libraries` 允许的 mux 组合），首个 `load_mux` 会带**空表**装载并 `init`，桥的 `(slot,path)` 再也登不进去 ⇒ **静默回落**。修法：`HostLibrary` 记下开库时的端口表，`library_for` 复用活库时**表不一致（且本次非空）就点名报错**（`klipper_host_port() 必须在 init 前调用`）。**不做**「表按路径合并」——复审论证那会**制造**新的静默错路径（固件槽表是全局的，槽号却是每颗桥自己的端口序，两条桥求并集会「同槽两值」后者覆盖前者）。附带收益：上一个测试泄漏的活库被下一条测试复用时，身份/模式相同、只有表能识破 ⇒ 从「怪异失败」变成点名错误。
+2. **P2（已修）**：桥测试的收尾改 `BridgeTeardown` RAII guard（`teardown → drop printer → 等卸载 → 清 symlink`）——R1 那次 240s 挂起的真因就是**断言在 `teardown()` 前 panic**、机器与已加载库被泄漏、后续测试静默复用陈旧固件；现在 panic 展开也收干净（写手用「临时 panic」验证过：该测红、其余 15 条全绿）。
+3. **P2（已修）**：`BRIDGE_MAX_PORTS`（generic `src/bridge.c:58`）与 `KLIPPER_HOST_PORT_SLOTS`（`klipper_host.h`）加**编译期 `#error` 绑定**（`#if CONFIG_MACH_HOST` 守卫，别把 host 头拖进真板构建）；槽越界/路径过长的文案补说明。
+4. **P2（已做）**：线上参数名 `path=%c` → **`slot=%c`**（它承载的是槽号，避免误导下一个读协议的人）。
+- 验收：主仓 **3238 passed / 0 failed / 13 ignored**、fmt 干净、0 告警；子模组两配置 0 告警；三条反证（编译期 `#error` 触发、表检查去掉即红、RAII 收尾的 panic 探针）。
+
+**仍然记着的事实（不是缺陷）**：`config_uart` 多了一个参数 ⇒ **新主机配旧库**在连接期**显式报错**（按字典校验参数个数：`expected 2 parameters, got 3`），只是文案不友好、没有版本握手；`KLIPPER_HOST_PORT_SLOTS = 4` 与 `BRIDGE_MAX_PORTS = 4` 现已编译期绑定；固件仍单流 ⇒ `slot != 0` 的端到端路径**不可能**被测到（只有主机侧单测覆盖），N 路并行流是**下一个单元（R2）**。

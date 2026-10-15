@@ -311,6 +311,12 @@ impl Interface {
     /// reference is attached under `mcu_id` ([`HostDevice::load_mux`]), so its
     /// frames carry the mux header from then on.
     ///
+    /// `host_port_paths` is the tty each of this MCU's bridge ports opens, as
+    /// `(slot, path)` (`mcu/bridge_ports.rs`): it is handed to the library
+    /// before klipper comes up, so a port's tty is a run-time fact rather than
+    /// one the library was built with. An empty slice — every reference that is
+    /// not a bridge — leaves the ports on the library's own default.
+    ///
     /// # Errors
     /// Returns [`InterfaceError`] for the reasons [`Interface::host`] does, and
     /// [`InterfaceError::Timeout`] when the device never confirms the
@@ -319,9 +325,10 @@ impl Interface {
         path: impl AsRef<Path>,
         mux: HostMux,
         mcu_id: u32,
+        host_port_paths: &[(u8, String)],
     ) -> Result<Self, InterfaceError> {
         Ok(Self::with_transport(Transport::Host(Arc::new(
-            HostDevice::load_mux(path, mux, mcu_id)?,
+            HostDevice::load_mux(path, mux, mcu_id, host_port_paths)?,
         ))))
     }
 

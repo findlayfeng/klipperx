@@ -89,6 +89,16 @@ pub struct McuConfig {
     /// `None` — the value parsing leaves it at — is today's single-MCU mode,
     /// bare frames with no identity.
     pub host_mux: Option<HostMux>,
+    /// The tty the host must name for each of this MCU's bridge ports before the
+    /// firmware comes up, as `(slot, path)`: a port section's `uart_path:`, keyed
+    /// by the port index `config_uart` carries.
+    ///
+    /// Set at load from the bridge's port sections (`mcu/bridge_ports.rs`) and
+    /// read back by `connect`, exactly as [`McuConfig::shared_baud`] is. Empty
+    /// for every MCU that is not a host-library bridge, and for a bridge whose
+    /// ports name no path — those ports open the path the library was built
+    /// with.
+    pub host_port_paths: Vec<(u8, String)>,
     /// Which mechanism `rpi_usb` uses to switch the port's power.
     ///
     /// Only meaningful with `restart_method: rpi_usb`; see
@@ -358,6 +368,7 @@ impl McuConfig {
             id,
             shared_baud: None,
             host_mux: None,
+            host_port_paths: Vec::new(),
             usb_power,
         })
     }
@@ -408,8 +419,13 @@ impl McuConfig {
         // the driver opened it. A shared serial port ignores this: several MCUs
         // one port cannot each drive its modem lines (`Transport::open` warns).
         let rts = self.restart_method != McuRestartMethod::Cheetah;
-        self.transport
-            .open(self.id, rts, self.shared_baud, self.host_mux)
+        self.transport.open(
+            self.id,
+            rts,
+            self.shared_baud,
+            self.host_mux,
+            &self.host_port_paths,
+        )
     }
 
     /// Resolve `restart_method`, and which port-level reset (if any) a
@@ -904,6 +920,13 @@ impl Transport {
     /// extra. Like `shared_baud`, it is decided for the whole config at load,
     /// not derived from this section alone.
     ///
+    /// `host_port_paths` is what that same open tells the library before it
+    /// comes up: the tty each of the MCU's bridge ports opens, as
+    /// `(slot, path)`. It is how `[uart_device <name>] uart_path:` reaches the
+    /// firmware at run time, instead of being a path the library was built
+    /// with; an empty slice (any MCU that is not a host-library bridge) leaves
+    /// every port on the library's own default.
+    ///
     /// `rts` is the state an **exclusive** serial port is left in after
     /// opening; a shared one ignores it — and warns when it is `false` —
     /// because several MCUs would otherwise fight over the same modem line.
@@ -917,6 +940,7 @@ impl Transport {
         rts: bool,
         shared_baud: Option<u32>,
         host_mux: Option<HostMux>,
+        host_port_paths: &[(u8, String)],
     ) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
@@ -964,7 +988,8 @@ impl Transport {
                     let id = id.ok_or_else(|| {
                         format!("host_library {library}: the MCU id has not been assigned")
                     })?;
-                    Interface::host_mux(library, mux, id).map_err(|e| format!("host_library: {e}"))
+                    Interface::host_mux(library, mux, id, host_port_paths)
+                        .map_err(|e| format!("host_library: {e}"))
                 }
                 None => Interface::host(library).map_err(|e| format!("host_library: {e}")),
             },

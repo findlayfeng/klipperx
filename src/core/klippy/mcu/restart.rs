@@ -532,6 +532,7 @@ mod tests {
             id: None,
             shared_baud: None,
             host_mux: None,
+            host_port_paths: Vec::new(),
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -551,6 +552,7 @@ mod tests {
             id: None,
             shared_baud: None,
             host_mux: None,
+            host_port_paths: Vec::new(),
             usb_power: usb::UsbPowerMethod::default(),
         }
     }
@@ -569,6 +571,7 @@ mod tests {
             id: None,
             shared_baud: None,
             host_mux: None,
+            host_port_paths: Vec::new(),
             usb_power: usb::UsbPowerMethod::default(),
         }
     }

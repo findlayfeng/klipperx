@@ -1084,10 +1084,11 @@ mod tests {
             .expect("the second get_clock is answered")
             .expect("get_clock twice");
         let advanced = second.clock.wrapping_sub(first.clock);
-        // The 5s `get_clock` timeout bounds any possible stall: 5s × 50 MHz =
-        // 250M ticks, so a delta under that is only "the counter advanced".
+        // The 5s `get_clock` timeout plus the 20ms sleep bound any possible
+        // stall: ≈ (5s + 20ms) × 50 MHz ≈ 251M ticks, so a delta under that
+        // is only "the counter advanced".
         assert!(
-            advanced > 0 && advanced < 250_000_000,
+            advanced > 0 && advanced < 251_000_000,
             "the counter advances by a plausible tick delta: {first:?} → {second:?}"
         );
 
@@ -1260,10 +1261,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{name}'s second get_clock is answered"))
                 .unwrap_or_else(|e| panic!("get_clock twice for {name}: {e}"));
             let advanced = second.clock.wrapping_sub(first.clock);
-            // The 5s `get_clock` timeout bounds any possible stall: 5s ×
-            // 50 MHz = 250M ticks, so a delta under that is only "advanced".
+            // The 5s `get_clock` timeout plus the 20ms sleep bound any
+            // possible stall: ≈ (5s + 20ms) × 50 MHz ≈ 251M ticks.
             assert!(
-                advanced > 0 && advanced < 250_000_000,
+                advanced > 0 && advanced < 251_000_000,
                 "{name}'s counter advances by a plausible tick delta: {first:?} → {second:?}"
             );
 

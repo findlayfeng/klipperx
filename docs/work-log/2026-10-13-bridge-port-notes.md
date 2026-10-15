@@ -711,4 +711,4 @@ dev-manual `README.md` 与 `serial-mux-protocol.md` 的引用计数关闭段）�
 
 - 主仓 `work` = `ce48af0`：全量闸门 **3241 passed / 0 failed / 13 ignored**、`cargo fmt --all --check` 干净、`--all-targets` 0 告警；工作区干净；两条任务 worktree 已全部销毁。
 - 手册同步（随代码）：`testing.md`（夹具小节 + bridge_attach 18 测两条新覆盖）、`serial-mux-protocol.md`（配置期按槽多流语义 + 「多下游端口」段改为「端到端已钉住」）、子模组 `README.md`/`Kconfig` 旧断言清理。
-- 待办：L2-b/R2-b 两测试的独立评审已派出（与本段收尾并行）；L3（linux console 接 mux + `-U` 身份 → 免真机验命名设备经真桥）与 P4/P5/P6 仍未动。
+- 两测试的独立评审均已完成：L2-b **OK（P0/P1 无，三条 P2 当场跟进进 `2690ded`）**；R2-b **无须返工（P2 三条：串行 get_clock 措辞、251M 余量、文件清单——均已在后续提交闭合）**；L3（linux console 接 mux + `-U` 身份 → 免真机验命名设备经真桥）与 P4/P5/P6 仍未动。

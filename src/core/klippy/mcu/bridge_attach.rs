@@ -722,7 +722,10 @@ mod tests {
     ///
     /// A load in a mode/identity the live library cannot serve fails while it is
     /// still up; a successful one means it was already unloaded, and dropping
-    /// that one reference unloads it again.
+    /// that one reference unloads it again. A timeout **warns and returns**
+    /// instead of asserting: this runs from `BridgeTeardown::drop`, and a panic
+    /// there while the test is already unwinding would abort the whole test
+    /// binary — the next test meeting the live library fails loudly instead.
     fn wait_for_mux_library_unload(path: &std::path::Path) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -732,10 +735,14 @@ mod tests {
                     return;
                 }
                 Err(_) => {
-                    assert!(
-                        Instant::now() < deadline,
-                        "the mux host library never unloaded"
-                    );
+                    if Instant::now() >= deadline {
+                        eprintln!(
+                            "teardown: mux host library still loaded after 10s: {} \
+                             (continuing; the next test on it will fail loudly)",
+                            path.display()
+                        );
+                        return;
+                    }
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -785,7 +792,8 @@ mod tests {
             if let Some(printer) = self.printer.take() {
                 printer.teardown();
                 // Release the guard's reference, the last one: the library
-                // unloads with it, which the wait below confirms.
+                // unloads with it, which the wait below checks (and warns
+                // about — never asserts — since this is a drop path).
                 drop(printer);
             }
             wait_for_mux_library_unload(&self.library);
@@ -1076,8 +1084,10 @@ mod tests {
             .expect("the second get_clock is answered")
             .expect("get_clock twice");
         let advanced = second.clock.wrapping_sub(first.clock);
+        // The 5s `get_clock` timeout bounds any possible stall: 5s × 50 MHz =
+        // 250M ticks, so a delta under that is only "the counter advanced".
         assert!(
-            advanced > 0 && advanced < 50_000_000,
+            advanced > 0 && advanced < 250_000_000,
             "the counter advances by a plausible tick delta: {first:?} → {second:?}"
         );
 
@@ -1250,8 +1260,10 @@ mod tests {
                 .unwrap_or_else(|_| panic!("{name}'s second get_clock is answered"))
                 .unwrap_or_else(|e| panic!("get_clock twice for {name}: {e}"));
             let advanced = second.clock.wrapping_sub(first.clock);
+            // The 5s `get_clock` timeout bounds any possible stall: 5s ×
+            // 50 MHz = 250M ticks, so a delta under that is only "advanced".
             assert!(
-                advanced > 0 && advanced < 50_000_000,
+                advanced > 0 && advanced < 250_000_000,
                 "{name}'s counter advances by a plausible tick delta: {first:?} → {second:?}"
             );
 

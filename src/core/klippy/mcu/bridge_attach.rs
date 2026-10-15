@@ -158,11 +158,7 @@ pub(crate) fn resolve(
 
     // The bridge object, registered under the same spelling the port section
     // writes: `mcu` for the bare section, `mcu <sub>` otherwise.
-    let bridge_name = if bridge == "mcu" {
-        "mcu".to_string()
-    } else {
-        format!("mcu {bridge}")
-    };
+    let bridge_name = bridge_object_name(&bridge);
     let not_up = || {
         // A bare `[mcu]` child can never be ordered after a named bridge: the
         // main section always registers (and so connects) before every
@@ -420,6 +416,44 @@ fn route_error(index: u8, id: u8, flags: u8, err: impl std::fmt::Display) -> Kli
 /// Wrap `message` as the config error this pass reports.
 fn config_error(message: String) -> KlippyError {
     KlippyError::Config(ConfigError::new(message))
+}
+
+/// The object name a port section's `*_mcu` refers to: `mcu` for the bare
+/// section, `mcu <sub>` otherwise — the spelling the loader registers the
+/// bridge under and [`resolve`] looks it up by.
+fn bridge_object_name(bridge: &str) -> String {
+    if bridge == "mcu" {
+        "mcu".to_string()
+    } else {
+        format!("mcu {bridge}")
+    }
+}
+
+/// The run-time tty a downstream device's port opens, when that port's bridge is
+/// a **host library**.
+///
+/// Only that shape's tty is opened by the library itself (when the firmware's
+/// `config_uart` arrives), so it is the only one a lost tty can be waited for
+/// and the whole printer restarted to reopen
+/// ([`McuObject::recover_lost_child_port`](crate::core::klippy::mcu::object::McuObject::recover_lost_child_port)).
+///
+/// `None` for everything else: an MCU that is not on a bridge port, a port that
+/// is not a `[uart_device]`, a port section that names no `uart_path` (the
+/// library then opens the tty it was built with, which the host cannot wait for),
+/// and a bridge that is not a host library (a `serial:`/CAN bridge opens its
+/// ports differently).
+pub(crate) fn host_bridge_port_path(printer: &Printer, config: &McuConfig) -> Option<String> {
+    let Transport::BridgePort { port, kind, .. } = &config.transport else {
+        return None;
+    };
+    if *kind != PortKind::Uart {
+        return None;
+    }
+    let section = printer.lookup_object_as::<UartPort>(port)?;
+    let path = section.path()?.to_string();
+    let bridge = printer.lookup_object_as::<McuObject>(&bridge_object_name(section.mcu()))?;
+    let bridge = bridge.mcu_config().ok()?;
+    matches!(bridge.transport, Transport::Host { .. }).then_some(path)
 }
 
 /// The firmware's own words when a bridge port's tty could not be opened
@@ -2297,6 +2331,354 @@ mod tests {
                 child.is_identified(),
                 "the child re-identified over the reopened bridge port"
             );
+            let _ = std::fs::remove_file(&port_link);
+        })
+        .await
+        .expect("the test finishes within its budget");
+    }
+
+    // -----------------------------------------------------------------------
+    // A device on the bridge's port that loses the tty during its own connect.
+    // -----------------------------------------------------------------------
+
+    /// The identity the named downstream answers the mux with. One definition so
+    /// the firmware's `-U` and the child's `uuid:` cannot drift apart.
+    const NAMED_CHILD_UUID: [u8; 6] = [0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c];
+
+    /// A `[mcu bridge]` over the real host library with one **named** child on
+    /// `uart0`, whose `uart_path` is `port_link` — the same shape the real
+    /// board runs (`restart_method: admin` included). The bridge's build-baked
+    /// tty is kept alive too, so a run that adopted the run-time path is the only
+    /// one that can open `port_link`.
+    ///
+    /// Returns the guard (it owns the printer) plus the printer and the parsed
+    /// config, so a test can rebuild the machine (`reset_for_restart` +
+    /// `load_config`) the way the host's run loop does.
+    fn named_child_bridge(
+        port_link: &std::path::Path,
+    ) -> (Pty, BridgeTeardown, Arc<Printer>, Config) {
+        let baked = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                baked.path.display()
+            )
+        });
+        let uuid_hex: String = NAMED_CHILD_UUID
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let text = format!(
+            "[mcu bridge]\nhost_library: {}\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
+             [mcu child]\nuart: uart0\nuuid: {uuid_hex}\nrestart_method: admin\n",
+            library.display(),
+            port_link.display()
+        );
+        let config = Config::from_text(&text).expect("the test config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library, bridge_path);
+        let printer = teardown.printer();
+        printer.load_config(&config).expect("the config loads");
+        (baked, teardown, printer, config)
+    }
+
+    /// Break the port tty the bridge holds, the way a downstream re-enumeration
+    /// does: wait until the library has opened it (its own stderr says so), then
+    /// drop the pty (`held`; the fd the bridge holds dies with it) and take the
+    /// stable path away. `restore` is the tty the path is put back on after the
+    /// given delay; `None` leaves it gone.
+    async fn break_bridge_port(
+        capture_path: std::path::PathBuf,
+        port_link: std::path::PathBuf,
+        held: Pty,
+        restore: Option<(std::path::PathBuf, Duration)>,
+    ) {
+        let opened = format!("{} open at", port_link.display());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(&capture_path).unwrap_or_default();
+            if text.contains(&opened) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the bridge never opened the port: {text}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(held);
+        let _ = std::fs::remove_file(&port_link);
+        if let Some((target, delay)) = restore {
+            tokio::time::sleep(delay).await;
+            std::os::unix::fs::symlink(&target, &port_link).unwrap_or_else(|e| {
+                panic!(
+                    "failed to link {} to {}: {e}",
+                    port_link.display(),
+                    target.display()
+                )
+            });
+        }
+    }
+
+    /// A child that loses the bridge's port tty during its own connect makes the
+    /// host ask for one **plain** restart, and the next bring-up comes up on the
+    /// tty that is back.
+    ///
+    /// This is the real sequence with `restart_method: admin`: the device is
+    /// reset by `RESTART_DEVICE` while the child is connecting, the board
+    /// re-enumerates and the tty the bridge holds dies, so the child's naming
+    /// handshake fails. The failure is the **child's**, not the bridge's — the
+    /// test drives the same run loop (`bring_up` → `reset_for_restart` →
+    /// `load_config` → `bring_up`) and asserts the one restart and the recovered
+    /// bring-up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_child_that_loses_its_bridge_port_asks_for_a_restart_and_recovers() {
+        use crate::core::klippy::printer::PrinterState;
+
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        tokio::time::timeout(Duration::from_secs(180), async {
+            let first = klipperx_test_support::LinuxFirmware::spawn_named(NAMED_CHILD_UUID)
+                .expect("the first downstream firmware starts");
+            let port_link = std::env::temp_dir().join(format!(
+                "klipperx-child-port-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&port_link);
+            std::os::unix::fs::symlink(first.serial_path(), &port_link)
+                .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
+
+            let (_baked, _teardown, printer, config) = named_child_bridge(&port_link);
+            let library = klipperx_test_support::klipper_host_mux_lib_path();
+
+            // Phase 1: the whole chain comes up on the real named downstream.
+            tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+                .await
+                .expect("the chain comes up");
+            let state = printer.get_state_message();
+            assert_eq!(
+                state.category,
+                PrinterState::Ready,
+                "the first bring-up is ready: {}",
+                state.message
+            );
+
+            // Phase 2: the downstream re-enumerates during the child's connect.
+            // The tty the bridge will hold is a throwaway pty now, and a fresh
+            // device is waiting to take its place.
+            let replacement = klipperx_test_support::LinuxFirmware::spawn_named(NAMED_CHILD_UUID)
+                .expect("the replacement downstream firmware starts");
+            let dying = Pty::new();
+            let _ = std::fs::remove_file(&port_link);
+            std::os::unix::fs::symlink(&dying.path, &port_link)
+                .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
+            printer.reset_for_restart("restart");
+            wait_for_mux_library_unload(&library);
+            printer.load_config(&config).expect("the config reloads");
+
+            let capture = StderrCapture::start(&_serial, "child-recovery");
+            let breaker = tokio::spawn(break_bridge_port(
+                capture.path().to_path_buf(),
+                port_link.clone(),
+                dying,
+                Some((
+                    replacement.serial_path().to_path_buf(),
+                    Duration::from_secs(3),
+                )),
+            ));
+
+            tokio::time::timeout(Duration::from_secs(60), printer.bring_up())
+                .await
+                .expect("the failing bring-up ends");
+            breaker.await.expect("the port-breaking task runs");
+            drop(capture);
+            assert!(
+                restart_requested(&printer),
+                "the child's lost port asks for the one plain restart"
+            );
+
+            // Phase 3: the restart the host asked for. The library unloads and
+            // loads again, the port opens on the tty that is back, and the child
+            // re-identifies.
+            printer.reset_for_restart("restart");
+            wait_for_mux_library_unload(&library);
+            printer.load_config(&config).expect("the config reloads");
+            tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+                .await
+                .expect("the recovered bring-up completes");
+            let state = printer.get_state_message();
+            assert_eq!(
+                state.category,
+                PrinterState::Ready,
+                "the recovered chain is ready: {}",
+                state.message
+            );
+            let child = printer
+                .lookup_object_as::<McuObject>("mcu child")
+                .expect("the printer has [mcu child]")
+                .mcu()
+                .expect("the child connected");
+            assert!(
+                child.is_identified(),
+                "the child re-identified over the reopened bridge port"
+            );
+            let _ = std::fs::remove_file(&port_link);
+        })
+        .await
+        .expect("the test finishes within its budget");
+    }
+
+    /// A child whose port tty never comes back is a configuration error: the
+    /// host waits for it for a bounded time and then reports the same failure,
+    /// with no restart.
+    ///
+    /// The control for the recovery above: the port is silent (so the child's
+    /// naming handshake fails) and its stable path is taken away for good.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_child_port_tty_that_never_comes_back_fails_bounded_without_a_restart() {
+        use crate::core::klippy::printer::PrinterState;
+
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        tokio::time::timeout(Duration::from_secs(120), async {
+            let silent = Pty::new();
+            let port_link = std::env::temp_dir().join(format!(
+                "klipperx-child-port-gone-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&port_link);
+            std::os::unix::fs::symlink(&silent.path, &port_link)
+                .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
+
+            let (_baked, _teardown, printer, _config) = named_child_bridge(&port_link);
+            let capture = StderrCapture::start(&_serial, "child-port-never-returns");
+            let breaker = tokio::spawn(break_bridge_port(
+                capture.path().to_path_buf(),
+                port_link.clone(),
+                silent,
+                None,
+            ));
+
+            let started = Instant::now();
+            tokio::time::timeout(Duration::from_secs(60), printer.bring_up())
+                .await
+                .expect("the bring-up ends by itself");
+            let waited = started.elapsed();
+            breaker.await.expect("the port-breaking task runs");
+            drop(capture);
+
+            assert!(
+                waited >= BRIDGE_PORT_RETURN_TIMEOUT,
+                "the host waits for the port tty before reporting: {waited:?}"
+            );
+            assert!(
+                waited < BRIDGE_PORT_RETURN_TIMEOUT + Duration::from_secs(20),
+                "the wait for the port tty is bounded: {waited:?}"
+            );
+            let state = printer.get_state_message();
+            assert_eq!(
+                state.category,
+                PrinterState::Error,
+                "the failure stays an error: {}",
+                state.message
+            );
+            assert!(
+                state
+                    .message
+                    .contains("SET_KLIPPER_NODEID handshake on port 0"),
+                "the failure is the child's own, unchanged: {}",
+                state.message
+            );
+            assert!(
+                !restart_requested(&printer),
+                "a tty that never comes back is a configuration error, not a restart"
+            );
+            let _ = std::fs::remove_file(&port_link);
+        })
+        .await
+        .expect("the test finishes within its budget");
+    }
+
+    /// A child that can never connect gets **one** restart at most, then the
+    /// printer stays in its error state.
+    ///
+    /// The recovery budget's test on the child side: the port tty is there and
+    /// the bridge opens it, but the device behind it never answers, so every
+    /// round would ask for a restart without the per-section budget.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_child_that_never_connects_restarts_at_most_once() {
+        use crate::core::klippy::printer::PrinterState;
+
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        tokio::time::timeout(Duration::from_secs(120), async {
+            // The bridge's port opens on a live pty nothing ever answers on.
+            let silent = Pty::new();
+            let port_link = std::env::temp_dir().join(format!(
+                "klipperx-child-port-silent-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_file(&port_link);
+            std::os::unix::fs::symlink(&silent.path, &port_link)
+                .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
+
+            let (_baked, _teardown, printer, config) = named_child_bridge(&port_link);
+            let library = klipperx_test_support::klipper_host_mux_lib_path();
+
+            // Round 1: the child's handshake times out, and the host spends its
+            // one recovery on a restart.
+            tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+                .await
+                .expect("the first bring-up ends");
+            assert!(
+                restart_requested(&printer),
+                "the first failure asks for the one restart"
+            );
+
+            // Rounds 2 and 3: the recovery is spent, so the printer stays halted
+            // with the child's own failure.
+            for round in 2..=3 {
+                printer.reset_for_restart("restart");
+                wait_for_mux_library_unload(&library);
+                printer.load_config(&config).expect("the config reloads");
+                tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
+                    .await
+                    .expect("the bring-up ends");
+                let state = printer.get_state_message();
+                assert_eq!(
+                    state.category,
+                    PrinterState::Error,
+                    "round {round} stays halted: {}",
+                    state.message
+                );
+                assert!(
+                    state
+                        .message
+                        .contains("SET_KLIPPER_NODEID handshake on port 0"),
+                    "round {round} keeps the child's failure: {}",
+                    state.message
+                );
+                assert!(
+                    !restart_requested(&printer),
+                    "round {round} must not ask for another restart"
+                );
+            }
             let _ = std::fs::remove_file(&port_link);
         })
         .await

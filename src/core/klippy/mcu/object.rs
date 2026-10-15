@@ -1129,17 +1129,62 @@ impl McuObject {
         {
             return err;
         }
-        // One restart per incident: a tty that is **there** but cannot be opened
-        // (a directory, a node without permission) satisfies the wait at once,
-        // and without this the bring-up would restart forever. The budget lives
-        // on the printer, so it survives the restart the claim buys, and it is
-        // given back if the MCU connects (`connect`'s success path).
         let Some(printer) = self.printer.upgrade() else {
             return err;
         };
+        self.restart_for_bridge_port(&printer, config, err)
+    }
+
+    /// Ask for a plain restart when a device behind a host-library bridge's port
+    /// lost that tty while it was connecting.
+    ///
+    /// The downstream device is reset by `RESTART_DEVICE` during its **own**
+    /// connect (`mcu/restart.rs`), and a native-USB board re-enumerates: the
+    /// bridge is still up, but the fd it holds for the port is dead, so the
+    /// frames the child sends fail (`bridge serial: write failed: (5)Input/output
+    /// error`) or reach nobody and its naming handshake times out. Nothing in
+    /// this session can mend that — the library would have to be re-mapped (see
+    /// [`McuObject::recover_lost_bridge_port`]) — so the same bounded wait and
+    /// the same budget are used, keyed by the **child's** own section.
+    ///
+    /// Only a port whose bridge is a host library has a tty the host can wait
+    /// for ([`bridge_attach::host_bridge_port_path`]), which is what keeps this
+    /// off `serial:`/CAN/`test:` devices.
+    async fn recover_lost_child_port(&self, config: &McuConfig, err: KlippyError) -> KlippyError {
+        let Some(printer) = self.printer.upgrade() else {
+            return err;
+        };
+        let Some(path) = bridge_attach::host_bridge_port_path(&printer, config) else {
+            return err;
+        };
+        if !bridge_attach::wait_for_port_paths(&[path], bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
+            .await
+        {
+            return err;
+        }
+        self.restart_for_bridge_port(&printer, config, err)
+    }
+
+    /// Spend this section's one bridge-port recovery on a **plain** restart, or
+    /// report `err` unchanged once it is gone.
+    ///
+    /// The budget is per section and lives on the printer
+    /// ([`Printer::claim_bridge_port_recovery`]), so it outlives the restart it
+    /// buys. Both triggers — the bridge's own port that could not be opened, and
+    /// a downstream device that lost the port while connecting — keep their own,
+    /// and each is spent once per incident: a port that is there but cannot be
+    /// opened (or whose device never answers) would otherwise restart forever. A
+    /// session that comes up gives the budget back (`connect`'s success path), so
+    /// the next real loss recovers once more.
+    fn restart_for_bridge_port(
+        &self,
+        printer: &Printer,
+        config: &McuConfig,
+        err: KlippyError,
+    ) -> KlippyError {
         if !printer.claim_bridge_port_recovery(&self.section.identifier()) {
             warn!(
-                "MCU '{}': the bridge port tty still cannot be opened; not restarting again",
+                "MCU '{}': the bridge port has already had its restart; not restarting again",
                 config.name
             );
             return err;
@@ -1531,18 +1576,23 @@ impl PrinterObject for McuObject {
                         if usb_reset {
                             self.usb_reset_unusable(&config, &err.to_string());
                         }
-                        return Err(self.connect_failure(err));
+                        let err = self.connect_failure(err);
+                        return Err(self.recover_lost_child_port(&config, err).await);
                     }
                 }
             } else {
-                let interface = self.open_interface(&config)?;
+                let interface = match self.open_interface(&config) {
+                    Ok(interface) => interface,
+                    Err(err) => return Err(self.recover_lost_child_port(&config, err).await),
+                };
                 match Mcu::connect(&config.name, interface).await {
                     Ok(mcu) => mcu,
                     Err(err) => {
                         if usb_reset {
                             self.usb_reset_unusable(&config, &err.to_string());
                         }
-                        return Err(self.connect_failure(KlippyError::Connection(err.to_string())));
+                        let err = self.connect_failure(KlippyError::Connection(err.to_string()));
+                        return Err(self.recover_lost_child_port(&config, err).await);
                     }
                 }
             };

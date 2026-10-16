@@ -48,6 +48,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -954,7 +955,11 @@ pub const TUNNEL_FRAME_MAX: usize = 128;
 
 /// One tunnel frame's length for its word count — katapult's own rule
 /// (`command.c`: `buf[MESSAGE_POS_LEN] * 4 + 8`).
-const fn tunnel_frame_len(word_cnt: u8) -> usize {
+///
+/// Public because the cut rule is one contract: a consumer that cuts whole
+/// katapult blocks out of a bare byte stream (the flashing tool's tunnel
+/// adapter) uses this same rule rather than spelling the arithmetic again.
+pub const fn tunnel_frame_len(word_cnt: u8) -> usize {
     word_cnt as usize * 4 + 8
 }
 
@@ -1048,6 +1053,98 @@ pub fn tunnel_unit(arb: u32, katapult_block: &[u8]) -> Option<Vec<u8>> {
     let mut unit = encode_header(arb);
     unit.extend_from_slice(katapult_block);
     Some(unit)
+}
+
+/// The katapult block of `unit` — a whole unit, header included — when it is a
+/// tunnel unit, `None` for anything else.
+///
+/// The cut is [`cut_unit`]'s, so this can never disagree with a reader about
+/// what a tunnel unit is. A caller that has one whole unit routed by its
+/// arbitration id (the host library's `route_unit`) uses this to tell the
+/// tunnel's units from the klipper ones before deciding where to deliver.
+pub(crate) fn tunnel_block(unit: &[u8]) -> Option<&[u8]> {
+    let consumed = match decode_header(unit) {
+        HeaderScan::Complete { consumed, .. } => consumed,
+        _ => return None,
+    };
+    match cut_unit(&unit[consumed..]) {
+        UnitCut::Tunnel { frame } if unit.len() == consumed + frame => Some(&unit[consumed..]),
+        _ => None,
+    }
+}
+
+/// The link end of one tunnel listener: the arbitration id whose tunnel units
+/// are to be handed over, paired with the sender they go to.
+///
+/// A link's reader hands each whole katapult block over as one message — the
+/// same block [`tunnel_unit`] wrapped, never split — so a consumer never
+/// reassembles one itself. The receiving end is the [`mpsc::Receiver`]
+/// [`TunnelSink::channel`] returns; dropping it is how a listener leaves, and
+/// the link notices on the next delivery (see [`TunnelRegistry::deliver`]).
+#[derive(Debug, Clone)]
+pub struct TunnelSink {
+    frames: mpsc::Sender<Vec<u8>>,
+}
+
+impl TunnelSink {
+    /// A sink and the receiver it hands whole katapult blocks to.
+    pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let (frames, receiver) = mpsc::channel();
+        (Self { frames }, receiver)
+    }
+
+    /// Hand one whole tunnel block over; `false` when the receiver is gone.
+    fn deliver(&self, frame: &[u8]) -> bool {
+        self.frames.send(frame.to_vec()).is_ok()
+    }
+}
+
+/// One link's tunnel listeners, keyed by the arbitration id their units are
+/// headed with.
+///
+/// A link's reader owns one of these (the shared serial port's reader, the host
+/// library's reader, the CAN link's reader). Delivering to an id nobody
+/// registered answers `false` and the unit is dropped — what the link did
+/// before there were listeners; a receiver that has gone away is unregistered
+/// the moment a delivery finds it, so no dead listener lingers in the table.
+#[derive(Debug, Default)]
+pub(crate) struct TunnelRegistry {
+    sinks: Mutex<HashMap<u32, TunnelSink>>,
+}
+
+impl TunnelRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route `arb`'s tunnel units to `sink` from now on; a second registration
+    /// under the same id replaces the first.
+    pub(crate) fn register(&self, arb: u32, sink: TunnelSink) {
+        self.sinks.lock().unwrap().insert(arb, sink);
+    }
+
+    /// Stop routing `arb`'s tunnel units; an unregistered id is a no-op.
+    pub(crate) fn clear(&self, arb: u32) {
+        self.sinks.lock().unwrap().remove(&arb);
+    }
+
+    /// Hand one whole tunnel frame to `arb`'s listener, if any.
+    ///
+    /// `true` when it was delivered. `false` when nobody listens — including a
+    /// listener whose receiver has been dropped, which is removed here so a
+    /// later delivery does not try it again.
+    pub(crate) fn deliver(&self, arb: u32, frame: &[u8]) -> bool {
+        let mut sinks = self.sinks.lock().unwrap();
+        let delivered = sinks.get(&arb).map(|sink| sink.deliver(frame));
+        match delivered {
+            Some(true) => true,
+            Some(false) => {
+                sinks.remove(&arb);
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 /// One board's answer to [`discovery_query`]: the UUID it is remembered by,
@@ -1340,6 +1437,10 @@ pub struct SharedSerialPort {
     /// request): a unit is a header plus a frame, and the two must not be split
     /// by another writer.
     write_lock: Mutex<()>,
+    /// The tunnel listeners on this port, keyed by the arbitration id their
+    /// units are headed with — the uplink half of a flashing tunnel
+    /// ([`SharedSerialHandle::set_tunnel_sink`]).
+    tunnels: TunnelRegistry,
     stopped: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1553,6 +1654,7 @@ impl SharedSerialPort {
             slots: Mutex::new(HashMap::new()),
             attach_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
+            tunnels: TunnelRegistry::new(),
             stopped: AtomicBool::new(false),
             reader: Mutex::new(None),
         });
@@ -1726,15 +1828,20 @@ fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut boo
             }
             UnitCut::Klipper { frame } => frame,
             UnitCut::Tunnel { frame } => {
-                // One whole tunnel unit, consumed as one piece. There is no
-                // tunnel listener yet, so it is dropped here — never through
-                // `drop_to_sync`, which would eat the stream around it.
-                debug!(
-                    "shared serial {}: no tunnel listener; dropping {}-byte tunnel unit for mcu {}",
-                    port.path.display(),
-                    HEADER_BYTES + frame,
-                    assign::mcu_id_from_arb(arb).expect("checked above"),
-                );
+                // One whole tunnel unit, consumed as one piece: the flashing
+                // tunnel's uplink. A listener registered for this unit's
+                // arbitration id gets the block whole; with none, the unit is
+                // dropped here (never through `drop_to_sync`, which would eat
+                // the stream around it).
+                let block = &pending[consumed..consumed + frame];
+                if !port.tunnels.deliver(arb, block) {
+                    debug!(
+                        "shared serial {}: no tunnel listener; dropping {}-byte tunnel unit for mcu {}",
+                        port.path.display(),
+                        HEADER_BYTES + frame,
+                        assign::mcu_id_from_arb(arb).expect("checked above"),
+                    );
+                }
                 pending.drain(..consumed + frame);
                 continue;
             }
@@ -1847,6 +1954,24 @@ impl SharedSerialHandle {
             )
         })?;
         self.port.write_unit(&unit)
+    }
+
+    /// Route this port's tunnel units headed with `arb` to `sink`: the uplink
+    /// half of a flashing tunnel, handed over whole.
+    ///
+    /// `arb` is the id the upstream tunnel units carry — for a device behind a
+    /// bridge port that is `reply_arb_id(mcu_id)` of the device's own id, which
+    /// is what the bridge heads them with. Registering the same id twice
+    /// replaces the first sink; [`Self::clear_tunnel_sink`] removes it, and so
+    /// does dropping the receiver (see [`TunnelSink::channel`]). Units no sink
+    /// is registered for are dropped, exactly as before there were listeners.
+    pub fn set_tunnel_sink(&self, arb: u32, sink: TunnelSink) {
+        self.port.tunnels.register(arb, sink);
+    }
+
+    /// Stop routing `arb`'s tunnel units to the sink registered for it.
+    pub fn clear_tunnel_sink(&self, arb: u32) {
+        self.port.tunnels.clear(arb);
     }
 
     /// Send one admin-channel unit to the bridge on this port: the
@@ -4323,6 +4448,131 @@ mod mux_tests {
             ),
             "the unit behind the tunnel unit must be dispatched"
         );
+    }
+
+    #[test]
+    fn a_tunnel_unit_is_delivered_whole_to_the_listener_of_its_arb() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+        let reply = assign::reply_arb_id(4).expect("a valid mcu id");
+
+        let (sink, frames) = TunnelSink::channel();
+        handle4.set_tunnel_sink(reply, sink);
+
+        // The whole block, byte for byte: the listener reassembles nothing.
+        master_write(&pty.master, &device_unit(4, &TUNNEL_SEND_BLOCK));
+        assert_eq!(
+            frames
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the block is delivered"),
+            TUNNEL_SEND_BLOCK.to_vec(),
+            "the listener gets the whole katapult block"
+        );
+
+        // An ordinary klipper unit on the same port is untouched: it still
+        // reaches its id's slot, not the tunnel listener.
+        master_write(&pty.master, &device_unit(4, &Frame::encode(7, b"after")));
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(7, b"after".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the klipper unit is routed as before"
+        );
+        assert!(
+            frames.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a klipper unit is not handed to the tunnel listener"
+        );
+    }
+
+    #[test]
+    fn a_tunnel_listener_is_keyed_by_arb_and_leaves_by_being_cleared() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+        let reply = assign::reply_arb_id(4).expect("a valid mcu id");
+
+        // A listener under another id gets nothing: the registry keys by the
+        // arbitration id the unit is headed with.
+        let (other, other_frames) = TunnelSink::channel();
+        handle4.set_tunnel_sink(assign::arb_id(9).expect("a valid mcu id"), other);
+        master_write(&pty.master, &device_unit(4, &TUNNEL_ACK));
+        assert!(
+            other_frames
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "another arb's listener gets nothing"
+        );
+
+        // The registered listener gets the block; clearing stops delivery.
+        let (sink, frames) = TunnelSink::channel();
+        handle4.set_tunnel_sink(reply, sink);
+        master_write(&pty.master, &device_unit(4, &TUNNEL_ACK));
+        assert!(
+            frames.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the registered listener takes the block"
+        );
+        handle4.clear_tunnel_sink(reply);
+        master_write(&pty.master, &device_unit(4, &TUNNEL_CONNECT));
+        assert!(
+            frames.recv_timeout(Duration::from_millis(200)).is_err(),
+            "a cleared listener gets nothing"
+        );
+
+        // A dropped receiver unregisters itself, and the stream keeps working:
+        // the ordinary unit behind the dropped listener's block still arrives.
+        let (dropped, dropped_frames) = TunnelSink::channel();
+        handle4.set_tunnel_sink(reply, dropped);
+        drop(dropped_frames);
+        master_write(&pty.master, &device_unit(4, &TUNNEL_CONNECT));
+        master_write(&pty.master, &device_unit(4, &Frame::encode(8, b"alive")));
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(8, b"alive".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the port keeps dispatching after a listener disappears"
+        );
+    }
+
+    #[test]
+    fn the_tunnel_registry_drops_a_dead_listener_and_keeps_the_rest() {
+        let registry = TunnelRegistry::new();
+        let arb = assign::reply_arb_id(4).expect("a valid mcu id");
+
+        let (sink, frames) = TunnelSink::channel();
+        registry.register(arb, sink);
+        assert!(
+            registry.deliver(arb, &TUNNEL_ACK),
+            "a live listener takes the block"
+        );
+        assert_eq!(
+            frames.recv_timeout(Duration::from_secs(1)).unwrap(),
+            TUNNEL_ACK.to_vec()
+        );
+
+        // The receiver goes away: the next delivery fails and unregisters it,
+        // so a later one does not even try.
+        drop(frames);
+        assert!(
+            !registry.deliver(arb, &TUNNEL_ACK),
+            "a dead listener is not delivered to"
+        );
+        assert!(
+            !registry.deliver(arb, &TUNNEL_ACK),
+            "and it is dropped, not retried"
+        );
+
+        // Clearing is independent of delivery, and a fresh registration works.
+        let (sink, frames) = TunnelSink::channel();
+        registry.register(arb, sink);
+        registry.clear(arb);
+        assert!(
+            !registry.deliver(arb, &TUNNEL_ACK),
+            "cleared means no listener"
+        );
+        assert!(frames.recv_timeout(Duration::from_millis(200)).is_err());
     }
 
     #[test]

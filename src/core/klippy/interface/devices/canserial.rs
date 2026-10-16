@@ -60,8 +60,8 @@ use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
-    admin_unit, set_port_node_id, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
-    CMD_SET_PORT_TUNNEL,
+    admin_unit, encode_header, set_port_node_id, tunnel_block, TunnelRegistry, TunnelSink,
+    UnitStream, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -306,6 +306,10 @@ pub struct CanSerialLink {
     tx_id: u32,
     /// Data bytes collected from accepted frames.
     incoming: FrameStream,
+    /// The same bytes, cut into whole **units**: a tunnel unit's block is not a
+    /// klipper frame, so it never appears in `incoming`, and this is where the
+    /// flashing tunnel's uplink is found ([`CanSerialLink::next_tunnel`]).
+    units: UnitStream,
 }
 
 impl CanSerialLink {
@@ -323,6 +327,7 @@ impl CanSerialLink {
         Self {
             tx_id,
             incoming: FrameStream::new(),
+            units: UnitStream::new(),
         }
     }
 
@@ -367,12 +372,31 @@ impl CanSerialLink {
             return false;
         }
         self.incoming.push(frame.data());
+        // The same bytes go to the unit stream too: the frame path cannot see a
+        // tunnel unit (its first byte is no klipper length), and a tunnel unit
+        // must not be missed by a reader that only reassembles frames.
+        self.units.feed(frame.data());
         true
     }
 
     /// The next complete message frame, once its bytes have arrived.
     pub fn next_frame(&mut self) -> Option<Frame> {
         self.incoming.next_frame()
+    }
+
+    /// The next whole tunnel unit as `(arb, block)`, once its bytes have arrived.
+    ///
+    /// The link's arbitration id says the unit is this node's; the unit header's
+    /// own id names which device behind a bridge it is for, and is the key a
+    /// tunnel listener registers under. Ordinary klipper units the unit stream
+    /// cuts are dropped here — [`CanSerialLink::next_frame`] is their reader.
+    pub fn next_tunnel(&mut self) -> Option<(u32, Vec<u8>)> {
+        loop {
+            let (arb, unit) = self.units.take_unit_with_arb()?;
+            if let Some(block) = tunnel_block(&unit) {
+                return Some((arb, block.to_vec()));
+            }
+        }
     }
 }
 
@@ -570,6 +594,10 @@ pub struct CanSerialDevice {
     /// The link's shape: what one frame holds and how large a datagram is.
     wire: CanWire,
     link: Mutex<CanSerialLink>,
+    /// The tunnel listeners on this link, keyed by the arbitration id their
+    /// units are headed with — the uplink half of a flashing tunnel
+    /// ([`CanSerialDevice::set_tunnel_sink`]).
+    tunnels: TunnelRegistry,
     stopped: AtomicBool,
 }
 
@@ -649,6 +677,7 @@ impl CanSerialDevice {
             nodeid,
             wire,
             link: Mutex::new(link),
+            tunnels: TunnelRegistry::new(),
             stopped: AtomicBool::new(false),
         })
     }
@@ -779,6 +808,41 @@ impl CanSerialDevice {
     pub fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
         self.send_bytes(&admin_unit(&[CMD_SET_PORT_TUNNEL, index]))
     }
+
+    /// Write one unit under an arbitrary arbitration id: the checked two-byte
+    /// header for `arb` ([`encode_header`]), then `payload` exactly as given,
+    /// cut into CAN frames like any byte stream
+    /// ([`CanSerialDevice::send_bytes`]).
+    ///
+    /// This is the entry the other transports' `send_unit` mirrors, and what a
+    /// tunnel adapter writes whole katapult blocks through: `payload` travels
+    /// as it came, so the caller owns the framing.
+    ///
+    /// # Errors
+    /// The same as [`Device::send`].
+    pub(crate) fn send_unit(&self, arb: u32, payload: &[u8]) -> Result<(), InterfaceError> {
+        let mut unit = encode_header(arb);
+        unit.extend_from_slice(payload);
+        self.send_bytes(&unit)
+    }
+
+    /// Route this link's tunnel units headed with `arb` to `sink`: the uplink
+    /// half of a flashing tunnel, handed over whole.
+    ///
+    /// `arb` is the id the upstream tunnel units carry — a device behind a
+    /// bridge port answers under `reply_arb_id(mcu_id)`, and the bridge heads
+    /// its bootloader's blocks with it. Registering the same id twice replaces
+    /// the first sink; [`Self::clear_tunnel_sink`] removes it, and so does
+    /// dropping the receiver ([`TunnelSink::channel`]). Units no sink is
+    /// registered for are dropped, exactly as before there were listeners.
+    pub fn set_tunnel_sink(&self, arb: u32, sink: TunnelSink) {
+        self.tunnels.register(arb, sink);
+    }
+
+    /// Stop routing `arb`'s tunnel units to the sink registered for it.
+    pub fn clear_tunnel_sink(&self, arb: u32) {
+        self.tunnels.clear(arb);
+    }
 }
 
 impl fmt::Debug for CanSerialDevice {
@@ -803,6 +867,18 @@ impl Device for CanSerialDevice {
         loop {
             if self.stopped.load(Ordering::Relaxed) {
                 return None;
+            }
+            // A tunnel unit that arrived for this link goes to its listener
+            // whole; the frame path cannot see it (its first byte is no klipper
+            // length). With none, it is dropped.
+            if let Some((arb, block)) = self.link.lock().unwrap().next_tunnel() {
+                if !self.tunnels.deliver(arb, &block) {
+                    debug!(
+                        "[{}]: no tunnel listener for {arb:#x}; dropping {}-byte tunnel block",
+                        self.id(),
+                        block.len()
+                    );
+                }
             }
             // The slices came together: the block is logged the way the serial
             // port logs one — however many CAN frames it took, even one.
@@ -883,6 +959,7 @@ impl CanSerialDevice {
             link: Mutex::new(
                 CanSerialLink::for_node(nodeid).expect("a test node id is in the CAN range"),
             ),
+            tunnels: TunnelRegistry::new(),
             stopped: AtomicBool::new(false),
         };
         (device, reader)
@@ -1372,6 +1449,40 @@ mod tests {
         let ours = CanFrame::new(link.rx_id(), &message(2, &[9]).raw_bytes()).unwrap();
         assert!(link.accept(&ours));
         assert_eq!(link.next_frame(), Some(message(2, &[9])));
+    }
+
+    #[test]
+    fn test_a_tunnel_unit_is_cut_out_of_the_incoming_stream() {
+        use crate::core::klippy::interface::devices::serial::{tunnel_unit, TUNNEL_TAG};
+
+        // The port's reply id heads both the CAN frames and the unit inside
+        // them: the unit stream needs the header, the frame stream does not.
+        let block = [0x01, 0x88, 0x11, 0x00, 0xf1, 0x7c, 0x99, 0x03];
+        let mut receiver = CanSerialLink::for_node(5).unwrap();
+        let reply = receiver.rx_id();
+        let unit = tunnel_unit(reply, &block).expect("a whole block");
+        assert_eq!(
+            &unit[2..4],
+            &TUNNEL_TAG[..],
+            "the frame is the katapult block"
+        );
+
+        // A bare klipper frame still reassembles, and draws no tunnel: the
+        // frame path is untouched.
+        let bare = CanFrame::new(reply, &message(2, &[9]).raw_bytes()).unwrap();
+        assert!(receiver.accept(&bare));
+        assert_eq!(receiver.next_frame(), Some(message(2, &[9])));
+        assert_eq!(receiver.next_tunnel(), None);
+
+        // A tunnel unit is then cut whole out of the same stream — a unit
+        // longer than one CAN frame and all — and the frame stream sees
+        // nothing of it (a tunnel frame's first byte is no klipper length).
+        for chunk in unit.chunks(CAN_DATA_BYTES) {
+            assert!(receiver.accept(&CanFrame::new(reply, chunk).unwrap()));
+        }
+        assert_eq!(receiver.next_tunnel(), Some((reply, block.to_vec())));
+        assert_eq!(receiver.next_tunnel(), None);
+        assert_eq!(receiver.next_frame(), None);
     }
 
     #[test]

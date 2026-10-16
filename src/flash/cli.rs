@@ -13,7 +13,10 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket};
+use crate::core::klippy::interface::HostMux;
 
+use super::bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
+use super::bridge_session::{BridgePort, BridgeTarget, PortReset};
 use super::session;
 use super::transport;
 
@@ -36,7 +39,8 @@ const QUERY_WINDOW: Duration = Duration::from_secs(2);
     name = "flash",
     version,
     about = "Flash firmware to a board running the katapult bootloader, \
-             over a direct serial tty/USB link or a SocketCAN bus",
+             over a direct serial tty/USB link or a SocketCAN bus, or through a \
+             bridge's downstream port",
     arg_required_else_help = true
 )]
 pub struct FlashArgs {
@@ -68,6 +72,47 @@ pub struct FlashArgs {
     #[arg(long)]
     pub baud: Option<u32>,
 
+    /// Serial tty of a **bridge** to flash a downstream board through: the
+    /// board behind the port named by `--port` is the target, reached over the
+    /// bridge's flashing tunnel
+    ///
+    // A bridge's link carries its downstream devices' frames too, so it is
+    // opened shared and addressed by id; the tool opens it directly (see
+    // `flash::bridge_flash`).
+    #[arg(long, value_name = "TTY")]
+    pub bridge: Option<String>,
+
+    /// Host library (`libklipper_host.so`) of a **bridge** to flash through,
+    /// when the bridge is an in-process host library instead of a serial board
+    #[arg(long, value_name = "SO")]
+    pub bridge_library: Option<String>,
+
+    /// Identity a host-library bridge answers the serial mux with, twelve hex
+    /// digits (only with `--bridge-library`; default all zeros)
+    #[arg(long, value_name = "HEX")]
+    pub host_identity: Option<String>,
+
+    /// A host-library bridge's port tty, `<slot>:<path>` (only with
+    /// `--bridge-library`; repeatable; a port without one keeps the library's
+    /// own path)
+    #[arg(long = "port-tty", value_name = "SLOT:PATH")]
+    pub port_tty: Vec<String>,
+
+    /// Bridge port the target's device hangs on, the plan's index (bridge
+    /// flashes only)
+    #[arg(long, value_name = "INDEX")]
+    pub port: Option<u8>,
+
+    /// Node id the bridge names the target's port with, 1..=255 (bridge flashes
+    /// only)
+    #[arg(long, value_name = "ID")]
+    pub port_nodeid: Option<u8>,
+
+    /// Reset the target port's device gets before the tunnel opens (bridge
+    /// flashes only; `reset-port` or `restart-device`, default `reset-port`)
+    #[arg(long, value_name = "METHOD")]
+    pub port_reset: Option<String>,
+
     /// List the unassigned nodes on a CAN bus instead of flashing
     #[arg(short, long)]
     pub query: bool,
@@ -84,6 +129,11 @@ pub enum Action {
     Query { interface: String, window: Duration },
     /// Flash one board over one direct link.
     Flash { target: Target, firmware: PathBuf },
+    /// Flash one board that hangs on a bridge's downstream port.
+    BridgeFlash {
+        target: BridgeFlashTarget,
+        firmware: PathBuf,
+    },
 }
 
 /// The direct link a flash runs over.
@@ -101,6 +151,41 @@ pub enum Target {
     },
 }
 
+/// One bridge-port flash, as the arguments describe it: the bridge's link, the
+/// port the target's device sits behind, and the reset that device gets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgeFlashTarget {
+    /// How the bridge's own link is reached.
+    pub source: BridgeLinkSource,
+    /// The line speed the target's port — and, for a serial bridge, its own
+    /// link — opens at.
+    pub baud: u32,
+    /// The target's port index on the bridge: the plan [`open_bridge`] is given
+    /// has one entry per port up to and including it.
+    ///
+    /// [`open_bridge`]: super::bridge_session::open_bridge
+    pub port: u8,
+    /// The node id the bridge names that port with.
+    pub node_id: u8,
+    /// The reset the target port's device gets before the tunnel opens.
+    pub reset: PortReset,
+}
+
+/// How a bridge's own link is reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BridgeLinkSource {
+    /// A shared serial tty the bridge answers on; its downstream devices share
+    /// the wire, so the link is addressed by id.
+    Serial { tty: String },
+    /// A muxed klipper host library loaded from `path`, given `identity` and
+    /// its port ttys.
+    Library {
+        path: String,
+        identity: [u8; 6],
+        port_ttys: Vec<(u8, String)>,
+    },
+}
+
 /// Turn a parsed command line into the action it asks for, or an error
 /// naming the first mistake.
 ///
@@ -111,6 +196,14 @@ pub enum Target {
 pub fn plan(args: &FlashArgs) -> Result<Action, String> {
     if args.query {
         return plan_query(args);
+    }
+    if args.bridge.is_some() || args.bridge_library.is_some() {
+        return plan_bridge(args);
+    }
+    if let Some(flag) = stray_bridge_argument(args) {
+        return Err(format!(
+            "{flag} needs --bridge (or --bridge-library): it names a bridge's port"
+        ));
     }
 
     match (&args.device, &args.interface) {
@@ -123,8 +216,155 @@ pub fn plan(args: &FlashArgs) -> Result<Action, String> {
     }
 }
 
+/// The first bridge-only argument on a line that names no bridge, if any —
+/// so the direct and query lines can name the option that belongs elsewhere
+/// rather than ignore it.
+fn stray_bridge_argument(args: &FlashArgs) -> Option<&'static str> {
+    if args.port.is_some() {
+        Some("--port")
+    } else if args.port_nodeid.is_some() {
+        Some("--port-nodeid")
+    } else if args.port_reset.is_some() {
+        Some("--port-reset")
+    } else if args.host_identity.is_some() {
+        Some("--host-identity")
+    } else if !args.port_tty.is_empty() {
+        Some("--port-tty")
+    } else {
+        None
+    }
+}
+
+/// The `--bridge` / `--bridge-library` line: a bridge's link, the port the
+/// target hangs on, and how the bridge reaches it.
+///
+/// Everything the direct lines spell differently is refused here so the option
+/// that belongs on one line cannot be silently dropped on the other: a bridge
+/// has one link (`--bridge` or `--bridge-library`, never both), the target is
+/// selected by its port (`--port`) and named by a node id
+/// (`--port-nodeid`) — not by `--uuid`/`--nodeid`, which are the CAN line's —
+/// and the library-only options come only with `--bridge-library`.
+fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
+    if args.bridge.is_some() && args.bridge_library.is_some() {
+        return Err(
+            "give either --bridge (serial) or --bridge-library (host library), not both".into(),
+        );
+    }
+    if args.device.is_some() {
+        return Err("--bridge names the bridge's link; it takes no --device".into());
+    }
+    if args.interface.is_some() {
+        return Err("--bridge names the bridge's link; it takes no --interface".into());
+    }
+    if args.uuid.is_some() {
+        return Err("--uuid selects a CAN board; a bridge target is named by --port-nodeid".into());
+    }
+    if args.nodeid.is_some() {
+        return Err("--nodeid is a CAN node id; a bridge target's id is --port-nodeid".into());
+    }
+    let port = args
+        .port
+        .ok_or("--bridge needs --port: which bridge port the target is on")?;
+    let node_id = args
+        .port_nodeid
+        .ok_or("--bridge needs --port-nodeid: the id the bridge names the target port with")?;
+    if node_id == 0 {
+        return Err(format!("--port-nodeid must be in 1..=255, got {node_id}"));
+    }
+    if u32::from(node_id) == BRIDGE_MCU_ID {
+        return Err(format!(
+            "--port-nodeid {node_id} is the bridge's own link id; the target needs another, \
+             or its tunnel units collide with the bridge's frames"
+        ));
+    }
+    let reset = parse_port_reset(args.port_reset.as_deref())?;
+    let firmware = firmware_or_err(args)?;
+    let baud = args.baud.unwrap_or(DEFAULT_BAUD);
+    let source = match (&args.bridge, &args.bridge_library) {
+        (Some(tty), None) => {
+            if args.host_identity.is_some() {
+                return Err(
+                    "--host-identity needs --bridge-library: a serial bridge has no library \
+                     identity"
+                        .into(),
+                );
+            }
+            if !args.port_tty.is_empty() {
+                return Err(
+                    "--port-tty needs --bridge-library: a serial bridge opens its own ports".into(),
+                );
+            }
+            BridgeLinkSource::Serial { tty: tty.clone() }
+        }
+        (None, Some(path)) => {
+            let identity = match &args.host_identity {
+                Some(text) => parse_host_identity(text)?,
+                None => [0u8; 6],
+            };
+            let mut port_ttys = Vec::with_capacity(args.port_tty.len());
+            for spec in &args.port_tty {
+                port_ttys.push(parse_port_tty(spec)?);
+            }
+            BridgeLinkSource::Library {
+                path: path.clone(),
+                identity,
+                port_ttys,
+            }
+        }
+        _ => unreachable!("plan_bridge is only reached with one of the two named"),
+    };
+    Ok(Action::BridgeFlash {
+        target: BridgeFlashTarget {
+            source,
+            baud,
+            port,
+            node_id,
+            reset,
+        },
+        firmware,
+    })
+}
+
+/// Parse `--port-reset`: the two resets [`PortReset`] has, in the spelling the
+/// port-level commands carry.
+fn parse_port_reset(text: Option<&str>) -> Result<PortReset, String> {
+    match text {
+        None | Some("reset-port") => Ok(PortReset::ResetPort),
+        Some("restart-device") => Ok(PortReset::RestartDevice),
+        Some(other) => Err(format!(
+            "--port-reset expects 'reset-port' or 'restart-device', got '{other}'"
+        )),
+    }
+}
+
+/// Parse `--port-tty`: `<slot>:<path>`, the slot the port's tty is named for.
+fn parse_port_tty(spec: &str) -> Result<(u8, String), String> {
+    let (slot, path) = spec
+        .split_once(':')
+        .ok_or_else(|| format!("--port-tty expects <slot>:<path>, got '{spec}'"))?;
+    let slot: u8 = slot
+        .parse()
+        .map_err(|_| format!("--port-tty expects a slot 0..=255 before ':', got '{slot}'"))?;
+    if path.is_empty() {
+        return Err(format!(
+            "--port-tty needs a tty path after ':', got '{spec}'"
+        ));
+    }
+    Ok((slot, path.to_string()))
+}
+
+/// Parse `--host-identity`: six bytes as twelve hex digits, most significant
+/// byte first — the same grammar `--uuid` uses, under its own name.
+fn parse_host_identity(text: &str) -> Result<[u8; 6], String> {
+    parse_hex6(text)
+        .ok_or_else(|| format!("--host-identity expects twelve hex digits, got '{text}'"))
+}
+
 /// The `--query` line: a bus to list and nothing that flashes.
 fn plan_query(args: &FlashArgs) -> Result<Action, String> {
+    if args.bridge.is_some() || args.bridge_library.is_some() {
+        return Err("--query lists a bus; --bridge flashes through one".into());
+    }
     if args.device.is_some() {
         return Err("--query lists a CAN bus; it takes --interface, not --device".into());
     }
@@ -139,6 +379,9 @@ fn plan_query(args: &FlashArgs) -> Result<Action, String> {
     }
     if args.firmware.is_some() {
         return Err("--query lists nodes; it does not flash a firmware file".into());
+    }
+    if let Some(flag) = stray_bridge_argument(args) {
+        return Err(format!("{flag} needs --bridge: it names a bridge's port"));
     }
     let interface = args
         .interface
@@ -208,16 +451,22 @@ fn firmware_or_err(args: &FlashArgs) -> Result<PathBuf, String> {
 /// first — the order a `[mcu] uuid:` option is written in, and the order the
 /// admin `SET_NODEID` frame carries.
 fn parse_uuid(text: &str) -> Result<[u8; 6], String> {
+    parse_hex6(text).ok_or_else(|| format!("--uuid expects twelve hex digits, got '{text}'"))
+}
+
+/// Six bytes as twelve hex digits, most significant byte first, or `None` —
+/// the grammar `--uuid` and `--host-identity` share.
+fn parse_hex6(text: &str) -> Option<[u8; 6]> {
     let bytes = text.as_bytes();
     if bytes.len() != 12 || !bytes.iter().all(u8::is_ascii_hexdigit) {
-        return Err(format!("--uuid expects twelve hex digits, got '{text}'"));
+        return None;
     }
-    let mut uuid = [0u8; 6];
+    let mut value = [0u8; 6];
     for (i, pair) in bytes.chunks(2).enumerate() {
         let text = std::str::from_utf8(pair).expect("ascii hex digits");
-        uuid[i] = u8::from_str_radix(text, 16).expect("ascii hex digits");
+        value[i] = u8::from_str_radix(text, 16).expect("ascii hex digits");
     }
-    Ok(uuid)
+    Some(value)
 }
 
 /// Run the action a command line asks for: the binary's whole job after
@@ -227,6 +476,7 @@ pub fn run(args: FlashArgs) -> Result<(), Box<dyn std::error::Error>> {
     match plan(&args)? {
         Action::Query { interface, window } => run_query(&interface, window),
         Action::Flash { target, firmware } => run_flash(target, &firmware),
+        Action::BridgeFlash { target, firmware } => run_bridge_flash(target, &firmware),
     }
 }
 
@@ -279,6 +529,81 @@ fn run_flash(target: Target, firmware: &Path) -> Result<(), Box<dyn std::error::
         }
     }
     Ok(())
+}
+
+/// One bridge flash: open the bridge's link, identify it, run the session over
+/// its tunnel, and report what it did.
+///
+/// The bridge's connection is asynchronous — `Mcu` drives its transport tasks
+/// on the interface's runtime — so this builds a small multi-thread runtime and
+/// runs the whole flow on it. The link is opened **inside** the runtime because
+/// the `Interface` captures the runtime its device I/O will run on.
+fn run_bridge_flash(
+    target: BridgeFlashTarget,
+    firmware: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let payload = std::fs::read(firmware)?;
+    let cfg = session::SessionConfig::default();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let link = open_bridge_link(&target)?;
+        tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
+
+        // The plan the firmware numbers by arrival order: one entry per port up
+        // to and including the target. The target's own reset is the caller's
+        // choice; the ports before it are named the one way an unknown device
+        // is reset (a line pulse, which needs no admin channel), since the
+        // caller's plan describes the target's device and not theirs.
+        let ports: Vec<BridgePort> = (0..=target.port)
+            .map(|index| BridgePort {
+                baud: target.baud,
+                reset: if index == target.port {
+                    target.reset
+                } else {
+                    PortReset::ResetPort
+                },
+            })
+            .collect();
+        let bridge_target = BridgeTarget {
+            index: target.port,
+            node_id: target.node_id,
+        };
+        let summary = link
+            .flash(&ports, bridge_target, &payload, &cfg, |line| {
+                println!("{line}")
+            })
+            .await?;
+        link.close();
+        report(summary);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+/// Open the bridge's link a [`BridgeFlashTarget`] names: a shared serial tty,
+/// or a muxed host library given its identity and port ttys.
+fn open_bridge_link(target: &BridgeFlashTarget) -> Result<BridgeLink, BridgeFlashError> {
+    match &target.source {
+        BridgeLinkSource::Serial { tty } => {
+            BridgeLink::open_serial(Path::new(tty), target.baud, BRIDGE_MCU_ID)
+        }
+        BridgeLinkSource::Library {
+            path,
+            identity,
+            port_ttys,
+        } => BridgeLink::open_host_library(
+            Path::new(path),
+            HostMux {
+                identity: *identity,
+                named: *identity,
+            },
+            BRIDGE_MCU_ID,
+            port_ttys,
+        ),
+    }
 }
 
 /// The last word of a successful flash.
@@ -610,5 +935,316 @@ mod tests {
 
         let err = planned(&["-q", "--device", "/dev/ttyACM0"]).expect_err("no tty here");
         assert!(err.contains("--device"), "{err}");
+    }
+
+    /// The serial bridge line in full: the bridge's tty, the port the target
+    /// hangs on, the id the bridge names it with, and the firmware.
+    #[test]
+    fn test_a_serial_bridge_flash_plan() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect("a bridge plan");
+        assert_eq!(
+            action,
+            Action::BridgeFlash {
+                target: BridgeFlashTarget {
+                    source: BridgeLinkSource::Serial {
+                        tty: "/dev/ttyUSB0".into(),
+                    },
+                    baud: DEFAULT_BAUD,
+                    port: 1,
+                    node_id: 7,
+                    reset: PortReset::ResetPort,
+                },
+                firmware: "fw.bin".into(),
+            }
+        );
+    }
+
+    /// The host-library bridge line: the library, its identity, its port ttys,
+    /// the target's port and id, and the target port's reset.
+    #[test]
+    fn test_a_host_library_bridge_flash_plan() {
+        let action = planned(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--host-identity",
+            "11aa22bb33cc",
+            "--port-tty",
+            "0:/dev/pts/3",
+            "--port-tty",
+            "1:/dev/pts/4",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "9",
+            "--port-reset",
+            "restart-device",
+            "--baud",
+            "115200",
+            "fw.bin",
+        ])
+        .expect("a host-library bridge plan");
+        let Action::BridgeFlash { target, firmware } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(firmware, PathBuf::from("fw.bin"));
+        assert_eq!(
+            target,
+            BridgeFlashTarget {
+                source: BridgeLinkSource::Library {
+                    path: "/lib/libklipper_host.so".into(),
+                    identity: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+                    port_ttys: vec![(0, "/dev/pts/3".into()), (1, "/dev/pts/4".into())],
+                },
+                baud: 115_200,
+                port: 1,
+                node_id: 9,
+                reset: PortReset::RestartDevice,
+            }
+        );
+    }
+
+    /// A host-library bridge without `--host-identity` answers with the
+    /// all-zero identity, the library's own none.
+    #[test]
+    fn test_a_host_library_bridge_defaults_its_identity_to_zero() {
+        let action = planned(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect("a host-library bridge plan");
+        let Action::BridgeFlash {
+            target:
+                BridgeFlashTarget {
+                    source: BridgeLinkSource::Library { identity, .. },
+                    ..
+                },
+            ..
+        } = action
+        else {
+            panic!("a library line makes a library plan");
+        };
+        assert_eq!(identity, [0u8; 6]);
+    }
+
+    /// A bridge flash names both the port and the id the bridge routes it to:
+    /// neither has a guessable default.
+    #[test]
+    fn test_a_bridge_needs_a_port_and_a_target_id() {
+        let err = planned(&["--bridge", "/dev/ttyUSB0", "--port-nodeid", "7", "fw.bin"])
+            .expect_err("which port?");
+        assert!(err.contains("--port"), "{err}");
+
+        let err =
+            planned(&["--bridge", "/dev/ttyUSB0", "--port", "1", "fw.bin"]).expect_err("which id?");
+        assert!(err.contains("--port-nodeid"), "{err}");
+    }
+
+    /// There is one bridge link or the other, never both.
+    #[test]
+    fn test_two_bridge_links_are_not_one_flash() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("one link or the other");
+        assert!(err.contains("--bridge"), "{err}");
+        assert!(err.contains("--bridge-library"), "{err}");
+    }
+
+    /// A bridge line takes the bridge's link, not a direct device or CAN bus.
+    #[test]
+    fn test_a_bridge_takes_no_device_or_interface() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--device",
+            "/dev/ttyACM0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("the bridge is the link");
+        assert!(err.contains("--device"), "{err}");
+
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--interface",
+            "can0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("the bridge is the link");
+        assert!(err.contains("--interface"), "{err}");
+    }
+
+    /// A bridge target is named by its port id, not by the CAN line's
+    /// `--uuid`/`--nodeid`, and not by the id the bridge's own link uses.
+    #[test]
+    fn test_a_bridge_takes_no_uuid_or_can_nodeid() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("a bridge target has no uuid");
+        assert!(err.contains("--port-nodeid"), "{err}");
+
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--nodeid",
+            "128",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("a bridge target's id is --port-nodeid");
+        assert!(err.contains("--port-nodeid"), "{err}");
+
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "1",
+            "fw.bin",
+        ])
+        .expect_err("the bridge's own link id is not the target's");
+        assert!(err.contains("--port-nodeid"), "{err}");
+    }
+
+    /// The bridge-only options name a bridge's port, so a direct line that
+    /// carries one is told where it belongs.
+    #[test]
+    fn test_bridge_arguments_need_a_bridge() {
+        let err = planned(&["--device", "/dev/ttyACM0", "--port", "1", "fw.bin"])
+            .expect_err("no bridge here");
+        assert!(err.contains("--port"), "{err}");
+        assert!(err.contains("--bridge"), "{err}");
+    }
+
+    /// The bridge-only spellings are parsed where they are written: a method
+    /// that is not a reset, an identity that is not twelve hex digits, and a
+    /// port tty without a slot are each named.
+    #[test]
+    fn test_bridge_spellings_are_checked() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "--port-reset",
+            "reboot",
+            "fw.bin",
+        ])
+        .expect_err("not a reset");
+        assert!(err.contains("reset-port"), "{err}");
+        assert!(err.contains("restart-device"), "{err}");
+
+        let err = planned(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--host-identity",
+            "nope",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("not an identity");
+        assert!(err.contains("--host-identity"), "{err}");
+
+        let err = planned(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--port-tty",
+            "/dev/pts/3",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("no slot");
+        assert!(err.contains("--port-tty"), "{err}");
+    }
+
+    /// The library-only options have no meaning on a serial bridge.
+    #[test]
+    fn test_library_options_need_a_host_library_bridge() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--host-identity",
+            "11aa22bb33cc",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("a serial bridge has no identity");
+        assert!(err.contains("--host-identity"), "{err}");
+
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port-tty",
+            "0:/dev/pts/3",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("a serial bridge opens its own ports");
+        assert!(err.contains("--port-tty"), "{err}");
+    }
+
+    /// A query lists a bus; it does not flash through a bridge.
+    #[test]
+    fn test_a_query_takes_no_bridge() {
+        let err = planned(&["-q", "--interface", "can0", "--bridge", "/dev/ttyUSB0"])
+            .expect_err("a listing is not a flash");
+        assert!(err.contains("--bridge"), "{err}");
     }
 }

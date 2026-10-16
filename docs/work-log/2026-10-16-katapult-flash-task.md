@@ -1,6 +1,7 @@
 # Katapult 拓扑刷写：动工前调查、决策与任务拆分（2026-10-16）
 
-> 状态：**T1、T4a 已完成验收（§8 实施记录），T2a 与 T4b 在跑**——T3 等 T2a+T2b，T5 收口。
+> 状态：**T1、T4a、T2a、T4b 四单元已验收，闸门全绿**；余 T2b（固件 mux.c 半）、T3（桥隧道）、
+> T5（拓扑流程）排队；真机测试等接线形态确认。四支任务分支待 `ff`。
 > 规格缺口先查 §8 附录（三路侦察全文，file:line 级）。
 > 本篇是一次性调查记录（非规范）；实现落地后按 work-log 惯例补「实施记录」节。
 
@@ -117,6 +118,8 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 
 ## 8. 实施记录（随实现回填，本节是唯一随实现更新的节）
 
+**2026-10-16 T4b（直连绑定 + 独立 bin）完成**：分支 `agents/feat-katapult-flash-direct`（链式基于 T4a 分支，再 6 提交：`a1d8b68` 骨架+传输层、`a6baa6a` prime 勘误+拆函数、`69090b1` tty pty 端到端、`8ebc558` CAN 数据报夹具、`25a3a5f` CLI 补测、`1701feb` 手册）。flash 模块 **54 测**（frame 15/tests 8/cli 22/transport 9），窄跑 58/58 两次，`--all-targets` 0 告警，`--workspace` rc=0。**执行记录**：三棒才收口——第一棒 content_filter 误杀零产出、第二棒超时但留下首提交、第三棒 fresh context 收口；prime 帧字节序勘误（CRC 值 0xE9E5 **按 LE 上线 = `e5 e9`**，早期把数值渲染当了线上字节）；`CLEAR_NODE_ID` 是单字节帧（不是 8 字节补零）。**评估结论**：不挂 `klipperx flash` 子命令（独立 bin 自包含已可用，CLI 形状属产品决策另议）。真机 CAN/串口未验，已入 `TESTING.md` 范围外真板项。
+
 **2026-10-16 T4a（katapult 会话核心）完成**：分支 `agents/feat-katapult-flash-core`（4 提交：3 个 feat 每步一提交 + 1 个手册），
 `src/flash/{frame,session,fake,tests}` 共 +1444 行；新增 23 测（frame 15 + session 8），窄跑两次均 27/27
 （含既有 4 条）、main 复跑 `flash::` 23/23（0.13s），`cargo build --all-targets` 0 告警，
@@ -124,6 +127,8 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 不确定点已归档：flashtool 对 SEND_BLOCK 的 tries=3/timeout=5 被统一成单一 `SessionConfig`（参数可调）；
 `prime()` 归 T4b；`get_canbus_id` 只进黄金解码测试。**T4b（直连绑定+独立 bin）已基于此分支派出**
 （`agents/feat-katapult-flash-direct`，链式可 ff）。
+
+**2026-10-16 T2a（主机侧隧道单元）完成**：分支 `agents/feat-katapult-tunnel-unit`（2 提交：`5529878` 编解码 + `42dd9fe` 手册）。判据 `01 88`/word-count 定长 8..=128 落在 `serial.rs`「The tunnel unit」一节（与固件 mux.c 的共享契约），切分单点化 `cut_unit`（`UnitStream` 与 `dispatch` 共用，−36 行全部是生产函数换成单点规则、既有测试零改动）；`tunnel_unit` builder + `send_tunnel`；收线整段消费不吃流（pty 钉住）。11 测两次 11/11，`devices::serial` 70/70（基线 59 零回归），`--workspace` rc=0。**待拍板留给 T3**：dispatch 识别在 arb 范围检查之后，越界隧道单元仍走 `drop_to_sync`。执行记录：首棒 30 分钟未提交超时，resume + 强制提交后一次收口。
 
 **2026-10-16 T1（双重封装原型）完成**：分支 `agents/test-katapult-dual-encap`，提交
 `485b74e`（485b74e 测试）+ `1581803`（手册），`cargo test --workspace` rc=0、0 告警，

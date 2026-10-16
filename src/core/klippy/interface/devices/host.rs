@@ -30,14 +30,15 @@
 //! library unloaded (a later load maps it afresh, exactly as if the board had
 //! been power-cycled).
 //!
-//! **One library per process.** One process may hold only one library, on one
-//! path: klipper stops its main loop through a process-wide `SIGUSR1` handler
-//! that every library installs over the last one, so a second path's library is
-//! refused ([`refuse_a_second_library`]) rather than left to crash or hang the
-//! process on the way out. The rule is per **live** path, not per config: many
-//! references on the one path are fine, and a path may be loaded again once its
-//! last reference is gone. The config layer refuses a config that names two
-//! paths up front (`mcu/host_libraries.rs`).
+//! **One mapping per path, any number of paths.** A path is mapped once —
+//! `dlopen` identifies a mapping by inode — and every reference on that path
+//! shares the one mapping (`library_for`). A second, **different** path is a
+//! second firmware image, and nothing refuses it: a klipper host library stops
+//! its main loop through the wake fd of its own instance
+//! (`third_party/klipper/src/host/host.c`), not through a process-wide signal,
+//! so two images run side by side in one process. The config layer
+//! (`mcu/host_libraries.rs`) allows a config that names two paths for the same
+//! reason.
 //!
 //! **One reader, one slot per addressed reference.** The library's output is a
 //! single byte stream, so the library has **one** reader thread — and that
@@ -122,12 +123,12 @@ fn library_registry() -> &'static Mutex<HashMap<PathBuf, Weak<HostLibrary>>> {
 ///
 /// The library registry is a per-path process-wide singleton, so two tests
 /// sharing the one `.so` must not overlap: the second would meet — or, at the
-/// end, unload — the first's library mid-handshake. A load now also consults
-/// the registry for a **different** live path (one host library per process,
-/// [`refuse_a_second_library`]), so an attempt on a path that does not exist
-/// takes the lock too. A loaded library's output mode and identity are fixed
-/// too ([`library_for`]), which puts a scan test and an identify test on the
-/// same `.so` in exactly that pair.
+/// end, unload — the first's library mid-handshake. A loaded library's output
+/// mode and identity are fixed too ([`library_for`]), which puts a scan test
+/// and an identify test on the same `.so` in exactly that pair. The lock also
+/// covers the state that is still process-wide even though the libraries are
+/// not: the stderr redirection the `bridge_attach` tests install, and the ptys
+/// they name for a port.
 #[cfg(test)]
 pub(crate) static HOST_LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -185,7 +186,6 @@ fn library_for(
     identity: Option<[u8; 6]>,
     host_port_paths: &[(u8, String)],
 ) -> Result<Arc<HostLibrary>, InterfaceError> {
-    refuse_a_second_library(path)?;
     let library = resource_for(library_registry(), path, |path| {
         HostLibrary::open(path, mode, identity, host_port_paths)
     })?;
@@ -227,47 +227,6 @@ fn describe_port_paths(paths: &[(u8, String)]) -> String {
         .map(|(slot, tty)| format!("{slot}={tty}"))
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-/// Refuse to load `path` while a **different** host library is live in this
-/// process.
-///
-/// A klipper host library stops its main loop through a **process-wide**
-/// `SIGUSR1` handler that every library installs over the last one
-/// (`third_party/klipper/src/host/host.c`), so a second library in one process
-/// makes the process crash or hang on the way out, whichever of the two is
-/// unloaded first (see [`one_library_per_process`]). The registry's live entries
-/// ([`Weak::upgrade`]) say which other path — if any — is loaded right now, so
-/// the rule is **by path**: any number of references on the one live path (a
-/// mux, a device behind a port) load as before, and a path whose library has
-/// been unloaded loads again — "one at a time", not "one ever".
-///
-/// # Errors
-/// [`InterfaceError::Other`] naming both paths when another path is live.
-fn refuse_a_second_library(path: &Path) -> Result<(), InterfaceError> {
-    let registry = library_registry().lock().unwrap();
-    let live_other = registry
-        .iter()
-        .find(|(loaded, weak)| loaded.as_path() != path && weak.upgrade().is_some());
-    match live_other {
-        None => Ok(()),
-        Some((loaded, _)) => Err(InterfaceError::Other(one_library_per_process(path, loaded))),
-    }
-}
-
-/// The message a load of `requested` gets when `loaded` is already live: one
-/// host library per process, and why.
-fn one_library_per_process(requested: &Path, loaded: &Path) -> String {
-    format!(
-        "klipper host library {} cannot be loaded: {} is already loaded in this process, and \
-         only one host library per process is allowed. klipper stops its main loop through a \
-         process-wide SIGUSR1 handler that each library installs over the last one, so two \
-         libraries in one process meet either a jump into unloaded code (a crash) or a join \
-         whose signal another library consumed (a hang); use several references on the one \
-         library (a mux), or run the firmware images in separate processes",
-        requested.display(),
-        loaded.display()
-    )
 }
 
 // ===========================================================================
@@ -1626,14 +1585,14 @@ mod host_tests {
     use crate::flash::session::{flash_with_config, SessionConfig};
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
 
     #[test]
     fn test_load_reports_a_missing_library() {
-        // The loader consults the process-wide registry (one host library per
-        // process), so even an attempt on a path that does not exist must not
-        // race another test's live library — it takes the same serialization
-        // every host-library test does.
+        // The load consults the process-wide registry, so even an attempt on a
+        // path that does not exist takes the same serialization every
+        // host-library test does.
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1764,17 +1723,15 @@ mod host_tests {
         wait_for_unload_blocking(&mux_library_path());
     }
 
-    /// One host library per process: a second, **different** `host_library:`
-    /// path cannot be loaded while another library is live, because klipper
-    /// stops its main loop through a process-wide `SIGUSR1` handler that each
-    /// library installs over the last one — two in one process meet a crash or a
-    /// join that never returns, depending on which is unloaded first.
+    /// Two host-library paths load side by side: the loader holds one mapping
+    /// per path (`library_for`), and a second, **different** path is a second
+    /// firmware image, not a refusal.
     ///
-    /// The guard is **by path**: several references on the one live path (the
-    /// mux shape) load as before, and once the first library has been unloaded
-    /// another path loads as its own fresh image would.
+    /// The per-path singleton still holds — several references on the one path
+    /// are one mapping, and a path may be loaded again once its last reference
+    /// is gone — but there is no process-wide rule above it any more.
     #[test]
-    fn test_a_second_host_library_path_is_refused_while_one_is_live() {
+    fn test_a_second_host_library_path_loads_beside_a_live_one() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1784,38 +1741,201 @@ mod host_tests {
         let same =
             HostDevice::load_bytes(library_path(), None).expect("the same path is one library");
 
-        // A **different** path while that one is live is refused, naming both.
-        let err = HostDevice::load_bytes(mux_library_path(), None)
-            .expect_err("a second host library path is not allowed in one process");
-        match err {
-            InterfaceError::Other(message) => {
-                assert!(
-                    message.contains("one host library per process"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(&library_path().display().to_string()),
-                    "{message}"
-                );
-                assert!(
-                    message.contains(&mux_library_path().display().to_string()),
-                    "{message}"
-                );
-            }
-            other => panic!("expected Other, got {other:?}"),
-        }
+        // A **different** path is a second mapping, live at the same time.
+        let second =
+            HostDevice::load_bytes(mux_library_path(), None).expect("a second path loads too");
+        assert!(
+            library_registry()
+                .lock()
+                .unwrap()
+                .get(mux_library_path().as_path())
+                .and_then(Weak::upgrade)
+                .is_some(),
+            "the second path's library is live beside the first's"
+        );
 
-        // Unloading the live library frees the process for another path: the
-        // guard is about still-live libraries, not about a path being used at
-        // all.
         drop(same);
         drop(first);
         wait_for_unload_blocking(&library_path());
-
-        let mux =
-            HostDevice::load_bytes(mux_library_path(), None).expect("a later path loads again");
-        drop(mux);
+        drop(second);
         wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// One test-owned copy of a host library on a path of its own, with the
+    /// temporary directory that holds it removed when it is dropped.
+    ///
+    /// `std::fs::copy` is the point: `dlopen` identifies a mapping by **inode**,
+    /// so a symlink or a hard link to the built library would hand back the one
+    /// mapping — one firmware, one mux uuid — not a second instance.
+    struct LibraryCopy {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl LibraryCopy {
+        fn of(source: &Path, tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "klipperx-hostlib-copy-{}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("the copy directory is created");
+            let path = directory.join("libklipper_host.so");
+            std::fs::copy(source, &path).expect("the host library is copied");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for LibraryCopy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Drive one live reference through the mux device half: it must answer the
+    /// discovery broadcast with `identity`, and a `get_clock` unit addressed to
+    /// the id it then adopts must come back as a `clock` frame.
+    ///
+    /// The bytes are the device layer's own (`HostDevice::write`/`read`), so
+    /// what each reference answers is its own image's state and nothing else's.
+    fn expect_identity_and_clock(
+        device: &mut HostDevice,
+        identity: [u8; 6],
+        parser: &Parser,
+        mcu_id: u32,
+        window: Duration,
+    ) {
+        let mut pending = Vec::new();
+
+        device
+            .write(&discovery_query())
+            .expect("the discovery query goes in");
+        let answer = scan_answer_within(device, &mut pending, window);
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed scan answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the device answers the identity its own image was given"
+        );
+
+        device
+            .write(&set_node_id_for(identity, mcu_id).expect("the id is addressable"))
+            .expect("the assignment goes in");
+
+        let reply_arb = assign::reply_arb_id(mcu_id).expect("the id is addressable");
+        let mut unit = encode_header(assign::arb_id(mcu_id).expect("the id is addressable"));
+        unit.extend_from_slice(&command_frame(parser, "get_clock", MESSAGE_DEST));
+        device.write(&unit).expect("the get_clock unit goes in");
+
+        let response = read_unit(device, &mut pending, window).expect("the clock response");
+        let (arb, frame) = unit_parts(&response);
+        assert_eq!(
+            arb, reply_arb,
+            "the answer goes out on this device's own reply header"
+        );
+        let clock = Frame::parse(frame).expect("the response is a whole frame");
+        let decoded = parser
+            .decode(Payload::from_raw(clock.payload().to_vec()))
+            .expect("the response decodes against the dictionary");
+        assert_eq!(decoded.len(), 1, "one message in the response frame");
+        assert_eq!(decoded[0].0.name, "clock", "get_clock is answered by clock");
+        assert!(
+            matches!(decoded[0].1.as_slice(), [ArgValue::UInt32(_)]),
+            "clock is a `%u` value, got {:?}",
+            decoded[0].1
+        );
+    }
+
+    /// Two host libraries, copied to paths of their own, run side by side in one
+    /// process and share nothing.
+    ///
+    /// A klipper host library used to stop its main loop through a process-wide
+    /// `SIGUSR1` handler that every loaded library installed over the last one,
+    /// which is why a second path was refused (both `library_for` and
+    /// `mcu/host_libraries.rs` guarded it). The loop now ends through the wake fd
+    /// of its own instance, so two paths are two independent firmware images and
+    /// nothing refuses the second.
+    ///
+    /// The copies are `std::fs::copy`, never a symlink or a hard link: `dlopen`
+    /// identifies a mapping by **inode**, so a link would hand back the one
+    /// mapping — one firmware, one mux uuid — and every assertion below would
+    /// flip. Each copy answers the discovery broadcast with the identity **it**
+    /// was given (not the other's, and not a shared last-set value), and answers
+    /// `get_clock` on the id it adopted: the two mappings are distinct, and
+    /// neither reads the other's units.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_two_host_library_copies_run_side_by_side() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let source = mux_library_path();
+        let first_copy = LibraryCopy::of(&source, "first");
+        let second_copy = LibraryCopy::of(&source, "second");
+
+        // Two files, two inodes: this is the bit a link would collapse.
+        let first_inode = std::fs::metadata(&first_copy.path)
+            .expect("the first copy exists")
+            .ino();
+        let second_inode = std::fs::metadata(&second_copy.path)
+            .expect("the second copy exists")
+            .ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "the copies must be distinct files: dlopen identifies a mapping by inode"
+        );
+
+        let first_identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let second_identity = [0x77, 0x66, 0x55, 0x44, 0x33, 0x22];
+
+        // Both load and stay live at once: neither path refuses the other.
+        let mut first = HostDevice::load_bytes(&first_copy.path, Some(first_identity))
+            .expect("the first copy loads");
+        let mut second = HostDevice::load_bytes(&second_copy.path, Some(second_identity))
+            .expect("the second copy loads while the first is live");
+        for path in [&first_copy.path, &second_copy.path] {
+            assert!(
+                library_registry()
+                    .lock()
+                    .unwrap()
+                    .get(path.as_path())
+                    .and_then(Weak::upgrade)
+                    .is_some(),
+                "{} is live",
+                path.display()
+            );
+        }
+
+        let mut parser = Parser::new();
+        mux_dictionary()
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+        let window = Duration::from_secs(5);
+
+        // Each copy answers its own identity and its own `get_clock` while the
+        // other is live and idle — the two images never cross.
+        expect_identity_and_clock(&mut first, first_identity, &parser, 5, window);
+        expect_identity_and_clock(&mut second, second_identity, &parser, 5, window);
+
+        // Both are still live after both round trips.
+        for path in [&first_copy.path, &second_copy.path] {
+            assert!(
+                library_registry()
+                    .lock()
+                    .unwrap()
+                    .get(path.as_path())
+                    .and_then(Weak::upgrade)
+                    .is_some(),
+                "{} is still live after its round trip",
+                path.display()
+            );
+        }
+
+        // Each image is unloaded on its own; wait for both, so neither is left
+        // initialized for the next test that might load the same path.
+        drop(first);
+        wait_for_unload(&first_copy.path).await;
+        drop(second);
+        wait_for_unload(&second_copy.path).await;
     }
 
     /// A live library is opened once, with one bridge port table: a later

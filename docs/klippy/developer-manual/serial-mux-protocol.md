@@ -317,8 +317,10 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
   **CAN 上游必须跑单元**：N 台下游设备的帧都复用到这一条字节流上，没有头就说不出哪台发的（串口上游
   可能只有一台，CAN 不会）；故选用「载荷内同一套单元」而非「单帧 admin 命令」（后者承载不了下游数据）。
   `depends on CANBUS && HAVE_CHIPID`、**不默认开**；`src-$(CONFIG_MUX) += mux.c` 让两种载体共用一份
-  `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。CAN 端到端（真总线或
-  `vcan` 特权环境）与 `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）仍属未落地。
+  `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。**`vcan` 上的端到端已落地**：`linux` 架构的
+  SocketCAN 控制台（`LINUX_CANSERIAL`）让真 `klipper.elf` 能当 can-serial 节点，主机侧已实测
+  跑通完整 `[mcu]` 连接（admin 指派 → identify → `get_clock`/stats）；剩下的未落地项只有
+  `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）与真总线。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

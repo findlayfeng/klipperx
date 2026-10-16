@@ -1012,6 +1012,49 @@ impl HostDevice {
         )?))
     }
 
+    /// [`HostDevice::load_bytes`] with the library's bridge ports named before
+    /// klipper comes up, exactly as [`HostDevice::load_mux`] names them — for the
+    /// tests that drive the port-level protocol by hand.
+    ///
+    /// Production names a port's tty through the config (`[uart_device]
+    /// uart_path:`, handed to `klipper_host_port` by [`HostDevice::load_mux`]);
+    /// this exists for the tests that load the library in a mode with no attach
+    /// or no handshake of its own and still want a port on their own pty, rather
+    /// than on the path the library was built with — one path for the whole
+    /// build, which two test processes linking it over would race for.
+    #[cfg(test)]
+    pub(crate) fn load_bytes_with_ports(
+        path: impl AsRef<Path>,
+        identity: Option<[u8; 6]>,
+        host_port_paths: &[(u8, String)],
+    ) -> Result<Self, InterfaceError> {
+        Self::open(
+            path.as_ref(),
+            OutputMode::Bytes,
+            identity,
+            None,
+            host_port_paths,
+        )
+    }
+
+    /// [`HostDevice::load_downstream`] with the library's bridge ports named
+    /// before klipper comes up, exactly as [`HostDevice::load_mux`] names them.
+    #[cfg(test)]
+    pub(crate) fn load_downstream_with_ports(
+        path: impl AsRef<Path>,
+        identity: [u8; 6],
+        mcu_id: u32,
+        host_port_paths: &[(u8, String)],
+    ) -> Result<Arc<Self>, InterfaceError> {
+        Ok(Arc::new(Self::open(
+            path.as_ref(),
+            OutputMode::Mux,
+            Some(identity),
+            Some(mcu_id),
+            host_port_paths,
+        )?))
+    }
+
     /// Wrap the live library on `path` as a reference in `mode`.
     ///
     /// `host_port_paths` reaches the library only when this call opens it (see
@@ -1955,13 +1998,13 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge's port is opened when the host declares it at
-        // configuration time, so the tty has
-        // to exist first - the same trick the device-half test uses.
+        // The bridge's port is opened at configuration time, so its tty has to
+        // exist first. It is named for the port's slot rather than linked over
+        // the path the library was built with (`host_port_paths` below, the
+        // table `[uart_device] uart_path:` fills in production): the baked path
+        // is one path for the whole build, shared by every test in a process
+        // and, once each test is its own process, by every test at once.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).expect("the bridge port path");
 
         let library = mux_library_path();
         let path = library.display().to_string();
@@ -1988,6 +2031,9 @@ mod host_tests {
             identity,
             named: identity,
         });
+        // The bridge's own port opens this test's pty, named when the library
+        // comes up.
+        mcu.host_port_paths = vec![(0u8, pty.path.display().to_string())];
         let interface = mcu.open().expect("the muxed library opens and attaches");
         let mcu = identify_and_clock(&mcu, &interface).await;
         assert!(mcu.is_identified());
@@ -2124,6 +2170,17 @@ mod host_tests {
     /// that loads a host library shares that one spine.
     fn mux_library_path() -> PathBuf {
         klipperx_test_support::klipper_host_mux_lib_path()
+    }
+
+    /// The bridge port table of one test's own pty: port 0's tty, named when the
+    /// library comes up.
+    ///
+    /// A test that leaves the table empty leaves its port on the path the
+    /// library was built with (`CONFIG_HOST_BRIDGE_SERIAL_PATH`) — one path for
+    /// the whole build, which every test in the process, and every test process,
+    /// would otherwise link its own pty over.
+    fn port_zero(pty: &Pty) -> Vec<(u8, String)> {
+        vec![(0u8, pty.path.display().to_string())]
     }
 
     /// The data dictionary of the mux build, for the message ids the command
@@ -2309,24 +2366,16 @@ mod host_tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         // The port is opened when the host declares it at configuration time
-        // (`config_uart`), so the tty has to exist before that: a pty whose
-        // slave is reachable at the path this build baked in. The `Pty` keeps
-        // both ends open for the whole test. (This test sends no configuration
-        // commands of its own, so the pty is only here to keep the path valid.)
+        // (`config_uart`), so the tty has to exist before that: a pty named for
+        // the port's slot when the library comes up. The `Pty` keeps both ends
+        // open for the whole test. (This test sends no configuration commands of
+        // its own, so the pty is only here to keep the port path valid.)
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
-            .expect("the mux host library opens");
+        let mut device =
+            HostDevice::load_bytes_with_ports(mux_library_path(), Some(identity), &port_zero(&pty))
+                .expect("the mux host library opens");
         let mut pending = Vec::new();
         let window = Duration::from_secs(5);
 
@@ -2554,21 +2603,14 @@ mod host_tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         // The same pty setup as the device-half test: the port has to exist
-        // before the library configures it.
+        // before the library configures it, and its tty is this pty named for the
+        // port's slot.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
-            .expect("the mux host library opens");
+        let mut device =
+            HostDevice::load_bytes_with_ports(mux_library_path(), Some(identity), &port_zero(&pty))
+                .expect("the mux host library opens");
         let mut pending = Vec::new();
         let window = Duration::from_secs(5);
         let quiet = Duration::from_millis(400);
@@ -2716,22 +2758,14 @@ mod host_tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         // The bridge opens its configured port while the host configures it,
-        // so the tty has to exist first — the same setup the device-half test
-        // uses.
+        // so the tty has to exist first — the port's own tty, named for its slot
+        // when the library comes up.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
-            .expect("the mux host library opens");
+        let mut device =
+            HostDevice::load_bytes_with_ports(mux_library_path(), Some(identity), &port_zero(&pty))
+                .expect("the mux host library opens");
         let mut pending = Vec::new();
         let window = Duration::from_secs(5);
         // A short window for the negative steps: enough for the task loop to
@@ -2988,19 +3022,10 @@ mod host_tests {
     /// tunnel on — the mode is the thing under test, not the setup.
     fn load_tunnel_port_zero() -> (HostDevice, Pty) {
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
-
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
-            .expect("the mux host library opens");
+        let mut device =
+            HostDevice::load_bytes_with_ports(mux_library_path(), Some(identity), &port_zero(&pty))
+                .expect("the mux host library opens");
         configure_port_zero(&mut device);
         device
             .write(&set_port_node_id(0, TUNNEL_PORT_ID, 0))
@@ -3436,23 +3461,19 @@ mod host_tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         // The bridge's port 0 opens at configuration time, so the tty has to
-        // exist first — and the port path is the library build's own, symlinked
-        // to this pty.
+        // exist first — and it is the port's own tty, named for its slot when the
+        // library comes up.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let device_id = 7u32;
-        let mut device = HostDevice::load_downstream(mux_library_path(), identity, device_id)
-            .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            device_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
         let window = Duration::from_secs(5);
 
         // Port 0 as a legacy device on id 7: the bridge strips the header on
@@ -3582,22 +3603,19 @@ mod host_tests {
 
         // The bridge's port is opened when the host declares it at
         // configuration time, so the tty has to
-        // exist first — the same setup the port-command probe uses.
+        // exist first — the same setup the port-command probe uses, down to the
+        // port's own tty named for its slot.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let downstream_id = 7u32;
-        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
-            .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            downstream_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
 
         let mut pending = Vec::new();
         let window = Duration::from_secs(5);
@@ -3707,17 +3725,9 @@ mod host_tests {
 
         // The bridge's port is opened when the host declares it at
         // configuration time, so the tty has to
-        // exist first — the same setup the other port tests use.
+        // exist first — the same setup the other port tests use, down to the
+        // port's own tty named for its slot.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         // The named device is **not** the bridge's own device: only the bridge's
@@ -3725,8 +3735,13 @@ mod host_tests {
         // this a device behind a port.
         let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
         let downstream_id = 7u32;
-        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
-            .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            downstream_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
         configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
 
         // The route first: port 0 owns id 7, and its device speaks units — it
@@ -3800,7 +3815,8 @@ mod host_tests {
     /// Both references are addressed the same way a live bridge reference and a
     /// live downstream one are — by the id in the unit's header — so they take
     /// the routing the real pair takes. The wire is a real pty on the port the
-    /// mux build baked in, and that port has been told its device speaks units
+    /// reference named for slot 0, and that port has been told its device speaks
+    /// units
     /// ([`MUX_PORT_UNITS`]): a headed unit written into it is forwarded upstream
     /// unchanged (the bridge attributes a unit to the port it *arrived on*, never
     /// to the id in its header), which is how units of each id are put on the one
@@ -3813,13 +3829,9 @@ mod host_tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port during init, so the tty this build baked in
-        // has to exist before the library is loaded — the same setup the other
-        // bridge tests use.
+        // The bridge opens its port during init, so its tty has to exist before
+        // the library is loaded — the port's own tty, named for its slot.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).expect("the bridge port path");
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let first_id = 7u32;
@@ -3828,8 +3840,13 @@ mod host_tests {
         // The first reference, and the port its id is routed to. The port is
         // declared at configuration time, so those frames go in before anything
         // is sent under an id.
-        let mut first = HostDevice::load_downstream(mux_library_path(), identity, first_id)
-            .expect("a downstream reference loads without a handshake");
+        let mut first = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            first_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
         configure_port_zero(Arc::get_mut(&mut first).expect("the test holds the only reference"));
         first
             .send_set_port_node_id(0, first_id as u8, MUX_PORT_UNITS)
@@ -4158,22 +4175,18 @@ mod host_tests {
 
         // The bridge's port is opened when the host declares it at
         // configuration time, so the tty has to
-        // exist first — the same setup the other port tests use.
+        // exist first — the port's own tty, named for its slot.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
         let downstream_id = 7u32;
-        let mut device = HostDevice::load_downstream(mux_library_path(), identity, downstream_id)
-            .expect("a downstream reference loads without a handshake");
+        let mut device = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            downstream_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
         configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
 
         // The bridge's port table: port 0 holds a legacy device at id 7. This is

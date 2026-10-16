@@ -571,4 +571,220 @@ mod tests {
         drop(link);
         wait_for_library_unload(&library);
     }
+
+    /// A `Read` that records the bytes it hands through: the tunnel's uplink
+    /// half delivers whole katapult blocks, so this is where the test sees that
+    /// the bridge's own console port carried them.
+    struct RecordingReader<R> {
+        inner: R,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<R: Read> Read for RecordingReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.seen.lock().unwrap().extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+
+    /// The whole bridge flash through a **real linux firmware process** as the
+    /// bridge, with that process's **own arch backend** as the port: the
+    /// firmware (`test/configs/linuxprocess-bridge.config`,
+    /// `src/linux/bridge.c`) opens a pty as its single downstream port and
+    /// [`FakeBootloader`] sits behind it.
+    ///
+    /// The host half is the flash run's own pieces, because the bridge is a
+    /// process on a tty and not a library reference: `serial::attach` over the
+    /// bridge's console pty (named with the identity it was started with, the
+    /// `SET_NODEID` an unassigned mux device adopts an id by), the `Mcu` over
+    /// it, then [`open_bridge`], the [`TunnelBridge`] and the katapult session —
+    /// the same path `BridgeLink::flash` walks for a board on a shared serial
+    /// port.
+    ///
+    /// What it shows, in the two directions a bridge has: the port's pty carried
+    /// the session's katapult frames as bare frames (the tunnel's downlink), the
+    /// console carried the bootloader's answers back as tunnel units (the
+    /// uplink, seen here through the sink the port's reply arb routes to), and
+    /// the session finished with the bootloader's own identity. Every wait is
+    /// bounded and the process is killed on the way out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_flash_via_a_real_linux_firmware_bridge_over_its_port_backend() {
+        // The identity the process is started with, and the one the host names
+        // it with: the bytes have to be the same or the firmware never adopts
+        // its node id and the attach times out instead of failing clearly.
+        const BRIDGE_UUID: [u8; 6] = [0x51, 0x52, 0x53, 0x54, 0x55, 0x56];
+
+        // The downstream port: a pty of the test's own. The firmware's backend
+        // opens it when the host declares the port (`config_uart`), and the test
+        // drives the far end with the fake bootloader below.
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+
+        // The upstream: the bridge's console pty, attached shared and given the
+        // identity the process was started with — an unassigned mux device
+        // answers nothing until a `SET_NODEID` names it.
+        let handle = serial::attach(
+            firmware.serial_path(),
+            250_000,
+            BRIDGE_MCU_ID,
+            Duration::from_millis(500),
+            Some(BRIDGE_UUID),
+        )
+        .expect("the bridge's console attaches and is named");
+        let link = Interface::shared_serial(Arc::clone(&handle));
+        let mcu = Mcu::new("bridge", link.clone());
+        tokio::time::timeout(Duration::from_secs(20), mcu.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the linux bridge identifies");
+
+        // The bootloader behind the port, pumped by a thread: the bridge's bare
+        // frames go into the fake (recorded), its answers go back out to the
+        // bridge.
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        open_bridge(&mcu, &link, &ports, target)
+            .await
+            .expect("the linux bridge declares its port, resets it, and opens the tunnel");
+
+        // The tunnel: the port's reply arb is where the bridge heads the frames
+        // it reads from the port, and the uplink reader below is what the
+        // session drives.
+        let node_id = u32::from(target.node_id);
+        let down_arb = assign::arb_id(node_id).expect("the target id is addressable");
+        let reply_arb = assign::reply_arb_id(node_id).expect("the target id is addressable");
+        let (sink, frames) = TunnelSink::channel();
+        handle.set_tunnel_sink(reply_arb, sink);
+        let bridge = TunnelBridge::new(down_arb, frames, Arc::clone(&handle));
+        let (reader, mut writer) = bridge.split();
+        let uplink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut reader = RecordingReader {
+            inner: reader,
+            seen: Arc::clone(&uplink),
+        };
+
+        let payload: Vec<u8> = (0..100u8).collect();
+        let outcome =
+            session::flash_with_config(&mut reader, &mut writer, &payload, &test_config(), |_| {});
+        // The bridge's own process is where a port that never opened, or one
+        // that shut the firmware down, says so: report it with the failure.
+        let stderr = firmware.stderr();
+        let summary = outcome.unwrap_or_else(|e| {
+            panic!(
+                "the katapult session completes over the port's tunnel: {e}\n\
+                 the port's pty carried {} bytes, the bootloader saw {} CONNECT \
+                 frame(s) and served {} answer(s)\nfirmware stderr:\n{stderr}",
+                recorded.lock().unwrap().len(),
+                fake.seen(command::CONNECT),
+                fake.responses_served(),
+            )
+        });
+
+        // The session's own verdict, taken from the bootloader's answers: these
+        // are values only the fake behind the port has.
+        assert_eq!(summary.start_addr, 0x0800_2000, "the fake's start address");
+        assert_eq!(summary.block_size, 64);
+        assert_eq!(summary.mcu_type, "STM32F103");
+        assert_eq!(summary.bytes_flashed, payload.len());
+        assert_eq!(summary.block_count, 2, "100 bytes is two 64-byte blocks");
+        assert_eq!(fake.seen(command::CONNECT), 1);
+        assert_eq!(fake.seen(command::SEND_BLOCK), 2, "both blocks written");
+        assert_eq!(fake.seen(command::REQUEST_BLOCK), 2, "both blocks verified");
+        assert_eq!(fake.seen(command::COMPLETE), 1);
+
+        // The bridge's own arch backend is where the port came from, and it says
+        // so on its stderr when the host's declaration opened the tty.
+        assert!(
+            stderr.contains("linux bridge serial:") && stderr.contains("slot 0"),
+            "the firmware's own port backend opened the tty: {stderr}"
+        );
+
+        // The tunnel is the bridge's own state and the bridge outlives the run:
+        // a repeat toggle flips it back to the mux units its other users expect.
+        link.send_set_port_tunnel(0).expect("the tunnel clears");
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+
+        // The downlink: the port's pty carried the session's katapult frames as
+        // bare frames — no unit header anywhere — byte for byte, and the 76-byte
+        // Send Block travelled whole.
+        let expected = session_frames(0x0800_2000, &payload, 64);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            expected,
+            "the port's pty carried bare katapult frames, byte for byte"
+        );
+        let mut send = 0x0800_2000u32.to_le_bytes().to_vec();
+        let mut block = payload[..64].to_vec();
+        block.resize(64, 0xFF);
+        send.extend_from_slice(&block);
+        let send_frame = build_frame(command::SEND_BLOCK, &send);
+        assert_eq!(send_frame.len(), 76, "a 64 B Send Block is one 76 B frame");
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .windows(send_frame.len())
+                .any(|window| window == send_frame.as_slice()),
+            "the 76-byte Send Block reaches the port's pty whole"
+        );
+
+        // The uplink: the bridge's console carried the bootloader's answers back
+        // as tunnel units — the sink is registered on the port's reply arb and
+        // receives units headed with it, so what the session read here can only
+        // have come over the tunnel — one whole katapult block each.
+        let uplink = uplink.lock().unwrap().clone();
+        assert!(
+            !uplink.is_empty(),
+            "the uplink delivered the bootloader's answers"
+        );
+        assert!(
+            uplink.windows(9).any(|w| w == b"STM32F103"),
+            "the bootloader's own identity came back over the tunnel"
+        );
+        let mut pos = 0usize;
+        let mut frames = 0usize;
+        while pos < uplink.len() {
+            assert_eq!(uplink[pos], 0x01, "every uplink block is a katapult frame");
+            let length = serial::tunnel_frame_len(uplink[pos + serial::TUNNEL_POS_WORDCNT]);
+            assert!(
+                (serial::TUNNEL_FRAME_MIN..=serial::TUNNEL_FRAME_MAX).contains(&length),
+                "the block's word count is inside the katapult frame bounds"
+            );
+            assert!(
+                pos + length <= uplink.len(),
+                "a whole block arrived, never a slice of one"
+            );
+            pos += length;
+            frames += 1;
+        }
+        assert_eq!(
+            frames,
+            fake.responses_served(),
+            "one tunnel unit per answer the bootloader gave"
+        );
+
+        // The connection's transport tasks hold the link, so close it before the
+        // fixture takes the process (and its pty) down.
+        mcu.close();
+        drop(mcu);
+        drop(link);
+        drop(handle);
+        drop(firmware);
+    }
 }

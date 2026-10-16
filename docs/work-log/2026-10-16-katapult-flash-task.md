@@ -134,6 +134,22 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
   content_filter——若再被滤就 fresh 棒按本快照接力）；恢复第一步 = 让 `3d58cf00` 的半成品编译过。
 - 执行史：首棒 30min 超时（5 次过滤）→ resume 后两笔提交 → 用户暂停。
 
+**T3 硬件测试口径（用户 2026-10-16 定：不走拓扑、不用配置文件）**：
+不走 `printer.cfg` 的 `[mcu 桥]` + 下游子节那套拓扑流程（那是 T5），改用**夹具级直接驱动**
+——用宿主库（`CONFIG_HOST_BRIDGE_SERIAL` 变体，T3 合并后重建即包含桥隧道代码）或 linux
+架构固件进程当桥，在 harness 里直接发 admin 命令（`SET_PORT_NODEID`/`SET_PORT_TUNNEL 0x06`）
+与隧道单元，下游接真板。
+- **拓扑**：harness ──宿主库（桥）── UART（CH340）── STM32F103（下游装置，跑 katapult）。
+  宿主库编译时烘死的端口路径可用**符号链接**指向 CH340 的 tty（库把它当普通 tty 打开），
+  不必改库构建。
+- **两个前置**：① 下游 katapult 要说 UART——板上现有的是 `USBSERIAL` only，需换一份
+  `USART1(PA9/PA10)` 配置的 katapult，用 deployer 自更新上去（自举闭环已真机验证，无风险）；
+  ② CH340 ↔ PA9/PA10 + GND 接线（用户手动）。
+- **两级验**：L1 机制级 = 一行最小序列（`SET_PORT_NODEID` + `0x06` → 下行写 katapult 帧 →
+  上游收到 reply-arb 隧道单元），证「剥头下行 + 回程组装」在真字节流上成立；L2 端到端 =
+  经隧道把一份新镜像刷进下游板 + 读回/版本定案（形态上等于 T5 收口）。
+- **反悔路径**：测完用 deployer 把 USB 版 katapult 刷回（同样已验通道）。
+
 **2026-10-16 katapult 自举实测（真机 STM32F103ZE + USB CDC，两轮，非 T 序列）**：
 - 配置：choice「Build Katapult deployment application」`0000→2000`（`BUILD_DEPLOYER` 随之开，
   `LAUNCH` 不变 0x8002000）；第二轮再改 serial 号来源 `CHIPID→"devloop1"` 当换血标记。

@@ -140,6 +140,19 @@ pub fn linux_mux_firmware_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_LINUX_MUX_FIRMWARE"))
 }
 
+/// Absolute path to the built linux process firmware with the bridge port
+/// backend (`test/configs/linuxprocess-bridge.config`: `CONFIG_MACH_LINUX=y` +
+/// `CONFIG_MUX_SERIAL=y` + `CONFIG_LINUX_BRIDGE_SERIAL=y`) — the binary
+/// [`linux_firmware::LinuxFirmware::spawn_bridge_port`] runs as a **bridge**,
+/// with a tty of its own as the downstream port.
+///
+/// `build.rs` treats it exactly like [`linux_firmware_path`]: it asserts the
+/// file when the default architecture set builds it, and with a `KLIPPERX_ARCHES`
+/// that leaves `linux` out the path still resolves but the file is absent.
+pub fn linux_bridge_firmware_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("KLIPPER_LINUX_BRIDGE_FIRMWARE"))
+}
+
 /// The linux firmware process fixture (spawn / reap, see [`LinuxFirmware`]).
 pub mod linux_firmware;
 pub use linux_firmware::LinuxFirmware;

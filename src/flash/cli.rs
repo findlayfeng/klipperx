@@ -501,6 +501,66 @@ mod tests {
         assert!(err.contains("firmware"), "{err}");
     }
 
+    /// A line speed is a serial concept — including on a query line.
+    #[test]
+    fn test_a_query_does_not_take_a_baud() {
+        let err = planned(&["-q", "--interface", "can0", "--baud", "250000"])
+            .expect_err("a listing has no serial line");
+        assert!(err.contains("--baud"), "{err}");
+    }
+
+    /// A node id above the range the admin command accepts is refused —
+    /// the top of the range is accepted.
+    #[test]
+    fn test_a_nodeid_above_the_range_is_refused() {
+        let err = planned(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "0123456789ab",
+            "--nodeid",
+            "256",
+            "fw.bin",
+        ])
+        .expect_err("node ids stop at 255");
+        assert!(err.contains("--nodeid"), "{err}");
+        assert!(err.contains("255"), "{err}");
+
+        let action = planned(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "0123456789ab",
+            "--nodeid",
+            "255",
+            "fw.bin",
+        ])
+        .expect("the top of the range is a node id");
+        let Action::Flash {
+            target: Target::Can { nodeid, .. },
+            ..
+        } = action
+        else {
+            panic!("a CAN line makes a CAN plan");
+        };
+        assert_eq!(nodeid, 255);
+    }
+
+    /// The firmware file is read before any port is opened: a missing file
+    /// is the error that comes back, and the (also missing) serial port is
+    /// never touched.
+    #[test]
+    fn test_the_firmware_file_is_read_before_the_port_is_opened() {
+        let args = parse(&["--device", "/dev/not-a-serial-port", "/not/a/firmware.bin"])
+            .expect("a command line clap accepted");
+        let err = run(args).expect_err("nothing was flashed");
+        let text = err.to_string();
+        assert!(
+            !text.contains("/dev/not-a-serial-port") && !text.contains("serial port"),
+            "the port must not be opened before the file is read: {text}"
+        );
+    }
+
     /// The query line: a bus to list, and a fixed deadline window.
     #[test]
     fn test_a_query_plan() {

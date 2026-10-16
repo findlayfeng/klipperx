@@ -20,6 +20,8 @@
 //! - [`bridge_session`] — the bridge half of a flash run: declare a bridge's
 //!   downstream ports, reset their devices, and open the flashing tunnel on
 //!   the target's port.
+//! - [`bridge_flash`] — the whole bridge-port flash in one place: open the
+//!   bridge, identify it, run the session over its tunnel, clear the tunnel.
 //! - [`frame`] — pure encode/decode plus a sliding-window scanner that finds
 //!   frames in a stream, skipping garbage one byte at a time.
 //! - [`session`] — the transport-agnostic flash session: connect →
@@ -33,6 +35,7 @@
 //!   scenarios run against.
 
 pub mod bridge;
+pub mod bridge_flash;
 pub mod bridge_session;
 pub mod cli;
 pub mod frame;
@@ -44,6 +47,7 @@ pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
+pub use bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
 pub use bridge_session::{
     open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget, PortReset,
 };

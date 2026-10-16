@@ -1484,9 +1484,10 @@ mod host_tests {
     use crate::core::klippy::identify::IDENTIFY_MESSAGES;
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, assignment_request, decode_header, discovery_query, encode_header,
-        set_node_id_for, set_port_node_id, HeaderScan, UnassignedNode, ADMIN_LISTEN, ADMIN_REPLY,
-        ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
-        CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS, RESP_NEED_NODEID,
+        set_node_id_for, set_port_node_id, tunnel_unit, HeaderScan, UnassignedNode, ADMIN_LISTEN,
+        ADMIN_REPLY, ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS,
+        RESP_NEED_NODEID, TUNNEL_TAG,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::SimulatorDevice;
@@ -2884,6 +2885,386 @@ mod host_tests {
 
         // Same invariant as the device-half test: leave this path unloaded for
         // whoever takes it next (see `wait_for_unload_blocking`).
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// The port the tunnel probes put on the bridge's port 0: a device in its
+    /// bootloader, named the way a device with no admin channel of its own is
+    /// (`SET_PORT_NODEID(0, 7, 0)`, legacy flags), which is what gives the
+    /// tunnel units an id to be headed with.
+    const TUNNEL_PORT_ID: u8 = 7;
+
+    /// `[CMD_SET_PORT_TUNNEL][index]`: the port-level command that toggles port
+    /// `index`'s flashing tunnel mode (firmware `mux.h`
+    /// `MUX_CMD_SET_PORT_TUNNEL`). The same command both enters and leaves the
+    /// mode. `serial.rs` spells no constant for it yet — the flashing tool that
+    /// sends it is the tool's own work — so the byte is spelled here.
+    const CMD_SET_PORT_TUNNEL: u8 = 0x06;
+
+    /// `[CMD_SET_PORT_TUNNEL][index]` on the admin channel.
+    fn set_port_tunnel(index: u8) -> Vec<u8> {
+        admin_unit(&[CMD_SET_PORT_TUNNEL, index])
+    }
+
+    /// The mux library loaded with the bridge's port 0 declared and named a
+    /// **legacy** device on [`TUNNEL_PORT_ID`], its tty on a fresh pty.
+    ///
+    /// This is where the tunnel probes start: a device in its bootloader speaks
+    /// no units of its own, so the port is named the legacy way, and the raw
+    /// bytes on its line become a katapult stream only once the host turns the
+    /// tunnel on — the mode is the thing under test, not the setup.
+    fn load_tunnel_port_zero() -> (HostDevice, Pty) {
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
+            .expect("the mux host library opens");
+        configure_port_zero(&mut device);
+        device
+            .write(&set_port_node_id(0, TUNNEL_PORT_ID, 0))
+            .expect("SET_PORT_NODEID goes in");
+        (device, pty)
+    }
+
+    /// Read from `device` until one whole unit is buffered, cut by the shared
+    /// codec ([`UnitStream`], so a tunnel frame is cut whole by its word count
+    /// rather than mistaken for junk), for at most `timeout`; `None` when no
+    /// unit arrived in the window. Every read is bounded.
+    fn read_stream_unit(
+        device: &mut HostDevice,
+        units: &mut UnitStream,
+        timeout: Duration,
+    ) -> Option<(u32, Vec<u8>)> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(unit) = units.take_unit_with_arb() {
+                return Some(unit);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let mut buf = [0u8; 256];
+            match device.read(&mut buf) {
+                Ok(0) => {} // the read window expired; recheck the deadline
+                Ok(read) => units.feed(&buf[..read]),
+                Err(e) => panic!("reading from the host library: {e}"),
+            }
+        }
+    }
+
+    /// The bridge's flashing tunnel mode over a real library and a real tty:
+    /// `SET_PORT_TUNNEL (0x06)` as the bridge's own port state, and the downlink
+    /// the tunnel saves — the bare katapult block, with no mux framing around it
+    /// anywhere on the wire.
+    ///
+    /// The tunnel is what the flashing tool turns on for the port a device in
+    /// its bootloader sits behind: the bridge stops speaking mux at it in both
+    /// directions. The mode is a toggle, its command is the bridge's alone, and
+    /// the rest of the bridge's traffic is untouched by it.
+    #[test]
+    fn test_the_bridge_tunnel_mode_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let (mut device, pty) = load_tunnel_port_zero();
+        let mut pending = Vec::new();
+        let mut units = UnitStream::new();
+        let window = Duration::from_secs(5);
+        // A short window for the negative steps: enough for the task loop to
+        // have run, short enough to keep the silence checks cheap.
+        let quiet = Duration::from_millis(500);
+
+        // A. `SET_PORT_TUNNEL(0)` is the bridge's own port state, like
+        //    SET_PORT_NODEID: no receipt comes back upstream, and nothing is
+        //    written to the port it toggles.
+        device
+            .write(&set_port_tunnel(0))
+            .expect("SET_PORT_TUNNEL goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "SET_PORT_TUNNEL must not be forwarded to the port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "SET_PORT_TUNNEL carries no receipt"
+        );
+
+        // The console applies the units it parses in the order it parses them,
+        // so a block that reaches the port proves this command was applied
+        // before it: the pty writes below are safe to make once this block is
+        // back. It is the downlink a tunnel saves as well — the bare katapult
+        // block, with no unit header around it.
+        let down_unit = tunnel_unit(
+            assign::arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            &TUNNEL_CONNECT,
+        )
+        .expect("the golden Connect is one whole block");
+        device.write(&down_unit).expect("the tunnel unit goes in");
+        let down = read_pty(&pty.master, TUNNEL_CONNECT.len(), window);
+        assert_eq!(
+            down, TUNNEL_CONNECT,
+            "a tunnel-mode port writes the block down bare and byte for byte"
+        );
+
+        // Port 0 is in tunnel mode now: its line is a katapult stream, so a
+        // stray klipper frame written into it is not read as one and never
+        // comes up (the legacy rule the next step shows).
+        let stray = [0x08, 0x21, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        (&pty.master)
+            .write_all(&stray)
+            .expect("the stray frame goes into the port");
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "a tunnel-mode port reads no klipper frames"
+        );
+
+        // The same command leaves the mode again: the port is legacy once more,
+        // and the raw frame is headed with its reply id as it was before. The
+        // downlink block is the ordering proof again — a toggle applied too
+        // late would leave the stray frame unread below.
+        device
+            .write(&set_port_tunnel(0))
+            .expect("the second SET_PORT_TUNNEL goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "the toggle writes nothing to the port either"
+        );
+        let down_unit = tunnel_unit(
+            assign::arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            &TUNNEL_ACK,
+        )
+        .expect("the golden ack is one whole block");
+        device.write(&down_unit).expect("the ack block goes in");
+        let down = read_pty(&pty.master, TUNNEL_ACK.len(), window);
+        assert_eq!(down, TUNNEL_ACK, "the block goes down bare in either mode");
+        (&pty.master)
+            .write_all(&stray)
+            .expect("the stray frame goes in again");
+        let up =
+            read_unit(&mut device, &mut pending, window).expect("a legacy port heads a raw frame");
+        let (arb, frame) = unit_parts(&up);
+        assert_eq!(
+            arb,
+            assign::reply_arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            "the raw frame is headed with the port's reply id again"
+        );
+        assert_eq!(frame, stray.as_slice(), "the raw frame travels unchanged");
+
+        // With no tunnel on, a block's bytes meet the legacy rule and complete
+        // no klipper frame at all, so nothing goes up: the tunnel is what makes
+        // a katapult block a unit.
+        (&pty.master)
+            .write_all(&TUNNEL_CONNECT)
+            .expect("the block goes into the legacy port");
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "a block's bytes are not a unit without the tunnel"
+        );
+
+        // B. The tunnel back on, and the downlink of a whole 76-byte block:
+        //    nothing but the block itself reaches the port, and nothing follows
+        //    it on the wire.
+        device
+            .write(&set_port_tunnel(0))
+            .expect("the tunnel is on again");
+        let down_unit = tunnel_unit(
+            assign::arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            &TUNNEL_SEND_BLOCK,
+        )
+        .expect("the golden Send Block is one whole block");
+        device.write(&down_unit).expect("the tunnel unit goes in");
+        let down = read_pty(&pty.master, TUNNEL_SEND_BLOCK.len(), window);
+        assert_eq!(
+            down, TUNNEL_SEND_BLOCK,
+            "a tunnel-mode port writes the block down bare and byte for byte"
+        );
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "no unit framing is written around the block"
+        );
+
+        // C. Traffic around it is untouched while the tunnel is on: a unit for
+        //    an id no port owns reaches no port, and the port-level command
+        //    family is consumed exactly as it was before the mode was set.
+        let mut unmapped = encode_header(assign::arb_id(9).expect("id 9"));
+        unmapped.extend_from_slice(&TUNNEL_CONNECT);
+        device.write(&unmapped).expect("the id 9 unit goes in");
+        device
+            .write(&admin_unit(&[CMD_SET_PORT_NODEID, 99, 9, 0]))
+            .expect("an out-of-range SET_PORT_NODEID goes in");
+        device
+            .write(&admin_unit(&[CMD_RESET_PORT, 0]))
+            .expect("RESET_PORT goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "none of the neighbouring traffic reaches the port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "none of the neighbouring traffic carries a receipt"
+        );
+
+        // D. The mode survived all of it, and the tunnel's own bad arguments
+        //    are dropped in silence without changing it: the block below is cut
+        //    into a tunnel unit only while the mode is still on, so a rejected
+        //    command that flipped it would leave this read with nothing.
+        device
+            .write(&admin_unit(&[CMD_SET_PORT_TUNNEL, 99]))
+            .expect("an out-of-range index goes in");
+        device
+            .write(&admin_unit(&[CMD_SET_PORT_TUNNEL]))
+            .expect("a short payload goes in");
+        assert!(
+            read_pty(&pty.master, 1, quiet).is_empty(),
+            "a rejected SET_PORT_TUNNEL reaches no port"
+        );
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "a rejected SET_PORT_TUNNEL carries no receipt"
+        );
+        (&pty.master)
+            .write_all(&TUNNEL_CONNECT)
+            .expect("a whole block goes into the port");
+        let (arb, unit) = read_stream_unit(&mut device, &mut units, window)
+            .expect("the block comes up as one tunnel unit");
+        assert_eq!(
+            arb,
+            assign::reply_arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            "the tunnel still heads its units with the port's reply id"
+        );
+        assert_eq!(
+            &unit[HEADER_BYTES..],
+            TUNNEL_CONNECT.as_slice(),
+            "and carries the block whole"
+        );
+
+        // Same invariant as the other bridge probes: leave this path unloaded
+        // for whoever takes it next.
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// The tunnel's uplink over a real library and a real tty: the bytes a
+    /// bootloader sends are cut into whole katapult blocks on the port's read
+    /// side and sent up as tunnel units under the port's reply id — which is
+    /// what [`UnitStream`] cuts back out of the host's byte stream.
+    ///
+    /// The bootloader's stream is a byte stream, not a framed one: a block that
+    /// arrives in two pieces waits for its tail, and bytes in front of a block
+    /// are junk that is skipped a byte at a time — the stream is
+    /// self-synchronising, exactly as the host reads it.
+    #[test]
+    fn test_the_bridge_tunnel_uplink_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let (mut device, pty) = load_tunnel_port_zero();
+        let mut units = UnitStream::new();
+        let window = Duration::from_secs(5);
+        let quiet = Duration::from_millis(500);
+        let reply = assign::reply_arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7");
+
+        device
+            .write(&set_port_tunnel(0))
+            .expect("the tunnel is on the port");
+
+        // The console applies the units it parses in the order it parses them,
+        // so a block that reaches the port proves the command above was applied
+        // before it. That ordering is what the pty writes below rely on: a block
+        // read in the legacy rule would wait for bytes of a frame that never
+        // comes and never reach the tunnel.
+        let down_unit = tunnel_unit(
+            assign::arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
+            &TUNNEL_SEND_BLOCK,
+        )
+        .expect("the golden Send Block is one whole block");
+        device.write(&down_unit).expect("the send block goes in");
+        let down = read_pty(&pty.master, TUNNEL_SEND_BLOCK.len(), window);
+        assert_eq!(
+            down, TUNNEL_SEND_BLOCK,
+            "a tunnel-mode port writes the block down bare"
+        );
+
+        // A. One whole block from the bootloader comes up as one tunnel unit on
+        //    the port's reply id, its bytes untouched — the frame position holds
+        //    the katapult tag, not a mux frame.
+        (&pty.master)
+            .write_all(&TUNNEL_ACK)
+            .expect("the ack block goes into the port");
+        let (arb, unit) = read_stream_unit(&mut device, &mut units, window)
+            .expect("the block comes up as a tunnel unit");
+        assert_eq!(
+            arb, reply,
+            "a tunnel unit is headed with the port's reply id"
+        );
+        assert_eq!(
+            &unit[HEADER_BYTES..],
+            TUNNEL_ACK.as_slice(),
+            "the block travels byte for byte"
+        );
+        assert_eq!(
+            &unit[HEADER_BYTES..HEADER_BYTES + 2],
+            &TUNNEL_TAG[..],
+            "the frame is the katapult block, not a mux frame"
+        );
+
+        // B. A block split across two writes is not a unit until its tail is
+        //    here: half a block on the wire is a block the far end cannot read,
+        //    so nothing complete goes up before the tail arrives.
+        let (head, tail) = TUNNEL_SEND_BLOCK.split_at(40);
+        (&pty.master)
+            .write_all(head)
+            .expect("the head of the block goes in");
+        assert!(
+            read_stream_unit(&mut device, &mut units, quiet).is_none(),
+            "half a block must not go up as a unit"
+        );
+        (&pty.master)
+            .write_all(tail)
+            .expect("the tail of the block goes in");
+        let (arb, unit) =
+            read_stream_unit(&mut device, &mut units, window).expect("the whole block comes up");
+        assert_eq!(arb, reply, "the reply id is the same for every block");
+        assert_eq!(
+            &unit[HEADER_BYTES..],
+            TUNNEL_SEND_BLOCK.as_slice(),
+            "the block is reassembled whole, byte for byte"
+        );
+
+        // C. Junk in front of a block — including a lone `01`, which could open
+        //    a tag — is skipped a byte at a time, and the block behind it comes
+        //    up whole.
+        (&pty.master)
+            .write_all(&[0x7e, 0x01, 0x00, 0x42])
+            .expect("junk goes into the port");
+        assert!(
+            read_stream_unit(&mut device, &mut units, quiet).is_none(),
+            "junk alone is not a block"
+        );
+        (&pty.master)
+            .write_all(&TUNNEL_CONNECT)
+            .expect("the block behind the junk goes in");
+        let (arb, unit) = read_stream_unit(&mut device, &mut units, window)
+            .expect("the block behind the junk comes up");
+        assert_eq!(arb, reply, "the junk did not change the id either");
+        assert_eq!(
+            &unit[HEADER_BYTES..],
+            TUNNEL_CONNECT.as_slice(),
+            "the block behind the junk travels whole"
+        );
+
         drop(device);
         wait_for_unload_blocking(&mux_library_path());
     }

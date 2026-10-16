@@ -19,7 +19,8 @@
 > `can_id_conflict` 弃号并 `shutdown`；已采纳 id 后自己发出的帧带应答头。`src/bridge.c`
 > （`CONFIG_BRIDGE`）有**桥半**：端口表、`uuid → 端口` 与 `id → 端口` 两张路由表、admin 扇出
 > （上游广播原样下达、下游应答**逐条**上行、不合并）、单设备路径**剥头/加头**；**M1-P2 起**
-> 又加上**端口级命令族**（`SET_PORT_NODEID`/`REQUEST_BOOTLOADER`/`RESTART_DEVICE`/`RESET_PORT`，面向桥自己、无回执，
+> 又加上**端口级命令族**（`SET_PORT_NODEID`/`REQUEST_BOOTLOADER`/`RESTART_DEVICE`/`RESET_PORT`，
+> **T3 起加 `SET_PORT_TUNNEL`**，面向桥自己、无回执，
 > 见下节「端口级命令族」）；**M1-P7 起端口改为配置期由主机声明的 UART 对象**
 > （`config_uart`/`config_bridge_port`，字典表退役），「单设备」由主机下发的 `flags` 运行期告知
 > 而非编译期标志。host 库还有
@@ -122,7 +123,7 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 `MESSAGE_MIN..=MESSAGE_MAX`、或头结构上不可能成立时，按 `FrameStream` 的重同步语义丢弃到
 下一个 `0x7e`。
 
-## 隧道单元：katapult 帧整段作为帧体（主机侧已落地）
+## 隧道单元：katapult 帧整段作为帧体（两侧均已落地）
 
 刷写会话（katapult 协议）要复用同一条共享链路时，katapult 帧**整帧**作为一个单元的帧体传——
 不拆、不改内层一个字节：
@@ -148,6 +149,14 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 - **与固件侧是共享契约**：判据与常量集中在 `serial.rs` 的「The tunnel unit」一节，固件 `mux.c`
   **已按同一判据镜像落地**（`mux_unit_len` 的 `01 88` 分支：子模组提交 `a5ecd95a`，真库测试
   `test_the_mux_tunnel_units_over_the_real_library` 钉住行为；两侧措辞与数字一致，无差异点）。
+- **桥的隧道口（T3，固件 `src/bridge.c`）**：`SET_PORT_TUNNEL (0x06)` 把一个**端口**置成隧道口
+  （幂等 toggle，桥自己消费、不转发下游、无回执，越界/短载荷静默）。置位后该口双向按隧道语义走：
+  **下行**收到路由到本的隧道单元则剥 2 B 头、把 katapult 帧原样字节写端口；**上行**扫端口字节流
+  （`01 88` 起、`frame[3]*4+8` 定长、垃圾逐字节丢），收齐一个整帧就作为一个隧道单元、以
+  `reply_arb_id(port.node_id)` 上行（一次 `mux_send`，不交错）；缓冲上限 = **2×128 B**（整块
+  总能装下）。**前提**：上行要用该口的 `node_id`，而它只由 **legacy 方式**的 `SET_PORT_NODEID`
+  （`flags` 无 `MUX_PORT_UNITS`）记下——刷写目标本来就是不说单元的引导设备，故口径一致；但把口
+  先命名成 UNITS 再开隧道会静默丢掉上行。主机侧 `SET_PORT_TUNNEL` 的常量与发送器属 T5。
 - 黄金字节（两侧测试共用）：Connect `01 88 11 00 f1 7c 99 03`；Send Block（64 B 块、地址
   `0x1000`）`01 88 12 11 00 10 00 00 + 00..3f + da 1e 99 03`；16 B ACK
   `01 88 a0 02 12 00 00 00 00 10 00 00 bc dc 99 03`。
@@ -204,6 +213,7 @@ CAN 侧的同族常量在 `canserial.rs`。
 | `RESTART_DEVICE` | `0x05` | 主机 → 桥 → 单口 | 同上形状，`[0x05][index]`——**重启那台设备的固件**（`mcu_restart()`，即 `reset` 命令的身体），设备自己起来而不是停在引导里 |
 | `SET_PORT_NODEID` | `0x03` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x03][index][id][flags][crc16][0x7e]`（`set_port_node_id(index, id, flags)`，见下节） |
 | `RESET_PORT` | `0x04` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x04][index][crc16][0x7e]`（M1-P2，见下节） |
+| `SET_PORT_TUNNEL` | `0x06` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x06][index][crc16][0x7e]`（**T3**）——把该口置/清为**刷写隧道口**（幂等，见下节与「隧道单元」段） |
 | `NEED_NODEID` | `0x20` | 设备 → 主机 | `[头(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
 
 - uuid **高位字节在前**；应答末尾可带一枚 application 字节：无字节或 `0x01` = Klipper、
@@ -253,6 +263,7 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 | `SET_PORT_NODEID` | `[0x03][index][id][flags]`（4 字节） | 桥建 `id → 端口` 表并记该口 `flags`。`index` 0 起（= 该端口节的**声明顺序**，配置期由 `config_bridge_port` 登记）；`id` = MCU 层 id（`1..=255`，`mux_arb_id(id)!=0`）；`flags` bit0=`MUX_PORT_UNITS`（`0x01`）：置位 = 该口设备**说单元**（收发整单元原样转发）；清零 = **legacy**（下行剥头、上行按该口记的 id 加应答头）；保留位忽略。**幂等**：重复发送 = 覆盖同值；**旧映射不撤销**——同一口改登记为别的 id 后，旧 id 仍路由到该口（`bridge_map_id` 只增不删），想把下游设备改绑到别的口需另行定义 |
 | `REQUEST_BOOTLOADER` / `RESTART_DEVICE` | `[0x02][index]` / `[0x05][index]` | 桥**只**转发到 `index` 口（UNITS 口带头转发、legacy 口剥头转发——legacy 设备的解析器会拒 seq `0x20`，属预期：无 admin 的 legacy 口只能走 `RESET_PORT`），不扇出全体；**但「index 指不到本机任何在用的端口」时不消费、穿透给本机设备半**（`BRIDGE` 是 `default y if MUX_SERIAL` ⇒ 每个 mux 设备自己也是桥构建，而「主机经别的桥找上我」时命令就是该由我执行的）——这正是「单设备 mux 板能被点名重启」的关键：设备半执行 `[0x02]`→`bootloader_request()`（`CONFIG_HAVE_BOOTLOADER_REQUEST` 守卫）、`[0x05]`→`mcu_restart()`，index 字节设备忽略 |
 | `RESET_PORT` | `[0x04][index]` | 桥消费后对 `index` 口做**线级复位**：经 `bridge_port_ops.reset` 钩子（NULL=不支持 → 静默）；host 侧实现为 DTR\|RTS 断言 250 ms 的脉冲（**只对 USB-串口桥接板有效**：原生 USB CDC 板记下控制线状态但不当复位，见 `config.md` 的 `uart_restart_method`），用任务循环 idle 处的 poll 状态机延迟恢复（不阻塞不忙等；pty 等无 modem 线的 fd 返回 -1 静默）；**保持窗内重复发送按已完成处理**（不把此刻已断言的线态当成「原状态」重存，否则释放时恢复断言态、设备被永久按住） |
+| `SET_PORT_TUNNEL` | `[0x06][index]` | 把 `index` 口置/清为**刷写隧道口**（**T3**）：**幂等 toggle**——置位后该口下行剥头直写 katapult 帧、上行把端口字节按隧道规则组单元回 `reply_arb_id(node_id)`；清位恢复常规模式。桥自己消费、**不转发下游**（与 `0x03` 同族）、无回执；短载荷/越界 index 静默丢弃 |
 
 **端口不再上报字典表**（M1-P7 起）：`BRIDGE_PORT_COUNT`/`BRIDGE_PORT<n>_NAME`/`_TYPE`/`_PATH`
 四键已**删除**。端口由**主机在配置期声明**——`config_uart oid=%c baud=%u slot=%c` 建一个 UART 对象（`slot` = 要用哪个端口槽，与下面的 `index` 同源一处计数；该槽没有运行期登记的 tty 时回落库构建期的默认路径），
@@ -279,7 +290,7 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 | 2 | **端口 `index` = 端口节声明顺序**；`config_uart` 的载槽参数 `slot` 与它**一处计数** | `mcu/bridge_ports.rs::wire_bridge_port`、固件 `bridge_add_port` |
 | 3 | `SET_PORT_NODEID` 的 `flags` bit0 = `MUX_PORT_UNITS`（`0x01`）置位 = 该口设备**说单元**；保留位忽略；命令**幂等**；**旧映射不撤销**（`bridge_map_id` 只增不删——同一口改登记别的 id 后旧 id 仍路由到该口） | 固件 `src/bridge.c` |
 | 4 | **桥半对设备命令的穿透规则**：`[0x02]/[0x05][index]` 只有 `index` 指到**本机在用端口**才消费，否则**穿透给本机设备半**——每个 mux 构建自己也是桥构建（`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`），「主机经别的桥找上我」时命令本就该由我执行 | 固件 `src/bridge.c::bridge_admin_unit` |
-| 5 | **面向桥自己的端口级命令族全无回执**（`0x02`/`0x03`/`0x04`/`0x05`）：参数不足/越界**静默丢弃**；确认只有两个手段——**复位后能否重新握手/identify**、连不上就按配置阶段报错。设备级的 `0x00`/`0x01` 不在此列（设备用 `0x20` 应答 / 重确认握手回答） | 命令族表、`mcu/bridge_attach.rs` |
+| 5 | **面向桥自己的端口级命令族全无回执**（`0x02`/`0x03`/`0x04`/`0x05`，**T3 起含 `0x06 SET_PORT_TUNNEL`**）：参数不足/越界**静默丢弃**；确认只有两个手段——**复位后能否重新握手/identify**、连不上就按配置阶段报错。设备级的 `0x00`/`0x01` 不在此列（设备用 `0x20` 应答 / 重确认握手回答） | 命令族表、`mcu/bridge_attach.rs` |
 | 6 | **`0x02` 与 `0x05` 分工**：`0x02 REQUEST_BOOTLOADER` = 请求**进引导**（刷写工具的命令，**不进** `restart_method`；无 bootloader 的板是设计内 no-op）；`0x05 RESTART_DEVICE` = **重启固件本身**（`mcu_restart()`，`restart_method: admin` 走它）。两者都只转发到 `index` 口、不扇出 | 固件 `src/mux.c`、`src/bridge.c` |
 | 7 | **一条链路一个读者、每引用自己的槽**：共享串口与 host 库同构（`SharedSerialPort`/`McuSlot`、`HostLibrary` 的 `Router`）——读者按 `assign::mcu_id_from_arb` 投槽，**无 id 的 admin 单元丢弃**（否则两个活引用会把字节流瓜分、谁都拼不齐帧）；读者**不持**强引用，避免「最后一个 `Drop` 落在读者线程 ⇒ `pthread_join(self)`」 | `devices/serial.rs`、`devices/host.rs` |
 | 8 | **一进程一份 host 库**：配置层按**路径**点名拒绝第二条（两个不同的 `host_library:` 路径），运行期在 `library_for` 最前面再按路径守卫一次（只读既有注册表的 `Weak`，不引入第二个静态表；同路径复用与「先卸 A 再载 B」不受影响）。**为什么**：每份库都覆盖**进程级** `SIGUSR1` handler ⇒ 两份同进程要么跳进已卸载代码（crash）、要么 join 的信号被另一份消费（hang）。要两个固件 → **同一份库的多引用（mux）** 或**独立进程** | `mcu/host_libraries.rs::reject_a_second_path`、`devices/host.rs::refuse_a_second_library` |

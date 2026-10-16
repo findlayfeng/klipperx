@@ -39,7 +39,7 @@
 //! reset each declared port's device takes are the caller's to say
 //! ([`BridgePort`], [`BridgeTarget`]), exactly as [`open_bridge`] documents.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -157,15 +157,35 @@ impl BridgeLink {
     ///
     /// A bridge's link carries its downstream devices' frames too, so its port
     /// is opened shared and addressed by id (`serial::attach`), which also runs
-    /// the assignment handshake. No `uuid` names the board: a flash host has no
-    /// config's uuid to give, and the handshake is the ordinary re-confirmation.
+    /// the assignment handshake. `uuid` is the bridge **board's** own identity,
+    /// for a bridge that carries no node id yet: the assignment goes through
+    /// `SET_NODEID`, and only that segment names an unassigned board — the
+    /// plain re-confirmation a `None` uuid sends is answered by assigned
+    /// devices alone, so an unassigned bridge times out instead (see
+    /// [`BridgeFlashError::UnassignedSerial`]). A bridge that already carries
+    /// an id needs no uuid: the re-confirmation is the ordinary handshake.
     ///
     /// # Errors
+    /// [`BridgeFlashError::UnassignedSerial`] when the handshake timed out with
+    /// no uuid given — the one failure that has an actionable answer — and
     /// [`BridgeFlashError::Open`] when the port cannot be opened, `mcu_id` is
-    /// outside the addressable range, or the handshake times out or is refused.
-    pub fn open_serial(path: &Path, baud: u32, mcu_id: u32) -> Result<Self, BridgeFlashError> {
-        let handle = serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, None)
-            .map_err(BridgeFlashError::Open)?;
+    /// outside the addressable range, or the handshake times out or is refused
+    /// with a uuid given.
+    pub fn open_serial(
+        path: &Path,
+        baud: u32,
+        mcu_id: u32,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<Self, BridgeFlashError> {
+        let handle = serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, uuid).map_err(
+            |e| match (uuid, e) {
+                (None, InterfaceError::Timeout) => BridgeFlashError::UnassignedSerial {
+                    path: path.to_path_buf(),
+                    baud,
+                },
+                (_, e) => BridgeFlashError::Open(e),
+            },
+        )?;
         let link = Interface::shared_serial(Arc::clone(&handle));
         Ok(Self::assemble(link.clone(), BridgeDevice::Shared(handle)))
     }
@@ -268,6 +288,17 @@ impl BridgeLink {
 pub enum BridgeFlashError {
     /// The bridge's device could not be opened or attached.
     Open(InterfaceError),
+    /// A **serial** bridge never answered the assignment handshake and no
+    /// `--bridge-uuid` named it: without an identity the host can only send the
+    /// re-confirmation request, which an unassigned board does not answer (see
+    /// [`BridgeLink::open_serial`]) — so a silent line is unassigned or absent,
+    /// and only the caller can tell.
+    UnassignedSerial {
+        /// The tty the handshake went out on.
+        path: PathBuf,
+        /// The line speed it opened at.
+        baud: u32,
+    },
     /// The identify handshake failed — no dictionary, so no declaration.
     Identify(McuError),
     /// [`open_bridge`] refused or failed a step.
@@ -287,6 +318,13 @@ impl fmt::Display for BridgeFlashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BridgeFlashError::Open(e) => write!(f, "opening the bridge: {e}"),
+            BridgeFlashError::UnassignedSerial { path, baud } => write!(
+                f,
+                "opening the bridge: {} at {baud} baud did not answer; if the bridge has no \
+                 node id yet it needs --bridge-uuid (take it from `klipperx scan --port {}`)",
+                path.display(),
+                path.display()
+            ),
             BridgeFlashError::Identify(e) => write!(f, "identifying the bridge: {e}"),
             BridgeFlashError::Bridge(e) => write!(f, "opening the bridge port: {e}"),
             BridgeFlashError::Session(e) => write!(f, "flashing: {e}"),
@@ -306,7 +344,9 @@ impl std::error::Error for BridgeFlashError {
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
-            BridgeFlashError::Unaddressable { .. } => None,
+            BridgeFlashError::Unaddressable { .. } | BridgeFlashError::UnassignedSerial { .. } => {
+                None
+            }
         }
     }
 }
@@ -570,5 +610,31 @@ mod tests {
         link.close();
         drop(link);
         wait_for_library_unload(&library);
+    }
+
+    /// A serial bridge that never answers is reported as an **unassigned**
+    /// link, naming the flag that fixes it: the bare serial layer's
+    /// "Receive timeout" leaves the caller with nothing to act on.
+    ///
+    /// The pty is the silent bridge: nothing on its far end answers the
+    /// handshake, which is exactly what an unassigned board does — an assigned
+    /// one would answer the re-confirmation `uuid: None` sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_silent_serial_bridge_is_reported_as_unassigned() {
+        let pty = Pty::new();
+        let err = match BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, None) {
+            Ok(_) => panic!("nothing answers on this pty, so the attach has to fail"),
+            Err(e) => e,
+        };
+        let text = err.to_string();
+        assert!(
+            matches!(
+                err,
+                BridgeFlashError::UnassignedSerial { baud: 250_000, .. }
+            ),
+            "{text}"
+        );
+        assert!(text.contains("--bridge-uuid"), "{text}");
+        assert!(text.contains("klipperx scan --port"), "{text}");
     }
 }

@@ -1,7 +1,7 @@
 # Katapult 拓扑刷写：动工前调查、决策与任务拆分（2026-10-16）
 
-> 状态：**T1、T4a、T2a、T4b 四单元已验收，闸门全绿**；余 T2b（固件 mux.c 半）、T3（桥隧道）、
-> T5（拓扑流程）排队；真机测试等接线形态确认。四支任务分支待 `ff`。
+> 状态：**五单元全部验收（T1/T4a/T2a/T4b/T2b），闸门全绿**；余 T3（桥隧道）、T5（拓扑流程）；
+> 真机测试等接线形态确认。合并时需先合子模组分支再更新 gitlink（见 §8 T2b 条）。
 > 规格缺口先查 §8 附录（三路侦察全文，file:line 级）。
 > 本篇是一次性调查记录（非规范）；实现落地后按 work-log 惯例补「实施记录」节。
 
@@ -117,6 +117,15 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 5. 工具重试节拍取自 flashtool（5 次 / 2s），隧道增加了桥转发延迟，上限值需在 T5 实测调。
 
 ## 8. 实施记录（随实现回填，本节是唯一随实现更新的节）
+
+**2026-10-16 T2b（固件 mux.c 半 + 真库测试）完成**：固件子模组分支 `agents/feat-mux-tunnel-unit`
+（klipper 仓库 @ `a5ecd95a`，`src/mux.c` +35/-0：`mux_unit_len` 的 `01 88` 分支与 5 个宏，英文前缀提交）；
+主仓分支 `agents/test-mux-tunnel-fw`（`b16e646` 真库测试 + `3b8b3e2` 手册）。新测
+`test_the_mux_tunnel_units_over_the_real_library` 三次运行均 1 passed/1.91s；既有 mux 过滤 87/87
+（串行）；`KLIPPERX_KLIPPER_DIR=<固件 worktree>` 前缀下 `--workspace` rc=0；fmt 干净、build 0 告警。
+两侧契约无差异点（判据/长度界/不查内层/黄金向量四处同述）。**合并编排**：需先在子模组仓把
+`agents/feat-mux-tunnel-unit` 合入其 `klipperx` 分支，再主仓更新 gitlink，然后主仓分支才能用默认路径过闸门。
+执行记录：首棒 steer 后固件按点提交，但 7 次 content_filter 拖到验收步超时；fresh 收尾棒 4 步闭合。
 
 **2026-10-16 T4b（直连绑定 + 独立 bin）完成**：分支 `agents/feat-katapult-flash-direct`（链式基于 T4a 分支，再 6 提交：`a1d8b68` 骨架+传输层、`a6baa6a` prime 勘误+拆函数、`69090b1` tty pty 端到端、`8ebc558` CAN 数据报夹具、`25a3a5f` CLI 补测、`1701feb` 手册）。flash 模块 **54 测**（frame 15/tests 8/cli 22/transport 9），窄跑 58/58 两次，`--all-targets` 0 告警，`--workspace` rc=0。**执行记录**：三棒才收口——第一棒 content_filter 误杀零产出、第二棒超时但留下首提交、第三棒 fresh context 收口；prime 帧字节序勘误（CRC 值 0xE9E5 **按 LE 上线 = `e5 e9`**，早期把数值渲染当了线上字节）；`CLEAR_NODE_ID` 是单字节帧（不是 8 字节补零）。**评估结论**：不挂 `klipperx flash` 子命令（独立 bin 自包含已可用，CLI 形状属产品决策另议）。真机 CAN/串口未验，已入 `TESTING.md` 范围外真板项。
 

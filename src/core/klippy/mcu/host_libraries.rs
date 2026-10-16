@@ -47,13 +47,12 @@
 //! names the board the bridge routes to), else the path's own identity (the
 //! bridge's own device, which only the host knows).
 //!
-//! One more rule is enforced here, whole-config rather than per path: a config
-//! may name **one** `host_library:` path, never two. A klipper host library
-//! stops its main loop with a process-wide `SIGUSR1` handler that every library
-//! installs over the last one, so two live libraries in one process crash or
-//! hang on the way out ([`HostLibraries::reject_a_second_path`]); several
-//! sections on the one path are one library and stay allowed. [`validate`] is
-//! what turns that into a load-time error.
+//! A config may name **several** `host_library:` paths: each is a separate
+//! firmware image, and klipper runs the images side by side in one process —
+//! each library ends its loop through its own instance's wake fd, so nothing
+//! refuses a second path (`interface/devices/host.rs`). Several sections on the
+//! **one** path are still one library; [`validate`] is what turns a path whose
+//! sections cannot be told apart into a load-time error.
 //!
 //! Like [`SerialPorts::classify`](super::serial_ports::SerialPorts), this is a
 //! pre-scan: it reads a sibling section's raw option text
@@ -215,35 +214,6 @@ impl HostLibraries {
         let group = self.by_path.get(path)?;
         Some(declared.unwrap_or(group.identity))
     }
-
-    /// Reject a config that names more than one `host_library:` path.
-    ///
-    /// A process holds **one** host library: klipper stops its main loop with a
-    /// process-wide `SIGUSR1` handler that each library installs over the last
-    /// one (`third_party/klipper/src/host/host.c`), so two live libraries in one
-    /// process meet either a jump into unloaded code when the first is dropped
-    /// (SIGSEGV) or a join whose signal another library consumed (a hang). Two
-    /// paths are therefore a config error **naming both**; one path that several
-    /// sections name — a mux, or a bridge's downstream references — is **one**
-    /// library and stays allowed.
-    ///
-    /// # Errors
-    /// A config whose `[mcu]` sections name two or more different paths.
-    fn reject_a_second_path(&self) -> Result<(), ConfigError> {
-        if self.by_path.len() < 2 {
-            return Ok(());
-        }
-        let paths: Vec<&str> = self.by_path.keys().map(String::as_str).collect();
-        Err(ConfigError::new(format!(
-            "host library: one host library per process, but the config names {}. klipper \
-             stops its main loop through a process-wide SIGUSR1 handler that each library \
-             installs over the last one, so two libraries in one process meet either a jump \
-             into unloaded code (a crash) or a join whose signal another library consumed (a \
-             hang); name one path from several sections, or run the firmware images in \
-             separate processes",
-            quoted(&paths)
-        )))
-    }
 }
 
 impl PrinterObject for HostLibraries {
@@ -259,8 +229,7 @@ impl PrinterObject for HostLibraries {
     }
 }
 
-/// Reject a `host_library:` path whose MCUs cannot be told apart, and a config
-/// naming more than one `host_library:` path.
+/// Reject a `host_library:` path whose MCUs cannot be told apart.
 ///
 /// The parse layer (`config/mcu.rs`) calls this as it parses each host section,
 /// so a conflict is a config error and the config fails to load — the same place
@@ -269,10 +238,9 @@ impl PrinterObject for HostLibraries {
 /// does and keeps only the verdict; each host section's parse calls it once.
 ///
 /// # Errors
-/// As [`HostLibraries::classify`], and a config whose sections name two or more
-/// different paths ([`HostLibraries::reject_a_second_path`]).
+/// As [`HostLibraries::classify`].
 pub fn validate(config: &ConfigWrapper) -> Result<(), ConfigError> {
-    HostLibraries::classify(config)?.reject_a_second_path()
+    HostLibraries::classify(config).map(|_| ())
 }
 
 /// The single classification, created on first demand.
@@ -607,10 +575,11 @@ mod tests {
         assert!(validate(&wrapper).is_err());
     }
 
-    /// A config naming two different `host_library:` paths is refused, and the
-    /// message names both and says why: a process holds one host library.
+    /// A config naming two different `host_library:` paths parses: each path is
+    /// a separate image, and klipper runs the images side by side in one
+    /// process.
     #[test]
-    fn validate_rejects_a_second_host_library_path() {
+    fn validate_allows_a_second_host_library_path() {
         let (config, _) = Config::from_text(
             "[mcu]\nhost_library: /lib/one.so\n\
              [mcu tool]\nhost_library: /lib/two.so\n",
@@ -618,11 +587,7 @@ mod tests {
         .expect("the test config parses");
         let section = config.get_section("mcu").expect("the bare [mcu]");
         let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
-        let err = validate(&wrapper).unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("one host library per process"), "{text}");
-        assert!(text.contains("'/lib/one.so'"), "{text}");
-        assert!(text.contains("'/lib/two.so'"), "{text}");
+        validate(&wrapper).expect("two different paths are not a conflict");
     }
 
     /// The scan records no reads: it must not exempt a sibling `[mcu]` section's

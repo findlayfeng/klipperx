@@ -21,19 +21,22 @@
 //!   frames in a stream, skipping garbage one byte at a time.
 //! - [`session`] — the transport-agnostic flash session: connect →
 //!   send_block × N → eof → verify → complete, over any `Read + Write`.
+//! - [`bridge`] — the `Read + Write` face of one bridge flashing tunnel:
+//!   whole katapult blocks through a bridge port in tunnel mode.
 //! - [`transport`] — the two direct byte streams: an exclusive serial
 //!   tty/USB link and a SocketCAN node session.
 //! - [`cli`] — the standalone `flash` binary's arguments and actions.
 //! - `fake` (tests only) — the in-process scripted bootloader the session
 //!   scenarios run against.
 
+pub mod bridge;
 pub mod cli;
 pub mod frame;
 pub mod session;
 pub mod transport;
 
 #[cfg(test)]
-mod fake;
+pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 

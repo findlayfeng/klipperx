@@ -2,3 +2,7 @@
 	path = third_party/klipper
 	url = https://github.com/findlayfeng/klipper.git
 	branch = klipperx
+[submodule "third_party/katapult"]
+	path = third_party/katapult
+	url = https://github.com/findlayfeng/katapult.git
+	branch = klipperx

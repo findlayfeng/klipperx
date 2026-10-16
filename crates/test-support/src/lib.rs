@@ -18,10 +18,36 @@
 /// The path is read per call rather than cached, so a test that wants to point
 /// at another checkout only has to set the variable before the call.
 pub fn klipper_dir() -> std::path::PathBuf {
-    let override_dir = std::env::var_os("KLIPPERX_KLIPPER_DIR").filter(|dir| !dir.is_empty());
-    match override_dir {
+    checkout_dir("KLIPPERX_KLIPPER_DIR", "third_party/klipper")
+}
+
+/// Absolute path to the katapult checkout: the bootloader protocol
+/// (`protocol.md`), its firmware sources, and `scripts/flashtool.py`.
+///
+/// `KLIPPERX_KATAPULT_DIR` overrides the in-tree submodule location with the
+/// same contract as `KLIPPERX_KLIPPER_DIR`: a git worktree carries no
+/// submodules, so it points this at the main checkout's `third_party/katapult`
+/// instead of copying one. The path is read per call rather than cached.
+pub fn katapult_dir() -> std::path::PathBuf {
+    checkout_dir("KLIPPERX_KATAPULT_DIR", "third_party/katapult")
+}
+
+/// One submodule checkout, resolved the way both [`klipper_dir`] and
+/// [`katapult_dir`] resolve it: the override in `env_var` when it is set to a
+/// non-empty value, otherwise `relative` under the repository root.
+fn checkout_dir(env_var: &str, relative: &str) -> std::path::PathBuf {
+    resolve_checkout(std::env::var_os(env_var), relative)
+}
+
+/// [`checkout_dir`] with the environment read already done, so the resolution
+/// itself is testable without mutating process-wide state.
+fn resolve_checkout(
+    override_dir: Option<std::ffi::OsString>,
+    relative: &str,
+) -> std::path::PathBuf {
+    match override_dir.filter(|dir| !dir.is_empty()) {
         Some(dir) => std::path::PathBuf::from(dir),
-        None => workspace_root().join("third_party/klipper"),
+        None => workspace_root().join(relative),
     }
 }
 
@@ -117,3 +143,31 @@ pub fn linux_mux_firmware_path() -> std::path::PathBuf {
 /// The linux firmware process fixture (spawn / reap, see [`LinuxFirmware`]).
 pub mod linux_firmware;
 pub use linux_firmware::LinuxFirmware;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The resolution contract both submodule checkouts share: a non-empty
+    /// override wins, anything else falls back to the in-tree submodule — the
+    /// default a git worktree (submodules not populated) starts from before it
+    /// points the variable at the main checkout.
+    #[test]
+    fn checkout_override_wins_and_the_in_tree_submodule_is_the_default() {
+        let default = workspace_root().join("third_party/katapult");
+        assert_eq!(resolve_checkout(None, "third_party/katapult"), default);
+        assert_eq!(
+            resolve_checkout(Some(std::ffi::OsString::new()), "third_party/katapult"),
+            default
+        );
+        assert_eq!(
+            resolve_checkout(
+                Some(std::ffi::OsString::from(
+                    "/tmp/main-checkout/third_party/katapult"
+                )),
+                "third_party/katapult"
+            ),
+            std::path::PathBuf::from("/tmp/main-checkout/third_party/katapult")
+        );
+    }
+}

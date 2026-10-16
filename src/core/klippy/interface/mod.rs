@@ -370,6 +370,49 @@ impl Interface {
         }
     }
 
+    /// Toggle the flashing tunnel of bridge port `index`
+    /// ([`CMD_SET_PORT_TUNNEL`](devices::serial::CMD_SET_PORT_TUNNEL)).
+    ///
+    /// What a **flashing tool** turns on for the port a device in its bootloader
+    /// sits behind: in tunnel mode the port carries a katapult raw byte stream
+    /// rather than units. The bridge flips its own port state and consumes the
+    /// command — nothing is forwarded downstream and there is no receipt — so a
+    /// repeat flips the mode back and the caller tracks the state it asked for.
+    /// Like `SET_PORT_NODEID` the command travels the bridge's admin channel, so
+    /// only a link that carries port mux units does: a shared serial port, a
+    /// muxed host library, or a can-serial CAN link (an ISO-TP link carries
+    /// blocks, not mux units).
+    ///
+    /// # Errors
+    /// The device's own error, or [`InterfaceError::Other`] when this interface
+    /// is not a bridge link.
+    // The end-to-end caller lands with T5d-2 (the bridge session doing its work
+    // over `Mcu` + `Interface`); remove this allowance once it is wired.
+    #[allow(dead_code)]
+    pub(crate) fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
+        match &self.transport {
+            Transport::SharedSerial(handle) => handle.send_set_port_tunnel(index),
+            Transport::CanSerial(device) => device.send_set_port_tunnel(index),
+            Transport::Host(device) => {
+                if !device.is_mux() {
+                    return Err(InterfaceError::Other(
+                        "SET_PORT_TUNNEL needs a link that carries port mux units (a shared \
+                         serial port, a muxed host library, or a can-serial link); this host \
+                         library reference has no mux, so no bridge is listening"
+                            .to_string(),
+                    ));
+                }
+                device.send_set_port_tunnel(index)
+            }
+            _ => Err(InterfaceError::Other(
+                "SET_PORT_TUNNEL needs a link that carries port mux units (a shared serial \
+                 port, a muxed host library, or a can-serial link); this interface is not one \
+                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Create an interface running klipper's host library from `path` on a path
     /// the config says is muxed: the library is given `mux`'s identity and the
     /// reference is attached under `mcu_id` ([`HostDevice::load_mux`]), so its
@@ -659,11 +702,58 @@ mod tests {
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::devices::isotp::read_wire_on;
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE, MUX_PORT_UNITS,
+        admin_unit, attach_downstream, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE,
+        CMD_SET_PORT_TUNNEL, DEFAULT_BAUD, MUX_PORT_UNITS,
     };
+    use crate::core::klippy::interface::pty::Pty;
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::time::{Duration, Instant};
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
+    }
+
+    /// Read exactly `want` bytes from the pty master within `window`; a sender
+    /// that writes nothing fails on the expired window instead of blocking the
+    /// test.
+    fn read_master_n(master: &std::fs::File, want: usize, window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut master = master;
+        let mut out = Vec::with_capacity(want);
+        let mut buf = [0u8; 64];
+        while out.len() < want {
+            let now = Instant::now();
+            assert!(
+                now < deadline,
+                "only {} of {want} bytes arrived within {window:?}",
+                out.len()
+            );
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    deadline.saturating_duration_since(now).as_millis() as i32,
+                )
+            };
+            assert!(
+                rc >= 0,
+                "polling the pty master: {}",
+                std::io::Error::last_os_error()
+            );
+            if rc == 0 {
+                continue;
+            }
+            let read = master.read(&mut buf).expect("pty master read");
+            assert_ne!(read, 0, "the pty closed before {want} bytes arrived");
+            out.extend_from_slice(&buf[..read]);
+        }
+        out
     }
 
     #[tokio::test]
@@ -914,6 +1004,72 @@ mod tests {
         );
     }
 
+    /// The tunnel toggle reaches the device's own sender through the interface:
+    /// `send_set_port_tunnel(3)` on a can-serial link writes exactly the bytes
+    /// the device-side sender does — the dispatch adds nothing of its own.
+    #[tokio::test]
+    async fn test_the_tunnel_toggle_dispatches_to_the_device_sender() {
+        let (device, mut wire) = CanSerialDevice::test_wire(3);
+        let interface = Interface::with_transport(Transport::CanSerial(Arc::new(device)));
+        interface.send_set_port_tunnel(3).unwrap();
+
+        let (direct, mut direct_wire) = CanSerialDevice::test_wire(3);
+        direct.send_set_port_tunnel(3).unwrap();
+
+        let through_interface: Vec<u8> = read_wire(&mut wire)
+            .iter()
+            .flat_map(|frame| frame.data().to_vec())
+            .collect();
+        let from_the_device: Vec<u8> = read_wire(&mut direct_wire)
+            .iter()
+            .flat_map(|frame| frame.data().to_vec())
+            .collect();
+        assert_eq!(
+            through_interface, from_the_device,
+            "the interface dispatch is byte for byte the device sender's"
+        );
+    }
+
+    /// A shared serial port carries the toggle too: the dispatch writes the
+    /// port's admin unit, byte for byte.
+    #[tokio::test]
+    async fn test_a_shared_port_carries_the_tunnel_toggle() {
+        let pty = Pty::new();
+        let handle =
+            attach_downstream(&pty.path, DEFAULT_BAUD, 3).expect("a downstream attach opens");
+        let interface = Interface::shared_serial(handle);
+        interface.send_set_port_tunnel(3).unwrap();
+
+        let unit = admin_unit(&[CMD_SET_PORT_TUNNEL, 3]);
+        let written = read_master_n(&pty.master, unit.len(), Duration::from_secs(5));
+        assert_eq!(written, unit, "the admin unit, byte for byte");
+    }
+
+    /// A host library reference that is **not** muxed has no admin channel, so
+    /// the Host arm refuses the toggle with its own wording — nothing is written
+    /// on the library.
+    #[tokio::test]
+    async fn test_a_non_mux_host_library_has_no_tunnel_command() {
+        // One live host library per process: the same lock every host-library
+        // test takes, so this load does not race theirs.
+        let _serial = crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let device = HostDevice::load_bytes(klipperx_test_support::klipper_host_lib_path(), None)
+            .expect("the test host library loads");
+        let interface = Interface::from_host(Arc::new(device));
+
+        assert_eq!(
+            interface.send_set_port_tunnel(3).unwrap_err(),
+            InterfaceError::Other(
+                "SET_PORT_TUNNEL needs a link that carries port mux units (a shared serial \
+                 port, a muxed host library, or a can-serial link); this host library \
+                 reference has no mux, so no bridge is listening"
+                    .to_string()
+            )
+        );
+    }
+
     /// An ISO-TP link is wired into the interface like every other transport: a
     /// send reaches the socket, and a shutdown is what ends a receive with
     /// nothing to return. Measured off the wire the device writes.
@@ -936,9 +1092,9 @@ mod tests {
         assert_eq!(interface.receive().await, None);
     }
 
-    /// The three bridge commands travel a bridge's admin channel; an interface
-    /// with no such link says so (`_` arm of each `send_*`) instead of writing a
-    /// unit nobody listens to — the message is asserted verbatim.
+    /// The bridge commands travel a bridge's admin channel; an interface with no
+    /// such link says so (`_` arm of each `send_*`) instead of writing a unit
+    /// nobody listens to — the message is asserted verbatim.
     ///
     /// A can-serial CAN link is one of the links that do carry them (its node is
     /// the bridge, see [`test_a_can_link_carries_the_bridge_commands`]), so this
@@ -974,6 +1130,15 @@ mod tests {
                 "RESET_PORT needs a link that carries port mux units (a shared serial port, a \
                  muxed host library, or a can-serial link); this interface is not one — an \
                  ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            interface.send_set_port_tunnel(1).unwrap_err(),
+            InterfaceError::Other(
+                "SET_PORT_TUNNEL needs a link that carries port mux units (a shared serial \
+                 port, a muxed host library, or a can-serial link); this interface is not one \
+                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string()
             )
         );

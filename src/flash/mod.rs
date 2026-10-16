@@ -17,7 +17,7 @@
 //! two codecs are not interchangeable and share no helpers.
 //!
 //! Modules:
-//! - [`bridge`] — the bridge half of a flash run: declare a bridge's
+//! - [`bridge_session`] — the bridge half of a flash run: declare a bridge's
 //!   downstream ports, reset their devices, and open the flashing tunnel on
 //!   the target's port.
 //! - [`frame`] — pure encode/decode plus a sliding-window scanner that finds
@@ -33,6 +33,7 @@
 //!   scenarios run against.
 
 pub mod bridge;
+pub mod bridge_session;
 pub mod cli;
 pub mod frame;
 pub mod session;
@@ -43,7 +44,7 @@ pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
-pub use bridge::{
+pub use bridge_session::{
     open_bridge, BridgeError, BridgeLink, BridgePort, BridgeReady, BridgeTarget, PortReset,
 };
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};

@@ -87,12 +87,12 @@ pub const CAN_FD_DATA_BYTES: usize = 64;
 
 /// Size of the kernel's `struct can_frame`, which is what a classical raw socket
 /// reads and writes one datagram at a time.
-const CAN_FRAME_SIZE: usize = 16;
+pub(crate) const CAN_FRAME_SIZE: usize = 16;
 
 /// Size of the kernel's `struct canfd_frame`: four bytes of header, then 64 data
 /// bytes. Its `len` sits at the same offset 4 and its data at the same offset 8 as
 /// the classical struct's, so one layout serves both and only the length differs.
-const CAN_FD_FRAME_SIZE: usize = 72;
+pub(crate) const CAN_FD_FRAME_SIZE: usize = 72;
 
 /// Klipper's admin arbitration id, and the commands and answers that travel on
 /// it (`klippy/serialhdl.py`, `src/generic/canserial.c`): the one that tells an
@@ -184,14 +184,14 @@ impl CanWire {
 /// bytes is what stops a classical frame from leaving as 72 bytes, which the kernel
 /// would read back as a CAN FD frame.
 #[derive(Debug)]
-struct AbiFrame {
+pub(crate) struct AbiFrame {
     wire: CanWire,
     bytes: [u8; CAN_FD_FRAME_SIZE],
 }
 
 impl AbiFrame {
     /// The datagram: `wire`'s own number of bytes.
-    fn as_bytes(&self) -> &[u8] {
+    pub(crate) fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.wire.frame_size()]
     }
 }
@@ -245,7 +245,7 @@ impl CanFrame {
     /// A frame whose data does not fit `wire` has no such layout, its length byte
     /// being unable to describe it, and is refused rather than truncated or padded.
     /// This is where the two layouts are kept from crossing.
-    fn to_abi(self, wire: CanWire) -> Result<AbiFrame, InterfaceError> {
+    pub(crate) fn to_abi(self, wire: CanWire) -> Result<AbiFrame, InterfaceError> {
         if self.len as usize > wire.data_bytes() {
             return Err(InterfaceError::Other(format!(
                 "{} bytes do not fit a {} frame",
@@ -262,7 +262,7 @@ impl CanFrame {
 
     /// Parse the kernel's layout for `wire`. Ids longer than 11 bits are extended
     /// frames, which nothing here uses.
-    fn from_abi(wire: CanWire, raw: &[u8; CAN_FD_FRAME_SIZE]) -> Self {
+    pub(crate) fn from_abi(wire: CanWire, raw: &[u8; CAN_FD_FRAME_SIZE]) -> Self {
         let id = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]) & CAN_SFF_MASK;
         let len = raw[4].min(wire.data_bytes() as u8);
         let mut data = [0u8; CAN_FD_DATA_BYTES];
@@ -1123,7 +1123,7 @@ impl AdminBus for CanbusAdminSocket {
 }
 
 /// What a `poll` on the socket said.
-enum Wait {
+pub(crate) enum Wait {
     Readable,
     Timeout,
     Closed,
@@ -1135,7 +1135,7 @@ enum Wait {
 /// `poll` counts in whole milliseconds, so a timeout shorter than one waits that
 /// millisecond rather than spinning on a zero timeout; one longer than a `c_int`
 /// can hold is capped, which only a caller asking for tens of days would reach.
-fn wait_readable(fd: RawFd, timeout: Duration) -> Wait {
+pub(crate) fn wait_readable(fd: RawFd, timeout: Duration) -> Wait {
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -1166,7 +1166,7 @@ fn wait_readable(fd: RawFd, timeout: Duration) -> Wait {
 }
 
 /// The interface index of `interface`, or an error naming it.
-fn interface_index(interface: &str) -> Result<libc::c_uint, InterfaceError> {
+pub(crate) fn interface_index(interface: &str) -> Result<libc::c_uint, InterfaceError> {
     let name = CString::new(interface)
         .map_err(|_| InterfaceError::Other(format!("invalid CAN interface '{interface}'")))?;
     // SAFETY: `name` is a NUL-terminated interface name.
@@ -1182,7 +1182,7 @@ fn interface_index(interface: &str) -> Result<libc::c_uint, InterfaceError> {
 
 /// Create a raw CAN socket, CAN FD datagrams enabled when `wire` is
 /// [`CanWire::Fd`].
-fn open_socket(wire: CanWire) -> Result<File, InterfaceError> {
+pub(crate) fn open_socket(wire: CanWire) -> Result<File, InterfaceError> {
     // SAFETY: a plain socket(2) call; the returned descriptor is checked and then
     // owned by the `File` below.
     let fd = unsafe { libc::socket(libc::AF_CAN, libc::SOCK_RAW, CAN_RAW) };
@@ -1231,7 +1231,7 @@ fn enable_fd_frames(socket: &File) -> Result<(), InterfaceError> {
 }
 
 /// Bind the socket to one CAN interface.
-fn bind_interface(socket: &File, index: libc::c_uint) -> Result<(), InterfaceError> {
+pub(crate) fn bind_interface(socket: &File, index: libc::c_uint) -> Result<(), InterfaceError> {
     let address = SockAddrCan {
         can_family: libc::AF_CAN as libc::sa_family_t,
         can_ifindex: index as libc::c_int,

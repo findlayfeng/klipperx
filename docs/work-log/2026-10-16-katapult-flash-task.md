@@ -330,6 +330,24 @@ T5c 与 T5-tool 已于 2026-10-16 并行派出；**T5b′ 等其中之一落地�
 号由 `SET_NODEID`/`SET_PORT_NODEID` 发放（桥先于下游：上游 MCU 先 attach，下游端口随桥接上）。
 **待确认的 API 缺口**：`Printer` 目前没有「遍历各 MCU/端口」的公开读口（T5b 需要它来做全拓扑复位）。
 
+**2026-10-16 T5c（隧道数据通路）与 T5b′（桥会话）验收并合入**：
+- **T5c**：三条链路加**按 arb 的隧道投递口**（`TunnelSink::channel()`/`set_tunnel_sink`/`clear_tunnel_sink`；
+  未注册仍 debug 丢弃、接收端死后自动注销），补上了 T2a 留的洞；`src/flash/bridge.rs` 新增
+  `TunnelLink`/`TunnelBridge::split()` → `TunnelReader`/`TunnelWriter`；真库端到端
+  `test_the_tunnel_flash_session_over_the_real_library`（真库当桥 + pty 当口 + `flash::fake`，钒住 pty 上
+  会话帧逐字节拼接含 76 B Send Block 整帧、上行成 `reply_arb_id(7)` 单单元）。验收：e2e 两次绿；
+  `host_tests` **18**（零回归）；`--workspace` rc=0；fmt 净；删除项仅 import 重排与旧 debug 丢弃块。
+- **T5b′**：`open_bridge(link, parser, ports, target)` 按固件顺序跑前半段：声明口（`allocate_oids 2n`
+  + 每口 `config_uart`/`config_bridge_port` **交错**）→ 逐口复位（`PortReset` 显式参数）→ 目标口
+  `SET_PORT_NODEID`（**legacy flags=0** 硬要求）+ `SET_PORT_TUNNEL`；`BridgeLink: Device` 已有
+  `HostDevice`/`SharedSerialHandle` 两实现（CAN 留给后续）。验收：`flash::bridge*` **7** 测两次绿；
+  `flash` 过滤 **66**；`--workspace` rc=0。**合并冲突消解**：两分支各自新建 `src/flash/bridge.rs`——
+  保留 T5c 的（已入手册），T5b′ 的移到 `src/flash/bridge_session.rs`，`mod.rs` 注册两个模块。
+- **T5b′ 报的 API 缺口与 main 裁决**：`open_bridge` 要现成链路句柄，而生产侧只有 `Interface`
+  （`Transport` 私有、无取句柄 accessor，`Interface` 也没有 `send_set_port_tunnel` 的 dispatch）。
+  **裁决：不阻塞、不补缝**——T5 流程里工具**自己开链路**（直接拿 `SharedSerialHandle`/`HostDevice`），
+  不从 `Interface` 里捣句柄；若日后要让 host 自身发起刷写，再补不迟。
+
 ## 9. 附录：三路侦察全文（2026-10-16，只读侦察，file:line 级）
 
 - 附录A：katapult 协议与传输层规格（`~/project/katapult`）

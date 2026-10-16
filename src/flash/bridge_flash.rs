@@ -1220,9 +1220,11 @@ mod tests {
 
         let text = err.to_string();
         assert!(matches!(err, BridgeFlashError::Shutdown { .. }), "{text}");
-        assert!(
-            text.contains("the UART device could not be opened"),
-            "the firmware's own reason is in the error: {text}"
+        assert_eq!(
+            text,
+            "the bridge's firmware shut down: config_uart: the UART device could not be \
+             opened",
+            "the error carries the firmware's own reason"
         );
 
         link.close();

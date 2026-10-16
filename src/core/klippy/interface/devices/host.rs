@@ -2352,6 +2352,227 @@ mod host_tests {
         wait_for_unload_blocking(&mux_library_path());
     }
 
+    /// Golden vector 1 — a katapult Connect request: 8 bytes, word count 0.
+    ///
+    /// Byte-for-byte shared with the host's tunnel tests (`serial.rs`) and
+    /// with the firmware's mirror of the rule in
+    /// `third_party/klipper/src/mux.c`: tag, command, word count, inner CRC,
+    /// trailer.
+    const TUNNEL_CONNECT: [u8; 8] = [0x01, 0x88, 0x11, 0x00, 0xf1, 0x7c, 0x99, 0x03];
+
+    /// Golden vector 2 — a Send Block request: 76 bytes, word count 17,
+    /// carrying a 64-byte block at address `0x1000`. One block, one unit,
+    /// never split.
+    const TUNNEL_SEND_BLOCK: [u8; 76] = [
+        0x01, 0x88, 0x12, 0x11, // tag, command, word count 17
+        0x00, 0x10, 0x00, 0x00, // block address (little-endian)
+        // the 64-byte block, bytes 0x00..=0x3f:
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
+        0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+        0x3c, 0x3d, 0x3e, 0x3f, 0xda, 0x1e, 0x99, 0x03, // inner CRC (little-endian), trailer
+    ];
+
+    /// Golden vector 3 — the device's ACK for that block: 16 bytes, word
+    /// count 2 — the device→host direction, headed like any other unit.
+    const TUNNEL_ACK: [u8; 16] = [
+        0x01, 0x88, 0xa0, 0x02, // tag, response, word count 2
+        0x12, 0x00, 0x00, 0x00, // acknowledged command
+        0x00, 0x10, 0x00, 0x00, // block address (little-endian)
+        0xbc, 0xdc, 0x99, 0x03, // inner CRC (little-endian), trailer
+    ];
+
+    /// Read units for at most `window`, skipping the parser's empty ack/nak
+    /// frames, until a discovery answer arrives.
+    ///
+    /// Every step that puts something in front of an ordinary unit stakes its
+    /// claim the same way: if the bytes in front were not consumed whole (or
+    /// were dropped into the parser), the query behind them never gets this
+    /// answer and the wait panics.
+    fn scan_answer_within(
+        device: &mut HostDevice,
+        pending: &mut Vec<u8>,
+        window: Duration,
+    ) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("an ordinary unit behind these bytes must still be answered");
+            }
+            let Some(unit) = read_unit(device, pending, deadline - now) else {
+                continue; // nothing whole yet: read again inside the window
+            };
+            if UnassignedNode::from_unit(&unit).is_some() {
+                return unit;
+            }
+        }
+    }
+
+    /// One junk flavour against a freshly loaded library: a header, `junk`,
+    /// the SYNC the parser resynchronises on, and an ordinary query behind it
+    /// — every unit the device wrote for that wire, in order, up to and
+    /// including the answer to the query.
+    ///
+    /// The library is loaded and unloaded here so both flavours run against
+    /// pristine statics: the parser's `sync_state` and sequence byte are the
+    /// same at the start of each run, so their outputs can be compared byte
+    /// for byte by the caller.
+    fn junk_roundtrip(identity: &[u8; 6], junk: &[u8], window: Duration) -> Vec<u8> {
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(*identity))
+            .expect("the mux host library opens again");
+        let mut pending = Vec::new();
+        let arb = assign::arb_id(7).expect("id 7");
+        let mut wire = encode_header(arb);
+        wire.extend_from_slice(junk);
+        wire.push(MESSAGE_SYNC); // what the junk path resynchronises on
+        wire.extend_from_slice(&discovery_query());
+        device.write(&wire).expect("the junk and the query go in");
+
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + window;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("the query behind junk {junk:02x?} must be answered");
+            }
+            let Some(unit) = read_unit(&mut device, &mut pending, deadline - now) else {
+                continue; // nothing whole yet: read again inside the window
+            };
+            seen.extend_from_slice(&unit);
+            if UnassignedNode::from_unit(&unit).is_some() {
+                break; // the stream recovered: junk then answer, all captured
+            }
+        }
+
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+        seen
+    }
+
+    /// The firmware's tunnel units, over a real library.
+    ///
+    /// A tunnel unit is `[2-byte checked header][frame]` whose first two frame
+    /// bytes are the katapult tag `01 88`; its length is its word count
+    /// (`frame[3] * 4 + 8`) bounded `8..=128` — the byte-for-byte contract the
+    /// host's `serial.rs` states and `third_party/klipper/src/mux.c` mirrors.
+    /// Here that mirror is pinned end to end: each golden block is consumed as
+    /// one whole unit with the ordinary unit behind it untouched, a short
+    /// buffer waits instead of dropping, an out-of-range word count and a
+    /// `01` without `88` take the junk path, and the stream recovers every
+    /// time. The unit layer never looks at the inner CRC or the command byte.
+    #[test]
+    fn test_the_mux_tunnel_units_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The same pty setup as the device-half test: the port has to exist
+        // before the library configures it.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device = HostDevice::load_bytes(mux_library_path(), Some(identity))
+            .expect("the mux host library opens");
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(5);
+        let quiet = Duration::from_millis(400);
+        // An id nobody holds: the unit addressing it is cut, handed on, and
+        // dropped by the device half — no listener, no answer of its own.
+        let listener = assign::arb_id(7).expect("id 7");
+
+        // 1. Each golden block, then an ordinary query in the same write. The
+        //    tunnel unit in front is cut whole and consumed; had any of it
+        //    reached the parser (or the stream been eaten on the way), the
+        //    query behind it would go unanswered.
+        for (name, block) in [
+            ("connect", &TUNNEL_CONNECT[..]),
+            ("send block", &TUNNEL_SEND_BLOCK[..]),
+            ("ack", &TUNNEL_ACK[..]),
+        ] {
+            let mut wire = encode_header(listener);
+            wire.extend_from_slice(block);
+            wire.extend_from_slice(&discovery_query());
+            device
+                .write(&wire)
+                .expect("the tunnel unit and the query go in");
+            let answer = scan_answer_within(&mut device, &mut pending, window);
+            let node = UnassignedNode::from_unit(&answer).expect("a well-formed scan answer");
+            assert_eq!(
+                node.uuid, identity,
+                "the query behind the {name} tunnel unit must be answered"
+            );
+            assert!(
+                read_unit(&mut device, &mut pending, quiet).is_none(),
+                "a {name} tunnel unit is consumed whole: nothing else comes out"
+            );
+        }
+
+        // 2. Half a tunnel unit is a wait, not a drop: the six bytes carrying
+        //    tag, command and word count leave the device silent — a dropped
+        //    fragment would reach the parser, which answers with its empty
+        //    nak — and the remaining 70 bytes then complete the unit without
+        //    disturbing the query behind them.
+        let mut partial = encode_header(listener);
+        partial.extend_from_slice(&TUNNEL_SEND_BLOCK[..6]);
+        device.write(&partial).expect("half a tunnel unit goes in");
+        assert!(
+            read_unit(&mut device, &mut pending, quiet).is_none(),
+            "half a tunnel unit must wait for the rest, not be dropped"
+        );
+        let mut rest = TUNNEL_SEND_BLOCK[6..].to_vec();
+        rest.extend_from_slice(&discovery_query());
+        device.write(&rest).expect("the rest of the unit goes in");
+        let answer = scan_answer_within(&mut device, &mut pending, window);
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed scan answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the query behind the completed tunnel unit must be answered"
+        );
+
+        // 3. Word count 31 would make 132 bytes: past the limit, so the unit is
+        //    junk. The header goes, the rest to the parser, which resyncs on
+        //    the SYNC this wire carries — and the query behind survives.
+        let mut wire = encode_header(listener);
+        wire.extend_from_slice(&[0x01, 0x88, 0x12, 0x1f, 0x00, 0x00, 0x00, 0x00]);
+        wire.push(MESSAGE_SYNC); // what the junk path resynchronises on
+        wire.extend_from_slice(&discovery_query());
+        device
+            .write(&wire)
+            .expect("the oversized word count and the query go in");
+        let answer = scan_answer_within(&mut device, &mut pending, window);
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed scan answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the stream must recover after a word count past the limit"
+        );
+
+        // 4. `01` without `88`: the existing junk path, byte for byte. The same
+        //    wire with a pre-existing junk flavour (a length below
+        //    MESSAGE_MIN) against a freshly loaded library must produce the
+        //    very same bytes, so both runs load and unload their own library
+        //    (`junk_roundtrip`) with pristine parser statics.
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+
+        let reference = junk_roundtrip(&identity, &[0x04, 0x20, 0x11, 0x00], window);
+        let tunnel_shaped = junk_roundtrip(&identity, &[0x01, 0x00, 0x11, 0x00], window);
+        assert_eq!(
+            tunnel_shaped, reference,
+            "01 without 88 must take the existing junk path byte for byte"
+        );
+    }
+
     /// Read from the pty's master end for at most `window`: everything the
     /// firmware wrote to the port, handed over as soon as `at_least` bytes are
     /// in hand — empty when the port stays silent the whole window. Every wait

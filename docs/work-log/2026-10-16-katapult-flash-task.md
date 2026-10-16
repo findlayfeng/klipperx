@@ -1,7 +1,6 @@
 # Katapult 拓扑刷写：动工前调查、决策与任务拆分（2026-10-16）
 
-> 状态：**T1 已完成验收（§8 实施记录），T4a 在跑**——§6 三项拍板点定了 ①A ②A ③A（+独立执行文件）；
-> T2 等 T1（已解锁，结论在 §8）、T3 等 T2、T4b 等 T4a。
+> 状态：**T1、T4a 已完成验收（§8 实施记录），T2a 与 T4b 在跑**——T3 等 T2a+T2b，T5 收口。
 > 规格缺口先查 §8 附录（三路侦察全文，file:line 级）。
 > 本篇是一次性调查记录（非规范）；实现落地后按 work-log 惯例补「实施记录」节。
 
@@ -117,6 +116,14 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 5. 工具重试节拍取自 flashtool（5 次 / 2s），隧道增加了桥转发延迟，上限值需在 T5 实测调。
 
 ## 8. 实施记录（随实现回填，本节是唯一随实现更新的节）
+
+**2026-10-16 T4a（katapult 会话核心）完成**：分支 `agents/feat-katapult-flash-core`（4 提交：3 个 feat 每步一提交 + 1 个手册），
+`src/flash/{frame,session,fake,tests}` 共 +1444 行；新增 23 测（frame 15 + session 8），窄跑两次均 27/27
+（含既有 4 条）、main 复跑 `flash::` 23/23（0.13s），`cargo build --all-targets` 0 告警，
+`cargo test --workspace` rc=0。CRC 双途径交叉验证（规格位运算 vs flashtool 逐行移植）+ python 第三者一致。
+不确定点已归档：flashtool 对 SEND_BLOCK 的 tries=3/timeout=5 被统一成单一 `SessionConfig`（参数可调）；
+`prime()` 归 T4b；`get_canbus_id` 只进黄金解码测试。**T4b（直连绑定+独立 bin）已基于此分支派出**
+（`agents/feat-katapult-flash-direct`，链式可 ff）。
 
 **2026-10-16 T1（双重封装原型）完成**：分支 `agents/test-katapult-dual-encap`，提交
 `485b74e`（485b74e 测试）+ `1581803`（手册），`cargo test --workspace` rc=0、0 告警，

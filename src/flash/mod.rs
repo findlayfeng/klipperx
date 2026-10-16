@@ -27,6 +27,7 @@
 //! - `fake` (tests only) — the in-process scripted bootloader the session
 //!   scenarios run against.
 
+pub mod bridge;
 pub mod cli;
 pub mod frame;
 pub mod session;
@@ -37,6 +38,9 @@ mod fake;
 #[cfg(test)]
 mod tests;
 
+pub use bridge::{
+    open_bridge, BridgeError, BridgeLink, BridgePort, BridgeReady, BridgeTarget, PortReset,
+};
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};
 pub use session::{
     command, complete, connect, eof, flash, flash_with_config, get_canbus_id, request_block,

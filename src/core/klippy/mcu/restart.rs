@@ -874,25 +874,20 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port during init, so the tty has to exist first.
+        // The bridge opens its port during init, so the tty has to exist first —
+        // the port's own `uart_path:` below, named for its slot when the library
+        // comes up.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
              uart_restart_method: arduino\n\
              [mcu child]\nuart: uart0\n",
-            library.display()
+            library.display(),
+            pty.path.display()
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
@@ -934,7 +929,6 @@ mod tests {
         printer.teardown();
         drop(printer);
         wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 
     /// The device reset restates the route first, on the bridge's own link.
@@ -997,22 +991,15 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
              [mcu child]\nuart: uart0\nuuid: 1234567890ab\nrestart_method: admin\n",
-            library.display()
+            library.display(),
+            pty.path.display()
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
@@ -1060,6 +1047,5 @@ mod tests {
         printer.teardown();
         drop(printer);
         wait_for_mux_library_unload(&library);
-        let _ = std::fs::remove_file(&bridge_path);
     }
 }

@@ -1683,6 +1683,87 @@ mod host_tests {
         HostDevice::load(library_path()).expect("the library is not loaded any more");
     }
 
+    /// `klipper_host_shutdown()` ends `klipper_host_run()`: the runtime thread
+    /// returns, and it returns promptly.
+    ///
+    /// The thread waited on is the library's own runtime ([`HostLibrary::open`]
+    /// spawns it), so its join is taken out of the library's list and completed by
+    /// a helper thread: that makes the wait **bounded** instead of a `join` with no
+    /// deadline, so a loop that never returns fails this test instead of hanging
+    /// the whole test binary. The bound is the assertion — the loop is woken by the
+    /// library's wake fd (`klipper_host_shutdown` writes it), so nothing in this
+    /// path may take a wait's worth of time.
+    fn assert_shutdown_ends_the_runtime_loop(path: &Path, mode: OutputMode) {
+        let library = library_for(path, mode, None, &[]).expect("the host library opens");
+        // Let the firmware come up and the loop settle into its idle sleep.
+        thread::sleep(Duration::from_millis(300));
+
+        let runtime = library.threads.lock().unwrap().remove(0); // `open` pushes it first
+        assert_eq!(
+            runtime.thread().name(),
+            Some("klipper-runtime"),
+            "the first thread of the library is its runtime loop"
+        );
+        assert!(
+            !runtime.is_finished(),
+            "the runtime thread left klipper_host_run() on its own in {}",
+            path.display()
+        );
+
+        let (done_tx, done_rx) = unbounded();
+        let waiter = thread::spawn(move || {
+            let _ = runtime.join();
+            let _ = done_tx.send(());
+        });
+
+        let started = Instant::now();
+        unsafe { (library.symbols.shutdown)() };
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "klipper_host_shutdown() did not end klipper_host_run() in {}: {e}",
+                    path.display()
+                )
+            });
+        let elapsed = started.elapsed();
+        let _ = waiter.join();
+        eprintln!(
+            "{}: klipper_host_run() returned {elapsed:?} after klipper_host_shutdown()",
+            path.display()
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "klipper_host_shutdown() took {elapsed:?} to end klipper_host_run() in {}: the loop \
+             is woken by the library's wake fd, not by a signal or a whole wait interval",
+            path.display()
+        );
+        drop(library);
+    }
+
+    /// The byte-stream build: its loop ends on `klipper_host_shutdown()`.
+    #[test]
+    fn test_shutdown_ends_the_runtime_loop() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_shutdown_ends_the_runtime_loop(&library_path(), OutputMode::Bytes);
+        // Nothing holds the library once the helper returns, so the path is free
+        // for the next host test — which has to meet a fresh firmware.
+        wait_for_unload_blocking(&library_path());
+    }
+
+    /// The mux build: the mux is the same library code, so its loop ends the same
+    /// way (and the mux header is no part of the wake path).
+    #[test]
+    fn test_shutdown_ends_the_runtime_loop_of_the_mux_build() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert_shutdown_ends_the_runtime_loop(&mux_library_path(), OutputMode::Mux);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
     /// One host library per process: a second, **different** `host_library:`
     /// path cannot be loaded while another library is live, because klipper
     /// stops its main loop through a process-wide `SIGUSR1` handler that each

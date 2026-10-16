@@ -21,9 +21,16 @@
 //!   frames in a stream, skipping garbage one byte at a time.
 //! - [`session`] — the transport-agnostic flash session: connect →
 //!   send_block × N → eof → verify → complete, over any `Read + Write`.
+//! - `fake` (tests only) — the in-process scripted bootloader the session
+//!   scenarios run against.
 
 pub mod frame;
 pub mod session;
+
+#[cfg(test)]
+mod fake;
+#[cfg(test)]
+mod tests;
 
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};
 pub use session::{

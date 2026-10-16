@@ -150,11 +150,12 @@ git config core.hooksPath .githooks
 ## 技能（skills）
 
 项目级 skill 放在 **`.agents/skills/<名>/SKILL.md`**（随仓库走，pi 从工作目录向上发现，到仓库根为止）；
-需要时用 `/skill:<名>` 显式加载。当前六份：
+需要时用 `/skill:<名>` 显式加载。当前七份：
 
 | skill | 何时用 |
 |-------|--------|
 | [`flash-firmware`](.agents/skills/flash-firmware/SKILL.md) | 给板子构建/刷写固件、SWD 排障、验证「固件到底刷上没有」——**含频率/`halt`/回读校验的完整手法** |
+| [`katapult-self-update`](.agents/skills/katapult-self-update/SKILL.md) | 不用编程器更新/开发 katapult 自身：deployer 自举的配置开关与符号语义、刷前三段核验、`flash` 自举命令与双复位窗口、读回硬证据、UART ROM 恢复 |
 | [`subagent-rescue`](.agents/skills/subagent-rescue/SKILL.md) | 子代理卡住/超时/零产出、provider `content_filter` 误杀、测试挂死时的救援流程 |
 | [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md) | 开任务分支/worktree、子模组 worktree、`KLIPPERX_KLIPPER_DIR` 构建、ff vs `--no-ff` 判定、`abandoned/*` 归档、并发构建与收尾 |
 | [`doc-sync`](.agents/skills/doc-sync/SKILL.md) | 改完同步手册的**清单**：改动→手册映射表、写死数字重核、旧断言/已完成标号清理、删档案前分流 |

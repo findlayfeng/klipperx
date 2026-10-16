@@ -5,9 +5,10 @@ description: 不用编程器给板子更新/开发 katapult 自身：deployer �
 
 # Katapult 自举更新（deployer 自更新）
 
-> 本页全部结论来自 2026-10-16 在 **STM32F103ZE + USB CDC** 真机上走通的一次完整自举
-> （构建 → 静态核验 → `flash` 刷 deployer → 双复位 → 三段读回全对上）。协议层禁止直接
-> 自写，唯一正路是 deployer；本页记录「怎么把它做对、怎么证明做对了」。
+> 2026-10-16 在 **STM32F103ZE + USB CDC** 真机上走通的一次完整自举
+> （构建 → 静态核验 → `flash` 刷 deployer → 双复位 → 三段读回全对上），**同日第二轮换血测试**
+> 进一步真执行了 deployer 写引导区循环（新镜像 serial `devloop1` 活体 + 读回 `boot==新 katapult.bin`）。
+> 协议层禁止直接自写，唯一正路是 deployer；本页记录「怎么把它做对、怎么证明做对了」。
 
 ## 第一原则：直接自写被协议封死，只走 deployer
 

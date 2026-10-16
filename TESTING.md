@@ -266,6 +266,14 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
+- **katapult 直连刷写真机验证**：带 katapult 引导的板子（应用带偏移）经 `flash` bin 直刷——
+  USB-CDC 路径（`--device /dev/serial/by-id/usb-Katapult…`：prime → 会话 → verify → `COMPLETE`
+  后重枚举）与 CAN 路径（`--interface` + `-u`：admin `0x11/0x12` 指派 + uuid 校验）。判定按
+  [flash-firmware](.agents/skills/flash-firmware/SKILL.md) 硬证据口径：刷后设备重枚举为应用
+  （USB id 从 `1d50:6177` 回到应用 id）、identify 版本与本地构建一致。  **实测记录（2026-10-16，UART ROM 首装 katapult 后）**：USB-CDC 路径**已验**——经 `flash` bin
+  两轮刷 deployer.bin（83/82 块+verify rc=0），第二轮换血后 `usb-katapult_…_devloop1` 活体
+  CONNECT + 读回 `boot==新 katapult.bin`/`app==新 deployer.bin` 双 True（手法见
+  [katapult-self-update](.agents/skills/katapult-self-update/SKILL.md)）；**CAN 路径仍未真机**。
 
 ## 怎么算清零
 

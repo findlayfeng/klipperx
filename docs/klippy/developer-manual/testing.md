@@ -368,9 +368,12 @@ git config core.hooksPath .githooks
 |------|------|
 | `src/flash/frame.rs`（15 测） | **katapult 帧纯编解码**（与 klipper 帧层的 CRC 覆盖范围不同：katapult 从 cmd 字节起算、不含 2B 头与尾，模块文档有警示）：黄金向量钉死（Connect 8B = `01 88 11 00 F1 7C 99 03`、含 64B 真数据的 Send Block 76B）；CRC16-CCITT 双途径交叉验证（按规格的位运算实现 vs `flashtool.py:42-49` 逐行移植，`"123456789"→0x6F91` 与 python 第三者一致）；六类应答解码（Connect 的版本/起始地址/block_size/build-info NUL 分支、SEND_BLOCK 回显地址、EOF 回 page_count、REQUEST_BLOCK 回地址+数据、COMPLETE、GET_CANBUS_ID 回 uuid、NACK/BUSY/ERROR 三态）；`FrameScanner` 滑窗（垃圾前缀跳过、坏 CRC 与坏尾各滑 1 字节、跨两次 feed 重组整帧、`clear` 丢半帧、`MAX_PAYLOAD` 防假 word_cnt 卡死） |
 | `src/flash/session.rs` + `tests.rs`（8 测） | **传输无关刷写会话**（阻塞 `Read+Write` + deadline，与 `serial.rs` 同读模型；`SessionConfig` 默认取 flashtool 节奏 tries=5/2s）：全流程（connect→send_block×N→eof→verify→complete）含尾块 0xFF 填充与 verify 比对；NACK 重发直到设备接受；busy 延迟后重试；坏 CRC 应答被滑窗跳过；应答分两次读到仍重组；F2 设备错误中止；静默设备耗尽 tries；verify 抓出被写坏的块。每测 30s 看门狗 |
-| `src/flash/fake.rs`（夹具，无独立测） | 进程内脚本化 bootloader：`Quirk` 按「命令+第 N 次」一次性触发（Nack/Busy/Error/Silent/坏 CRC/写坏存储）、`split_responses` 造分片到达、`memory`/`seen` 供断言；空队列回 `WouldBlock` 永不阻塞。为直连绑定（T4b）与拓扑流程（T5）的测试复用 |
+| `src/flash/fake.rs`（夹具，无独立测） | 进程内脚本化 bootloader：`Quirk` 按「命令+第 N 次」一次性触发（Nack/Busy/Error/Silent/坏 CRC/写坏存储）、`split_responses` 造分片到达、`memory`/`seen` 供断言；空队列回 `WouldBlock` 永不阻塞。直连绑定与拓扑流程的测试都复用它 |
 
-传输绑定（tty/CAN/USB）与 CLI 入口属后续直连单元（T4b），不在本模块；会话对任意字节流成立，这 23 测全部不碰真端口。 
+| `src/flash/cli.rs`（22 测） | **独立 `[[bin]] flash` 的参数层**：`flash [OPTIONS] [FIRMWARE]`——`--device`（独占串口/tty，含 USB CDC 枚举出的 tty）/ `--interface`（SocketCAN）/ `--uuid` / `--nodeid`（128..=255，默认 128，与 flashtool 同段）/ `--baud`（默认 250000；`-q` 不取波特率）/ `-q` 查询（复用 `scan` 的 admin 查询，app=0x11 命名）；裸调用打 help；「先读固件文件、后开端口」的次序有测试钉住 |
+| `src/flash/transport.rs`（9 测） | **两条直连传输**：tty——raw 打开（复用 `set_raw_mode`）+ 首发 prime 帧 `01 88 90 00 e5 e9 99 03`（CRC 值 0xE9E5 按 LE 上线；**勘误**：早期记录写成 `e9 e5` 是把数值渲染当成了线上字节），pty 对后接 `flash::fake` 的**端到端全流程**（prime 首帧逐字节 + 落盘比对）；CAN——admin `0x3f0/0x3f1` 黄金字节（`CLEAR=[0x12]` 单字节帧、`SET=[0x11][uuid msb 先][nodeid]`）、`GET_CANBUS_ID` uuid 校验与拒连、≤8 B 切片重组（夹具用 `UnixDatagram::pair()`：`UnixStream::pair()` 会合并记录导致挂起，仓里踩过） |
+
+传输绑定已落地：会话仍对任意字节流成立，全部 **54 测**不碰真端口（tty 用 pty 对、CAN 用 unix 数据报对；真实 SocketCAN 适配器与 katapult 真板属真机项，见 `TESTING.md`）。过滤：`cargo test -p klipperx --lib flash`（54 测；连同名字带 flash 的邻模块共 58）。
 
 ### `msg`
 

@@ -21,11 +21,16 @@
 //!   frames in a stream, skipping garbage one byte at a time.
 //! - [`session`] — the transport-agnostic flash session: connect →
 //!   send_block × N → eof → verify → complete, over any `Read + Write`.
+//! - [`transport`] — the two direct byte streams: an exclusive serial
+//!   tty/USB link and a SocketCAN node session.
+//! - [`cli`] — the standalone `flash` binary's arguments and actions.
 //! - `fake` (tests only) — the in-process scripted bootloader the session
 //!   scenarios run against.
 
+pub mod cli;
 pub mod frame;
 pub mod session;
+pub mod transport;
 
 #[cfg(test)]
 mod fake;
@@ -37,3 +42,4 @@ pub use session::{
     command, complete, connect, eof, flash, flash_with_config, get_canbus_id, request_block,
     send_block, FlashError, SessionConfig, Summary,
 };
+pub use transport::{open_can, open_tty, CanBus, TransportError, TtyLink};

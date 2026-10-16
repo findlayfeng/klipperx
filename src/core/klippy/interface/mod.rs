@@ -4,10 +4,11 @@ pub mod error;
 pub(crate) mod pty;
 pub mod usb;
 
-pub use devices::canserial::CanSerialDevice;
+pub use devices::canserial::{CanSerialDevice, CanWire};
 #[cfg(test)]
 pub use devices::frame_mock::{FrameMock, MappingEntry};
 pub use devices::host::{HostDevice, HostMux};
+pub use devices::isotp::IsotpDevice;
 pub use devices::serial::SerialDevice;
 use devices::serial::SharedSerialHandle;
 #[cfg(test)]
@@ -57,6 +58,8 @@ pub struct Interface {
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
 ///   can-serial link (`uuid:` + `canbus_interface:`; `canbus_nodeid:` is
 ///   the Klipper-named key that explicitly overrides the MCU's layer id)
+/// - `Isotp(IsotpDevice)` — a real MCU reached over CAN, carrying Klipper's
+///   blocks as ISO-TP messages (ISO 15765-2) instead of a chopped byte stream
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `FrameMock(FrameMock)` — a frame-level mock for tests (built in code)
@@ -73,6 +76,7 @@ enum Transport {
     /// stream by arbitration id, and `shutdown` stops only this handle.
     SharedSerial(Arc<SharedSerialHandle>),
     CanSerial(Arc<CanSerialDevice>),
+    Isotp(Arc<IsotpDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
     FrameMock(Arc<FrameMock>),
@@ -167,14 +171,60 @@ impl Interface {
     }
 
     /// Create an interface for the MCU `uuid` on the CAN interface `name`, brought
-    /// up as node `nodeid`.
+    /// up as node `nodeid` — the classical CAN link.
+    ///
+    /// This is [`Interface::canserial_with_wire`] on [`CanWire::Classical`].
     ///
     /// # Errors
     /// Returns [`InterfaceError`] if the interface does not exist or the socket
     /// cannot be set up.
     pub fn canserial(name: &str, uuid: [u8; 6], nodeid: u32) -> Result<Self, InterfaceError> {
+        Self::canserial_with_wire(name, uuid, nodeid, CanWire::Classical)
+    }
+
+    /// The same on `wire`: a CAN FD link carries sixty-four data bytes per CAN
+    /// frame, and its socket reads and writes seventy-two byte datagrams.
+    ///
+    /// The wire is not a preference but a pairing with the other end — a socket
+    /// that has not asked the kernel for CAN FD frames hears nothing on an FD
+    /// bus — so a link says which wire it is when it opens.
+    ///
+    /// # Errors
+    /// The same as [`Interface::canserial`], plus a socket that cannot be given
+    /// CAN FD frames.
+    pub fn canserial_with_wire(
+        name: &str,
+        uuid: [u8; 6],
+        nodeid: u32,
+        wire: CanWire,
+    ) -> Result<Self, InterfaceError> {
         Ok(Self::with_transport(Transport::CanSerial(Arc::new(
-            CanSerialDevice::open(name, uuid, nodeid)?,
+            CanSerialDevice::open_with_wire(name, uuid, nodeid, wire)?,
+        ))))
+    }
+
+    /// Create an interface for the MCU `uuid` on the CAN interface `name`,
+    /// brought up as node `nodeid` and carried over **ISO-TP** on `wire`.
+    ///
+    /// The node id and the way it is handed over are the can-serial link's (same
+    /// admin frame, same socket recipe); what differs is how Klipper's blocks
+    /// travel — one ISO-TP message per block, segmented and flow controlled,
+    /// rather than a byte stream cut every frame. A block that fits one frame is
+    /// unaffected; a longer one costs a flow control frame and a round trip per
+    /// message (see the CAN ISO-TP notes).
+    ///
+    /// # Errors
+    /// Returns [`InterfaceError`] if the interface does not exist, the socket
+    /// cannot be set up, CAN FD cannot be enabled on it, or the node id is
+    /// outside `1..=255`.
+    pub fn isotp(
+        name: &str,
+        uuid: [u8; 6],
+        nodeid: u32,
+        wire: CanWire,
+    ) -> Result<Self, InterfaceError> {
+        Ok(Self::with_transport(Transport::Isotp(Arc::new(
+            IsotpDevice::open(name, uuid, nodeid, wire)?,
         ))))
     }
 
@@ -375,6 +425,12 @@ impl Interface {
                     .await
                     .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
+            Transport::Isotp(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.send(&frame))
+                    .await
+                    .unwrap_or(Err(InterfaceError::ConnectionLost))
+            }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame))
@@ -419,6 +475,10 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
             }
+            Transport::Isotp(device) => {
+                let device = Arc::clone(device);
+                self.off_runtime(move || device.receive()).await.flatten()
+            }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
@@ -447,6 +507,7 @@ impl Interface {
             Transport::Serial(device) => device.shutdown(),
             Transport::SharedSerial(device) => device.shutdown(),
             Transport::CanSerial(device) => device.shutdown(),
+            Transport::Isotp(device) => device.shutdown(),
             Transport::Host(device) => device.shutdown(),
             #[cfg(test)]
             Transport::FrameMock(device) => device.shutdown(),
@@ -588,6 +649,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::interface::devices::canserial::read_wire;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::devices::isotp::read_wire_on;
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE, MUX_PORT_UNITS,
     };
@@ -842,6 +904,28 @@ mod tests {
             .concat(),
             "the three units, byte for byte on the CAN byte stream"
         );
+    }
+
+    /// An ISO-TP link is wired into the interface like every other transport: a
+    /// send reaches the socket, and a shutdown is what ends a receive with
+    /// nothing to return. Measured off the wire the device writes.
+    #[tokio::test]
+    async fn test_an_isotp_link_sends_and_stops_through_the_interface() {
+        let (device, mut wire) = IsotpDevice::test_wire_on(3, CanWire::Classical);
+        let interface = Interface::with_transport(Transport::Isotp(Arc::new(device)));
+
+        interface.send(make_frame(1, &[0xab; 11])).await.unwrap();
+
+        // Eleven payload bytes are a sixteen byte block, which one classical CAN
+        // frame cannot carry: the first frame goes out and the rest waits for a
+        // flow control frame nobody is there to send.
+        let sent = read_wire_on(&mut wire, CanWire::Classical);
+        assert_eq!(sent.len(), 1, "the first frame of a segmented block");
+        assert_eq!(sent[0].id(), 0x106);
+        assert_eq!(&sent[0].data()[..2], &[0x10, 16]);
+
+        interface.shutdown();
+        assert_eq!(interface.receive().await, None);
     }
 
     /// The three bridge commands travel a bridge's admin channel; an interface

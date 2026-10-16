@@ -1585,6 +1585,7 @@ mod host_tests {
     use crate::flash::session::{flash_with_config, SessionConfig};
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use std::time::Instant;
 
     #[test]
@@ -1758,6 +1759,183 @@ mod host_tests {
         wait_for_unload_blocking(&library_path());
         drop(second);
         wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// One test-owned copy of a host library on a path of its own, with the
+    /// temporary directory that holds it removed when it is dropped.
+    ///
+    /// `std::fs::copy` is the point: `dlopen` identifies a mapping by **inode**,
+    /// so a symlink or a hard link to the built library would hand back the one
+    /// mapping — one firmware, one mux uuid — not a second instance.
+    struct LibraryCopy {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl LibraryCopy {
+        fn of(source: &Path, tag: &str) -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "klipperx-hostlib-copy-{}-{tag}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&directory);
+            std::fs::create_dir_all(&directory).expect("the copy directory is created");
+            let path = directory.join("libklipper_host.so");
+            std::fs::copy(source, &path).expect("the host library is copied");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for LibraryCopy {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    /// Drive one live reference through the mux device half: it must answer the
+    /// discovery broadcast with `identity`, and a `get_clock` unit addressed to
+    /// the id it then adopts must come back as a `clock` frame.
+    ///
+    /// The bytes are the device layer's own (`HostDevice::write`/`read`), so
+    /// what each reference answers is its own image's state and nothing else's.
+    fn expect_identity_and_clock(
+        device: &mut HostDevice,
+        identity: [u8; 6],
+        parser: &Parser,
+        mcu_id: u32,
+        window: Duration,
+    ) {
+        let mut pending = Vec::new();
+
+        device
+            .write(&discovery_query())
+            .expect("the discovery query goes in");
+        let answer = scan_answer_within(device, &mut pending, window);
+        let node = UnassignedNode::from_unit(&answer).expect("a well-formed scan answer");
+        assert_eq!(
+            node.uuid, identity,
+            "the device answers the identity its own image was given"
+        );
+
+        device
+            .write(&set_node_id_for(identity, mcu_id).expect("the id is addressable"))
+            .expect("the assignment goes in");
+
+        let reply_arb = assign::reply_arb_id(mcu_id).expect("the id is addressable");
+        let mut unit = encode_header(assign::arb_id(mcu_id).expect("the id is addressable"));
+        unit.extend_from_slice(&command_frame(parser, "get_clock", MESSAGE_DEST));
+        device.write(&unit).expect("the get_clock unit goes in");
+
+        let response = read_unit(device, &mut pending, window).expect("the clock response");
+        let (arb, frame) = unit_parts(&response);
+        assert_eq!(
+            arb, reply_arb,
+            "the answer goes out on this device's own reply header"
+        );
+        let clock = Frame::parse(frame).expect("the response is a whole frame");
+        let decoded = parser
+            .decode(Payload::from_raw(clock.payload().to_vec()))
+            .expect("the response decodes against the dictionary");
+        assert_eq!(decoded.len(), 1, "one message in the response frame");
+        assert_eq!(decoded[0].0.name, "clock", "get_clock is answered by clock");
+        assert!(
+            matches!(decoded[0].1.as_slice(), [ArgValue::UInt32(_)]),
+            "clock is a `%u` value, got {:?}",
+            decoded[0].1
+        );
+    }
+
+    /// Two host libraries, copied to paths of their own, run side by side in one
+    /// process and share nothing.
+    ///
+    /// A klipper host library used to stop its main loop through a process-wide
+    /// `SIGUSR1` handler that every loaded library installed over the last one,
+    /// which is why a second path was refused (both `library_for` and
+    /// `mcu/host_libraries.rs` guarded it). The loop now ends through the wake fd
+    /// of its own instance, so two paths are two independent firmware images and
+    /// nothing refuses the second.
+    ///
+    /// The copies are `std::fs::copy`, never a symlink or a hard link: `dlopen`
+    /// identifies a mapping by **inode**, so a link would hand back the one
+    /// mapping — one firmware, one mux uuid — and every assertion below would
+    /// flip. Each copy answers the discovery broadcast with the identity **it**
+    /// was given (not the other's, and not a shared last-set value), and answers
+    /// `get_clock` on the id it adopted: the two mappings are distinct, and
+    /// neither reads the other's units.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_two_host_library_copies_run_side_by_side() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let source = mux_library_path();
+        let first_copy = LibraryCopy::of(&source, "first");
+        let second_copy = LibraryCopy::of(&source, "second");
+
+        // Two files, two inodes: this is the bit a link would collapse.
+        let first_inode = std::fs::metadata(&first_copy.path)
+            .expect("the first copy exists")
+            .ino();
+        let second_inode = std::fs::metadata(&second_copy.path)
+            .expect("the second copy exists")
+            .ino();
+        assert_ne!(
+            first_inode, second_inode,
+            "the copies must be distinct files: dlopen identifies a mapping by inode"
+        );
+
+        let first_identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let second_identity = [0x77, 0x66, 0x55, 0x44, 0x33, 0x22];
+
+        // Both load and stay live at once: neither path refuses the other.
+        let mut first = HostDevice::load_bytes(&first_copy.path, Some(first_identity))
+            .expect("the first copy loads");
+        let mut second = HostDevice::load_bytes(&second_copy.path, Some(second_identity))
+            .expect("the second copy loads while the first is live");
+        for path in [&first_copy.path, &second_copy.path] {
+            assert!(
+                library_registry()
+                    .lock()
+                    .unwrap()
+                    .get(path.as_path())
+                    .and_then(Weak::upgrade)
+                    .is_some(),
+                "{} is live",
+                path.display()
+            );
+        }
+
+        let mut parser = Parser::new();
+        mux_dictionary()
+            .install(&mut parser)
+            .expect("install the mux build's dictionary");
+        let window = Duration::from_secs(5);
+
+        // Each copy answers its own identity and its own `get_clock` while the
+        // other is live and idle — the two images never cross.
+        expect_identity_and_clock(&mut first, first_identity, &parser, 5, window);
+        expect_identity_and_clock(&mut second, second_identity, &parser, 5, window);
+
+        // Both are still live after both round trips.
+        for path in [&first_copy.path, &second_copy.path] {
+            assert!(
+                library_registry()
+                    .lock()
+                    .unwrap()
+                    .get(path.as_path())
+                    .and_then(Weak::upgrade)
+                    .is_some(),
+                "{} is still live after its round trip",
+                path.display()
+            );
+        }
+
+        // Each image is unloaded on its own; wait for both, so neither is left
+        // initialized for the next test that might load the same path.
+        drop(first);
+        wait_for_unload(&first_copy.path).await;
+        drop(second);
+        wait_for_unload(&second_copy.path).await;
     }
 
     /// A live library is opened once, with one bridge port table: a later

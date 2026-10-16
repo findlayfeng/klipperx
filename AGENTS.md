@@ -194,5 +194,6 @@ cargo fmt --all                         # 提交前格式化（钩子也会跑�
   **想知道自己是不是在排队**：用 `scripts/cargo-locked.sh <cargo 子命令…>` 代替 `cargo`——它探的是 **cargo 自己的锁**（`<target>/<profile>/.cargo-build-lock`，cargo 用 `flock(2)`），所以**裸 `cargo` 在跑它也能发现**；会先打
   `another cargo holds …; waiting (idle CPU here is expected, not a hang)` + 持有者 pid 与命令行，拿到锁后报 `acquired after <时长>`，退出码原样透传（实测：裸 `cargo build` 占着时，包装器报告并等了 11.5s）。
 - **合并前用全量闸门**：`cargo test -p klipperx --lib` 很快，但**不含** `klippy-client` 的集成测试（历史上内建参数表过期就是这样漏掉的）；提交/合并前跑 `cargo test --workspace`。
+- **Python 工具一律走仓库根的 `venv`**：装用 `venv/bin/pip`、跑用 `venv/bin/python`（工具同理 `venv/bin/<工具>`）；**不要**裸 `python`/`pip`（那四个都在 `/usr/bin/`，装出来不在 venv 里、按路径调就找不到），**也不要**依赖 `source venv/bin/activate`（激活是**状态**，一旦掉了就悄悄退回系统解释器）。没有 `venv/` 就先 `python3 -m venv venv`。三步细则与踩坑见 [`python-tools`](.agents/skills/python-tools/SKILL.md)。
 
 真机 / 外设验证不阻塞主线，约定见 [`TESTING.md`](TESTING.md)。

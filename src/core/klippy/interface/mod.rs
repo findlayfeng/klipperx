@@ -350,9 +350,6 @@ impl Interface {
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
     /// is not a bridge link.
-    // The end-to-end caller lands with T5d-2 (the bridge session doing its work
-    // over `Mcu` + `Interface`); remove this allowance once it is wired.
-    #[allow(dead_code)]
     pub(crate) fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
         match &self.transport {
             Transport::SharedSerial(handle) => handle.send_set_port_tunnel(index),

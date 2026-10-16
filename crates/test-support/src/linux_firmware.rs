@@ -38,6 +38,15 @@ const REAP_ATTEMPTS: usize = 50;
 /// Distinguishes the temporary directories of concurrently running fixtures.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
+/// The environment variable the bridge-flavoured firmware reads for the tty its
+/// bridge port is on (`third_party/klipper/src/linux/bridge.c`: the launcher
+/// names it, since the host that declares the port is another process).
+const BRIDGE_PORT_ENV: &str = "KLIPPER_BRIDGE_PORT_0";
+
+/// The file the firmware's stderr is captured to, inside the fixture's own
+/// temporary directory.
+const STDERR_LOG: &str = "stderr.log";
+
 /// A running linux process firmware, shut down when it goes out of scope.
 ///
 /// The firmware keeps running until it is killed, so dropping this type is the
@@ -64,7 +73,7 @@ impl LinuxFirmware {
     /// stderr tail rather than hanging the test run. The half-started process
     /// and its directory are cleaned up on that path too.
     pub fn spawn() -> io::Result<Self> {
-        Self::spawn_elf(crate::linux_firmware_path(), None)
+        Self::spawn_elf(crate::linux_firmware_path(), None, None)
     }
 
     /// Start the mux-flavoured `klipper.elf` (built from
@@ -77,13 +86,45 @@ impl LinuxFirmware {
     /// node id — the named counterpart of [`spawn`], which leaves the identity
     /// all zero and speaks the legacy bare-frame protocol.
     pub fn spawn_named(uuid: [u8; 6]) -> io::Result<Self> {
-        Self::spawn_elf(crate::linux_mux_firmware_path(), Some(hex_uuid(&uuid)))
+        Self::spawn_elf(
+            crate::linux_mux_firmware_path(),
+            Some(hex_uuid(&uuid)),
+            None,
+        )
     }
 
-    /// The shared body of [`spawn`] and [`spawn_named`]: run `elf` with the
-    /// fixture's own `-I` path (and `-U identity` when given), then wait as
-    /// the doc on [`spawn`] describes.
-    fn spawn_elf(elf: PathBuf, identity: Option<String>) -> io::Result<Self> {
+    /// Start the **bridge**-flavoured `klipper.elf` (built from
+    /// `test/configs/linuxprocess-bridge.config`) with a six-byte identity and
+    /// the tty its bridge port is on, and wait until its console is up.
+    ///
+    /// The process is a bridge: its console is the upstream side a host attaches
+    /// to, and `port_path` is the tty it serves as its single downstream port
+    /// (`CONFIG_LINUX_BRIDGE_SERIAL`), named to it in the
+    /// `KLIPPER_BRIDGE_PORT_0` environment variable. Which tty that is belongs
+    /// to the caller, since a test drives the far end of it; nothing opens it
+    /// until the host declares the port (`config_uart`), so a path that does not
+    /// exist is only an error at that configuration, never at startup.
+    ///
+    /// `uuid` is the identity `-U` gives the process, exactly as in
+    /// [`spawn_named`]: the bytes a host has to name in its assignment request
+    /// (`SET_NODEID`) for the firmware to adopt its node id.
+    pub fn spawn_bridge_port(port_path: &Path, uuid: [u8; 6]) -> io::Result<Self> {
+        Self::spawn_elf(
+            crate::linux_bridge_firmware_path(),
+            Some(hex_uuid(&uuid)),
+            Some(port_path),
+        )
+    }
+
+    /// The shared body of [`spawn`], [`spawn_named`] and
+    /// [`spawn_bridge_port`]: run `elf` with the fixture's own `-I` path (and
+    /// `-U identity` when given, and the port's tty in the environment when one
+    /// is given), then wait as the doc on [`spawn`] describes.
+    fn spawn_elf(
+        elf: PathBuf,
+        identity: Option<String>,
+        bridge_port: Option<&Path>,
+    ) -> io::Result<Self> {
         let dir = std::env::temp_dir().join(format!(
             "klipperx-linux-firmware-{}-{}",
             std::process::id(),
@@ -96,7 +137,7 @@ impl LinuxFirmware {
             ));
         }
         let serial_path = dir.join("mcu");
-        let stderr_log = dir.join("stderr.log");
+        let stderr_log = dir.join(STDERR_LOG);
 
         let stderr = match fs::File::create(&stderr_log) {
             Ok(file) => Stdio::from(file),
@@ -112,6 +153,9 @@ impl LinuxFirmware {
         command.arg("-I").arg(&serial_path);
         if let Some(identity) = &identity {
             command.arg("-U").arg(identity);
+        }
+        if let Some(port_path) = bridge_port {
+            command.env(BRIDGE_PORT_ENV, port_path);
         }
         let mut child = match command
             .stdin(Stdio::null())
@@ -188,6 +232,17 @@ impl LinuxFirmware {
     pub fn serial_path(&self) -> &Path {
         &self.serial_path
     }
+
+    /// What the running firmware has written to stderr so far.
+    ///
+    /// The process's stderr is captured to a file of the fixture's own (it
+    /// carries the startup report and anything an arch backend logs), and a
+    /// test that asserts what the process reported reads it here. Empty when
+    /// nothing has been written yet — a firmware reports as it goes, not on
+    /// exit.
+    pub fn stderr(&self) -> String {
+        fs::read_to_string(self.dir.join(STDERR_LOG)).unwrap_or_default()
+    }
 }
 
 impl Drop for LinuxFirmware {
@@ -238,7 +293,7 @@ fn abort(child: Option<&mut Child>, dir: &Path, message: String) -> String {
         let _ = child.kill();
         let _ = child.wait();
     }
-    let detail = stderr_tail(&dir.join("stderr.log"));
+    let detail = stderr_tail(&dir.join(STDERR_LOG));
     let _ = fs::remove_dir_all(dir);
     format!("{message}{detail}")
 }
@@ -328,6 +383,50 @@ mod tests {
             )
             .is_err()),
             "the fixture's directory should be gone with it"
+        );
+    }
+
+    /// The bridge-flavoured firmware starts with its port's tty in the
+    /// environment and its identity on the command line, and reaps like the
+    /// others. The port itself is opened by a `config_uart` from a host, so the
+    /// path here is never touched — this only checks the fixture can start that
+    /// elf.
+    #[test]
+    fn linux_bridge_firmware_spawn_bridge_port_and_drop() {
+        let elf = crate::linux_bridge_firmware_path();
+        assert!(
+            elf.exists(),
+            "{} is missing — the default KLIPPERX_ARCHES builds the \
+             linuxprocess-bridge target",
+            elf.display()
+        );
+
+        let dir = std::env::temp_dir().join(format!(
+            "klipperx-bridge-port-fixture-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("the fixture's own directory is creatable");
+        let port = dir.join("port");
+
+        let firmware =
+            LinuxFirmware::spawn_bridge_port(&port, [0x11, 0x22, 0x33, 0x44, 0x55, 0x66])
+                .expect("the bridge firmware fixture should start");
+        let pid = firmware.pid();
+        assert!(
+            process_exists(pid),
+            "firmware {pid} should run right after spawn_bridge_port"
+        );
+        assert!(
+            serial_link_ready(firmware.serial_path()),
+            "spawn_bridge_port should have waited for the -I symlink"
+        );
+
+        drop(firmware);
+        let _ = fs::remove_dir_all(&dir);
+
+        assert!(
+            eventually(Duration::from_secs(5), || !process_exists(pid)),
+            "firmware {pid} should be killed and reaped by drop"
         );
     }
 

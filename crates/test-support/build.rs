@@ -147,6 +147,7 @@ fn main() {
     let mut built = 0usize;
     let mut linux_firmware = None;
     let mut linux_mux_firmware = None;
+    let mut linux_bridge_firmware = None;
     for config in
         std::fs::read_dir(klipper_dir.join("test/configs")).expect("test/configs is readable")
     {
@@ -167,20 +168,23 @@ fn main() {
 
         let target_out = build(&klipper_dir, &build_dir.join("mcu").join(&name), &text);
         let dictionary = require_dict(&target_out);
-        // The linux process firmware, in two shapes: the fixture in
+        // The linux process firmware, in three shapes: the fixture in
         // `src/linux_firmware.rs` runs these `klipper.elf` files as standalone
         // processes, so their presence is asserted right where they are built
         // (the default architecture set contains `linux`, so the default build
         // always gets here). `linuxprocess` is the base target;
         // `linuxprocess-mux` adds the serial mux (`CONFIG_MUX_SERIAL=y`), which
-        // is what lets a fixture give the process an identity with `-U`.
-        if name == "linuxprocess" || name == "linuxprocess-mux" {
+        // is what lets a fixture give the process an identity with `-U`;
+        // `linuxprocess-bridge` adds the bridge port backend
+        // (`CONFIG_LINUX_BRIDGE_SERIAL=y`), which is what lets the process
+        // serve a tty of its own as the bridge's downstream port.
+        if ["linuxprocess", "linuxprocess-mux", "linuxprocess-bridge"].contains(&name.as_str()) {
             let elf = target_out.join("klipper.elf");
             assert!(elf.exists(), "make did not produce {}", elf.display());
-            if name == "linuxprocess" {
-                linux_firmware = Some(elf);
-            } else {
-                linux_mux_firmware = Some(elf);
+            match name.as_str() {
+                "linuxprocess" => linux_firmware = Some(elf),
+                "linuxprocess-mux" => linux_mux_firmware = Some(elf),
+                _ => linux_bridge_firmware = Some(elf),
             }
         }
         std::fs::copy(&dictionary, dicts.join(format!("{name}.dict")))
@@ -226,6 +230,23 @@ fn main() {
     println!(
         "cargo:rustc-env=KLIPPER_LINUX_MUX_FIRMWARE={}",
         linux_mux_firmware.display()
+    );
+
+    // The bridge-flavoured firmware's `klipper.elf`, exposed the same way and
+    // with the same degenerate behaviour: with `linux` left out of
+    // `KLIPPERX_ARCHES` the file is absent while the path still points at where
+    // a default build would put it, so the fixture reports the missing file
+    // instead of the build failing here.
+    let linux_bridge_firmware = linux_bridge_firmware.unwrap_or_else(|| {
+        build_dir
+            .join("mcu")
+            .join("linuxprocess-bridge")
+            .join("out")
+            .join("klipper.elf")
+    });
+    println!(
+        "cargo:rustc-env=KLIPPER_LINUX_BRIDGE_FIRMWARE={}",
+        linux_bridge_firmware.display()
     );
 
     // Upstream's `test/klippy/*.test` corpus, turned into individual

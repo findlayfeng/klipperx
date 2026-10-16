@@ -105,7 +105,7 @@ use tracing::{debug, info, trace, warn};
 use super::serial::{
     admin_unit, assignment_request, encode_header, parse_assignment_ack, set_node_id_for,
     set_port_node_id, UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT,
-    CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, HEADER_BYTES,
+    CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
 };
 use super::shared::resource_for;
 
@@ -1217,6 +1217,22 @@ impl HostDevice {
         self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
     }
 
+    /// Toggle the flashing tunnel of bridge port `index` —
+    /// [`CMD_SET_PORT_TUNNEL`]'s admin unit. The bridge flips its own port
+    /// state; nothing is sent downstream.
+    ///
+    /// What a **flashing tool** turns on for the port a device in its
+    /// bootloader sits behind: in tunnel mode the port carries a katapult raw
+    /// byte stream rather than units. The same command leaves the mode — a
+    /// repeat flips back, so the caller tracks the state it asked for. No
+    /// receipt, like [`HostDevice::send_restart_device`].
+    ///
+    /// # Errors
+    /// The same as [`HostDevice::send_admin`].
+    pub fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_SET_PORT_TUNNEL, index])[HEADER_BYTES..])
+    }
+
     /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and
     /// re-confirm the assignment.
     ///
@@ -1486,8 +1502,8 @@ mod host_tests {
         admin_unit, assignment_request, decode_header, discovery_query, encode_header,
         set_node_id_for, set_port_node_id, tunnel_unit, HeaderScan, UnassignedNode, ADMIN_LISTEN,
         ADMIN_REPLY, ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
-        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC, MUX_PORT_UNITS,
-        RESP_NEED_NODEID, TUNNEL_TAG,
+        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC,
+        MUX_PORT_UNITS, RESP_NEED_NODEID, TUNNEL_TAG,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::SimulatorDevice;
@@ -2895,18 +2911,6 @@ mod host_tests {
     /// tunnel units an id to be headed with.
     const TUNNEL_PORT_ID: u8 = 7;
 
-    /// `[CMD_SET_PORT_TUNNEL][index]`: the port-level command that toggles port
-    /// `index`'s flashing tunnel mode (firmware `mux.h`
-    /// `MUX_CMD_SET_PORT_TUNNEL`). The same command both enters and leaves the
-    /// mode. `serial.rs` spells no constant for it yet — the flashing tool that
-    /// sends it is the tool's own work — so the byte is spelled here.
-    const CMD_SET_PORT_TUNNEL: u8 = 0x06;
-
-    /// `[CMD_SET_PORT_TUNNEL][index]` on the admin channel.
-    fn set_port_tunnel(index: u8) -> Vec<u8> {
-        admin_unit(&[CMD_SET_PORT_TUNNEL, index])
-    }
-
     /// The mux library loaded with the bridge's port 0 declared and named a
     /// **legacy** device on [`TUNNEL_PORT_ID`], its tty on a fresh pty.
     ///
@@ -2989,7 +2993,7 @@ mod host_tests {
         //    SET_PORT_NODEID: no receipt comes back upstream, and nothing is
         //    written to the port it toggles.
         device
-            .write(&set_port_tunnel(0))
+            .send_set_port_tunnel(0)
             .expect("SET_PORT_TUNNEL goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
@@ -3034,7 +3038,7 @@ mod host_tests {
         // downlink block is the ordering proof again — a toggle applied too
         // late would leave the stray frame unread below.
         device
-            .write(&set_port_tunnel(0))
+            .send_set_port_tunnel(0)
             .expect("the second SET_PORT_TUNNEL goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
@@ -3076,7 +3080,7 @@ mod host_tests {
         //    nothing but the block itself reaches the port, and nothing follows
         //    it on the wire.
         device
-            .write(&set_port_tunnel(0))
+            .send_set_port_tunnel(0)
             .expect("the tunnel is on again");
         let down_unit = tunnel_unit(
             assign::arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7"),
@@ -3177,7 +3181,7 @@ mod host_tests {
         let reply = assign::reply_arb_id(u32::from(TUNNEL_PORT_ID)).expect("id 7");
 
         device
-            .write(&set_port_tunnel(0))
+            .send_set_port_tunnel(0)
             .expect("the tunnel is on the port");
 
         // The console applies the units it parses in the order it parses them,

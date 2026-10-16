@@ -829,6 +829,15 @@ pub const CMD_RESET_PORT: u8 = 0x04;
 /// by the port index that follows; on a board with no bridge the device half
 /// runs it itself.
 pub const CMD_RESTART_DEVICE: u8 = 0x05;
+/// The frame body byte of the port-level command that toggles the flashing
+/// tunnel mode of the port that follows: `[CMD_SET_PORT_TUNNEL][index]`. The
+/// firmware spells it `MUX_CMD_SET_PORT_TUNNEL 0x06` with payload length
+/// `MUX_SET_PORT_TUNNEL_LEN` (`mux.h`); bridge side (`bridge.c`
+/// `bridge_set_port_tunnel`) it is the bridge's own port state — consumed by
+/// the bridge, never forwarded downstream, no receipt. The same command both
+/// enters and leaves the mode, so a repeat flips back; an index the bridge's
+/// port table does not list, or a short payload, is dropped in silence.
+pub const CMD_SET_PORT_TUNNEL: u8 = 0x06;
 /// The first body byte of an unassigned board's answer.
 pub const RESP_NEED_NODEID: u8 = 0x20;
 /// The application id CanBoot reports instead of Klipper's own
@@ -1920,6 +1929,22 @@ impl SharedSerialHandle {
         self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
     }
 
+    /// Toggle the flashing tunnel of bridge port `index` —
+    /// [`CMD_SET_PORT_TUNNEL`]'s admin unit. The bridge flips its own port
+    /// state; nothing is sent downstream.
+    ///
+    /// What a **flashing tool** turns on for the port a device in its
+    /// bootloader sits behind: in tunnel mode the port carries a katapult raw
+    /// byte stream rather than units. The same command leaves the mode — a
+    /// repeat flips back, so the caller tracks the state it asked for. No
+    /// receipt, like [`SharedSerialHandle::send_restart_device`].
+    ///
+    /// # Errors
+    /// The same as [`SharedSerialHandle::send_unit`].
+    pub fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_admin(&admin_unit(&[CMD_SET_PORT_TUNNEL, index])[HEADER_BYTES..])
+    }
+
     /// Complete the frame-level id handshake on this already-open handle: name
     /// this device `uuid` ([`set_node_id_for`]) and have it re-confirm the
     /// assignment — exactly the segment [`attach`] runs once its slot is
@@ -2400,6 +2425,23 @@ mod mux_tests {
             .send_request_bootloader(0)
             .expect("the bootloader request goes out");
         assert_eq!(read_n(&pty.master, bootloader.len()), bootloader);
+
+        // The flashing tunnel toggle: `[0x06][index]`, the same admin-unit
+        // shape one command byte on.
+        let tunnel = admin_unit(&[CMD_SET_PORT_TUNNEL, 3]);
+        handle
+            .send_set_port_tunnel(3)
+            .expect("the tunnel toggle goes out");
+        assert_eq!(read_n(&pty.master, tunnel.len()), tunnel);
+
+        // An out-of-range index is not the host's to reject: the bridge drops
+        // an index its port table does not list in silence, so the sender
+        // writes it all the same.
+        let out_of_range = admin_unit(&[CMD_SET_PORT_TUNNEL, 200]);
+        handle
+            .send_set_port_tunnel(200)
+            .expect("an out-of-range index still goes out");
+        assert_eq!(read_n(&pty.master, out_of_range.len()), out_of_range);
     }
 
     /// A downstream device joins the **same** port singleton an attached MCU
@@ -3751,12 +3793,14 @@ mod mux_tests {
     fn set_port_node_id_is_the_port_level_admin_unit() {
         // The port-level command bytes are the firmware's mux.h table
         // (0x02 REQUEST_BOOTLOADER / 0x03 SET_PORT_NODEID / 0x04 RESET_PORT /
-        // 0x05 RESTART_DEVICE) — pinned here so a drift from the C side fails
-        // on the host too, not only in the real-library probe.
+        // 0x05 RESTART_DEVICE / 0x06 SET_PORT_TUNNEL) — pinned here so a drift
+        // from the C side fails on the host too, not only in the real-library
+        // probe.
         assert_eq!(CMD_REQUEST_BOOTLOADER, 0x02);
         assert_eq!(CMD_SET_PORT_NODEID, 0x03);
         assert_eq!(CMD_RESET_PORT, 0x04);
         assert_eq!(CMD_RESTART_DEVICE, 0x05);
+        assert_eq!(CMD_SET_PORT_TUNNEL, 0x06);
         // The bytes on the wire, exactly: the admin listen id as a checked
         // header, then the `KXID` frame carrying `[0x03][index][id][flags]` —
         // the firmware's mux.h command table (SET_PORT_NODEID, payload
@@ -3789,6 +3833,19 @@ mod mux_tests {
             &unit[HEADER_BYTES + 1 + 1 + MAGIC.len()..unit.len() - 3],
             &[0x03, 0x01, 0xff, 0x01],
             "the payload is exactly [0x03][index][id][flags] behind the KXID marker"
+        );
+    }
+
+    #[test]
+    fn set_port_tunnel_is_the_port_level_admin_unit() {
+        // The toggle's wire bytes, exactly, the way
+        // [`set_port_node_id_is_the_port_level_admin_unit`] pins its own:
+        // `[0x06][index]` after the admin listen id and the `KXID` marker, the
+        // firmware's mux.h `MUX_CMD_SET_PORT_TUNNEL`. One index pinned whole so
+        // the length byte, marker and CRC of this command are pinned too.
+        assert_eq!(
+            admin_unit(&[CMD_SET_PORT_TUNNEL, 3]),
+            [0xe8, 0x3f, 0x0b, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x06, 0x03, 0x54, 0x5d, 0x7e]
         );
     }
 

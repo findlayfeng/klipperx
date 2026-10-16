@@ -256,7 +256,7 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 | 9 | **端口 tty 路径在库 `init` 前登记、运行期可注入**：`klipper_host_port(slot, path)`（`slot` = 端口 `index`，槽数 `KLIPPER_HOST_PORT_SLOTS = 4`，与固件 `BRIDGE_MAX_PORTS` 编译期绑定）；该槽未登记则回落构建期默认 `CONFIG_HOST_BRIDGE_SERIAL_PATH`（降级为兜底默认）；**同一路径的库在端口表不一致时拒绝复用**（`klipper_host_port()` 必须在 `init` 前调用——不做「表按路径合并」，那会让两条桥的槽号互相覆盖） | 固件 `src/host/host.c`、主机 `mcu/bridge_ports.rs` / `cmd/uart.rs` |
 | 10 | **口形态判据是「设备说不说单元」，与台数无关**：legacy（无 `uuid:` + uart）⇒ 该口剥头/加头；命名（写了 `uuid:`）⇒ 整单元原样转发；**多站口**（同一端口节被 ≥2 台命名设备引用，如 RS-485）⇒ 都带头、各自走自己的 `uuid → id`。**legacy 只允许出现在单设备端口上**（它与邻居无法区分 ⇒ 在共享端口上声明 legacy 是配置错） | 两级寻址一节、[MCU 连接方式](../user-manual/mcu-connection.md) |
 | 11 | **恢复预算：一次机会、归还条件明确**。桥 bring-up 因端口 `open` 失败、或 child 在连接期间被 `0x05` 重启而连不上 ⇒ **有界等 `uart_path` 回来**（`BRIDGE_PORT_RETURN_TIMEOUT` = 10 s、`BRIDGE_PORT_POLL` = 100 ms），回来就请求一次 **plain** restart（不是 `firmware_restart`，免得把子设备再点一次 `0x05` ⇒ 循环）。预算挂在 **`Printer`** 上**按节名**记（桥侧记桥节、child 侧记 child 节），**成功 connect 后归还**——所以「路径一直在但打不开」（目录/无权限/被占/槽越界）只重启**一次**便稳定 error，不会变成常驻重启风暴 | `mcu/object.rs`、`printer.rs::claim_bridge_port_recovery` / `clear_bridge_port_recovery` |
-| 12 | **`MUX_SERIAL`/`MUX_CAN` 的载体条件与「不默认开」**：`MUX_SERIAL depends on SERIAL \|\| USBSERIAL`（载体存在才可见）+ 身份来源 `HAVE_CHIPID \|\| MACH_HOST \|\| MACH_LINUX`；`MUX_CAN depends on CANBUS && HAVE_CHIPID`；两者都 `select MUX`，`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`。**都不默认开**：单元格式不是上游 klippy 主机说的格式，必须是刻意选择（host 库由 `HOST_MUX_SERIAL` 选上） | 固件 `src/Kconfig` |
+| 12 | **`MUX_SERIAL`/`MUX_CAN` 的载体条件与「不默认开」**：`MUX_SERIAL depends on SERIAL \|\| USBSERIAL`（载体存在才可见）+ 身份来源 `HAVE_CHIPID \|\| MACH_HOST \|\| MACH_LINUX`；`MUX_CAN depends on CANBUS && HAVE_CHIPID`；两者都 `select MUX`，`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`。**都不默认开**：单元格式不是上游 klippy 主机说的格式，必须是刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。CAN 的**传输层**另是一个独立开关：`ISOTP`（`depends on CANSERIAL`，把 can-serial 的 CAN 承载换成 ISO 15765-2，与 `MUX_CAN` 正交可叠加） | 固件 `src/Kconfig` |
 
 ## 主机侧的行为约定
 
@@ -317,8 +317,13 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
   **CAN 上游必须跑单元**：N 台下游设备的帧都复用到这一条字节流上，没有头就说不出哪台发的（串口上游
   可能只有一台，CAN 不会）；故选用「载荷内同一套单元」而非「单帧 admin 命令」（后者承载不了下游数据）。
   `depends on CANBUS && HAVE_CHIPID`、**不默认开**；`src-$(CONFIG_MUX) += mux.c` 让两种载体共用一份
-  `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。CAN 端到端（真总线或
-  `vcan` 特权环境）与 `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）仍属未落地。
+  `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。**CAN 上还能换一副传输承载**：
+  `CONFIG_ISOTP`（`src/generic/isotp.c`）把 can-serial 的「按帧容量切片」换成 ISO 15765-2 分段
+  （一条 Klipper 帧 = 一条 ISO-TP 消息），而单元层与 `mux_input`/`mux_send` 一个字节不改；
+  **`depends on CANSERIAL`、且只编 classical**。**`vcan` 上的端到端已落地**：`linux` 架构的
+  SocketCAN 控制台（`LINUX_CANSERIAL`）让真 `klipper.elf` 能当 can-serial 节点，主机侧已实测
+  跑通完整 `[mcu]` 连接（admin 指派 → identify → `get_clock`/stats）；剩下的未落地项只有
+  `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）与真总线。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

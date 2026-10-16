@@ -4,7 +4,7 @@ use crate::core::klippy::interface::devices::serial::{self, ASSIGN_ATTACH_TIMEOU
 use crate::core::klippy::interface::usb::UsbPowerMethod;
 #[cfg(test)]
 use crate::core::klippy::interface::SimulatorDevice;
-use crate::core::klippy::interface::{HostMux, Interface, SerialDevice};
+use crate::core::klippy::interface::{CanWire, HostMux, Interface, SerialDevice};
 use crate::core::klippy::mcu::port_grouping::{self, PortKind};
 use crate::core::klippy::mcu::{host_libraries, serial_ports, McuRestartMethod};
 use std::path::Path;
@@ -107,6 +107,46 @@ pub struct McuConfig {
     pub usb_power: UsbPowerMethod,
 }
 
+/// How Klipper's blocks travel a CAN family link: the `canbus_protocol` option.
+///
+/// Both protocols ride the same CAN socket and send the same admin `SET_NODEID`
+/// when the link opens ([`Interface::canserial`] / [`Interface::isotp`]); what
+/// differs is the framing. `cans` is Klipper's can-serial link — a byte stream
+/// cut every CAN frame — and the default; `isotp` sends one Klipper block per
+/// ISO-TP message (ISO 15765-2), segmented and flow controlled instead. The
+/// protocol is a pairing with the other end's firmware — both ends have to
+/// agree — so it is written explicitly and never guessed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CanProtocol {
+    /// Klipper's can-serial link: the byte stream cut every CAN frame.
+    #[default]
+    Cans,
+    /// One Klipper block per ISO-TP message (ISO 15765-2).
+    Isotp,
+}
+
+impl CanProtocol {
+    /// The spellings a config file may use, for error messages.
+    pub const CHOICES: &'static [&'static str] = &["cans", "isotp"];
+
+    /// The config-file spelling of this protocol, for logs and errors.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cans => "cans",
+            Self::Isotp => "isotp",
+        }
+    }
+
+    /// Parse a `canbus_protocol` value from the config file.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "cans" => Some(Self::Cans),
+            "isotp" => Some(Self::Isotp),
+            _ => None,
+        }
+    }
+}
+
 /// The transport a section asks for, described before anything is opened.
 ///
 /// Keeping the description separate from the opened [`Interface`] is what lets
@@ -129,13 +169,35 @@ pub enum Transport {
         baud: u32,
         uuid: Option<[u8; 6]>,
     },
-    /// A Klipper can-serial link (a CAN interface and a uuid).
+    /// A Klipper can-serial link (a CAN interface and a uuid) on the
+    /// **classical** CAN wire — `canbus_protocol` unset or `cans`,
+    /// `canbus_fd` unset or `false`, today's link.
     ///
     /// The id that addresses the node is **not** part of the transport: it is
     /// the MCU's id at the `[mcu]` level (`McuConfig::id`), allocated to every
     /// MCU regardless of transport (`mcu/ids.rs`); the CAN arm here just
     /// consumes it when the link is opened.
     Can { interface: String, uuid: [u8; 6] },
+    /// The same link on a **CAN FD** wire (`canbus_fd: true`).
+    ///
+    /// One variant rather than a flag on [`Transport::Can`]: the wire is a
+    /// property of the other end's build, not a preference this side may switch
+    /// alone — a socket that has not asked the kernel for CAN FD frames hears
+    /// nothing on an FD bus — so a link says which wire it is. Sixty-four data
+    /// bytes per CAN frame instead of eight ([`CanWire::Fd`]).
+    CanFd { interface: String, uuid: [u8; 6] },
+    /// Klipper's blocks carried as **ISO-TP** messages (`canbus_protocol: isotp`)
+    /// on `wire` (ISO 15765-2).
+    ///
+    /// Reached the same way as a can-serial link — the same socket recipe and
+    /// the same admin `SET_NODEID` — and opened by [`Interface::isotp`]; the
+    /// protocol and the wire are independent choices, so this variant carries
+    /// both.
+    Isotp {
+        interface: String,
+        uuid: [u8; 6],
+        wire: CanWire,
+    },
     /// Klipper's host library, loaded from a shared object.
     ///
     /// `uuid` is the identity the board answers to when the library path is
@@ -276,6 +338,22 @@ impl McuConfig {
     /// MCU-layer id this `[mcu]` takes instead of the one the allocator would hand
     /// out (the key keeps Klipper's spelling).
     ///
+    /// How the link carries Klipper's blocks is two further keys, both
+    /// orthogonal to the uuid and the id:
+    ///
+    /// ```ini
+    /// [mcu]
+    /// uuid: 11aa22bb33cc
+    /// canbus_protocol: isotp   # `cans` by default, Klipper's can-serial link
+    /// canbus_fd: true          # `false` by default, the classical wire
+    /// ```
+    ///
+    /// `canbus_protocol` picks the framing — the can-serial byte stream cut
+    /// every CAN frame, or one block per ISO-TP message (ISO 15765-2) — and
+    /// `canbus_fd` the wire the socket asks the kernel for. Both only apply to
+    /// the CAN family; written on a section with another transport they name a
+    /// second interface, like every other `canbus_*` key.
+    ///
     /// `baud` only applies to `serial`, and defaults to Klipper's 250000.
     ///
     /// A device on a bridge downstream port names the port **section**
@@ -306,6 +384,20 @@ impl McuConfig {
             .clone()
             .unwrap_or_else(|| section.section().id.clone());
         let transport = Self::transport_for(section)?;
+        // `canbus_protocol: isotp` and `canbus_fd: true` are orthogonal choices,
+        // and the pair is legal — but only the classical wire has been exercised
+        // against firmware. Say so once rather than refusing a config that may
+        // well be what the other end is built for.
+        if let Transport::Isotp {
+            wire: CanWire::Fd, ..
+        } = &transport
+        {
+            warn!(
+                "MCU '{name}' sets canbus_protocol: isotp with canbus_fd: the ISO-TP link on a \
+                 CAN FD wire is a valid combination but has not been validated; only the \
+                 classical wire has been exercised"
+            );
+        }
         // A CAN MCU's id is the node id it is addressed with. It is normally the
         // allocator's to hand out at load (`mcu/ids.rs`); the only value parsing
         // knows here is an explicit `canbus_nodeid`, read and validated now and
@@ -316,6 +408,8 @@ impl McuConfig {
         // one at load.
         let id = match &transport {
             Transport::Can { .. }
+            | Transport::CanFd { .. }
+            | Transport::Isotp { .. }
             | Transport::BridgePort {
                 kind: PortKind::Can,
                 ..
@@ -403,6 +497,38 @@ impl McuConfig {
         Ok(method)
     }
 
+    /// Resolve `canbus_protocol`: which protocol carries Klipper's blocks.
+    ///
+    /// Unset is [`CanProtocol::Cans`], Klipper's can-serial link — the same
+    /// transport a section with no `canbus_protocol` has always parsed to. An
+    /// unknown spelling is a config error rather than a silent default: the
+    /// protocol is a pairing with the other end's firmware, so a value nobody
+    /// recognizes has to be reported, as `restart_method` is (`parse_method`).
+    fn parse_can_protocol(section: &ConfigWrapper) -> Result<CanProtocol, ConfigError> {
+        let Some(text) = section.get_str("canbus_protocol") else {
+            return Ok(CanProtocol::default());
+        };
+        CanProtocol::parse(&text).ok_or_else(|| {
+            ConfigError::new(format!(
+                "MCU '{}' has an invalid canbus_protocol: '{text}' (expected one of {})",
+                section.identifier(),
+                CanProtocol::CHOICES.join(", ")
+            ))
+        })
+    }
+
+    /// Resolve `canbus_fd`: which CAN wire the link uses.
+    ///
+    /// Unset is the classical wire (eight data bytes per CAN frame) — the same
+    /// link a section with no `canbus_fd` has always parsed to. The option is
+    /// read through the wrapper's boolean parse, so a value that is not a
+    /// boolean is refused there and the read counts for the undefined-option
+    /// check.
+    fn parse_can_wire(section: &ConfigWrapper) -> Result<CanWire, ConfigError> {
+        let fd = section.get_bool("canbus_fd", Some(false))?;
+        Ok(if fd { CanWire::Fd } else { CanWire::Classical })
+    }
+
     /// Open the transport this config describes.
     ///
     /// An exclusive serial port opens the tty directly and sends **no**
@@ -412,7 +538,7 @@ impl McuConfig {
     ///
     /// # Errors
     /// Returns the transport's own message (`serial: …`, `canbus: …`,
-    /// `host_library: …`) when it cannot be opened.
+    /// `isotp: …`, `host_library: …`) when it cannot be opened.
     pub fn open(&self) -> Result<Interface, String> {
         // Cheetah boards need RTS deasserted for the **whole** connection, not
         // just while resetting, or the board drops into its bootloader
@@ -634,13 +760,23 @@ impl McuConfig {
         // The keys that can name or configure a transport, in the order the
         // conflict error lists the present ones. `uuid`/`canbus_uuid` are the
         // identity, not selectors, but they belong in the list so a conflict
-        // is reported with every key involved. `canbus_interface`/`canbus_nodeid`
-        // sit below the `interface_keys` the conflict counter used to count.
+        // is reported with every key involved. The rest of the CAN family —
+        // `canbus_interface`/`canbus_nodeid` and the two options that only
+        // shape that link — sits below the `interface_keys` the conflict
+        // counter used to count, and is listed here for the same reason.
         let present = || {
             interface_keys()
                 .iter()
                 .copied()
-                .chain(["canbus_interface", "canbus_nodeid"].into_iter())
+                .chain(
+                    [
+                        "canbus_interface",
+                        "canbus_nodeid",
+                        "canbus_protocol",
+                        "canbus_fd",
+                    ]
+                    .into_iter(),
+                )
                 .filter(|key| section.has(key))
                 .collect::<Vec<_>>()
         };
@@ -674,6 +810,8 @@ impl McuConfig {
                 "test",
                 "canbus_interface",
                 "canbus_nodeid",
+                "canbus_protocol",
+                "canbus_fd",
             ]
             .into_iter()
             .filter(|key| section.has(key))
@@ -713,6 +851,8 @@ impl McuConfig {
                 "test",
                 "canbus_interface",
                 "canbus_nodeid",
+                "canbus_protocol",
+                "canbus_fd",
             ]
             .into_iter()
             .filter(|key| section.has(key))
@@ -767,7 +907,10 @@ impl McuConfig {
             // a selector: a CAN port's member is a CAN device and takes it
             // the way a direct CAN link does, while no non-CAN transport has
             // ever accepted it (`serial:`/`host_library:` refuse it), so a
-            // uart port's member refuses it with the same conflict.
+            // uart port's member refuses it with the same conflict. The
+            // CAN family's shaping options (`canbus_protocol`/`canbus_fd`)
+            // belong to the bridge's own link, not to a device hanging on one
+            // of its ports, so a port child refuses them the same way.
             let mut other = [
                 "host_library",
                 "serial",
@@ -775,6 +918,8 @@ impl McuConfig {
                 "can",
                 "test",
                 "canbus_interface",
+                "canbus_protocol",
+                "canbus_fd",
             ]
             .into_iter()
             .filter(|key| *key != kind.reference_option() && section.has(key))
@@ -829,9 +974,16 @@ impl McuConfig {
         #[cfg(test)]
         if section.has("test") {
             // A `test:` simulator and a CAN MCU are two transports.
-            if ["uuid", "canbus_uuid", "canbus_interface", "canbus_nodeid"]
-                .into_iter()
-                .any(|key| section.has(key))
+            if [
+                "uuid",
+                "canbus_uuid",
+                "canbus_interface",
+                "canbus_nodeid",
+                "canbus_protocol",
+                "canbus_fd",
+            ]
+            .into_iter()
+            .any(|key| section.has(key))
             {
                 return Err(too_many());
             }
@@ -844,7 +996,8 @@ impl McuConfig {
 
         // The remaining interface is the CAN family: a uuid (either spelling)
         // names a CAN MCU, and `canbus_interface`/`canbus_nodeid` only set its
-        // interface and id.
+        // interface and id while `canbus_protocol`/`canbus_fd` shape the link
+        // itself — which protocol carries the blocks, and on which wire.
         if section.has("uuid") && section.has("canbus_uuid") {
             return Err(both_uuids());
         }
@@ -865,10 +1018,26 @@ impl McuConfig {
             // `[mcu]` level (see `McuConfig::id`), where parsing keeps only an
             // explicit `canbus_nodeid` and the allocator the rest
             // (`mcu/object.rs`, `mcu/ids.rs`).
-            return Ok(Transport::Can { interface, uuid });
+            let protocol = Self::parse_can_protocol(section)?;
+            let wire = Self::parse_can_wire(section)?;
+            return Ok(match (protocol, wire) {
+                // The default pair: exactly the transport an unset
+                // `canbus_protocol`/`canbus_fd` has always produced.
+                (CanProtocol::Cans, CanWire::Classical) => Transport::Can { interface, uuid },
+                (CanProtocol::Cans, CanWire::Fd) => Transport::CanFd { interface, uuid },
+                (CanProtocol::Isotp, wire) => Transport::Isotp {
+                    interface,
+                    uuid,
+                    wire,
+                },
+            });
         }
 
-        if section.has("canbus_nodeid") || section.has("canbus_interface") {
+        if section.has("canbus_nodeid")
+            || section.has("canbus_interface")
+            || section.has("canbus_protocol")
+            || section.has("canbus_fd")
+        {
             return Err(ConfigError::new(format!(
                 "MCU '{}' needs a uuid to go with its CAN settings",
                 section.identifier()
@@ -886,6 +1055,16 @@ impl McuConfig {
             section.identifier()
         )))
     }
+}
+
+/// The id a CAN family link addresses its node by, or the error that the
+/// allocator has not handed one out yet.
+///
+/// Every CAN family variant needs it the same way: the id is the MCU's at the
+/// `[mcu]` level, and the link cannot be opened before the allocator assigned
+/// one (`mcu/ids.rs`, `mcu/object.rs`).
+fn can_link_id(id: Option<u32>) -> Result<u32, String> {
+    id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())
 }
 
 impl Transport {
@@ -977,9 +1156,25 @@ impl Transport {
                 // A link cannot be opened until the id is known: the allocator
                 // fills it in at connect time (see `mcu/object.rs`), and only an
                 // explicit `canbus_nodeid` is set this early.
-                let id =
-                    id.ok_or_else(|| "canbus: the MCU id has not been assigned".to_string())?;
+                let id = can_link_id(id)?;
                 Interface::canserial(interface, *uuid, id).map_err(|e| format!("canbus: {e}"))
+            }
+            // The same link on a CAN FD wire: the socket is asked for
+            // sixty-four-byte frames, and the same admin `SET_NODEID` opens it.
+            Transport::CanFd { interface, uuid } => {
+                let id = can_link_id(id)?;
+                Interface::canserial_with_wire(interface, *uuid, id, CanWire::Fd)
+                    .map_err(|e| format!("canbus: {e}"))
+            }
+            // Klipper's blocks as ISO-TP messages, on either wire; the id is
+            // the same node id the can-serial link takes.
+            Transport::Isotp {
+                interface,
+                uuid,
+                wire,
+            } => {
+                let id = can_link_id(id)?;
+                Interface::isotp(interface, *uuid, id, *wire).map_err(|e| format!("isotp: {e}"))
             }
             // A muxed path is addressed by id, so it cannot be opened before
             // the allocator has handed one out (`mcu/ids.rs`); a path the config
@@ -1613,6 +1808,228 @@ mod tests {
         let section = section_with("canbus_interface", "can0");
         let err = McuConfig::new(&wrap(&section)).unwrap_err();
         assert!(err.to_string().contains("needs a uuid"), "{err}");
+
+        // The two shaping options are CAN settings too: alone they name no
+        // link any more than `canbus_nodeid` does.
+        for (key, value) in [("canbus_protocol", "isotp"), ("canbus_fd", "true")] {
+            let section = section_with(key, value);
+            let err = McuConfig::new(&wrap(&section)).unwrap_err();
+            assert!(err.to_string().contains("needs a uuid"), "{key}: {err}");
+        }
+    }
+
+    /// The two new keys unset leave the transport exactly what it was — a
+    /// can-serial link on the classical wire — and the spellings of those
+    /// defaults parse to the very same one.
+    #[test]
+    fn test_the_can_family_keys_default_to_todays_link() {
+        let default = McuConfig::new(&wrap(&can_section(&[]))).unwrap();
+        assert_eq!(
+            default.transport,
+            Transport::Can {
+                interface: "can0".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            }
+        );
+        for (key, value) in [("canbus_protocol", "cans"), ("canbus_fd", "false")] {
+            let written = McuConfig::new(&wrap(&can_section(&[(key, value)]))).unwrap();
+            assert_eq!(written.transport, default.transport, "{key}: {value}");
+        }
+        let both = McuConfig::new(&wrap(&can_section(&[
+            ("canbus_protocol", "cans"),
+            ("canbus_fd", "false"),
+        ])))
+        .unwrap();
+        assert_eq!(both.transport, default.transport);
+    }
+
+    /// `canbus_fd: true` picks the same link on a CAN FD wire: one key, one
+    /// transport, with everything else read as before.
+    #[test]
+    fn test_canbus_fd_selects_the_fd_can_link() {
+        let section = can_section(&[("canbus_interface", "can99"), ("canbus_fd", "true")]);
+        let config = McuConfig::new(&wrap(&section)).unwrap();
+        assert_eq!(
+            config.transport,
+            Transport::CanFd {
+                interface: "can99".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            }
+        );
+        // The id override still rides the CAN family, and the link is opened the
+        // can-serial way — so it fails on the socket the test environment does
+        // not have, named the way that link names it.
+        assert_eq!(config.id, Some(2));
+        let err = config.open().unwrap_err();
+        assert!(err.starts_with("canbus: "), "{err}");
+        assert!(err.contains("no CAN interface named 'can99'"), "{err}");
+    }
+
+    /// `canbus_protocol: isotp` picks the ISO-TP link, on the classical wire
+    /// unless `canbus_fd` says otherwise.
+    #[test]
+    fn test_canbus_protocol_isotp_selects_the_isotp_link() {
+        let section = can_section(&[("canbus_interface", "can99"), ("canbus_protocol", "isotp")]);
+        let mut config = McuConfig::new(&wrap(&section)).unwrap();
+        assert_eq!(
+            config.transport,
+            Transport::Isotp {
+                interface: "can99".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+                wire: CanWire::Classical,
+            }
+        );
+        config.id = Some(2);
+        let err = config.open().unwrap_err();
+        assert!(err.starts_with("isotp: "), "{err}");
+        assert!(err.contains("no CAN interface named 'can99'"), "{err}");
+    }
+
+    /// Both keys are parsed strictly: an unknown protocol is reported with the
+    /// choices it should have been, and a value that is not a boolean is refused
+    /// by the wrapper's own boolean parse, which also records the read.
+    #[test]
+    fn test_the_can_family_keys_are_validated() {
+        for bad in ["canbus", "can-serial", "auto", ""] {
+            let err = McuConfig::new(&wrap(&can_section(&[("canbus_protocol", bad)]))).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid canbus_protocol"),
+                "{bad}: {err}"
+            );
+            // The error names the valid choices, so the config can be fixed.
+            assert!(err.to_string().contains("cans, isotp"), "{bad}: {err}");
+        }
+        for bad in ["yes-please", "2", "fd"] {
+            let err = McuConfig::new(&wrap(&can_section(&[("canbus_fd", bad)]))).unwrap_err();
+            assert!(err.to_string().contains("canbus_fd"), "{bad}: {err}");
+        }
+        // Every spelling the wrapper's boolean parse accepts works, on the same
+        // terms every other boolean option gets.
+        for good in ["1", "yes", "true", "on", "0", "no", "false", "off"] {
+            assert!(
+                McuConfig::new(&wrap(&can_section(&[("canbus_fd", good)]))).is_ok(),
+                "{good}"
+            );
+        }
+        for good in CanProtocol::CHOICES {
+            assert!(
+                McuConfig::new(&wrap(&can_section(&[("canbus_protocol", good)]))).is_ok(),
+                "{good}"
+            );
+        }
+    }
+
+    /// Every advertised protocol spelling round-trips, the way `restart_method`'s
+    /// choices do.
+    #[test]
+    fn test_can_protocol_spellings_round_trip() {
+        for spelling in CanProtocol::CHOICES {
+            let protocol = CanProtocol::parse(spelling).unwrap();
+            assert_eq!(protocol.as_str(), *spelling);
+        }
+    }
+
+    /// The two keys only shape a CAN link. On a serial, a host library or a
+    /// `test:` section they name a second interface; on a device hanging on a
+    /// bridge port they would shape the **bridge's** link rather than the
+    /// child's, so the child refuses them the way it refuses
+    /// `canbus_interface`.
+    #[test]
+    fn test_the_can_family_keys_off_a_can_link_are_a_second_interface() {
+        for key in ["canbus_protocol", "canbus_fd"] {
+            let value = if key == "canbus_protocol" {
+                "isotp"
+            } else {
+                "true"
+            };
+            for (base, base_value) in [
+                ("serial", "/dev/ttyACM0"),
+                ("host_library", "/nonexistent/libklipper_host.so"),
+                ("test", "dict=/fake/path.dict"),
+            ] {
+                let mut section = section_with(base, base_value);
+                section
+                    .parameters
+                    .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+                let err = McuConfig::new(&wrap(&section)).unwrap_err();
+                let text = err.to_string();
+                assert!(
+                    text.contains("more than one interface"),
+                    "{base} + {key}: {text}"
+                );
+                assert!(text.contains(key), "the conflict names {key}: {text}");
+            }
+            for reference in ["uart: uart0", "can: can0"] {
+                let port = if reference.starts_with("uart") {
+                    "[uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n"
+                } else {
+                    "[can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n"
+                };
+                let err = parse_section(
+                    &format!(
+                        "[mcu bridge]\nserial: /dev/a\n\
+                         [mcu child]\n{reference}\nuuid: 11aa22bb33cc\n{key}: {value}\n{port}"
+                    ),
+                    "mcu child",
+                )
+                .unwrap_err();
+                let text = err.to_string();
+                assert!(
+                    text.contains("more than one interface"),
+                    "{reference} + {key}: {text}"
+                );
+            }
+        }
+    }
+
+    /// `isotp` on a CAN FD wire is allowed — the protocol and the wire are
+    /// orthogonal, and the pair is a legal configuration — but only the
+    /// classical wire has been exercised against firmware, so the pairing is
+    /// reported rather than silently accepted.
+    #[test]
+    fn isotp_on_can_fd_is_allowed_with_a_warning() {
+        let (config, warnings) = parse_shared(
+            "[mcu]\nuuid: 11aa22bb33cc\ncanbus_protocol: isotp\ncanbus_fd: true\n",
+            "mcu",
+        );
+        let config = config.expect("the orthogonal pair parses");
+        assert_eq!(
+            config.transport,
+            Transport::Isotp {
+                interface: "can0".to_string(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+                wire: CanWire::Fd,
+            }
+        );
+        assert!(
+            warnings.contains("MCU 'mcu'"),
+            "the MCU is named: {warnings}"
+        );
+        assert!(warnings.contains("canbus_protocol"), "{warnings}");
+        assert!(warnings.contains("canbus_fd"), "{warnings}");
+        assert!(
+            warnings.contains("not been validated"),
+            "the unvalidated pairing is stated: {warnings}"
+        );
+    }
+
+    /// The pair that **has** been exercised says nothing: the warning is for the
+    /// FD wire alone, not for choosing ISO-TP.
+    #[test]
+    fn isotp_on_the_classical_wire_is_silent() {
+        let (config, warnings) =
+            parse_shared("[mcu]\nuuid: 11aa22bb33cc\ncanbus_protocol: isotp\n", "mcu");
+        assert!(matches!(
+            config.unwrap().transport,
+            Transport::Isotp {
+                wire: CanWire::Classical,
+                ..
+            }
+        ));
+        assert!(
+            warnings.is_empty(),
+            "the validated pair is not warned about: {warnings}"
+        );
     }
 
     #[test]

@@ -36,6 +36,7 @@
 |------|--------|-----------|
 | `SerialDevice` | `serial:` | tty 上的字节流 |
 | `CanSerialDevice` | `uuid:`（旧名 `canbus_uuid` 兼容）+ `canbus_interface:`（`canbus_nodeid:` 可选，由 MCU id 分配器 `[mcu_ids]`——历史名 `[canbus_ids]` 兼容——分配，`mcu/ids.rs`；其它接口也各分到一个 id——**共享串口**用同一套 `0x100+2*id` 做帧头寻址、并在分配端口时同步握手，**独占串口不使用**） | SocketCAN，**承载的仍是同一份 serial 字节流**；admin 扫描（`klipperx scan` 的 CAN 侧）走单独的 `CanbusAdminSocket`——它直接说 CAN 协议本身，不是 `Device` |
+| `IsotpDevice` | `canbus_protocol: isotp`（+ `canbus_fd:` 选链路）× `uuid:` × `canbus_interface:` | SocketCAN + **ISO 15765-2**：**一条 Klipper 帧 = 一条 ISO-TP 消息**（SF/FF/CF 分段 + FC 流控），承载的仍是同一份 serial 字节流；节点号同样由 admin `0x3f0` 指派（`IsotpDevice::open` 自己发），寻址用同一套 `0x100+2*id`。**`canbus_protocol: cans` + `canbus_fd: true` 则是 `CanSerialDevice` 走 64 字节 CAN-FD 帧**（一帧直接装下 64 B 的 Klipper 消息） |
 | `SharedSerialHandle` | `serial:`（**同一路径被 ≥2 颗 `[mcu]` 引用**，由 `mcu/serial_ports.rs` 在装载期分组） | 同一个 tty 上按 id 分派：单元 = `[2 字节带校验头(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一字节不改），设备在 `+1` 方向回；分配端口时做一次同步握手（节上带 `uuid` 时先按它发 SET_NODEID 再发重确认请求）；发现扫描（`klipperx scan --port`）走同一 admin 信道 `0x3f0/0x3f1`（[串口复用协议](serial-mux-protocol.md)） |
 | `HostDevice` | `host_library:`（**可写 `uuid:`**：指明该路径上被寻址的设备） | `dlopen` 的 klipper host 库，输入/输出都是协议字节；同路径库只加载一次、多引用共享。**这条路径的帧是否带 mux 头由配置层判定**（`mcu/host_libraries.rs`：1 节无 uuid = 裸帧，1 节有 uuid 或 ≥2 节 = 按 id 寻址）。判定为 mux 的路径连接时按 id 寻址——装载期为该路径指派身份、`init` 前投递给库、`SET_NODEID` 点名 + 重确认握手，之后收发都带帧头；字节流始终可用，另有 unit 收发接口（头 + 帧一次交付）供 host 侧快路径 |
 | `FrameMock` | —（仅测试构建，代码里直接建） | 脚本化应答 |
@@ -45,7 +46,7 @@
 
 两个直接后果：
 
-- 改 CAN 不需要另一套协议代码，只需要那个 `0x100 + 2*nodeid` 的映射——它单一定义在 `assign.rs`（CAN 与共享串口共用），`canserial.rs` 的单测钉的是「与这份共享映射逐项一致」，socket 层只经过编译（见 [测试](testing.md)）；
+- 改 CAN 不需要另一套协议代码，只需要那个 `0x100 + 2*nodeid` 的映射——它单一定义在 `assign.rs`（CAN 与共享串口共用），`canserial.rs` 的单测钉的是「与这份共享映射逐项一致」，socket 层只经过编译（见 [测试](testing.md)）。**加 ISO-TP 也没改变这一点**：它换的是 CAN 上那一层分帧（`isotp.rs` 把一整条 Klipper 帧交给 ISO 15765-2 分段，而不是按帧容量切片），字节流、`FrameStream`、`frame.rs` 的块格式与那份映射都没动——`isotp` 与 `cans` 只是同一个字节流的两副 CAN 承载；
 - TRACE 日志里 CAN 打两种行：**分片行**每个 CAN 帧一行（`rx can frame [can0:0x30a]: id 0x30b data 01020304 05060708`，仲裁 id + 8 个数据字节，就是总线上看到的东西），**整块行**按 serial 帧格式打一次（`rx frame [can0:0x30a]: 0a11 | 01020304 05 | 31d87e`）。`rx` 先逐片打分片行、凑齐后再打整块行；`tx` 先打整块行（拆片之前）、再逐片打分片行。**整块只占一个 CAN 帧时两种行也都会打**——总线上的分片与协议里的块不是一回事。
 
 **串口没有寻址能力**：在总线那一侧，仲裁 id 由 CAN 硬件负责，而一条串口线上只有一个字节流。所以「同一个 `serial:` 路径被 ≥2 颗 `[mcu]` 引用」时，地址头得主机自己加：单元 = `[2 字节带校验头(0x100 + 2*mcu_id)] ++ 原始帧`（帧体一个字节不改；头为 10 数据位 + 4 检测位，任何 1/2 位错丢单元），设备在 `+1` 方向回；端口只开一次，主机侧**唯一 reader** 按头分派到每颗 MCU 自己的 `FrameStream`，并用**分配期同步握手**（identify 之前，无回执即连接失败）确认设备懂这套协议。只被 1 颗引用时一切与 Klipper 相同（无头、无握手）。完整线上规格与设备端要求见[串口复用协议](serial-mux-protocol.md)；装载期分组在 `mcu/serial_ports.rs`，端口/reader/分派/握手在 `interface/devices/serial.rs`；按路径复用同一资源的公共肋（`Weak` 注册表 + `resource_for`）在 `interface/devices/shared.rs`。`host_library:` 走另一条共享路：`interface/devices/host.rs` 里一个路径的库只 `dlopen` 一次（`HostLibrary`，同一套 `resource_for` 肋按路径复用），多个通讯引用（`HostDevice`）共享它，最后一个引用析构才收线程并卸载；`shutdown` 只停本引用（旧固件没有桥，同一时刻只能有一路活动引用，见[模块表](README.md)）。

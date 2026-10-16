@@ -6,6 +6,7 @@
 //! | [`serial`] | a tty (exclusive), or a tty shared by several MCUs (the serial mux) | `serial:` |
 //! | [`shared`] | the reuse spine: one resource per path, several references (shared by serial & host) | — |
 //! | [`canserial`] | Klipper's can-serial link | `uuid:` |
+//! | [`isotp`] | Klipper's blocks over ISO-TP on CAN (ISO 15765-2) | `uuid:` |
 //! | [`host`] | Klipper's host library, loaded once, several communication references | `host_library:` |
 //! | `frame_mock` | a frame-level mock (test builds only) | — |
 //! | `simulator` | a dictionary-driven fake MCU (test builds only) | `test: dict=` |
@@ -19,6 +20,8 @@ pub mod canserial;
 #[cfg(test)]
 pub mod frame_mock;
 pub mod host;
+pub mod isotp;
+pub mod isotp_proto;
 #[cfg(test)]
 pub mod responder_mcu;
 pub mod serial;

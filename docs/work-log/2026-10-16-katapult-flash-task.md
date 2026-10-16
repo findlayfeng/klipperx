@@ -1,7 +1,8 @@
 # Katapult 拓扑刷写：动工前调查、决策与任务拆分（2026-10-16）
 
-> 状态：**五单元全部验收（T1/T4a/T2a/T4b/T2b），闸门全绿**；余 T3（桥隧道）、T5（拓扑流程）；
-> 真机测试等接线形态确认。合并时需先合子模组分支再更新 gitlink（见 §8 T2b 条）。
+> 状态：**五单元全部验收 + katapult 真机自举闭环（含 deployer 真写入）已验证**；
+> 余 T3（桥隧道）、T5（拓扑流程）；真机 USB-CDC 直刷已验，CAN 直连仍待真机。
+> 合并进行中：先合子模组分支再更新 gitlink（见 §8 T2b 条）。
 > 规格缺口先查 §8 附录（三路侦察全文，file:line 级）。
 > 本篇是一次性调查记录（非规范）；实现落地后按 work-log 惯例补「实施记录」节。
 
@@ -68,7 +69,7 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 3. **工具（主机侧，自研）**：§1 的状态机——复位拓扑 → `SET_PORT_NODEID` 配路径 →
    `REQUEST_BOOTLOADER` → 隧道刷写（katapult 6 命令 + 重试节拍：`tries=5`、`read_timeout=2s`、
    prime 帧、busy/NACK 处理，`flashtool.py:321-406`）→ `COMPLETE` → 重新握手验收。
-   直连路径直接说裸 katapult 帧（CAN/独占口/USB 现成可用）。
+   直连路径直接说裸 katapult 帧（CAN/独占口/USB 现成可用；**USB-CDC 直刷已真机实测**，CAN 仍夹具级）。
 4. **验收锚点**：坏帧只丢弃不误投的性质已被钉死（上表「握手」「共存」两行的测试），
    隧道设计沿用同一原则；桥的隧道模式要配自己的永久测试（参照 mux 端口命令族探针
    `test_the_bridge_port_commands_over_the_real_library` 的做法）。
@@ -117,6 +118,20 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 5. 工具重试节拍取自 flashtool（5 次 / 2s），隧道增加了桥转发延迟，上限值需在 T5 实测调。
 
 ## 8. 实施记录（随实现回填，本节是唯一随实现更新的节）
+
+**2026-10-16 katapult 自举实测（真机 STM32F103ZE + USB CDC，两轮，非 T 序列）**：
+- 配置：choice「Build Katapult deployment application」`0000→2000`（`BUILD_DEPLOYER` 随之开，
+  `LAUNCH` 不变 0x8002000）；第二轮再改 serial 号来源 `CHIPID→"devloop1"` 当换血标记。
+- 第一轮（字节相同彩排）：读回证明板上原固件 == 改配置后的构建（4304 B 逐字节）；`flash` bin
+  真机刷 `deployer.bin`（83 块+verify，rc=0）；双复位后读回三段全对。**当时盲区：deployer 走
+  equal-快路径，写引导区循环未执行**（已记入 skill）。
+- 第二轮（换血）：新镜像 4264 B（首差异 offset 896），deployer **写引导区循环首次真实执行**，
+  新枚举 `usb-katapult_stm32f103xe_devloop1-if00` 活体 CONNECT + 读回 `boot==新 katapult.bin`
+  True + `app==新 deployer.bin` True——**自举闭环（含真写入）全部验证**。
+- 沉淀：`.agents/skills/katapult-self-update`（`3ec1821`）。实测坑：首撞 CONNECT 失败=双复位窗口
+  （两轮都撞到，等 2s 重试）；读回应答 addr 在帧偏移 8、data 从 12；`.config` 不改 `git describe`
+  ⇒ 版本串不可作验证依据（读回比对才是）；deployer 留在应用区掉电自恢复（代码级推演+两轮实跑）。
+- **保持未测**：写保护下限的越界写（测了=冒真砖，只留 `flashcmd.c:90` 代码级声明）；CAN 直连真机。
 
 **2026-10-16 T2b（固件 mux.c 半 + 真库测试）完成**：固件子模组分支 `agents/feat-mux-tunnel-unit`
 （klipper 仓库 @ `a5ecd95a`，`src/mux.c` +35/-0：`mux_unit_len` 的 `01 88` 分支与 5 个宏，英文前缀提交）；

@@ -129,6 +129,16 @@ enum Commands {
     // bus.
     #[command(arg_required_else_help = true)]
     Scan(klipperx::scan::ScanArgs),
+
+    /// Flash firmware to a board running the katapult bootloader
+    //
+    // One direct link, one firmware file, one katapult session — the grammar the
+    // standalone `flash` binary used to speak, now the subcommand's: a serial
+    // tty/USB path or a SocketCAN bus, chosen by the arguments. Naming neither
+    // is not a flash with a guess but a question, so a bare `flash` prints this
+    // help, the same courtesy `klippy` and `scan` get.
+    #[command(arg_required_else_help = true)]
+    Flash(klipperx::flash::cli::FlashArgs),
 }
 
 fn main() {
@@ -142,6 +152,7 @@ fn main() {
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
         (Some(Commands::Scan(args)), _) => klipperx::scan::run(args).map(|()| 0),
+        (Some(Commands::Flash(args)), _) => klipperx::flash::cli::run(args).map(|()| 0),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
@@ -524,6 +535,61 @@ mod tests {
         let error = parse(&["scan", "--help"]).expect_err("the help is not a scan");
         let help = error.to_string();
         for option in ["--interface", "--port", "--timeout", "--baud"] {
+            assert!(help.contains(option), "{option} is missing from:\n{help}");
+        }
+    }
+
+    #[test]
+    fn test_the_flash_subcommand_reuses_the_flash_grammar() {
+        // The standalone `flash` binary is gone; its grammar is the
+        // subcommand's, option for option. A bare `flash` is still a question
+        // answered with the help, and naming a link and a firmware is still a
+        // flash.
+        let error = parse(&["flash"]).expect_err("a flash needs a link");
+        let help = error.to_string();
+        assert!(help.contains("--device"), "{help}");
+
+        let cli = parse(&["flash", "--device", "/dev/ttyACM0", "fw.bin"])
+            .expect("the link and the firmware are the subcommand's");
+        match cli.command {
+            Some(Commands::Flash(args)) => {
+                assert_eq!(args.device.as_deref(), Some("/dev/ttyACM0"));
+                assert_eq!(
+                    args.firmware.as_deref(),
+                    Some(std::path::Path::new("fw.bin"))
+                );
+            }
+            other => panic!("expected `flash`, got {other:?}"),
+        }
+
+        // The CAN spelling and the query shortcut travel too: the subcommand
+        // is the binary's grammar, not a copy of part of it.
+        let cli = parse(&[
+            "flash",
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33cc",
+            "fw.bin",
+        ])
+        .expect("the CAN link is the subcommand's");
+        match cli.command {
+            Some(Commands::Flash(args)) => {
+                assert_eq!(args.interface.as_deref(), Some("can0"));
+                assert_eq!(args.uuid.as_deref(), Some("11aa22bb33cc"));
+            }
+            other => panic!("expected `flash`, got {other:?}"),
+        }
+        let cli = parse(&["flash", "-q", "--interface", "can0"]).expect("a query is a flash");
+        match cli.command {
+            Some(Commands::Flash(args)) => assert!(args.query),
+            other => panic!("expected `flash`, got {other:?}"),
+        }
+
+        // And the help names the options, like the other bench tools.
+        let error = parse(&["flash", "--help"]).expect_err("the help is not a flash");
+        let help = error.to_string();
+        for option in ["--device", "--interface", "--uuid", "-q"] {
             assert!(help.contains(option), "{option} is missing from:\n{help}");
         }
     }

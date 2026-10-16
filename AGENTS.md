@@ -150,7 +150,7 @@ git config core.hooksPath .githooks
 ## 技能（skills）
 
 项目级 skill 放在 **`.agents/skills/<名>/SKILL.md`**（随仓库走，pi 从工作目录向上发现，到仓库根为止）；
-需要时用 `/skill:<名>` 显式加载。当前两份：
+需要时用 `/skill:<名>` 显式加载。当前六份：
 
 | skill | 何时用 |
 |-------|--------|
@@ -159,6 +159,7 @@ git config core.hooksPath .githooks
 | [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md) | 开任务分支/worktree、子模组 worktree、`KLIPPERX_KLIPPER_DIR` 构建、ff vs `--no-ff` 判定、`abandoned/*` 归档、并发构建与收尾 |
 | [`doc-sync`](.agents/skills/doc-sync/SKILL.md) | 改完同步手册的**清单**：改动→手册映射表、写死数字重核、旧断言/已完成标号清理、删档案前分流 |
 | [`subagent-briefing`](.agents/skills/subagent-briefing/SKILL.md) | 写子代理任务书：六要素模板、纪律块、防超时三板斧、worker/scout/reviewer 分工与路由 |
+| [`python-tools`](.agents/skills/python-tools/SKILL.md) | 加/用 Python 工具的固定流程：没有 `venv/` 先 `python3 -m venv venv` → 用 `venv/bin/pip` 装 → 之后一切 Python 只写 `venv/bin/python`、`venv/bin/<工具>` 的**绝对路径** |
 
 新手法（工具/设备/流程）沉淀优先考虑做成 skill；**规则与纪律**（本节各节）仍写在 `AGENTS.md`。
 

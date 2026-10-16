@@ -95,6 +95,16 @@ const RESET_IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long to wait between reopen attempts.
 const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
 
+/// How long the discovery broadcast a run sends when it has **no**
+/// `--bridge-uuid` waits for an answer, after the restart dropped the bridge's
+/// node id.
+///
+/// The scan is the one `klipperx scan --port` uses; it runs to the end of this
+/// window even after a board answers, so the budget is the price of not knowing
+/// the identity up front. Long enough for a board to finish coming back up,
+/// short enough that [`RESET_TIMEOUT`] still has room to retry.
+const DISCOVER_WINDOW: Duration = Duration::from_secs(2);
+
 /// The bridge device the run holds directly, one variant per link it can be
 /// opened on: the host library the config calls muxed, or a shared serial port.
 ///
@@ -195,6 +205,47 @@ impl BridgeOpen {
                 Ok((link, BridgeDevice::Shared(handle)))
             }
         }
+    }
+}
+
+/// Broadcast the unassigned query on the bridge's tty and return the identity
+/// of the one bridge that answers.
+///
+/// A bridge's node id lives in its firmware's RAM, so the restart
+/// [`BridgeLink::reset`] performs drops it; a run that has no `--bridge-uuid`
+/// to name the bridge with has to **find** it, and the discovery broadcast is
+/// how — the one query an unassigned board answers, the same call
+/// `klipperx scan --port` makes.
+///
+/// # Errors
+/// [`BridgeFlashError::AmbiguousBridge`] when more than one bridge answers:
+/// naming the wrong one would restart and re-assign the wrong board, so this
+/// refuses to guess. A tty that cannot be opened or read is
+/// [`BridgeFlashError::Open`], and **no** answer at all is
+/// [`InterfaceError::Timeout`] — which [`BridgeLink::reopen`] retries, because a
+/// bridge that has not finished coming back up is not yet unassigned, it is
+/// simply not there yet.
+fn discover_bridge_uuid(path: &Path, baud: u32) -> Result<[u8; 6], BridgeFlashError> {
+    let mut port = serial::SerialDevice::open(path, baud).map_err(BridgeFlashError::Open)?;
+    let mut first: Option<[u8; 6]> = None;
+    let total = serial::serial_query_unassigned(&mut port, DISCOVER_WINDOW, |node| {
+        if first.is_none() {
+            first = Some(node.uuid);
+        }
+    })
+    .map_err(|e| {
+        BridgeFlashError::Open(InterfaceError::Other(format!(
+            "discovery scan on {}: {e}",
+            path.display()
+        )))
+    })?;
+    match total {
+        0 => Err(BridgeFlashError::Open(InterfaceError::Timeout)),
+        1 => Ok(first.expect("the scan reported exactly one bridge")),
+        count => Err(BridgeFlashError::AmbiguousBridge {
+            count,
+            path: path.to_path_buf(),
+        }),
     }
 }
 
@@ -435,28 +486,80 @@ impl BridgeLink {
 
     /// Open a fresh connection from [`open`](BridgeLink::open) and identify it,
     /// retried (bounded) while the restarted bridge is coming back up.
+    ///
+    /// The retry is also what absorbs a bridge that is not up yet: an attempt
+    /// that finds nothing to attach to (its tty does not answer, or the scan a
+    /// uuid-less run sends finds no unassigned bridge) is dropped and tried
+    /// again until [`RESET_TIMEOUT`] is spent. A run that has to **find** the
+    /// bridge's identity is the exception that does not retry: an answer that
+    /// names several bridges is a hard error
+    /// ([`BridgeFlashError::AmbiguousBridge`]), because a wrong guess would
+    /// restart and re-assign the wrong board.
     async fn reopen(&self) -> Result<LiveBridge, BridgeFlashError> {
         let deadline = Instant::now() + RESET_TIMEOUT;
         loop {
-            let last = match self.open.build() {
-                Ok((link, device)) => {
-                    let mcu = Mcu::new("bridge", link.clone());
-                    match mcu.identify(RESET_IDENTIFY_TIMEOUT).await {
-                        Ok(_) => return Ok(LiveBridge { mcu, link, device }),
-                        Err(e) => {
-                            mcu.close();
-                            e.to_string()
-                        }
-                    }
-                }
+            let last = match self.open_after_restart().await {
+                Ok(live) => return Ok(live),
+                Err(e @ BridgeFlashError::AmbiguousBridge { .. }) => return Err(e),
                 Err(e) => e.to_string(),
             };
             if Instant::now() >= deadline {
                 return Err(BridgeFlashError::Reset(format!(
-                    "the bridge did not come back within {RESET_TIMEOUT:?}: {last}"
+                    "the bridge did not come back within {RESET_TIMEOUT:?}: {last}{}",
+                    self.rediscover_hint()
                 )));
             }
             tokio::time::sleep(RESET_RETRY_DELAY).await;
+        }
+    }
+
+    /// One reopen attempt: open the transport the restart left behind, name the
+    /// bridge when it has to be named, and identify.
+    async fn open_after_restart(&self) -> Result<LiveBridge, BridgeFlashError> {
+        let (link, device) = match &self.open {
+            BridgeOpen::Serial {
+                path,
+                baud,
+                mcu_id,
+                uuid,
+            } => {
+                // A restart drops the bridge's node id (it lives in the
+                // firmware's RAM), so a serial bridge has to be **named** again
+                // before it answers: the uuid the caller gave, or one the
+                // discovery scan finds on its now-unassigned line.
+                let uuid = match uuid {
+                    Some(uuid) => *uuid,
+                    None => discover_bridge_uuid(path, *baud)?,
+                };
+                let handle =
+                    serial::attach(path, *baud, *mcu_id, SERIAL_ATTACH_TIMEOUT, Some(uuid))
+                        .map_err(BridgeFlashError::Open)?;
+                let link = Interface::shared_serial(Arc::clone(&handle));
+                (link, BridgeDevice::Shared(handle))
+            }
+            // A host library never restarts, so `reset` never reopens one; the
+            // shared construction keeps the two paths from drifting.
+            BridgeOpen::Host { .. } => self.open.build()?,
+        };
+        let mcu = Mcu::new("bridge", link.clone());
+        mcu.identify(RESET_IDENTIFY_TIMEOUT)
+            .await
+            .map_err(BridgeFlashError::Identify)?;
+        Ok(LiveBridge { mcu, link, device })
+    }
+
+    /// The tail a reset timeout carries when the bridge had to be found rather
+    /// than named: the flag that would have skipped the scan.
+    fn rediscover_hint(&self) -> String {
+        match &self.open {
+            BridgeOpen::Serial {
+                path, uuid: None, ..
+            } => format!(
+                "; no --bridge-uuid was given and the discovery scan found no unassigned \
+                 bridge — pass --bridge-uuid (take it from `klipperx scan --port {}`)",
+                path.display()
+            ),
+            _ => String::new(),
         }
     }
 
@@ -584,6 +687,16 @@ pub enum BridgeFlashError {
         /// The firmware's own shutdown reason.
         reason: String,
     },
+    /// Several unassigned bridges answered the discovery scan a serial bridge
+    /// opened without a `--bridge-uuid` sends after its restart: which one this
+    /// run means cannot be told, and a wrong guess would restart and re-assign
+    /// the wrong board.
+    AmbiguousBridge {
+        /// How many distinct bridges answered.
+        count: usize,
+        /// The tty the scan ran on.
+        path: PathBuf,
+    },
     /// The katapult session over the tunnel failed.
     Session(FlashError),
     /// The target's node id names no arb (only `1..=255` are addressable).
@@ -612,6 +725,13 @@ impl fmt::Display for BridgeFlashError {
             BridgeFlashError::Shutdown { reason } => {
                 write!(f, "the bridge's firmware shut down: {reason}")
             }
+            BridgeFlashError::AmbiguousBridge { count, path } => write!(
+                f,
+                "{count} unassigned bridges answered on {}; pass --bridge-uuid to name this \
+                 one (take it from `klipperx scan --port {}`)",
+                path.display(),
+                path.display()
+            ),
             BridgeFlashError::Session(e) => write!(f, "flashing: {e}"),
             BridgeFlashError::Unaddressable { node_id } => write!(
                 f,
@@ -632,6 +752,7 @@ impl std::error::Error for BridgeFlashError {
             BridgeFlashError::Unaddressable { .. }
             | BridgeFlashError::UnassignedSerial { .. }
             | BridgeFlashError::Reset(_)
+            | BridgeFlashError::AmbiguousBridge { .. }
             | BridgeFlashError::Shutdown { .. } => None,
         }
     }
@@ -1553,5 +1674,148 @@ mod tests {
         link.close();
         drop(link);
         drop(firmware);
+    }
+
+    /// A bridge→host answer to the discovery broadcast, as the firmware's
+    /// `mux_need_nodeid` builds it and `klipperx scan --port` decodes: the admin
+    /// reply header, then the `KXID` frame carrying [`RESP_NEED_NODEID`] and the
+    /// six uuid bytes ([`serial::RESP_NEED_NODEID`], no application byte).
+    fn unassigned_answer(uuid: [u8; 6]) -> Vec<u8> {
+        use crate::core::klippy::frame::Frame;
+        let mut body = serial::MAGIC.to_vec();
+        body.push(serial::RESP_NEED_NODEID);
+        body.extend_from_slice(&uuid);
+        let mut unit = serial::encode_header(serial::ADMIN_REPLY);
+        unit.extend_from_slice(&Frame::with_wire_seq(serial::ASSIGN_SEQ_BYTE, body).raw_bytes());
+        unit
+    }
+
+    /// Two runs against one bridge with **no** `--bridge-uuid`: each run restarts
+    /// the firmware, which drops its node id, finds it again with the discovery
+    /// scan, re-assigns it, and flashes. That is the shape a re-used bridge takes
+    /// when the caller only knows its tty — and the reassignment is proven by the
+    /// session running over the tunnel at all, since the tunnel's route needs the
+    /// id the scan found.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_two_runs_against_the_same_bridge_without_a_uuid() {
+        const BRIDGE_UUID: [u8; 6] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6];
+
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        // The bridge's id, as a run that had `--bridge-uuid` would have left it:
+        // the runs below do not know it and have to find it again.
+        drop(
+            serial::attach(
+                firmware.serial_path(),
+                250_000,
+                BRIDGE_MCU_ID,
+                Duration::from_millis(500),
+                Some(BRIDGE_UUID),
+            )
+            .expect("the bridge adopts its node id"),
+        );
+
+        let mut link =
+            BridgeLink::open_serial(firmware.serial_path(), 250_000, BRIDGE_MCU_ID, None)
+                .expect("the assigned bridge answers the re-confirmation");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the linux bridge identifies");
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let payload: Vec<u8> = (0..100u8).collect();
+
+        let first = link
+            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .await
+            .expect("the first run, after finding the bridge by scan");
+        let second = link
+            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .await
+            .expect("the second run, after finding the bridge by scan again");
+
+        for summary in [&first, &second] {
+            assert_eq!(summary.start_addr, 0x0800_2000);
+            assert_eq!(summary.block_size, 64);
+            assert_eq!(summary.mcu_type, "STM32F103");
+            assert_eq!(summary.bytes_flashed, payload.len());
+            assert_eq!(summary.block_count, 2);
+        }
+        assert_eq!(fake.seen(command::CONNECT), 2, "one session per run");
+        assert_eq!(fake.seen(command::COMPLETE), 2);
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+        link.close();
+        drop(link);
+        drop(firmware);
+    }
+
+    /// A tty that answers nothing to the discovery scan names no bridge: the
+    /// scan is a bounded [`InterfaceError::Timeout`], which the reopen retries
+    /// (the bridge may still be coming back up), not a guess.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_discovery_scan_with_no_answer_is_a_timeout() {
+        let pty = Pty::new();
+        let err =
+            discover_bridge_uuid(&pty.path, 250_000).expect_err("a silent tty names no bridge");
+        assert!(
+            matches!(err, BridgeFlashError::Open(InterfaceError::Timeout)),
+            "{err}"
+        );
+    }
+
+    /// Two unassigned bridges on one line and no `--bridge-uuid`: naming either
+    /// would restart and re-assign the other, so the run refuses to guess.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_discovery_scan_with_two_bridges_refuses_to_guess() {
+        let pty = Pty::new();
+        let mut master = pty.master.try_clone().expect("the pty master clones");
+        let responder = std::thread::spawn(move || {
+            // Bounded: the scan sends its broadcast at once, so a poll that runs
+            // out means the fixture never got it and the join must not hang.
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, 5_000) } <= 0 {
+                return;
+            }
+            let mut query = [0u8; 256];
+            if master.read(&mut query).unwrap_or(0) == 0 {
+                return;
+            }
+            master
+                .write_all(&unassigned_answer([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]))
+                .expect("the first bridge answers");
+            master
+                .write_all(&unassigned_answer([0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f]))
+                .expect("the second bridge answers");
+        });
+
+        let err =
+            discover_bridge_uuid(&pty.path, 250_000).expect_err("two bridges cannot be told apart");
+        assert!(
+            matches!(err, BridgeFlashError::AmbiguousBridge { count: 2, .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("--bridge-uuid"), "{err}");
+        responder.join().expect("the responder thread");
     }
 }

@@ -45,7 +45,7 @@ pub(crate) mod fake;
 mod tests;
 
 pub use bridge_session::{
-    open_bridge, BridgeError, BridgeLink, BridgePort, BridgeReady, BridgeTarget, PortReset,
+    open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget, PortReset,
 };
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};
 pub use session::{

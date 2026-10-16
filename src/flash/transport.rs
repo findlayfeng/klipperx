@@ -455,6 +455,91 @@ mod tests {
         );
     }
 
+    /// The tty path end to end: a pty pair plays the port, the scripted
+    /// fake bootloader answers behind the master, and the full session runs
+    /// over [`open_tty`]. The first bytes the device sees are the prime
+    /// frame, golden byte for byte, before the `CONNECT` that follows it.
+    #[test]
+    fn test_open_tty_primes_then_the_session_flashes_over_the_pty() {
+        use crate::core::klippy::interface::pty::Pty;
+        use crate::flash::fake::FakeBootloader;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let pty = Pty::new();
+        let fake = FakeBootloader::new();
+        let raw = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        // The board behind the master: every byte the host writes is fed to
+        // the fake, every answer goes back out, and the raw wire bytes are
+        // kept for the prime assertion.
+        let bridge = {
+            let raw = Arc::clone(&raw);
+            let stop = Arc::clone(&stop);
+            let mut writer = fake.writer();
+            let mut reader = fake.reader();
+            let mut master = pty.master.try_clone().expect("the master clones");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 256];
+                let mut out = [0u8; 256];
+                while !stop.load(Ordering::Relaxed) {
+                    let mut poll = libc::pollfd {
+                        fd: master.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let rc = unsafe { libc::poll(&mut poll, 1, 20) };
+                    if rc > 0 {
+                        let n = master.read(&mut buf).expect("the master reads");
+                        if n == 0 {
+                            break;
+                        }
+                        raw.lock().expect("raw lock").extend_from_slice(&buf[..n]);
+                        writer.write_all(&buf[..n]).expect("the fake takes it");
+                    }
+                    match reader.read(&mut out) {
+                        Ok(n) => master.write_all(&out[..n]).expect("the master takes it"),
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                        Err(e) => panic!("the fake reader: {e}"),
+                    }
+                }
+            })
+        };
+
+        // Open (raw mode plus the prime) and run the whole flash.
+        let link = open_tty(pty.path.to_str().expect("a utf-8 path"), 115_200)
+            .expect("the port opens, primes and drains");
+        let (mut reader, mut writer) = link.split();
+        let payload = b"katapult direct tty".to_vec();
+        let cfg = SessionConfig {
+            tries: 3,
+            read_timeout: Duration::from_millis(200),
+            retry_delay: Duration::from_millis(10),
+            busy_delay: Duration::from_millis(10),
+        };
+        let summary = session::flash_with_config(&mut reader, &mut writer, &payload, &cfg, |_| {})
+            .expect("the session runs over the tty");
+        assert_eq!(summary.bytes_flashed, payload.len());
+        assert_eq!(summary.block_count, 1);
+
+        stop.store(true, Ordering::Relaxed);
+        bridge.join().expect("the bridge thread exits");
+
+        // The prime came first on the wire: header, echo 0x88, the invalid
+        // command, an empty payload, CRC 0xE9E5 little-endian, trailer.
+        let raw = raw.lock().expect("raw lock");
+        assert_eq!(&raw[..8], &[0x01, 0x88, 0x90, 0x00, 0xe5, 0xe9, 0x99, 0x03]);
+
+        // The device stored exactly the payload, padded to the block size.
+        let memory = fake.memory();
+        assert_eq!(memory.len(), 1);
+        let stored = memory.values().next().expect("one block stored");
+        let mut want = payload;
+        want.resize(64, 0xFF);
+        assert_eq!(stored, &want);
+    }
+
     /// The admin constants are the channel `flashtool.py` names, and the
     /// command bytes are katapult's — not klipper's admin values.
     #[test]

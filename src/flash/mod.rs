@@ -19,7 +19,14 @@
 //! Modules:
 //! - [`frame`] — pure encode/decode plus a sliding-window scanner that finds
 //!   frames in a stream, skipping garbage one byte at a time.
+//! - [`session`] — the transport-agnostic flash session: connect →
+//!   send_block × N → eof → verify → complete, over any `Read + Write`.
 
 pub mod frame;
+pub mod session;
 
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};
+pub use session::{
+    command, complete, connect, eof, flash, flash_with_config, get_canbus_id, request_block,
+    send_block, FlashError, SessionConfig, Summary,
+};

@@ -316,6 +316,24 @@ fn build(klipper_dir: &Path, target_dir: &Path, config_text: &str) -> PathBuf {
 }
 
 /// The data dictionary a build produced, which every target emits.
+/// The `-j` count this build script hands `make`.
+///
+/// The machine's parallelism, or `KLIPPERX_MAKE_JOBS` when a caller wants
+/// fewer (an override is read per call, so a change re-runs the build).
+fn make_jobs() -> usize {
+    println!("cargo:rerun-if-env-changed=KLIPPERX_MAKE_JOBS");
+    if let Some(value) = std::env::var("KLIPPERX_MAKE_JOBS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+    {
+        return value;
+    }
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(2)
+}
+
 fn require_dict(klipper_out: &Path) -> PathBuf {
     let dictionary = klipper_out.join("klipper.dict");
     assert!(
@@ -333,6 +351,14 @@ fn make(klipper_dir: &Path, config: &Path, klipper_out: &Path, targets: &[&str])
         // a command line value overrides them.
         .arg(format!("KCONFIG_CONFIG={}", config.display()))
         .arg(format!("OUT={}/", klipper_out.display()))
+        // Build one klipper target with `-j`, as a person would: this build
+        // script asks for several targets (two host libraries and one
+        // dictionary per enabled architecture), and without it every target's
+        // sources are compiled one at a time — minutes of wall clock on a
+        // machine that has cores to spare. `make` still owns ordering; the job
+        // count is the machine's own (a `KLIPPERX_MAKE_JOBS` override is there
+        // because a constrained CI box may want fewer).
+        .arg(format!("-j{}", make_jobs()))
         .args(targets)
         .status()
         .unwrap_or_else(|e| {

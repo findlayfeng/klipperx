@@ -519,7 +519,16 @@ canbus_fd: true | false           # 链路层；默认 false
   只回收 worktree。改动清单一字未动地留在 §8.1–§8.4，恢复时直接照它下任务书。
 - **挂起只影响 FD 的固件半边**；2b 不受影响（见 §9.2 的阶段表）。
 
-### ⏸ 暂停点（2026-10-16，用户指示「暂存工作」）
+### ⏸→▶ 暂停点与恢复（2026-10-16）
+
+> **已恢复（同日）**：用户指示「恢复」。下面记录暂停时刻的快照，**已在恢复时重派**：
+> 主机侧 ISO-TP 设备层（`agents/feat-can-isotp-device`）、固件 ISO-TP 从站（子模组
+> `agents/can-isotp-firmware`）、以及 `linux` 目标 SocketCAN 的只读侦察（三者并行）。
+> 另：暂停时列的「全量闸门未跑」已拆开验证——`cargo test -p klipperx --lib` **3018 passed**
+> 与 `cargo test -p klippy-client`（**164+1+2** passed，即 AGENTS 点名的“`--lib` 漏掉
+> `klippy-client` 集成测试”这个历史坑）均已在 feature worktree 上跑绿；剩下的
+> `cargo test --workspace` 与它的差别只在**重编全部架构固件**，而本分支 `third_party` gitlink
+> 未改 ⇒ 留给合入 `work` 前闸门（2b 落地后就变成必需）。
 
 **状态已固定，没有任何未提交改动；未跑 `git stash`、未丢弃任何东西。**
 
@@ -542,7 +551,7 @@ canbus_fd: true | false           # 链路层；默认 false
 
 | 单元 | 状态 |
 |---|---|
-| 2b 固件 ISO-TP 从站 | 已派出任务书，运行中被停，**零产出**（worktree 干净、分支零提交）。任务书内容与冻结规格留档在本节与 §5.2，可直接重发——重建一个子模组 worktree（`git -C third_party/klipper worktree add <路径> -b agents/can-isotp-firmware HEAD`）即可 |
+| 2b 固件 ISO-TP 从站 | ✅ **恢复时已重派**（子模组 worktree `can-isotp-fw`）。任务书要点与冻结规格在 §5.2 与本节 |
 | 3a 配置面（`canbus_protocol`/`canbus_fd` 两个键） | 未开工。1a+1b 已就绪，无前置 |
 | 4 `linux` 目标 SocketCAN | 未开工，**需先侦察**控制台角色的选择机制与接口名怎么传（未派） |
 | 5 真机 / vcan | 未开工。卡在**两个输入**：真机 STM32 型号（决定阶段 5 验收板）、`vcan` 需用户一次性 `sudo ip link add dev vcan0 type vcan` |

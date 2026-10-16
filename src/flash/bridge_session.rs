@@ -291,14 +291,13 @@ mod tests {
     use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::config::{Config, ConfigWrapper};
     use crate::core::klippy::frame::{MESSAGE_HEADER_SIZE, MESSAGE_TRAILER_SIZE};
-    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
+    use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN, CMD_RESET_PORT,
         CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
-    use crate::core::klippy::mcu::bridge_attach::wait_for_mux_library_unload;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::msg::parser::Parser;
@@ -638,6 +637,34 @@ mod tests {
         out
     }
 
+    /// Block (bounded) until the process-wide library on `path` is unloaded,
+    /// then return — and **fail here** rather than warning.
+    ///
+    /// Releasing [`HOST_LIBRARY_TEST_LOCK`] with the mux library still loaded is
+    /// what makes the *next* host-library test meet a live image and fail with
+    /// "only one host library per process", so the blame has to land on this
+    /// test. The probe is [`HostDevice::load_bytes`] in another output mode: it
+    /// fails while the mux library is live and succeeds (dropping the probe
+    /// unloads it again) once it is gone — the same test as
+    /// `bridge_attach::wait_for_mux_library_unload`, but bounded with a panic so
+    /// a stuck teardown cannot smuggle a live library past the lock.
+    fn wait_for_library_unload(path: &std::path::Path) {
+        for _ in 0..200 {
+            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
+                Ok(probe) => {
+                    drop(probe);
+                    return;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!(
+            "the mux host library at {} was still loaded after 2s; the next \
+             library test would meet a live image",
+            path.display()
+        );
+    }
+
     /// The session over a real bridge: the mux host library loaded as a bridge
     /// with two ports on real ptys — port 0 the flashing target (legacy, sitting
     /// in its bootloader), port 1 a named device the bridge restarts.
@@ -655,7 +682,15 @@ mod tests {
     /// the bridge's own (consumed, never written to a port, no receipt), and
     /// `RESTART_DEVICE` for port 1 is forwarded to it header-stripped — the bare
     /// `KXID` frame a legacy port's line carries.
-    #[tokio::test]
+    ///
+    /// `multi_thread` is not incidental: [`Mcu::close`] only **aborts** the
+    /// transport tasks, and on the default current-thread runtime an abort is
+    /// processed by the runtime — which is idle while the test thread blocks in
+    /// the unload wait below. The aborted tasks would keep their `Interface`
+    /// clones (and so the library) until the runtime is dropped *after* the lock
+    /// is released, leaving the mux library live for the next test. On worker
+    /// threads the aborts land while the wait runs, and the library unloads.
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_open_bridge_over_the_real_library() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
@@ -752,11 +787,12 @@ mod tests {
 
         // The connection's transport tasks hold references to the library, so
         // its drop is not synchronous with `drop(mcu)`: close it, let the
-        // blocked device read see the shutdown, then wait the library out. The
-        // next test on this path has to meet a fresh firmware, not this session.
+        // blocked device read see the shutdown, then wait the library out — all
+        // of it under `_serial`, whose scope is the whole test, so the next
+        // library test cannot start before this path is free.
         mcu.close();
         drop(mcu);
         drop(link);
-        wait_for_mux_library_unload(&library);
+        wait_for_library_unload(&library);
     }
 }

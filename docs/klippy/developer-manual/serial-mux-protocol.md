@@ -144,8 +144,13 @@ id**（`mcu_id_from_arb`），方向本身由奇偶区分（`is_reply_arb`）。
 - **unit 层不校验内层**：只按 framing 切整段（tag、word-count 定长一致、8..=128），**不校验内层
   CRC、不校验 cmd 字节**——内层校验归刷写会话。双向：主机→设备用 `arb_id`、设备→主机用
   `reply_arb_id`（寻址不变）。
-- **消费**：主机收线识别到隧道单元即整段消费；尚无消费者时记 debug 并干净丢弃，**绝不**落进
-  `drop_to_sync` 吃流（其后普通单元照常切出，有测试钉住）。
+- **消费（T5c 起有投递口）**：主机收线识别到隧道单元即整段消费，并**按 arb 投给注册过该 arb 的监听者**
+  （`TunnelSink::channel()` / `set_tunnel_sink(arb)` / `clear_tunnel_sink(arb)`；三条链路同形：共享串口
+  `SharedSerialHandle`、host 库 `HostDevice`、CAN `CanSerialDevice`）。投的是**整帧字节**（消息 = 一个 katapult
+  块），消费方不必重新分帧；**未注册时仍记 debug 丢弃**，**绝不**落进 `drop_to_sync` 吃流（其后普通单元
+  照常切出，有测试钉住）；接收端 drop 后 `send` 失败 ⇒ 自动注销并回到丢弃。主机侧的 `Read+Write`
+  适配器在 `src/flash/bridge.rs`（`TunnelBridge::split()` → `TunnelReader`/`TunnelWriter`；writer
+  只发**整个 katapult 块**，reader 非阻塞 `WouldBlock`），刷写会话直接就着它跑。
 - **与固件侧是共享契约**：判据与常量集中在 `serial.rs` 的「The tunnel unit」一节，固件 `mux.c`
   **已按同一判据镜像落地**（`mux_unit_len` 的 `01 88` 分支：子模组提交 `a5ecd95a`，真库测试
   `test_the_mux_tunnel_units_over_the_real_library` 钉住行为；两侧措辞与数字一致，无差异点）。

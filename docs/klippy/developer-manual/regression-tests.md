@@ -115,7 +115,7 @@ connect_file(输出文件, 字典):
 |----|------|
 | `.test` 文件 | 37 |
 | 运行（`CONFIG` 块） | 239（`printers.test` 占 203） |
-| `test/configs/*.config` 目标 | 44 |
+| `test/configs/*.config` 目标 | 47 |
 | 被 `.test` 引用的目标 | 28 |
 
 按 `CONFIG_MACH_<FAMILY>` 聚合（`目标` 为该架构的 kconfig 片段数，`引用` 为声明该架构字典
@@ -124,9 +124,9 @@ connect_file(输出文件, 字典):
 | 架构 | 目标 | 引用 | 说明 |
 |------|------|------|------|
 | `avr` | 7 | 34 | 默认字典（几乎所有功能用例） |
-| `stm32` | 20 | 1 | `printers.test` |
+| `stm32` | 22 | 1 | `printers.test` |
 | `avr` | 7 | 33 | 默认字典（`tmc.test` 批 #39 已摘出） |
-| `linux` | 2 | 2 | `linuxtest.test`、`printers.test`；**本地可编，默认启用**（`linuxprocess` + `linuxprocess-mux`） |
+| `linux` | 3 | 2 | `linuxtest.test`、`printers.test`；**本地可编，默认启用**（`linuxprocess` + `linuxprocess-mux` + `linuxprocess-can`） |
 | `atsam` | 5 | 1 | `printers.test` |
 | `atsamd` | 2 | 1 | `printers.test` |
 | `hc32f460` | 2 | 1 | `printers.test` |
@@ -178,9 +178,11 @@ connect_file(输出文件, 字典):
 | `z_tilt.test` | 1 | `avr` |
 | `z_virtual_endstop.test` | 1 | `avr` |
 
-默认列表（`linux` + `avr` + 各 ARM 家族）会构建 41 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
-全部具备（另有 14 份没被引用的目标也一并编出，作为编译覆盖，含 `linuxprocess-mux`（linux 可命名
-固件）、`stm32f103-can-mux`（CAN 载体的 `MUX_CAN`）与 `stm32f103-{usb,serial}-mux`（MCU 侧两种
+默认列表（`linux` + `avr` + 各 ARM 家族）会构建 44 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
+全部具备（另有 17 份没被引用的目标也一并编出，作为编译覆盖，含 `linuxprocess-mux`（linux 可命名
+固件）、`linuxprocess-can`（linux 的 SocketCAN can-serial 控制台，`LINUX_CANSERIAL`——真
+`klipper.elf` 能绑 SocketCAN 当 can-serial 节点）、`stm32f103-can-mux`（CAN 载体的 `MUX_CAN`）
+与 `stm32f103-{usb,serial}-mux`（MCU 侧两种
 载体的 `MUX_SERIAL`——后两个是唯一让 `usb_cdc.c`/`serial_irq.c` 的 mux 接线与 `mcu_restart()`
 进入闸门的目标））。引用 `pru` 的运行只有 2 条（`printers.test`
 里 `DICTIONARY pru.dict host=linuxprocess.dict` 那一组），它们因字典未构建被跳过。

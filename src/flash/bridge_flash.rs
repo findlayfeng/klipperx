@@ -1749,6 +1749,14 @@ mod tests {
             .await
             .expect("the second run, after finding the bridge by scan again");
 
+        // The two runs' own numbers, and the firmware's report of both port
+        // opens: two restarts, two re-declarations, two assignments.
+        println!(
+            "two runs without a uuid:\n  first:  {first:?}\n  second: {second:?}\n\
+             firmware stderr:\n{}",
+            firmware.stderr()
+        );
+
         for summary in [&first, &second] {
             assert_eq!(summary.start_addr, 0x0800_2000);
             assert_eq!(summary.block_size, 64);

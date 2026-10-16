@@ -363,30 +363,47 @@ pub fn open_can(
         pending: VecDeque::new(),
     };
 
-    // `flashtool.py` `_reset_nodes`: one broadcast, so no other board keeps
-    // a stale node id from a previous session.
-    bus.write_frame(ADMIN_ID, &[CMD_CLEAR_NODE_ID])?;
-
-    // `flashtool.py` `_set_node_id`: the command, the UUID most significant
-    // byte first, the node id.
-    let mut payload = [0u8; CAN_DATA_BYTES];
-    payload[0] = CMD_SET_NODE_ID;
-    payload[1..7].copy_from_slice(&uuid);
-    payload[7] = nodeid as u8;
-    bus.write_frame(ADMIN_ID, &payload)?;
+    // `flashtool.py` `_reset_nodes` and `_set_node_id`, below.
+    assign_node(&mut bus, uuid, nodeid)?;
 
     // The UUID check: `GET_CANBUS_ID` over the data channel the assignment
     // just opened. Anything else answering (wrong UUID, wrong node id) is
     // caught before the flash starts.
     let mut reader = bus.try_clone()?;
-    let got = session::get_canbus_id(&mut reader, &mut bus, cfg)?;
+    check_uuid(&mut reader, &mut bus, uuid, cfg)?;
+    Ok((reader, bus))
+}
+
+/// The two admin frames that open a node session for `uuid`:
+/// `flashtool.py`'s `_reset_nodes` (one broadcast, so no other board keeps
+/// a stale node id) followed by `_set_node_id` (the command, the UUID most
+/// significant byte first, the node id).
+fn assign_node(bus: &mut CanBus, uuid: [u8; 6], nodeid: u32) -> Result<(), TransportError> {
+    bus.write_frame(ADMIN_ID, &[CMD_CLEAR_NODE_ID])?;
+
+    let mut payload = [0u8; CAN_DATA_BYTES];
+    payload[0] = CMD_SET_NODE_ID;
+    payload[1..7].copy_from_slice(&uuid);
+    payload[7] = nodeid as u8;
+    bus.write_frame(ADMIN_ID, &payload)?;
+    Ok(())
+}
+
+/// Ask the data channel who it is, and refuse anyone but `uuid`.
+fn check_uuid<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    uuid: [u8; 6],
+    cfg: &SessionConfig,
+) -> Result<(), TransportError> {
+    let got = session::get_canbus_id(reader, writer, cfg)?;
     if got != uuid {
         return Err(TransportError::UuidMismatch {
             expected: uuid,
             got,
         });
     }
-    Ok((reader, bus))
+    Ok(())
 }
 
 impl CanBus {
@@ -412,11 +429,13 @@ mod tests {
     use super::*;
 
     /// The prime is the frame `flashtool.py` sends: invalid command 0x90,
-    /// empty payload, the CRC over `[0x90, 0x00]`.
+    /// empty payload, the CRC over `[0x90, 0x00]` — value `0xE9E5`, on the
+    /// wire little-endian (`struct.pack("<H")` in `flashtool.py`), so
+    /// `… e5 e9 …`.
     #[test]
     fn test_prime_frame_bytes() {
         let prime = frame::build_frame(PRIME_CMD, &[]);
-        assert_eq!(prime, [0x01, 0x88, 0x90, 0x00, 0xe9, 0xe5, 0x99, 0x03]);
+        assert_eq!(prime, [0x01, 0x88, 0x90, 0x00, 0xe5, 0xe9, 0x99, 0x03]);
     }
 
     /// The data ids of a node session: `tx = 0x100 + 2×nodeid`, `rx = tx+1`,

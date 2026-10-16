@@ -580,7 +580,7 @@ fn run_bridge_flash(
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let link = open_bridge_link(&target)?;
+        let mut link = open_bridge_link(&target)?;
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;

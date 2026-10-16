@@ -61,6 +61,7 @@ use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
     admin_unit, set_port_node_id, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
+    CMD_SET_PORT_TUNNEL,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -767,6 +768,16 @@ impl CanSerialDevice {
     /// The same as [`Device::send`].
     pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
         self.send_bytes(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index]))
+    }
+
+    /// Toggle the flashing tunnel of bridge port `index`:
+    /// [`CMD_SET_PORT_TUNNEL`]'s unit, on the byte stream like
+    /// [`CanSerialDevice::send_set_port_node_id`].
+    ///
+    /// # Errors
+    /// The same as [`Device::send`].
+    pub fn send_set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
+        self.send_bytes(&admin_unit(&[CMD_SET_PORT_TUNNEL, index]))
     }
 }
 
@@ -1889,6 +1900,12 @@ mod tests {
         let bootloader = admin_unit(&[CMD_REQUEST_BOOTLOADER, 1]);
         device.send_request_bootloader(1).unwrap();
         assert_unit_on_the_wire(&device, &mut wire, &bootloader);
+
+        // SET_PORT_TUNNEL (0x06): toggles port 1's flashing tunnel mode, the
+        // same serial-side unit one command byte on.
+        let set_port_tunnel = admin_unit(&[CMD_SET_PORT_TUNNEL, 1]);
+        device.send_set_port_tunnel(1).unwrap();
+        assert_unit_on_the_wire(&device, &mut wire, &set_port_tunnel);
     }
 
     #[test]

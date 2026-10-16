@@ -868,8 +868,8 @@ mod tests {
     }
 
     /// Tears a host-library bring-up down when it drops, so a test that panics
-    /// before its own cleanup leaves neither the machine (and so the library)
-    /// alive for the next test on the path nor the bridge's tty symlink behind.
+    /// before its own cleanup does not leave the machine (and so the library)
+    /// alive for the next test on the path.
     ///
     /// `teardown` drops the parts the config loaded and the event handlers they
     /// registered; without it the `SAVE_CONFIG` handler's strong `Arc<Printer>`
@@ -883,19 +883,13 @@ mod tests {
     struct BridgeTeardown {
         printer: Option<Arc<Printer>>,
         library: std::path::PathBuf,
-        bridge_path: std::path::PathBuf,
     }
 
     impl BridgeTeardown {
-        fn new(
-            printer: Arc<Printer>,
-            library: std::path::PathBuf,
-            bridge_path: std::path::PathBuf,
-        ) -> Self {
+        fn new(printer: Arc<Printer>, library: std::path::PathBuf) -> Self {
             Self {
                 printer: Some(printer),
                 library,
-                bridge_path,
             }
         }
 
@@ -915,7 +909,6 @@ mod tests {
                 drop(printer);
             }
             wait_for_mux_library_unload(&self.library);
-            let _ = std::fs::remove_file(&self.bridge_path);
         }
     }
 
@@ -1065,13 +1058,7 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            // The teardown removes the path a test linked into the build: this
-            // one links nothing, so what it hands back is its own pty.
-            pty.path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -1119,19 +1106,6 @@ mod tests {
         let firmware =
             klipperx_test_support::LinuxFirmware::spawn().expect("the firmware process starts");
 
-        // The bridge keeps its build-baked tty as a live pty, so the only
-        // difference from the E1 chain is the port's own path.
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
-
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
@@ -1147,7 +1121,6 @@ mod tests {
         let teardown = BridgeTeardown::new(
             Arc::new(Printer::new(Arc::clone(&reactor))),
             library.clone(),
-            bridge_path.clone(),
         );
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
@@ -1274,19 +1247,6 @@ mod tests {
         let firmware = klipperx_test_support::LinuxFirmware::spawn_named(NAMED_DOWNSTREAM_UUID)
             .expect("the mux firmware process starts");
 
-        // The bridge keeps its build-baked tty as a live pty, so the only
-        // difference from the legacy chain is the port's own path.
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
-
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
@@ -1302,7 +1262,6 @@ mod tests {
         let teardown = BridgeTeardown::new(
             Arc::new(Printer::new(Arc::clone(&reactor))),
             library.clone(),
-            bridge_path.clone(),
         );
         let printer = teardown.printer();
 
@@ -1443,19 +1402,6 @@ mod tests {
             "the two ports need distinct ttys"
         );
 
-        // The bridge keeps its build-baked tty as a live pty, as in the
-        // single-port chain above.
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
-
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
@@ -1475,7 +1421,6 @@ mod tests {
         let teardown = BridgeTeardown::new(
             Arc::new(Printer::new(Arc::clone(&reactor))),
             library.clone(),
-            bridge_path.clone(),
         );
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
@@ -1605,24 +1550,20 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // No tty at the path this build baked in: the port cannot be opened.
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
+        // The port names a tty that is not there: it cannot be opened.
+        let missing = "/nonexistent/klipperx-missing-port-tty";
 
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             uart_path: {missing}\n\
              [mcu child]\nuart: uart0\n",
             library.display()
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            bridge_path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -1773,33 +1714,24 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The bridge opens its port during init, so the tty has to exist first.
+        // The bridge opens its port during init, so the tty has to exist first —
+        // the port's own `uart_path:`, named for its slot when the library comes
+        // up.
         let pty = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                pty.path.display()
-            )
-        });
 
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
+             uart_path: {}\n\
              [mcu child]\nuart: uart0\nuuid: 998877665544\n",
-            library.display()
+            library.display(),
+            pty.path.display()
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            bridge_path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -1841,12 +1773,12 @@ mod tests {
     /// built with.
     ///
     /// Two ptys say which one it was: `runtime` is the port's `uart_path:`, and
-    /// the path the library baked in (`CONFIG_HOST_BRIDGE_SERIAL_PATH`) is linked
-    /// to the second. The bridge comes up over the library exactly as in
+    /// the bridge comes up over the library exactly as in
     /// `the_config_driven_legacy_route_reaches_the_bridge_port`, so the child's
-    /// bare identify request has to arrive on the **runtime** pty while the other
-    /// one stays silent. A host that ignored `uart_path:` would open the baked
-    /// path, which turns both assertions red.
+    /// bare identify request has to arrive on the **runtime** pty. A host that
+    /// ignored `uart_path:` would open the path the library was built with — one
+    /// nothing links, so that port would fail its `config_uart` and the request
+    /// would never arrive: the assertion below is red.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ports_uart_path_is_the_tty_the_bridge_opens() {
         let _serial = HOST_LIBRARY_TEST_LOCK
@@ -1854,16 +1786,6 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         let runtime = Pty::new();
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
 
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
@@ -1876,11 +1798,7 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            bridge_path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -1895,12 +1813,6 @@ mod tests {
              arrives there; the pty at {} got {bytes:02x?}",
             runtime.path.display()
         );
-        // Enough time for the task loop to have opened anything it was going to.
-        assert!(
-            read_pty(&baked.master, 1, Duration::from_millis(500)).is_empty(),
-            "the tty the library was built with must not be opened at all once the port names \
-             its own"
-        );
     }
 
     /// A port whose `uart_path:` is not there fails the **configuration**, and
@@ -1908,28 +1820,14 @@ mod tests {
     /// names that tty, and the firmware's own `config_uart` message is what the
     /// bring-up reports.
     ///
-    /// The path the library was built with is linked to a live pty here, so a
-    /// host that fell back to it would open that one and come up. The failure
-    /// itself is therefore the evidence that the run-time path was adopted, and
-    /// the stderr line says which tty was tried.
+    /// The path is the **host's** one, so a host that fell back to the path the
+    /// library was built with would name that one instead: the stderr line below
+    /// is what says the run-time path was adopted.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_missing_uart_path_tty_fails_the_configuration() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-
-        // The build's own path is a live tty, so it is not the reason for the
-        // failure below.
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
 
         let missing = "/nonexistent/klipperx-missing-port-tty";
         let library = klipperx_test_support::klipper_host_mux_lib_path();
@@ -1941,11 +1839,7 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            bridge_path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -2012,19 +1906,8 @@ mod tests {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
-        // The build's own path is a live tty, so the missing port path is the
-        // only reason the bridge cannot come up.
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
-
+        // The port names a tty that never appears, which is the only reason the
+        // bridge cannot come up.
         let missing = "/nonexistent/klipperx-bridge-port-never-returns";
         let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
@@ -2035,11 +1918,7 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the test config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(
-            Arc::new(Printer::new(reactor)),
-            library.clone(),
-            bridge_path.clone(),
-        );
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
 
@@ -2103,19 +1982,6 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
 
         tokio::time::timeout(Duration::from_secs(120), async {
-            // The bridge's build-baked tty is a live pty, so the bridge itself is
-            // not the reason its port cannot open.
-            let baked = Pty::new();
-            let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-            let _ = std::fs::remove_file(&bridge_path);
-            std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-                panic!(
-                    "failed to link {} to {}: {e}",
-                    bridge_path.display(),
-                    baked.path.display()
-                )
-            });
-
             // The port tty is a directory: present to `Path::exists()`, but
             // `open` fails — the case a restart cannot mend.
             let directory = std::env::temp_dir().join(format!(
@@ -2136,11 +2002,7 @@ mod tests {
             );
             let config = Config::from_text(&text).expect("the test config parses").0;
             let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-            let teardown = BridgeTeardown::new(
-                Arc::new(Printer::new(reactor)),
-                library.clone(),
-                bridge_path.clone(),
-            );
+            let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
             let printer = teardown.printer();
             printer.load_config(&config).expect("the config loads");
 
@@ -2233,19 +2095,6 @@ mod tests {
                 )
             });
 
-            // The bridge keeps its build-baked tty alive, so only the port's own
-            // path changes across the phases.
-            let baked = Pty::new();
-            let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-            let _ = std::fs::remove_file(&bridge_path);
-            std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-                panic!(
-                    "failed to link {} to {}: {e}",
-                    bridge_path.display(),
-                    baked.path.display()
-                )
-            });
-
             let library = klipperx_test_support::klipper_host_mux_lib_path();
             let text = format!(
                 "[mcu bridge]\nhost_library: {}\n\
@@ -2257,11 +2106,7 @@ mod tests {
             );
             let config = Config::from_text(&text).expect("the test config parses").0;
             let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-            let teardown = BridgeTeardown::new(
-                Arc::new(Printer::new(reactor)),
-                library.clone(),
-                bridge_path.clone(),
-            );
+            let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.clone());
             let printer = teardown.printer();
             printer.load_config(&config).expect("the config loads");
 
@@ -2371,26 +2216,13 @@ mod tests {
 
     /// A `[mcu bridge]` over the real host library with one **named** child on
     /// `uart0`, whose `uart_path` is `port_link` — the same shape the real
-    /// board runs (`restart_method: admin` included). The bridge's build-baked
-    /// tty is kept alive too, so a run that adopted the run-time path is the only
-    /// one that can open `port_link`.
+    /// board runs (`restart_method: admin` included), so a run that adopted the
+    /// run-time path is the only one that can open `port_link`.
     ///
     /// Returns the guard (it owns the printer) plus the printer and the parsed
     /// config, so a test can rebuild the machine (`reset_for_restart` +
     /// `load_config`) the way the host's run loop does.
-    fn named_child_bridge(
-        port_link: &std::path::Path,
-    ) -> (Pty, BridgeTeardown, Arc<Printer>, Config) {
-        let baked = Pty::new();
-        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
-        let _ = std::fs::remove_file(&bridge_path);
-        std::os::unix::fs::symlink(&baked.path, &bridge_path).unwrap_or_else(|e| {
-            panic!(
-                "failed to link {} to {}: {e}",
-                bridge_path.display(),
-                baked.path.display()
-            )
-        });
+    fn named_child_bridge(port_link: &std::path::Path) -> (BridgeTeardown, Arc<Printer>, Config) {
         let uuid_hex: String = NAMED_CHILD_UUID
             .iter()
             .map(|byte| format!("{byte:02x}"))
@@ -2407,10 +2239,10 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the test config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library, bridge_path);
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library);
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
-        (baked, teardown, printer, config)
+        (teardown, printer, config)
     }
 
     /// Break the port tty the bridge holds, the way a downstream re-enumeration
@@ -2482,7 +2314,7 @@ mod tests {
             std::os::unix::fs::symlink(first.serial_path(), &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_baked, _teardown, printer, config) = named_child_bridge(&port_link);
+            let (_teardown, printer, config) = named_child_bridge(&port_link);
             let library = klipperx_test_support::klipper_host_mux_lib_path();
 
             // Phase 1: the whole chain comes up on the real named downstream.
@@ -2587,7 +2419,7 @@ mod tests {
             std::os::unix::fs::symlink(&silent.path, &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_baked, _teardown, printer, _config) = named_child_bridge(&port_link);
+            let (_teardown, printer, _config) = named_child_bridge(&port_link);
             let capture = StderrCapture::start(&_serial, "child-port-never-returns");
             let breaker = tokio::spawn(break_bridge_port(
                 capture.path().to_path_buf(),
@@ -2662,7 +2494,7 @@ mod tests {
             std::os::unix::fs::symlink(&silent.path, &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_baked, _teardown, printer, config) = named_child_bridge(&port_link);
+            let (_teardown, printer, config) = named_child_bridge(&port_link);
             let library = klipperx_test_support::klipper_host_mux_lib_path();
 
             // Round 1: the child's handshake times out, and the host spends its

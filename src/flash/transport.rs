@@ -267,6 +267,19 @@ impl CanBus {
         })
     }
 
+    /// A bus over any datagram socket: the kernel CAN socket delivers one
+    /// frame per datagram, and so does a unix datagram pair — which is what
+    /// the tests drive, needing no interface and no privileges.
+    #[cfg(test)]
+    pub(crate) fn over_dgram(socket: File, tx_id: u32, rx_id: u32) -> Self {
+        Self {
+            socket,
+            tx_id,
+            rx_id,
+            pending: VecDeque::new(),
+        }
+    }
+
     /// The kernel's frame struct is what a socket read delivers, so a frame
     /// is one datagram: parse it back out of those bytes.
     fn recv_frame(&mut self) -> Result<Option<CanFrame>, TransportError> {
@@ -427,6 +440,8 @@ pub(crate) const ADMIN_RESP: u32 = 0x3f1;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    use std::os::unix::net::UnixDatagram;
 
     /// The prime is the frame `flashtool.py` sends: invalid command 0x90,
     /// empty payload, the CRC over `[0x90, 0x00]` — value `0xE9E5`, on the
@@ -512,12 +527,7 @@ mod tests {
             .expect("the port opens, primes and drains");
         let (mut reader, mut writer) = link.split();
         let payload = b"katapult direct tty".to_vec();
-        let cfg = SessionConfig {
-            tries: 3,
-            read_timeout: Duration::from_millis(200),
-            retry_delay: Duration::from_millis(10),
-            busy_delay: Duration::from_millis(10),
-        };
+        let cfg = fast_session();
         let summary = session::flash_with_config(&mut reader, &mut writer, &payload, &cfg, |_| {})
             .expect("the session runs over the tty");
         assert_eq!(summary.bytes_flashed, payload.len());
@@ -538,6 +548,176 @@ mod tests {
         let mut want = payload;
         want.resize(64, 0xFF);
         assert_eq!(stored, &want);
+    }
+
+    /// The timing a transport test runs on: the session defaults, minus
+    /// the seconds — the fake and the fixtures answer inside milliseconds.
+    fn fast_session() -> SessionConfig {
+        SessionConfig {
+            tries: 3,
+            read_timeout: Duration::from_millis(200),
+            retry_delay: Duration::from_millis(10),
+            busy_delay: Duration::from_millis(10),
+        }
+    }
+
+    /// One classical frame as a socket delivers it: the ABI bytes of `id`
+    /// carrying `data`.
+    fn abi_datagram(id: u32, data: &[u8]) -> Vec<u8> {
+        CanFrame::new(id, data)
+            .expect("a chunk is at most one frame's worth")
+            .to_abi(CanWire::Classical)
+            .expect("a classical chunk fits a classical frame")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// One datagram off the device side of a pair, decoded as the frame it
+    /// carries. The side must be non-blocking: an empty queue is a panic.
+    fn recv_datagram(dev: &std::os::unix::net::UnixDatagram) -> CanFrame {
+        let mut raw = [0u8; CAN_FD_FRAME_SIZE];
+        let n = dev.recv(&mut raw).expect("one datagram");
+        assert!(n >= CAN_FRAME_SIZE, "one datagram is one whole frame");
+        CanFrame::from_abi(CanWire::Classical, &raw)
+    }
+
+    /// The bus is one datagram per frame both ways: a stream longer than a
+    /// frame's worth goes out sliced into 8-byte frames, and a reply comes
+    /// back reassembled — every frame that is not the node's dropped.
+    #[test]
+    fn test_can_slices_the_stream_out_and_reassembles_the_reply() {
+        let (host, dev) = UnixDatagram::pair().expect("a datagram pair");
+        // SAFETY: the raw fd is consumed by this `File` from here on.
+        let host = unsafe { File::from_raw_fd(host.into_raw_fd()) };
+        let (tx_id, rx_id) = (0x200, 0x201);
+        let mut bus = CanBus::over_dgram(host, tx_id, rx_id);
+
+        // Out: 20 bytes as 8 + 8 + 4, every slice on the node's tx id.
+        let stream: Vec<u8> = (0u8..20).collect();
+        bus.write_all(&stream).expect("the stream goes out");
+        dev.set_nonblocking(true).expect("non-blocking reads");
+        let mut sent = Vec::new();
+        let mut raw = [0u8; CAN_FD_FRAME_SIZE];
+        while let Ok(n) = dev.recv(&mut raw) {
+            assert!(n >= CAN_FRAME_SIZE, "one datagram is one whole frame");
+            let frame = CanFrame::from_abi(CanWire::Classical, &raw);
+            assert_eq!(frame.id(), tx_id);
+            sent.extend_from_slice(frame.data());
+        }
+        assert_eq!(sent, stream);
+
+        // In: the reply on rx id with a foreign frame in the middle — only
+        // the node's bytes are handed to the session.
+        let reply: Vec<u8> = (100u8..116).collect();
+        dev.send(&abi_datagram(ADMIN_ID, &[0xEE; 8]))
+            .expect("a foreign frame");
+        for chunk in reply.chunks(CAN_DATA_BYTES) {
+            dev.send(&abi_datagram(rx_id, chunk))
+                .expect("a reply frame");
+        }
+        let mut got = Vec::new();
+        while got.len() < reply.len() {
+            let n = bus.read(&mut raw).expect("the reply reads");
+            assert_ne!(n, 0, "the reply arrived in full");
+            got.extend_from_slice(&raw[..n]);
+        }
+        assert_eq!(got, reply);
+    }
+
+    /// The two admin frames `assign_node` sends, golden byte for byte: the
+    /// clear broadcast, then the assignment — command 0x11, the UUID most
+    /// significant byte first, the node id.
+    #[test]
+    fn test_assign_node_pins_the_admin_frame_bytes() {
+        let (host, dev) = UnixDatagram::pair().expect("a datagram pair");
+        let host = unsafe { File::from_raw_fd(host.into_raw_fd()) };
+        let mut bus = CanBus::over_dgram(host, 0x200, 0x201);
+        let uuid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab];
+        assign_node(&mut bus, uuid, 0x83).expect("the assignment goes out");
+
+        dev.set_nonblocking(true).expect("non-blocking reads");
+        let clear = recv_datagram(&dev);
+        assert_eq!(clear.id(), ADMIN_ID);
+        assert_eq!(clear.data(), &[0x12]);
+        let set = recv_datagram(&dev);
+        assert_eq!(set.id(), ADMIN_ID);
+        assert_eq!(
+            set.data(),
+            &[0x11, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0x83]
+        );
+        assert!(
+            dev.recv(&mut [0u8; CAN_FD_FRAME_SIZE]).is_err(),
+            "exactly two admin frames went out"
+        );
+    }
+
+    /// The UUID check asks the data channel who it is (`GET_CANBUS_ID`,
+    /// one frame on the node's tx id) and accepts the board it asked for.
+    #[test]
+    fn test_check_uuid_accepts_the_requested_board() {
+        let (host, dev) = UnixDatagram::pair().expect("a datagram pair");
+        let host = unsafe { File::from_raw_fd(host.into_raw_fd()) };
+        let (tx_id, rx_id) = (0x200, 0x201);
+        let mut bus = CanBus::over_dgram(host, tx_id, rx_id);
+        let mut reader = bus.try_clone().expect("a second handle");
+        let uuid = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab];
+
+        // The board's answer is queued before the ask: one socket carries
+        // both directions, so no second thread is needed.
+        let mut data = u32::from(frame::command::GET_CANBUS_ID)
+            .to_le_bytes()
+            .to_vec();
+        data.extend_from_slice(&uuid);
+        data.extend_from_slice(&[0x00, 0x00]);
+        let answer = frame::build_frame(frame::ACK_SUCCESS, &data);
+        for chunk in answer.chunks(CAN_DATA_BYTES) {
+            dev.send(&abi_datagram(rx_id, chunk))
+                .expect("an answer frame");
+        }
+
+        check_uuid(&mut reader, &mut bus, uuid, &fast_session())
+            .expect("the board answers as asked");
+
+        let ask = recv_datagram(&dev);
+        assert_eq!(ask.id(), tx_id);
+        assert_eq!(
+            ask.data(),
+            &frame::build_frame(frame::command::GET_CANBUS_ID, &[])[..]
+        );
+    }
+
+    /// A different board answering the check is refused before the flash
+    /// starts, and the error names both UUIDs.
+    #[test]
+    fn test_check_uuid_refuses_a_different_board() {
+        let (host, dev) = UnixDatagram::pair().expect("a datagram pair");
+        let host = unsafe { File::from_raw_fd(host.into_raw_fd()) };
+        let (tx_id, rx_id) = (0x200, 0x201);
+        let mut bus = CanBus::over_dgram(host, tx_id, rx_id);
+        let mut reader = bus.try_clone().expect("a second handle");
+        let wanted = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab];
+        let other = [0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54];
+
+        let mut data = u32::from(frame::command::GET_CANBUS_ID)
+            .to_le_bytes()
+            .to_vec();
+        data.extend_from_slice(&other);
+        data.extend_from_slice(&[0x00, 0x00]);
+        let answer = frame::build_frame(frame::ACK_SUCCESS, &data);
+        for chunk in answer.chunks(CAN_DATA_BYTES) {
+            dev.send(&abi_datagram(rx_id, chunk))
+                .expect("an answer frame");
+        }
+
+        let err = check_uuid(&mut reader, &mut bus, wanted, &fast_session())
+            .expect_err("another UUID is refused");
+        match err {
+            TransportError::UuidMismatch { expected, got } => {
+                assert_eq!(expected, wanted);
+                assert_eq!(got, other);
+            }
+            other_err => panic!("expected a UUID mismatch, got {other_err:?}"),
+        }
     }
 
     /// The admin constants are the channel `flashtool.py` names, and the

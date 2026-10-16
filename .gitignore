@@ -2,6 +2,12 @@
 
 # Local debug configuration, not part of the tree.
 /config.cfg
+
+# Python tooling is a local venv (see .agents/skills/python-tools).
+# venv writes its own `venv/.gitignore` (a lone `*`), but keep the entry here as
+# well: the ignore must not depend on what generated the directory.
+/venv/
+
 src/core/klippy/upstream_generated/cases/
 src/core/klippy/upstream_generated/fixtures/
 src/core/klippy/upstream_generated/mod.rs

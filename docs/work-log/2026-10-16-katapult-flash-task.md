@@ -259,6 +259,33 @@ klipper 设备自发 1 Hz `stats` 帧、上一轮未读的应答头还留在流�
 **停在 katapult 的设备**（不说 mux、不应答单元）只能 `RESET_PORT (0x04)` 做线脉冲，或走端口节的
 `uart_restart_method`。**缺口**：今天没有「全拓扑一次复位」的现成入口（那是 T5）。
 
+**2026-10-16 T3（桥刷写隧道）验收并合入**：子模组分支 `agents/feat-bridge-tunnel` 合入 `klipperx`（`2a4de04f`，
+`bridge.c` +78/−1：`bridge_port_tunnel_scan`/`_up`、`bridge_port_scan` 的 `p->tunnel` 分支、
+`bridge_add_port` 清 `tunnel`；`mux.c`/`mux.h` 未动——0x06 与契约已在 T2b/`a5ecd95a` 落地）；
+主仓分支 `agents/feat-bridge-flash-tunnel` 合入 `work`（`host.rs` +387：两测 + 助手），gitlink 指
+`2a4de04f`（`e02f842`，sha 取 `rev-parse` 并 `ls-tree` 对回）。**验收证据**：`test_the_bridge_tunnel*`
+两次 2 passed（6.21s，`--test-threads=1`）；`host::host_tests` **17 passed**（15 旧 + 2 新，零回归）；
+`--workspace` rc=0；fmt 净；`make`（host mux 配置）0 告警；`host.rs` 的 −3 行只是 `use` 列表重排，
+**未动既有断言**。文档（main 补）：协议页 0x06 命令行/载荷行/无回执族 + 隧道口子段；testing.md
+host.rs 17 测（按源码重数）与两测名。
+
+**T3 留给 T5 的六条设计输入（worker 自查 + main 核）**：
+1. **主机侧没有 `0x06` 常量与发送器**（`serial.rs` 只有 T3 测试内局部写法）——T5 要把它放在
+   `CMD_RESET_PORT` 旁并提供发送器（三条链路）。
+2. **上行依赖 legacy 命名的 `node_id`**：`port->node_id` 只由 `flags` 无 `MUX_PORT_UNITS` 的
+   `SET_PORT_NODEID` 记下；先把口命名成 UNITS 再开隧道⇒**下行仍通、上行静默丢**。刷写目标本
+   就是不说单元的引导设备，故与口径一致，但 T5 必须把这一点写死（命名目标口为 legacy）。
+3. **主机侧无隧道单元消费者**：`dispatch` 今日把隧道单元记 debug 后丢弃——T5c 要加消费/投递。
+4. **隧道口会收到 admin 扇出**（`bridge_admin_unit` 把广播当 mux 单元写到该口，预存行为）：
+   隧道期间避免扫描类广播，或另议；引导设备会安全丢丢，不误执行。
+5. **混合流量只验了单口**（真第二口需 `host_port_paths`，属生产 API 变更，未做）。
+6. **MCU 侧端口后端尚不存在**（今日只有 `host/bridge.c`）；host 端口 tx 队列 132 B = 恰好一帧。
+
+**T5 拆分（待派）**：T5a = 主机侧 `0x06` 常量 + 三链路发送器（`serial.rs`/`host.rs`/`canserial.rs`）；
+T5b = 刷机前置状态机（全拓扑复位 → 统一重配 → 桥先初始化；新模块）；T5c = 隧道传输适配
+（桥隧道单元 ↔ katapult 会话的 `Read+Write`；含主机侧隧道单元消费/投递，`serial.rs`）；
+T5d = 端到端工具流程 + 阶段 2 真机。
+
 ## 9. 附录：三路侦察全文（2026-10-16，只读侦察，file:line 级）
 
 - 附录A：katapult 协议与传输层规格（`~/project/katapult`）

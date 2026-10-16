@@ -1,9 +1,8 @@
 # Katapult 拓扑刷写：动工前调查、决策与任务拆分（2026-10-16）
 
-> 状态：**五单元全部验收 + katapult 真机自举闭环（含 deployer 真写入）已验证 + 全部六支已合入
-> `work`（2026-10-16，6 个 `--no-ff` 合并；终验：测数 74/15/54 对上、fmt 干净、`--all-targets`
-> 0 告警、`cargo test --workspace` rc=0；worktree 与本批分支已清理）**。
-> 余 T3（桥隧道）、T5（拓扑流程）；真机 USB-CDC 直刷已验，CAN 直连仍待真机。
+> 状态：**T3 暂停于半途（进度与未完成清单见 §8 暂停快照，worktree 保留）**；
+> 余 T5（拓扑流程）；真机 USB-CDC 直刷已验，CAN 直连仍待真机。
+> 已完成并合入 `work`：五单元 + katapult 自举（含 deployer 真写入换血），终验全绿。
 > 规格缺口先查 §8 附录（三路侦察全文，file:line 级）。
 > 本篇是一次性调查记录（非规范）；实现落地后按 work-log 惯例补「实施记录」节。
 
@@ -119,6 +118,21 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 5. 工具重试节拍取自 flashtool（5 次 / 2s），隧道增加了桥转发延迟，上限值需在 T5 实测调。
 
 ## 8. 实施记录（随实现回填，本节是唯一随实现更新的节）
+
+**2026-10-16 T3 暂停快照（用户暂停；进度已全部固化，worktree 保留）**：
+- **固件侧**：worktree `klipperx.worktrees/bridge-tunnel-fw`，分支 `agents/feat-bridge-tunnel`
+  （基于 `a5ecd95a`），4 提交：`b3c2cd94`（mux.h 契约上提）、`a6f63992`（端口 tunnel flag +
+  `bridge_set_port_tunnel` 处理器，toggle 语义）、`3d58cf00`（**中断时的 bridge.c 半成品快照**
+  +20/−6：下行剥头/回程组装/admin 臂写到一半）、基 `a5ecd95a`。**全部 WIP：未编译、未测试。**
+- **测试侧**：worktree `klipperx.worktrees/bridge-tunnel-tests`，分支 `agents/feat-bridge-flash-tunnel`
+  @ `work`(20879b5)，零提交（五类真库测试未开始）。
+- **未完成清单**：① 0x06 在 mux.c admin 分发的接线核对（handler 已写、臂挂没挂待核）② 下行剥头
+  转发完成态 ③ 回程组装（整帧/垃圾跳过/缓冲上限 ≤256/片段上行）④ 主仓五类测试（模板
+  `test_the_bridge_port_commands_over_the_real_library`）⑤ 前缀两次跑测+既有零回归 ⑥ fmt
+  ⑦ gitlink（**sha 必须 `rev-parse agents/feat-bridge-tunnel`，`ls-tree` 对回**）⑧ 报告。
+- **恢复方式**：resume 会话 `63707dcc-ec9e-4300-b615-d865eb656375`（有上下文，但已 5 次
+  content_filter——若再被滤就 fresh 棒按本快照接力）；恢复第一步 = 让 `3d58cf00` 的半成品编译过。
+- 执行史：首棒 30min 超时（5 次过滤）→ resume 后两笔提交 → 用户暂停。
 
 **2026-10-16 katapult 自举实测（真机 STM32F103ZE + USB CDC，两轮，非 T 序列）**：
 - 配置：choice「Build Katapult deployment application」`0000→2000`（`BUILD_DEPLOYER` 随之开，

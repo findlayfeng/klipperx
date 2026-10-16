@@ -688,6 +688,7 @@ git config core.hooksPath .githooks
 | 模块 | 覆盖 |
 |------|------|
 | `crates/test-support/src/linux_firmware.rs`（2 测） | **linux 固件进程夹具** `linux_firmware_spawn_and_drop`：spawn 后 `/proc/<pid>` 存在且 `-I` 路径是指向 `/dev/pts/*` 的符号链接（就绪信号，有界等待 ≤5s，失败带固件 stderr 尾部），drop 后进程被 kill 并收尸、临时目录被删（同样有界，无挂死路径）；夹具全程不向固件发任何字节。`build.rs` 侧以 `KLIPPER_LINUX_FIRMWARE` 暴露 `linuxprocess` 的 `klipper.elf`（`linux_firmware_path()` 读它），路径缺失即构建期断言失败。**`linux_mux_firmware_spawn_named_and_drop`** 钉住带身份的构造 `LinuxFirmware::spawn_named([u8;6])`：它用**可命名**的那份固件（`linuxprocess-mux`，`build.rs` 以 `KLIPPER_LINUX_MUX_FIRMWARE` 暴露、`linux_mux_firmware_path()` 读取）并以 `-U <12 hex>` 给身份；现有 `spawn()` 行为不变 |
+| `crates/test-support/src/lib.rs`（1 测） | 检出路径解析：`klipper_dir()` 与 `katapult_dir()` 共用的 `resolve_checkout`——非空 `KLIPPERX_*_DIR` 覆盖生效、空值/未设置回默认树内子模组（`checkout_override_wins_and_the_in_tree_submodule_is_the_default`）。测试不读进程环境（环境读完再注入），worktree 里行内设置的变量不会与它竞争 |
 
 ### 上游语料（`src/core/klippy/upstream.rs`）
 

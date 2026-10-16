@@ -589,3 +589,38 @@ canbus_fd: true | false           # 链路层；默认 false
 2. ISO-TP 的 25 ms 要不要做成配置键（只有当将来出现**慢对端**时才需要；见 §3.2 的边界条件）。
 3. `isotp + FD` 那个保留组合：已知只缺 `padlen` 约 3 行（§9.1），做不做。
 4. ~~STmin 保留值~~ —— **已关**（与内核 `isotp_rcv_fc()` 逐字节核对一致）。
+
+### 2026-10-16（恢复后）：主机侧收口 + 固件两半 + vcan 端到端
+
+| 单元 | 提交 | 独立复核 |
+|---|---|---|
+| H1 主机侧 ISO-TP 设备层（`isotp.rs`） | `b6511bd` | `--test-threads=1` 下 31 测 + canserial 30 测全过 |
+| 4a linux 目标 SocketCAN 控制台 | 子模组 `d7dbfcd5` | **vcan0 端到端**（比 worker 自证更强） |
+| 2b 固件 ISO-TP 从站（`CONFIG_ISOTP`） | 子模组 `a3fc5652` 等 4 提交 | 闸门编出两个 fragment |
+| 3a `canbus_protocol`/`canbus_fd` + 装载期接线 | `f2b1305` + `2953db4`（main 修的文案残留） | config 524 / isotp 34 / canserial 30 / interface 203 / mcu:: 468 全绿 |
+
+**真 `klipper.elf` 在 vcan0 上当 can-serial 节点的端到端（main 亲自做的）**
+
+```
+klipperx scan --interface vcan0   → Found uuid=cea4296ad82a, Application: Klipper
+klipperx api -a … info            → "state": "ready"
+klipperx api -a … objects/query   → mcu_version 非空、MCU="linux"、CLOCK_FREQ=50_000_000、
+                                      RECEIVE_WINDOW=192、last_stats.mcu_tick_avg 在跑
+```
+
+即完整 `[mcu]` 连接（admin 指派 → identify → 配置 → `get_clock`/stats）全走 CAN 字节流。
+这补上了 4a worker 自己声明「没测」的那半（它只测了 admin 通道）。
+
+**踩过的坑（留给夹具与后来者）**
+
+1. **总线上不能同时有两台同 uuid 的节点**——第一轮“失败”是 main 自己造成的：前一轮固件的 `timeout` 未到就起了第二台，两台互相破坏回复 → 主机只看到 CRC 失败、报 “no answer”。写 vcan 夹具必须先确认无残留（`pgrep -x klipper.elf`；**不要**用 `pkill -f`，它会连自己的命令行一起匹配）。
+2. **`candump -T <ms>` 是「无流量 N ms 后退出」**，不是「抓 N ms」——启动即空转退出，trace 全空。抓一段用 `timeout N candump <if>`。
+3. **`isotprecv -l` 重定向到文件时 stdout 是块缓冲**，要 `stdbuf -o0`；否则“收到但文件空”。
+4. **设备层测试夹具必须用 `UnixDatagram::pair()`**：CAN 是数据报语义（一次 read 一帧），用 `UnixStream::pair()` 会把多条记录合并进一次读，解析完 FF/FC 就丢掉后续 CF 然后**永久阻塞**（本次真的挂死了 4 分钟：/proc 下主线程 `futex_wait` + 两个 `poll` 线程、CPU 零增长）。定位手法：`/proc/<pid>/task/*/wchan` + CPU 时间。
+5. **改 gitlink 先 `rev-parse`**：main 曾凭前缀臆造完整 sha 写进索引（立刻发现并改正）。
+
+**帧数从推算变实测**（§4.4）：`N=16` ⇒ 4 帧、`N=64` ⇒ 11 帧，与推算完全一致；并用 can-utils 逐字节印证了 SF 不 padding、FF 的 `10 0C`、FC 的 `30/BS=0/STmin=0`、CF 的 PCI 序列 `10,21..29`。
+
+**闸门**：`cargo test --workspace` → lib **3027** passed / 0 failed / 13 ignored（其余包 15/6/2/71/164/1/2 全过）；并核实 `test/configs` 的产物里真有 `linuxprocess-can` / `stm32f103-can-isotp` / `stm32h743-can-isotp` 三份新字典。
+
+**已知缺口（未做）**：CAN-linux 上指针编码类命令（`spicmds`/`i2ccmds`/`ds18b20`）不可用（`console_receive_buffer` 与 `canserial.c` 的 static `receive_buf` 不是同一块）；2b 自报 IRQ 内无界重试与 TX 队列深度 2；4b（klipperx 侧把 linux CAN 夹具接成永久 vcan 测试）未开工。

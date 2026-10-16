@@ -28,24 +28,24 @@
 //! target's port is ready for it, and the [`BridgeReady`] it returns records
 //! what was done.
 //!
-//! Every step is a command on one link, and every command is one the repo
-//! already spells for each wire: the bridge's own frame channel is [`Device`],
-//! and the port-level commands are the ones the concrete handles carry
-//! ([`BridgeLink`]). Nothing here probes what is behind a port — a bridge link
-//! carries no such probe — so which reset a port gets, and which port the target
-//! is, are the caller's to say.
+//! Every step is a command on one link. The declaration commands are
+//! [`Mcu::send`]'s — the bridge's own connection, whose dictionary the identify
+//! handshake installed, which is also what owns the frame sequence — and the
+//! port-level ones are the [`Interface`]'s (`send_set_port_node_id`,
+//! `send_restart_device`, `send_reset_port`, `send_set_port_tunnel`), which
+//! spell the admin unit for whichever wire the link is. `mcu` and `link` are two
+//! handles on that one transport. Nothing here probes what is behind a port — a
+//! bridge link carries no such probe — so which reset a port gets, and which
+//! port the target is, are the caller's to say.
 
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
 use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::frame::{Frame, MESSAGE_SEQ_MASK};
-use crate::core::klippy::interface::devices::host::HostDevice;
-use crate::core::klippy::interface::devices::serial::SharedSerialHandle;
-use crate::core::klippy::interface::{Device, InterfaceError};
-use crate::core::klippy::msg::parser::Parser;
-use crate::core::klippy::msg::proto::ArgValue;
+use crate::core::klippy::interface::{Interface, InterfaceError};
+use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::msg::MsgError;
 use std::fmt;
+use std::time::Duration;
 
 /// The port flags a target is named with: none at all — a **legacy** route.
 ///
@@ -62,70 +62,15 @@ const LEGACY_PORT_FLAGS: u8 = 0;
 /// one byte.
 const MAX_BRIDGE_PORTS: usize = u8::MAX as usize / 2;
 
-/// A link a bridge session can drive.
+/// How long the declaration barrier waits for the queued commands to reach the
+/// transport before the session gives up.
 ///
-/// Two channels are needed, and the handles the config layer builds already
-/// carry both: the bridge's own frame channel, for the initialization commands
-/// (that is [`Device::send`]), and its **admin** channel, for the port-level
-/// ones. Each handle spells the admin unit for its own wire — a muxed host
-/// library, a shared serial port and a CAN node are three different units — so
-/// this trait names the capability rather than re-encoding any of it.
-///
-/// Implemented for the two links a klipper config builds for a bridge:
-/// [`HostDevice`] (`[mcu] host_library:`) and [`SharedSerialHandle`] (a
-/// `serial:` path more than one `[mcu]` section shares). A CAN bridge has the
-/// same four commands on its own device and would be added the same way;
-/// nothing in this module depends on which of them it was given.
-pub trait BridgeLink: Device {
-    /// Tell the bridge which id the device behind port `index` answers to
-    /// ([`HostDevice::send_set_port_node_id`], `flags` and all).
-    fn set_port_node_id(&self, index: u8, node_id: u8, flags: u8) -> Result<(), InterfaceError>;
-    /// Ask the device behind port `index` to restart its firmware
-    /// ([`HostDevice::send_restart_device`]).
-    fn restart_device(&self, index: u8) -> Result<(), InterfaceError>;
-    /// Ask the bridge to pulse port `index`'s lines
-    /// ([`HostDevice::send_reset_port`]).
-    fn reset_port(&self, index: u8) -> Result<(), InterfaceError>;
-    /// Toggle port `index`'s flashing tunnel
-    /// ([`HostDevice::send_set_port_tunnel`]).
-    fn set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError>;
-}
-
-impl BridgeLink for HostDevice {
-    fn set_port_node_id(&self, index: u8, node_id: u8, flags: u8) -> Result<(), InterfaceError> {
-        self.send_set_port_node_id(index, node_id, flags)
-    }
-
-    fn restart_device(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_restart_device(index)
-    }
-
-    fn reset_port(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_reset_port(index)
-    }
-
-    fn set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_set_port_tunnel(index)
-    }
-}
-
-impl BridgeLink for SharedSerialHandle {
-    fn set_port_node_id(&self, index: u8, node_id: u8, flags: u8) -> Result<(), InterfaceError> {
-        self.send_set_port_node_id(index, node_id, flags)
-    }
-
-    fn restart_device(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_restart_device(index)
-    }
-
-    fn reset_port(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_reset_port(index)
-    }
-
-    fn set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_set_port_tunnel(index)
-    }
-}
+/// The declaration has to be on the wire before any port-level command — the
+/// bridge builds its port table from it, and a reset that names a port the
+/// bridge does not have is dropped in silence — but [`Mcu::send`] only queues.
+/// [`Mcu::flush`] is the barrier that makes the boundary real
+/// ([`flush`](Mcu::flush)); this is how long it may take.
+const DECLARE_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How one port's device is taken back to its bootloader.
 ///
@@ -187,30 +132,28 @@ pub struct BridgeTarget {
 }
 
 /// What a bridge session did, for the caller to report and to continue from.
+///
+/// The bridge's own frame sequence is not here: [`Mcu`] owns it now, so a
+/// caller that sends anything else on that connection goes through the same
+/// [`Mcu::send`] and the count stays with it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeReady {
     /// The plan as it was carried out: every port declared, in index order.
     pub ports: Vec<BridgePort>,
     /// The target as it was named.
     pub target: BridgeTarget,
-    /// The sequence byte the bridge's own frame channel expects next.
-    ///
-    /// The declaration commands consume one sequence byte each
-    /// (`next_sequence` in `third_party/klipper/src/command.c`); the port-level
-    /// commands travel the admin channel and consume none. A caller that sends
-    /// anything else on that channel starts here.
-    pub next_sequence: u8,
 }
 
 /// Everything that can stop a bridge session.
 #[derive(Debug)]
 pub enum BridgeError {
-    /// The link refused a write — a closed handle, a failed device write.
+    /// The link refused a port-level write — a closed handle, a failed device
+    /// write, or a link that carries no port mux units at all.
     Link(InterfaceError),
-    /// The dictionary could not spell a command: it carries no such name, or
-    /// the arguments do not match what the firmware declares. The parser is the
-    /// caller's, so this is a dictionary mismatch rather than a wire failure.
-    Command(MsgError),
+    /// The bridge's own connection refused the command: the dictionary cannot
+    /// spell the name, the arguments do not match, the send queue is full, or
+    /// the declaration barrier was not reached in time.
+    Mcu(McuError),
     /// The plan names more ports than one `allocate_oids count=%c` can number
     /// (two oids per port), so nothing was sent.
     TooManyPorts {
@@ -223,7 +166,7 @@ impl fmt::Display for BridgeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BridgeError::Link(e) => write!(f, "bridge link: {e}"),
-            BridgeError::Command(e) => write!(f, "bridge command: {e}"),
+            BridgeError::Mcu(e) => write!(f, "bridge command: {e}"),
             BridgeError::TooManyPorts { ports } => write!(
                 f,
                 "{ports} ports ask for more oids than allocate_oids can number \
@@ -237,7 +180,7 @@ impl std::error::Error for BridgeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BridgeError::Link(e) => Some(e),
-            BridgeError::Command(e) => Some(e),
+            BridgeError::Mcu(e) => Some(e),
             BridgeError::TooManyPorts { .. } => None,
         }
     }
@@ -249,31 +192,41 @@ impl From<InterfaceError> for BridgeError {
     }
 }
 
+impl From<McuError> for BridgeError {
+    fn from(e: McuError) -> Self {
+        BridgeError::Mcu(e)
+    }
+}
+
+/// [`Mcu::send`]'s error lifts into the connection variant unchanged.
 impl From<MsgError> for BridgeError {
     fn from(e: MsgError) -> Self {
-        BridgeError::Command(e)
+        BridgeError::Mcu(McuError::Msg(e))
     }
 }
 
 /// Declare `ports` on the bridge, reset their devices, and open the tunnel on
 /// `target` — the flashing prerequisites of a bridge-port flash, in one call.
 ///
-/// `parser` is the bridge's data dictionary (an identify's, or the built one):
-/// every command is encoded from it, so a dictionary that does not carry one is
-/// an error rather than bytes that mean something else.
+/// `mcu` is the bridge's own connection: its identify handshake installed the
+/// dictionary the declaration commands are encoded from, and it owns the frame
+/// sequence, so nothing here counts bytes. `link` is the same bridge seen as its
+/// port-level channel ([`Interface`]), which spells the admin unit for whichever
+/// wire the link is. `ports` and `target` are the caller's plan.
 ///
 /// The three steps and their order are in the module docs. Nothing is sent
-/// until the plan has been checked, and everything is sent in the order the
+/// until the plan has been checked, the declaration is flushed onto the wire
+/// before any port-level command, and everything is sent in the order the
 /// firmware needs, so a session either runs to the end or fails with the bridge
-/// left as it was.
+/// as it was.
 ///
 /// # Errors
 /// [`BridgeError::TooManyPorts`] when the plan is wider than the oid byte can
-/// number, [`BridgeError::Command`] when the dictionary cannot spell a command,
-/// and [`BridgeError::Link`] when the link refuses a write.
-pub fn open_bridge<L: BridgeLink>(
-    link: &L,
-    parser: &Parser,
+/// number, [`BridgeError::Mcu`] when the connection cannot spell or flush a
+/// command, and [`BridgeError::Link`] when the link refuses a port-level write.
+pub async fn open_bridge(
+    mcu: &Mcu,
+    link: &Interface,
     ports: &[BridgePort],
     target: BridgeTarget,
 ) -> Result<BridgeReady, BridgeError> {
@@ -284,15 +237,7 @@ pub fn open_bridge<L: BridgeLink>(
     // 1. The oid table, then one stream-and-port pair per port, in index order:
     //    the bridge numbers a port by the order `config_bridge_port` reaches it.
     let count = (ports.len() * 2) as u8;
-    let mut sequence = 0u8;
-    let allocate = AllocateOids { count };
-    send_command(
-        link,
-        parser,
-        &mut sequence,
-        AllocateOids::NAME,
-        &allocate.args(),
-    )?;
+    mcu.send(AllocateOids::NAME, &AllocateOids { count }.args())?;
     for (index, port) in ports.iter().enumerate() {
         let index = index as u8;
         let uart_oid = index * 2;
@@ -301,65 +246,37 @@ pub fn open_bridge<L: BridgeLink>(
             baud: port.baud,
             slot: index,
         };
-        send_command(link, parser, &mut sequence, ConfigUart::NAME, &uart.args())?;
+        mcu.send(ConfigUart::NAME, &uart.args())?;
         let bridge_port = ConfigBridgePort {
             oid: uart_oid + 1,
             uart: uart_oid,
         };
-        send_command(
-            link,
-            parser,
-            &mut sequence,
-            ConfigBridgePort::NAME,
-            &bridge_port.args(),
-        )?;
+        mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
     }
+    // The declaration has to be on the wire before the first port-level command:
+    // the bridge builds its port table from it, and a command that names a port
+    // it does not have is dropped in silence.
+    mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
 
     // 2. Every declared port's device, the way its plan says. After the
     //    declaration above, so each command addresses a port the bridge has.
     for (index, port) in ports.iter().enumerate() {
         let index = index as u8;
         match port.reset {
-            PortReset::RestartDevice => link.restart_device(index)?,
-            PortReset::ResetPort => link.reset_port(index)?,
+            PortReset::RestartDevice => link.send_restart_device(index)?,
+            PortReset::ResetPort => link.send_reset_port(index)?,
         }
     }
 
     // 3. The target: its route first (legacy, so the raw uplink is served),
     //    then the tunnel that makes the port carry the katapult stream.
-    link.set_port_node_id(target.index, target.node_id, LEGACY_PORT_FLAGS)?;
-    link.set_port_tunnel(target.index)?;
+    link.send_set_port_node_id(target.index, target.node_id, LEGACY_PORT_FLAGS)?;
+    link.send_set_port_tunnel(target.index)?;
 
     Ok(BridgeReady {
         ports: ports.to_vec(),
         target,
-        next_sequence: sequence,
     })
-}
-
-/// Encode one command from the dictionary and write it on the bridge's own
-/// frame channel, taking the next sequence byte.
-///
-/// The sequence byte is the firmware's own check (`next_sequence` in
-/// `third_party/klipper/src/command.c`): it starts at `MESSAGE_DEST`, so a
-/// session's first frame carries sequence `0`, and the firmware discards
-/// anything it is not expecting until it is retransmitted. The count therefore
-/// lives with the session that sends the frames, and the caller gets where it
-/// ended ([`BridgeReady::next_sequence`]).
-fn send_command<L: BridgeLink>(
-    link: &L,
-    parser: &Parser,
-    sequence: &mut u8,
-    name: &str,
-    args: &[ArgValue],
-) -> Result<(), BridgeError> {
-    let payload = parser.encode(name, args)?;
-    link.send(&Frame::new(*sequence, payload.payload().to_vec()))?;
-    // The firmware's own sequence is four bits wide (it wraps at
-    // `MESSAGE_SEQ_MASK` and re-adds `MESSAGE_DEST`), so the count the caller
-    // sees wraps with it.
-    *sequence = (*sequence + 1) & MESSAGE_SEQ_MASK;
-    Ok(())
 }
 
 // ===========================================================================
@@ -369,160 +286,241 @@ fn send_command<L: BridgeLink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::frame::{
-        MESSAGE_DEST, MESSAGE_HEADER_SIZE, MESSAGE_POS_LEN, MESSAGE_POS_SEQ, MESSAGE_TRAILER_SIZE,
-    };
+    use crate::core::klippy::assign;
+    use crate::core::klippy::config::access::AccessTracking;
+    use crate::core::klippy::config::mcu::McuConfig;
+    use crate::core::klippy::config::{Config, ConfigWrapper};
+    use crate::core::klippy::frame::{MESSAGE_HEADER_SIZE, MESSAGE_TRAILER_SIZE};
     use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
     use crate::core::klippy::interface::devices::serial::{
-        admin_unit, CMD_RESTART_DEVICE, HEADER_BYTES,
+        admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN, CMD_RESET_PORT,
+        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
+    use crate::core::klippy::mcu::bridge_attach::wait_for_mux_library_unload;
+    use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::Dictionary;
-    use crate::core::klippy::msg::proto::Payload;
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::{ArgValue, Payload};
+    use crate::core::klippy::Interface;
     use std::io::Read;
     use std::os::fd::AsRawFd;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     /// The id the target device is named with behind its port.
     const TARGET_NODE_ID: u8 = 7;
 
-    /// The mux build's data dictionary, in a parser: the same dictionary an
-    /// identify would fetch, read from the file `make` wrote instead.
-    fn mux_parser() -> Parser {
+    /// The id the bridge's own connection is attached as — the arbitration id
+    /// its frames carry on a shared serial wire.
+    const BRIDGE_MCU_ID: u32 = 1;
+
+    /// The mux build's data dictionary: the same dictionary an identify would
+    /// install, read from the file `make` wrote instead.
+    fn mux_dictionary() -> Dictionary {
         let path = klipperx_test_support::klipper_host_mux_dictionary_path();
         let raw =
             std::fs::read(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let dictionary = Dictionary::from_json(
-            serde_json::from_slice(&raw).expect("the dictionary file is JSON"),
-        )
-        .expect("the mux build's data dictionary");
+        Dictionary::from_json(serde_json::from_slice(&raw).expect("the dictionary file is JSON"))
+            .expect("the mux build's data dictionary")
+    }
+
+    /// That dictionary in a parser, for decoding what a session put on the wire.
+    fn mux_parser() -> Parser {
         let mut parser = Parser::new();
-        dictionary
+        mux_dictionary()
             .install(&mut parser)
             .expect("install the mux build's dictionary");
         parser
     }
 
-    /// One call a session made on a link, in order.
+    /// A bridge link on a pty: `attach_downstream` registers a slot with no
+    /// handshake, so every unit the session writes lands on the pty master
+    /// where a test can read it back — frames and admin units alike, in order.
+    fn shared_serial_link(pty: &Pty) -> Interface {
+        let handle = attach_downstream(&pty.path, 250_000, BRIDGE_MCU_ID)
+            .expect("the shared serial port opens");
+        Interface::shared_serial(handle)
+    }
+
+    /// A connection over `link` carrying the mux build's dictionary, installed
+    /// directly: the declaration commands are encoded from it without an
+    /// identify handshake, since this fixture speaks no firmware.
+    fn bridge_mcu(name: &str, link: &Interface) -> Mcu {
+        let mcu = Mcu::new(name, link.clone());
+        mcu.install_dictionary(mux_dictionary())
+            .expect("the mux build's dictionary installs");
+        mcu
+    }
+
+    /// One call a session made, in order.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    enum Call {
-        /// A frame on the bridge's own channel, wire bytes and all.
-        Frame(Vec<u8>),
-        SetPortNodeId {
-            index: u8,
-            node_id: u8,
-            flags: u8,
-        },
-        RestartDevice(u8),
-        ResetPort(u8),
-        SetPortTunnel(u8),
+    enum Step {
+        /// A command on the bridge's own connection: its name and arguments.
+        Command(String, Vec<ArgValue>),
+        /// One admin-channel unit, the bytes the bridge sees behind its mux
+        /// header.
+        Admin(Vec<u8>),
     }
 
-    /// A bridge link that answers nothing and records every call: the shape a
-    /// session's own commands, arguments and order are pinned on, with no
-    /// firmware and no wire.
-    struct RecordingLink {
-        calls: Mutex<Vec<Call>>,
+    /// The admin unit for `command` **without** the mux header a shared serial
+    /// wire wraps it in — the bytes the bridge parses.
+    fn admin_payload(command: &[u8]) -> Vec<u8> {
+        admin_unit(command)[HEADER_BYTES..].to_vec()
     }
 
-    impl RecordingLink {
-        fn new() -> Self {
-            Self {
-                calls: Mutex::new(Vec::new()),
+    /// The plan's steps in the order the firmware needs them: the declaration
+    /// pairs in index order, then each port's reset as its plan says, then the
+    /// target named **legacy** and its tunnel opened.
+    fn expected_steps(target_node_id: u8) -> Vec<Step> {
+        vec![
+            Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(4)]),
+            Step::Command(
+                "config_uart".to_string(),
+                vec![
+                    ArgValue::UInt8(0),
+                    ArgValue::UInt32(250_000),
+                    ArgValue::UInt8(0),
+                ],
+            ),
+            Step::Command(
+                "config_bridge_port".to_string(),
+                vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
+            ),
+            Step::Command(
+                "config_uart".to_string(),
+                vec![
+                    ArgValue::UInt8(2),
+                    ArgValue::UInt32(115_200),
+                    ArgValue::UInt8(1),
+                ],
+            ),
+            Step::Command(
+                "config_bridge_port".to_string(),
+                vec![ArgValue::UInt8(3), ArgValue::UInt8(2)],
+            ),
+            Step::Admin(admin_payload(&[CMD_RESET_PORT, 0])),
+            Step::Admin(admin_payload(&[CMD_RESTART_DEVICE, 1])),
+            // flags=0 is the legacy route the katapult stream needs: a units
+            // port would drop the raw uplink in silence.
+            Step::Admin(admin_payload(&[
+                CMD_SET_PORT_NODEID,
+                0,
+                target_node_id,
+                LEGACY_PORT_FLAGS,
+            ])),
+            Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 0])),
+        ]
+    }
+
+    /// Every unit a session sent, in wire order: an admin unit is one step, a
+    /// command frame can hold several messages (the connection coalesces a
+    /// batch into one block) and yields one step per message.
+    fn steps(parser: &Parser, units: &[(u32, Vec<u8>)]) -> Vec<Step> {
+        let bridge_arb = assign::arb_id(BRIDGE_MCU_ID).expect("a valid bridge id");
+        let mut steps = Vec::new();
+        for (arb, frame) in units {
+            if *arb == ADMIN_LISTEN {
+                steps.push(Step::Admin(frame.clone()));
+                continue;
+            }
+            assert_eq!(
+                *arb, bridge_arb,
+                "the bridge's own connection sends under its own id"
+            );
+            let payload = Payload::from_raw(
+                frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE].to_vec(),
+            );
+            for (msg, args) in parser.decode(payload).expect("the payload decodes") {
+                steps.push(Step::Command(msg.name.clone(), args));
             }
         }
+        steps
+    }
 
-        fn calls(&self) -> Vec<Call> {
-            self.calls.lock().unwrap().clone()
+    /// Split a host→device byte run into whole `(arbitration id, frame)` units,
+    /// leaving a trailing partial unit unparsed. The length byte after the two
+    /// header bytes is the whole unit's length for both a command frame and an
+    /// admin unit.
+    fn split_units(mut wire: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let mut units = Vec::new();
+        loop {
+            match decode_header(wire) {
+                HeaderScan::Complete { arb, consumed } => {
+                    if wire.len() < consumed + 1 {
+                        break;
+                    }
+                    let length = wire[consumed] as usize;
+                    if wire.len() < consumed + length {
+                        break;
+                    }
+                    units.push((arb, wire[consumed..consumed + length].to_vec()));
+                    wire = &wire[consumed + length..];
+                }
+                HeaderScan::NeedMore => break,
+                HeaderScan::Invalid => panic!("a sent unit must start with a header"),
+            }
         }
+        units
+    }
 
-        fn record(&self, call: Call) {
-            self.calls.lock().unwrap().push(call);
+    /// Read the pty master until `done` accepts what has arrived — or `window`
+    /// expires — then hand back the whole units. A bounded wait, so a
+    /// "nothing was written" check costs one window and a "these arrived"
+    /// check stops as soon as the last one is in hand.
+    fn read_units(
+        master: &std::fs::File,
+        window: Duration,
+        done: impl Fn(&[(u32, Vec<u8>)]) -> bool,
+    ) -> Vec<(u32, Vec<u8>)> {
+        let deadline = Instant::now() + window;
+        let mut wire = Vec::new();
+        let mut buf = [0u8; 512];
+        let mut reader = master;
+        loop {
+            let units = split_units(&wire);
+            if done(&units) {
+                return units;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return units;
+            }
+            let wait = deadline.saturating_duration_since(now).as_millis() as i32;
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut poll, 1, wait.max(1)) };
+            if rc < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                panic!("polling the pty master: {error}");
+            }
+            if rc == 0 {
+                return units; // the window expired with nothing more to read
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => return units,
+                Ok(read) => wire.extend_from_slice(&buf[..read]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(e) => panic!("reading the pty master: {e}"),
+            }
         }
     }
 
-    impl Device for RecordingLink {
-        fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
-            self.record(Call::Frame(frame.raw_bytes()));
-            Ok(())
-        }
+    /// The three steps, in the order the firmware needs them, observed at the
+    /// wire: a bridge link on a pty, the declaration as coalesced command
+    /// frames, the port-level commands as admin units behind their mux header.
+    #[tokio::test]
+    async fn test_open_bridge_declares_resets_and_opens_the_tunnel_in_order() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
 
-        fn receive(&self) -> Option<Frame> {
-            None
-        }
-
-        fn shutdown(&self) {}
-    }
-
-    impl BridgeLink for RecordingLink {
-        fn set_port_node_id(
-            &self,
-            index: u8,
-            node_id: u8,
-            flags: u8,
-        ) -> Result<(), InterfaceError> {
-            self.record(Call::SetPortNodeId {
-                index,
-                node_id,
-                flags,
-            });
-            Ok(())
-        }
-
-        fn restart_device(&self, index: u8) -> Result<(), InterfaceError> {
-            self.record(Call::RestartDevice(index));
-            Ok(())
-        }
-
-        fn reset_port(&self, index: u8) -> Result<(), InterfaceError> {
-            self.record(Call::ResetPort(index));
-            Ok(())
-        }
-
-        fn set_port_tunnel(&self, index: u8) -> Result<(), InterfaceError> {
-            self.record(Call::SetPortTunnel(index));
-            Ok(())
-        }
-    }
-
-    /// What one recorded frame says: its sequence byte, and the command the
-    /// dictionary decodes its payload back into. Asserting on the decoded view
-    /// keeps the test about *what* was said rather than a byte layout the
-    /// dictionary owns.
-    fn frame_command(parser: &Parser, frame: &[u8]) -> (u8, String, Vec<ArgValue>) {
-        assert_eq!(
-            frame[MESSAGE_POS_LEN] as usize,
-            frame.len(),
-            "a frame's length byte is the length of the whole frame"
-        );
-        assert_eq!(
-            frame[MESSAGE_POS_SEQ] & !MESSAGE_SEQ_MASK,
-            MESSAGE_DEST,
-            "a command frame's sequence byte carries the destination flag"
-        );
-        let payload = Payload::from_raw(
-            frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE].to_vec(),
-        );
-        let decoded = parser.decode(payload).expect("the payload decodes");
-        assert_eq!(decoded.len(), 1, "one command per frame");
-        let (msg, args) = decoded.into_iter().next().expect("one command per frame");
-        (
-            frame[MESSAGE_POS_SEQ] & MESSAGE_SEQ_MASK,
-            msg.name.clone(),
-            args,
-        )
-    }
-
-    /// The three steps, in the order the firmware needs them, over a link that
-    /// only records: the declaration pairs in index order, then each port's
-    /// reset as its plan says, then the target named **legacy** and its tunnel
-    /// opened.
-    #[test]
-    fn test_open_bridge_declares_resets_and_opens_the_tunnel_in_order() {
-        let parser = mux_parser();
-        let link = RecordingLink::new();
         let ports = [
             BridgePort {
                 baud: 250_000,
@@ -537,7 +535,9 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        let ready = open_bridge(&link, &parser, &ports, target).expect("the session runs");
+        let ready = open_bridge(&mcu, &link, &ports, target)
+            .await
+            .expect("the session runs");
 
         assert_eq!(
             ready.ports,
@@ -545,86 +545,29 @@ mod tests {
             "the plan as it was carried out"
         );
         assert_eq!(ready.target, target);
-        assert_eq!(
-            ready.next_sequence, 5,
-            "allocate_oids plus two commands per port, one sequence byte each"
-        );
 
-        let calls = link.calls();
+        // The four admin units are the last things on the wire, so seeing them
+        // all means every declaration frame is already in hand.
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 4
+        });
+        let parser = mux_parser();
         assert_eq!(
-            calls.len(),
-            9,
-            "five frames, two resets, the naming, the tunnel"
-        );
-
-        // The declaration: the oid table, then a stream-and-port pair per port,
-        // in index order — the bridge numbers a port by the order
-        // `config_bridge_port` reaches it, and the port's oid pair is one
-        // number in `config_uart`'s slot.
-        let wanted = [
-            ("allocate_oids", vec![ArgValue::UInt8(4)]),
-            (
-                "config_uart",
-                vec![
-                    ArgValue::UInt8(0),
-                    ArgValue::UInt32(250_000),
-                    ArgValue::UInt8(0),
-                ],
-            ),
-            (
-                "config_bridge_port",
-                vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
-            ),
-            (
-                "config_uart",
-                vec![
-                    ArgValue::UInt8(2),
-                    ArgValue::UInt32(115_200),
-                    ArgValue::UInt8(1),
-                ],
-            ),
-            (
-                "config_bridge_port",
-                vec![ArgValue::UInt8(3), ArgValue::UInt8(2)],
-            ),
-        ];
-        for (sequence, call) in calls.iter().take(wanted.len()).enumerate() {
-            let Call::Frame(frame) = call else {
-                panic!("the declaration step sends frames only, got {call:?}");
-            };
-            let (seq, name, args) = frame_command(&parser, frame);
-            assert_eq!(
-                seq, sequence as u8,
-                "the firmware counts a session's frames from sequence 0"
-            );
-            let (want_name, want_args) = &wanted[sequence];
-            assert_eq!(&name, want_name, "frame {sequence}");
-            assert_eq!(&args, want_args, "frame {sequence}");
-        }
-
-        assert_eq!(
-            &calls[wanted.len()..],
-            &[
-                Call::ResetPort(0),
-                Call::RestartDevice(1),
-                Call::SetPortNodeId {
-                    index: 0,
-                    node_id: TARGET_NODE_ID,
-                    flags: 0,
-                },
-                Call::SetPortTunnel(0),
-            ],
-            "each port's reset follows its plan, then the target is named with no port \
-             flags (a units route would drop the katapult stream) and its tunnel opened"
+            steps(&parser, &units),
+            expected_steps(TARGET_NODE_ID),
+            "the declaration pairs in index order, then each reset as its plan says, \
+             then the target named legacy and its tunnel opened"
         );
     }
 
-    /// The sequence count is the firmware's four-bit one, and a plan the oid
-    /// byte cannot number is refused before anything is sent.
-    #[test]
-    fn test_an_impossible_plan_is_refused_and_the_sequence_wraps_with_the_firmware() {
-        let parser = mux_parser();
-        let link = RecordingLink::new();
+    /// The sequence count is the connection's own now, so what is left to pin is
+    /// that a plan the oid byte cannot number is refused before anything is sent.
+    #[tokio::test]
+    async fn test_an_impossible_plan_is_refused_and_sends_nothing() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
+
         let target = BridgeTarget {
             index: 0,
             node_id: TARGET_NODE_ID,
@@ -636,43 +579,21 @@ mod tests {
             };
             MAX_BRIDGE_PORTS + 1
         ];
-        let err = open_bridge(&link, &parser, &one_too_many, target)
+        let err = open_bridge(&mcu, &link, &one_too_many, target)
+            .await
             .expect_err("one port over the oid byte is refused");
         match err {
             BridgeError::TooManyPorts { ports } => assert_eq!(ports, MAX_BRIDGE_PORTS + 1),
             other => panic!("expected TooManyPorts, got {other:?}"),
         }
+
+        let units = read_units(&pty.master, Duration::from_millis(300), |units| {
+            !units.is_empty()
+        });
         assert!(
-            link.calls().is_empty(),
-            "a plan that cannot run sends nothing"
+            units.is_empty(),
+            "a plan that cannot run sends nothing, got {units:?}"
         );
-
-        // The widest plan that does fit: two oids per port is the whole byte,
-        // and its 255 frames wrap the four-bit sequence count.
-        let widest = vec![
-            BridgePort {
-                baud: 250_000,
-                reset: PortReset::ResetPort,
-            };
-            MAX_BRIDGE_PORTS
-        ];
-        let ready = open_bridge(&link, &parser, &widest, target)
-            .expect("the widest plan the oid byte can number runs");
-        assert_eq!(
-            ready.next_sequence,
-            (2 * MAX_BRIDGE_PORTS + 1) as u8 & MESSAGE_SEQ_MASK
-        );
-    }
-
-    /// Both links a config builds for a bridge meet the session's bound: the
-    /// host-library reference and the shared serial port's handle. A CAN
-    /// bridge's own device carries the same four commands and is added the same
-    /// way; it is not one this module has a fixture for.
-    #[test]
-    fn test_both_bridge_links_meet_the_session_bound() {
-        fn assert_bridge_link<L: BridgeLink>() {}
-        assert_bridge_link::<HostDevice>();
-        assert_bridge_link::<SharedSerialHandle>();
     }
 
     /// Read from a pty's master end for at most `window`: what the bridge wrote
@@ -721,38 +642,71 @@ mod tests {
     /// with two ports on real ptys — port 0 the flashing target (legacy, sitting
     /// in its bootloader), port 1 a named device the bridge restarts.
     ///
+    /// The bridge's connection is built the way the config layer builds one —
+    /// `McuConfig` → [`McuConfig::open`] → [`Mcu::new`] → [`Mcu::identify`] —
+    /// which is the sequence a bridge-port flash uses, so this test also pins
+    /// that it works. The two sections on one path are what makes it muxed; the
+    /// port ttys are handed to the library as the `(slot, path)` pairs the
+    /// `[uart_device]` sections resolve to at load.
+    ///
     /// Every command's effect is pinned where the wire is. The two declaration
     /// commands are the library's (they are what opens a port's stream, and
     /// nothing of them reaches the line), the target's naming and its tunnel are
     /// the bridge's own (consumed, never written to a port, no receipt), and
     /// `RESTART_DEVICE` for port 1 is forwarded to it header-stripped — the bare
     /// `KXID` frame a legacy port's line carries.
-    #[test]
-    fn test_open_bridge_over_the_real_library() {
+    #[tokio::test]
+    async fn test_open_bridge_over_the_real_library() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
 
         // A bridge opens a port's tty when the host declares it, so those ttys
-        // are named when the library comes up, each on its own pty.
+        // have to exist when the library comes up, each on its own pty.
         let target_port = Pty::new();
         let named_port = Pty::new();
-        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let bridge = HostDevice::load_mux(
-            klipperx_test_support::klipper_host_mux_lib_path(),
-            HostMux {
-                identity,
-                named: identity,
-            },
-            1,
-            &[
-                (0, target_port.path.to_string_lossy().into_owned()),
-                (1, named_port.path.to_string_lossy().into_owned()),
-            ],
-        )
-        .expect("the mux host library opens with both port ttys");
 
-        let parser = mux_parser();
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let path = library.display().to_string();
+        let text = format!(
+            "[mcu]\nhost_library: {path}\n\
+             [mcu child]\nhost_library: {path}\nuuid: 1234567890ab\n"
+        );
+        let (config, _) = Config::from_text(&text).expect("the config parses");
+        let section = config
+            .sections()
+            .find(|section| section.id == "mcu")
+            .expect("the config has an [mcu] section");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+
+        // The config layer's own judgement: two sections on one path are muxed,
+        // and the path gets an identity — the value the library is told.
+        let libraries = HostLibraries::classify(&wrapper).expect("the path is told apart");
+        let identity = libraries.identity(&path).expect("the path has an identity");
+
+        let mut mcu_config = McuConfig::new(&wrapper).expect("the [mcu] section");
+        mcu_config.id = Some(BRIDGE_MCU_ID);
+        mcu_config.host_mux = Some(HostMux {
+            identity,
+            named: identity,
+        });
+        mcu_config.host_port_paths = vec![
+            (0, target_port.path.to_string_lossy().into_owned()),
+            (1, named_port.path.to_string_lossy().into_owned()),
+        ];
+        let link = mcu_config
+            .open()
+            .expect("the muxed library opens and attaches");
+
+        let mcu = Mcu::new("bridge", link.clone());
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            mcu.identify(Duration::from_secs(10)),
+        )
+        .await
+        .expect("the identify handshake timed out")
+        .expect("the bridge identifies");
+
         let ports = [
             BridgePort {
                 baud: 250_000,
@@ -767,10 +721,10 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        let ready = open_bridge(&bridge, &parser, &ports, target)
+        let ready = open_bridge(&mcu, &link, &ports, target)
+            .await
             .expect("the session runs against a real bridge");
         assert_eq!(ready.target, target);
-        assert_eq!(ready.next_sequence, 5);
 
         let quiet = Duration::from_millis(500);
 
@@ -796,9 +750,13 @@ mod tests {
              to the port"
         );
 
-        // Dropping the bridge is the whole teardown — the library's drop joins
-        // its threads and unmaps before it returns, and the lock above is held
-        // until this test ends, so the path is free for the next test.
-        drop(bridge);
+        // The connection's transport tasks hold references to the library, so
+        // its drop is not synchronous with `drop(mcu)`: close it, let the
+        // blocked device read see the shutdown, then wait the library out. The
+        // next test on this path has to meet a fresh firmware, not this session.
+        mcu.close();
+        drop(mcu);
+        drop(link);
+        wait_for_mux_library_unload(&library);
     }
 }

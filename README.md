@@ -20,6 +20,8 @@ CRC/时钟同步/序号与重传）、运动规划与步进压缩、G-Code 调�
 
 - 上游基线：`third_party/klipper/`（git 子模组，钉住一份上游版本；上游源码、`config/` 与语料
   都从这一份读，不拿机器上别的 klipper 检出当参照）
+- 引导加载程序：`third_party/katapult/`（git 子模组，fork 的 `klipperx` 分支；katapult 协议、
+  bootloader 固件与刷写脚本都从这一份读）
 - 许可：GPL-3.0（派生自 [Klipper](https://github.com/Klipper3d/klipper)，Kevin O'Connor 等）
 
 ## 关于「谁写的」：AI 生成声明
@@ -85,8 +87,8 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 ## 快速上手
 
 ```sh
-# 取上游子模组（上游源码、`config/` 与回归语料都在里面；克隆时带了 --recurse-submodules 可跳过）
-git submodule update --init third_party/klipper
+# 取子模组（klipper 里是上游源码、`config/` 与回归语料，katapult 是引导加载程序；克隆时带了 --recurse-submodules 可跳过）
+git submodule update --init third_party/klipper third_party/katapult
 
 # 构建（宿主二进制 klipperx 与 klippy）
 cargo build --release
@@ -125,6 +127,7 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 | 变量 | 默认 | 作用 |
 |---|---|---|
 | `KLIPPERX_KLIPPER_DIR` | `<仓库>/third_party/klipper` | 语料、kconfig 片段与 host 库从哪个 klipper 检出读。**git worktree 里没有子模组，靠它指向主检出的那一份**。构建期与运行期读同一个值，改指向会触发重建。 |
+| `KLIPPERX_KATAPULT_DIR` | `<仓库>/third_party/katapult` | katapult 检出（`protocol.md`、bootloader 固件、刷写脚本）从哪读：`katapult_dir()`，与 `KLIPPERX_KLIPPER_DIR` 同一解析约定（非空覆盖、否则树内子模组）。**git worktree 里子模组同样为空**，靠它指向主检出的那一份。 |
 | `KLIPPERX_ARCHES` | `linux,avr,stm32,atsam,atsamd,lpc176x,rpxxxx,hc32f460` | 逗号分隔的 MCU 家族列表：构建阶段只为这些家族的 `test/configs/*.config` 生成 `.dict`（各需其工具链：主机 `cc`、`avr-gcc`、`arm-none-eabi-gcc`）；其余运行因缺字典跳过。 |
 | `KLIPPERX_ALL_ARCHES` | 未设置 | 设成任意值即忽略上面的列表，构建 `test/configs/` 下的**全部**目标（含 `pru`、`ar100`、`simu`，需要各自的工具链）。 |
 | `KLIPPERX_UPSTREAM_ALL` | 未设置 | 设成任意值即取消语料忽略列表（当前列表为空，故这只是口径上的保险；字典未构建的运行仍然跑不起来）。 |
@@ -159,6 +162,7 @@ crates/
   test-support/          测试支撑：按架构构建 MCU 字典、语料目录解析
 docs/                    文档（见下）
 third_party/klipper/     上游 Klipper（git 子模组：语料 + 上游 config + 固件源码）
+third_party/katapult/    Katapult 引导加载程序（git 子模组：katapult 协议 + bootloader 固件 + 刷写脚本）
 ```
 
 ## 文档

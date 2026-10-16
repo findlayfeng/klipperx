@@ -32,6 +32,8 @@ git worktree add ../klipperx.worktrees/<短名> -b agents/<类型>-<主题> work
 
   由 `crates/test-support`（`build.rs` 与 `klipper_dir()`）与 `src/core/klippy/upstream.rs` 统一解析；
   共享同一份检出是安全的（构建只写各自 `OUT_DIR`，`KCONFIG_CONFIG`/`OUT` 显式外移）。
+- `third_party/katapult` 同样保持空目录；读 katapult 检出的代码用
+  `KLIPPERX_KATAPULT_DIR=<主检出>/third_party/katapult`（`katapult_dir()` 解析，同一约定）。
 - 注意：worktree 的 `.cargo/config.toml` 里**不一定**有 `KLIPPERX_KLIPPER_DIR`（主检出的本地改动不带过去），
   所以每条 cargo 命令都显式带上这个前缀最稳。
 
@@ -42,6 +44,8 @@ git worktree add ../klipperx.worktrees/<短名> -b agents/<类型>-<主题> work
 ```bash
 git -C third_party/klipper worktree add /abs/path/klipperx.worktrees/<短名> -b agents/<主题> HEAD
 ```
+
+（`third_party/katapult` 要改时同理：`git -C third_party/katapult worktree add …`。）
 
 - 销毁时**必须在属主仓库里执行**：`git -C third_party/klipper worktree remove <路径>`；
   在主检出里跑 `git worktree remove <子模组路径>` 会报「不是一个工作区」（踩过）。

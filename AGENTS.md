@@ -26,7 +26,7 @@
    独立提交。worktree 里 `third_party/klipper` 保持**空目录**——不 `git submodule update`（属规则 6 禁止的
    远程交互），**也不拷**主检出的子模组（相对 gitfile 会失效）；构建/语料用
    `KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper` 指向主检出（共享同一份检出是安全的：只写各自
-   `OUT_DIR`）。**命令、目录布局、子模组 worktree、并发构建与收尾见
+   `OUT_DIR`）；`third_party/katapult` 同理——保持空目录，读取用 `KLIPPERX_KATAPULT_DIR=<主检出>/third_party/katapult`。**命令、目录布局、子模组 worktree、并发构建与收尾见
    [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md)。**此命令只由 main 执行，见规则 5。
 3. **开工前先看状态**：`git status` 确认工作区干净再切分支；发现已有未提交改动先报告，
    不要替用户 stash 或丢弃。

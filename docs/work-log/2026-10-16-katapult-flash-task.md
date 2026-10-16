@@ -348,6 +348,27 @@ T5c 与 T5-tool 已于 2026-10-16 并行派出；**T5b′ 等其中之一落地�
   **裁决：不阻塞、不补缝**——T5 流程里工具**自己开链路**（直接拿 `SharedSerialHandle`/`HostDevice`），
   不从 `Interface` 里捣句柄；若日后要让 host 自身发起刷写，再补不迟。
 
+**2026-10-16 T5d-3（经桥刷写端到端）+ B1/B2/B3（host 库多实例）验收并合入 `work`**
+
+- **T5d-3**：`src/flash/bridge_flash.rs`（574 行）+ CLI（`--bridge` / `--bridge-library` / `--host-identity` /
+  `--port-tty` / `--port` / `--port-nodeid` / `--port-reset`）：建桥链路（`McuConfig::open()` → `Interface`
+  clone → `Mcu::new` → `identify`，**字典走运行期 identify**）→ `open_bridge`（声明口/逐口复位/目标口
+  legacy 命名 + 开隧道）→ 隧道上跑 katapult 会话 → 清隧道收尾。端到端 `test_flash_via_bridge_over_the_real_library`
+  （真库当桥 + pty 当端口 + `flash::fake` 当 bootloader）绿；`flash` 77 测绿；测试卫生（取锁 +
+  `multi_thread` + 有界收尾）。**真机部分待用户下游设备**。
+- **B1（C 侧）**：子模组 `host:` 三提交——主循环唤醒从**进程级 `SIGUSR1` disposition** 改为
+  **按实例 `eventfd`**（`klipper_host_shutdown` 写 fd、`irq_wait`/`irq_poll` poll 它并查 shutdown），
+  删死代码 `SIGALRM`；**公共 ABI 未变**（`nm -D` 导出集一致）。证据：`grep -rn "SIGUSR1\|SIGALRM" third_party/klipper/src/host/` = **0**；并新增 2 条
+  「`shutdown()` ⇒ `run()` 返回」的有界测试（我裁决新增：既有覆盖只是无期限 join，退化会表现为整二进制挂住而非具名红测）。
+- **B2+B3（Rust 侧）**：去掉两处「一进程一份库」守卫（`refuse_a_second_library`、`reject_a_second_path`），
+  三个旧「拒绝第二路径」测试翻为正例；新增**真共存测试** `test_two_host_library_copies_run_side_by_side`
+  （两份 `fs::copy` 的库同进程 live，身份与 `get_clock` 互不影响——证明不是同一映射）。**同路径节一致性校验保留**；
+  **`HOST_LIBRARY_TEST_LOCK` 保留**（它护的是进程级 stderr 重定向与 pty，不是库单例）。
+- **合入顺序**：子模组先合 → 主仓 gitlink（`rev-parse` 取 sha）→ 主仓分支；**全量闸门 `--workspace` rc=0（13 二进制 0 失败）**、fmt 净、`build` 0 告警。
+- **文档**：四处「一进程一份库」陈述改写（`mcu-connection.md`、`serial-mux-protocol.md` 第 8 条、开发手册 README、`testing.md`），
+  testing.md 的 host.rs 覆盖面 18 → **21**（20 真库 + 1 缺库）。
+- **附带**：`abandoned/nextest-lane` 入台账（放弃 A：换 runner 做闸门快车道）——原因与可挖掘点见 `docs/abandoned.md`。
+
 ## 9. 附录：三路侦察全文（2026-10-16，只读侦察，file:line 级）
 
 - 附录A：katapult 协议与传输层规格（`~/project/katapult`）

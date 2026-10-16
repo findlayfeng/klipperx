@@ -255,11 +255,14 @@ impl Interface {
     ///
     /// The port-level command
     /// ([`set_port_node_id`](devices::serial::set_port_node_id)) travels the
-    /// bridge's **admin** channel, so only a link that has one can carry it: a
-    /// shared serial port, a muxed host library, or a CAN link (the node behind
-    /// it is the bridge, and the channel is the mux unit inside the byte stream).
-    /// Every other transport has no bridge to tell, and the message says so
-    /// rather than writing the unit on a link nobody listens to.
+    /// bridge's **admin** channel, so only a link that carries port mux units
+    /// can carry it: a shared serial port, a muxed host library, or a
+    /// can-serial CAN link (the node behind it is the bridge, and the channel is
+    /// the mux unit inside the byte stream). An ISO-TP link is a CAN link as
+    /// well, but it carries blocks rather than mux units, so it has no
+    /// port-level channel either. Every other transport has no bridge to tell,
+    /// and the message says so rather than writing the unit on a link nobody
+    /// listens to.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -276,17 +279,18 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed \
-                         host library, or a CAN link); this host library reference has no mux, \
-                         so no bridge is listening"
+                        "SET_PORT_NODEID needs a link that carries port mux units (a shared \
+                         serial port, a muxed host library, or a can-serial link); this host \
+                         library reference has no mux, so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_set_port_node_id(index, mcu_id, flags)
             }
             _ => Err(InterfaceError::Other(
-                "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "SET_PORT_NODEID needs a link that carries port mux units (a shared serial port, \
+                 a muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string(),
             )),
         }
@@ -298,8 +302,9 @@ impl Interface {
     ///
     /// The restart a **named** bridge-port device gets: it answers the bridge's
     /// mux itself, so it has an admin channel to receive this. Like
-    /// `SET_PORT_NODEID` the command travels that channel, so only a bridge link
-    /// carries it (a shared serial port, a muxed host library, or a CAN link).
+    /// `SET_PORT_NODEID` the command travels that channel, so only a link that
+    /// carries port mux units does: a shared serial port, a muxed host library,
+    /// or a can-serial CAN link (an ISO-TP link carries blocks, not mux units).
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -311,17 +316,18 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed \
-                         host library, or a CAN link); this host library reference has no mux, \
-                         so no bridge is listening"
+                        "RESTART_DEVICE needs a link that carries port mux units (a shared \
+                         serial port, a muxed host library, or a can-serial link); this host \
+                         library reference has no mux, so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_restart_device(index)
             }
             _ => Err(InterfaceError::Other(
-                "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "RESTART_DEVICE needs a link that carries port mux units (a shared serial port, \
+                 a muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string(),
             )),
         }
@@ -333,8 +339,9 @@ impl Interface {
     /// The reset a **legacy** bridge-port device gets: it has no admin channel of
     /// its own, so its bridge's port is the only thing that can reset it. Like
     /// `SET_PORT_NODEID` the command travels the bridge's admin channel, so only
-    /// a bridge link carries it (a shared serial port, a muxed host library, or a
-    /// CAN link).
+    /// a link that carries port mux units does: a shared serial port, a muxed
+    /// host library, or a can-serial CAN link (an ISO-TP link carries blocks,
+    /// not mux units).
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -346,17 +353,18 @@ impl Interface {
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
-                        "RESET_PORT needs a bridge link (a shared serial port, a muxed \
-                         host library, or a CAN link); this host library reference has no mux, \
-                         so no bridge is listening"
+                        "RESET_PORT needs a link that carries port mux units (a shared serial \
+                         port, a muxed host library, or a can-serial link); this host library \
+                         reference has no mux, so no bridge is listening"
                             .to_string(),
                     ));
                 }
                 device.send_reset_port(index)
             }
             _ => Err(InterfaceError::Other(
-                "RESET_PORT needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "RESET_PORT needs a link that carries port mux units (a shared serial port, a \
+                 muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string(),
             )),
         }
@@ -932,9 +940,12 @@ mod tests {
     /// with no such link says so (`_` arm of each `send_*`) instead of writing a
     /// unit nobody listens to — the message is asserted verbatim.
     ///
-    /// A CAN link is one of the links that do carry them (its node is the bridge,
-    /// see [`test_a_can_link_carries_the_bridge_commands`]), so this pins the
-    /// wording for the transports with no bridge at all.
+    /// A can-serial CAN link is one of the links that do carry them (its node is
+    /// the bridge, see [`test_a_can_link_carries_the_bridge_commands`]), so this
+    /// pins the wording for the transports with no port-level channel at all. It
+    /// names what such a link needs instead of calling the interface "none of
+    /// them": an ISO-TP link is a CAN link too, it just carries blocks rather
+    /// than mux units, so the old phrasing misread as "not CAN".
     #[tokio::test]
     async fn test_bridge_commands_need_a_bridge_link() {
         let interface = Interface::new(FrameMock::new(vec![]));
@@ -942,24 +953,27 @@ mod tests {
         assert_eq!(
             interface.send_set_port_node_id(1, 2, 0).unwrap_err(),
             InterfaceError::Other(
-                "SET_PORT_NODEID needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "SET_PORT_NODEID needs a link that carries port mux units (a shared serial port, \
+                 a muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string()
             )
         );
         assert_eq!(
             interface.send_restart_device(1).unwrap_err(),
             InterfaceError::Other(
-                "RESTART_DEVICE needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "RESTART_DEVICE needs a link that carries port mux units (a shared serial port, \
+                 a muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string()
             )
         );
         assert_eq!(
             interface.send_reset_port(1).unwrap_err(),
             InterfaceError::Other(
-                "RESET_PORT needs a bridge link (a shared serial port, a muxed host \
-                 library, or a CAN link); this interface is none of them"
+                "RESET_PORT needs a link that carries port mux units (a shared serial port, a \
+                 muxed host library, or a can-serial link); this interface is not one — an \
+                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
                     .to_string()
             )
         );

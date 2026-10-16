@@ -324,12 +324,18 @@ fn open_link_handle(
                 },
             ))
         }
-        Transport::Can { .. } => Err(config_error(
-            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+        // Every CAN upstream is unwired for downstream devices for the same
+        // reason, so all three share one refusal rather than falling through to
+        // the `{:?}` arm: the wire (`CanFd`) and the segmentation (`Isotp`) are
+        // orthogonal to what is missing.
+        Transport::Can { .. } | Transport::CanFd { .. } | Transport::Isotp { .. } => {
+            Err(config_error(
+                "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
              carrier and the port-command units exist, but the host-side attach is not \
              wired yet"
-                .to_string(),
-        )),
+                    .to_string(),
+            ))
+        }
         other => Err(config_error(format!(
             "a bridge on {other:?} cannot carry a downstream device"
         ))),
@@ -549,6 +555,7 @@ mod tests {
     use crate::core::klippy::frame::{Frame, MESSAGE_MAX, MESSAGE_MIN};
     use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
     use crate::core::klippy::interface::pty::Pty;
+    use crate::core::klippy::interface::CanWire;
     use crate::core::klippy::printer::Printer;
     use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
     use std::io::Read;
@@ -774,28 +781,46 @@ mod tests {
 
     /// A bridge reached over CAN is refused with the one message the attach pass
     /// and the reset path share, and never through `{:?}`: its host-side attach
-    /// is not wired yet.
+    /// is not wired yet. The wire and the segmentation are orthogonal to what is
+    /// missing, so all three CAN transports share the refusal.
     #[test]
     fn a_can_bridge_is_refused_with_the_shared_message() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let link = BridgePortLink {
-            transport: Transport::Can {
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let transports = [
+            Transport::Can {
                 interface: "can0".to_string(),
-                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+                uuid,
             },
-            index: 0,
-            flags: 0,
-            named: None,
-        };
+            Transport::CanFd {
+                interface: "can0".to_string(),
+                uuid,
+            },
+            Transport::Isotp {
+                interface: "can0".to_string(),
+                uuid,
+                wire: CanWire::Classical,
+            },
+        ];
 
-        let err = open_link(&printer, &link, 7).unwrap_err();
+        for transport in transports {
+            let link = BridgePortLink {
+                transport,
+                index: 0,
+                flags: 0,
+                named: None,
+            };
 
-        assert_eq!(
-            err.to_string(),
-            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
-             carrier and the port-command units exist, but the host-side attach is not \
-             wired yet"
-        );
+            let err = open_link(&printer, &link, 7).unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+                 carrier and the port-command units exist, but the host-side attach is not \
+                 wired yet",
+                "transport {link:?}"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -1,4 +1,5 @@
 pub mod core;
+pub mod flash;
 #[cfg(test)]
 mod hardware_test;
 pub mod klippy;

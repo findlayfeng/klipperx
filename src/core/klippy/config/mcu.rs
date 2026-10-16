@@ -2563,21 +2563,16 @@ mod tests {
     }
 
     /// Two `[mcu]` sections naming two **different** `host_library:` paths are a
-    /// config error naming both: a process holds one host library, whose exit
-    /// path (`SIGUSR1`) is process-wide, so two would crash or hang on the way
-    /// out.
+    /// shape that parses: each path is a separate image, and klipper runs both
+    /// in one process.
     #[test]
-    fn a_config_with_two_host_library_paths_is_rejected() {
+    fn a_config_with_two_host_library_paths_parses() {
         let (config, _) = parse_shared(
             "[mcu]\nhost_library: /lib/one.so\n\
              [mcu tool]\nhost_library: /lib/two.so\n",
             "mcu",
         );
-        let err = config.unwrap_err();
-        let text = err.to_string();
-        assert!(text.contains("one host library per process"), "{text}");
-        assert!(text.contains("'/lib/one.so'"), "{text}");
-        assert!(text.contains("'/lib/two.so'"), "{text}");
+        assert!(config.is_ok(), "{config:?}");
     }
 
     // -----------------------------------------------------------------------

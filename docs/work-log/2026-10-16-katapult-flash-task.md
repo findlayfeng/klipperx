@@ -134,21 +134,27 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
   content_filter——若再被滤就 fresh 棒按本快照接力）；恢复第一步 = 让 `3d58cf00` 的半成品编译过。
 - 执行史：首棒 30min 超时（5 次过滤）→ resume 后两笔提交 → 用户暂停。
 
-**T3 硬件测试口径（用户 2026-10-16 定：不走拓扑、不用配置文件）**：
-不走 `printer.cfg` 的 `[mcu 桥]` + 下游子节那套拓扑流程（那是 T5），改用**夹具级直接驱动**
-——用宿主库（`CONFIG_HOST_BRIDGE_SERIAL` 变体，T3 合并后重建即包含桥隧道代码）或 linux
-架构固件进程当桥，在 harness 里直接发 admin 命令（`SET_PORT_NODEID`/`SET_PORT_TUNNEL 0x06`）
-与隧道单元，下游接真板。
-- **拓扑**：harness ──宿主库（桥）── UART（CH340）── STM32F103（下游装置，跑 katapult）。
-  宿主库编译时烘死的端口路径可用**符号链接**指向 CH340 的 tty（库把它当普通 tty 打开），
-  不必改库构建。
-- **两个前置**：① 下游 katapult 要说 UART——板上现有的是 `USBSERIAL` only，需换一份
-  `USART1(PA9/PA10)` 配置的 katapult，用 deployer 自更新上去（自举闭环已真机验证，无风险）；
-  ② CH340 ↔ PA9/PA10 + GND 接线（用户手动）。
-- **两级验**：L1 机制级 = 一行最小序列（`SET_PORT_NODEID` + `0x06` → 下行写 katapult 帧 →
-  上游收到 reply-arb 隧道单元），证「剥头下行 + 回程组装」在真字节流上成立；L2 端到端 =
-  经隧道把一份新镜像刷进下游板 + 读回/版本定案（形态上等于 T5 收口）。
-- **反悔路径**：测完用 deployer 把 USB 版 katapult 刷回（同样已验通道）。
+**真机测试分阶段口径（用户 2026-10-16 定）**：
+
+**阶段 1（不摆桥、直连设备，验「设备对新增指令的应答是否正确」）**
+- 固件：klipper 子模组构一份 `test/configs/stm32f103-usb-mux.config` + **`CONFIG_STM32_FLASH_START_2000=y`**
+  （应用偏移 0x8002000 与 katapult 对齐），**构建外移**（`KCONFIG_CONFIG`/`OUT` 指自建目录，
+  不碰子模组 `.config`/`out/`——不属第三阶段「改子模组先报告」）。`HAVE_BOOTLOADER_REQUEST`
+  由 `src/stm32/Kconfig:17` 恒 select，无需额外开关。
+- 刷入：我们的 `flash` bin 直连 USB（板子在 katapult 态）、**不走拓扑**。
+- 验项（直连，逐个给字节/重枚举证据）：①发现：`klipperx scan --port <by-id>` 应答 NEED_NODEID
+  （USB-CDC 载体上的 mux 设备半，身份=chipid 派生、跨复位稳定）；②主机 mux attach + identify
+  作基线；③ `SET_PORT_NODEID (0x03)` 设备不执行（桥自身命令）；④ **`REQUEST_BOOTLOADER (0x02)`**
+  → `bootloader_request()` → 板子重枚举为 katapult（`1d50:6177`）；⑤ **`RESTART_DEVICE (0x05)`**
+  → `mcu_restart()` → 重枚举回 klipper；⑥隧道单元（`01 88 …`）发给设备→**安全丢弃**且流不挂，
+  随后一条合法命令仍被应答。④即可用来在无调试器时把板子从应用切回引导。
+- 驱动：三个发送器（`send_set_port_node_id`/`send_restart_device`/`send_request_bootloader`）
+  在主机侧**无生产调用者**，用硬件门控用例/夹具直驱（不配 `printer.cfg`）。
+- **不依赖 T3**（T3 是桥半）：可与 T3 并行。
+
+**阶段 2（等 T5 收掉后）：设备在桥后面能否正确刷入**——届时走配置拓扑，复用同一块板。
+
+（前段已作废的口径不再适用）
 
 **2026-10-16 katapult 自举实测（真机 STM32F103ZE + USB CDC，两轮，非 T 序列）**：
 - 配置：choice「Build Katapult deployment application」`0000→2000`（`BUILD_DEPLOYER` 随之开，

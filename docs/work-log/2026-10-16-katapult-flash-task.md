@@ -136,7 +136,7 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 
 **真机测试分阶段口径（用户 2026-10-16 定）**：
 
-**阶段 1（不摆桥、直连设备，验「设备对新增指令的应答是否正确」）**
+**阶段 1（直连设备半，不摆桥，验「设备对新增指令的应答是否正确」）——已真机完成，见 §8**
 - 固件：klipper 子模组构一份 `test/configs/stm32f103-usb-mux.config` + **`CONFIG_STM32_FLASH_START_2000=y`**
   （应用偏移 0x8002000 与 katapult 对齐），**构建外移**（`KCONFIG_CONFIG`/`OUT` 指自建目录，
   不碰子模组 `.config`/`out/`——不属第三阶段「改子模组先报告」）。`HAVE_BOOTLOADER_REQUEST`
@@ -209,6 +209,35 @@ klipper 同款约定（提交 `d6a66c4`，已 ff 进 `work`）。
 - 执行记录：T1 首次 30 分钟超时零产出（侦察挤爆预算），按救援 skill 同会话 resume +
   强制落笔后一次交卷；T4a 同日同样超时一次（已完成黄金向量/CRC 交叉验证但未落笔），
   resume 后在跑。
+
+**2026-10-16 阶段 1 真机完成（直连设备半，不摆桥）**：固件 = klipper 子模组 `test/configs/stm32f103-usb-mux.config`
++ `CONFIG_STM32_FLASH_START_2000=y`（应用 0x8002000），外部构建（`target/hw-phase1`，未碰子模组 `.config`/`out/`），
+经**自己的 `flash` bin** 直连 USB 刷入（684 块 + verify，rc=0），板子随即枚举为 mux-klipper。
+夹具：分支 `agents/test-hw-mux-device-phase1`（`b6db875`，`serial.rs` +421），两条 `#[ignore]` 探针，
+`KLIPPERX_HW_MUX_TTY=<by-id>` 驱动（uuid 可 `KLIPPERX_HW_MUX_UUID` 覆盖，默认本板 `e512c60ac0e6`）。
+
+| # | 验项 | 结果 | 证据 |
+|---|------|------|------|
+| 1 | 发现（未指派） | ✓ | 扫描应答在 admin 应答 id（`0x3f1`）上，uuid=`e512c60ac0e6`、`application=None`、`NEED_NODEID` |
+| 2 | 指派被采纳 | ✓ | 指派后再扫**静默**（号在主机侧，设备只持有） |
+| 3 | `SET_PORT_NODEID (0x03)` | ✓ 设备不执行 | 发出去无任何应答（桥自身命令） |
+| 4 | 隧道单元（`01 88 …`） | ✓ 安全丢弃 + 流恢复 | 无应答；**其后第一个帧被吞、第二个帧起有应答**（见下） |
+| 5 | `RESTART_DEVICE (0x05)` | ✓ 真重启 | tty 回来、**号丢失**（重启后扫描重新应答同一 uuid） |
+| 6 | `REQUEST_BOOTLOADER (0x02)` | ✓ 进引导 | 板子从 `usb-Klipper_…` 变为 `usb-katapult_stm32f103xe_devloop1-if00` |
+
+实测数字：第 1 条 8.91s 通过；第 2 条 2.41s 通过。
+
+**真机踩出的三条（已写进探针注释与提交正文）**：
+1. **探针必须按 arb 分派单元、并在开端口时清输入缓冲**——板子会自发 1 Hz 的 `stats` 帧（字典里
+   `stats count/sum/sumsq` 记作 id `-12`，其编码首字节 `0x74`，三个参数逐帧可解），且上一轮
+   留下的应答头还会先到；盲读第一个单元会把二者粘在一起误判。
+2. **隧道单元后至多丢一个帧**：设备帧解析器遇到内层 katapult 帧（首字节 `0x01` 不是合法长度）
+   进入「等下一个 SYNC」态，于是紧随其后的那一帧被整体吃掉，再下一帧恢复——与 T1 在主机侧
+   铉住的「丢到下一个 `0x7e`、至多损失一个单元」是同一性质；刷写会话的重传（tries=5）能盖过它。
+3. **DTR 不是必要条件**：断言与否都能收到管理应答（无 DTR 只是看不到那 1 Hz `stats`），
+   所以仓库正常开端口路径不断言 DTR 不是缺陷。
+
+**未测（留阶段 2）**：设备在桥后面能否正确刷入（待 T5）。板子阶段 1 结束时停在 katapult。
 
 ## 9. 附录：三路侦察全文（2026-10-16，只读侦察，file:line 级）
 

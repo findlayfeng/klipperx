@@ -4919,3 +4919,424 @@ mod katapult_dual_encap_tests {
         });
     }
 }
+
+// ===========================================================================
+// Phase-1 hardware probe: the mux device half on a real board
+// ===========================================================================
+//
+// Drives a board that runs the firmware's serial-mux device half over its own
+// tty, **with no bridge in the path** (the staging in
+// `docs/work-log/2026-10-16-katapult-flash-task.md`, "真机测试分阶段口径"): every
+// step sends one unit and reads what comes back, so each answer of the device
+// half is pinned against real bytes instead of a pty fixture.
+//
+// The two tests split where the board's identity changes:
+//
+//   * [`hw_mux_device_answers_the_admin_commands`] — discovery, the assignment,
+//     a bridge-only command (`SET_PORT_NODEID`) that a device must ignore, and a
+//     tunnel unit (dropped whole, with the stream alive afterwards);
+//   * [`hw_mux_device_bootloader_and_restart`] — the two commands that make the
+//     device *leave*: `RESTART_DEVICE` (same firmware comes back) and
+//     `REQUEST_BOOTLOADER` (katapult takes over).
+//
+// Both are `#[ignore]`d and take the tty from `KLIPPERX_HW_MUX_TTY`; without it
+// they return immediately, so the default gate is untouched.
+#[cfg(test)]
+mod hw_mux_device_tests {
+    use super::*;
+    use crate::core::klippy::frame::{Frame, MESSAGE_DEST, MESSAGE_MAX, MESSAGE_MIN};
+
+    /// The tty a board running the mux device half listens on.
+    fn hw_tty() -> Option<PathBuf> {
+        std::env::var_os("KLIPPERX_HW_MUX_TTY")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    }
+
+    /// The identity the probe addresses the board by.
+    ///
+    /// This is the board's own (chipid-derived, stable across resets) identity;
+    /// an assignment naming it is idempotent, which is what lets the two probes
+    /// run in any order — a scan only answers while the board holds no node id,
+    /// and a node id outlives a test run (it lives in the host, not the MCU).
+    /// `KLIPPERX_HW_MUX_UUID` overrides it for another board.
+    fn hw_uuid() -> [u8; 6] {
+        let Some(raw) = std::env::var_os("KLIPPERX_HW_MUX_UUID") else {
+            return [0xe5, 0x12, 0xc6, 0x0a, 0xc0, 0xe6];
+        };
+        let text = raw.to_string_lossy();
+        let bytes: Vec<u8> = (0..6)
+            .map(|i| u8::from_str_radix(&text[i * 2..i * 2 + 2], 16).expect("a hex uuid"))
+            .collect();
+        let mut uuid = [0u8; 6];
+        uuid.copy_from_slice(&bytes);
+        uuid
+    }
+
+    /// Bind the board to `mcu_id` (idempotent: the same identity keeps it).
+    fn bind(port: &mut File, mcu_id: u32) {
+        let assignment = set_node_id_for(hw_uuid(), mcu_id).expect("an addressable id");
+        port.write_all(&assignment)
+            .expect("the assignment goes out");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    /// One data unit to `mcu_id`, and whether the board answered it — how a
+    /// probe tells a bound, live device from one that never adopted the id.
+    fn alive_on(port: &mut File, pending: &mut Vec<u8>, mcu_id: u32, window: Duration) -> bool {
+        let frame = Frame::new(MESSAGE_DEST, vec![1]).raw_bytes();
+        let mut unit = encode_header(assign::arb_id(mcu_id).expect("an addressable id"));
+        unit.extend_from_slice(&frame);
+        port.write_all(&unit).expect("the frame unit goes out");
+        read_unit_for(
+            port,
+            pending,
+            assign::reply_arb_id(mcu_id).expect("the id"),
+            window,
+        )
+        .is_some()
+    }
+
+    /// Open the tty raw and non-blocking, the way the device layer opens one.
+    ///
+    /// **DTR and RTS are asserted**: a board's CDC console only hands its
+    /// bytes over once the host raises the modem lines (the first hardware run
+    /// got silence until they were), so a probe that opens without them sees
+    /// a device that looks dead.
+    fn open_hw_tty(path: &Path) -> File {
+        let port = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(path)
+            .unwrap_or_else(|e| panic!("opening {}: {e}", path.display()));
+        set_raw_mode(&port, DEFAULT_BAUD).expect("the hardware tty goes raw");
+        set_modem_line(&port, libc::TIOCM_DTR, true).expect("DTR is asserted");
+        set_modem_line(&port, libc::TIOCM_RTS, true).expect("RTS is asserted");
+        // Discard whatever accumulated while nobody was reading (a prior run's
+        // late answers, the firmware's `stats` frames): a probe reads from its
+        // own question onwards.
+        // SAFETY: `tcflush` takes the fd and a queue selector.
+        unsafe {
+            libc::tcflush(port.as_raw_fd(), libc::TCIFLUSH);
+        }
+        // Let the board's console settle after the line change before the first
+        // unit goes out (the working probe waited here).
+        std::thread::sleep(Duration::from_millis(300));
+        port
+    }
+
+    /// Drop bytes up to and including the next frame sync — the device layer's
+    /// resynchronisation policy ([`drop_to_sync`]), which a probe needs for the
+    /// same reason the reader does: a board also sends its own traffic (the
+    /// firmware's once-a-second `stats` frame), and those bytes sit in front of
+    /// the unit a probe is waiting for.
+    fn skip_to_sync(pending: &mut Vec<u8>) {
+        match pending.iter().position(|b| *b == MESSAGE_SYNC) {
+            Some(idx) => {
+                pending.drain(..=idx);
+            }
+            None => pending.clear(),
+        }
+    }
+
+    /// A whole unit cut off the front of `pending`, if one is there.
+    fn unit_from(pending: &mut Vec<u8>) -> Option<Vec<u8>> {
+        loop {
+            if pending.is_empty() {
+                return None;
+            }
+            let consumed = match decode_header(pending) {
+                HeaderScan::Complete { consumed, .. } => consumed,
+                HeaderScan::NeedMore => return None,
+                HeaderScan::Invalid => {
+                    skip_to_sync(pending);
+                    continue;
+                }
+            };
+            if pending.len() < consumed + 1 {
+                return None;
+            }
+            let length = pending[consumed] as usize;
+            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+                // A length no frame has: the header is not one after all.
+                skip_to_sync(pending);
+                continue;
+            }
+            if pending.len() < consumed + length {
+                return None;
+            }
+            return Some(pending.drain(..consumed + length).collect());
+        }
+    }
+
+    /// The next whole unit within `window`, or nothing if the port stayed
+    /// silent — the two outcomes every step below distinguishes.
+    fn read_unit(port: &File, pending: &mut Vec<u8>, window: Duration) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + window;
+        let mut buf = [0u8; 256];
+        // `File` reads through a shared reference, so a local binding is all the
+        // `Read` methods need here.
+        let mut port = port;
+        loop {
+            if let Some(unit) = unit_from(pending) {
+                return Some(unit);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let mut poll = libc::pollfd {
+                fd: port.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut poll,
+                    1,
+                    deadline.saturating_duration_since(now).as_millis() as i32,
+                )
+            };
+            assert!(rc >= 0, "poll: {}", std::io::Error::last_os_error());
+            if rc == 0 {
+                continue;
+            }
+            match port.read(&mut buf) {
+                Ok(0) => return None,
+                Ok(n) => pending.extend_from_slice(&buf[..n]),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                Err(e) => panic!("reading the hardware tty: {e}"),
+            }
+        }
+    }
+
+    /// The next unit **for `want_arb`** within `window`, discarding units for
+    /// other ids — the dispatch rule the device layer's reader applies, and what
+    /// a probe needs here for the same reason: a board also delivers what a
+    /// previous run left in flight (an old reply header) and sends its own
+    /// `stats` frames, so the front of the stream is not ours to assume.
+    fn read_unit_for(
+        port: &File,
+        pending: &mut Vec<u8>,
+        want_arb: u32,
+        window: Duration,
+    ) -> Option<Vec<u8>> {
+        let deadline = Instant::now() + window;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            match read_unit(port, pending, deadline.saturating_duration_since(now)) {
+                Some(unit) => {
+                    if unit_parts(&unit).0 == want_arb {
+                        return Some(unit);
+                    }
+                }
+                None => return None,
+            }
+        }
+    }
+
+    /// The arbitration id and frame half of a unit.
+    fn unit_parts(unit: &[u8]) -> (u32, &[u8]) {
+        match decode_header(unit) {
+            HeaderScan::Complete { arb, consumed } => (arb, &unit[consumed..]),
+            other => panic!("not a unit: {other:?}"),
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Wait until `path` exists again, up to `window`.
+    fn wait_for_path(path: &Path, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            if path.exists() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        false
+    }
+
+    /// Whether a `usb-katapult_…` node is enumerated right now.
+    fn katapult_node_enumerated() -> Option<String> {
+        let entries = std::fs::read_dir("/dev/serial/by-id").ok()?;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("usb-katapult_") {
+                return Some(name);
+            }
+        }
+        None
+    }
+
+    /// The answers a device half owes a host that is *directly* on its tty.
+    #[test]
+    #[ignore = "hardware: needs KLIPPERX_HW_MUX_TTY (a board running the mux device half)"]
+    fn hw_mux_device_answers_the_admin_commands() {
+        let Some(path) = hw_tty() else {
+            eprintln!("KLIPPERX_HW_MUX_TTY is not set: nothing to probe");
+            return;
+        };
+        let mut port = open_hw_tty(&path);
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(3);
+        let silent = Duration::from_millis(800);
+
+        // 1. An unaddressed board answers a scan on the admin reply id. A board
+        //    that already holds a node id (a previous run, or the sibling probe)
+        //    stays quiet by design — that is what a scan lists — so the answer
+        //    is checked when it comes and the step is a note when it does not.
+        let query = discovery_query();
+        eprintln!("1. discovery query = {}", hex(&query));
+        port.write_all(&query).expect("the query goes out");
+        match read_unit_for(&port, &mut pending, ADMIN_REPLY, window) {
+            Some(answer) => {
+                let node = UnassignedNode::from_unit(&answer).expect("a well-formed admin answer");
+                assert_eq!(
+                    node.uuid,
+                    hw_uuid(),
+                    "the board answers with its own identity"
+                );
+                eprintln!(
+                    "1. discovery: uuid={}, application={:?}",
+                    hex(&node.uuid),
+                    node.application
+                );
+            }
+            None => eprintln!(
+                "1. no scan answer: the board already holds a node id (a scan lists the \
+                 unaddressed only)"
+            ),
+        }
+
+        // 2. The assignment is adopted, so a second scan draws silence.
+        bind(&mut port, 5);
+        port.write_all(&discovery_query())
+            .expect("the second scan goes out");
+        assert!(
+            read_unit_for(&port, &mut pending, ADMIN_REPLY, silent).is_none(),
+            "an addressed board must stay quiet in a scan"
+        );
+        eprintln!("2. the assignment was adopted (the second scan was silent)");
+
+        // 3. `SET_PORT_NODEID` belongs to a bridge's own port table: a device
+        //    must not execute it, and must not answer it.
+        let port_command = admin_unit(&[CMD_SET_PORT_NODEID, 0, 5, 0]);
+        port.write_all(&port_command)
+            .expect("the port command goes out");
+        assert!(
+            read_unit_for(&port, &mut pending, ADMIN_REPLY, silent).is_none(),
+            "SET_PORT_NODEID is a bridge's own command, so a device must ignore it"
+        );
+        eprintln!("3. SET_PORT_NODEID (0x03) drew no answer from the device");
+
+        // 4. A tunnel unit is dropped whole, and the stream stays alive: a valid
+        //    klipper frame still draws an answer afterwards.
+        let katapult_frame = vec![0x01, 0x88, 0x11, 0x00, 0xf1, 0x7c, 0x99, 0x03];
+        let tunnel = tunnel_unit(assign::arb_id(5).expect("id 5"), &katapult_frame)
+            .expect("a whole katapult frame is one tunnel unit");
+        port.write_all(&tunnel).expect("the tunnel unit goes out");
+        if let Some(extra) = read_unit_for(&port, &mut pending, ADMIN_REPLY, silent) {
+            panic!(
+                "a tunnel unit is not the device half's to answer (got {})",
+                hex(&extra)
+            );
+        }
+        //    klipper frame still draws an answer afterwards. The tunnel unit
+        //    itself leaves the device's frame parser resynchronising (it looks
+        //    for the next SYNC), so the first frame after it can be swallowed —
+        //    at most one, which is the property the tunnel unit test pins on the
+        //    host side too. The first probe that *is* answered is the proof the
+        //    stream came back.
+        let mut answered = alive_on(&mut port, &mut pending, 5, window);
+        let mut probes = 1;
+        while !answered && probes < 4 {
+            probes += 1;
+            answered = alive_on(&mut port, &mut pending, 5, window);
+        }
+        assert!(answered, "the device answers again after it resynchronises");
+        eprintln!(
+            "4. a tunnel unit drew no answer; the stream answered after {probes} probe frames"
+        );
+    }
+
+    /// The two commands that make a device leave, and what it comes back as.
+    #[test]
+    #[ignore = "hardware: needs KLIPPERX_HW_MUX_TTY (a board running the mux device half)"]
+    fn hw_mux_device_bootloader_and_restart() {
+        let Some(path) = hw_tty() else {
+            eprintln!("KLIPPERX_HW_MUX_TTY is not set: nothing to probe");
+            return;
+        };
+        let mut port = open_hw_tty(&path);
+        let mut pending = Vec::new();
+        let window = Duration::from_secs(3);
+
+        // 0. Bind the board and prove it holds the id: the two commands below
+        //    are transported as units addressed to it, so there is nothing to
+        //    send if it never adopted the id.
+        bind(&mut port, 5);
+        assert!(
+            alive_on(&mut port, &mut pending, 5, window),
+            "the board holds node id 5 after the assignment"
+        );
+        eprintln!("0. bound: the board answers on id 5's reply header");
+
+        // 1. `RESTART_DEVICE` reboots the firmware. The node id does not survive
+        //    a reset (it is the host's to hand out), so the rebooted board must
+        //    answer a scan again — the proof that this command really reset it.
+        port.write_all(&admin_unit(&[CMD_RESTART_DEVICE, 0]))
+            .expect("the restart goes out");
+        drop(port);
+        assert!(
+            wait_for_path(&path, Duration::from_secs(15)),
+            "the tty comes back after RESTART_DEVICE"
+        );
+        std::thread::sleep(Duration::from_millis(800));
+        let mut port = open_hw_tty(&path);
+        let mut pending = Vec::new();
+        let mut rebooted = None;
+        for _ in 0..6 {
+            port.write_all(&discovery_query())
+                .expect("the query goes out");
+            if let Some(answer) =
+                read_unit_for(&port, &mut pending, ADMIN_REPLY, Duration::from_secs(2))
+            {
+                if let Some(node) = UnassignedNode::from_unit(&answer) {
+                    rebooted = Some(node);
+                    break;
+                }
+            }
+        }
+        let node = rebooted.expect("the rebooted board answers a scan (its node id is gone)");
+        assert_eq!(node.uuid, hw_uuid(), "the same board came back");
+        eprintln!(
+            "1. RESTART_DEVICE: back up unaddressed, uuid={}",
+            hex(&node.uuid)
+        );
+
+        // 2. `REQUEST_BOOTLOADER` hands the board to katapult, whose USB id is
+        //    its own (`usb-katapult_…`, the klipper node disappears).
+        bind(&mut port, 5);
+        port.write_all(&admin_unit(&[CMD_REQUEST_BOOTLOADER, 0]))
+            .expect("the bootloader request goes out");
+        drop(port);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut found = None;
+        while Instant::now() < deadline {
+            if let Some(name) = katapult_node_enumerated() {
+                found = Some(name);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let name = found.expect("REQUEST_BOOTLOADER leaves the board in katapult");
+        eprintln!("2. REQUEST_BOOTLOADER: the board is in katapult as {name}");
+    }
+}

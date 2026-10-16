@@ -104,8 +104,9 @@ use tracing::{debug, info, trace, warn};
 
 use super::serial::{
     admin_unit, assignment_request, encode_header, parse_assignment_ack, set_node_id_for,
-    set_port_node_id, UnitStream, ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT,
-    CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
+    set_port_node_id, tunnel_block, TunnelRegistry, TunnelSink, UnitStream, ADMIN_LISTEN,
+    ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+    CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
 };
 use super::shared::resource_for;
 
@@ -454,6 +455,10 @@ struct Router {
     /// The reader is the only producer ([`push_unit`]); a reference reads only
     /// its own slot, so one reference's units can never be taken by another.
     slots: Mutex<HashMap<u32, Sender<Vec<u8>>>>,
+    /// The tunnel listeners on this library, keyed by the arbitration id their
+    /// units are headed with — the uplink half of a flashing tunnel
+    /// ([`HostDevice::set_tunnel_sink`]).
+    tunnels: TunnelRegistry,
 }
 
 impl Router {
@@ -616,6 +621,7 @@ impl HostLibrary {
                 library_path,
                 mode,
                 slots: Mutex::new(HashMap::new()),
+                tunnels: TunnelRegistry::new(),
             }),
             read_output,
             identity,
@@ -747,7 +753,26 @@ fn reader_loop(
 /// reference cuts with [`UnitStream`] — the same stream
 /// [`HostDevice::attach`]'s handshake scans — so the answer is routed by its
 /// header like everything else and reaches the reference waiting for it.
+///
+/// A **tunnel** unit ([`tunnel_block`]) is the exception: its frame position is
+/// a katapult block, not a klipper frame, so it goes to a tunnel listener
+/// registered for its id ([`HostDevice::set_tunnel_sink`]) instead of a slot,
+/// and is dropped with a debug line when no listener holds it.
 fn route_unit(router: &Router, arb: u32, unit: Vec<u8>) {
+    // A tunnel unit's frame position holds the katapult tag, not a klipper
+    // frame: it belongs to a tunnel listener under this very id, and a listener
+    // gets the whole block. With none, it is dropped here — never pushed into
+    // the slot of the id it names, where a frame consumer would meet a frame
+    // it cannot parse.
+    if let Some(block) = tunnel_block(&unit) {
+        if !router.tunnels.deliver(arb, block) {
+            debug!(
+                "klipper host library {}: no tunnel listener for {arb:#x}; dropping tunnel unit",
+                router.library_path.display()
+            );
+        }
+        return;
+    }
     match assign::mcu_id_from_arb(arb) {
         Some(mcu_id) => push_unit(router, mcu_id, unit),
         None => debug!(
@@ -1233,6 +1258,45 @@ impl HostDevice {
         self.send_admin(&admin_unit(&[CMD_SET_PORT_TUNNEL, index])[HEADER_BYTES..])
     }
 
+    /// Write one unit on this library under an arbitrary arbitration id: the
+    /// checked two-byte header for `arb` ([`encode_header`]), then `payload`
+    /// exactly as given.
+    ///
+    /// The whole unit goes to the library's input under the write lock, so
+    /// another reference on the same library cannot split its header from its
+    /// frame. This is the entry the other transports' `send_unit` mirrors, and
+    /// what a tunnel adapter writes whole katapult blocks through: `payload`
+    /// travels as it came, so the caller owns the framing.
+    ///
+    /// # Errors
+    /// [`InterfaceError::ConnectionLost`] when this reference has been shut
+    /// down, [`InterfaceError::SendError`] when the library refuses the bytes.
+    pub(crate) fn send_unit(&self, arb: u32, payload: &[u8]) -> Result<(), InterfaceError> {
+        let mut unit = encode_header(arb);
+        unit.extend_from_slice(payload);
+        self.write_raw(&unit)
+    }
+
+    /// Route this library's tunnel units headed with `arb` to `sink`: the
+    /// uplink half of a flashing tunnel, handed over whole.
+    ///
+    /// `arb` is the id the upstream tunnel units carry — a device behind a
+    /// bridge port answers under `reply_arb_id(mcu_id)`, and the bridge heads
+    /// its bootloader's blocks with it. Every reference on the library shares
+    /// this one table, so any of them can register it. Registering the same id
+    /// twice replaces the first sink; [`Self::clear_tunnel_sink`] removes it,
+    /// and so does dropping the receiver ([`TunnelSink::channel`]). Units no
+    /// sink is registered for are dropped, exactly as before there were
+    /// listeners.
+    pub fn set_tunnel_sink(&self, arb: u32, sink: TunnelSink) {
+        self.library.router.tunnels.register(arb, sink);
+    }
+
+    /// Stop routing `arb`'s tunnel units to the sink registered for it.
+    pub fn clear_tunnel_sink(&self, arb: u32) {
+        self.library.router.tunnels.clear(arb);
+    }
+
     /// Attach a muxed reference: name the device `named`, hand it `mcu_id`, and
     /// re-confirm the assignment.
     ///
@@ -1500,8 +1564,8 @@ mod host_tests {
     use crate::core::klippy::identify::IDENTIFY_MESSAGES;
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, assignment_request, decode_header, discovery_query, encode_header,
-        set_node_id_for, set_port_node_id, tunnel_unit, HeaderScan, UnassignedNode, ADMIN_LISTEN,
-        ADMIN_REPLY, ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+        set_node_id_for, set_port_node_id, tunnel_unit, HeaderScan, TunnelSink, UnassignedNode,
+        ADMIN_LISTEN, ADMIN_REPLY, ASSIGN_ATTACH_ATTEMPTS, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
         CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC,
         MUX_PORT_UNITS, RESP_NEED_NODEID, TUNNEL_TAG,
     };
@@ -1513,6 +1577,10 @@ mod host_tests {
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::msg::Msg;
     use crate::core::klippy::Interface;
+    use crate::flash::bridge::TunnelBridge;
+    use crate::flash::fake::FakeBootloader;
+    use crate::flash::frame::{build_frame, command};
+    use crate::flash::session::{flash_with_config, SessionConfig};
     use std::io::{Read, Write};
     use std::os::fd::AsRawFd;
     use std::time::Instant;
@@ -3269,6 +3337,229 @@ mod host_tests {
             "the block behind the junk travels whole"
         );
 
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// Pump bytes between a pty's master end and a [`FakeBootloader`] until
+    /// `stop` is set, recording everything the bridge wrote to the port.
+    ///
+    /// The bootloader's answers go back to the slave (the bridge reads them);
+    /// the bridge's bytes go into the bootloader and are recorded, which is
+    /// where the downlink's bare katapult frames are seen. Every wait is
+    /// bounded (a 5 ms poll), so the thread exits promptly once stopped.
+    fn start_fake_pump(
+        pty: &Pty,
+        fake: &FakeBootloader,
+        recorded: Arc<Mutex<Vec<u8>>>,
+        stop: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        let mut fake_reader = fake.reader();
+        let mut fake_writer = fake.writer();
+        let mut master_write = pty.master.try_clone().expect("the pty master clones");
+        let master_read = pty.master.try_clone().expect("the pty master clones");
+        std::thread::spawn(move || {
+            let mut from_bootloader = [0u8; 256];
+            let mut from_bridge = [0u8; 256];
+            let mut reader = &master_read;
+            while !stop.load(Ordering::Relaxed) {
+                // The bootloader's answers go back to the bridge.
+                match fake_reader.read(&mut from_bootloader) {
+                    Ok(n) if n > 0 => master_write
+                        .write_all(&from_bootloader[..n])
+                        .expect("the pty takes the bootloader's answer"),
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("the fake bootloader failed: {e}"),
+                }
+                // The bridge's frames go into the bootloader, recorded.
+                let mut poll = libc::pollfd {
+                    fd: master_read.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let ready = unsafe { libc::poll(&mut poll, 1, 5) };
+                if ready > 0 {
+                    match reader.read(&mut from_bridge) {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            recorded
+                                .lock()
+                                .unwrap()
+                                .extend_from_slice(&from_bridge[..n]);
+                            fake_writer
+                                .write_all(&from_bridge[..n])
+                                .expect("the fake bootloader takes the frame");
+                        }
+                        Err(e) => panic!("reading the pty master: {e}"),
+                    }
+                }
+            }
+        })
+    }
+
+    /// The exact bytes `flash::session` writes for `payload` at `start_addr`:
+    /// every command frame it sends, in order, as the `flash::frame` codec
+    /// builds them — a 64 B block padded with `0xFF` like the session's.
+    fn session_frames(start_addr: u32, payload: &[u8]) -> Vec<u8> {
+        let mut block = payload.to_vec();
+        block.resize(64, 0xFF);
+        let mut send = start_addr.to_le_bytes().to_vec();
+        send.extend_from_slice(&block);
+        let mut out = Vec::new();
+        out.extend_from_slice(&build_frame(command::CONNECT, &[]));
+        out.extend_from_slice(&build_frame(command::SEND_BLOCK, &send));
+        out.extend_from_slice(&build_frame(command::EOF, &[]));
+        out.extend_from_slice(&build_frame(
+            command::REQUEST_BLOCK,
+            &start_addr.to_le_bytes(),
+        ));
+        out.extend_from_slice(&build_frame(command::COMPLETE, &[]));
+        out
+    }
+
+    /// The bridge tunnel as a flashing tool uses it: a whole katapult session
+    /// (`flash::session`) driven through the host library, with the real
+    /// `flash::fake` bootloader on the pty's far end.
+    ///
+    /// The session's bytes go out as whole tunnel units and the port writes
+    /// them down **bare** — the pty's bytes are the katapult frames exactly,
+    /// the 76-byte Send Block whole — while the bootloader's answers come back
+    /// up as tunnel units under the port's reply id and reach the session's
+    /// sink. The session completing (its `Summary` matching what the fake
+    /// reported) is the proof the uplink ran; the recorded pty bytes are the
+    /// downlink.
+    #[test]
+    fn test_the_tunnel_flash_session_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge's port 0 opens at configuration time, so the tty has to
+        // exist first — and the port path is the library build's own, symlinked
+        // to this pty.
+        let pty = Pty::new();
+        let bridge_path = klipperx_test_support::klipper_host_mux_serial_path();
+        let _ = std::fs::remove_file(&bridge_path);
+        std::os::unix::fs::symlink(&pty.path, &bridge_path).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                bridge_path.display(),
+                pty.path.display()
+            )
+        });
+
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let device_id = 7u32;
+        let mut device = HostDevice::load_downstream(mux_library_path(), identity, device_id)
+            .expect("a downstream reference loads without a handshake");
+        let window = Duration::from_secs(5);
+
+        // Port 0 as a legacy device on id 7: the bridge strips the header on
+        // the way down and heads the port's bytes with the reply id on the way
+        // up — the shape a bootloader (which speaks no units) needs.
+        configure_port_zero(Arc::get_mut(&mut device).expect("the test holds the only reference"));
+        device
+            .send_set_port_node_id(0, device_id as u8, 0)
+            .expect("SET_PORT_NODEID goes in");
+        device.send_set_port_tunnel(0).expect("the tunnel is on");
+
+        // The uplink listener: the bridge heads the bootloader's blocks with
+        // the port's reply id, and this is where the session reads them.
+        let reply = assign::reply_arb_id(device_id).expect("id 7 is addressable");
+        let (sink, frames) = TunnelSink::channel();
+        device.set_tunnel_sink(reply, sink);
+        let down_arb = assign::arb_id(device_id).expect("id 7 is addressable");
+
+        // Ordering: one whole block sent down must arrive on the pty bare
+        // before the session starts, or its first CONNECT could precede the
+        // tunnel mode.
+        device
+            .send_unit(down_arb, &TUNNEL_CONNECT)
+            .expect("the ordering probe goes in");
+        assert_eq!(
+            read_pty(&pty.master, TUNNEL_CONNECT.len(), window),
+            TUNNEL_CONNECT,
+            "the tunnel is on: the block reaches the pty with no unit header"
+        );
+
+        // The uplink, before the session: a whole block written on the port
+        // comes up as one unit under the port's reply id and reaches the sink
+        // byte for byte.
+        (&pty.master)
+            .write_all(&TUNNEL_SEND_BLOCK)
+            .expect("a whole block goes into the port");
+        assert_eq!(
+            frames
+                .recv_timeout(window)
+                .expect("the uplink block comes up"),
+            TUNNEL_SEND_BLOCK.to_vec(),
+            "the library cuts the port's bytes into one reply-id unit, delivered whole"
+        );
+
+        // The fake bootloader on the pty's far end, pumped by a thread.
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&pty, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        let payload: Vec<u8> = (0..16u8).collect();
+        let cfg = SessionConfig {
+            tries: 3,
+            read_timeout: Duration::from_secs(2),
+            retry_delay: Duration::from_millis(50),
+            busy_delay: Duration::from_millis(50),
+        };
+        let bridge = TunnelBridge::new(down_arb, frames, Arc::clone(&device));
+        let (mut reader, mut writer) = bridge.split();
+        let summary = flash_with_config(&mut reader, &mut writer, &payload, &cfg, |_| {})
+            .expect("the tunnel session completes");
+
+        // The uplink ran: the Summary is what the fake's bare CONNECT answer
+        // carried, and the fake saw exactly one write and one verify.
+        assert_eq!(summary.start_addr, 0x0800_2000, "the fake's start address");
+        assert_eq!(summary.block_size, 64);
+        assert_eq!(summary.mcu_type, "STM32F103");
+        assert_eq!(summary.bytes_flashed, payload.len());
+        assert_eq!(summary.block_count, 1);
+        assert_eq!(fake.seen(command::SEND_BLOCK), 1, "one block written");
+        assert_eq!(fake.seen(command::REQUEST_BLOCK), 1, "one block verified");
+        assert_eq!(
+            fake.memory().get(&0x0800_2000).map(Vec::len),
+            Some(64),
+            "the bootloader stored one 64-byte block"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+
+        // The downlink: the pty's bytes are the session's katapult frames,
+        // exactly and in order — no unit header anywhere, and the 76-byte Send
+        // Block travels whole.
+        let expected = session_frames(0x0800_2000, &payload);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            expected,
+            "the pty carried bare katapult frames, byte for byte"
+        );
+        let mut send = 0x0800_2000u32.to_le_bytes().to_vec();
+        let mut block = payload.clone();
+        block.resize(64, 0xFF);
+        send.extend_from_slice(&block);
+        let send_frame = build_frame(command::SEND_BLOCK, &send);
+        assert_eq!(send_frame.len(), 76, "a 64 B Send Block is one 76 B frame");
+        assert!(
+            recorded
+                .lock()
+                .unwrap()
+                .windows(send_frame.len())
+                .any(|w| w == send_frame.as_slice()),
+            "the 76-byte Send Block reaches the pty whole"
+        );
+
+        drop(reader);
+        drop(writer);
+        drop(bridge);
         drop(device);
         wait_for_unload_blocking(&mux_library_path());
     }

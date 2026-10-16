@@ -718,6 +718,31 @@ mod tests {
         out
     }
 
+    /// The fake's store for `payload` at `start_addr`, block for block: a block
+    /// the session padded to `block_size` with `0xFF` is compared padded, so a
+    /// short final block is checked exactly too.
+    fn assert_fake_stored(
+        fake: &FakeBootloader,
+        start_addr: u32,
+        payload: &[u8],
+        block_size: usize,
+    ) {
+        let memory = fake.memory();
+        for (i, chunk) in payload.chunks(block_size).enumerate() {
+            let addr = start_addr + (i * block_size) as u32;
+            let stored = memory
+                .get(&addr)
+                .unwrap_or_else(|| panic!("block {i} at {addr:#x} never arrived"));
+            let mut expected = chunk.to_vec();
+            expected.resize(block_size, 0xFF);
+            assert_eq!(
+                stored.as_slice(),
+                expected.as_slice(),
+                "block {i} at {addr:#x}"
+            );
+        }
+    }
+
     /// Pump the pty's far end through the fake bootloader: the bridge's frames
     /// (read on the master) go into the fake and are recorded, the fake's
     /// answers go back out the master to the bridge. Run until `stop` is set.
@@ -1346,15 +1371,13 @@ mod tests {
 
         // The fake's store is the payload, block for block: a byte lost or
         // reordered anywhere in the sustained transfer would show here.
-        let memory = fake.memory();
-        assert_eq!(memory.len(), blocks, "exactly one entry per block");
-        for (i, chunk) in payload.chunks(64).enumerate() {
-            let addr = 0x0800_2000 + (i * 64) as u32;
-            let stored = memory.get(&addr).unwrap_or_else(|| {
-                panic!("block {i} at {addr:#x} never reached the device's memory")
-            });
-            assert_eq!(stored.as_slice(), chunk, "block {i} stored byte for byte");
-        }
+        assert_eq!(fake.memory().len(), blocks, "exactly one entry per block");
+        assert_fake_stored(
+            &fake,
+            summary.start_addr,
+            &payload,
+            summary.block_size as usize,
+        );
 
         stop.store(true, Ordering::Relaxed);
         pump.join().expect("the pump thread");
@@ -1449,6 +1472,84 @@ mod tests {
         drop(mcu);
         drop(link);
         drop(handle);
+        drop(firmware);
+    }
+
+    /// Sustained transfer under repetition and changing size: four rounds, all
+    /// through **one** bridge instance, so the reset, the declaration and the
+    /// tunnel are rebuilt every round and the path is never warm for long. The
+    /// sizes cross 40 KiB and include short final blocks; a small pause between
+    /// rounds moves the transfer off whatever timing the previous round left.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_repeated_rounds_of_different_sizes_keep_every_byte() {
+        const BRIDGE_UUID: [u8; 6] = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6];
+        let sizes = [43 * 1024, 64, 40 * 1024 + 37, 7777];
+
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        let mut link = BridgeLink::open_serial(
+            firmware.serial_path(),
+            250_000,
+            BRIDGE_MCU_ID,
+            Some(BRIDGE_UUID),
+        )
+        .expect("the bridge's console attaches and is named");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the linux bridge identifies");
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let mut blocks = 0usize;
+        for (round, size) in sizes.iter().enumerate() {
+            let payload: Vec<u8> = (0..*size).map(|i| ((i * 7 + round) % 256) as u8).collect();
+            let expected_blocks = (payload.len() + 63) / 64;
+            let summary = link
+                .flash(&ports, target, &payload, &test_config(), |_| {})
+                .await
+                .unwrap_or_else(|e| panic!("round {round} ({size} bytes): {e}"));
+            assert_eq!(summary.bytes_flashed, *size, "round {round}");
+            assert_eq!(summary.block_count, expected_blocks, "round {round}");
+            assert_fake_stored(
+                &fake,
+                summary.start_addr,
+                &payload,
+                summary.block_size as usize,
+            );
+            blocks += expected_blocks;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            fake.seen(command::CONNECT),
+            sizes.len(),
+            "one session per round"
+        );
+        assert_eq!(
+            fake.seen(command::SEND_BLOCK),
+            blocks,
+            "every block of every round reached the device"
+        );
+        assert_eq!(fake.seen(command::REQUEST_BLOCK), blocks);
+        assert_eq!(fake.seen(command::COMPLETE), sizes.len());
+
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+        link.close();
+        drop(link);
         drop(firmware);
     }
 }

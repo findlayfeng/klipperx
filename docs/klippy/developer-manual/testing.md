@@ -362,6 +362,16 @@ git config core.hooksPath .githooks
 
 `plan` 是 `#[ignore]` 的，用 `KLIPPERX_HW_CONFIG=… cargo test -p klipperx --lib hardware_test::plan -- --ignored --nocapture` 运行，只打印配置的能力图（`HW-SECTIONS` / 每节 `HW-SECTION` / `HW-MCU` 判定），不打开端口。
 
+### `flash`（crate 根，katapult 刷写会话）
+
+| 模块 | 覆盖 |
+|------|------|
+| `src/flash/frame.rs`（15 测） | **katapult 帧纯编解码**（与 klipper 帧层的 CRC 覆盖范围不同：katapult 从 cmd 字节起算、不含 2B 头与尾，模块文档有警示）：黄金向量钉死（Connect 8B = `01 88 11 00 F1 7C 99 03`、含 64B 真数据的 Send Block 76B）；CRC16-CCITT 双途径交叉验证（按规格的位运算实现 vs `flashtool.py:42-49` 逐行移植，`"123456789"→0x6F91` 与 python 第三者一致）；六类应答解码（Connect 的版本/起始地址/block_size/build-info NUL 分支、SEND_BLOCK 回显地址、EOF 回 page_count、REQUEST_BLOCK 回地址+数据、COMPLETE、GET_CANBUS_ID 回 uuid、NACK/BUSY/ERROR 三态）；`FrameScanner` 滑窗（垃圾前缀跳过、坏 CRC 与坏尾各滑 1 字节、跨两次 feed 重组整帧、`clear` 丢半帧、`MAX_PAYLOAD` 防假 word_cnt 卡死） |
+| `src/flash/session.rs` + `tests.rs`（8 测） | **传输无关刷写会话**（阻塞 `Read+Write` + deadline，与 `serial.rs` 同读模型；`SessionConfig` 默认取 flashtool 节奏 tries=5/2s）：全流程（connect→send_block×N→eof→verify→complete）含尾块 0xFF 填充与 verify 比对；NACK 重发直到设备接受；busy 延迟后重试；坏 CRC 应答被滑窗跳过；应答分两次读到仍重组；F2 设备错误中止；静默设备耗尽 tries；verify 抓出被写坏的块。每测 30s 看门狗 |
+| `src/flash/fake.rs`（夹具，无独立测） | 进程内脚本化 bootloader：`Quirk` 按「命令+第 N 次」一次性触发（Nack/Busy/Error/Silent/坏 CRC/写坏存储）、`split_responses` 造分片到达、`memory`/`seen` 供断言；空队列回 `WouldBlock` 永不阻塞。为直连绑定（T4b）与拓扑流程（T5）的测试复用 |
+
+传输绑定（tty/CAN/USB）与 CLI 入口属后续直连单元（T4b），不在本模块；会话对任意字节流成立，这 23 测全部不碰真端口。 
+
 ### `msg`
 
 | 模块 | 覆盖 |

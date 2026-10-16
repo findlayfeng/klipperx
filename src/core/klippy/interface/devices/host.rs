@@ -3815,7 +3815,8 @@ mod host_tests {
     /// Both references are addressed the same way a live bridge reference and a
     /// live downstream one are — by the id in the unit's header — so they take
     /// the routing the real pair takes. The wire is a real pty on the port the
-    /// mux build baked in, and that port has been told its device speaks units
+    /// reference named for slot 0, and that port has been told its device speaks
+    /// units
     /// ([`MUX_PORT_UNITS`]): a headed unit written into it is forwarded upstream
     /// unchanged (the bridge attributes a unit to the port it *arrived on*, never
     /// to the id in its header), which is how units of each id are put on the one

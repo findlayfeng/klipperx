@@ -3838,3 +3838,585 @@ mod mux_tests {
         assert_eq!(reported[0].uuid, [0x11; 6]);
     }
 }
+
+// ===========================================================================
+// T1 双重封装原型通路：katapult 字节流裹进 klipper 帧载荷
+// ===========================================================================
+//
+// 主机把 katapult 块按 klipper 单帧载荷上限（59 B）切片、裹成帧再加 2 字节
+// 单元头发到线上；桥在 legacy 口剥掉单元头（`bridge_attach.rs:400`：
+// “the bridge strips the header going down”），完整 klipper 帧逐字节落到设备；
+// 设备侧由 katapult 的 `command_find_block`
+// （`third_party/katapult/src/command.c:99-141`，本模块忠实移植——结构检查
+// 顺序、resync 丢到下一个 `0x01`、`CF_NEED_VALID` 一次性 NACK 均按 C 语义）
+// 逐字节吃这条流。四类载荷各给逐字节判定。
+#[cfg(test)]
+mod katapult_dual_encap_tests {
+    use super::*;
+
+    // katapult 块帧常量：`third_party/katapult/src/command.h:39-56`。
+    const K_MIN: usize = 8; // MESSAGE_MIN
+    const K_MAX: usize = 128; // MESSAGE_MAX
+    const K_STX1: u8 = 0x01; // MESSAGE_STX1
+    const K_STX2: u8 = 0x88; // MESSAGE_STX2
+    const K_SYNC2: u8 = 0x99; // MESSAGE_SYNC2（尾 0x99，command.h:53）
+    const K_SYNC: u8 = 0x03; // MESSAGE_SYNC（尾 0x03，command.h:54）
+    const K_TRAILER: usize = 4; // MESSAGE_TRAILER_SIZE
+    const CMD_CONNECT: u8 = 0x11; // command.h:14
+    const CMD_RX_BLOCK: u8 = 0x12; // command.h:15（Send Block，host→设备）
+                                   // `command.c:95`：`enum { CF_NEED_SYNC=1<<0, CF_NEED_VALID=1<<1 };`
+    const CF_NEED_SYNC: u8 = 1 << 0;
+    const CF_NEED_VALID: u8 = 1 << 1;
+
+    /// klipper 单帧载荷上限（`frame.rs:26`：`MESSAGE_MAX - MESSAGE_MIN`）。
+    const PAYLOAD_MAX: usize = crate::core::klippy::frame::MESSAGE_PAYLOAD_MAX;
+    /// 外层帧尾的 SYNC（`frame.rs:45`）。
+    const FRAME_SYNC: u8 = crate::core::klippy::frame::MESSAGE_SYNC;
+
+    /// 本端口（裹 katapult 流的那个 MCU）与夹在混合流里的“其他 MCU”。
+    fn our_arb() -> u32 {
+        assign::arb_id(4).expect("id 4 has an arbitration id")
+    }
+    fn foreign_arb() -> u32 {
+        assign::arb_id(9).expect("id 9 has an arbitration id")
+    }
+
+    // --------------------------------------------------------------------
+    // 主机侧：katapult 块的构造与 klipper 帧封装
+    // --------------------------------------------------------------------
+
+    /// 一个 katapult 块帧：`<01><88><cmd><word_cnt><payload(4B倍数)>
+    /// <crc16-LE><99><03>`；CRC 覆盖 `[cmd][word_cnt][payload]`
+    /// （`command.c:120`：`crc16_ccitt(buf+2, msglen-4-2)`），低字节在前
+    /// （`command.h:50` 的 `MESSAGE_TRAILER_CRC = 4`）。
+    fn katapult_block(cmd: u8, payload: &[u8]) -> Vec<u8> {
+        assert_eq!(payload.len() % 4, 0, "payload 必须按 word 对齐");
+        let word_cnt = u8::try_from(payload.len() / 4).expect("word count fits a byte");
+        let mut covered = vec![cmd, word_cnt];
+        covered.extend_from_slice(payload);
+        let crc = crate::crc16_ccitt!(&covered);
+        let mut out = vec![K_STX1, K_STX2, cmd, word_cnt];
+        out.extend_from_slice(payload);
+        out.push(crc as u8);
+        out.push((crc >> 8) as u8);
+        out.push(K_SYNC2);
+        out.push(K_SYNC);
+        assert_eq!(out.len(), out[3] as usize * 4 + 8, "msglen = word_cnt*4+8");
+        assert!((K_MIN..=K_MAX).contains(&out.len()));
+        out
+    }
+
+    /// 8 B Connect 控制帧（word_cnt = 0，msglen = 8 = MESSAGE_MIN）。
+    fn connect_block() -> Vec<u8> {
+        let block = katapult_block(CMD_CONNECT, &[]);
+        assert_eq!(block.len(), 8);
+        block
+    }
+
+    /// 76 B Send Block：地址 word + 16 个数据 word = 68 B 载荷，
+    /// `msglen = 17*4+8 = 76`；数据是真 64 B，CRC 真算。
+    fn send_block(addr: u32) -> Vec<u8> {
+        let data: [u8; 64] = std::array::from_fn(|i| b'A' + (i % 26) as u8);
+        let mut payload = addr.to_le_bytes().to_vec();
+        payload.extend_from_slice(&data);
+        let block = katapult_block(CMD_RX_BLOCK, &payload);
+        assert_eq!(block.len(), 76);
+        block
+    }
+
+    /// 56 B 块（word_cnt = 12）：整段能落进一个 59 B 外层载荷，
+    /// 用来把后面的小帧顶过切点。
+    fn block_56() -> Vec<u8> {
+        let data: [u8; 44] = std::array::from_fn(|i| b'a' + (i % 26) as u8);
+        let mut payload = 0x2000u32.to_le_bytes().to_vec();
+        payload.extend_from_slice(&data);
+        let block = katapult_block(CMD_RX_BLOCK, &payload);
+        assert_eq!(block.len(), 56);
+        block
+    }
+
+    /// 主机侧封装：katapult 字节流按 59 B 载荷切片，每片裹成
+    /// `[len][seq|0x10][payload][crc16][0x7e]`（`frame.rs:17-47`），
+    /// 前面加 2 字节单元头——共享线上发出的单元序列。
+    fn host_units(arb: u32, stream: &[u8]) -> Vec<Vec<u8>> {
+        stream
+            .chunks(PAYLOAD_MAX)
+            .enumerate()
+            .map(|(i, chunk)| {
+                let mut unit = encode_header(arb);
+                unit.extend_from_slice(&Frame::encode(i as u8, chunk));
+                unit
+            })
+            .collect()
+    }
+
+    // --------------------------------------------------------------------
+    // 桥的 legacy 下行
+    // --------------------------------------------------------------------
+
+    /// 逐单元剥掉 2 字节单元头、帧字节原样往下落（`bridge_attach.rs:400`）。
+    /// `route = Some(ours)` 只下发本口单元（其他 MCU 的被路由走）；`None`
+    /// 模拟最坏情况——整条线的帧都落到设备。
+    fn bridge_down(wire: &[u8], route: Option<u32>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < wire.len() {
+            assert!(wire.len() - pos >= 3, "unit at {pos}: header + length byte");
+            let arb = match decode_header(&wire[pos..pos + 2]) {
+                HeaderScan::Complete { arb, .. } => arb,
+                other => panic!("unit at {pos}: bad header {other:?}"),
+            };
+            let frame_len = wire[pos + 2] as usize;
+            assert!(
+                (5..=64).contains(&frame_len),
+                "unit at {pos}: frame length {frame_len}"
+            );
+            let unit_len = 2 + frame_len;
+            assert!(pos + unit_len <= wire.len(), "unit at {pos}: truncated");
+            let deliver = match route {
+                Some(want) => want == arb,
+                None => true,
+            };
+            if deliver {
+                out.extend_from_slice(&wire[pos + 2..pos + unit_len]);
+            }
+            pos += unit_len;
+        }
+        out
+    }
+
+    // --------------------------------------------------------------------
+    // 设备侧：`command_find_block` 的忠实移植与逐字节驱动
+    // --------------------------------------------------------------------
+
+    /// 一次 `command_find_block` 调用（C 的返回值 + `pop_count` 出参）。
+    #[derive(Debug)]
+    struct Call {
+        ret: i8,
+        pop: usize,
+        nacked: bool,
+    }
+
+    /// `command_find_block`（`third_party/katapult/src/command.c:99-141`）的
+    /// 忠实移植。特别保留：错误时缓冲头恰是 `0x01` 则 `memchr` 命中自身、
+    /// `pop_count = 0`、缓冲永不推进——固件的调用方（`serial_irq.c:71-86`
+    /// 的 `console_task`）不做 0 推进保护，原地空转即停摆。
+    #[derive(Default)]
+    struct KatapultParser {
+        /// C 的 `static uint8_t sync_state`，初始 0（`command.c:100`）。
+        sync_state: u8,
+    }
+
+    impl KatapultParser {
+        fn find_block(&mut self, buf: &[u8]) -> Call {
+            // `command.c:101-102`
+            if !buf.is_empty() && self.sync_state & CF_NEED_SYNC != 0 {
+                return self.need_sync(buf);
+            }
+            // `command.c:103-104`
+            if buf.len() < K_MIN {
+                return Call {
+                    ret: 0,
+                    pop: 0,
+                    nacked: false,
+                };
+            }
+            // `command.c:105-106`
+            if buf[0] != K_STX1 || buf[1] != K_STX2 {
+                return self.error(buf);
+            }
+            // `command.c:107-108` —— msglen = word_cnt*4+8，须 8..=128
+            let msglen = buf[3] as usize * 4 + 8;
+            if !(K_MIN..=K_MAX).contains(&msglen) {
+                return self.error(buf);
+            }
+            // `command.c:109-110`
+            if buf.len() < msglen {
+                return Call {
+                    ret: 0,
+                    pop: 0,
+                    nacked: false,
+                };
+            }
+            // `command.c:111-112` —— 尾部 0x99 / 0x03
+            if buf[msglen - 2] != K_SYNC2 || buf[msglen - 1] != K_SYNC {
+                return self.error(buf);
+            }
+            // `command.c:113-117` —— CRC16-LE，覆盖 buf+2 起 msglen-4-2 字节
+            let msgcrc = buf[msglen - 4] as u16 | (buf[msglen - 3] as u16) << 8;
+            let crc = crate::crc16_ccitt!(&buf[2..msglen - K_TRAILER]);
+            if crc != msgcrc {
+                return self.error(buf);
+            }
+            // `command.c:118` —— 有效块清 CF_NEED_VALID（重 arm 一次性 NACK）
+            self.sync_state &= !CF_NEED_VALID;
+            // `command.c:119`
+            Call {
+                ret: 1,
+                pop: msglen,
+                nacked: false,
+            }
+        }
+
+        fn error(&mut self, buf: &[u8]) -> Call {
+            // `command.c:135`
+            self.sync_state |= CF_NEED_SYNC;
+            self.need_sync(buf)
+        }
+
+        /// `command.c:136-148`：丢到下一个 `0x01`（命中才清 CF_NEED_SYNC，
+        /// 否则整段丢弃）；`CF_NEED_VALID` 未置时发一次性 NACK。
+        fn need_sync(&mut self, buf: &[u8]) -> Call {
+            let pop = match buf.iter().position(|&b| b == K_STX1) {
+                Some(at) => {
+                    self.sync_state &= !CF_NEED_SYNC;
+                    at
+                }
+                None => buf.len(),
+            };
+            if self.sync_state & CF_NEED_VALID != 0 {
+                return Call {
+                    ret: -1,
+                    pop,
+                    nacked: false,
+                };
+            }
+            self.sync_state |= CF_NEED_VALID;
+            Call {
+                ret: -1,
+                pop,
+                nacked: true,
+            }
+        }
+    }
+
+    /// 设备侧接收缓冲与调用节奏：按 `console_task`（`serial_irq.c:71-86`）
+    /// ——每收一字节就反复 `command_find_block` 直到 need_more；`ret≠0` 且
+    /// `pop=0` 连续两次即 C 侧原地空转（缓冲头是错误的 `0x01`，`memchr`
+    /// 永远命中自身），记录停摆位置，此后字节只进缓冲不再解析——与固件
+    /// 一致：那些字节永远轮不到。
+    #[derive(Default)]
+    struct DeviceSide {
+        parser: KatapultParser,
+        buf: Vec<u8>,
+        recovered: Vec<Vec<u8>>,
+        nacks: usize,
+        stalled_at: Option<usize>,
+    }
+
+    impl DeviceSide {
+        fn feed(&mut self, stream: &[u8]) {
+            let mut fed = 0usize;
+            for &byte in stream {
+                self.buf.push(byte);
+                fed += 1;
+                if self.stalled_at.is_some() {
+                    continue;
+                }
+                let mut no_progress = 0u8;
+                loop {
+                    let call = self.parser.find_block(&self.buf);
+                    if call.ret == 0 {
+                        break;
+                    }
+                    // NACK 与 pop 无关（`command.c:146-147` 在 return 前发），
+                    // 所以先记账再看推进。
+                    if call.nacked {
+                        self.nacks += 1;
+                    }
+                    if call.pop == 0 {
+                        no_progress += 1;
+                        if no_progress >= 2 {
+                            self.stalled_at = Some(fed);
+                            break;
+                        }
+                        continue;
+                    }
+                    no_progress = 0;
+                    let drained: Vec<u8> = self.buf.drain(..call.pop).collect();
+                    if call.ret > 0 {
+                        self.recovered.push(drained);
+                    }
+                }
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // 断言与有界兜底
+    // --------------------------------------------------------------------
+
+    /// 整体有界兜底：主体跑在独立线程，超时未结束即失败，不让解析循环挂住 CI。
+    fn bounded(seconds: u64, body: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _ = std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(Duration::from_secs(seconds)) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(_) => panic!("双重封装测试在 {seconds}s 内没有结束：解析循环失去有界性"),
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// 逐字节差异：首个不同偏移 + 期望/实际字节，附完整十六进制行。
+    fn byte_diff(expected: &[u8], actual: &[u8]) -> String {
+        let first = expected.iter().zip(actual).position(|(e, a)| e != a);
+        let mismatch = first.or_else(|| {
+            (expected.len() != actual.len()).then_some(expected.len().min(actual.len()))
+        });
+        let head = match mismatch {
+            Some(i) => {
+                let show =
+                    |v: Option<u8>| v.map_or_else(|| "<缺>".to_string(), |b| format!("{b:#04x}"));
+                format!(
+                    "首个差异 @偏移 {i}: 期望 {}, 实际 {}",
+                    show(expected.get(i).copied()),
+                    show(actual.get(i).copied())
+                )
+            }
+            None => "两串逐字节一致".to_string(),
+        };
+        format!(
+            "{head}\n  期望({}): {}\n  实际({}): {}",
+            expected.len(),
+            hex(expected),
+            actual.len(),
+            hex(actual)
+        )
+    }
+
+    fn assert_recovered(actual: &[Vec<u8>], expected: &[Vec<u8>], ctx: &str) {
+        let names = |frames: &[Vec<u8>]| {
+            frames
+                .iter()
+                .map(|f| format!("[{}]", hex(f)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{ctx}: 捞出帧数不对\n  实际 {}: {}\n  期望 {}: {}",
+            actual.len(),
+            names(actual),
+            expected.len(),
+            names(expected)
+        );
+        for (i, (got, want)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                got == want,
+                "{ctx}: 第 {i} 帧不一致\n{}",
+                byte_diff(want, got)
+            );
+        }
+    }
+
+    // --------------------------------------------------------------------
+    // 四类载荷
+    // --------------------------------------------------------------------
+
+    /// ① 8 B Connect：8 ≤ 59，单帧装得下 —— 完整捞出。剥头前的 [len][seq]
+    /// 触发一次 resync 丢弃，按固件的一次性 NACK 语义恰好 NACK 一次；
+    /// 内层帧之后只剩 3 字节外层尾（klipper crc+0x7e），永远不够 8 B、无害。
+    #[test]
+    fn a_connect_control_frame_survives_dual_encapsulation_intact() {
+        bounded(10, || {
+            let inner = connect_block();
+            assert!(inner.len() <= PAYLOAD_MAX, "8 ≤ 59：单帧装得下");
+            let units = host_units(our_arb(), &inner);
+            assert_eq!(units.len(), 1, "Connect 只裹一个单元");
+            let wire = units.concat();
+            let device_bytes = bridge_down(&wire, Some(our_arb()));
+            assert_eq!(
+                device_bytes.len(),
+                13,
+                "[len][seq] + 8 B 内层 + [crc][0x7e]"
+            );
+            let mut dev = DeviceSide::default();
+            dev.feed(&device_bytes);
+            assert_recovered(&dev.recovered, &[inner], "① Connect");
+            assert_eq!(dev.nacks, 1, "首个错误触发固件的一次性 NACK");
+            assert_eq!(dev.stalled_at, None, "不得停摆");
+            assert_eq!(dev.buf.len(), 3, "残留仅为外层帧尾 klipper crc+0x7e");
+        });
+    }
+
+    /// ② 76 B Send Block：76 > 单帧载荷 59 ⇒ 必须切成 59+17 两帧。剥头后
+    /// 设备流在内层偏移 59 处被外层帧尾 (crc16+0x7e) 与下一帧头 (len+seq)
+    /// 撕开，内层 CRC 必炸 ⇒ 整帧捞不出；且解析器停摆——`command.c:141-143`
+    /// 的 resync 在缓冲头就是 `0x01` 时 `memchr` 命中自身、`pop_count = 0`，
+    /// 缓冲永不推进，后续字节永远轮不到。
+    #[test]
+    fn a_76_byte_send_block_is_torn_apart_by_the_klipper_frame_split() {
+        bounded(10, || {
+            let inner = send_block(0x1000);
+            assert_eq!(inner.len(), 76, "msglen = 17*4+8");
+            assert!(inner.len() > PAYLOAD_MAX, "关键算术：76 B > 59 ⇒ 必须分片");
+            let sizes: Vec<usize> = inner.chunks(PAYLOAD_MAX).map(<[u8]>::len).collect();
+            assert_eq!(sizes, vec![59, 17], "切点必然落在内层帧中间");
+            let units = host_units(our_arb(), &inner);
+            assert_eq!(units.len(), 2);
+            let wire = units.concat();
+            let device_bytes = bridge_down(&wire, Some(our_arb()));
+            assert_eq!(device_bytes.len(), 86, "64 B 整帧 + 22 B 整帧");
+            let mut dev = DeviceSide::default();
+            dev.feed(&device_bytes);
+            assert!(
+                dev.recovered.is_empty(),
+                "76 B Send Block 必须整帧捞不出，实捞 {}",
+                dev.recovered
+                    .iter()
+                    .map(|f| hex(f))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            );
+            assert_eq!(
+                dev.nacks, 1,
+                "只有首个错误发 NACK，其余被 CF_NEED_VALID 静默"
+            );
+            let stalled_at = dev
+                .stalled_at
+                .expect("分片撕裂后解析器必须停摆（pop 0、缓冲永不推进）");
+            assert_eq!(stalled_at, 78, "内层第 76 B（= 流偏移 2+76）处判定失败");
+            // 逐字节证据：停摆缓冲的头仍是我们内层帧的头；内层偏移 59..64
+            // 正是被夹进来的外层帧1尾(crc16+0x7e)+帧2头(len+seq)。
+            assert_eq!(
+                &dev.buf[..4],
+                &[K_STX1, K_STX2, CMD_RX_BLOCK, 17],
+                "停摆在我们的内层帧头上"
+            );
+            assert_eq!(
+                &dev.buf[59..64],
+                &device_bytes[61..66],
+                "内层偏移 59 起 = 外层帧1尾 + 帧2头"
+            );
+            assert_eq!(
+                device_bytes[63], FRAME_SYNC,
+                "外层帧1的 0x7e 插在内层偏移 61"
+            );
+            assert_eq!(device_bytes[64], 22, "外层帧2的 len 插在内层偏移 62");
+        });
+    }
+
+    /// ③ 跨两个 klipper 帧的分片流：56 B 块整段落在第一帧的 59 B 载荷里，
+    /// 8 B Connect 从内层偏移 56 起跨过 59 的切点 —— 前一个完整块照常捞出，
+    /// 跨界的 Connect 被外层帧尾/下一帧头撕碎、捞不出：撕碎的头就压在缓冲
+    /// 最前，word_cnt 位被外层 crc 字节污染、msglen 要么越界要么与外层尾
+    /// 对不上，立刻报错 → resync 命中自身 pop 0 → 停摆。
+    #[test]
+    fn an_inner_frame_straddling_the_split_is_lost_while_the_one_before_survives() {
+        bounded(10, || {
+            let first = block_56();
+            let straddler = connect_block();
+            let mut inner = first.clone();
+            inner.extend_from_slice(&straddler);
+            assert_eq!(inner.len(), 64);
+            let sizes: Vec<usize> = inner.chunks(PAYLOAD_MAX).map(<[u8]>::len).collect();
+            assert_eq!(sizes, vec![59, 5], "Connect 从 56 起跨过 59 的切点");
+            let units = host_units(our_arb(), &inner);
+            assert_eq!(units.len(), 2);
+            let wire = units.concat();
+            let device_bytes = bridge_down(&wire, Some(our_arb()));
+            let mut dev = DeviceSide::default();
+            dev.feed(&device_bytes);
+            assert_recovered(&dev.recovered, &[first], "③ 分片流：只有前一个完整块");
+            // 有效块清过 CF_NEED_VALID 后，跨界帧的失败再 NACK 一次（前一次是
+            // 丢 [len][seq]），随即 pop 0 停摆：撕碎的头让外层帧1的 crc 字节
+            // 被读成 word_cnt，buf 一到 8 B 就报错（越界，或 msglen=8 但尾
+            // 对不上外层的 0x0a），resync 命中自身、缓冲永不推进。
+            assert_eq!(dev.nacks, 2, "丢 [len][seq] 一次、跨界帧失败一次");
+            assert_eq!(
+                dev.stalled_at,
+                Some(66),
+                "buf 到 8 B（= 流偏移 66）处报错并停摆"
+            );
+            assert_eq!(
+                dev.buf.len(),
+                16,
+                "停摆时已 pop 2+56，余下 16 B 只进缓冲不再解析"
+            );
+            // 逐字节证据：内层偏移 3 起是被夹进来的外层帧1尾 + 帧2头。
+            assert_eq!(
+                &dev.buf[..8],
+                &[
+                    K_STX1,
+                    K_STX2,
+                    CMD_CONNECT,
+                    device_bytes[61], // 外层帧1 crc 高
+                    device_bytes[62], // 外层帧1 crc 低
+                    device_bytes[63], // 外层帧1 0x7e
+                    device_bytes[64], // 外层帧2 len
+                    device_bytes[65], // 外层帧2 seq
+                ],
+                "撕碎的 Connect 头压在缓冲最前，外层帧尾/下一帧头穿在它中间"
+            );
+        });
+    }
+
+    /// 其他 MCU 的合法 klipper 单元：identify 请求帧（本仓既有测试的常形）。
+    fn foreign_frame(seq: u8) -> Vec<u8> {
+        Frame::encode(seq, b"identify offset=0 count=112")
+    }
+    fn foreign_unit(seq: u8) -> Vec<u8> {
+        let mut unit = encode_header(foreign_arb());
+        unit.extend_from_slice(&foreign_frame(seq));
+        unit
+    }
+
+    /// ④ 混合流的线：其他 MCU 的单元前后夹着裹了 Connect 的我们的单元。
+    fn mixed_wire(inner: &[u8]) -> Vec<u8> {
+        let mut wire = foreign_unit(1);
+        for unit in host_units(our_arb(), inner) {
+            wire.extend_from_slice(&unit);
+        }
+        wire.extend_from_slice(&foreign_unit(2));
+        wire
+    }
+
+    /// ④ 混合流：其他 MCU 的合法 klipper 单元夹着我们裹了 Connect 的单元。
+    /// 桥按单元头路由时外层帧根本不落到本设备（a）；即使按最坏情况整条线
+    /// 的帧都落到设备（b），外层帧不含 0x01、被 resync 整段丢弃，
+    /// Connect 仍完整捞出。
+    #[test]
+    fn our_connect_survives_foreign_klipper_units_sandwiching_it() {
+        bounded(10, || {
+            let inner = connect_block();
+            let wire = mixed_wire(&inner);
+
+            // (a) 路由：其他 MCU 的单元被桥路由走，只有我们的帧落设备。
+            let routed = bridge_down(&wire, Some(our_arb()));
+            assert_eq!(routed.len(), 13, "外层帧路由走后只剩我们的 13 B 帧");
+            let mut dev_a = DeviceSide::default();
+            dev_a.feed(&routed);
+            assert_recovered(&dev_a.recovered, &[inner.clone()], "④a 路由");
+            assert_eq!(dev_a.nacks, 1);
+            assert_eq!(dev_a.stalled_at, None);
+
+            // (b) 最坏情况：整条线的帧都落到设备 —— 外层帧必须无 0x01
+            // （resync 才能整段丢弃而不是停在它里面），Connect 仍捞出。
+            for seq in [1u8, 2] {
+                let frame = foreign_frame(seq);
+                assert!(
+                    !frame.contains(&K_STX1),
+                    "外层帧必须不含 0x01 才能被 resync 整段丢弃: {}",
+                    hex(&frame)
+                );
+            }
+            let leaked = bridge_down(&wire, None);
+            assert!(leaked.len() > routed.len(), "混合流确实混进了外层帧");
+            let mut dev_b = DeviceSide::default();
+            dev_b.feed(&leaked);
+            assert_recovered(&dev_b.recovered, &[inner], "④b 混合流");
+        });
+    }
+}

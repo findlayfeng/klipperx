@@ -290,12 +290,39 @@ host.rs 17 测（按源码重数）与两测名。
 3. 前置流程按 §8 口径：全拓扑复位（含不参与本次的设备）→ 统一重配（号/端口）→ 桥先初始化；
    实现上复用 host 已有的重连/就地复位与桥端口恢复（有界等 `uart_path` 回来）机制。
 
-**单元与缝**：T5a ✅（`0x06` 常量 + 三链路发送器，已合入）；
+**T5 流程定形（2026-10-16 用户确认；本条更正上面第 3 点里「复用 host 装载」的说法）**：
+**每次刷写都是一次独立会话**，三步：**① 重启整个拓扑 → ② 只初始化需要的通路 → ③ 刷到目标**。
+工具**直接初始化桥**，不装载整份 `printer.cfg`、不把 host 拓扑拉起来。
+
+两条代码事实（main 核，支撑这个流程）：
+- **桥的“初始化”就是三条命令**：`src/uart.c:44-100`——`config_uart oid/baud/slot` **立即**
+  `uart_backend_open()` 开那个端口的流；`config_bridge_port oid/uart` **立即** `bridge_add_port()`
+  挂进路由表并分配 `index`。**没有 `finalize_config` 之类的“武装”步骤**，三条命令后该口就能被
+  `SET_PORT_NODEID` 按 index 点名。（`slot` = 口在桥上的编号，也是端口 tty 登记时用的号。）
+- **端口表只在桥的 RAM 里**（`oid_alloc`/`bridge_add_port`）：桥一复位就没了 ⇒ 「先复位→再重配」
+  不是卫生习惯，而是**必须**；复位后要用到的口必须重新声明。
+- 配置命令的 id 由固件字典决定 ⇒ 需要**对桥直接做一次 identify** 拿字典（只有这一步来自
+  klipper 命令路径）；其余（mux 握手、`SET_PORT_NODEID`/`SET_PORT_TUNNEL`/`0x02`/`0x04`/`0x05`、
+  隧道单元）都是字节级 mux 命令，不需字典。
+
+**会话序列（工具视角）**：开桥链路 → mux 握手（给桥命名）→ identify（字典）→ 声明要用到的口
+（`allocate_oids` → `config_uart` → `config_bridge_port`）→ **逐口复位下游设备**（命名口 `0x05`、
+legacy/停在引导的口 `0x04` 线脉冲）→ 给目标口命名（`SET_PORT_NODEID`，**legacy**：上行才带
+reply arb）→ `SET_PORT_TUNNEL (0x06)` → `REQUEST_BOOTLOADER (0x02)` → 隧道刷写 → 收尾（清隧道/
+复位，会话结束不留状态）。
+**后果**：先前那条「需要 `Printer` 遍历各 MCU/端口」的缺口**消失**（桥自己就能按 index 逐口下手）；
+T5b 从「host 拓扑上的前置状态机」改为「**桥会话**（开链路/握手/identify/声明口/逐口复位/命名+开隧道）」。
+
+**单元与缝（复核后）**：T5a ✅（`0x06` 常量 + 三链路发送器，已合入）；
 **T5c** = 隧道数据通路（三链路按 arb 的**隧道投递口** + `src/flash/` 的 `Read+Write` 适配器；
 真库+假 bootloader 端到端）；**T5-tool** = 独立 bin → `klipperx flash` 子命令（参数语法不变、
-删 `[[bin]]`、文档同步）；**T5b** = 前置状态机（全拓扑复位 → 重配，在 host 拓扑对象上）；
-**T5d** = 端到端流程 + 阶段 2 真机（mux 宿主库当桥 + 真下游）。
-T5c 与 T5-tool 已于 2026-10-16 并行派出（不同文件，互不重叠）。
+删 `[[bin]]`、文档同步）；**T5b′** = 桥会话（开链路/握手/identify/声明口/逐口复位/命名+开隧道；
+新文件 `src/flash/…`）；**T5d** = 端到端流程（子命令里串起 b′+c）+ 阶段 2 真机
+（mux 宿主库当桥 + 真下游）。
+T5c 与 T5-tool 已于 2026-10-16 并行派出；**T5b′ 等其中之一落地后再派**（三者在 `src/flash/mod.rs`
+上会撞）。
+
+**单元与缝**：T5a ✅（`0x06` 常量 + 三链路发送器，已合入）；
 
 **前置流程的现成缝（已核）**：主机侧「不起 API 起拓扑」= `Printer::new(reactor)`（`printer.rs:349`）
 + `Factories::load_config(config)`（`load.rs:188`）；端口由配置期的 `allocate_oids` →

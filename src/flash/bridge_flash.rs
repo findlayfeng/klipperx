@@ -40,10 +40,11 @@
 //! ([`BridgePort`], [`BridgeTarget`]), exactly as [`open_bridge`] documents.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::core::klippy::assign;
+use crate::core::klippy::event::{McuEvent, Shutdown};
 use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{self, SharedSerialHandle, TunnelSink};
 use crate::core::klippy::interface::error::InterfaceError;
@@ -72,6 +73,27 @@ const SERIAL_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 /// never answers is a flash that never starts; ten seconds is the same budget
 /// the bridge-session tests give their real-library fixture.
 pub const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The index a `RESTART_DEVICE` carries to reach the **bridge itself**
+/// ([`BridgeLink::reset`]).
+///
+/// A bridge's port routing consumes `RESTART_DEVICE [0x05][index]` only when
+/// `index` names a port it has in use; any other index falls through to its own
+/// device half, which restarts the firmware (`third_party/klipper/src/bridge.c`,
+/// `mux.c` → `mcu_restart`). No bridge numbers a port this high
+/// (`BRIDGE_MAX_PORTS` is 8), so this index always means the bridge.
+const RESTART_DEVICE_TO_BRIDGE: u8 = 0xFF;
+
+/// How long a restarted bridge may take to answer again before a run gives up.
+const RESET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The identify budget of one reopen attempt while a restarted bridge is coming
+/// back up; a boot that is not finished yet answers nothing, and the attempt is
+/// retried until [`RESET_TIMEOUT`] is spent.
+const RESET_IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long to wait between reopen attempts.
+const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// The bridge device the run holds directly, one variant per link it can be
 /// opened on: the host library the config calls muxed, or a shared serial port.
@@ -108,6 +130,97 @@ impl BridgeDevice {
     }
 }
 
+/// How a [`BridgeLink`]'s transport was opened, kept so a run can open a fresh
+/// one after the bridge's firmware restarts.
+///
+/// A bridge's port table lives in its firmware's RAM only, and a restart
+/// re-creates the console it answers on, which kills the host's old handle: the
+/// reopen therefore needs the same parameters the first open took.
+#[derive(Clone)]
+enum BridgeOpen {
+    /// A muxed host-library reference.
+    Host {
+        path: PathBuf,
+        mux: HostMux,
+        mcu_id: u32,
+        host_port_paths: Vec<(u8, String)>,
+    },
+    /// A shared serial port on a bridge board (or a linux firmware process).
+    Serial {
+        path: PathBuf,
+        baud: u32,
+        mcu_id: u32,
+        uuid: Option<[u8; 6]>,
+    },
+}
+
+impl BridgeOpen {
+    /// Open the transport these parameters name, as a fresh link handle and its
+    /// [`Interface`].
+    ///
+    /// # Errors
+    /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
+    /// [`BridgeFlashError::UnassignedSerial`] for a serial bridge that does not
+    /// answer with no uuid given, [`BridgeFlashError::Open`] otherwise.
+    fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
+        match self {
+            BridgeOpen::Host {
+                path,
+                mux,
+                mcu_id,
+                host_port_paths,
+            } => {
+                let device = Arc::new(
+                    HostDevice::load_mux(path, *mux, *mcu_id, host_port_paths)
+                        .map_err(BridgeFlashError::Open)?,
+                );
+                let link = Interface::from_host(Arc::clone(&device));
+                Ok((link, BridgeDevice::Host(device)))
+            }
+            BridgeOpen::Serial {
+                path,
+                baud,
+                mcu_id,
+                uuid,
+            } => {
+                let handle = serial::attach(path, *baud, *mcu_id, SERIAL_ATTACH_TIMEOUT, *uuid)
+                    .map_err(|e| match (*uuid, e) {
+                        (None, InterfaceError::Timeout) => BridgeFlashError::UnassignedSerial {
+                            path: path.clone(),
+                            baud: *baud,
+                        },
+                        (_, e) => BridgeFlashError::Open(e),
+                    })?;
+                let link = Interface::shared_serial(Arc::clone(&handle));
+                Ok((link, BridgeDevice::Shared(handle)))
+            }
+        }
+    }
+}
+
+/// A bridge the flash host has open, with the `Mcu` over it and the two faces
+/// the run needs: the [`Interface`] for the port-level commands, and the device
+/// itself for the tunnel's downlink and the sink registration.
+///
+/// Built by [`open_host_library`](BridgeLink::open_host_library) or
+/// [`open_serial`](BridgeLink::open_serial), then identified
+/// ([`identify`](BridgeLink::identify)), then flashed
+/// ([`flash`](BridgeLink::flash)). Both constructors take their device's
+/// blocking open, so they run inside a runtime — the `Interface` they build
+/// captures the runtime its `Mcu` transport tasks will use.
+/// The live connection behind a [`BridgeLink`]: the `Mcu`, the [`Interface`]
+/// spelling its port-level commands, and the device both are faces of.
+///
+/// Kept as one value (in an `Option`) so [`reset`](BridgeLink::reset) can drop
+/// the whole thing before it reopens: the shared-serial registry hands out one
+/// port per path while a handle is alive, and the handle a restart killed would
+/// otherwise be handed back as if it were fresh.
+struct LiveBridge {
+    mcu: Mcu,
+    link: Interface,
+    device: BridgeDevice,
+}
+
 /// A bridge the flash host has open, with the `Mcu` over it and the two faces
 /// the run needs: the [`Interface`] for the port-level commands, and the device
 /// itself for the tunnel's downlink and the sink registration.
@@ -119,9 +232,16 @@ impl BridgeDevice {
 /// blocking open, so they run inside a runtime — the `Interface` they build
 /// captures the runtime its `Mcu` transport tasks will use.
 pub struct BridgeLink {
-    mcu: Mcu,
-    link: Interface,
-    device: BridgeDevice,
+    /// How the transport was opened, so [`reset`](BridgeLink::reset) can open a
+    /// fresh one after the bridge's firmware restarts.
+    open: BridgeOpen,
+    /// The live connection, absent only while [`reset`](BridgeLink::reset) is
+    /// between dropping the restarted one and opening a fresh one.
+    live: Option<LiveBridge>,
+    /// The reason the bridge's firmware gave when it last shut down. The
+    /// `shutdown` event handler records it; a run reports it with the
+    /// declaration that triggered it instead of letting the next step time out.
+    shutdown: Arc<Mutex<Option<String>>>,
 }
 
 impl BridgeLink {
@@ -144,12 +264,12 @@ impl BridgeLink {
         mcu_id: u32,
         host_port_paths: &[(u8, String)],
     ) -> Result<Self, BridgeFlashError> {
-        let device = Arc::new(
-            HostDevice::load_mux(path, mux, mcu_id, host_port_paths)
-                .map_err(BridgeFlashError::Open)?,
-        );
-        let link = Interface::from_host(Arc::clone(&device));
-        Ok(Self::assemble(link.clone(), BridgeDevice::Host(device)))
+        Self::from_open(BridgeOpen::Host {
+            path: path.to_path_buf(),
+            mux,
+            mcu_id,
+            host_port_paths: host_port_paths.to_vec(),
+        })
     }
 
     /// Open a **shared serial** bridge on `path` at `baud`, attached as
@@ -177,24 +297,64 @@ impl BridgeLink {
         mcu_id: u32,
         uuid: Option<[u8; 6]>,
     ) -> Result<Self, BridgeFlashError> {
-        let handle = serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, uuid).map_err(
-            |e| match (uuid, e) {
-                (None, InterfaceError::Timeout) => BridgeFlashError::UnassignedSerial {
-                    path: path.to_path_buf(),
-                    baud,
-                },
-                (_, e) => BridgeFlashError::Open(e),
-            },
-        )?;
-        let link = Interface::shared_serial(Arc::clone(&handle));
-        Ok(Self::assemble(link.clone(), BridgeDevice::Shared(handle)))
+        Self::from_open(BridgeOpen::Serial {
+            path: path.to_path_buf(),
+            baud,
+            mcu_id,
+            uuid,
+        })
     }
 
-    /// Build the `Mcu` over the link the constructor made, with the interface
-    /// kept for the port-level commands.
-    fn assemble(link: Interface, device: BridgeDevice) -> Self {
+    /// Build the `Mcu` over the transport `open` names, with the interface kept
+    /// for the port-level commands.
+    fn from_open(open: BridgeOpen) -> Result<Self, BridgeFlashError> {
+        let (link, device) = open.build()?;
         let mcu = Mcu::new("bridge", link.clone());
-        Self { mcu, link, device }
+        Ok(Self {
+            open,
+            live: Some(LiveBridge { mcu, link, device }),
+            shutdown: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// The live connection, which is absent only between the two halves of a
+    /// [`reset`](BridgeLink::reset).
+    fn live(&self) -> &LiveBridge {
+        self.live
+            .as_ref()
+            .expect("a live connection is in place outside reset")
+    }
+
+    /// Record the bridge's `shutdown` reason for [`flash`](BridgeLink::flash)
+    /// to report.
+    ///
+    /// The bridge is an MCU: its firmware pushes `shutdown`
+    /// (`clock=%u static_string_id=%hu`) when a handler fails, and the tool is
+    /// the only one listening — without a handler the message is discarded and
+    /// a declaration the bridge refused looks like a session that never
+    /// answers. The handler runs on the receive task and only stores the decoded
+    /// reason, so it never blocks.
+    fn watch_shutdown(&self) {
+        let mcu = &self.live().mcu;
+        if !mcu.has_message(Shutdown::NAME) {
+            return;
+        }
+        let slot = Arc::clone(&self.shutdown);
+        let _ = mcu.bind_event::<Shutdown, _>(move |event| {
+            let mut reason = slot.lock().unwrap_or_else(|poison| poison.into_inner());
+            if reason.is_none() {
+                *reason = Some(event.reason);
+            }
+        });
+    }
+
+    /// The reason the bridge shut down, taking it so a later run sees only its
+    /// own shutdowns.
+    fn take_shutdown(&self) -> Option<String> {
+        self.shutdown
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
     }
 
     /// Run the bridge's identify handshake: the dictionary the declaration
@@ -204,11 +364,100 @@ impl BridgeLink {
     /// # Errors
     /// [`BridgeFlashError::Identify`] when the handshake fails or times out.
     pub async fn identify(&self, timeout: Duration) -> Result<(), BridgeFlashError> {
-        self.mcu
+        self.live()
+            .mcu
             .identify(timeout)
             .await
             .map(|_| ())
-            .map_err(BridgeFlashError::Identify)
+            .map_err(BridgeFlashError::Identify)?;
+        self.watch_shutdown();
+        Ok(())
+    }
+
+    /// Restart the bridge so its port table is empty before a run declares
+    /// ports, then reopen the link the restart killed and identify again.
+    ///
+    /// A bridge's port table lives in RAM only: it is built by the declaration
+    /// commands (`config_uart` / `config_bridge_port`) and outlives the host's
+    /// run, so a second run against the **same** bridge meets the previous
+    /// run's open slot and the firmware shuts down (`third_party/klipper/src/
+    /// uart.c`: `config_uart: the port slot is already in use`). The reset is
+    /// what makes every run start from the same clean state.
+    ///
+    /// The restart is the port-level `RESTART_DEVICE` carrying an index that
+    /// names no port of the bridge's (`[0x05][index]`): the bridge's port
+    /// routing consumes it only when the index names a port it has in use, and
+    /// otherwise falls through to its own device half, which restarts the
+    /// firmware (`third_party/klipper/src/bridge.c`, `mux.c` → `mcu_restart`).
+    ///
+    /// A restart re-creates the console a real bridge answers on, so the old
+    /// handle is dead with it: the whole old connection is dropped before the
+    /// reopen (the shared-serial registry hands the same port back while a
+    /// handle is alive), and the reopen + identify is retried until it answers
+    /// or [`RESET_TIMEOUT`](BridgeLink::RESET_TIMEOUT) is spent.
+    ///
+    /// A **host library** bridge cannot restart — its `mcu_restart` is a no-op
+    /// (`third_party/klipper/src/host/host.c`) and it is the process this host
+    /// is linked into — and its `config_uart` is idempotent on a slot it already
+    /// opened, so there is nothing to clear and nothing to reopen.
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Reset`] when the restart command cannot be sent or
+    /// the bridge does not come back and identify in time.
+    pub async fn reset(&mut self) -> Result<(), BridgeFlashError> {
+        // This run reports only its own shutdowns.
+        *self
+            .shutdown
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
+
+        if matches!(self.open, BridgeOpen::Host { .. }) {
+            return Ok(());
+        }
+
+        self.live()
+            .link
+            .send_restart_device(RESTART_DEVICE_TO_BRIDGE)
+            .map_err(|e| BridgeFlashError::Reset(format!("sending the restart failed: {e}")))?;
+
+        // Drop the restarted connection whole before reopening: the serial
+        // registry would otherwise hand back the port whose fd died with the
+        // firmware that just re-exec'd.
+        if let Some(old) = self.live.take() {
+            old.mcu.close();
+            drop(old);
+        }
+        let fresh = self.reopen().await?;
+        self.live = Some(fresh);
+        self.watch_shutdown();
+        Ok(())
+    }
+
+    /// Open a fresh connection from [`open`](BridgeLink::open) and identify it,
+    /// retried (bounded) while the restarted bridge is coming back up.
+    async fn reopen(&self) -> Result<LiveBridge, BridgeFlashError> {
+        let deadline = Instant::now() + RESET_TIMEOUT;
+        loop {
+            let last = match self.open.build() {
+                Ok((link, device)) => {
+                    let mcu = Mcu::new("bridge", link.clone());
+                    match mcu.identify(RESET_IDENTIFY_TIMEOUT).await {
+                        Ok(_) => return Ok(LiveBridge { mcu, link, device }),
+                        Err(e) => {
+                            mcu.close();
+                            e.to_string()
+                        }
+                    }
+                }
+                Err(e) => e.to_string(),
+            };
+            if Instant::now() >= deadline {
+                return Err(BridgeFlashError::Reset(format!(
+                    "the bridge did not come back within {RESET_TIMEOUT:?}: {last}"
+                )));
+            }
+            tokio::time::sleep(RESET_RETRY_DELAY).await;
+        }
     }
 
     /// The whole bridge flash: open the target's port
@@ -227,11 +476,14 @@ impl BridgeLink {
     ///
     /// # Errors
     /// [`BridgeFlashError::Unaddressable`] when the target's node id names no
-    /// arb, [`BridgeFlashError::Bridge`] when [`open_bridge`] fails,
-    /// [`BridgeFlashError::Session`] when the katapult session fails, and
-    /// [`BridgeFlashError::Teardown`] when only the tunnel clearing fails.
+    /// arb, [`BridgeFlashError::Reset`] when the bridge could not be taken back
+    /// to a clean state, [`BridgeFlashError::Shutdown`] when the bridge's
+    /// firmware shuts down while the port is declared (its reason included),
+    /// [`BridgeFlashError::Bridge`] when [`open_bridge`] fails for any other
+    /// reason, [`BridgeFlashError::Session`] when the katapult session fails,
+    /// and [`BridgeFlashError::Teardown`] when only the tunnel clearing fails.
     pub async fn flash(
-        &self,
+        &mut self,
         ports: &[BridgePort],
         target: BridgeTarget,
         payload: &[u8],
@@ -244,17 +496,30 @@ impl BridgeLink {
         })?;
         let reply_arb = assign::reply_arb_id(node_id).expect("arb_id accepted the id");
 
-        open_bridge(&self.mcu, &self.link, ports, target)
-            .await
-            .map_err(BridgeFlashError::Bridge)?;
+        // Every run starts from a clean bridge: the previous run's port table is
+        // still in the firmware's RAM and would shut it down on this run's
+        // declaration.
+        self.reset().await?;
+
+        if let Err(e) = open_bridge(&self.live().mcu, &self.live().link, ports, target).await {
+            // A declaration the bridge refused shuts its firmware down, and the
+            // reason is the whole story: report that, not the timeout behind it.
+            return Err(match self.take_shutdown() {
+                Some(reason) => BridgeFlashError::Shutdown { reason },
+                None => BridgeFlashError::Bridge(e),
+            });
+        }
+        if let Some(reason) = self.take_shutdown() {
+            return Err(BridgeFlashError::Shutdown { reason });
+        }
 
         // The uplink listener is registered before the session's first block,
         // and the adapter below is what a session drives. The receiver lives in
         // the `TunnelBridge`, so dropping it below is also what unregisters the
         // sink.
         let (sink, frames) = TunnelSink::channel();
-        self.device.set_tunnel_sink(reply_arb, sink);
-        let bridge = TunnelBridge::new(down_arb, frames, self.device.tunnel_link());
+        self.live().device.set_tunnel_sink(reply_arb, sink);
+        let bridge = TunnelBridge::new(down_arb, frames, self.live().device.tunnel_link());
         let (mut reader, mut writer) = bridge.split();
         let outcome = session::flash_with_config(&mut reader, &mut writer, payload, cfg, progress);
         drop(reader);
@@ -264,11 +529,15 @@ impl BridgeLink {
         // The bridge stays up after the host exits, so the port must not be
         // left carrying the katapult raw stream: a repeat toggle flips it back
         // to the mux units its other users expect.
-        let cleared = self.link.send_set_port_tunnel(target.index);
+        let cleared = self.live().link.send_set_port_tunnel(target.index);
         match (outcome, cleared) {
             (Ok(summary), Ok(())) => Ok(summary),
             (Ok(_), Err(e)) => Err(BridgeFlashError::Teardown(e)),
-            (Err(e), _) => Err(BridgeFlashError::Session(e)),
+            // A firmware that shut down mid-session explains its own failure.
+            (Err(e), _) => Err(match self.take_shutdown() {
+                Some(reason) => BridgeFlashError::Shutdown { reason },
+                None => BridgeFlashError::Session(e),
+            }),
         }
     }
 
@@ -279,7 +548,7 @@ impl BridgeLink {
     /// and their blocking reads released, which dropping the `Mcu` alone does
     /// not force.
     pub fn close(&self) {
-        self.mcu.close();
+        self.live().mcu.close();
     }
 }
 
@@ -303,6 +572,18 @@ pub enum BridgeFlashError {
     Identify(McuError),
     /// [`open_bridge`] refused or failed a step.
     Bridge(BridgeError),
+    /// The bridge could not be taken back to a clean state before the
+    /// declaration: the self-restart could not be sent, or the bridge did not
+    /// answer again within [`RESET_TIMEOUT`](BridgeLink::RESET_TIMEOUT).
+    Reset(String),
+    /// The bridge's firmware shut down while the port was declared — the reason
+    /// it gave, resolved from its `static_string_id` enumeration. Reported
+    /// instead of the session timeout that would otherwise follow, so a
+    /// declaration the bridge refused says why.
+    Shutdown {
+        /// The firmware's own shutdown reason.
+        reason: String,
+    },
     /// The katapult session over the tunnel failed.
     Session(FlashError),
     /// The target's node id names no arb (only `1..=255` are addressable).
@@ -327,6 +608,10 @@ impl fmt::Display for BridgeFlashError {
             ),
             BridgeFlashError::Identify(e) => write!(f, "identifying the bridge: {e}"),
             BridgeFlashError::Bridge(e) => write!(f, "opening the bridge port: {e}"),
+            BridgeFlashError::Reset(message) => write!(f, "resetting the bridge: {message}"),
+            BridgeFlashError::Shutdown { reason } => {
+                write!(f, "the bridge's firmware shut down: {reason}")
+            }
             BridgeFlashError::Session(e) => write!(f, "flashing: {e}"),
             BridgeFlashError::Unaddressable { node_id } => write!(
                 f,
@@ -344,9 +629,10 @@ impl std::error::Error for BridgeFlashError {
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
-            BridgeFlashError::Unaddressable { .. } | BridgeFlashError::UnassignedSerial { .. } => {
-                None
-            }
+            BridgeFlashError::Unaddressable { .. }
+            | BridgeFlashError::UnassignedSerial { .. }
+            | BridgeFlashError::Reset(_)
+            | BridgeFlashError::Shutdown { .. } => None,
         }
     }
 }
@@ -531,7 +817,7 @@ mod tests {
             named: identity,
         };
 
-        let link = BridgeLink::open_host_library(
+        let mut link = BridgeLink::open_host_library(
             Path::new(&path),
             mux,
             BRIDGE_MCU_ID,

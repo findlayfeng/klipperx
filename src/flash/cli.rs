@@ -87,6 +87,12 @@ pub struct FlashArgs {
     #[arg(long, value_name = "SO")]
     pub bridge_library: Option<String>,
 
+    /// Identity of the **serial bridge** board itself, twelve hex digits — the
+    /// same spelling `--uuid` uses. Needed when that board carries no node id
+    /// yet, since only `SET_NODEID` assigns one (only with `--bridge`)
+    #[arg(long, value_name = "HEX")]
+    pub bridge_uuid: Option<String>,
+
     /// Identity a host-library bridge answers the serial mux with, twelve hex
     /// digits (only with `--bridge-library`; default all zeros)
     #[arg(long, value_name = "HEX")]
@@ -175,8 +181,12 @@ pub struct BridgeFlashTarget {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BridgeLinkSource {
     /// A shared serial tty the bridge answers on; its downstream devices share
-    /// the wire, so the link is addressed by id.
-    Serial { tty: String },
+    /// the wire, so the link is addressed by id. `uuid` is the bridge board's
+    /// own identity, to name it with when it is not assigned yet —
+    /// [`serial::attach`](crate::core::klippy::interface::devices::serial::attach)
+    /// assigns through `SET_NODEID`, which needs the identity; without one the
+    /// bridge must already carry an id to answer the re-confirmation.
+    Serial { tty: String, uuid: Option<[u8; 6]> },
     /// A muxed klipper host library loaded from `path`, given `identity` and
     /// its port ttys.
     Library {
@@ -202,7 +212,7 @@ pub fn plan(args: &FlashArgs) -> Result<Action, String> {
     }
     if let Some(flag) = stray_bridge_argument(args) {
         return Err(format!(
-            "{flag} needs --bridge (or --bridge-library): it names a bridge's port"
+            "{flag} needs --bridge (or --bridge-library): it belongs to a bridge"
         ));
     }
 
@@ -228,6 +238,8 @@ fn stray_bridge_argument(args: &FlashArgs) -> Option<&'static str> {
         Some("--port-reset")
     } else if args.host_identity.is_some() {
         Some("--host-identity")
+    } else if args.bridge_uuid.is_some() {
+        Some("--bridge-uuid")
     } else if !args.port_tty.is_empty() {
         Some("--port-tty")
     } else {
@@ -294,9 +306,23 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
                     "--port-tty needs --bridge-library: a serial bridge opens its own ports".into(),
                 );
             }
-            BridgeLinkSource::Serial { tty: tty.clone() }
+            let uuid = match &args.bridge_uuid {
+                Some(text) => Some(parse_bridge_uuid(text)?),
+                None => None,
+            };
+            BridgeLinkSource::Serial {
+                tty: tty.clone(),
+                uuid,
+            }
         }
         (None, Some(path)) => {
+            if args.bridge_uuid.is_some() {
+                return Err(
+                    "--bridge-uuid names a serial bridge; a host library is named by \
+                     --host-identity"
+                        .into(),
+                );
+            }
             let identity = match &args.host_identity {
                 Some(text) => parse_host_identity(text)?,
                 None => [0u8; 6],
@@ -360,6 +386,12 @@ fn parse_host_identity(text: &str) -> Result<[u8; 6], String> {
         .ok_or_else(|| format!("--host-identity expects twelve hex digits, got '{text}'"))
 }
 
+/// Parse `--bridge-uuid`: the same twelve hex digits, most significant byte
+/// first — the identity the bridge board is named with.
+fn parse_bridge_uuid(text: &str) -> Result<[u8; 6], String> {
+    parse_hex6(text).ok_or_else(|| format!("--bridge-uuid expects twelve hex digits, got '{text}'"))
+}
+
 /// The `--query` line: a bus to list and nothing that flashes.
 fn plan_query(args: &FlashArgs) -> Result<Action, String> {
     if args.bridge.is_some() || args.bridge_library.is_some() {
@@ -381,7 +413,7 @@ fn plan_query(args: &FlashArgs) -> Result<Action, String> {
         return Err("--query lists nodes; it does not flash a firmware file".into());
     }
     if let Some(flag) = stray_bridge_argument(args) {
-        return Err(format!("{flag} needs --bridge: it names a bridge's port"));
+        return Err(format!("{flag} needs --bridge: it belongs to a bridge"));
     }
     let interface = args
         .interface
@@ -455,7 +487,7 @@ fn parse_uuid(text: &str) -> Result<[u8; 6], String> {
 }
 
 /// Six bytes as twelve hex digits, most significant byte first, or `None` —
-/// the grammar `--uuid` and `--host-identity` share.
+/// the grammar `--uuid`, `--host-identity` and `--bridge-uuid` share.
 fn parse_hex6(text: &str) -> Option<[u8; 6]> {
     let bytes = text.as_bytes();
     if bytes.len() != 12 || !bytes.iter().all(u8::is_ascii_hexdigit) {
@@ -587,8 +619,8 @@ fn run_bridge_flash(
 /// or a muxed host library given its identity and port ttys.
 fn open_bridge_link(target: &BridgeFlashTarget) -> Result<BridgeLink, BridgeFlashError> {
     match &target.source {
-        BridgeLinkSource::Serial { tty } => {
-            BridgeLink::open_serial(Path::new(tty), target.baud, BRIDGE_MCU_ID)
+        BridgeLinkSource::Serial { tty, uuid } => {
+            BridgeLink::open_serial(Path::new(tty), target.baud, BRIDGE_MCU_ID, *uuid)
         }
         BridgeLinkSource::Library {
             path,
@@ -957,6 +989,7 @@ mod tests {
                 target: BridgeFlashTarget {
                     source: BridgeLinkSource::Serial {
                         tty: "/dev/ttyUSB0".into(),
+                        uuid: None,
                     },
                     baud: DEFAULT_BAUD,
                     port: 1,
@@ -1238,6 +1271,83 @@ mod tests {
         ])
         .expect_err("a serial bridge opens its own ports");
         assert!(err.contains("--port-tty"), "{err}");
+    }
+
+    /// The serial bridge's own identity rides on the plan when the line names
+    /// it: an unassigned bridge answers only the `SET_NODEID` segment, which
+    /// needs exactly these twelve hex digits.
+    #[test]
+    fn test_a_serial_bridge_carries_its_uuid() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bridge-uuid",
+            "11aa22bb33cc",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect("a serial bridge plan with its identity");
+        let Action::BridgeFlash {
+            target:
+                BridgeFlashTarget {
+                    source: BridgeLinkSource::Serial { uuid, .. },
+                    ..
+                },
+            ..
+        } = action
+        else {
+            panic!("a serial line makes a serial plan");
+        };
+        assert_eq!(uuid, Some([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]));
+    }
+
+    /// `--bridge-uuid` is checked where it is written — twelve hex digits — and
+    /// it belongs to a serial bridge alone: a host library is named by
+    /// `--host-identity`.
+    #[test]
+    fn test_bridge_uuid_is_checked() {
+        let err = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bridge-uuid",
+            "nope",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("not an identity");
+        assert!(err.contains("--bridge-uuid"), "{err}");
+
+        let err = planned(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--bridge-uuid",
+            "11aa22bb33cc",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "fw.bin",
+        ])
+        .expect_err("a host library has no serial bridge board");
+        assert!(err.contains("--bridge-uuid"), "{err}");
+        assert!(err.contains("--host-identity"), "{err}");
+
+        let err = planned(&[
+            "--device",
+            "/dev/ttyACM0",
+            "--bridge-uuid",
+            "11aa22bb33cc",
+            "fw.bin",
+        ])
+        .expect_err("no bridge here");
+        assert!(err.contains("--bridge-uuid"), "{err}");
+        assert!(err.contains("needs --bridge"), "{err}");
     }
 
     /// A query lists a bus; it does not flash through a bridge.

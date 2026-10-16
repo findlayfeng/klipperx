@@ -25,7 +25,8 @@
 //! into whole units and hands each to the MCU its header names
 //! ([`SharedSerialPort`] / [`SharedSerialHandle`]). That half owns the mux wire
 //! format — the checked 2-byte header, the KXID assignment pseudo-frame, the
-//! assignment-time handshake and the discovery/assignment admin channel — and
+//! assignment-time handshake, the discovery/assignment admin channel and the
+//! tunnel unit (one katapult message block carried whole) — and
 //! rides the shared reuse spine `resource_for`. It is serial wire logic only;
 //! the wire spec is the developer manual's *serial-mux-protocol* page.
 //!
@@ -906,6 +907,140 @@ pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Vec<u8> {
     admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags])
 }
 
+// ===========================================================================
+// The tunnel unit: one katapult message block carried whole inside one mux unit
+// ===========================================================================
+//
+// A flash session talks to a bootloader that speaks katapult's own message
+// blocks, so each **whole** block travels wrapped in one mux unit and the far
+// end unwraps it. A block is never split across units: splitting would put
+// outer framing inside an inner block (and an inner tail or head into the
+// next one), which the inner CRC then rejects.
+//
+// This is the contract both ends share — host `serial.rs` here, firmware
+// `mux.c` on the other side (mirrored by T2b). The tag, the word-count
+// position and the length rule below must stay byte-for-byte identical on
+// both sides; change one, change both.
+
+/// The two bytes that open a katapult message block — `MESSAGE_STX1` and
+/// `MESSAGE_STX2` (`third_party/katapult/src/command.h`).
+///
+/// The signature sits at the **frame position**, the first two bytes after the
+/// unit header, and can never collide with a klipper frame: a klipper frame's
+/// first byte is its length (`MESSAGE_MIN..=MESSAGE_MAX`, 5..=64) and neither
+/// `0x01` nor `0x88` is in that range.
+pub const TUNNEL_TAG: [u8; 2] = [0x01, 0x88];
+
+/// The frame position of the word count — katapult's `MESSAGE_POS_LEN`, the
+/// byte after the command byte.
+pub const TUNNEL_POS_WORDCNT: usize = 3;
+
+/// The bounds on one tunnel **frame**: katapult's `MESSAGE_MIN`/`MESSAGE_MAX`.
+///
+/// A frame's length is [`tunnel_frame_len`] of its word count, so a legal word
+/// count is `0..=30` (`30 * 4 + 8 == 128`); `31` would make 132 bytes, past
+/// the limit, and is junk like any other word count that overshoots.
+pub const TUNNEL_FRAME_MIN: usize = 8;
+pub const TUNNEL_FRAME_MAX: usize = 128;
+
+/// One tunnel frame's length for its word count — katapult's own rule
+/// (`command.c`: `buf[MESSAGE_POS_LEN] * 4 + 8`).
+const fn tunnel_frame_len(word_cnt: u8) -> usize {
+    word_cnt as usize * 4 + 8
+}
+
+/// The verdict for the bytes at a unit's front, its header already decoded:
+/// the one cut rule [`UnitStream::take_unit_with_arb`] and [`dispatch`] both
+/// run, so the two cannot drift apart.
+///
+/// The tunnel test comes **before** the klipper length range, because a tunnel
+/// frame's first byte (`0x01`) is itself an illegal klipper length — today
+/// that sends the stream into [`drop_to_sync`], which eats bytes up to the
+/// next SYNC and would swallow the rest of the flash stream along with the
+/// unit. Two tag bytes are needed to tell the cases apart, so a lone `0x01`
+/// waits for the next byte instead of resynchronising, and `0x01` followed by
+/// anything but `0x88` takes the old junk path unchanged.
+#[derive(Debug, PartialEq, Eq)]
+enum UnitCut {
+    /// A whole unit: header plus one ordinary klipper frame of `frame` bytes.
+    Klipper { frame: usize },
+    /// A whole unit: header plus one tunnel frame of `frame` bytes, taken in
+    /// one piece by its word count — never split, never partly consumed.
+    Tunnel { frame: usize },
+    /// Too few bytes are buffered to decide; wait for the next read.
+    NeedMore,
+    /// These bytes cannot start a unit: resynchronise on the next
+    /// `MESSAGE_SYNC`.
+    Junk,
+}
+
+/// Cut the frame that follows a decoded header into one whole unit — or not.
+fn cut_unit(frame: &[u8]) -> UnitCut {
+    let Some(&first) = frame.first() else {
+        return UnitCut::NeedMore;
+    };
+    if first == TUNNEL_TAG[0] {
+        // The tag is two bytes: until the second arrives, a tunnel frame and
+        // junk that merely starts with 0x01 cannot be told apart.
+        if frame.len() < TUNNEL_TAG.len() {
+            return UnitCut::NeedMore;
+        }
+        if frame[1] != TUNNEL_TAG[1] {
+            return UnitCut::Junk; // 0x01 is no klipper length either
+        }
+        if frame.len() <= TUNNEL_POS_WORDCNT {
+            return UnitCut::NeedMore; // the word count is still in flight
+        }
+        let length = tunnel_frame_len(frame[TUNNEL_POS_WORDCNT]);
+        if !(TUNNEL_FRAME_MIN..=TUNNEL_FRAME_MAX).contains(&length) {
+            return UnitCut::Junk;
+        }
+        if frame.len() < length {
+            return UnitCut::NeedMore;
+        }
+        return UnitCut::Tunnel { frame: length };
+    }
+    let length = first as usize;
+    if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
+        return UnitCut::Junk;
+    }
+    if frame.len() < length {
+        return UnitCut::NeedMore;
+    }
+    UnitCut::Klipper { frame: length }
+}
+
+/// The tunnel unit carrying `katapult_block` under `arb`: the checked two-byte
+/// header ([`encode_header`]), then the block exactly as given.
+///
+/// `katapult_block` must be **one whole, self-delimiting** katapult message
+/// block: tagged [`TUNNEL_TAG`], `8..=128` bytes long, and exactly as long as
+/// its own word count says ([`tunnel_frame_len`]) — precisely what
+/// [`cut_unit`] needs to cut it back out at the far end. The unit layer does
+/// **not** check the inner CRC and does **not** check the command byte: those
+/// belong to the consumer that reads the block (the flash session), not to the
+/// tunnel.
+///
+/// `None` when `arb` names no address or the block is not one whole message —
+/// this builder never panics where [`encode_header`] would.
+pub fn tunnel_unit(arb: u32, katapult_block: &[u8]) -> Option<Vec<u8>> {
+    if arb >= HEADER_RESERVED_FIRST {
+        return None;
+    }
+    if katapult_block.len() <= TUNNEL_POS_WORDCNT
+        || katapult_block[..TUNNEL_TAG.len()] != TUNNEL_TAG
+    {
+        return None;
+    }
+    let length = tunnel_frame_len(katapult_block[TUNNEL_POS_WORDCNT]);
+    if !(TUNNEL_FRAME_MIN..=TUNNEL_FRAME_MAX).contains(&length) || katapult_block.len() != length {
+        return None;
+    }
+    let mut unit = encode_header(arb);
+    unit.extend_from_slice(katapult_block);
+    Some(unit)
+}
+
 /// One board's answer to [`discovery_query`]: the UUID it is remembered by,
 /// and the application it runs.
 ///
@@ -1047,8 +1182,8 @@ impl UnassignedScan {
 /// be used here: the units a discovery scan reads carry the admin ids
 /// ([`ADMIN_LISTEN`]/[`ADMIN_REPLY`]) that are outside the assigned range, so
 /// no id check is applied and the caller decides what each unit is. Everything
-/// else is the shared codec ([`decode_header`], [`drop_to_sync`], the
-/// `MESSAGE_*` frame constants) — one framing, not a second one.
+/// else is the shared codec ([`decode_header`], [`cut_unit`], [`drop_to_sync`],
+/// the `MESSAGE_*` frame constants) — one framing, not a second one.
 #[derive(Debug)]
 pub(crate) struct UnitStream {
     pending: Vec<u8>,
@@ -1081,8 +1216,10 @@ impl UnitStream {
     /// (`host.rs`'s `route_unit`) — while a scan
     /// ([`serial_query_unassigned`]) reads units whole and ignores it.
     ///
-    /// Exactly the [`dispatch`] policy: an invalid header or a length byte
-    /// outside the frame range resynchronises on the next [`MESSAGE_SYNC`].
+    /// Exactly the [`dispatch`] policy: an invalid header, or bytes that
+    /// cannot start a unit, resynchronise on the next [`MESSAGE_SYNC`] — and a
+    /// tunnel frame (tag [`TUNNEL_TAG`]) is cut whole by its word count,
+    /// never eaten by the resync.
     pub(crate) fn take_unit_with_arb(&mut self) -> Option<(u32, Vec<u8>)> {
         loop {
             if self.needs_sync {
@@ -1105,18 +1242,16 @@ impl UnitStream {
                 }
                 HeaderScan::Complete { arb, consumed } => (arb, consumed),
             };
-            if self.pending.len() < consumed + 1 {
-                return None; // the length byte is still in flight
-            }
-            let length = self.pending[consumed] as usize;
-            if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
-                drop_to_sync(&mut self.pending, &mut self.needs_sync);
-                continue;
-            }
-            let unit_len = consumed + length;
-            if self.pending.len() < unit_len {
-                return None; // the rest of the frame is still in flight
-            }
+            let frame_len = match cut_unit(&self.pending[consumed..]) {
+                UnitCut::NeedMore => return None,
+                UnitCut::Junk => {
+                    drop_to_sync(&mut self.pending, &mut self.needs_sync);
+                    continue;
+                }
+                UnitCut::Klipper { frame } | UnitCut::Tunnel { frame } => frame,
+            };
+            // `cut_unit` only answers with a whole frame, so the unit is here.
+            let unit_len = consumed + frame_len;
             let unit: Vec<u8> = self.pending.drain(..unit_len).collect();
             return Some((arb, unit));
         }
@@ -1531,12 +1666,18 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
 
 /// Cut every whole unit out of `pending` and deliver it.
 ///
-/// A unit is a header ([`decode_header`]) followed by one frame
-/// (length byte + that many bytes). Anything that cannot be one — an invalid
-/// header, an arbitration id outside the assigned range, or a length byte
-/// outside `MESSAGE_MIN..=MESSAGE_MAX` — resynchronises on the next SYNC, the
-/// same policy as [`FrameStream`]. Too few bytes for a unit just waits for the
-/// next read.
+/// A unit is a header ([`decode_header`]) followed by one frame: at the tunnel
+/// tag ([`TUNNEL_TAG`]) a whole katapult block cut by its word count
+/// ([`cut_unit`]), otherwise an ordinary frame cut by its length byte.
+/// Anything that cannot be one — an invalid header, an arbitration id outside
+/// the assigned range, or a frame the cut rule rejects — resynchronises on the
+/// next SYNC, the same policy as [`FrameStream`]. Too few bytes for a unit
+/// just waits for the next read.
+///
+/// A tunnel unit is consumed as one piece and dropped here (with a debug
+/// line): there is no tunnel listener yet. It must never reach
+/// [`drop_to_sync`], which would eat through the stream instead of taking one
+/// unit.
 fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut bool) {
     loop {
         if *needs_sync {
@@ -1568,20 +1709,29 @@ fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut boo
             continue;
         }
 
-        if pending.len() < consumed + 1 {
-            return; // the length byte is still in flight
-        }
-        let length = pending[consumed] as usize;
-        if !(MESSAGE_MIN..=MESSAGE_MAX).contains(&length) {
-            drop_to_sync(pending, needs_sync);
-            continue;
-        }
+        let frame_len = match cut_unit(&pending[consumed..]) {
+            UnitCut::NeedMore => return,
+            UnitCut::Junk => {
+                drop_to_sync(pending, needs_sync);
+                continue;
+            }
+            UnitCut::Klipper { frame } => frame,
+            UnitCut::Tunnel { frame } => {
+                // One whole tunnel unit, consumed as one piece. There is no
+                // tunnel listener yet, so it is dropped here — never through
+                // `drop_to_sync`, which would eat the stream around it.
+                debug!(
+                    "shared serial {}: no tunnel listener; dropping {}-byte tunnel unit for mcu {}",
+                    port.path.display(),
+                    HEADER_BYTES + frame,
+                    assign::mcu_id_from_arb(arb).expect("checked above"),
+                );
+                pending.drain(..consumed + frame);
+                continue;
+            }
+        };
 
-        let unit_len = consumed + length;
-        if pending.len() < unit_len {
-            return; // the rest of the frame is still in flight
-        }
-
+        let unit_len = consumed + frame_len;
         let unit = &pending[..unit_len];
         if let Some(mcu_id) = parse_assignment_ack(unit) {
             // The answer to a handshake: it goes to the ack slot, not to
@@ -1660,6 +1810,33 @@ impl SharedSerialHandle {
         }
         let mut unit = encode_header(arb);
         unit.extend_from_slice(payload);
+        self.port.write_unit(&unit)
+    }
+
+    /// Send one **tunnel** unit on this port: a whole katapult message block
+    /// under this handle's host→device arbitration id ([`assign::arb_id`]),
+    /// wrapped by [`tunnel_unit`] — one unit, the block unsplit.
+    ///
+    /// The same write path as [`Self::send_unit`]: the header comes from
+    /// [`encode_header`], the whole unit goes out under the port's write lock
+    /// so no other writer can split it. What is checked here is the block's
+    /// **shape** only (tag, word-count length, `8..=128`); the inner CRC and
+    /// command byte are the consuming session's to check, not this writer's.
+    ///
+    /// # Errors
+    /// [`InterfaceError::ConnectionLost`] when this handle or the port has been
+    /// shut down, [`InterfaceError::SendError`] when the write fails or `block`
+    /// is not one self-delimiting katapult message block.
+    pub fn send_tunnel(&self, block: &[u8]) -> Result<(), InterfaceError> {
+        if self.stopped.load(Ordering::SeqCst) || self.port.stopped.load(Ordering::SeqCst) {
+            return Err(InterfaceError::ConnectionLost);
+        }
+        let arb = assign::arb_id(self.mcu_id).expect("an attached mcu id is always addressable");
+        let unit = tunnel_unit(arb, block).ok_or_else(|| {
+            InterfaceError::SendError(
+                "tunnel block is not one self-delimiting katapult message block".to_string(),
+            )
+        })?;
         self.port.write_unit(&unit)
     }
 
@@ -3836,6 +4013,328 @@ mod mux_tests {
         });
         assert_eq!(total, 1);
         assert_eq!(reported[0].uuid, [0x11; 6]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The tunnel unit: golden vectors (the byte-for-byte contract with the
+    // firmware's mux.c, which mirrors these), the shared cut rule's bad cases,
+    // and "a tunnel unit never eats the stream" at the reader.
+    // -----------------------------------------------------------------------
+
+    /// Golden vector 1 — a Connect request: 8 bytes, word count 0.
+    ///
+    /// `01 88 11 00 f1 7c 99 03` — tag, `CMD_CONNECT`, word count 0,
+    /// `crc16_ccitt(11 00) = f1 7c` stored little-endian, trailer `99 03`.
+    const TUNNEL_CONNECT: [u8; 8] = [0x01, 0x88, 0x11, 0x00, 0xf1, 0x7c, 0x99, 0x03];
+
+    /// Golden vector 2 — a Send Block request (`CMD_RX_BLOCK`): 76 bytes,
+    /// word count 17, carrying a 64-byte block at address `00 10 00 00`.
+    ///
+    /// One block, one unit, never split — a split would drop outer framing
+    /// into the middle of this frame.
+    const TUNNEL_SEND_BLOCK: [u8; 76] = [
+        0x01, 0x88, 0x12, 0x11, // tag, CMD_RX_BLOCK, word count 17
+        0x00, 0x10, 0x00, 0x00, // block address (little-endian)
+        // the 64-byte block, bytes 0x00..=0x3f:
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c,
+        0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+        0x3c, 0x3d, 0x3e, 0x3f, 0xda, 0x1e, 0x99, 0x03, // crc16 (little-endian), trailer
+    ];
+
+    /// Golden vector 3 — the device's ACK for that block: 16 bytes, word
+    /// count 2, `RESPONSE_ACK` acknowledging `CMD_RX_BLOCK` — the
+    /// device→host direction, headed by `reply_arb_id`.
+    const TUNNEL_ACK: [u8; 16] = [
+        0x01, 0x88, 0xa0, 0x02, // tag, RESPONSE_ACK, word count 2
+        0x12, 0x00, 0x00, 0x00, // acknowledged command: CMD_RX_BLOCK
+        0x00, 0x10, 0x00, 0x00, // block address (little-endian)
+        0xbc, 0xdc, 0x99, 0x03, // crc16 (little-endian), trailer
+    ];
+
+    /// Whether the block carries the CRC katapult computes over its own bytes
+    /// (`crc16_ccitt` from byte 2 to the trailer). The tunnel never checks
+    /// this — the golden vectors must still be legal blocks.
+    fn inner_crc_ok(block: &[u8]) -> bool {
+        let stored = u16::from_le_bytes([block[block.len() - 4], block[block.len() - 3]]);
+        crate::crc16_ccitt!(&block[2..block.len() - 4]) == stored
+    }
+
+    /// Attach `mcu_id` over `pty` with every wait bounded: the handshake
+    /// bytes are read within a window, so a broken attach fails the test
+    /// instead of blocking it.
+    fn attach_within(pty: &Pty, mcu_id: u32) -> Arc<SharedSerialHandle> {
+        let request = assignment_request(mcu_id).expect("a valid mcu id");
+        let path = pty.path.clone();
+        let thread =
+            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT, None));
+        let seen = read_n_within(&pty.master, request.len(), Duration::from_secs(2));
+        assert_eq!(
+            seen, request,
+            "attach must send the assignment request verbatim"
+        );
+        master_write(
+            &pty.master,
+            &assignment_reply(mcu_id).expect("a valid mcu id"),
+        );
+        thread
+            .join()
+            .expect("attach thread")
+            .expect("attach succeeds")
+    }
+
+    #[test]
+    fn a_tunnel_golden_connect_block_round_trips_in_one_unit() {
+        assert!(
+            inner_crc_ok(&TUNNEL_CONNECT),
+            "the vector's CRC must be right"
+        );
+        let arb = assign::arb_id(1).expect("a valid mcu id");
+        let unit = tunnel_unit(arb, &TUNNEL_CONNECT).expect("a whole block");
+
+        // Out: the header, then the block verbatim — nothing added, split or
+        // rewritten.
+        let mut want = encode_header(arb);
+        want.extend_from_slice(&TUNNEL_CONNECT);
+        assert_eq!(unit, want);
+        assert_eq!(
+            unit.len(),
+            HEADER_BYTES + 8,
+            "word count 0 → an 8-byte frame"
+        );
+
+        // In: cut whole, same id, same bytes.
+        let mut stream = UnitStream::new();
+        stream.feed(&unit);
+        assert_eq!(stream.take_unit_with_arb(), Some((arb, unit)));
+    }
+
+    #[test]
+    fn a_tunnel_golden_send_block_is_cut_as_one_whole_unit() {
+        assert!(
+            inner_crc_ok(&TUNNEL_SEND_BLOCK),
+            "the vector's CRC must be right"
+        );
+        assert_eq!(TUNNEL_SEND_BLOCK[TUNNEL_POS_WORDCNT], 17, "word count");
+        assert_eq!(tunnel_frame_len(17), TUNNEL_SEND_BLOCK.len());
+
+        let arb = assign::arb_id(1).expect("a valid mcu id");
+        let unit = tunnel_unit(arb, &TUNNEL_SEND_BLOCK).expect("a whole block");
+
+        let mut stream = UnitStream::new();
+        stream.feed(&unit);
+        // One take, the whole 76-byte frame: never split, never resynchronised.
+        assert_eq!(stream.take_unit_with_arb(), Some((arb, unit)));
+        // And nothing is left behind: the unit was consumed exactly.
+        assert_eq!(stream.take_unit_with_arb(), None);
+    }
+
+    #[test]
+    fn a_tunnel_golden_ack_round_trips_in_the_device_to_host_direction() {
+        assert!(inner_crc_ok(&TUNNEL_ACK), "the vector's CRC must be right");
+        let arb = assign::reply_arb_id(4).expect("a valid mcu id");
+        let unit = tunnel_unit(arb, &TUNNEL_ACK).expect("a whole block");
+        let mut want = encode_header(arb);
+        want.extend_from_slice(&TUNNEL_ACK);
+        assert_eq!(unit, want);
+
+        let mut stream = UnitStream::new();
+        stream.feed(&unit);
+        assert_eq!(stream.take_unit_with_arb(), Some((arb, unit)));
+    }
+
+    #[test]
+    fn the_tunnel_cut_rule_is_one_shared_contract_and_junk_stays_junk() {
+        // The three golden vectors, each cut whole by its word count.
+        assert_eq!(cut_unit(&TUNNEL_CONNECT), UnitCut::Tunnel { frame: 8 });
+        assert_eq!(cut_unit(&TUNNEL_SEND_BLOCK), UnitCut::Tunnel { frame: 76 });
+        assert_eq!(cut_unit(&TUNNEL_ACK), UnitCut::Tunnel { frame: 16 });
+
+        // The size limits: word count 30 fills exactly the maximum frame…
+        let mut at_limit = vec![0x01u8, 0x88, 0x12, 30];
+        at_limit.extend(std::iter::repeat(0u8).take(TUNNEL_FRAME_MAX - 4));
+        assert_eq!(
+            cut_unit(&at_limit),
+            UnitCut::Tunnel {
+                frame: TUNNEL_FRAME_MAX
+            }
+        );
+        // …and 31 would make 132 bytes: past the limit, so junk.
+        assert_eq!(cut_unit(&[0x01, 0x88, 0x12, 31]), UnitCut::Junk);
+
+        // `01` without `88`: the old junk path, byte for byte.
+        assert_eq!(cut_unit(&[0x01, 0x5a]), UnitCut::Junk);
+
+        // Too few bytes to tell tunnel from junk: each of these waits.
+        let partials: [&[u8]; 4] = [&[], &[0x01], &[0x01, 0x88], &[0x01, 0x88, 0x12]];
+        for partial in partials {
+            assert_eq!(cut_unit(partial), UnitCut::NeedMore, "at {partial:02x?}");
+        }
+
+        // An ordinary frame still cuts by its length byte, and impossible
+        // klipper lengths are still junk.
+        assert_eq!(cut_unit(&assignment_frame()), UnitCut::Klipper { frame: 9 });
+        assert_eq!(cut_unit(&[0x04, 0x20]), UnitCut::Junk); // below MESSAGE_MIN
+        assert_eq!(cut_unit(&[0x41, 0x20]), UnitCut::Junk); // above MESSAGE_MAX
+    }
+
+    #[test]
+    fn a_tunnel_unit_waits_out_a_short_buffer_and_then_comes_out_whole() {
+        let arb = assign::arb_id(7).expect("a valid mcu id");
+        let unit = tunnel_unit(arb, &TUNNEL_SEND_BLOCK).expect("a whole block");
+        let mut stream = UnitStream::new();
+
+        // One byte at a time: every prefix is short, so nothing is cut and
+        // nothing is resynchronised away.
+        for fed in 1..unit.len() {
+            stream.feed(&unit[fed - 1..fed]);
+            assert_eq!(stream.take_unit_with_arb(), None, "after {fed} bytes");
+        }
+        // The last byte completes it: the whole unit, in one piece.
+        stream.feed(&unit[unit.len() - 1..]);
+        assert_eq!(stream.take_unit_with_arb(), Some((arb, unit)));
+    }
+
+    #[test]
+    fn a_tunnel_shaped_junk_resynchronises_and_the_unit_behind_it_survives() {
+        let arb = assign::arb_id(2).expect("a valid mcu id");
+        let mut behind = encode_header(arb);
+        behind.extend_from_slice(&assignment_frame());
+
+        // Both junk flavours: `01` without `88`, and a word count past 128.
+        let junk_cases: [&[u8]; 2] = [
+            &[0x01, 0x5a, 0x11, 0x00],
+            &[0x01, 0x88, 0x12, 0x1f, 0x00, 0x00, 0x00, 0x00],
+        ];
+        for junk in junk_cases {
+            let mut wire = encode_header(arb);
+            wire.extend_from_slice(junk);
+            wire.push(MESSAGE_SYNC); // what the junk path resynchronises on
+            wire.extend_from_slice(&behind);
+
+            let mut stream = UnitStream::new();
+            stream.feed(&wire);
+            // The junk never becomes a unit; the stream resynchronises and the
+            // unit behind it comes out whole.
+            assert_eq!(
+                stream.take_unit_with_arb(),
+                Some((arb, behind.clone())),
+                "for junk {junk:02x?}"
+            );
+            assert_eq!(stream.take_unit_with_arb(), None, "for junk {junk:02x?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_header_never_reaches_the_tunnel_tag() {
+        let arb = assign::arb_id(2).expect("a valid mcu id");
+        // A framing-broken header in front of a perfect tunnel block: the
+        // block never enters the tunnel rule, so no unit is cut from it.
+        let mut wire = vec![0x00, 0x01]; // first byte misses the 0x80 framing bit
+        wire.extend_from_slice(&TUNNEL_CONNECT);
+        let mut stream = UnitStream::new();
+        stream.feed(&wire);
+        assert_eq!(stream.take_unit_with_arb(), None);
+
+        // The stream recovers at the next SYNC and cuts the unit behind it.
+        let mut behind = encode_header(arb);
+        behind.extend_from_slice(&assignment_frame());
+        stream.feed(&[MESSAGE_SYNC]);
+        stream.feed(&behind);
+        assert_eq!(stream.take_unit_with_arb(), Some((arb, behind)));
+    }
+
+    #[test]
+    fn a_tunnel_unit_is_consumed_whole_and_the_next_unit_is_dispatched() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+
+        // A device→host tunnel unit nobody listens for, then an ordinary unit.
+        let mut wire = device_unit(4, &TUNNEL_ACK);
+        wire.extend_from_slice(&device_unit(4, &Frame::encode(7, b"after")));
+        master_write(&pty.master, &wire);
+
+        // The tunnel unit was cut and dropped (no listener), and the unit
+        // behind it still arrived: the reader never fell into `drop_to_sync`,
+        // which would have eaten through this whole run to the frame's trailer.
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(7, b"after".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the unit behind the tunnel unit must be dispatched"
+        );
+    }
+
+    #[test]
+    fn send_tunnel_writes_the_header_and_block_verbatim() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+
+        handle4
+            .send_tunnel(&TUNNEL_SEND_BLOCK)
+            .expect("a whole block");
+        let want = tunnel_unit(assign::arb_id(4).unwrap(), &TUNNEL_SEND_BLOCK).unwrap();
+        assert_eq!(read_n(&pty.master, want.len()), want);
+    }
+
+    #[test]
+    fn send_tunnel_refuses_a_block_that_is_not_one_whole_message() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+
+        // Right tag, but word count 31 would claim 132 bytes: over the limit.
+        let over = [0x01, 0x88, 0x12, 0x1f, 0x00, 0x00, 0x00, 0x00];
+        let err = handle4.send_tunnel(&over).expect_err("must be refused");
+        assert!(matches!(err, InterfaceError::SendError(_)), "{err:?}");
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(150)),
+            "a refused block must write nothing"
+        );
+    }
+
+    #[test]
+    fn the_tunnel_unit_checks_the_frame_shape_but_not_the_inner_crc_or_cmd() {
+        // Right shape, deliberately wrong CRC, an unlisted command byte: the
+        // tunnel wraps bytes, the consumer checks them.
+        let mut block = [
+            0x01, 0x88, 0xf3, 0x01, // tag, cmd, word count 1
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x99, 0x03,
+        ];
+        assert!(!inner_crc_ok(&block), "the CRC is wrong on purpose");
+        let arb = assign::arb_id(3).expect("a valid mcu id");
+        assert_eq!(
+            tunnel_unit(arb, &block).map(|unit| unit[HEADER_BYTES..].to_vec()),
+            Some(block.to_vec())
+        );
+
+        // Shape is checked, though: nothing but one self-delimiting block gets
+        // out.
+        assert_eq!(
+            tunnel_unit(arb, &block[..11]),
+            None,
+            "shorter than its own word count"
+        );
+        block[TUNNEL_POS_WORDCNT] = 30; // would claim 128 bytes
+        assert_eq!(
+            tunnel_unit(arb, &block),
+            None,
+            "longer than its own word count"
+        );
+        block[TUNNEL_POS_WORDCNT] = 31; // would claim 132: past the limit
+        assert_eq!(tunnel_unit(arb, &block), None, "over the size limit");
+        assert_eq!(
+            tunnel_unit(arb, &[0x02, 0x88, 0x11, 0x00, 0x00, 0x00, 0x99, 0x03]),
+            None,
+            "wrong tag"
+        );
+        assert_eq!(
+            tunnel_unit(HEADER_RESERVED_FIRST, &TUNNEL_CONNECT),
+            None,
+            "a reserved id names no address"
+        );
     }
 }
 

@@ -108,6 +108,11 @@ cargo run --release -- config.cfg -a /tmp/klippy_uds
 cargo run --release -- config.cfg --tui           # 本进程内开一个终端客户端窗口
 klipperx console -a /tmp/klippy_uds               # 另开终端连上去
 
+# 刷写带 katapult 引导的板子（独立 bin；设备需停在引导态；直连两条路径）
+cargo run --bin flash -- --device /dev/serial/by-id/usb-Katapult… klipper.bin   # USB-CDC / 独占串口
+cargo run --bin flash -- --interface can0 -u <uuid> klipper.bin                 # CAN
+cargo run --bin flash -- -q --interface can0     # 列出未指派节点（app=katapult 的 UUID）
+
 # 真机（需要一块板子；见 TESTING.md；指向你自己的 printer 配置，接口从它的 [mcu] 里读）
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest        # 只跑真机 lane（别名，见 .cargo/config.toml）
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest \

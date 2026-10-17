@@ -1929,17 +1929,15 @@ pub fn load_config(
     // every explicit `canbus_nodeid` in the config, so the auto ids the later
     // sections receive step over them — an explicit claim is honoured wherever
     // it sits in the file. Every CAN family link brings its uuid and any
-    // explicit `canbus_nodeid`: the protocol (`cans`/`isotp`) and the wire
-    // (`canbus_fd`) shape **how** the blocks travel, not who is addressed, so
-    // an ISO-TP or CAN FD MCU takes the same allocation as a can-serial one;
-    // another transport takes the lowest free id from the same sequence, with
-    // no concrete allocation of its own yet.
+    // explicit `canbus_nodeid`: the wire (`canbus_fd`) shapes **how** the
+    // blocks travel, not who is addressed, so a CAN FD MCU takes the same
+    // allocation as a classical-wire one; another transport takes the lowest
+    // free id from the same sequence, with no concrete allocation of its own
+    // yet.
     let allocator = ids::ensure(printer)?;
     allocator.reserve_explicit(config);
     let id = match &parsed.transport {
-        Transport::Can { uuid, .. }
-        | Transport::CanFd { uuid, .. }
-        | Transport::Isotp { uuid, .. } => {
+        Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => {
             allocator.register_can(&parsed.name, *uuid, parsed.id)?
         }
         // A CAN port's member is addressed by its uuid exactly as a direct
@@ -2467,16 +2465,16 @@ mod tests {
             .id()
     }
 
-    /// A CAN FD and an ISO-TP MCU are addressed the way a can-serial one is:
-    /// the load registers them with their uuid (`register_can`), so their ids
-    /// come from the same sequence as a serial MCU's and interleave with it in
-    /// declaration order.
+    /// A CAN FD MCU is addressed the way a classical-wire one is: the load
+    /// registers it with its uuid (`register_can`), so its id comes from the
+    /// same sequence as a serial MCU's and interleaves with it in declaration
+    /// order.
     #[test]
     fn test_the_can_family_links_register_with_their_uuid() {
         let printer = load_printer(
             "[mcu]\nuuid: 11aa22bb33cc\ncanbus_fd: true\n\
              [mcu tool]\nserial: /dev/not-opened\n\
-             [mcu probe]\nuuid: 44dd55ee66ff\ncanbus_protocol: isotp\n",
+             [mcu probe]\nuuid: 44dd55ee66ff\ncanbus_fd: false\n",
         );
         // `NODEID_FIRST` (4) upward, one sequence for every transport.
         assert_eq!(id_of(&printer, "mcu"), Some(4));
@@ -2485,13 +2483,13 @@ mod tests {
     }
 
     /// The allocation is `register_can`'s, which is the one place a uuid is
-    /// remembered: a CAN FD and an ISO-TP section naming one identity are one
-    /// board claimed twice, exactly as two can-serial sections would be.
+    /// remembered: two CAN family sections naming one identity are one board
+    /// claimed twice, exactly as two classical-wire sections would be.
     #[test]
     fn test_a_uuid_is_claimed_once_across_the_can_family() {
         let (config, _) = Config::from_text(
             "[mcu a]\nuuid: 11aa22bb33cc\ncanbus_fd: true\n\
-             [mcu b]\nuuid: 11aa22bb33cc\ncanbus_protocol: isotp\n",
+             [mcu b]\nuuid: 11aa22bb33cc\ncanbus_fd: false\n",
         )
         .expect("the test config parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));

@@ -849,7 +849,8 @@ impl BridgeLink {
     /// only a count, so they name nothing here.
     pub fn uart_slots(&self) -> Option<Vec<String>> {
         let dictionary = self.live().mcu.dictionary()?;
-        let slots = stm32_bridge_serial_slots(&dictionary);
+        let mut slots = stm32_bridge_serial_slots(&dictionary);
+        slots.extend(stm32_bridge_can_slot(&dictionary));
         (!slots.is_empty()).then_some(slots)
     }
 
@@ -1038,6 +1039,25 @@ fn stm32_bridge_serial_slots(dictionary: &Dictionary) -> Vec<String> {
             Some(format!("{usart} {}", pins.replace(',', "/")))
         })
         .collect()
+}
+
+/// The bridge's CAN downstream port as a slot name (`CAN1 PB8/PB9`), when the
+/// firmware declares one.
+///
+/// The CAN backend has no USART name of its own to look up, so it publishes the
+/// pins it was built with (`RESERVE_PINS_bridge_can`, the same shape the USART
+/// backend uses) and this says `CAN1` for the controller those pins belong to
+/// (`third_party/klipper/src/stm32/can.c`: the bxCAN controller). It comes after
+/// every USART slot, which is the order the arch's dispatcher numbers slots in
+/// (`src/stm32/bridge_port.c`), and an empty vec when the build has no such port.
+fn stm32_bridge_can_slot(dictionary: &Dictionary) -> Vec<String> {
+    let Some(pins) = dictionary
+        .constant("RESERVE_PINS_bridge_can")
+        .and_then(|value| value.as_str())
+    else {
+        return Vec::new();
+    };
+    vec![format!("CAN1 {}", pins.replace(',', "/"))]
 }
 
 // ===========================================================================
@@ -1567,6 +1587,47 @@ mod tests {
         }))
         .expect("a host library bridge dictionary");
         assert!(stm32_bridge_serial_slots(&dictionary).is_empty());
+        assert!(stm32_bridge_can_slot(&dictionary).is_empty());
+    }
+
+    /// The CAN downstream port is a slot the firmware names after the pins it was
+    /// built with, and it comes after every USART slot - the order
+    /// `src/stm32/bridge_port.c` numbers them in.
+    #[test]
+    fn test_the_stm32_bridge_names_its_can_slot_from_its_reserved_pins() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": {
+                "BRIDGE_UART_COUNT": 2,
+                "MCU": "stm32f446xx",
+                "RESERVE_PINS_bridge_serial": "PA10,PA9",
+                "RESERVE_PINS_bridge_can": "PB8,PB9",
+            }
+        }))
+        .expect("an stm32 bridge dictionary with a CAN port");
+        let mut slots = stm32_bridge_serial_slots(&dictionary);
+        slots.extend(stm32_bridge_can_slot(&dictionary));
+        assert_eq!(
+            slots,
+            vec!["USART1 PA10/PA9".to_string(), "CAN1 PB8/PB9".to_string()]
+        );
+    }
+
+    /// A CAN-only bridge (the F446: USB console, CAN on PB8/PB9, no USART port)
+    /// still names its one slot.
+    #[test]
+    fn test_a_can_only_bridge_names_its_single_slot() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": {
+                "BRIDGE_UART_COUNT": 1,
+                "MCU": "stm32f446xx",
+                "RESERVE_PINS_bridge_can": "PB8,PB9",
+            }
+        }))
+        .expect("an stm32 CAN-only bridge dictionary");
+        assert_eq!(
+            stm32_bridge_can_slot(&dictionary),
+            vec!["CAN1 PB8/PB9".to_string()]
+        );
     }
 
     /// The host library's count is the host's own tty table: one UART slot per

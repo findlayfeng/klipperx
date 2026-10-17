@@ -144,6 +144,17 @@ pub struct FlashArgs {
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
 
+    /// Identity of the board behind the target port, to **re-assign**
+    /// `--port-nodeid` to before the session — twelve hex digits, the same
+    /// spelling `admin bridge port --assign-uuid` takes (bridge flashes only;
+    /// meaningful on the bridge's CAN slot)
+    //
+    // A CAN device's node id lives in the device: the katapult a `bootloader`
+    // reset starts comes up without one, and the tunnel is addressed by it, so
+    // the run hands the id over again before it opens the session.
+    #[arg(long, value_name = "HEX")]
+    pub assign_uuid: Option<String>,
+
     /// List the unassigned nodes on a CAN bus instead of flashing
     #[arg(short, long)]
     pub query: bool,
@@ -474,6 +485,13 @@ pub struct BridgeFlashTarget {
     pub node_id: u8,
     /// The reset the target port's device gets before the tunnel opens.
     pub reset: PortReset,
+    /// The board behind the target port, to give [`node_id`](Self::node_id) to
+    /// again before the session when the port is the bridge's **CAN** slot
+    /// (`--assign-uuid`).
+    ///
+    /// A CAN device's node id lives in its own RAM, so the katapult a `bootloader`
+    /// reset starts has none — and the tunnel's frames are addressed by it.
+    pub assign: Option<[u8; 6]>,
 }
 
 /// How a bridge's own link is reached.
@@ -535,6 +553,8 @@ fn stray_bridge_argument(args: &FlashArgs) -> Option<&'static str> {
         Some("--port-nodeid")
     } else if args.port_reset.is_some() {
         Some("--port-reset")
+    } else if args.assign_uuid.is_some() {
+        Some("--assign-uuid")
     } else if args.host_identity.is_some() {
         Some("--host-identity")
     } else if args.bridge_uuid.is_some() {
@@ -591,6 +611,9 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
         ));
     }
     let reset = parse_port_reset(args.port_reset.as_deref())?;
+    // The same identity, spelled the same way, as `admin bridge port` takes: the
+    // board behind the port and the id it is given.
+    let assign = plan_assign_uuid(args.assign_uuid.as_deref(), args.port_nodeid)?;
     let firmware = firmware_or_err(args)?;
     let baud = args.baud.unwrap_or(DEFAULT_BAUD);
     let bitrate = args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE);
@@ -609,6 +632,7 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
             port,
             node_id,
             reset,
+            assign,
         },
         firmware,
     })
@@ -1095,9 +1119,14 @@ fn run_bridge_flash(
             node_id: target.node_id,
         };
         let summary = link
-            .flash(&ports, bridge_target, &payload, &cfg, |line| {
-                println!("{line}")
-            })
+            .flash(
+                &ports,
+                bridge_target,
+                target.assign,
+                &payload,
+                &cfg,
+                |line| println!("{line}"),
+            )
             .await?;
         link.close();
         report(summary);
@@ -1772,6 +1801,7 @@ mod tests {
                     port: 1,
                     node_id: 7,
                     reset: PortReset::ResetPort,
+                    assign: None,
                 },
                 firmware: "fw.bin".into(),
             }
@@ -1799,6 +1829,31 @@ mod tests {
             panic!("a bridge line makes a bridge plan");
         };
         assert_eq!(target.reset, PortReset::Bootloader);
+    }
+
+    /// `--assign-uuid` on the flash line: the board behind the target port, given
+    /// `--port-nodeid` again before the session — the same identity and the same
+    /// spelling `admin bridge port` takes, because it is the same assignment.
+    #[test]
+    fn test_a_bridge_flash_plan_can_carry_the_board_to_assign() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "--port-reset",
+            "bootloader",
+            "--assign-uuid",
+            "13fed3c99012",
+            "fw.bin",
+        ])
+        .expect("a bridge plan with an assignment");
+        let Action::BridgeFlash { target, .. } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(target.assign, Some([0x13, 0xfe, 0xd3, 0xc9, 0x90, 0x12]));
     }
 
     /// The host-library bridge line: the library, its identity, its port ttys,
@@ -1842,6 +1897,7 @@ mod tests {
                 port: 1,
                 node_id: 9,
                 reset: PortReset::RestartDevice,
+                assign: None,
             }
         );
     }

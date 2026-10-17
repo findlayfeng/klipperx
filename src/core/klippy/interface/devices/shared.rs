@@ -16,11 +16,18 @@
 //!
 //! Each owns a process-wide registry (`HashMap<PathBuf, Weak<Resource>>`,
 //! lazily initialised) and hands it to `resource_for` together with its open
-//! function: the first reference opens the resource and registers it, later
-//! references on the same path share it, and the resource is torn down only
-//! when its **last** reference is gone — at which point the `Weak` entry is
-//! dead and the next lookup opens a fresh one. `shutdown` on a reference stops
-//! only that reference, never the shared resource.
+//! function and its own test for whether a resource may still be reused: the
+//! first reference opens the resource and registers it, later references on the
+//! same path share it, and the resource is torn down only when its **last**
+//! reference is gone — at which point the `Weak` entry is dead and the next
+//! lookup opens a fresh one. `shutdown` on a reference stops only that
+//! reference, never the shared resource.
+//!
+//! A resource that is still alive but **no longer usable** is the third case,
+//! and the one the `usable` predicate exists for: a serial port whose tty went
+//! away under it (the board re-enumerated after a reset) has live references
+//! but cannot carry a session, so its registry entry is dropped and the lookup
+//! opens a fresh resource — a new descriptor for the path that exists now.
 //!
 //! The wire logic of each transport is deliberately **not** here — a generic
 //! registry has nothing to say about headers or firmware; it only holds the one
@@ -41,11 +48,19 @@ use std::sync::{Arc, Mutex, Weak};
 pub(crate) fn resource_for<T>(
     registry: &Mutex<HashMap<PathBuf, Weak<T>>>,
     path: &Path,
+    usable: impl Fn(&T) -> bool,
     open: impl FnOnce(&Path) -> Result<Arc<T>, InterfaceError>,
 ) -> Result<Arc<T>, InterfaceError> {
     let mut registry = registry.lock().unwrap();
     if let Some(existing) = registry.get(path).and_then(Weak::upgrade) {
-        return Ok(existing);
+        if usable(&existing) {
+            return Ok(existing);
+        }
+        // Alive but unusable: its entry goes, so the open below replaces it
+        // instead of handing the same dead resource out again. The old one
+        // keeps running for the references that still hold it; it just stops
+        // being *the* resource for `path`.
+        registry.remove(path);
     }
     // A dead weak entry (its resource was dropped) is replaced by the fresh one.
     let resource = open(path)?;

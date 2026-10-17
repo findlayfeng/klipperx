@@ -230,12 +230,58 @@ pub async fn open_bridge(
     ports: &[BridgePort],
     target: BridgeTarget,
 ) -> Result<BridgeReady, BridgeError> {
+    declare_ports(mcu, ports).await?;
+    reset_ports(link, ports)?;
+    open_target_port(link, target)?;
+    Ok(BridgeReady {
+        ports: ports.to_vec(),
+        target,
+    })
+}
+
+/// Declare the ports and open the target's port and tunnel, **without** resetting
+/// anything — everything [`open_bridge`] does after step 2, for a caller that
+/// wants the bridge configured but no device [reset](PortReset).
+///
+/// `admin configure-bridge` is that caller: it prepares the bridge (its oid
+/// table and port table) and the target's route and flashing tunnel, and stops,
+/// leaving the devices as they were found. `mcu`, `link`, `ports` and `target`
+/// are [`open_bridge`]'s; the three steps and their order are in the module docs.
+///
+/// # Errors
+/// The same as [`declare_ports`] and [`open_target_port`].
+pub async fn configure_bridge(
+    mcu: &Mcu,
+    link: &Interface,
+    ports: &[BridgePort],
+    target: BridgeTarget,
+) -> Result<BridgeReady, BridgeError> {
+    declare_ports(mcu, ports).await?;
+    open_target_port(link, target)?;
+    Ok(BridgeReady {
+        ports: ports.to_vec(),
+        target,
+    })
+}
+
+/// Declare `ports` on the bridge: the oid table, then one stream-and-port pair
+/// per port in index order — the bridge numbers a port by the order
+/// `config_bridge_port` reaches it — then the barrier that makes the
+/// declaration real.
+///
+/// The declaration has to be on the wire before any port-level command: the
+/// bridge builds its port table from it, and a command that names a port it
+/// does not have is dropped in silence.
+///
+/// # Errors
+/// [`BridgeError::TooManyPorts`] when the plan is wider than the oid byte can
+/// number (nothing is sent), [`BridgeError::Mcu`] when a command cannot be
+/// spelled or the barrier is not reached in time.
+pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), BridgeError> {
     if ports.len() > MAX_BRIDGE_PORTS {
         return Err(BridgeError::TooManyPorts { ports: ports.len() });
     }
 
-    // 1. The oid table, then one stream-and-port pair per port, in index order:
-    //    the bridge numbers a port by the order `config_bridge_port` reaches it.
     let count = (ports.len() * 2) as u8;
     mcu.send(AllocateOids::NAME, &AllocateOids { count }.args())?;
     for (index, port) in ports.iter().enumerate() {
@@ -253,30 +299,53 @@ pub async fn open_bridge(
         };
         mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
     }
-    // The declaration has to be on the wire before the first port-level command:
-    // the bridge builds its port table from it, and a command that names a port
-    // it does not have is dropped in silence.
     mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
+    Ok(())
+}
 
-    // 2. Every declared port's device, the way its plan says. After the
-    //    declaration above, so each command addresses a port the bridge has.
+/// Reset every declared port's device, the way its plan says — [`open_bridge`]'s
+/// step 2, after [`declare_ports`] so each command addresses a port the bridge
+/// has.
+///
+/// # Errors
+/// [`BridgeError::Link`] when the link refuses a port-level write.
+pub fn reset_ports(link: &Interface, ports: &[BridgePort]) -> Result<(), BridgeError> {
     for (index, port) in ports.iter().enumerate() {
-        let index = index as u8;
-        match port.reset {
-            PortReset::RestartDevice => link.send_restart_device(index)?,
-            PortReset::ResetPort => link.send_reset_port(index)?,
-        }
+        reset_port(link, index as u8, port.reset)?;
     }
+    Ok(())
+}
 
-    // 3. The target: its route first (legacy, so the raw uplink is served),
-    //    then the tunnel that makes the port carry the katapult stream.
+/// Reset one declared port's device the way `reset` says: a line pulse on the
+/// port ([`PortReset::ResetPort`]) or the device's own restart
+/// ([`PortReset::RestartDevice`]). [`reset_ports`] and `admin reset --port`
+/// share this one spelling of the two admin units.
+///
+/// The port has to be one the bridge has **declared** — the firmware drops a
+/// port-level command that names a port it does not have, in silence.
+///
+/// # Errors
+/// [`BridgeError::Link`] when the link refuses a port-level write.
+pub fn reset_port(link: &Interface, index: u8, reset: PortReset) -> Result<(), BridgeError> {
+    match reset {
+        PortReset::RestartDevice => link.send_restart_device(index)?,
+        PortReset::ResetPort => link.send_reset_port(index)?,
+    }
+    Ok(())
+}
+
+/// Name the target's port (a legacy route) and open its flashing tunnel —
+/// [`open_bridge`]'s step 3, after the declaration (and any resets) so the
+/// bridge has the port to route and toggle.
+///
+/// # Errors
+/// [`BridgeError::Link`] when the link refuses a port-level write.
+pub fn open_target_port(link: &Interface, target: BridgeTarget) -> Result<(), BridgeError> {
+    // The target's route first (legacy, so the raw uplink is served), then the
+    // tunnel that makes the port carry the katapult stream.
     link.send_set_port_node_id(target.index, target.node_id, LEGACY_PORT_FLAGS)?;
     link.send_set_port_tunnel(target.index)?;
-
-    Ok(BridgeReady {
-        ports: ports.to_vec(),
-        target,
-    })
+    Ok(())
 }
 
 // ===========================================================================
@@ -294,7 +363,7 @@ mod tests {
     use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN, CMD_RESET_PORT,
-        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
+        CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID, CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
@@ -410,6 +479,34 @@ mod tests {
             ])),
             Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 0])),
         ]
+    }
+
+    /// The steps of a configure: [`expected_steps`] without the reset units —
+    /// `configure_bridge`'s declaration, then the target named legacy and its
+    /// tunnel opened, and nothing between them.
+    fn expected_configure_steps(target_node_id: u8) -> Vec<Step> {
+        expected_steps(target_node_id)
+            .into_iter()
+            .filter(|step| !is_reset(step))
+            .collect()
+    }
+
+    /// Whether a step is a port-reset unit (`0x04`/`0x05`): the admin unit's
+    /// `KXID` frame carries its command right after [`MAGIC`].
+    fn is_reset(step: &Step) -> bool {
+        let Step::Admin(bytes) = step else {
+            return false;
+        };
+        let Some(kxid) = bytes
+            .windows(MAGIC.len())
+            .position(|w| w == MAGIC.as_slice())
+        else {
+            return false;
+        };
+        matches!(
+            bytes.get(kxid + MAGIC.len()),
+            Some(&command) if command == CMD_RESET_PORT || command == CMD_RESTART_DEVICE
+        )
     }
 
     /// Every unit a session sent, in wire order: an admin unit is one step, a
@@ -556,6 +653,85 @@ mod tests {
             expected_steps(TARGET_NODE_ID),
             "the declaration pairs in index order, then each reset as its plan says, \
              then the target named legacy and its tunnel opened"
+        );
+    }
+
+    /// `configure_bridge` is `open_bridge` **without the resets**: the same
+    /// declaration, then the target's port named legacy and its tunnel opened —
+    /// and nothing between them. Comparing the two plans on the wire is what
+    /// pins both the order and the absence of every reset unit.
+    #[tokio::test]
+    async fn test_configure_bridge_declares_and_opens_the_tunnel_without_a_reset() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
+
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                reset: PortReset::ResetPort,
+            },
+            BridgePort {
+                baud: 115_200,
+                reset: PortReset::RestartDevice,
+            },
+        ];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let ready = configure_bridge(&mcu, &link, &ports, target)
+            .await
+            .expect("the configure runs");
+        assert_eq!(ready.ports, ports.to_vec(), "the plan as it was declared");
+        assert_eq!(ready.target, target);
+
+        // Only two admin units are expected (the target's route and its
+        // tunnel), so seeing both means every declaration frame is in hand.
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+        });
+        let parser = mux_parser();
+        let observed = steps(&parser, &units);
+        assert_eq!(
+            observed,
+            expected_configure_steps(TARGET_NODE_ID),
+            "the declaration pairs in index order, then the target named legacy and its \
+             tunnel opened, with no reset unit anywhere"
+        );
+        // The difference from the flashing prep is exactly the two resets.
+        assert_eq!(
+            observed,
+            expected_steps(TARGET_NODE_ID)
+                .into_iter()
+                .filter(|step| !is_reset(step))
+                .collect::<Vec<_>>(),
+            "configure is flash's declaration + naming + tunnel, minus the resets"
+        );
+    }
+
+    /// `admin reset --port`'s one write: the port-reset unit (`0x04`, a line pulse)
+    /// or the restart-device unit (`0x05`), each naming the port it means. No
+    /// receipt, so the wire bytes are the whole evidence.
+    #[tokio::test]
+    async fn test_reset_port_sends_the_one_port_reset_unit() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+
+        reset_port(&link, 2, PortReset::ResetPort).expect("the pulse goes out");
+        reset_port(&link, 3, PortReset::RestartDevice).expect("the restart goes out");
+
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+        });
+        let parser = mux_parser();
+        assert_eq!(
+            steps(&parser, &units),
+            vec![
+                Step::Admin(admin_payload(&[CMD_RESET_PORT, 2])),
+                Step::Admin(admin_payload(&[CMD_RESTART_DEVICE, 3])),
+            ],
+            "the two resets are the firmware's own units, naming their port"
         );
     }
 

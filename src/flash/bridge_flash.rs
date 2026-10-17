@@ -53,8 +53,9 @@ use crate::core::klippy::mcu::{Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
-    declare_ports as send_declare_ports, open_bridge, open_target_port as send_open_target_port,
-    reset_port as send_port_reset, BridgeError, BridgePort, BridgeTarget, PortReset,
+    declare_port as send_declare_port, declare_ports as send_declare_ports, open_bridge,
+    open_target_port as send_open_target_port, reset_port as send_port_reset, BridgeError,
+    BridgePort, BridgeTarget, PortReset, PortRoute,
 };
 use super::frame::command::CONNECT;
 use super::session::{self, FlashError, SessionConfig, Summary};
@@ -630,18 +631,23 @@ impl BridgeLink {
         }
     }
 
-    /// Name the target's port (a **legacy** route, so the raw uplink is served)
-    /// and open its flashing tunnel — `admin bridge port`'s whole job.
+    /// Name the target's port on `route` and open its flashing tunnel —
+    /// `admin bridge port`'s whole job (that command declares the port first,
+    /// since a bridge's port table lives in RAM and starts empty).
     ///
     /// The port has to be one an earlier
-    /// [`declare_ports`](BridgeLink::declare_ports) made (`admin bridge config`):
-    /// a port-level command that names a port the bridge does not have is
-    /// dropped in silence.
+    /// [`declare_ports`](BridgeLink::declare_ports) or
+    /// [`declare_port`](BridgeLink::declare_port) made: a port-level command that
+    /// names a port the bridge does not have is dropped in silence.
     ///
     /// # Errors
     /// [`BridgeFlashError::Bridge`] when the link refuses the write.
-    pub fn open_target_port(&self, target: BridgeTarget) -> Result<(), BridgeFlashError> {
-        send_open_target_port(&self.live().link, target).map_err(BridgeFlashError::Bridge)
+    pub fn open_target_port(
+        &self,
+        target: BridgeTarget,
+        route: PortRoute,
+    ) -> Result<(), BridgeFlashError> {
+        send_open_target_port(&self.live().link, target, route).map_err(BridgeFlashError::Bridge)
     }
 
     /// Reset one **declared** port's device through the bridge's admin channel —
@@ -759,6 +765,64 @@ impl BridgeLink {
                 Some(reason) => BridgeFlashError::Shutdown { reason },
                 None => BridgeFlashError::Session(e),
             }),
+        }
+    }
+
+    /// Declare **one** port at `index` — the scattered-declaration sibling of
+    /// [`declare_ports`](BridgeLink::declare_ports), for a caller that has work
+    /// to do between declarations (a bridge scan declares a port, scans through
+    /// it, then declares the next). Ports are declared in ascending index from
+    /// 0, because the bridge numbers a port by the order the declaration rows
+    /// reach it.
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down over
+    /// the declaration (its reason included — a slot another object already
+    /// opened is the common one), and [`BridgeFlashError::Bridge`] when the
+    /// declaration fails for any other reason.
+    pub async fn declare_port(&self, index: u8, baud: u32) -> Result<(), BridgeFlashError> {
+        match send_declare_port(&self.live().mcu, index, baud).await {
+            Ok(()) => match self.take_shutdown() {
+                Some(reason) => Err(BridgeFlashError::Shutdown { reason }),
+                None => Ok(()),
+            },
+            Err(e) => Err(match self.take_shutdown() {
+                Some(reason) => BridgeFlashError::Shutdown { reason },
+                None => BridgeFlashError::Bridge(e),
+            }),
+        }
+    }
+
+    /// How many UART slots the bridge's backend offers, from its
+    /// `BRIDGE_UART_COUNT` constant — `None` on a firmware that predates it, so
+    /// a caller can say so and fall back (`admin bridge config`).
+    ///
+    /// The count is the backend's: each one declares the slots it can open
+    /// (`third_party/klipper/src/{linux,host}/bridge.c`,
+    /// `src/stm32/bridge_serial.c`), so this is what the bridge can actually be
+    /// given rather than what a command line assumes.
+    pub fn uart_count(&self) -> Option<u8> {
+        let dictionary = self.live().mcu.dictionary()?;
+        let count = dictionary.constant("BRIDGE_UART_COUNT")?.as_u64()?;
+        u8::try_from(count).ok()
+    }
+
+    /// The `MCU` constant the bridge's firmware reports (`stm32f103xe`,
+    /// `linux`, …) — what `admin bridge config` names the arch's UART by.
+    /// Absent on a build that declares none (the host library).
+    pub fn mcu_name(&self) -> Option<String> {
+        let dictionary = self.live().mcu.dictionary()?;
+        Some(dictionary.constant("MCU")?.as_str()?.to_string())
+    }
+
+    /// The shared serial port a **serial** bridge's link is on — what a scan
+    /// needs, because a downstream device's answer carries an id no MCU owns
+    /// and only reaches a listener registered on the port itself
+    /// ([`SharedSerialHandle::set_unit_sink`]). `None` for a host library.
+    pub(crate) fn shared_handle(&self) -> Option<&Arc<SharedSerialHandle>> {
+        match &self.live().device {
+            BridgeDevice::Shared(handle) => Some(handle),
+            BridgeDevice::Host(_) => None,
         }
     }
 
@@ -945,6 +1009,19 @@ mod tests {
     /// The node id the target's device answers to behind its port — a small,
     /// addressable id in the assigned range.
     const TARGET_NODE_ID: u8 = 7;
+
+    /// The identity the linux bridge fixture is started with: the same bytes the
+    /// link names it by, or the firmware never adopts its node id.
+    const LINUX_BRIDGE_UUID: [u8; 6] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6];
+
+    /// How many UART slots the linux bridge backend serves — one static stream,
+    /// slot 0 only (`third_party/klipper/src/linux/bridge.c`).
+    const LINUX_BRIDGE_UARTS: u8 = 1;
+
+    /// How many UART slots the host library serves: one per tty slot of the
+    /// host's table (`KLIPPER_HOST_PORT_SLOTS`,
+    /// `third_party/klipper/src/host/bridge.c`).
+    const HOST_LIBRARY_UARTS: u8 = 4;
 
     /// Session timing for the test: same shape as the defaults, millisecond
     /// scale, so the run is fast but every wait is bounded.
@@ -1251,7 +1328,7 @@ mod tests {
         link.declare_ports(&ports)
             .await
             .expect("the bridge declares its ports without resetting anything");
-        link.open_target_port(target)
+        link.open_target_port(target, PortRoute::Legacy)
             .expect("the target's port is named and its tunnel opened");
 
         // The port's pty is watched for the whole window: neither half writes
@@ -1341,6 +1418,69 @@ mod tests {
             "the port carries the firmware's request-bootloader unit, and no katapult frame"
         );
         assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
+
+        link.close();
+        drop(link);
+        wait_for_library_unload(&library);
+    }
+
+    /// A bridge's own firmware says how many UART slots its backend offers: the
+    /// linux bridge serves one stream on slot 0, and reports exactly that — the
+    /// count `admin bridge config` lists instead of guessing a `--port-count`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_bridge_reports_its_uart_count() {
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, LINUX_BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+        let link = BridgeLink::open_serial(
+            firmware.serial_path(),
+            250_000,
+            BRIDGE_MCU_ID,
+            Some(LINUX_BRIDGE_UUID),
+        )
+        .expect("the bridge's console attaches and is named");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the linux bridge identifies");
+
+        assert_eq!(link.uart_count(), Some(LINUX_BRIDGE_UARTS));
+        assert_eq!(link.mcu_name().as_deref(), Some("linux"));
+
+        link.close();
+        drop(link);
+        drop(firmware);
+    }
+
+    /// The host library's count is the host's own tty table: one UART slot per
+    /// slot a tty could be named in, which is what its backend enforces
+    /// (`klipper_host_port`, `KLIPPER_HOST_PORT_SLOTS`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_host_library_bridge_reports_a_slot_per_tty() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let port = Pty::new();
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let path = library.display().to_string();
+        let link = BridgeLink::open_host_library(
+            Path::new(&path),
+            host_mux_for(&path),
+            BRIDGE_MCU_ID,
+            &[(0u8, port.path.display().to_string())],
+        )
+        .expect("the muxed library opens and attaches");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the bridge identifies");
+
+        assert_eq!(link.uart_count(), Some(HOST_LIBRARY_UARTS));
+        // The host library declares no `MCU` constant, so the report cannot name
+        // an arch for its slots — `admin bridge config` says `arch-named`.
+        assert_eq!(link.mcu_name(), None);
 
         link.close();
         drop(link);

@@ -1051,9 +1051,10 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         let uarts = link.uart_count();
+        let slots = link.uart_slots();
         let mcu = link.mcu_name();
         link.close();
-        for line in bridge_config_lines(&plan, uarts, mcu.as_deref()) {
+        for line in bridge_config_lines(&plan, uarts, slots.as_deref(), mcu.as_deref()) {
             println!("{line}");
         }
         Ok::<(), Box<dyn std::error::Error>>(())
@@ -1066,10 +1067,13 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
 ///
 /// `uarts` is the firmware's own `BRIDGE_UART_COUNT` — `None` on a firmware that
 /// predates the constant, which the report names and then covers with the plan's
-/// `--port-count` instead of pretending the bridge answered.
+/// `--port-count` instead of pretending the bridge answered. `slots` is that
+/// same firmware's per-slot naming ([`BridgeLink::uart_slots`]) when it has one,
+/// in slot order; a slot it does not name falls back to [`uart_slot_note`].
 fn bridge_config_lines(
     plan: &BridgeConfigPlan,
     uarts: Option<u8>,
+    slots: Option<&[String]>,
     mcu: Option<&str>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
@@ -1087,34 +1091,35 @@ fn bridge_config_lines(
     let assumed = if uarts.is_some() { "" } else { " (assumed)" };
     lines.push(format!("available uarts: {count}{assumed}"));
     for slot in 0..count {
+        let note = slots
+            .and_then(|slots| slots.get(usize::from(slot)))
+            .map_or_else(|| uart_slot_note(mcu).to_string(), String::from);
         lines.push(format!(
-            "  uart {slot}: {} baud default slot ({})",
-            plan.baud,
-            uart_slot_note(mcu)
+            "  uart {slot}: {} baud default slot ({note})",
+            plan.baud
         ));
     }
     lines.push("enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string());
     lines
 }
 
-/// How the arch names a port's stream, for a line of `admin bridge config`.
+/// How the arch names a port's stream, for a line of `admin bridge config` whose
+/// firmware named no slot.
 ///
-/// The dictionary carries the count (`BRIDGE_UART_COUNT`) but not the names: which
-/// USART or tty a slot ends up on is a build-time fact of the backend
-/// (`MCU` names the arch; the pin or path is fixed where the backend opens it), so
-/// it is written here from those backends and named as theirs.
+/// The dictionary is what a slot is named from when the backend declares it
+/// ([`BridgeLink::uart_slots`]); this is the fallback for the backends that
+/// declare only a count, so it can say no more than where their stream comes
+/// from. `MCU` names the arch (`third_party/klipper/src/{linux,host}/bridge.c`
+/// for the two that reach here).
 fn uart_slot_note(mcu: Option<&str>) -> &'static str {
     match mcu {
-        // `third_party/klipper/src/stm32/bridge_serial.c`: USART1, RX PA10 /
-        // TX PA9 (`CONFIG_STM32_BRIDGE_SERIAL_USART1`), fixed at build time.
-        Some(mcu) if mcu.starts_with("stm32") => "arch-named USART1 PA10/PA9",
         // `third_party/klipper/src/linux/bridge.c`: the tty the launcher put in
         // `KLIPPER_BRIDGE_PORT_0`.
         Some("linux") => "arch-named tty from KLIPPER_BRIDGE_PORT_0",
-        // A host library's ttys are its host's to name (`klipper_host_port`,
-        // one per slot), so nothing here can say more than that.
-        Some(_) => "arch-named",
-        None => "arch-named",
+        // The host library's slots are ttys its host names (`klipper_host_port`,
+        // one per slot) and any other arch's are its own to name, so nothing
+        // here can say which: not a USART number, not a path.
+        _ => "arch-named",
     }
 }
 
@@ -2008,18 +2013,39 @@ mod tests {
     }
 
     /// The report is the slots the **bridge** offers, one line each, with the
-    /// rate a port on it would open at and the arch's own naming of the stream —
-    /// and nothing that claims a port was declared.
+    /// rate a port on it would open at and the firmware's own naming of each
+    /// slot — and nothing that claims a port was declared.
     #[test]
     fn test_a_bridge_config_report_lists_the_uarts_the_bridge_offers() {
         let plan = planned_bridge_config(&["--bridge", "/dev/ttyUSB0", "--baud", "115200"])
             .expect("a bridge config plan");
+        let slots = vec!["USART1 PA10/PA9".to_string(), "USART2 PA3/PA2".to_string()];
         assert_eq!(
-            bridge_config_lines(&plan, Some(2), Some("stm32f103xe")),
+            bridge_config_lines(&plan, Some(2), Some(&slots), Some("stm32f103xe")),
             vec![
                 "available uarts: 2".to_string(),
-                "  uart 0: 115200 baud default slot (arch-named USART1 PA10/PA9)".to_string(),
-                "  uart 1: 115200 baud default slot (arch-named USART1 PA10/PA9)".to_string(),
+                "  uart 0: 115200 baud default slot (USART1 PA10/PA9)".to_string(),
+                "  uart 1: 115200 baud default slot (USART2 PA3/PA2)".to_string(),
+                "enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string(),
+            ]
+        );
+    }
+
+    /// A slot the firmware names nothing for falls back to the arch's note — the
+    /// linux bridge's single tty, and an older firmware whose slots were assumed
+    /// from `--port-count` rather than read.
+    #[test]
+    fn test_a_bridge_config_report_falls_back_to_the_arch_for_an_unnamed_slot() {
+        let plan = planned_bridge_config(&["--bridge", "/dev/ttyUSB0", "--baud", "115200"])
+            .expect("a bridge config plan");
+        assert_eq!(
+            bridge_config_lines(&plan, Some(2), None, Some("linux")),
+            vec![
+                "available uarts: 2".to_string(),
+                "  uart 0: 115200 baud default slot (arch-named tty from KLIPPER_BRIDGE_PORT_0)"
+                    .to_string(),
+                "  uart 1: 115200 baud default slot (arch-named tty from KLIPPER_BRIDGE_PORT_0)"
+                    .to_string(),
                 "enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string(),
             ]
         );
@@ -2040,7 +2066,7 @@ mod tests {
         ])
         .expect("a bridge config plan");
         assert_eq!(
-            bridge_config_lines(&plan, None, Some("linux")),
+            bridge_config_lines(&plan, None, None, Some("linux")),
             vec![
                 "note: this bridge reports no BRIDGE_UART_COUNT (an older firmware); \
                  assuming 3 slot(s) from --port-count"
@@ -2057,8 +2083,9 @@ mod tests {
         );
     }
 
-    /// The arch's naming comes from the `MCU` constant, and a build that declares
-    /// none (the host library) says exactly that much.
+    /// The arch's note names where an unnamed slot's stream comes from — the
+    /// linux tty variable — and a build that names no arch (the host library) or
+    /// an arch whose slots are the host's to name says only that much.
     #[test]
     fn test_a_bridge_config_names_the_arch_that_fixes_the_uart() {
         assert_eq!(uart_slot_note(None), "arch-named");
@@ -2066,10 +2093,9 @@ mod tests {
             uart_slot_note(Some("linux")),
             "arch-named tty from KLIPPER_BRIDGE_PORT_0"
         );
-        assert_eq!(
-            uart_slot_note(Some("stm32f103xe")),
-            "arch-named USART1 PA10/PA9"
-        );
+        // A stm32 bridge names its own slots in the dictionary (`uart_slots`), so
+        // the note for it cannot claim a USART: it says only that the arch does.
+        assert_eq!(uart_slot_note(Some("stm32f103xe")), "arch-named");
     }
 
     /// `--port-count` is the fallback count and `--baud` the speed a slot would

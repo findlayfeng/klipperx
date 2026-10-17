@@ -49,7 +49,7 @@ use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{self, SharedSerialHandle, TunnelSink};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{HostMux, Interface};
-use crate::core::klippy::mcu::{Mcu, McuError};
+use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
@@ -109,6 +109,24 @@ const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// the identity up front. Long enough for a board to finish coming back up,
 /// short enough that [`RESET_TIMEOUT`] still has room to retry.
 const DISCOVER_WINDOW: Duration = Duration::from_secs(2);
+
+/// The USARTs the stm32 bridge backend can put a port on, in the order it
+/// numbers the slots, each with the name it reserves that USART's pins under.
+///
+/// `third_party/klipper/src/stm32/bridge_serial.c` numbers the slots by USART
+/// number — USART1, USART2, USART3, UART4, UART5 — and USART1 keeps the
+/// constant name the single-port backend always used
+/// (`RESERVE_PINS_bridge_serial`), while the others are named after their own
+/// USART (`RESERVE_PINS_bridge_serial_usart2`, …). A ticked USART is one whose
+/// reserve constant the dictionary carries; so this list is the backend's own
+/// slot order, not a guess from `MCU`.
+const STM32_BRIDGE_SERIAL_UARTS: [(&str, &str); 5] = [
+    ("USART1", "bridge_serial"),
+    ("USART2", "bridge_serial_usart2"),
+    ("USART3", "bridge_serial_usart3"),
+    ("UART4", "bridge_serial_uart4"),
+    ("UART5", "bridge_serial_uart5"),
+];
 
 /// The bridge device the run holds directly, one variant per link it can be
 /// opened on: the host library the config calls muxed, or a shared serial port.
@@ -808,11 +826,31 @@ impl BridgeLink {
     }
 
     /// The `MCU` constant the bridge's firmware reports (`stm32f103xe`,
-    /// `linux`, …) — what `admin bridge config` names the arch's UART by.
-    /// Absent on a build that declares none (the host library).
+    /// `linux`, …) — what `admin bridge config` names the arch by when the
+    /// firmware names no slot ([`uart_slots`](BridgeLink::uart_slots)). Absent
+    /// on a build that declares none (the host library).
     pub fn mcu_name(&self) -> Option<String> {
         let dictionary = self.live().mcu.dictionary()?;
         Some(dictionary.constant("MCU")?.as_str()?.to_string())
+    }
+
+    /// How the bridge's firmware names each of its UART slots, in slot order —
+    /// one entry per slot [`uart_count`](BridgeLink::uart_count) counts, each as
+    /// `<USART> <RX>/<TX>` (`USART1 PA10/PA9`). `None` on a backend that names
+    /// no slot, so a caller can fall back to naming the arch.
+    ///
+    /// Only the stm32 serial backend names its slots in the dictionary: it
+    /// reserves each ticked USART's pins under a constant whose value is the pin
+    /// pair (`third_party/klipper/src/stm32/bridge_serial.c`). A slot is a
+    /// ticked USART's place among the ticked ones, so an unticked USART leaves
+    /// no entry and the slots after it move up — which is why this reads the
+    /// backend's own declarations instead of deriving a USART from a slot
+    /// number. The linux bridge's single tty and the host library's ttys declare
+    /// only a count, so they name nothing here.
+    pub fn uart_slots(&self) -> Option<Vec<String>> {
+        let dictionary = self.live().mcu.dictionary()?;
+        let slots = stm32_bridge_serial_slots(&dictionary);
+        (!slots.is_empty()).then_some(slots)
     }
 
     /// The shared serial port a **serial** bridge's link is on — what a scan
@@ -981,6 +1019,25 @@ impl std::error::Error for BridgeFlashError {
             | BridgeFlashError::Shutdown { .. } => None,
         }
     }
+}
+
+/// Which of [`STM32_BRIDGE_SERIAL_UARTS`] a dictionary's bridge was built with,
+/// in slot order and named the way the backend names it (`USART2 PA3/PA2`).
+///
+/// A ticked USART is one whose `RESERVE_PINS_*` constant the dictionary carries;
+/// that constant's value is the pin pair it is wired to, RX first
+/// (`PA3,PA2`), which reads better as `PA3/PA2`. Empty for a firmware that
+/// declares none (every backend but the stm32 serial one).
+fn stm32_bridge_serial_slots(dictionary: &Dictionary) -> Vec<String> {
+    STM32_BRIDGE_SERIAL_UARTS
+        .iter()
+        .filter_map(|(usart, reserve)| {
+            let pins = dictionary
+                .constant(&format!("RESERVE_PINS_{reserve}"))?
+                .as_str()?;
+            Some(format!("{usart} {}", pins.replace(',', "/")))
+        })
+        .collect()
 }
 
 // ===========================================================================
@@ -1447,10 +1504,69 @@ mod tests {
 
         assert_eq!(link.uart_count(), Some(LINUX_BRIDGE_UARTS));
         assert_eq!(link.mcu_name().as_deref(), Some("linux"));
+        // The linux backend declares a count and no per-slot name, so the report
+        // has only the arch's note to name its slot with.
+        assert_eq!(link.uart_slots(), None);
 
         link.close();
         drop(link);
         drop(firmware);
+    }
+
+    /// Which USART each slot is comes from the backend's own reserved-pin
+    /// constants, in the order it numbers its slots (`USART1`, `USART2`, …,
+    /// `UART5`), with the pin pair read as `RX/TX`.
+    ///
+    /// `third_party/klipper/src/stm32/bridge_serial.c`: a ticked USART reserves
+    /// `RESERVE_PINS_bridge_serial*` = its pins, and USART1 keeps the name the
+    /// single-port backend always used.
+    #[test]
+    fn test_the_stm32_bridge_names_its_slots_from_its_reserved_pins() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": {
+                "BRIDGE_UART_COUNT": 2,
+                "MCU": "stm32f103xe",
+                "RESERVE_PINS_bridge_serial": "PA10,PA9",
+                "RESERVE_PINS_bridge_serial_usart2": "PA3,PA2",
+            }
+        }))
+        .expect("a stm32 bridge dictionary");
+        assert_eq!(
+            stm32_bridge_serial_slots(&dictionary),
+            vec!["USART1 PA10/PA9".to_string(), "USART2 PA3/PA2".to_string()]
+        );
+    }
+
+    /// A slot is a ticked USART's place **among the ticked ones**, so ticking a
+    /// later USART alone moves it to slot 0: naming slots off a fixed
+    /// slot→USART table would call this one `USART1`, which is a port the
+    /// firmware does not have.
+    #[test]
+    fn test_a_later_stm32_usart_alone_moves_up_to_slot_zero() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": {
+                "BRIDGE_UART_COUNT": 2,
+                "MCU": "stm32f103xe",
+                "RESERVE_PINS_bridge_serial_usart3": "PB11,PB10",
+                "RESERVE_PINS_bridge_serial_uart5": "PD2,PC12",
+            }
+        }))
+        .expect("a stm32 bridge dictionary");
+        assert_eq!(
+            stm32_bridge_serial_slots(&dictionary),
+            vec!["USART3 PB11/PB10".to_string(), "UART5 PD2/PC12".to_string()]
+        );
+    }
+
+    /// A backend that reserves no USART pins names no slot — the host library's
+    /// dictionary has no such constants, and neither does the linux bridge's.
+    #[test]
+    fn test_a_bridge_without_reserved_pins_names_no_slot() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": { "BRIDGE_UART_COUNT": 4 }
+        }))
+        .expect("a host library bridge dictionary");
+        assert!(stm32_bridge_serial_slots(&dictionary).is_empty());
     }
 
     /// The host library's count is the host's own tty table: one UART slot per
@@ -1479,8 +1595,10 @@ mod tests {
 
         assert_eq!(link.uart_count(), Some(HOST_LIBRARY_UARTS));
         // The host library declares no `MCU` constant, so the report cannot name
-        // an arch for its slots — `admin bridge config` says `arch-named`.
+        // an arch for its slots — `admin bridge config` says `arch-named` — and
+        // it names no slot either: its ttys are its host's to name.
         assert_eq!(link.mcu_name(), None);
+        assert_eq!(link.uart_slots(), None);
 
         link.close();
         drop(link);

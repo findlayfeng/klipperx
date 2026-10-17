@@ -731,7 +731,7 @@ impl BridgeLink {
         }
         self.live()
             .link
-            .send_request_bootloader(REQUEST_BOOTLOADER_TO_BRIDGE)
+            .send_request_bootloader(REQUEST_BOOTLOADER_TO_BRIDGE, None)
             .map_err(|e| {
                 BridgeFlashError::Reset(format!("sending the bootloader request failed: {e}"))
             })?;
@@ -850,8 +850,9 @@ impl BridgeLink {
         &self,
         ports: &[BridgePort],
         target: BridgeTarget,
+        uuid: Option<[u8; 6]>,
     ) -> Result<(), BridgeFlashError> {
-        match send_port_resets(&self.live().link, ports, target).await {
+        match send_port_resets(&self.live().link, ports, target, uuid).await {
             Ok(()) => match self.take_shutdown() {
                 Some(reason) => Err(BridgeFlashError::Shutdown { reason }),
                 None => Ok(()),
@@ -943,8 +944,13 @@ impl BridgeLink {
     ///
     /// # Errors
     /// [`BridgeFlashError::PortReset`] when the link refuses the write.
-    pub fn reset_port(&self, index: u8, reset: PortReset) -> Result<(), BridgeFlashError> {
-        send_port_reset(&self.live().link, index, reset).map_err(|e| match e {
+    pub fn reset_port(
+        &self,
+        index: u8,
+        reset: PortReset,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<(), BridgeFlashError> {
+        send_port_reset(&self.live().link, index, reset, uuid).map_err(|e| match e {
             BridgeError::Link(e) => BridgeFlashError::PortReset(e),
             other => BridgeFlashError::Bridge(other),
         })
@@ -1025,7 +1031,7 @@ impl BridgeLink {
             self.assign_node_id(uuid, target.node_id)?;
             tokio::time::sleep(ASSIGN_SETTLE).await;
         }
-        self.reset_ports(ports, target).await?;
+        self.reset_ports(ports, target, assign).await?;
         match assignment {
             Some(uuid) => {
                 // The bootloader is up (or nearly) after the reset, and its
@@ -1817,7 +1823,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
 
-        link.reset_port(0, PortReset::Bootloader)
+        link.reset_port(0, PortReset::Bootloader, None)
             .expect("the bootloader request goes out");
         tokio::time::sleep(Duration::from_millis(300)).await;
         stop.store(true, Ordering::Relaxed);

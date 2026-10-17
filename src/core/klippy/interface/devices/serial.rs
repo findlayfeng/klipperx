@@ -870,6 +870,26 @@ pub fn discovery_query() -> Vec<u8> {
     admin_unit(&[CMD_QUERY_UNASSIGNED])
 }
 
+/// The admin unit that asks the device behind bridge port `index` to park in its
+/// bootloader: `[header(0x3f0)][KXID: 0x02, index, uuid?]`.
+///
+/// The uuid is what makes the request reach a device whose own byte stream is
+/// not slices: a CAN port translates a uuid-carrying request into the bus's
+/// single admin frame (`0x3f0 [0x02][uuid]`, `generic/canserial.c`), which a
+/// device reads whatever carrier it speaks.
+/// Without it the request can only travel as the mux unit itself, which needs a
+/// device that reads units. `None` keeps that older, unit-only shape.
+pub(crate) fn request_bootloader_unit(index: u8, uuid: Option<[u8; 6]>) -> Vec<u8> {
+    match uuid {
+        Some(uuid) => {
+            let mut body = vec![CMD_REQUEST_BOOTLOADER, index];
+            body.extend_from_slice(&uuid);
+            admin_unit(&body)
+        }
+        None => admin_unit(&[CMD_REQUEST_BOOTLOADER, index]),
+    }
+}
+
 /// The broadcast that tells the board with `uuid` to take `mcu_id`: the admin
 /// listen id as the header, then the `KXID` frame carrying
 /// [`CMD_SET_KLIPPER_NODEID`], the six UUID bytes most significant first, and
@@ -2230,8 +2250,12 @@ impl SharedSerialHandle {
     ///
     /// # Errors
     /// The same as [`SharedSerialHandle::send_unit`].
-    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
+    pub fn send_request_bootloader(
+        &self,
+        index: u8,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<(), InterfaceError> {
+        self.send_admin(&request_bootloader_unit(index, uuid)[HEADER_BYTES..])
     }
 
     /// Toggle the flashing tunnel of bridge port `index` —
@@ -2727,7 +2751,7 @@ mod mux_tests {
 
         let bootloader = admin_unit(&[CMD_REQUEST_BOOTLOADER, 0]);
         handle
-            .send_request_bootloader(0)
+            .send_request_bootloader(0, None)
             .expect("the bootloader request goes out");
         assert_eq!(read_n(&pty.master, bootloader.len()), bootloader);
 

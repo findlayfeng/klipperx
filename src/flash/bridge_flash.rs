@@ -54,8 +54,8 @@ use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
     declare_port as send_declare_port, declare_ports as send_declare_ports, open_bridge,
-    open_target_port as send_open_target_port, reset_port as send_port_reset, BridgeError,
-    BridgePort, BridgeTarget, PortReset, PortRoute,
+    open_target_port as send_open_target_port, reset_port as send_port_reset, slot_kind,
+    BridgeError, BridgePort, BridgeTarget, PortKind, PortReset, PortRoute,
 };
 use super::frame::command::CONNECT;
 use super::session::{self, FlashError, SessionConfig, Summary};
@@ -791,15 +791,16 @@ impl BridgeLink {
     /// to do between declarations (a bridge scan declares a port, scans through
     /// it, then declares the next). Ports are declared in ascending index from
     /// 0, because the bridge numbers a port by the order the declaration rows
-    /// reach it.
+    /// reach it. `port` is that port's plan entry: the rate its bus takes, and a
+    /// [`BridgePort::reset`] this method does not use.
     ///
     /// # Errors
     /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down over
     /// the declaration (its reason included — a slot another object already
     /// opened is the common one), and [`BridgeFlashError::Bridge`] when the
     /// declaration fails for any other reason.
-    pub async fn declare_port(&self, index: u8, baud: u32) -> Result<(), BridgeFlashError> {
-        match send_declare_port(&self.live().mcu, index, baud).await {
+    pub async fn declare_port(&self, index: u8, port: BridgePort) -> Result<(), BridgeFlashError> {
+        match send_declare_port(&self.live().mcu, index, port).await {
             Ok(()) => match self.take_shutdown() {
                 Some(reason) => Err(BridgeFlashError::Shutdown { reason }),
                 None => Ok(()),
@@ -852,6 +853,22 @@ impl BridgeLink {
         let mut slots = stm32_bridge_serial_slots(&dictionary);
         slots.extend(stm32_bridge_can_slot(&dictionary));
         (!slots.is_empty()).then_some(slots)
+    }
+
+    /// Which bus the bridge's slot `index` carries — [`PortKind::Uart`] or
+    /// [`PortKind::Can`] — from the same two dictionary constants
+    /// [`uart_slots`](BridgeLink::uart_slots) names the slots from.
+    ///
+    /// A **declaration** needs it: a UART slot's stream is opened with
+    /// `config_uart` at a line rate, the CAN slot's with `config_can` at a
+    /// bitrate ([`bridge_session::slot_kind`]), and the firmware shuts down on
+    /// the wrong one. The host does not guess from the plan — the bridge says
+    /// which slots it has.
+    ///
+    /// A slot the firmware does not name, a connection with no dictionary, and
+    /// every non-stm32 backend read as a UART slot, since nothing said otherwise.
+    pub fn slot_kind(&self, index: u8) -> PortKind {
+        slot_kind(self.live().mcu.dictionary().as_deref(), index)
     }
 
     /// The shared serial port a **serial** bridge's link is on — what a scan
@@ -1087,6 +1104,14 @@ mod tests {
     /// addressable id in the assigned range.
     const TARGET_NODE_ID: u8 = 7;
 
+    /// The bus rate the plans here carry for a bridge's CAN slot.
+    ///
+    /// Every fixture in this module is a **UART** bridge (the mux library, the
+    /// linux firmware, a fake bootloader on one port), so the declaration never
+    /// reads it: the entry carries it because [`BridgePort`] carries both rates
+    /// and the bridge's own slot table picks the one its slot takes.
+    const CAN_BITRATE: u32 = 1_000_000;
+
     /// The identity the linux bridge fixture is started with: the same bytes the
     /// link names it by, or the firmware never adopts its node id.
     const LINUX_BRIDGE_UUID: [u8; 6] = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6];
@@ -1308,6 +1333,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -1396,6 +1422,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -1467,6 +1494,7 @@ mod tests {
         // silence, and the pty would stay quiet for the wrong reason.
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::Bootloader,
         }];
         link.declare_ports(&ports)
@@ -1700,6 +1728,7 @@ mod tests {
         // refused (its port slot was in use).
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         link.declare_ports(&ports)
@@ -1816,6 +1845,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -1988,6 +2018,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2049,6 +2080,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2122,6 +2154,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2211,6 +2244,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2291,6 +2325,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2392,6 +2427,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {
@@ -2580,6 +2616,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::Bootloader,
         }];
         let target = BridgeTarget {
@@ -2630,6 +2667,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::Bootloader,
         }];
         let target = BridgeTarget {
@@ -2681,6 +2719,7 @@ mod tests {
 
         let ports = [BridgePort {
             baud: 250_000,
+            bitrate: CAN_BITRATE,
             reset: PortReset::ResetPort,
         }];
         let target = BridgeTarget {

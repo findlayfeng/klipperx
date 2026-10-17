@@ -10,8 +10,9 @@
 //! command can name a port. [`open_bridge`] is that front half, in the order the
 //! firmware requires:
 //!
-//! 1. **declare** every port — `allocate_oids` for the object ids, then a
-//!    `config_uart` + `config_bridge_port` pair per port
+//! 1. **declare** every port — `allocate_oids` for the object ids, then the
+//!    stream command the port's bus takes ([`PortKind`]: `config_uart` on a UART
+//!    slot, `config_can` on the CAN one) plus a `config_bridge_port`
 //!    ([`crate::core::klippy::cmd::uart`]). Both commands take effect as they
 //!    arrive: the stream is opened, the port is hung on the router and numbered
 //!    by arrival order. There is no `finalize_config` in this flow; these
@@ -41,11 +42,11 @@
 //! port the target is, are the caller's to say.
 
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
-use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart};
+use crate::core::klippy::cmd::uart::{ConfigBridgePort, PortConfig};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
 use crate::core::klippy::interface::{Interface, InterfaceError};
-use crate::core::klippy::mcu::{Mcu, McuError};
+use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 use crate::core::klippy::msg::MsgError;
 use std::fmt;
 use std::time::Duration;
@@ -177,21 +178,98 @@ pub enum PortReset {
     Bootloader,
 }
 
+/// Which bus a bridge slot carries, and so which command opens its stream.
+///
+/// The bridge's slot order is the arch dispatcher's: **every UART slot first, the
+/// CAN slot after them** (`third_party/klipper/src/stm32/bridge_port.c`, whose
+/// `BRIDGE_UART_COUNT` is "UART slots + CAN slots" added up). Which kind a slot is
+/// decides the one command that opens its stream ([`slot_kind`] reads it from the
+/// firmware's own declarations); everything else in a declaration — the oid pair,
+/// `config_bridge_port`, the slot number — is the same for both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortKind {
+    /// A serial slot: opened with `config_uart` at [`BridgePort::baud`].
+    Uart,
+    /// The CAN bus slot: opened with `config_can` at [`BridgePort::bitrate`].
+    Can,
+}
+
+impl PortKind {
+    /// The stream command that opens this kind of port at the plan's rate.
+    fn stream_config(self, port: &BridgePort) -> PortConfig {
+        match self {
+            Self::Uart => PortConfig::Uart { baud: port.baud },
+            Self::Can => PortConfig::Can {
+                bitrate: port.bitrate,
+            },
+        }
+    }
+}
+
+/// Which bus the bridge's slot `index` carries, read from the two constants the
+/// firmware publishes for its slots.
+///
+/// `RESERVE_PINS_bridge_can` exists only in a build that has a CAN downstream
+/// port (`third_party/klipper/src/{stm32/bridge_port.c,stm32/can.c}` — the same
+/// constant `admin bridge config` names that slot from), and `BRIDGE_UART_COUNT`
+/// is **every** slot the arch numbers. The CAN slot is the last of them, so its
+/// number is that count minus one, and every slot below it is a UART slot. A
+/// build with no CAN slot (the linux bridge, the host library) publishes no such
+/// constant and every slot of it is a UART slot.
+///
+/// Everything else reads as [`PortKind::Uart`]: a firmware that names no CAN slot,
+/// a slot past the ones it numbered (the CAN slot included), and a connection
+/// whose dictionary never arrived — nothing said otherwise. `admin bridge config`
+/// lists those slots in the same order ([`BridgeLink::uart_slots`]).
+///
+/// [`BridgeLink::uart_slots`]: crate::flash::bridge_flash::BridgeLink::uart_slots
+pub(crate) fn slot_kind(dictionary: Option<&Dictionary>, index: u8) -> PortKind {
+    let Some(dictionary) = dictionary else {
+        return PortKind::Uart;
+    };
+    let has_can_slot = dictionary
+        .constant("RESERVE_PINS_bridge_can")
+        .and_then(|pins| pins.as_str())
+        .is_some();
+    let Some(total) = dictionary
+        .constant("BRIDGE_UART_COUNT")
+        .and_then(|count| count.as_u64())
+    else {
+        return PortKind::Uart;
+    };
+    let can_slot = total.saturating_sub(1);
+    if has_can_slot && u64::from(index) == can_slot {
+        PortKind::Can
+    } else {
+        PortKind::Uart
+    }
+}
+
 /// One port of a bridge's downstream plan.
 ///
 /// The plan's **order is the port numbering**: `config_bridge_port` makes the
 /// bridge number a port by the order the command arrives, and that number is
-/// also the slot `config_uart` carries and the number the host named the port's
-/// tty with before the bridge came up (`third_party/klipper/src/uart.c`,
+/// also the slot the stream command carries and the number the host named the
+/// port's tty with before the bridge came up (`third_party/klipper/src/uart.c`,
 /// `mcu/bridge_ports.rs`). So the i-th entry of the slice [`open_bridge`] is
-/// given is port `i` — the index every port-level command addresses.
+/// given is port `i` — the index every port-level command addresses. Which kind
+/// of port that entry is comes from the bridge's own slot table ([`slot_kind`]),
+/// not from the plan: the two rates below are carried so that either kind can be
+/// declared from one entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BridgePort {
-    /// The line rate the bridge opens this port's stream at — the port
+    /// The line rate the bridge opens a **UART** slot's stream at — the port
     /// section's `uart_baud:`, or
     /// [`DEFAULT_UART_BAUD`](crate::core::klippy::cmd::uart::DEFAULT_UART_BAUD)
-    /// when it wrote none.
+    /// when it wrote none. A CAN slot ignores it.
     pub baud: u32,
+    /// The bus rate the bridge opens the **CAN** slot at, in bits per second —
+    /// `--can-bitrate`.
+    ///
+    /// The port's bitrate is the `config_can` rate and nothing else: a CAN port's
+    /// stream *is* the bus, so this is where `canhw_set_rate` gets its number.
+    /// A UART slot ignores it.
+    pub bitrate: u32,
     /// Which reset this port's device gets before the tunnel opens.
     pub reset: PortReset,
 }
@@ -336,24 +414,41 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
         return Err(BridgeError::TooManyPorts { ports: ports.len() });
     }
 
+    let dictionary = mcu.dictionary();
     let count = (ports.len() * 2) as u8;
     mcu.send(AllocateOids::NAME, &AllocateOids { count }.args())?;
     for (index, port) in ports.iter().enumerate() {
-        let index = index as u8;
-        let uart_oid = index * 2;
-        let uart = ConfigUart {
-            oid: uart_oid,
-            baud: port.baud,
-            slot: index,
-        };
-        mcu.send(ConfigUart::NAME, &uart.args())?;
-        let bridge_port = ConfigBridgePort {
-            oid: uart_oid + 1,
-            port: uart_oid,
-        };
-        mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
+        send_declaration(mcu, index as u8, port, dictionary.as_deref())?;
     }
     mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
+    Ok(())
+}
+
+/// Send one port's declaration pair: the stream command its bus takes, then the
+/// `config_bridge_port` that hangs it on the bridge's router.
+///
+/// `index` is the port's number — the slot the stream command carries, and the
+/// number the bridge assigns it by arrival order — so the oid pair is `index * 2`
+/// for the stream object and `index * 2 + 1` for the port that carries it.
+/// `dictionary` is the bridge's, whose constants say which bus the slot is
+/// ([`slot_kind`]); a connection with none declares every port as a UART, since
+/// nothing said otherwise.
+fn send_declaration(
+    mcu: &Mcu,
+    index: u8,
+    port: &BridgePort,
+    dictionary: Option<&Dictionary>,
+) -> Result<(), McuError> {
+    let stream_oid = index * 2;
+    let (name, args) = slot_kind(dictionary, index)
+        .stream_config(port)
+        .stream_command(stream_oid, index);
+    mcu.send(name, &args)?;
+    let bridge_port = ConfigBridgePort {
+        oid: stream_oid + 1,
+        port: stream_oid,
+    };
+    mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
     Ok(())
 }
 
@@ -365,32 +460,24 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
 /// The bridge numbers a port by the order `config_bridge_port` reaches it, so
 /// ports are declared in ascending index from 0 with nothing else allocating
 /// oids in between; `index` is that order's next free number, and the oid pair
-/// follows [`declare_ports`]'s scheme (`index * 2` the UART object, `index * 2
-/// + 1` the port that carries it).
+/// follows [`declare_ports`]'s scheme (`index * 2` the stream object, `index * 2
+/// + 1` the port that carries it). `port` is that port's plan entry — its two
+/// rates, of which the one its bus takes is used; the entry's reset is unused
+/// here, as in [`declare_ports`].
 ///
 /// # Errors
 /// [`BridgeError::TooManyPorts`] when `index` is past what the oid byte can
 /// number (nothing is sent), [`BridgeError::Mcu`] when a command cannot be
 /// spelled or the barrier is not reached in time.
-pub async fn declare_port(mcu: &Mcu, index: u8, baud: u32) -> Result<(), BridgeError> {
+pub async fn declare_port(mcu: &Mcu, index: u8, port: BridgePort) -> Result<(), BridgeError> {
     if usize::from(index) >= MAX_BRIDGE_PORTS {
         return Err(BridgeError::TooManyPorts {
             ports: usize::from(index) + 1,
         });
     }
+    let dictionary = mcu.dictionary();
     mcu.send(AllocateOids::NAME, &AllocateOids { count: 2 }.args())?;
-    let uart_oid = index * 2;
-    let uart = ConfigUart {
-        oid: uart_oid,
-        baud,
-        slot: index,
-    };
-    mcu.send(ConfigUart::NAME, &uart.args())?;
-    let bridge_port = ConfigBridgePort {
-        oid: uart_oid + 1,
-        port: uart_oid,
-    };
-    mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
+    send_declaration(mcu, index, &port, dictionary.as_deref())?;
     mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
     Ok(())
 }
@@ -532,6 +619,14 @@ mod tests {
 
     /// The id the target device is named with behind its port.
     const TARGET_NODE_ID: u8 = 7;
+
+    /// The bus rate the plans here carry for a bridge's CAN slot.
+    ///
+    /// Every fixture in this module declares **UART** slots (the mux dictionary
+    /// and the muxed library have no CAN slot at all), so the declaration never
+    /// reads it: the entry carries it because [`BridgePort`] carries both rates
+    /// and the bridge's own slot table picks the one its slot takes.
+    const CAN_BITRATE: u32 = 1_000_000;
 
     /// The id the bridge's own connection is attached as — the arbitration id
     /// its frames carry on a shared serial wire.
@@ -833,10 +928,12 @@ mod tests {
         let ports = [
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::ResetPort,
             },
             BridgePort {
                 baud: 115_200,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::RestartDevice,
             },
         ];
@@ -883,10 +980,12 @@ mod tests {
         let ports = [
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::ResetPort,
             },
             BridgePort {
                 baud: 115_200,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::RestartDevice,
             },
         ];
@@ -905,6 +1004,139 @@ mod tests {
         assert!(
             observed.iter().all(|step| !is_reset(step)),
             "declaring ports resets nothing"
+        );
+    }
+
+    /// A bridge dictionary that has a CAN downstream slot, as the stm32 arch
+    /// publishes it: `BRIDGE_UART_COUNT` is every slot it numbers (the UART ones
+    /// and the CAN one), and `RESERVE_PINS_bridge_can` is the pin pair of the CAN
+    /// port, which is how a build says it has one at all. `uart_slots` is how
+    /// many UART slots come **before** the CAN slot.
+    fn stm32_can_bridge_dictionary(uart_slots: u64) -> Dictionary {
+        Dictionary::from_json(serde_json::json!({
+            "config": {
+                "MCU": "stm32f446xx",
+                "BRIDGE_UART_COUNT": uart_slots + 1,
+                "RESERVE_PINS_bridge_can": "PB8,PB9",
+            },
+            "commands": {
+                // The identify pair owns id 1 in every parser, so a synthetic
+                // dictionary numbers its own messages above it.
+                "allocate_oids count=%c": 2,
+                "config_uart oid=%c baud=%u slot=%c": 3,
+                "config_can oid=%c bitrate=%u slot=%c": 4,
+                "config_bridge_port oid=%c port=%c": 5,
+            }
+        }))
+        .expect("an stm32 bridge dictionary with a CAN slot")
+    }
+
+    /// The slot order is the arch's: **every UART slot first, the CAN slot last**,
+    /// and the two constants in the dictionary are what says so —
+    /// `BRIDGE_UART_COUNT` (every slot the firmware numbers) and
+    /// `RESERVE_PINS_bridge_can` (this build has a CAN port).
+    #[test]
+    fn test_the_can_slot_is_the_last_one_the_firmware_numbers() {
+        let dictionary = stm32_can_bridge_dictionary(2);
+        assert_eq!(slot_kind(Some(&dictionary), 0), PortKind::Uart);
+        assert_eq!(slot_kind(Some(&dictionary), 1), PortKind::Uart);
+        assert_eq!(slot_kind(Some(&dictionary), 2), PortKind::Can);
+        // A slot past the ones the firmware numbered is not the CAN one by
+        // accident: only the slot it named is.
+        assert_eq!(slot_kind(Some(&dictionary), 3), PortKind::Uart);
+        assert_eq!(slot_kind(Some(&dictionary), 255), PortKind::Uart);
+    }
+
+    /// A CAN-only bridge numbers one slot and it is the CAN one — no UART slot
+    /// comes before it, since `BRIDGE_UART_COUNT` is 1 there.
+    #[test]
+    fn test_a_can_only_bridge_has_the_can_slot_at_zero() {
+        let dictionary = stm32_can_bridge_dictionary(0);
+        assert_eq!(slot_kind(Some(&dictionary), 0), PortKind::Can);
+        assert_eq!(slot_kind(Some(&dictionary), 1), PortKind::Uart);
+    }
+
+    /// A backend with no CAN slot — the linux bridge, the host library — declares
+    /// no such constant, so every slot it numbers is a UART slot. So does a
+    /// connection whose dictionary never arrived: nothing said otherwise.
+    #[test]
+    fn test_a_bridge_without_a_can_slot_declares_uart_ports() {
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "config": { "BRIDGE_UART_COUNT": 4 }
+        }))
+        .expect("a host library bridge dictionary");
+        assert_eq!(slot_kind(Some(&dictionary), 0), PortKind::Uart);
+        assert_eq!(slot_kind(Some(&dictionary), 3), PortKind::Uart);
+        assert_eq!(slot_kind(None, 0), PortKind::Uart);
+    }
+
+    /// The declaration takes its command from the slot: `config_uart` at the line
+    /// rate on a UART slot, `config_can` at the plan's **bitrate** on the CAN one,
+    /// and the same `config_bridge_port` pair after each — so one plan entry
+    /// carries both rates and only the slot's own is used.
+    #[tokio::test]
+    async fn test_declare_ports_opens_the_can_slot_with_config_can_at_the_plan_bitrate() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = Mcu::new("bridge", link.clone());
+        let dictionary = stm32_can_bridge_dictionary(1);
+        mcu.install_dictionary(dictionary.clone())
+            .expect("the CAN bridge dictionary installs");
+        let mut parser = Parser::new();
+        dictionary
+            .install(&mut parser)
+            .expect("install the CAN bridge's dictionary");
+
+        // One UART slot (index 0) and the CAN slot after it (index 1). The
+        // bitrate is not the line rate and the line rate is not the bitrate, so
+        // a port declared with the wrong one cannot pass.
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                bitrate: 500_000,
+                reset: PortReset::ResetPort,
+            },
+            BridgePort {
+                baud: 115_200,
+                bitrate: 500_000,
+                reset: PortReset::ResetPort,
+            },
+        ];
+        declare_ports(&mcu, &ports)
+            .await
+            .expect("the declaration is sent");
+
+        let units = read_units(&pty.master, Duration::from_millis(500), |_| false);
+        assert_eq!(
+            steps(&parser, &units),
+            vec![
+                Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(4)]),
+                Step::Command(
+                    "config_uart".to_string(),
+                    vec![
+                        ArgValue::UInt8(0),
+                        ArgValue::UInt32(250_000),
+                        ArgValue::UInt8(0),
+                    ],
+                ),
+                Step::Command(
+                    "config_bridge_port".to_string(),
+                    vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
+                ),
+                Step::Command(
+                    "config_can".to_string(),
+                    vec![
+                        ArgValue::UInt8(2),
+                        ArgValue::UInt32(500_000),
+                        ArgValue::UInt8(1),
+                    ],
+                ),
+                Step::Command(
+                    "config_bridge_port".to_string(),
+                    vec![ArgValue::UInt8(3), ArgValue::UInt8(2)],
+                ),
+            ],
+            "a UART slot at its line rate, the CAN slot at the plan's bitrate"
         );
     }
 
@@ -950,9 +1182,17 @@ mod tests {
         let link = shared_serial_link(&pty);
         let mcu = bridge_mcu("bridge", &link);
 
-        declare_port(&mcu, 0, 250_000)
-            .await
-            .expect("the port declares");
+        declare_port(
+            &mcu,
+            0,
+            BridgePort {
+                baud: 250_000,
+                bitrate: CAN_BITRATE,
+                reset: PortReset::ResetPort,
+            },
+        )
+        .await
+        .expect("the port declares");
         let target = BridgeTarget {
             index: 0,
             node_id: TARGET_NODE_ID,
@@ -1051,10 +1291,12 @@ mod tests {
         let ports = [
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::ResetPort,
             },
             BridgePort {
                 baud: 115_200,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::Bootloader,
             },
         ];
@@ -1152,6 +1394,7 @@ mod tests {
         let one_too_many = vec![
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::ResetPort,
             };
             MAX_BRIDGE_PORTS + 1
@@ -1323,10 +1566,12 @@ mod tests {
         let ports = [
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::ResetPort,
             },
             BridgePort {
                 baud: 250_000,
+                bitrate: CAN_BITRATE,
                 reset: PortReset::RestartDevice,
             },
         ];

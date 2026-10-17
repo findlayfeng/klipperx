@@ -80,6 +80,30 @@ pub const BRIDGE_MCU_ID: u32 = 1;
 /// handshake, per attempt — the serial layer's own `ASSIGN_ATTACH_*` budget.
 const SERIAL_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How many times a run offers the bridge its attach handshake before it
+/// reports it unanswered.
+///
+/// Measured on an F446 bridge on USB CDC: a command issued within a few seconds
+/// of the previous one ends in `opening the bridge: Receive timeout`, and the
+/// same command issued 8–10 s later succeeds. The bridge is alive in between —
+/// its own console logs `No answer for 1 in-flight block(s); retransmitting`
+/// while it sits in the previous session's residual state — so the handshake it
+/// missed is worth offering again rather than reporting after one try.
+const ATTACH_ATTEMPTS: u32 = 3;
+
+/// How long a run waits between two attach attempts: the pause the residual
+/// state needed in practice, long enough that the bridge has finished whatever
+/// it was still doing with the previous session when the offer is repeated.
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(1_500);
+
+/// How long the whole attach retry may take, all attempts and pauses included.
+///
+/// The bound that matters: an attempt on a bridge with no `--bridge-uuid` runs
+/// the discovery scan first ([`DISCOVER_WINDOW`], two seconds) and its own
+/// handshake after it, so the attempt count alone would let a bridge that really
+/// is unreachable cost far longer than the wait it would save.
+const ATTACH_BUDGET: Duration = Duration::from_secs(5);
+
 /// How long the bridge's identify handshake may take before a run gives up.
 ///
 /// The declaration commands cannot be encoded before it, so a bridge that
@@ -260,7 +284,107 @@ enum BridgeOpen {
 }
 
 /// Attach a **shared serial** bridge at `path`, naming it with `uuid` — or,
-/// when `uuid` is `None`, finding it first.
+/// when `uuid` is `None`, finding it first — retried while the bridge answers
+/// nothing.
+///
+/// One attempt is [`attach_bridge_once`]; this offers it [`ATTACH_ATTEMPTS`]
+/// times, [`ATTACH_RETRY_DELAY`] apart and never past [`ATTACH_BUDGET`]. Each
+/// attempt is a fresh attach: the handle a failed attempt returned nothing
+/// through is not reused, and a serial port whose handshake went unanswered is
+/// left as the attempt found it ([`serial::attach`] unregisters the slot it
+/// opened), so the retry opens the link again from nothing.
+///
+/// Only an unanswered handshake (a [`BridgeFlashError::Open`] carrying
+/// [`InterfaceError::Timeout`]) is retried. Everything else is a property of the
+/// request and answers the same way however often it is made — an id or a uuid
+/// the wire format cannot carry, a tty that cannot be opened, and, as the case
+/// that must never be guessed at, several unassigned bridges on the line
+/// ([`BridgeFlashError::AmbiguousBridge`]) — so those are returned at once.
+///
+/// A run that spends its attempts or its budget reports the **last** attempt's
+/// own reason, with what the caller can check
+/// ([`BridgeFlashError::AttachUnanswered`]).
+///
+/// # Errors
+/// As [`attach_bridge_once`], with the unanswered case retried as above.
+fn attach_bridge(
+    path: &Path,
+    baud: u32,
+    mcu_id: u32,
+    uuid: Option<[u8; 6]>,
+) -> Result<Arc<SharedSerialHandle>, BridgeFlashError> {
+    attach_with_retries(RUN_ATTACH_RETRY, path, || {
+        attach_bridge_once(path, baud, mcu_id, uuid)
+    })
+}
+
+/// The retry bounds [`attach_bridge`] runs with: the constants above, in one
+/// value so the policy can be exercised without the waits it bounds.
+#[derive(Clone, Copy)]
+struct AttachRetry {
+    /// At most this many attempts, the first one included.
+    attempts: u32,
+    /// How long to wait between two of them.
+    delay: Duration,
+    /// How long all of them may take together.
+    budget: Duration,
+}
+
+/// What a run uses ([`ATTACH_ATTEMPTS`], [`ATTACH_RETRY_DELAY`], [`ATTACH_BUDGET`]).
+const RUN_ATTACH_RETRY: AttachRetry = AttachRetry {
+    attempts: ATTACH_ATTEMPTS,
+    delay: ATTACH_RETRY_DELAY,
+    budget: ATTACH_BUDGET,
+};
+
+/// Whether an attach failure is one a further attempt can answer.
+///
+/// Only "the bridge did not answer this handshake": that is the residual state
+/// of a previous session, which a repeated offer after a pause gets past.
+/// Every other failure — an unaddressable id, a tty that cannot be opened, a
+/// discovery scan that found several bridges — is decided by the request and
+/// comes back identical, so retrying it would only delay the report.
+fn attach_is_worth_retrying(error: &BridgeFlashError) -> bool {
+    matches!(error, BridgeFlashError::Open(InterfaceError::Timeout))
+}
+
+/// Run `attempt` and repeat it while it fails with an unanswered handshake,
+/// within `retry`'s bounds. Generic in what a successful attempt yields so the
+/// policy can be exercised without a bridge behind it.
+fn attach_with_retries<T>(
+    retry: AttachRetry,
+    path: &Path,
+    mut attempt: impl FnMut() -> Result<T, BridgeFlashError>,
+) -> Result<T, BridgeFlashError> {
+    let deadline = Instant::now() + retry.budget;
+    let mut attempts: u32 = 0;
+    loop {
+        attempts += 1;
+        let error = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        if !attach_is_worth_retrying(&error) {
+            return Err(error);
+        }
+        // Another attempt has to fit before the budget runs out, or the retry
+        // would report a failure it never got to make.
+        if attempts >= retry.attempts || Instant::now() + retry.delay >= deadline {
+            return Err(match error {
+                BridgeFlashError::Open(error) => BridgeFlashError::AttachUnanswered {
+                    attempts,
+                    path: path.to_path_buf(),
+                    error,
+                },
+                other => other,
+            });
+        }
+        std::thread::sleep(retry.delay);
+    }
+}
+
+/// One attach attempt: a **shared serial** bridge at `path`, naming it with
+/// `uuid` — or, when `uuid` is `None`, finding it first.
 ///
 /// A bridge's node id lives in its firmware's RAM, so a run with no
 /// `--bridge-uuid` has to **find** the bridge. An unassigned one answers the
@@ -285,7 +409,7 @@ enum BridgeOpen {
 /// [`BridgeFlashError::BridgeNotFound`] when the scan found no unassigned bridge
 /// **and** the assigned-id attach failed too, and [`BridgeFlashError::Open`]
 /// when the tty cannot be opened.
-fn attach_bridge(
+fn attach_bridge_once(
     path: &Path,
     baud: u32,
     mcu_id: u32,
@@ -325,10 +449,15 @@ impl BridgeOpen {
     /// Open the transport these parameters name, as a fresh link handle and its
     /// [`Interface`].
     ///
+    /// The serial arm is a **first** open — nothing has restarted the bridge, so
+    /// a session that left it in its residual state is met here and not by a
+    /// reopen — and it is the one that gets [`attach_bridge`]'s bounded retry.
+    ///
     /// # Errors
     /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
     /// [`BridgeFlashError::BridgeNotFound`] / [`BridgeFlashError::AmbiguousBridge`]
-    /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise.
+    /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise,
+    /// and [`BridgeFlashError::AttachUnanswered`] when the retry ran out.
     fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
         match self {
             BridgeOpen::Host {
@@ -566,9 +695,11 @@ impl BridgeLink {
     /// [`BridgeFlashError::BridgeNotFound`] when no uuid names the bridge, the
     /// discovery scan finds nothing unassigned, **and** the attach on `mcu_id`
     /// fails, [`BridgeFlashError::AmbiguousBridge`] when several unassigned
-    /// bridges answer the broadcast, and [`BridgeFlashError::Open`] when the
-    /// port cannot be opened, `mcu_id` is outside the addressable range, or the
-    /// handshake with a named bridge times out or is refused.
+    /// bridges answer the broadcast, [`BridgeFlashError::Open`] when the port
+    /// cannot be opened, `mcu_id` is outside the addressable range, or the
+    /// handshake with a named bridge is refused, and
+    /// [`BridgeFlashError::AttachUnanswered`] when nothing answered it on any
+    /// of the attempts [`attach_bridge`] makes.
     pub fn open_serial(
         path: &Path,
         baud: u32,
@@ -780,8 +911,11 @@ impl BridgeLink {
                 // A restart drops the bridge's node id (it lives in the
                 // firmware's RAM), so a serial bridge has to be **named** again
                 // before it answers: the uuid the caller gave, or one the
-                // discovery scan finds on its now-unassigned line.
-                let handle = attach_bridge(path, *baud, *mcu_id, *uuid)?;
+                // discovery scan finds on its now-unassigned line. One attempt
+                // only: [`BridgeLink::reopen`] is the retry here, and nesting
+                // [`attach_bridge`]'s own into its deadline would spend the
+                // reopen budget several times over.
+                let handle = attach_bridge_once(path, *baud, *mcu_id, *uuid)?;
                 let link = Interface::shared_serial(Arc::clone(&handle));
                 (link, BridgeDevice::Shared(handle))
             }
@@ -1253,6 +1387,21 @@ pub enum BridgeFlashError {
     },
     /// The identify handshake failed — no dictionary, so no declaration.
     Identify(McuError),
+    /// A **serial** bridge answered nothing to the attach handshake, on every
+    /// attempt [`attach_bridge`] made within its bounds. A bridge still in the
+    /// previous session's state does exactly this: alive, and silent for the
+    /// handshake of the session that follows.
+    ///
+    /// The last attempt's own reason is kept in `error`, so a run reports what
+    /// actually failed rather than a count of tries.
+    AttachUnanswered {
+        /// How many attempts were made.
+        attempts: u32,
+        /// The tty they were made on.
+        path: PathBuf,
+        /// What the last attempt failed with.
+        error: InterfaceError,
+    },
     /// [`open_bridge`](super::bridge_session::open_bridge) refused or failed a
     /// step.
     Bridge(BridgeError),
@@ -1310,6 +1459,27 @@ impl fmt::Display for BridgeFlashError {
                 path.display()
             ),
             BridgeFlashError::Identify(e) => write!(f, "identifying the bridge: {e}"),
+            BridgeFlashError::AttachUnanswered {
+                attempts,
+                path,
+                error,
+            } => {
+                let tries = if *attempts == 1 {
+                    "attempt"
+                } else {
+                    "attempts"
+                };
+                write!(
+                    f,
+                    "opening the bridge: no answer to the attach handshake on {} in {attempts} \
+                     {tries} ({error}); the bridge did not answer this session's handshake, which \
+                     is what a bridge still in the previous session's state does — wait a few \
+                     seconds and run the command again, or pass --bridge-uuid <the bridge's uuid> \
+                     (take it from `klipperx admin scan --port {}`)",
+                    path.display(),
+                    path.display()
+                )
+            }
             BridgeFlashError::Bridge(e) => write!(f, "opening the bridge port: {e}"),
             BridgeFlashError::Reset(message) => write!(f, "resetting the bridge: {message}"),
             BridgeFlashError::PortReset(e) => write!(f, "resetting the bridge port: {e}"),
@@ -1337,7 +1507,8 @@ impl std::error::Error for BridgeFlashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BridgeFlashError::Open(e) | BridgeFlashError::Teardown(e) => Some(e),
-            BridgeFlashError::BridgeNotFound { error, .. } => Some(error),
+            BridgeFlashError::BridgeNotFound { error, .. }
+            | BridgeFlashError::AttachUnanswered { error, .. } => Some(error),
             BridgeFlashError::PortReset(e) => Some(e),
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
@@ -2082,6 +2253,210 @@ mod tests {
 
         link.close();
         drop(link);
+    }
+
+    // =======================================================================
+    // The attach retry: a bridge in the previous session's residual state
+    // =======================================================================
+
+    /// [`attach_bridge`]'s bounds, with the pauses shrunk so the policy is
+    /// exercised in milliseconds. The attempt count is the run's own, because
+    /// that is the part the assertion is about.
+    fn quick_retry() -> AttachRetry {
+        AttachRetry {
+            attempts: ATTACH_ATTEMPTS,
+            delay: Duration::from_millis(1),
+            budget: ATTACH_BUDGET,
+        }
+    }
+
+    /// The attempts and pauses of a run fit inside its budget: a pause that no
+    /// longer fits would turn every retry into a single attempt.
+    #[test]
+    fn test_the_attach_retry_bounds_agree() {
+        assert!(
+            RUN_ATTACH_RETRY.delay * (RUN_ATTACH_RETRY.attempts - 1) < RUN_ATTACH_RETRY.budget,
+            "the pauses between {:?} attempts have to fit in {:?}",
+            RUN_ATTACH_RETRY.attempts,
+            RUN_ATTACH_RETRY.budget
+        );
+    }
+
+    /// An unanswered attach is offered again, and the attempt that answers is
+    /// the one reported: this is what a bridge left in the previous session's
+    /// state needs.
+    #[test]
+    fn test_an_unanswered_attach_is_offered_again() {
+        let mut attempts = 0;
+        let answered = attach_with_retries::<u32>(quick_retry(), Path::new("/dev/ttyACM0"), || {
+            attempts += 1;
+            if attempts < 3 {
+                Err(BridgeFlashError::Open(InterfaceError::Timeout))
+            } else {
+                Ok(attempts)
+            }
+        })
+        .expect("the third attempt is answered");
+        assert_eq!(answered, 3, "the attempt that answered is the one reported");
+    }
+
+    /// Several unassigned bridges are **not** retried: which one the run means
+    /// cannot be told, and a second attempt would only be another guess at
+    /// re-assigning the wrong board.
+    #[test]
+    fn test_an_ambiguous_bridge_is_not_retried() {
+        let mut attempts = 0;
+        let err = attach_with_retries::<u32>(quick_retry(), Path::new("/dev/ttyACM0"), || {
+            attempts += 1;
+            Err(BridgeFlashError::AmbiguousBridge {
+                count: 2,
+                path: PathBuf::from("/dev/ttyACM0"),
+            })
+        })
+        .expect_err("two bridges cannot be told apart");
+        assert_eq!(attempts, 1, "a wrong guess is not worth repeating");
+        assert!(
+            matches!(err, BridgeFlashError::AmbiguousBridge { count: 2, .. }),
+            "{err}"
+        );
+    }
+
+    /// A bridge that never answers costs [`ATTACH_ATTEMPTS`] attempts and no
+    /// more, and the report keeps the **last** attempt's own reason with what
+    /// the caller can check.
+    #[test]
+    fn test_the_attach_retry_stops_at_its_attempt_count() {
+        let mut attempts = 0;
+        let err = attach_with_retries::<u32>(quick_retry(), Path::new("/dev/ttyACM0"), || {
+            attempts += 1;
+            Err(BridgeFlashError::Open(InterfaceError::Timeout))
+        })
+        .expect_err("a bridge that never answers");
+        assert_eq!(attempts, ATTACH_ATTEMPTS, "the attempts are bounded");
+        match &err {
+            BridgeFlashError::AttachUnanswered {
+                attempts: tried,
+                error,
+                ..
+            } => {
+                assert_eq!(*tried, ATTACH_ATTEMPTS);
+                assert_eq!(*error, InterfaceError::Timeout, "the last reason is kept");
+            }
+            other => panic!("an unanswered attach, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("wait a few seconds"), "{text}");
+        assert!(text.contains("--bridge-uuid"), "{text}");
+        assert!(text.contains("klipperx admin scan --port"), "{text}");
+    }
+
+    /// The budget, not the attempt count, is what stops a retry that has no
+    /// room left for another pause — an attempt on a bridge with no
+    /// `--bridge-uuid` runs the discovery scan first, so the count alone would
+    /// let a dead line cost far more than the wait it saves.
+    #[test]
+    fn test_the_attach_retry_stops_when_its_budget_is_spent() {
+        let mut attempts = 0;
+        let started = Instant::now();
+        let err = attach_with_retries::<u32>(
+            AttachRetry {
+                attempts: 10,
+                delay: Duration::from_millis(200),
+                budget: Duration::from_millis(50),
+            },
+            Path::new("/dev/ttyACM0"),
+            || {
+                attempts += 1;
+                Err(BridgeFlashError::Open(InterfaceError::Timeout))
+            },
+        )
+        .expect_err("there is no room for a second attempt");
+        assert_eq!(attempts, 1, "the budget stopped it, not the count");
+        assert!(
+            matches!(err, BridgeFlashError::AttachUnanswered { .. }),
+            "{err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a spent budget returns at once, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Read up to `want` bytes off the pty master within `window`, stopping
+    /// early when the window runs out. A read that fails is not an error here:
+    /// between two attach attempts the slave side is closed, and the master
+    /// reads `EIO` until the retry opens it again.
+    fn read_bytes_within(master: &std::fs::File, want: usize, window: Duration) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut reader: &std::fs::File = master;
+        let deadline = Instant::now() + window;
+        let mut buf = [0u8; 256];
+        while out.len() < want {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, left.as_millis() as i32) } <= 0 {
+                continue;
+            }
+            match reader.read(&mut buf) {
+                Ok(0) => {}
+                Ok(read) => out.extend_from_slice(&buf[..read]),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        out.truncate(want);
+        out
+    }
+
+    /// The case the retry exists for, over a real tty: the first handshake is
+    /// swallowed — exactly what an F446 bridge does right after a command — and
+    /// the run attaches on the second offer instead of reporting it.
+    #[test]
+    fn test_a_bridge_that_swallows_the_first_handshake_is_attached_on_the_retry() {
+        let pty = Pty::new();
+        let uuid = [0xc7, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let set = serial::set_node_id_for(uuid, BRIDGE_MCU_ID).expect("an addressable id");
+        let request = serial::assignment_request(BRIDGE_MCU_ID).expect("an addressable id");
+        let reply = serial::assignment_reply(BRIDGE_MCU_ID).expect("an addressable id");
+
+        let path = pty.path.clone();
+        let attach =
+            std::thread::spawn(move || attach_bridge(&path, 250_000, BRIDGE_MCU_ID, Some(uuid)));
+
+        // The first attempt goes out whole — one SET_NODEID and a request per
+        // retry of the serial layer's own handshake — and is answered with the
+        // silence this bridge keeps while it finishes the previous session.
+        let master = pty.master.try_clone().expect("the pty master clones");
+        let handshake = set.len() + request.len() * serial::ASSIGN_ATTACH_ATTEMPTS as usize;
+        let swallowed = read_bytes_within(&master, handshake, Duration::from_secs(5));
+        assert_eq!(
+            swallowed.len(),
+            handshake,
+            "the whole first handshake went out and nothing answered it"
+        );
+
+        // The retry opens the link afresh and offers the handshake again.
+        let second = read_bytes_within(&master, set.len() + request.len(), Duration::from_secs(10));
+        assert_eq!(
+            second.len(),
+            set.len() + request.len(),
+            "the retry offers the handshake again"
+        );
+        let mut writer: &std::fs::File = &master;
+        writer.write_all(&reply).expect("the pty takes the answer");
+
+        let handle = attach
+            .join()
+            .expect("the attach thread")
+            .expect("the retry attaches the bridge");
+        drop(handle);
     }
 
     /// No bridge at all: the scan finds nothing unassigned **and** the attach on

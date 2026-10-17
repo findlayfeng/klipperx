@@ -59,7 +59,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 - 起宿主、连真实 MCU、装字典、配置、同步时钟、跑 g-code：`klipperx <config.cfg>`
 - 开 API 给客户端（`-a <socket>`），或在本进程里开一个终端窗口：`--tui`
-- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）/ `klipperx admin scan --interface <总线>` 或 `klipperx admin scan --port <tty>`（扫出还没分配 id 的板子：CAN 或串口，传输必须指定），打印可粘进配置的 uuid
+- 独立客户端：`klipperx console`（交互式窗口）/ `klipperx api`（发一条请求）/ `klipperx stress`（压测步进或链路）/ `klipperx admin …`（板级直联：`scan` 扫未分配 id 的板子、`flash` 刷 katapult、`reset` 复位桥或端口设备、`bridge` 列槽/启口）
 - 大部分运动学（cartesian/corexy/corexz/hybrid/polar/delta/generic_cartesian/rotary_delta/winch/deltesian）、探针与调平族、TMC 驱动（UART 与 SPI 六个）、面板四驱动、断料/称重/风扇/加热等
 
 ### 离「真能打印」还缺什么
@@ -108,10 +108,22 @@ cargo run --release -- config.cfg -a /tmp/klippy_uds
 cargo run --release -- config.cfg --tui           # 本进程内开一个终端客户端窗口
 klipperx console -a /tmp/klippy_uds               # 另开终端连上去
 
-# 刷写带 katapult 引导的板子（`klipperx admin flash` 子命令；设备需停在引导态；直连两条路径）
+# 刷写带 katapult 引导的板子（`klipperx admin flash` 子命令；直连两条路径，设备需先停在引导态）
 cargo run -- admin flash --device /dev/serial/by-id/usb-Katapult… klipper.bin   # USB-CDC / 独占串口
 cargo run -- admin flash --interface can0 -u <uuid> klipper.bin                # CAN
 cargo run -- admin flash -q --interface can0     # 列出未指派节点（app=katapult 的 UUID）
+
+# 经桥刷下游（桥 = 一块开着 MUX_SERIAL 的板或一个 host 库；下游在它的 UART 口上）
+# ① 问桥有几个 UART 槽（只读 BRIDGE_UART_COUNT）② 启一个口（声明 → 命名 → 开隧道）
+# ③ 经桥逐口发现 ④ 刷写。②③④ 各自都会重启桥并重新声明端口，所以它们不是流水线；要刷只跑 ④ 就够。
+cargo run -- admin bridge config --bridge /dev/ttyACM0
+cargo run -- admin bridge port  --bridge /dev/ttyACM0 --port 0 --port-nodeid 7
+cargo run -- admin scan       --bridge /dev/ttyACM0 --ports 0
+cargo run -- admin flash      --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 klipper.bin
+
+# 可反复刷：目标正跑应用时先让它自己进引导（0x02 经 UNITS 路由送到设备），刷完可直接再刷
+cargo run -- admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
+  --port-reset bootloader klipper.bin
 
 # 真机（需要一块板子；见 TESTING.md；指向你自己的 printer 配置，接口从它的 [mcu] 里读）
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest        # 只跑真机 lane（别名，见 .cargo/config.toml）

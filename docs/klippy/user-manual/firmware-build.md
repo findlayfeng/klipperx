@@ -70,6 +70,13 @@ katapult 专属的引导侧选项在 [`kconfig/katapult.kconfig`](../../../kconf
 `make` 的配置阶段会打印这一轮的目标、哪项只对一侧生效（例如 USB 构建里 katapult 不提供
 `MUX_SERIAL`），以及没有合并的项。
 
+**串口波特率（`SERIAL_BAUD`）有个前提**：这个符号只有开了 `LOW_LEVEL_OPTIONS` 才有 prompt，
+否则每次配置都会把它推回默认 250000（`olddefconfig`/`genconfig.py` 都按默认值算）。所以想把
+下游设备的控制台编成 500 k（见 [MCU 连接方式 → 桥下游链路的吞吐与余量](mcu-connection.md#桥下游链路的吞吐与余量真机实测)），
+要在那份配置里先 `CONFIG_LOW_LEVEL_OPTIONS=y` 再设 `CONFIG_SERIAL_BAUD=500000`。
+katapult 侧的 `SERIAL_BAUD` 同样是默认 250 k（同样的 prompt 规则），所以**隧道与引导永远按 250 k 走**，
+只有应用可以换速——换速的两步命令见上面那一节。
+
 ## 限制与拒绝构建的情形
 
 - **目标型号必须是 katapult 认识的那一颗**：katapult 的架构只有 STM32、LPC176x、RP2040/RP235x

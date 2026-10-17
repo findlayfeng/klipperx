@@ -53,7 +53,8 @@ use crate::core::klippy::mcu::{Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
-    configure_bridge, open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget,
+    configure_bridge, open_bridge, reset_port as send_port_reset, BridgeError, BridgePort,
+    BridgeReady, BridgeTarget, PortReset,
 };
 use super::session::{self, FlashError, SessionConfig, Summary};
 use std::fmt;
@@ -636,6 +637,24 @@ impl BridgeLink {
         }
     }
 
+    /// Reset one **declared** port's device through the bridge's admin channel —
+    /// `admin reset --port`. The same two units [`flash`](BridgeLink::flash) sends
+    /// before a session (`0x04`/`0x05`), for a caller that only wants the reset.
+    ///
+    /// The port has to be one the bridge has already **declared** (a
+    /// `configure-bridge`, or a flash run's own declaration): a port-level command
+    /// that names a port the bridge does not have is dropped in silence, and no
+    /// receipt comes back either way.
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::PortReset`] when the link refuses the write.
+    pub fn reset_port(&self, index: u8, reset: PortReset) -> Result<(), BridgeFlashError> {
+        send_port_reset(&self.live().link, index, reset).map_err(|e| match e {
+            BridgeError::Link(e) => BridgeFlashError::PortReset(e),
+            other => BridgeFlashError::Bridge(other),
+        })
+    }
+
     /// The whole bridge flash: open the target's port
     /// ([`open_bridge`]), run the katapult session over its tunnel, then clear
     /// the tunnel.
@@ -752,6 +771,9 @@ pub enum BridgeFlashError {
     /// declaration: the self-restart could not be sent, or the bridge did not
     /// answer again within [`RESET_TIMEOUT`](BridgeLink::RESET_TIMEOUT).
     Reset(String),
+    /// A port-level reset (`0x04`/`0x05`) could not be written — a closed link,
+    /// a failed write, or a link that carries no port mux units at all.
+    PortReset(InterfaceError),
     /// The bridge's firmware shut down while the port was declared — the reason
     /// it gave, resolved from its `static_string_id` enumeration. Reported
     /// instead of the session timeout that would otherwise follow, so a
@@ -795,6 +817,7 @@ impl fmt::Display for BridgeFlashError {
             BridgeFlashError::Identify(e) => write!(f, "identifying the bridge: {e}"),
             BridgeFlashError::Bridge(e) => write!(f, "opening the bridge port: {e}"),
             BridgeFlashError::Reset(message) => write!(f, "resetting the bridge: {message}"),
+            BridgeFlashError::PortReset(e) => write!(f, "resetting the bridge port: {e}"),
             BridgeFlashError::Shutdown { reason } => {
                 write!(f, "the bridge's firmware shut down: {reason}")
             }
@@ -819,6 +842,7 @@ impl std::error::Error for BridgeFlashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BridgeFlashError::Open(e) | BridgeFlashError::Teardown(e) => Some(e),
+            BridgeFlashError::PortReset(e) => Some(e),
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
@@ -1187,6 +1211,55 @@ mod tests {
         link.close();
         drop(link);
         wait_for_library_unload(&library);
+    }
+
+    /// `admin reset`'s **bridge** path: the self-restart goes out, the firmware
+    /// re-execs, and the link comes back and identifies again — proven by a port
+    /// declaration the restarted bridge accepts. This is the same restart
+    /// [`BridgeLink::flash`] runs before it declares its ports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_admin_reset_restarts_the_bridge_and_reidentifies() {
+        const BRIDGE_UUID: [u8; 6] = [0xe1, 0xe2, 0xe3, 0xe4, 0xe5, 0xe6];
+
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+
+        let mut link = BridgeLink::open_serial(
+            firmware.serial_path(),
+            250_000,
+            BRIDGE_MCU_ID,
+            Some(BRIDGE_UUID),
+        )
+        .expect("the bridge's console attaches and is named");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the linux bridge identifies");
+
+        link.reset()
+            .await
+            .expect("the bridge restarts itself and answers again");
+
+        // The restart really happened and the bridge is up: the declaration a
+        // fresh firmware accepts is one the pre-restart bridge would have
+        // refused (its port slot was in use).
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        link.configure(&ports, target)
+            .await
+            .expect("the restarted bridge accepts a declaration");
+
+        link.close();
+        drop(link);
+        drop(firmware);
     }
 
     /// A serial bridge that never answers is reported as an **unassigned**

@@ -1,15 +1,15 @@
 //! Arguments for the `admin flash` subcommand (its grammar the standalone `flash`
-//! binary used to speak), plus `admin configure-bridge` and `admin reset`, and
-//! the plans they make.
+//! binary used to speak), plus `admin bridge config` / `admin bridge port` and
+//! `admin reset`, and the plans they make.
 //!
 //! [`plan`] is the flash grammar as a pure function: it turns the command line
 //! into one [`Action`] (query a CAN bus, or flash one board over one direct link)
 //! or into an error naming the mistake, before anything is opened or sent. The
 //! same grammar `scripts/flashtool.py` speaks, in this repo's spelling: a serial
 //! board is addressed by its device path, a CAN board by its CANbus UUID plus the
-//! node id the session assigns it. [`plan_configure_bridge`] and [`plan_reset`]
-//! are the bridge-side siblings: the same bridge grammar, without a firmware to
-//! write.
+//! node id the session assigns it. [`plan_bridge_config`], [`plan_bridge_port`]
+//! and [`plan_reset`] are the bridge-side siblings: the same bridge grammar,
+//! without a firmware to write and without a reset.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,7 +20,7 @@ use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket
 use crate::core::klippy::interface::HostMux;
 
 use super::bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
-use super::bridge_session::{BridgePort, BridgeReady, BridgeTarget, PortReset};
+use super::bridge_session::{BridgePort, BridgeTarget, PortReset};
 use super::session;
 use super::transport;
 
@@ -131,23 +131,24 @@ pub struct FlashArgs {
     pub firmware: Option<PathBuf>,
 }
 
-/// The command line of `admin configure-bridge`.
+/// The command line of `admin bridge config`: the bridge's downstream ports, as a
+/// declaration.
 ///
-/// The bridge side of [`FlashArgs`], plus the port plan, and **no** flashing: the
-/// bridge's oid and port tables are built, the target's port is named with the
-/// legacy route, and its flashing tunnel is opened — and the command stops. No
-/// device is reset ([`admin reset`](ResetArgs) does that) and no firmware is
+/// The bridge side of [`FlashArgs`], and **only** the declaration: the bridge's
+/// oid and port tables are built, and the command stops. Nothing is reset
+/// ([`admin reset`](ResetArgs) does that), no route is named and no tunnel is
+/// opened ([`admin bridge port`](BridgePortArgs) does that), and no firmware is
 /// written ([`admin flash`](FlashArgs) does that).
 #[derive(Parser, Debug)]
 #[command(
-    name = "configure-bridge",
+    name = "config",
     version,
-    about = "Prepare a bridge: declare its downstream ports, name the target's \
-             port, and open its flashing tunnel, without resetting a device or \
-             flashing anything",
+    about = "Declare a bridge's downstream ports, the port table a port-level \
+             command needs, without naming a target, opening a tunnel, resetting \
+             a device, or flashing anything",
     arg_required_else_help = true
 )]
-pub struct ConfigureBridgeArgs {
+pub struct BridgeConfigArgs {
     /// Serial tty of the **bridge** to configure (`/dev/ttyUSB0`)
     #[arg(long, value_name = "TTY")]
     pub bridge: Option<String>,
@@ -183,26 +184,83 @@ pub struct ConfigureBridgeArgs {
     /// port numbering is the declaration order)
     #[arg(long, value_name = "N")]
     pub port_count: Option<u8>,
+}
 
-    /// Bridge port the target's device hangs on, the plan's index
+/// The command line of `admin bridge port`: one declared port, named and
+/// tunnelled.
+///
+/// The bridge side of [`FlashArgs`] after
+/// [`admin bridge config`](BridgeConfigArgs): the target's port is named with the
+/// legacy route and its flashing tunnel is opened, and the command stops. No
+/// device is reset ([`admin reset`](ResetArgs) does that) and nothing is flashed
+/// ([`admin flash`](FlashArgs) does that).
+#[derive(Parser, Debug)]
+#[command(
+    name = "port",
+    version,
+    about = "Name one of a bridge's declared ports and open its flashing tunnel, \
+             without resetting a device or flashing anything",
+    arg_required_else_help = true
+)]
+pub struct BridgePortArgs {
+    /// Serial tty of the **bridge** to open the port on (`/dev/ttyUSB0`)
+    #[arg(long, value_name = "TTY")]
+    pub bridge: Option<String>,
+
+    /// Host library (`libklipper_host.so`) of a **bridge** to open the port on,
+    /// when the bridge is an in-process host library instead of a serial board
+    #[arg(long, value_name = "SO")]
+    pub bridge_library: Option<String>,
+
+    /// Identity of the **serial bridge** board itself, twelve hex digits — the
+    /// same spelling `flash --bridge-uuid` uses
+    ///
+    // Optional: without it the bridge is found by the discovery scan when it
+    // carries no node id yet.
+    #[arg(long, value_name = "HEX")]
+    pub bridge_uuid: Option<String>,
+
+    /// Identity a host-library bridge answers the serial mux with, twelve hex
+    /// digits (only with `--bridge-library`; default all zeros)
+    #[arg(long, value_name = "HEX")]
+    pub host_identity: Option<String>,
+
+    /// A host-library bridge's port tty, `<slot>:<path>` (only with
+    /// `--bridge-library`; repeatable)
+    #[arg(long = "port-tty", value_name = "SLOT:PATH")]
+    pub port_tty: Vec<String>,
+
+    /// Bridge port to name and tunnel, the declaration's index — a port
+    /// `admin bridge config` declared
     #[arg(long, value_name = "INDEX")]
     pub port: Option<u8>,
 
-    /// Node id the bridge names the target's port with, 1..=255
+    /// Node id the bridge names that port with, 1..=255
     #[arg(long, value_name = "ID")]
     pub port_nodeid: Option<u8>,
 }
 
-/// A `configure-bridge` command line, as a plan: the bridge's link and the port
-/// plan to declare and open, all validated before any device is opened.
+/// A `bridge config` command line, as a plan: the bridge's link and the ports to
+/// declare, all validated before any device is opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigureBridgePlan {
+pub struct BridgeConfigPlan {
     /// How the bridge's own link is reached.
     pub source: BridgeLinkSource,
     /// The line speed every declared port opens at.
     pub baud: u32,
     /// The ports to declare, in index order.
     pub ports: Vec<BridgePort>,
+}
+
+/// A `bridge port` command line, as a plan: the bridge's link and the port to
+/// name and tunnel, validated before any device is opened.
+///
+/// The link opens at [`DEFAULT_BAUD`]: this command declares no port, so there is
+/// no port speed to choose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BridgePortPlan {
+    /// How the bridge's own link is reached.
+    pub source: BridgeLinkSource,
     /// The port to name (legacy) and open the tunnel on.
     pub target: BridgeTarget,
 }
@@ -476,8 +534,9 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
 /// side's own identity spelled by its own option.
 ///
 /// Shared by every command whose bridge side is the same shape — `flash`'s
-/// bridge line and `admin configure-bridge` — so the two cannot drift on which
-/// identity belongs to which link.
+/// shared by every bridge line — `flash`'s bridge line and `admin bridge config`
+/// and `admin bridge port` — so they cannot drift on which identity belongs to
+/// which link.
 ///
 /// # Errors
 /// A message naming the first option out of place.
@@ -540,15 +599,14 @@ fn plan_bridge_link(
     }
 }
 
-/// Turn a `configure-bridge` command line into the plan it asks for, or an
-/// error naming the first mistake.
+/// Turn a `bridge config` command line into the plan it asks for, or an error
+/// naming the first mistake.
 ///
 /// Every rejection happens before any device is opened. The bridge's link is the
-/// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); the port plan
-/// is `--port-count` ports at one speed, with `--port`/`--port-nodeid` naming the
-/// target. The target's port must be one of the declared ones, and its node id
-/// must be a usable one (not zero, not the bridge's own link id).
-pub fn plan_configure_bridge(args: &ConfigureBridgeArgs) -> Result<ConfigureBridgePlan, String> {
+/// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); the port plan is
+/// `--port-count` ports at one speed. No port is named and no reset is chosen:
+/// this command only declares the table.
+pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, String> {
     let source = plan_bridge_link(
         &args.bridge,
         &args.bridge_library,
@@ -561,12 +619,43 @@ pub fn plan_configure_bridge(args: &ConfigureBridgeArgs) -> Result<ConfigureBrid
     if port_count == 0 {
         return Err("--port-count must be at least 1".into());
     }
+    // The declaration carries only the port's slot and speed; no reset runs in
+    // this command, so every entry's reset is the unused placeholder.
+    let ports = (0..port_count)
+        .map(|_| BridgePort {
+            baud,
+            reset: PortReset::ResetPort,
+        })
+        .collect();
+    Ok(BridgeConfigPlan {
+        source,
+        baud,
+        ports,
+    })
+}
+
+/// Turn a `bridge port` command line into the plan it asks for, or an error
+/// naming the first mistake.
+///
+/// Every rejection happens before any device is opened. The bridge's link is the
+/// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); `--port` says
+/// which declared port to name and `--port-nodeid` the id the bridge routes it
+/// to — neither has a guessable default, and the id has to be a usable one (not
+/// zero, not the bridge's own link id).
+pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String> {
+    let source = plan_bridge_link(
+        &args.bridge,
+        &args.bridge_library,
+        args.bridge_uuid.as_deref(),
+        args.host_identity.as_deref(),
+        &args.port_tty,
+    )?;
     let port = args
         .port
-        .ok_or("configure-bridge needs --port: which bridge port the target is on")?;
-    let node_id = args.port_nodeid.ok_or(
-        "configure-bridge needs --port-nodeid: the id the bridge names the target port with",
-    )?;
+        .ok_or("bridge port needs --port: which declared bridge port the target is on")?;
+    let node_id = args
+        .port_nodeid
+        .ok_or("bridge port needs --port-nodeid: the id the bridge names the target port with")?;
     if node_id == 0 {
         return Err(format!("--port-nodeid must be in 1..=255, got {node_id}"));
     }
@@ -576,25 +665,8 @@ pub fn plan_configure_bridge(args: &ConfigureBridgeArgs) -> Result<ConfigureBrid
              or its tunnel units collide with the bridge's frames"
         ));
     }
-    if port >= port_count {
-        return Err(format!(
-            "--port {port} is not among the {port_count} declared port(s); --port-count must \
-             be at least {}",
-            u16::from(port) + 1
-        ));
-    }
-    // The declaration carries only the port's slot and speed; no reset runs in
-    // this command, so every entry's reset is the unused placeholder.
-    let ports = (0..port_count)
-        .map(|_| BridgePort {
-            baud,
-            reset: PortReset::ResetPort,
-        })
-        .collect();
-    Ok(ConfigureBridgePlan {
+    Ok(BridgePortPlan {
         source,
-        baud,
-        ports,
         target: BridgeTarget {
             index: port,
             node_id,
@@ -911,8 +983,8 @@ fn open_bridge_link(target: &BridgeFlashTarget) -> Result<BridgeLink, BridgeFlas
 }
 
 /// Open a bridge's link: a shared serial tty, or a muxed host library given its
-/// identity and port ttys. The one opening `flash` and `admin configure-bridge`
-/// and `admin reset` share.
+/// identity and port ttys. The one opening `flash` and `admin bridge config` /
+/// `admin bridge port` and `admin reset` share.
 fn open_link(source: &BridgeLinkSource, baud: u32) -> Result<BridgeLink, BridgeFlashError> {
     match source {
         BridgeLinkSource::Serial { tty, uuid } => {
@@ -934,15 +1006,15 @@ fn open_link(source: &BridgeLinkSource, baud: u32) -> Result<BridgeLink, BridgeF
     }
 }
 
-/// `admin configure-bridge`: open the bridge, identify it, declare the plan's
-/// ports, name the target's port (legacy), and open its tunnel — then stop.
+/// `admin bridge config`: open the bridge, identify it, declare the plan's ports —
+/// and stop.
 ///
-/// Nothing is reset and nothing is flashed: the bridge is left configured, and
-/// the result line says what was declared and where the tunnel was opened. The
+/// Nothing is reset, no route is named and no tunnel is opened: the bridge is
+/// left with its port table, and the result line says what was declared. The
 /// runtime is built here for the same reason [`run_bridge_flash`] builds one —
 /// the link is opened inside it.
-pub fn run_configure_bridge(args: ConfigureBridgeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let plan = plan_configure_bridge(&args)?;
+pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = plan_bridge_config(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -951,29 +1023,56 @@ pub fn run_configure_bridge(args: ConfigureBridgeArgs) -> Result<(), Box<dyn std
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
-        let ready = link.configure(&plan.ports, plan.target).await?;
+        link.declare_ports(&plan.ports).await?;
         link.close();
-        report_configure_bridge(&ready);
+        report_bridge_config(&plan);
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
-/// The last word of a successful `admin configure-bridge`: one greppable line
-/// naming every declared port (its slot and speed) and the target's route and
-/// tunnel.
-fn report_configure_bridge(ready: &BridgeReady) {
-    let ports = ready
+/// The last word of a successful `admin bridge config`: one greppable line naming
+/// every declared port, with its slot and its speed.
+fn report_bridge_config(plan: &BridgeConfigPlan) {
+    let ports = plan
         .ports
         .iter()
         .enumerate()
         .map(|(index, port)| format!("port {index} slot {index} baud {}", port.baud))
         .collect::<Vec<_>>()
         .join(", ");
+    println!("declared: {} port(s), {ports}", plan.ports.len());
+}
+
+/// `admin bridge port`: open the bridge, identify it, name the plan's port
+/// (legacy) and open its tunnel — and stop.
+///
+/// The port has to be one `admin bridge config` declared: a port-level command
+/// that names a port the bridge does not have is dropped in silence, and nothing
+/// is reset or flashed here. The runtime is built here for the same reason
+/// [`run_bridge_flash`] builds one — the link is opened inside it.
+pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = plan_bridge_port(&args)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let link = open_link(&plan.source, DEFAULT_BAUD)?;
+        tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
+        link.open_target_port(plan.target)?;
+        link.close();
+        report_bridge_port(plan.target);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+/// The last word of a successful `admin bridge port`: the port the bridge routes
+/// and the tunnel it opened.
+fn report_bridge_port(target: BridgeTarget) {
     println!(
-        "configured: {} port(s), {ports}; target port {} nodeid {}, tunnel open",
-        ready.ports.len(),
-        ready.target.index,
-        ready.target.node_id,
+        "target: port {} nodeid {}, tunnel open",
+        target.index, target.node_id
     );
 }
 
@@ -1752,32 +1851,24 @@ mod tests {
         assert!(err.contains("--bridge"), "{err}");
     }
 
-    /// Parse a `configure-bridge` command line the way the shell would.
-    fn parse_configure(args: &[&str]) -> Result<ConfigureBridgeArgs, clap::Error> {
-        ConfigureBridgeArgs::try_parse_from(
-            std::iter::once("configure-bridge").chain(args.iter().copied()),
-        )
+    /// Parse a `bridge config` command line the way the shell would.
+    fn parse_bridge_config(args: &[&str]) -> Result<BridgeConfigArgs, clap::Error> {
+        BridgeConfigArgs::try_parse_from(std::iter::once("config").chain(args.iter().copied()))
     }
 
-    /// A parsed `configure-bridge` line and the plan it makes.
-    fn planned_configure(args: &[&str]) -> Result<ConfigureBridgePlan, String> {
-        let args = parse_configure(args).expect("a command line clap accepted");
-        plan_configure_bridge(&args)
+    /// A parsed `bridge config` line and the plan it makes.
+    fn planned_bridge_config(args: &[&str]) -> Result<BridgeConfigPlan, String> {
+        let args = parse_bridge_config(args).expect("a command line clap accepted");
+        plan_bridge_config(&args)
     }
 
-    /// The serial configure plan in full: one port at the default speed, the
-    /// target named legacy by the caller's id.
+    /// The serial config plan in full: one port at the default speed and nothing
+    /// else — this command declares the table and stops, so it names no target
+    /// and opens no tunnel.
     #[test]
-    fn test_a_configure_bridge_plan() {
-        let plan = planned_configure(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "0",
-            "--port-nodeid",
-            "7",
-        ])
-        .expect("a serial configure plan");
+    fn test_a_bridge_config_plan() {
+        let plan =
+            planned_bridge_config(&["--bridge", "/dev/ttyUSB0"]).expect("a serial config plan");
         assert_eq!(
             plan.source,
             BridgeLinkSource::Serial {
@@ -1793,26 +1884,14 @@ mod tests {
                 reset: PortReset::ResetPort,
             }]
         );
-        assert_eq!(
-            plan.target,
-            BridgeTarget {
-                index: 0,
-                node_id: 7,
-            }
-        );
     }
 
-    /// `--port-count` declares that many ports, all at `--baud`, and the target
-    /// may name any of them.
+    /// `--port-count` declares that many ports, all at `--baud`.
     #[test]
-    fn test_a_configure_bridge_declares_the_named_port_count() {
-        let plan = planned_configure(&[
+    fn test_a_bridge_config_declares_the_named_port_count() {
+        let plan = planned_bridge_config(&[
             "--bridge",
             "/dev/ttyUSB0",
-            "--port",
-            "2",
-            "--port-nodeid",
-            "9",
             "--port-count",
             "3",
             "--baud",
@@ -1824,27 +1903,21 @@ mod tests {
             plan.ports.iter().all(|port| port.baud == 115_200),
             "every port opens at --baud"
         );
-        assert_eq!(plan.target.index, 2);
-        assert_eq!(plan.target.node_id, 9);
     }
 
     /// The host-library bridge carries its identity and its port ttys, the same
     /// spelling the flash line uses.
     #[test]
-    fn test_a_configure_bridge_host_library_plan() {
-        let plan = planned_configure(&[
+    fn test_a_bridge_config_host_library_plan() {
+        let plan = planned_bridge_config(&[
             "--bridge-library",
             "/lib/libklipper_host.so",
             "--host-identity",
             "11aa22bb33cc",
             "--port-tty",
             "0:/dev/pts/3",
-            "--port",
-            "0",
-            "--port-nodeid",
-            "7",
         ])
-        .expect("a host-library configure plan");
+        .expect("a host-library config plan");
         assert_eq!(
             plan.source,
             BridgeLinkSource::Library {
@@ -1855,60 +1928,118 @@ mod tests {
         );
     }
 
+    /// A plan of no ports declares nothing, so the count starts at one.
+    #[test]
+    fn test_a_bridge_config_port_count_is_at_least_one() {
+        let err = planned_bridge_config(&["--bridge", "/dev/ttyUSB0", "--port-count", "0"])
+            .expect_err("no ports is not a declaration");
+        assert!(err.contains("--port-count"), "{err}");
+    }
+
+    /// The bridge's link is one of the two, never both and never neither — the
+    /// same rule the flash line enforces.
+    #[test]
+    fn test_a_bridge_config_link_is_required() {
+        let err = planned_bridge_config(&["--port-count", "2"]).expect_err("which bridge?");
+        assert!(err.contains("--bridge"), "{err}");
+
+        let err = planned_bridge_config(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+        ])
+        .expect_err("one link or the other");
+        assert!(err.contains("--bridge"), "{err}");
+        assert!(err.contains("--bridge-library"), "{err}");
+    }
+
+    /// Parse a `bridge port` command line the way the shell would.
+    fn parse_bridge_port(args: &[&str]) -> Result<BridgePortArgs, clap::Error> {
+        BridgePortArgs::try_parse_from(std::iter::once("port").chain(args.iter().copied()))
+    }
+
+    /// A parsed `bridge port` line and the plan it makes.
+    fn planned_bridge_port(args: &[&str]) -> Result<BridgePortPlan, String> {
+        let args = parse_bridge_port(args).expect("a command line clap accepted");
+        plan_bridge_port(&args)
+    }
+
+    /// The serial port plan in full: the port the declaration names and the id
+    /// the bridge routes it to, with no port speed to choose (nothing is
+    /// declared here).
+    #[test]
+    fn test_a_bridge_port_plan() {
+        let plan = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+        ])
+        .expect("a serial port plan");
+        assert_eq!(
+            plan.source,
+            BridgeLinkSource::Serial {
+                tty: "/dev/ttyUSB0".into(),
+                uuid: None,
+            }
+        );
+        assert_eq!(
+            plan.target,
+            BridgeTarget {
+                index: 1,
+                node_id: 7,
+            }
+        );
+    }
+
     /// Both the port and the id the bridge routes it to are required: neither has
     /// a guessable default.
     #[test]
-    fn test_a_configure_bridge_needs_a_port_and_a_target_id() {
-        let err = planned_configure(&["--bridge", "/dev/ttyUSB0", "--port-nodeid", "7"])
+    fn test_a_bridge_port_needs_a_port_and_a_target_id() {
+        let err = planned_bridge_port(&["--bridge", "/dev/ttyUSB0", "--port-nodeid", "7"])
             .expect_err("which port?");
         assert!(err.contains("--port"), "{err}");
 
-        let err =
-            planned_configure(&["--bridge", "/dev/ttyUSB0", "--port", "0"]).expect_err("which id?");
+        let err = planned_bridge_port(&["--bridge", "/dev/ttyUSB0", "--port", "0"])
+            .expect_err("which id?");
         assert!(err.contains("--port-nodeid"), "{err}");
     }
 
-    /// The target's port has to be one the plan declares: naming a port past the
-    /// count would leave the route talking about a port the bridge does not have.
+    /// Both numbers are one byte: a port index and a node id past 255 are
+    /// refused at the command line, before any plan.
     #[test]
-    fn test_a_configure_bridge_port_must_be_declared() {
-        let err = planned_configure(&[
+    fn test_a_bridge_port_index_and_id_must_fit_a_byte() {
+        let err = parse_bridge_port(&[
             "--bridge",
             "/dev/ttyUSB0",
             "--port",
-            "2",
+            "256",
             "--port-nodeid",
             "7",
-            "--port-count",
-            "1",
         ])
-        .expect_err("port 2 is not among one declared port");
-        assert!(err.contains("--port"), "{err}");
-        assert!(err.contains("--port-count"), "{err}");
-    }
+        .expect_err("256 names no port");
+        assert!(err.to_string().contains("--port"), "{err}");
 
-    /// A plan of no ports declares nothing, so the count starts at one.
-    #[test]
-    fn test_a_configure_bridge_port_count_is_at_least_one() {
-        let err = planned_configure(&[
+        let err = parse_bridge_port(&[
             "--bridge",
             "/dev/ttyUSB0",
             "--port",
             "0",
             "--port-nodeid",
-            "7",
-            "--port-count",
-            "0",
+            "256",
         ])
-        .expect_err("no ports is not a configure");
-        assert!(err.contains("--port-count"), "{err}");
+        .expect_err("256 is past the last node id");
+        assert!(err.to_string().contains("--port-nodeid"), "{err}");
     }
 
     /// The target's node id has to be a usable one: not zero, and not the id the
     /// bridge's own link carries.
     #[test]
-    fn test_a_configure_bridge_target_id_is_usable() {
-        let err = planned_configure(&[
+    fn test_a_bridge_port_target_id_is_usable() {
+        let err = planned_bridge_port(&[
             "--bridge",
             "/dev/ttyUSB0",
             "--port",
@@ -1919,7 +2050,7 @@ mod tests {
         .expect_err("zero names no device");
         assert!(err.contains("--port-nodeid"), "{err}");
 
-        let err = planned_configure(&[
+        let err = planned_bridge_port(&[
             "--bridge",
             "/dev/ttyUSB0",
             "--port",
@@ -1931,15 +2062,14 @@ mod tests {
         assert!(err.contains("--port-nodeid"), "{err}");
     }
 
-    /// The bridge's link is one of the two, never both and never neither — the
-    /// same rule the flash line enforces.
+    /// The bridge's link is one of the two here too.
     #[test]
-    fn test_a_configure_bridge_link_is_required() {
+    fn test_a_bridge_port_link_is_required() {
         let err =
-            planned_configure(&["--port", "0", "--port-nodeid", "7"]).expect_err("which bridge?");
+            planned_bridge_port(&["--port", "0", "--port-nodeid", "7"]).expect_err("which bridge?");
         assert!(err.contains("--bridge"), "{err}");
 
-        let err = planned_configure(&[
+        let err = planned_bridge_port(&[
             "--bridge",
             "/dev/ttyUSB0",
             "--bridge-library",

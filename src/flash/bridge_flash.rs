@@ -56,6 +56,7 @@ use super::bridge_session::{
     declare_ports as send_declare_ports, open_bridge, open_target_port as send_open_target_port,
     reset_port as send_port_reset, BridgeError, BridgePort, BridgeTarget, PortReset,
 };
+use super::frame::command::CONNECT;
 use super::session::{self, FlashError, SessionConfig, Summary};
 use std::fmt;
 
@@ -644,8 +645,9 @@ impl BridgeLink {
     }
 
     /// Reset one **declared** port's device through the bridge's admin channel —
-    /// `admin reset --port`. The same two units [`flash`](BridgeLink::flash) sends
-    /// before a session (`0x04`/`0x05`), for a caller that only wants the reset.
+    /// `admin reset --port`. The same three units [`flash`](BridgeLink::flash)
+    /// sends before a session (`0x02` into the bootloader, `0x04` a line pulse,
+    /// `0x05` a restart), for a caller that only wants the reset.
     ///
     /// The port has to be one the bridge has already **declared** (an
     /// `admin bridge config`, or a flash run's own declaration): a port-level
@@ -669,6 +671,15 @@ impl BridgeLink {
     /// is the bridge's numbering, and only a **legacy** route (no port flags)
     /// serves the raw uplink the tunnel carries, so [`open_bridge`] names the
     /// target that one way. `progress` is [`session::flash_with_config`]'s.
+    ///
+    /// A target whose plan reset is [`PortReset::Bootloader`] was **sent back to
+    /// its bootloader** and is still coming up when the tunnel opens, so nothing
+    /// answers the session's first `CONNECT` yet: that case gets the session's
+    /// own bounds again — `cfg.tries` sessions, `cfg.read_timeout` apart — and
+    /// the retries stop at the first session that gets past `CONNECT` (a failure
+    /// after it has written a block is never retried). Every other reset keeps
+    /// the single session, and a target that never answers still fails with the
+    /// session's own error.
     ///
     /// The tunnel is cleared on every path, success or failure, because the
     /// bridge outlives this run; a clearing that fails after a successful flash
@@ -722,7 +733,16 @@ impl BridgeLink {
         self.live().device.set_tunnel_sink(reply_arb, sink);
         let bridge = TunnelBridge::new(down_arb, frames, self.live().device.tunnel_link());
         let (mut reader, mut writer) = bridge.split();
-        let outcome = session::flash_with_config(&mut reader, &mut writer, payload, cfg, progress);
+        let outcome = run_session(
+            ports,
+            target,
+            &mut reader,
+            &mut writer,
+            payload,
+            cfg,
+            progress,
+        )
+        .await;
         drop(reader);
         drop(writer);
         drop(bridge);
@@ -753,6 +773,44 @@ impl BridgeLink {
     }
 }
 
+/// The katapult session over an already-open tunnel — [`BridgeLink::flash`]'s
+/// step 3, with the one retry a **bootloader-sent** target needs.
+///
+/// A target whose plan reset is [`PortReset::Bootloader`] was sent back to its
+/// bootloader and is still starting when the tunnel opens, so the session's
+/// first `CONNECT` may reach nothing: that case gets `cfg.tries` sessions,
+/// `cfg.read_timeout` apart. Only a `CONNECT` that spent its own tries earns
+/// another session — a failure after it has written a block is never retried,
+/// because the device is then mid-flash — and any other reset keeps the single
+/// session [`session::flash_with_config`] runs.
+async fn run_session<R: std::io::Read, W: std::io::Write>(
+    ports: &[BridgePort],
+    target: BridgeTarget,
+    reader: &mut R,
+    writer: &mut W,
+    payload: &[u8],
+    cfg: &SessionConfig,
+    mut progress: impl FnMut(&str),
+) -> Result<Summary, FlashError> {
+    let attempts = match ports.get(usize::from(target.index)) {
+        Some(port) if port.reset == PortReset::Bootloader => cfg.tries.max(1),
+        _ => 1,
+    };
+    let mut attempt = 1;
+    loop {
+        let outcome = session::flash_with_config(reader, writer, payload, cfg, &mut progress);
+        match outcome {
+            Err(FlashError::RetriesExhausted { cmd, .. })
+                if cmd == CONNECT && attempt < attempts =>
+            {
+                attempt += 1;
+                tokio::time::sleep(cfg.read_timeout).await;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Everything that can stop a bridge flash.
 #[derive(Debug)]
 pub enum BridgeFlashError {
@@ -777,8 +835,8 @@ pub enum BridgeFlashError {
     /// declaration: the self-restart could not be sent, or the bridge did not
     /// answer again within [`RESET_TIMEOUT`](BridgeLink::RESET_TIMEOUT).
     Reset(String),
-    /// A port-level reset (`0x04`/`0x05`) could not be written — a closed link,
-    /// a failed write, or a link that carries no port mux units at all.
+    /// A port-level reset (`0x02`/`0x04`/`0x05`) could not be written — a closed
+    /// link, a failed write, or a link that carries no port mux units at all.
     PortReset(InterfaceError),
     /// The bridge's firmware shut down while the port was declared — the reason
     /// it gave, resolved from its `static_string_id` enumeration. Reported
@@ -875,7 +933,7 @@ mod tests {
     use crate::core::klippy::interface::HostMux;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::flash::bridge_session::{BridgePort, BridgeTarget, PortReset};
-    use crate::flash::fake::FakeBootloader;
+    use crate::flash::fake::{FakeBootloader, Quirk};
     use crate::flash::frame::{build_frame, command};
     use crate::flash::session::SessionConfig;
     use std::io::{Read, Write};
@@ -1211,6 +1269,71 @@ mod tests {
             recorded.lock().unwrap().is_empty(),
             "the config and port halves write nothing to the port's pty, got {:?}",
             recorded.lock().unwrap()
+        );
+        assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
+
+        link.close();
+        drop(link);
+        wait_for_library_unload(&library);
+    }
+
+    /// `admin reset --port 0 --port-reset bootloader`'s one write, over the
+    /// **real** mux library: the bridge forwards the request-bootloader unit
+    /// (`0x02`) to the port it names, and the port's pty is where that lands —
+    /// the whole action a reset run has, with no receipt to wait for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_admin_reset_sends_the_target_port_into_its_bootloader() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let port = Pty::new();
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let path = library.display().to_string();
+
+        let link = BridgeLink::open_host_library(
+            Path::new(&path),
+            host_mux_for(&path),
+            BRIDGE_MCU_ID,
+            &[(0u8, port.path.display().to_string())],
+        )
+        .expect("the muxed library opens and attaches");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the bridge identifies");
+
+        // The reset addresses a port the bridge has to have declared: a
+        // port-level command naming a port it does not have is dropped in
+        // silence, and the pty would stay quiet for the wrong reason.
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::Bootloader,
+        }];
+        link.declare_ports(&ports)
+            .await
+            .expect("the bridge declares its port");
+
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        link.reset_port(0, PortReset::Bootloader)
+            .expect("the bootloader request goes out");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+
+        // The port's flags are the declaration's (legacy), so the bridge
+        // forwards the unit without its mux header: the bytes on the port are
+        // the KXID frame the host wrote, `[0x02][index]` and nothing else.
+        let mut unit = serial::admin_unit(&[serial::CMD_REQUEST_BOOTLOADER, 0]);
+        unit.drain(..serial::HEADER_BYTES);
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            unit,
+            "the port carries the firmware's request-bootloader unit, and no katapult frame"
         );
         assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
 
@@ -2066,5 +2189,200 @@ mod tests {
         link.close();
         drop(link);
         drop(firmware);
+    }
+
+    /// Session timing for the bootloader-retry cases: the same shape as
+    /// [`test_config`], millisecond scale so a `CONNECT` that no one answers
+    /// and the wait after it stay fast — the retry count is the session's
+    /// `tries`, so shrinking the budget shrinks the whole bounded wait.
+    fn bootloader_test_config() -> SessionConfig {
+        SessionConfig {
+            tries: 3,
+            read_timeout: Duration::from_millis(100),
+            retry_delay: Duration::from_millis(10),
+            busy_delay: Duration::from_millis(10),
+        }
+    }
+
+    /// A downstream that has not come up yet: the first `mute` frames written
+    /// to it are swallowed and never answered, everything after them reaches
+    /// `inner`. Each swallowed frame is the session's `CONNECT`, because a
+    /// session that got no answer to it never writes anything else.
+    struct NotReadyYet<W> {
+        inner: W,
+        /// Frames left to swallow; the count the test reads back.
+        swallowed: usize,
+        /// How many of `swallowed` are still to come.
+        remaining: usize,
+    }
+
+    impl<W> NotReadyYet<W> {
+        fn new(inner: W, mute: usize) -> Self {
+            Self {
+                inner,
+                swallowed: 0,
+                remaining: mute,
+            }
+        }
+    }
+
+    impl<W: Write> Write for NotReadyYet<W> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining > 0 {
+                self.remaining -= 1;
+                self.swallowed += 1;
+                return Ok(buf.len());
+            }
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// A target whose plan reset is [`PortReset::Bootloader`] was just sent
+    /// back to its bootloader, so the session's first `CONNECT`s reach nothing
+    /// while it comes up: the run waits and tries again, and the first session
+    /// that gets past `CONNECT` is the one that finishes.
+    #[tokio::test]
+    async fn test_a_bootloader_sent_target_is_retried_until_connect_answers() {
+        let fake = FakeBootloader::new();
+        let mut reader = fake.reader();
+        let cfg = bootloader_test_config();
+        // The device is still starting: one session's worth of CONNECTs goes
+        // unanswered, and the next session's reaches the bootloader.
+        let mut writer = NotReadyYet::new(fake.writer(), cfg.tries as usize);
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::Bootloader,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let payload: Vec<u8> = (0..100u8).collect();
+        let summary = run_session(
+            &ports,
+            target,
+            &mut reader,
+            &mut writer,
+            &payload,
+            &cfg,
+            |_| {},
+        )
+        .await
+        .expect("the session after the silent one gets its CONNECT answered");
+
+        assert_eq!(summary.bytes_flashed, payload.len());
+        assert_eq!(summary.block_count, 2, "100 bytes is two 64-byte blocks");
+        assert_eq!(
+            writer.swallowed, cfg.tries as usize,
+            "the first session spent its tries on a device that was not up yet"
+        );
+        assert_eq!(
+            fake.seen(command::CONNECT),
+            1,
+            "the retried session's CONNECT is the one that reached the bootloader"
+        );
+        assert_eq!(
+            fake.seen(command::COMPLETE),
+            1,
+            "one session ran to the end"
+        );
+    }
+
+    /// A bootloader-sent target that never answers is still bounded: exactly
+    /// `tries` sessions of `tries` `CONNECT`s each, and the session's own error
+    /// (the one a plain reset would have given on the first session).
+    #[tokio::test]
+    async fn test_a_bootloader_sent_target_that_never_answers_keeps_the_session_error() {
+        let fake = FakeBootloader::new();
+        let mut reader = fake.reader();
+        let cfg = bootloader_test_config();
+        let attempts = cfg.tries as usize;
+        let mut writer = NotReadyYet::new(fake.writer(), attempts * attempts);
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::Bootloader,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let err = run_session(
+            &ports,
+            target,
+            &mut reader,
+            &mut writer,
+            &[0u8; 8],
+            &cfg,
+            |_| {},
+        )
+        .await
+        .expect_err("nothing ever answers CONNECT");
+
+        assert!(
+            matches!(
+                err,
+                FlashError::RetriesExhausted {
+                    cmd: CONNECT,
+                    tries,
+                    ..
+                } if tries as usize == attempts
+            ),
+            "the session's own CONNECT error, unchanged: {err}"
+        );
+        assert_eq!(
+            writer.swallowed,
+            attempts * attempts,
+            "one session per try, each spending its own tries"
+        );
+        assert_eq!(fake.seen(command::CONNECT), 0, "nothing got past the wire");
+    }
+
+    /// Any other reset keeps the single session: a silent `CONNECT` spends the
+    /// session's tries once and fails, with no second attempt behind it.
+    #[tokio::test]
+    async fn test_a_plain_reset_gets_one_session_with_no_retry() {
+        let fake = FakeBootloader::new();
+        let mut reader = fake.reader();
+        let mut writer = fake.writer();
+        let cfg = bootloader_test_config();
+        // The fake's silence is permanent for the command, which is exactly the
+        // device a retry cannot help.
+        fake.script(command::CONNECT, 1, Quirk::Silent);
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let err = run_session(
+            &ports,
+            target,
+            &mut reader,
+            &mut writer,
+            &[0u8; 8],
+            &cfg,
+            |_| {},
+        )
+        .await
+        .expect_err("nothing answers CONNECT");
+
+        assert!(
+            matches!(err, FlashError::RetriesExhausted { cmd: CONNECT, .. }),
+            "the session's own CONNECT error: {err}"
+        );
+        assert_eq!(
+            fake.seen(command::CONNECT),
+            cfg.tries as usize,
+            "one session's tries and no retry behind them"
+        );
     }
 }

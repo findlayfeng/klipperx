@@ -195,4 +195,18 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 
 **待确认（真机刷写前）**：① F446 上的 katapult 是否按 **32 KiB bootloader**（→ 应用 0x8008000）编的；② CAN 速率——classical CAN 上限 1 Mbit/s，固件现设 `CANBUS_FREQUENCY=1000000`，用户说的「10MHz」需澄清。
 
+### 2026-10-17 收口：CAN 下游端口真机闭环（`work` 已合入）
+
+| 单元 | 提交（klipper / 主仓） | 结果 |
+|---|---|---|
+| U2 CAN 切片后端 | `18e35da4`/`7d578035`/`62ec8298` | `CONFIG_BRIDGE_PORT_CAN` + `generic/bridge_can.c`：管线脱离 CANserial、`.node_id` 钩子装过滤器、`write` 解 arb、收侧按 node 分桶 |
+| U5b 单帧 admin 代理 | `70dd3a68`/`79ad754e` | 开端口即装 `0x3f1`；`0x00`/`0x01`(+`0x11`) 翻译成 `0x3f0` 单帧；`0x3f1 [0x20][uuid][app]` 包成单元上行（端口路径由桥追加） |
+| 设备命令按单元下发 | `7df2df49`/`…` | `0x02`/`0x05` 必须带单元头发到设备自己的 arb；剥头+沿用 `0x3f0` 会让 mux 设备看不懂 |
+| `0x02` 带 uuid | `d627e384` | `[0x02][index][uuid]` → `0x3f0 [0x02][uuid]` **且**照旧发单元 |
+| R1 端口层改名 + `config_can` + 运行期速率 | `bb31ac7d`/`88ce8bfd` | `port` 层、`config_can oid bitrate slot`、`canhw_set_rate`、`CANBUS=n` 的端口型 build |
+| R2/U7/U8/U9 主机 | `3bd0463`…`5100c8a` | `ConfigCan`/`PortConfig`、`--can-bitrate`、`--assign-uuid`、刷写前后各指派一次、attach 重试（4 s/25 s） |
+
+**真机结果**（F446 桥 ─CAN 1M→ F103，见 `TESTING.md`）：发现 → 指派 → 送引导 → 隧道刷写 → 再发现 →
+反复刷全部通过；下游应用换一副字节流后**一条命令**照样能刷。
+
 **已知缺口 → U5b**：CAN 单帧 admin（`0x3f0`/`0x3f1`）未代理，而且端口开时也没有人装 admin 过滤器，所以**经桥扫描/指派一台未指派的 CAN 下游设备现在还不可能**。这是真机测试的前置单元（U5b，§3 已排），不是本轮遗留缺陷。

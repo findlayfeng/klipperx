@@ -286,7 +286,7 @@ admin 信道，`mux_unit()` 决定归属）。**注意两条不同的寻址**：
 拿到点名错误。host 侧 UART 后端**按端口槽各开一路流**（≤ `KLIPPER_HOST_PORT_SLOTS`，每槽独立
 fd、整帧发送队列与 reset 状态机）：不同 `slot` 可同时打开；**同槽**重复 `config_uart` 报
 `config_uart: the port slot is already in use`，slot 越界在后端点名拒绝（不走路径回落）。
-这两条命令（`third_party/klipper/src/uart.c:44-96`）就是让一个口可用的全部配置动作：**打开即生效、
+这两条命令（`third_party/klipper/src/port.c`：`config_uart` / `config_can` + `config_bridge_port`）就是让一个口可用的全部配置动作：**打开即生效、
 没有 finalize 阶段**，随后只有端口级命令（`SET_PORT_NODEID` 命名 + `SET_PORT_TUNNEL` 开隧道）。
 **端口表只在桥的 RAM 里**——桥一复位就空，所以任何要用端口的命令都得先（重新）声明。
 
@@ -314,24 +314,32 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
   下行照剥头、上行照 `reply_arb_id(node_id)` 组单元（两边都不看 `flags`）。刷写工具因此**沿用
   legacy 命名**目标口（`open_bridge` 的口径）；而把口先命名成 UNITS 再开隧道，现在也能上行。
 
-### 桥端口的三个固件后端与 `BRIDGE_UART_COUNT`
+### 桥端口的固件后端与 `BRIDGE_UART_COUNT`
 
-端口后端是「一个 UART 对象接到哪条流」的实现，三种，各自声明自己能给几个口：
+端口后端是「一个**端口对象**接到哪条流」的实现，四种，各自声明自己能给几个口：
 
 | 后端 | 文件 | `BRIDGE_UART_COUNT` | 口在哪 |
 |------|------|---------------------|--------|
-| STM32 | `third_party/klipper/src/stm32/bridge_serial.c` | 选中的 USART 个数（0..=5） | 编译期固定的 USART：总开关 `CONFIG_STM32_BRIDGE_SERIAL`（默认 n，`select` 后端与 `MUX_SERIAL`）下多选 `STM32_BRIDGE_SERIAL_USART1/2/3`、`_UART4/_UART5`，每个勾上的 USART 就是一个口，带自己的引脚、接收环和中断（`RESERVE_PINS_bridge_serial` = `PA10,PA9`、`RESERVE_PINS_bridge_serial_usart2` = `PA3,PA2`…） |
-| linux 进程 | `third_party/klipper/src/linux/bridge.c` | `1` | 环境变量 `KLIPPER_BRIDGE_PORT_0` 给的 tty（只有一条静态流，`uart_backend_open` 拒一切非 0 槽） |
+| STM32（USART） | `third_party/klipper/src/stm32/bridge_serial.c` | 选中的 USART 个数（0..=5） | 编译期固定的 USART：总开关 `CONFIG_STM32_BRIDGE_SERIAL`（默认 n，`select` 后端与 `MUX_SERIAL`）下多选 `STM32_BRIDGE_SERIAL_USART1/2/3`、`_UART4/_UART5`，每个勾上的 USART 就是一个口（`RESERVE_PINS_bridge_serial*` = `RX,TX`） |
+| **STM32（CAN）** | `third_party/klipper/src/generic/bridge_can.c` | **`1`**（排在所有 USART 槽之后） | 一个 bxCAN 控制器：`CONFIG_STM32_BRIDGE_CAN_PB8_PB9`（`select BRIDGE_PORT_CAN` + `CANBUS_FILTER_MULTI`，**不** select `CANSERIAL`/`MUX_CAN`，也**不** select `CANBUS`——端口型 build 不是 CAN 节点）。槽名来自 `RESERVE_PINS_bridge_can` = `PB8,PB9`。**F1 上它 `depends on !(MACH_STM32F1 && USBSERIAL)`**：USB 与 CAN1 RX0 共用中断向量 20 |
+| linux 进程 | `third_party/klipper/src/linux/bridge.c` | `1` | 环境变量 `KLIPPER_BRIDGE_PORT_0` 给的 tty（只有一条静态流，`port_backend_open` 拒一切非 0 槽） |
 | host 库 | `third_party/klipper/src/host/bridge.c` | `KLIPPER_HOST_PORT_SLOTS`（= **4**，`host/klipper_host.h`） | 每槽一路独立流（独立 fd / 发送队列 / reset 状态机），tty 由 `klipper_host_port(slot, path)` 在 `init` 前登记，未登记则回落 `CONFIG_HOST_BRIDGE_SERIAL_PATH` |
 
-这个常量**就是「列口」的数据源**：固件不报端口表，只报「我能给几个 UART 对象」；主机据此列出
+**对象层叫 `port`，不叫 `uart`**（`src/port.{c,h}`：`struct port_s`、`port_backend_open/port_ops/set_port`、`PORT_OPEN_*`），因为它装的不只是 UART。两条命令各自创建同一个对象，区别只在速率字段：
+
+```
+config_uart oid=%c baud=%u slot=%c        # UART 口，baud 真实
+config_can  oid=%c bitrate=%u slot=%c    # CAN 口，bitrate 是**这段总线**的速率（运行期给）
+config_bridge_port oid=%c port=%c        # 两种口都交到这里，index = 声明顺序
+```
+
+CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再重装过滤器与追加表），所以**换下游速率不再需要重烧桥**；设不了（分不出位）报 `PORT_OPEN_BAD_BAUD`。端口型 build 不声明 `CANBUS_FREQUENCY` 常量（那是节点的口径），速率只来自命令。
+
+这个常量**就是「列口」的数据源**：固件不报端口表，只报「我能给几个端口对象」；主机据此列出
 可用的 `--port` 序号（`klipperx admin bridge config`，读固件字典里的 `BRIDGE_UART_COUNT`）。
 字典里没有这个常数的是旧固件——`admin bridge config` 会明说，并用 `--port-count`（默认 1）兜底。
 
-**槽序就是端口的身份**：`slot` 是「选中的 USART 按编号升序里的名次」——USART1 在前、UART5 在后；
-只勾 USART2 时它就是**槽 0**，不是槽 1。所以主机**不能**拿「槽号 = 固定 USART 表」硬套，
-`admin bridge config` 的槽名来自后端自己的预留引脚常数（`RESERVE_PINS_bridge_serial*`，有哪个就说明
-哪个 USART 被勾上，值就是它的引脚对），见下文。
+**槽序就是端口的身份**：USART 槽在前（选中的 USART 按编号升序里的名次），CAN 槽在后；只勾 USART2 时它就是**槽 0**；一个 CAN-only 桥（如 F446：USB 控制台 + CAN 口，无 USART 口）只有一个槽 0 且它是 CAN。主机**不能**拿「槽号 = 固定 USART 表」硬套——槽名来自后端自己的预留引脚常数（`RESERVE_PINS_bridge_serial*` / `RESERVE_PINS_bridge_can`），后端只报个数、不报槽名的（linux 单 tty、host 库 tty 表）才回落到 `MCU` 给的 arch 注记。
 
 ### 桥上的四条命令：`config` / `port` / `scan --bridge` / `flash`
 
@@ -343,23 +351,54 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 1. **`admin bridge config --bridge <tty>`** —— 打开、identify，**只读** 固件字典并
    列出槽位；不声明端口、不复位设备、不命名、不开隧道、不刷写。输出形如
    `available uarts: 2` + `  uart 0: 250000 baud default slot (USART1 PA10/PA9)` +
-   `  uart 1: 250000 baud default slot (USART2 PA3/PA2)` +
-   一行「用 `admin bridge port --port <slot> --port-nodeid <id>` 启用」。槽后那句名字**逐个槽来自字典**：
-   stm32 后端给每个勾上的 USART 预留引脚（`RESERVE_PINS_bridge_serial*` = `RX,TX`），主机按后端自己的
-   槽序（USART1、USART2、USART3、UART4、UART5 里有勾的那些）把它们读成 `USART1 PA10/PA9`；后端只报
-   个数、不报槽名的（linux 的单条 tty、host 库的 tty 表）才回落到 `MCU` 给的 arch 注记。
-2. **`admin bridge port --bridge <tty> --port N --port-nodeid ID [--baud] [--legacy]`** —— 打开、
-   identify、**重启桥**（空端口表）、声明 `0..=N` 这些口（每个口一对 `config_uart` +
+   `  uart 1: 250000 baud default slot (CAN1 PB8/PB9)` +
+   一行「用 `admin bridge port --port <slot> --port-nodeid <id>` 启用」。
+2. **`admin bridge port --bridge <tty> --port N --port-nodeid ID [--baud] [--can-bitrate] [--legacy] [--assign-uuid <hex>]`** —— 打开、
+   identify、**重启桥**（空端口表）、声明 `0..=N` 这些口（UART 槽一对 `config_uart` +
+   `config_bridge_port`；CAN 槽一对 `config_can`（带 `--can-bitrate`，默认 1 Mbit/s）+
    `config_bridge_port`，`slot` = `index`）、然后 `SET_PORT_NODEID(N, ID, flags)` +
-   `SET_PORT_TUNNEL(N)`；**默认 UNITS**，`--legacy` 给 stock katapult/旧固件。`ID` 不能是 0、也
-   不能是桥自己的链路 id（`BRIDGE_MCU_ID = 1`，否则隧道单元与桥自己的帧撞 arb）。成功只打一行
-   `target: port N nodeid ID, units route, tunnel open`。
-3. **`admin scan --bridge <tty> [--ports 0,…] [--bridge-uuid <hex>] [--baud] [--timeout]`** —— 见下
+   `SET_PORT_TUNNEL(N)`。**默认 UNITS**，`--legacy` 给 stock katapult/旧固件；`ID` 不能是 0、也
+   不能是桥自己的链路 id（`BRIDGE_MCU_ID = 1`）。给了 `--assign-uuid` 时再发一枚指派广播（见下文
+   「CAN 端口」），有界等回执。成功打一行 `target: port N nodeid ID, units route, tunnel open`
+   （+ 一行指派结果）。
+3. **`admin scan --bridge <tty> [--ports 0,…] [--bridge-uuid <hex>] [--baud] [--can-bitrate] [--timeout]`** —— 见下
    「桥扫描的发现路径与归属规则」（`src/scan.rs::bridge_query_unassigned`）。
-4. **`admin flash --bridge <tty> --port N --port-nodeid ID [--port-reset …] <fw.bin>`** —— 重启桥 →
-   声明 `0..=N` → 按 `--port-reset`（`reset-port` 默认 / `restart-device` / `bootloader`）复位目标口
-   → legacy 命名 + 开隧道 → katapult 会话 → **关隧道**（桥活得比本次运行久，不能让它一直带着
-   裸 bootloader 流）。
+4. **`admin flash --bridge <tty> --port N --port-nodeid ID [--port-reset …] [--can-bitrate] [--assign-uuid <hex>] <fw.bin>`** —— 重启桥 →
+   声明 `0..=N` → （CAN 槽且给了 `--assign-uuid`：**先指派一次**，让正在运行的应用听见下面的复位）→
+   按 `--port-reset`（`reset-port` 默认 / `restart-device` / `bootloader`）复位目标口 →
+   （CAN 槽：等引导起来（1 s）→ **再指派一次**（katapult 也丢了 id）→ 等 300 ms）→
+   legacy 命名 + 开隧道 → katapult 会话 → **关隧道**。
+
+#### CAN 下游端口（`BRIDGE_PORT_CAN`）
+
+一个 CAN 控制器当桥的口，与 USART 口同契约（`bridge_port_ops`：`write` 整块入队永不断块、`reset = NULL`），差在**寻址在总线上的 arb 里**：
+
+| 情形 | 桥交下来的 blob | 用哪个 arb |
+|---|---|---|
+| UNITS 口 | 整单元（头 + 帧） | 单元头解出的 arb（主机放进去的地址） |
+| legacy / 隧道口 | 已剥头（裸帧 / katapult 块） | 端口记的 `node_id` → `0x100 + 2*node` |
+| 两者都没有 | — | 丢弃并计数（不阻塞、不 `shutdown`） |
+
+收侧按 **node** 分桶重组（最多 `BRIDGE_CAN_NODE_MAX` = 4 个 id），凑齐整单元后才交路由器——一条总线上的多台设备帧是逐帧交错的，不分桶就没有边界。
+
+**CAN 单帧 admin 的代理**（这是它与 USART 口最大的不同）：CAN 上的发现/指派对话不走单元，走 `0x3f0`/`0x3f1` 单帧（`generic/canserial.c` 的 `can_process_admin`）。端口两向翻译：
+
+| 主机发的 KXID 单元（`0x3f0`） | 端口放到总线上的帧 |
+|---|---|
+| `[0x00]` 扫描 | `0x3f0 [0x00]` |
+| `[0x01][uuid][id]` 指派 | `0x3f0 [0x01][uuid][id]` **和** `0x3f0 [0x11][uuid][id]`（klipper 应用 / katapult 各认一条） |
+| `[0x02][index][uuid]` 送引导 | `0x3f0 [0x02][uuid]` 单帧 **且**照旧把单元发下去 |
+| `[0x05]` 重启等 | 原样按单元发下去（mux 设备自己的命令） |
+
+带上 uuid 的那条是关键：**单帧与载具无关**，所以它读不懂切片单元的设备也能被送进引导。
+
+上行：`0x3f1` 的 `[0x20][uuid][app]` 应答被包成 arb=`0x3f1` 的单元交给路由器（不是节点流量，不进分桶），桥既有逻辑会追加端口路径。
+
+**两条硬约束**：
+
+1. **CAN 口必须命名成 UNITS**（`SET_PORT_NODEID` 带 `MUX_PORT_UNITS`）：legacy 口会剥头，arb 就丢了。
+2. **设备每次进引导都要重新指派**：CAN node id 是 RAM 态，应用启动丢一次、katapult 启动又丢一次——所以刷写流程是「指派 → 0x02 → 等引导 → 再指派 → 隧道」，这就是 `--assign-uuid` 存在的理由。
+3. **过滤器预算**：`0x3f1` 占 1 个 bank，每个下游 id 占 1 个（bit0 掩码一格盯 `id`/`id+1` 一对），追加项上限 `CANHW_EXTRA_FILTERS = 8`；装不下就 `shutdown` 点名，**不静默听不见**。
 
 #### 桥扫描的发现路径与归属规则
 
@@ -402,7 +441,7 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 | 13 | **口形态是主机每次命令的选择，不是编译期事实**：`flags` bit0 `MUX_PORT_UNITS` 由 `SET_PORT_NODEID` 给，桥两个方向都按它剥/加头；UNITS 口的**裸帧上行会被丢**（`bridge_port_raw_up`），legacy 口的**整单元照原样转发** | 固件 `src/mux.h`、`src/bridge.c` |
 | 14 | **端口 id 与 `flags` 解耦**：`SET_PORT_NODEID` 无论 UNITS/legacy 都记 `node_id`，因此隧道模式的上行在两种口上都成立（UNITS 口的 `node_id` 曾恒 0 ⇒ 隧道上行静默丢；2026-10-17 修） | 固件 `src/bridge.c::bridge_set_port_nodeid`、`bridge_port_tunnel_up`；探针 `devices/host.rs::test_the_bridge_tunnel_uplink_over_a_units_port_over_the_real_library` |
 | 15 | **「桥能给几个口」由后端声明**：三个后端各自 `DECL_CONSTANT("BRIDGE_UART_COUNT", …)`（stm32 1 / linux 1 / host `KLIPPER_HOST_PORT_SLOTS` = 4）；固件不再上报端口表，主机按这个常数列 `--port`，旧固件（无常量）由 `--port-count` 兜底 | `third_party/klipper/src/{stm32,linux,host}/bridge*.c`、`src/flash/bridge_flash.rs::uart_count` |
-| 16 | **端口表只在桥的 RAM 里**：桥一复位就空，所以每一条用到端口的命令（`bridge config` 之后的 `port`、`scan --bridge`、`flash`）都先重启桥再声明；`config_uart`/`config_bridge_port` 打开即生效、**无 finalize** | 固件 `src/uart.c:44-96`、`src/flash/bridge_flash.rs::reset`/`declare_ports` |
+| 16 | **端口表只在桥的 RAM 里**：桥一复位就空，所以每一条用到端口的命令（`bridge config` 之后的 `port`、`scan --bridge`、`flash`）都先重启桥再声明；`config_uart`/`config_can`/`config_bridge_port` 打开即生效、**无 finalize** | 固件 `src/port.c`、`src/flash/bridge_flash.rs::reset`/`declare_ports` |
 
 ## 主机侧的行为约定
 
@@ -506,7 +545,8 @@ klipper 设备半的叙述**逐条对齐**：
   **`depends on CANSERIAL`、且只编 classical**。**`vcan` 上的端到端已落地**：`linux` 架构的
   SocketCAN 控制台（`LINUX_CANSERIAL`）让真 `klipper.elf` 能当 can-serial 节点，主机侧已实测
   跑通完整 `[mcu]` 连接（admin 指派 → identify → `get_clock`/stats）；剩下的未落地项只有
-  `[can_device]` 下**游**端口（需 `BRIDGE_PORT_CAN` 端口后端）与真总线。
+  **CAN 下游端口已落地**（`BRIDGE_PORT_CAN`：`generic/bridge_can.c`，单帧 admin 代理已验）；
+  仍未接的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 CAN **上游** attach。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

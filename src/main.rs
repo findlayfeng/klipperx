@@ -168,6 +168,14 @@ enum AdminCommands {
     // job and flashing is `admin flash`'s.
     #[command(name = "configure-bridge", arg_required_else_help = true)]
     ConfigureBridge(klipperx::flash::cli::ConfigureBridgeArgs),
+
+    /// Reset a bridge itself, or a device on one of its ports
+    //
+    // The admin-channel reset: without `--port` the bridge restarts itself (the
+    // step `flash` does before declaring ports), and with `--port` the device
+    // behind that declared port is reset, the way `--port-reset` says.
+    #[command(arg_required_else_help = true)]
+    Reset(klipperx::flash::cli::ResetArgs),
 }
 
 fn main() {
@@ -202,6 +210,7 @@ fn run_admin(command: AdminCommands) -> Result<i32, Box<dyn std::error::Error>> 
         AdminCommands::ConfigureBridge(args) => {
             klipperx::flash::cli::run_configure_bridge(args).map(|()| 0)
         }
+        AdminCommands::Reset(args) => klipperx::flash::cli::run_reset(args).map(|()| 0),
     }
 }
 
@@ -588,6 +597,7 @@ mod tests {
         assert!(help.contains("scan"), "{help}");
         assert!(help.contains("flash"), "{help}");
         assert!(help.contains("configure-bridge"), "{help}");
+        assert!(help.contains("reset"), "{help}");
 
         let error = parse(&["admin", "scan", "--help"]).expect_err("the help is not a scan");
         let help = error.to_string();
@@ -692,6 +702,49 @@ mod tests {
                 assert_eq!(args.port_count, Some(2));
             }
             other => panic!("expected `admin configure-bridge`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_reset_subcommand_is_under_admin() {
+        // A bare `admin reset` is a question (which bridge?), answered with the
+        // help.
+        let error = parse(&["admin", "reset"]).expect_err("a bridge has to be named");
+        let help = error.to_string();
+        assert!(help.contains("--bridge"), "{help}");
+        assert!(help.contains("--port-reset"), "{help}");
+
+        // The bridge side of the flash grammar, plus the port choice.
+        let cli = parse(&[
+            "admin",
+            "reset",
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-reset",
+            "restart-device",
+        ])
+        .expect("the bridge side of the flash grammar");
+        match cli.command {
+            Some(Commands::Admin {
+                command: AdminCommands::Reset(args),
+            }) => {
+                assert_eq!(args.bridge.as_deref(), Some("/dev/ttyUSB0"));
+                assert_eq!(args.port, Some(1));
+                assert_eq!(args.port_reset.as_deref(), Some("restart-device"));
+            }
+            other => panic!("expected `admin reset`, got {other:?}"),
+        }
+
+        // Without `--port` it is the bridge itself; nothing else is required.
+        let cli = parse(&["admin", "reset", "--bridge", "/dev/ttyUSB0"])
+            .expect("the bridge alone is a reset");
+        match cli.command {
+            Some(Commands::Admin {
+                command: AdminCommands::Reset(args),
+            }) => assert!(args.port.is_none()),
+            other => panic!("expected `admin reset`, got {other:?}"),
         }
     }
 

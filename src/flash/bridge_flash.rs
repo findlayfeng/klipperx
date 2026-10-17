@@ -1012,9 +1012,21 @@ impl BridgeLink {
         // shuts its firmware down, and the reason is the whole story — report
         // that, not the timeout behind it.
         self.declare_ports(ports).await?;
-        self.reset_ports(ports, target).await?;
+        // A device that speaks units only listens on the id its port was named
+        // with - so the reset command below reaches it only if it already
+        // holds that id. A board that has just booted an application does not
+        // (the id is RAM, dropped by every boot), which is why the assignment
+        // comes **twice**: once now so the running application hears the
+        // reset, and once again after the bootloader starts, because katapult
+        // dropped the id the same way the application did.
         let kind = self.slot_kind(target.index);
-        match bootloader_assign(kind, assign) {
+        let assignment = bootloader_assign(kind, assign);
+        if let Some(uuid) = assignment {
+            self.assign_node_id(uuid, target.node_id)?;
+            tokio::time::sleep(ASSIGN_SETTLE).await;
+        }
+        self.reset_ports(ports, target).await?;
+        match assignment {
             Some(uuid) => {
                 // The bootloader is up (or nearly) after the reset, and its
                 // address is what the tunnel will carry: hand it the id the

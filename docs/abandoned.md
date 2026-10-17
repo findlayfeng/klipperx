@@ -24,6 +24,7 @@
 
 | `abandoned/can-isotp`（主仓 + klipper 子模组各一条） | 2026-10-16～17 的**整条 ISO-TP 线**：直连 CAN 的从站与主机状态机/设备层（klipper `93cecfc8`…、主仓 `0085b2c`/`b6511bd`）+ 桥 CAN 端口的多帧载具（klipper `100bc0ac`…、主仓 `116224d`…）及其一批修补提交。主仓侧停在 `work` 被重写之前的头（`7b9ebd1`，gitlink = klipper `c8886d62`）；子模组侧同 sha | 用户 2026-10-17 裁定**全部删除**：多帧载具删减到只剩「每帧自定界」之后，相对切片的收益（小消息原子性、丢帧只丢一条、CF 序号即时可知）抵不上代价（每帧少 1 B 载荷、大消息帧数 +25%、两端各一套状态机、一个 carrier 配置维度），且删掉长度字段与流控后它已**不互通标准 ISO-TP**，「标准」这条卖点也没了。主线现已只有**切片**一种 CAN 传输 | ① 主机侧分段器的完整实现与 22+8 条单测（`isotp_proto.rs` 的 `block_left: Option` 就是「BS=0 = 不限」的正确写法）；② 桥端口 per-node 双端状态机的结构；③ 「BS=0 不是 0 帧」「共享定时器里已到期的事件会误删别人的定时器」两条实测教训（留档在 [`2026-10-17-bridge-can-plan.md`](2026-10-17-bridge-can-plan.md)） | 2026-10-17 |
 | `abandoned/can-bare-frames-forward` | 一个 worker 在 `agents/feat-can-bare-frames` 上的**前向删除**（`ef6b7d2`，未编译未测试） | 被「从第一个添加 ISO 的提交往回逐个清理（重写历史）」的做法取代 | 四个文件的删除起点（`serial.rs` / `bridge_attach.rs` / `bridge_ports.rs` / `bridge_session.rs`）可作删除清单的对照 | 2026-10-17 |
+| `abandoned/can-isotp-deletion-forward`（主仓 + klipper 各一条） | 重写历史之前的**前向删除**（主仓 `548f01b`、klipper `d89edb1c`；两者都编译通过、三份固件构建也过） | 被「重写历史」取代：前向删除只清掉 ISO 的文件与分支，**保留了 ISO-only 的端口 API seam**（`node_id` 的 `flags` 参数、`ops.tunnel` 钩子、`carrier` 字段、`canserial_receive_message` 的抽出）；重写连这些一起消失 | 那几处 seam 的删除起点（`bridge.h` / `bridge.c` / `bridge_can.c` / `canserial.c`）可作对照；它也是重写后树的审计基准 | 2026-10-17 |
 
 > 备注（2026-10-16 侦察结论，未立项）：让 host 库支持「一进程多份实例」的真正阻断项只有 **`SIGUSR1` 的进程级 disposition**
 > （`third_party/klipper/src/host/host.c:48-55` 的 `longjmp` handler、`:114-119` 安装、`:147-148` `pthread_kill`）；`SIGALRM` 在

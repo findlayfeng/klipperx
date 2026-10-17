@@ -328,6 +328,22 @@ impl ConfigBuilder {
         self.push(Kind::Config, C::NAME, cmd.args())
     }
 
+    /// The commands queued for the `config` phase so far: each one's name and
+    /// arguments, in the order they will be sent.
+    ///
+    /// Test-only: nothing at run time reads the queue back — it is built once and
+    /// encoded against the firmware's dictionary ([`ConfigBuilder::build`]). A
+    /// load-time test that asserts what a section wired onto its `[mcu]` has no
+    /// firmware to ask, so it asks the queue instead.
+    #[cfg(test)]
+    pub fn queued_config_commands(&self) -> Vec<(&'static str, Vec<ArgValue>)> {
+        self.lock()
+            .config
+            .iter()
+            .map(|command| (command.name, command.args.clone()))
+            .collect()
+    }
+
     /// Add a command to the `restart` list, re-sent even when the firmware is
     /// reused. Used to restore start values.
     pub fn add_restart_cmd<C: McuCommand>(&self, cmd: &C) -> Result<(), McuError> {

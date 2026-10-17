@@ -1400,7 +1400,7 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
                 report_reset_bridge_bootloader();
             }
             ResetTarget::Port { index, reset } => {
-                link.reset_port(index, reset)?;
+                link.reset_port(index, reset, None)?;
                 report_reset_port(index, reset);
             }
         }

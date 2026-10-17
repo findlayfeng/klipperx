@@ -1656,10 +1656,21 @@ fn port_registry() -> &'static Mutex<HashMap<PathBuf, Weak<SharedSerialPort>>> {
 
 /// The live port for `path`, opening it (and starting its reader) if the
 /// registry holds no live one.
+///
+/// A port that has **stopped** — its reader saw the tty go away, or a write hit
+/// the same failure — is not a port for `path` any more: a board that reset and
+/// re-enumerated leaves the old descriptor pointing at a device that is gone
+/// (EIO on every access), while its `Arc` is still held by the sessions that
+/// were on it. Reusing it re-attaches to a dead descriptor; the entry is
+/// therefore dropped and the tty opened again, which is what makes a reconnect
+/// after a reset get the new enumeration ([`resource_for`]'s `usable`).
 fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceError> {
-    resource_for(port_registry(), path, |path| {
-        SharedSerialPort::open(path, baud)
-    })
+    resource_for(
+        port_registry(),
+        path,
+        |port| !port.stopped.load(Ordering::SeqCst),
+        |path| SharedSerialPort::open(path, baud),
+    )
 }
 
 /// Open a port for one MCU and complete the frame-level id handshake.
@@ -1854,14 +1865,24 @@ impl SharedSerialPort {
 
     /// Write one whole unit under the write lock, so no other writer can split
     /// its header from its frame.
+    ///
+    /// A failed write stops the port, the same way a failed read does
+    /// ([`reader_loop`]): on a re-enumerated board the descriptor is gone and
+    /// every later write to it fails with EIO too, so keeping the port alive
+    /// would only serve EIO to every MCU on it. Stopping it is also what retires
+    /// it from the registry — the next attach opens the tty that exists now.
     fn write_unit(&self, unit: &[u8]) -> Result<(), InterfaceError> {
         let _writing = self.write_lock.lock().unwrap();
-        (&*self.port).write_all(unit).map_err(|e| {
-            InterfaceError::SendError(format!(
-                "serial write to {} failed: {e}",
-                self.path.display()
-            ))
-        })
+        match (&*self.port).write_all(unit) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.stop();
+                Err(InterfaceError::SendError(format!(
+                    "serial write to {} failed: {e}",
+                    self.path.display()
+                )))
+            }
+        }
     }
 }
 
@@ -2455,6 +2476,12 @@ mod mux_tests {
     use crate::core::klippy::interface::pty::Pty;
     use std::thread;
 
+    /// How long a test waits for a handshake request to appear on the wire.
+    ///
+    /// Generous for a loaded machine, but finite: a handshake that writes
+    /// nothing at all must fail its test rather than block it.
+    const ATTACH_REQUEST_WINDOW: Duration = Duration::from_secs(10);
+
     /// Read exactly `want` bytes from the pty master (blocking, no polling).
     fn read_n(master: &File, want: usize) -> Vec<u8> {
         let mut master = master;
@@ -2529,25 +2556,39 @@ mod mux_tests {
         rc > 0
     }
 
-    /// Attach `mcu_id`, playing the device side of the handshake from the test.
-    fn attach_with_reply(pty: &Pty, mcu_id: u32) -> Arc<SharedSerialHandle> {
+    /// Attach `mcu_id` **over `path`**, playing the device side of the handshake
+    /// from `master` — the pty that path leads to.
+    ///
+    /// Path and pty are separate parameters so a test can address a tty through
+    /// a link it re-points, the way a `by-id`/`by-path` entry survives a
+    /// re-enumeration while the device behind it does not. The wait for the
+    /// request is bounded ([`ATTACH_REQUEST_WINDOW`]) so a handshake that writes
+    /// **nothing** fails the test instead of hanging it — what a lookup handing
+    /// a dead port back produces.
+    fn attach_over(path: &Path, master: &File, mcu_id: u32) -> Arc<SharedSerialHandle> {
         let request = assignment_request(mcu_id).expect("a valid mcu id");
-        let path = pty.path.clone();
+        let path = path.to_path_buf();
         let thread =
             thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, ASSIGN_ATTACH_TIMEOUT, None));
-        let seen = read_n(&pty.master, request.len());
+        assert!(
+            readable_within(master, ATTACH_REQUEST_WINDOW),
+            "attach must send the assignment request"
+        );
+        let seen = read_n(master, request.len());
         assert_eq!(
             seen, request,
             "attach must send the assignment request verbatim"
         );
-        master_write(
-            &pty.master,
-            &assignment_reply(mcu_id).expect("a valid mcu id"),
-        );
+        master_write(master, &assignment_reply(mcu_id).expect("a valid mcu id"));
         thread
             .join()
             .expect("attach thread")
             .expect("attach succeeds")
+    }
+
+    /// Attach `mcu_id`, playing the device side of the handshake from the test.
+    fn attach_with_reply(pty: &Pty, mcu_id: u32) -> Arc<SharedSerialHandle> {
+        attach_over(&pty.path, &pty.master, mcu_id)
     }
 
     /// One device→host unit: the answer-direction header, then the frame bytes.
@@ -2996,6 +3037,105 @@ mod mux_tests {
         // A fresh attach on the same path builds a new port and a new reader.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(9, vec![1])).is_ok());
+    }
+
+    /// A port whose tty went away under it is **not** the port for its path any
+    /// more: the next attach opens the tty that exists now.
+    ///
+    /// This is the reconnect after a reset. The board re-enumerates, so the
+    /// descriptor the old session holds is dead (EIO on every access) while its
+    /// `Arc` is still held by the sessions that were on it — which is exactly
+    /// what made a path lookup hand the dead port straight back, and made any
+    /// `[mcu]` on a shared port fail on its second bring-up. The tty is
+    /// addressed through a link the test re-points, the way a `by-id` entry
+    /// keeps naming the port across an enumeration: /dev/pts/N is the kernel's
+    /// to allocate, so a fresh pty is a fresh path and the link is what stays.
+    #[test]
+    fn a_port_whose_tty_was_replaced_is_reopened_not_handed_back() {
+        let link = std::env::temp_dir().join(format!(
+            "klipperx-shared-port-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&link);
+
+        // The board as it enumerated the first time, on the session that is
+        // about to be orphaned.
+        let first = Pty::new();
+        std::os::unix::fs::symlink(&first.path, &link).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                link.display(),
+                first.path.display()
+            )
+        });
+        let stale = attach_over(&link, &first.master, 4);
+        let first_tty = first.path.clone();
+
+        // The reset: the tty goes away and the reader notices — the port is
+        // stopped, and the session that was on it still holds it.
+        drop(first);
+        assert!(
+            wait_for_port_stopped(&link, Duration::from_secs(5)),
+            "the reader must notice the tty went away"
+        );
+
+        // The new enumeration, at the same path.
+        let second = Pty::new();
+        assert_ne!(second.path, first_tty, "a new pty is a new tty");
+        std::fs::remove_file(&link).expect("the old link goes");
+        std::os::unix::fs::symlink(&second.path, &link).unwrap_or_else(|e| {
+            panic!(
+                "failed to link {} to {}: {e}",
+                link.display(),
+                second.path.display()
+            )
+        });
+
+        // The attach opens the tty that exists now and handshakes on it, and it
+        // is a new port, not the stopped one handed back.
+        let fresh = attach_over(&link, &second.master, 4);
+        assert!(
+            !Arc::ptr_eq(&stale.port, &fresh.port),
+            "the stopped port must not be reused for the path"
+        );
+        let frame = Frame::new(1, b"live".to_vec());
+        fresh.send(&frame).unwrap();
+        assert!(
+            readable_within(&second.master, ATTACH_REQUEST_WINDOW),
+            "the session must write on the tty that exists now"
+        );
+        let wire = read_n(&second.master, 2 + frame.raw_bytes().len());
+        assert_eq!(
+            split_units(&wire),
+            vec![(assign::arb_id(4).unwrap(), frame)],
+            "the session must speak on the tty that exists now"
+        );
+
+        drop(stale);
+        drop(fresh);
+        let _ = std::fs::remove_file(&link);
+    }
+
+    /// Whether the port for `path` has been **stopped** within `window` — how a
+    /// test waits out the reader noticing its tty is gone.
+    fn wait_for_port_stopped(path: &Path, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        loop {
+            if port_registry()
+                .lock()
+                .unwrap()
+                .get(path)
+                .and_then(Weak::upgrade)
+                .is_some_and(|port| port.stopped.load(Ordering::SeqCst))
+            {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
     }
 
     /// Poll `slot` for `frame` until `window` expires.

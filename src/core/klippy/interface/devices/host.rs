@@ -186,9 +186,15 @@ fn library_for(
     identity: Option<[u8; 6]>,
     host_port_paths: &[(u8, String)],
 ) -> Result<Arc<HostLibrary>, InterfaceError> {
-    let library = resource_for(library_registry(), path, |path| {
-        HostLibrary::open(path, mode, identity, host_port_paths)
-    })?;
+    let library = resource_for(
+        library_registry(),
+        path,
+        // A loaded library has no "stopped" state of its own: one reference
+        // shutting down leaves the library — and every other reference — up, so
+        // a live one is always reusable.
+        |_| true,
+        |path| HostLibrary::open(path, mode, identity, host_port_paths),
+    )?;
     let identity = identity.unwrap_or([0; 6]);
     if library.router.mode != mode || library.identity != identity {
         return Err(InterfaceError::Other(format!(

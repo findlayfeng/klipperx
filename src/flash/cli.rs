@@ -1013,9 +1013,9 @@ fn open_link(source: &BridgeLinkSource, baud: u32) -> Result<BridgeLink, BridgeF
 /// and stop.
 ///
 /// Nothing is reset, no route is named and no tunnel is opened: the bridge is
-/// left with its port table, and the result line says what was declared. The
-/// runtime is built here for the same reason [`run_bridge_flash`] builds one —
-/// the link is opened inside it.
+/// left with its port table, and the report says what was declared and which
+/// indexes the next commands have to name. The runtime is built here for the same
+/// reason [`run_bridge_flash`] builds one — the link is opened inside it.
 pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_bridge_config(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1028,22 +1028,40 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         link.declare_ports(&plan.ports).await?;
         link.close();
-        report_bridge_config(&plan);
+        for line in bridge_config_lines(&plan.ports) {
+            println!("{line}");
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
-/// The last word of a successful `admin bridge config`: one greppable line naming
-/// every declared port, with its slot and its speed.
-fn report_bridge_config(plan: &BridgeConfigPlan) {
-    let ports = plan
-        .ports
+/// The last word of a successful `admin bridge config`: the ports it declared —
+/// one line each, with the slot and speed — and the **indexes** a later
+/// `admin bridge port` or `admin flash` names with `--port`.
+///
+/// The indexes are the positions of the entries the declaration carried, so the
+/// list and the bridge's port table cannot disagree: a declaration that stopped
+/// short (it failed, and said why) never reaches this report.
+fn bridge_config_lines(ports: &[BridgePort]) -> Vec<String> {
+    let mut lines = vec![format!("declared: {} port(s)", ports.len())];
+    for (index, port) in ports.iter().enumerate() {
+        lines.push(format!("  port {index}: slot {index} baud {}", port.baud));
+    }
+    let indexes = ports
         .iter()
         .enumerate()
-        .map(|(index, port)| format!("port {index} slot {index} baud {}", port.baud))
+        .map(|(index, _)| index.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    println!("declared: {} port(s), {ports}", plan.ports.len());
+    lines.push(format!(
+        "available port indexes: {}",
+        if indexes.is_empty() {
+            "(none)".to_string()
+        } else {
+            indexes
+        }
+    ));
+    lines
 }
 
 /// `admin bridge port`: open the bridge, identify it, name the plan's port
@@ -1911,6 +1929,58 @@ mod tests {
                 baud: DEFAULT_BAUD,
                 reset: PortReset::ResetPort,
             }]
+        );
+    }
+
+    /// `admin bridge config`'s report: the declared ports, then the greppable
+    /// `available port indexes:` line a later `admin bridge port` / `admin flash`
+    /// takes its `--port` from.
+    #[test]
+    fn test_a_bridge_config_report_lists_the_available_port_indexes() {
+        let plan = planned_bridge_config(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port-count",
+            "3",
+            "--baud",
+            "115200",
+        ])
+        .expect("a three-port plan");
+        assert_eq!(
+            bridge_config_lines(&plan.ports),
+            vec![
+                "declared: 3 port(s)".to_string(),
+                "  port 0: slot 0 baud 115200".to_string(),
+                "  port 1: slot 1 baud 115200".to_string(),
+                "  port 2: slot 2 baud 115200".to_string(),
+                "available port indexes: 0, 1, 2".to_string(),
+            ]
+        );
+    }
+
+    /// The index list is the **declared** entries' own positions, not a count: a
+    /// table of two ports declared at different speeds reports its two slots and
+    /// nothing wider.
+    #[test]
+    fn test_a_bridge_config_report_follows_the_declared_ports() {
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                reset: PortReset::ResetPort,
+            },
+            BridgePort {
+                baud: 115_200,
+                reset: PortReset::ResetPort,
+            },
+        ];
+        assert_eq!(
+            bridge_config_lines(&ports),
+            vec![
+                "declared: 2 port(s)".to_string(),
+                "  port 0: slot 0 baud 250000".to_string(),
+                "  port 1: slot 1 baud 115200".to_string(),
+                "available port indexes: 0, 1".to_string(),
+            ]
         );
     }
 

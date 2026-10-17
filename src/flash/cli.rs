@@ -1,11 +1,15 @@
-//! Arguments for the standalone `flash` host binary, and the plan they make.
+//! Arguments for the `admin flash` subcommand (its grammar the standalone `flash`
+//! binary used to speak), plus `admin configure-bridge` and `admin reset`, and
+//! the plans they make.
 //!
-//! [`plan`] is the whole argument grammar as a pure function: it turns the
-//! command line into one [`Action`] (query a CAN bus, or flash one board over
-//! one direct link) or into an error naming the mistake, before anything is
-//! opened or sent. The same grammar `scripts/flashtool.py` speaks, in this
-//! repo's spelling: a serial board is addressed by its device path, a CAN
-//! board by its CANbus UUID plus the node id the session assigns it.
+//! [`plan`] is the flash grammar as a pure function: it turns the command line
+//! into one [`Action`] (query a CAN bus, or flash one board over one direct link)
+//! or into an error naming the mistake, before anything is opened or sent. The
+//! same grammar `scripts/flashtool.py` speaks, in this repo's spelling: a serial
+//! board is addressed by its device path, a CAN board by its CANbus UUID plus the
+//! node id the session assigns it. [`plan_configure_bridge`] and [`plan_reset`]
+//! are the bridge-side siblings: the same bridge grammar, without a firmware to
+//! write.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -33,7 +37,7 @@ const DEFAULT_NODEID: u32 = 128;
 /// deadline window a `flashtool.py` query uses.
 const QUERY_WINDOW: Duration = Duration::from_secs(2);
 
-/// The command line of the `flash` binary.
+/// The command line of the `admin flash` subcommand.
 #[derive(Parser, Debug)]
 #[command(
     name = "flash",

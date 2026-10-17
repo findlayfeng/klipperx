@@ -1,11 +1,11 @@
-//! `klipperx scan` — list the boards that have no node id yet, on a CAN bus or
+//! `klipperx admin scan` — list the boards that have no node id yet, on a CAN bus or
 //! a serial port.
 //!
 //! One command covers both transports because the question is the same one:
 //! which boards has a `printer.cfg` still to name? The answer is always a UUID
 //! (what a `[mcu]` section then writes in `uuid:`) and an application name. The
 //! transport is chosen by the arguments, not by a second command, and it must
-//! be named: the subcommand has no default bus, so a bare `klipperx scan`
+//! be named: the subcommand has no default bus, so a bare `klipperx admin scan`
 //! prints its help rather than guessing at one.
 //!
 //! - `--interface <name>` — that CAN bus, as Klipper's

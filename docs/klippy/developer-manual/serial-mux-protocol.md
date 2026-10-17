@@ -321,7 +321,7 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 | 后端 | 文件 | `BRIDGE_UART_COUNT` | 口在哪 |
 |------|------|---------------------|--------|
 | STM32（USART） | `third_party/klipper/src/stm32/bridge_serial.c` | 选中的 USART 个数（0..=5） | 编译期固定的 USART：总开关 `CONFIG_STM32_BRIDGE_SERIAL`（默认 n，`select` 后端与 `MUX_SERIAL`）下多选 `STM32_BRIDGE_SERIAL_USART1/2/3`、`_UART4/_UART5`，每个勾上的 USART 就是一个口（`RESERVE_PINS_bridge_serial*` = `RX,TX`） |
-| **STM32（CAN）** | `third_party/klipper/src/generic/bridge_can.c` | **`1`**（计入口数，**不占 USART 槽**） | 一个 bxCAN 控制器：`CONFIG_STM32_BRIDGE_CAN_PB8_PB9`（`select BRIDGE_PORT_CAN` + `CANBUS_FILTER_MULTI`，**不** select `CANSERIAL`/`MUX_CAN`，也**不** select `CANBUS`——端口型 build 不是 CAN 节点）。槽名来自 `RESERVE_PINS_bridge_can` = `PB8,PB9`。**F1 上它 `depends on !(MACH_STM32F1 && USBSERIAL)`**：USB 与 CAN1 RX0 共用中断向量 20 |
+| **STM32（CAN）** | `third_party/klipper/src/generic/bridge_can.c` | **`1`**（计入口数，**不占 USART 槽**） | 一个 bxCAN 控制器：`CONFIG_STM32_BRIDGE_CAN_PB8_PB9`（`select BRIDGE_PORT_CAN` + `CANBUS_FILTER_MULTI`，**不** select `CANSERIAL`/`MUX_CAN`，也**不** select `CANBUS`——端口型 build 不是 CAN 节点）。槽名来自 `RESERVE_PINS_bridge_can` = `PB8,PB9`，**该常数由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下声明**（引脚属于 arch；节点型 build 里同一个分支声明的是 `RESERVE_PINS_CAN`，两名字不会同时出现在一份字典里）。**F1 上它 `depends on !(MACH_STM32F1 && USBSERIAL)`**：USB 与 CAN1 RX0 共用中断向量 20 |
 | linux 进程 | `third_party/klipper/src/linux/bridge.c` | `1` | 环境变量 `KLIPPER_BRIDGE_PORT_0` 给的 tty（只有一条静态流，`port_backend_open` 拒一切非 0 槽） |
 | host 库 | `third_party/klipper/src/host/bridge.c` | `KLIPPER_HOST_PORT_SLOTS`（= **4**，`host/klipper_host.h`） | 每槽一路独立流（独立 fd / 发送队列 / reset 状态机），tty 由 `klipper_host_port(slot, path)` 在 `init` 前登记，未登记则回落 `CONFIG_HOST_BRIDGE_SERIAL_PATH` |
 
@@ -380,13 +380,38 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 
 一个 CAN 控制器当桥的口，与 USART 口同契约（`bridge_port_ops`：`write` 整块入队永不断块、`reset = NULL`），差在**寻址在总线上的 arb 里**：
 
-| 情形 | 桥交下来的 blob | 用哪个 arb |
-|---|---|---|
-| UNITS 口 | 整单元（头 + 帧） | 单元头解出的 arb（主机放进去的地址） |
-| legacy / 隧道口 | 已剥头（裸帧 / katapult 块） | 端口记的 `node_id` → `0x100 + 2*node` |
-| 两者都没有 | — | 丢弃并计数（不阻塞、不 `shutdown`） |
+| 情形 | 桥交下来的 blob | 总线上发的字节 | 用哪个 arb |
+|---|---|---|---|
+| UNITS 口 | 整单元（头 + 帧） | **剥头后的帧**（按 8 B 切片） | 单元头解出的 arb（主机放进去的地址） |
+| legacy / 隧道口 | 已剥头（裸帧 / katapult 块） | 原样（按 8 B 切片） | 端口记的 `node_id` → `0x100 + 2*node` |
+| 两者都没有 | — | — | 丢弃并计数（不阻塞、不 `shutdown`） |
 
 收侧按 **node** 分桶重组（最多 `BRIDGE_CAN_NODE_MAX` = 4 个 id），凑齐整单元后才交路由器——一条总线上的多台设备帧是逐帧交错的，不分桶就没有边界。
+
+**单元头与 arb：一个地址只上线一次**（这是这一层的设计意图，改动前先读这段）
+
+单元头（2 字节，`0x100 + 2*id`）是**主机↔桥这一段**的寻址层：主机靠它分派到 MCU 槽，路由器靠它查
+「哪台设备在哪个口」。到了 CAN 上，同一个地址已经由**报文仲裁 id** 承载，所以头在这里是**纯冗余**，
+跨上总线时必须**即解即剥**，不能跟着切片一起走：
+
+| 段 | 谁带头 / 谁剥头 | 为什么 |
+|---|---|---|
+| 主机 → 桥 | 主机带（头 = 目标 id） | 桥的路由表按它查口 |
+| 桥 → 总线（数据） | 桥**解头取 arb、剥头** | arb 已经就是这个地址；再带一遍等于让同一地址在总线上出现两次，白占 2 字节/单元（常常多一整个 CAN 帧），还让设备多一层 arb 校验——校验不过就静默丢帧 |
+| 总线 → 桥（数据） | 设备按自己的 node id 带头 | 这是**主机线格式**：桥把单元原样上交，主机按头分派到 slot。桥不改写它 |
+| 桥 → 主机 | 不加头（已带） | — |
+
+**只有两种形状允许头上线**，且都不是数据路径：
+
+1. **admin 通道**：有 CAN 原生形态的命令（`0x00`/`0x01`/`0x02`）由端口翻译成 `0x3f0` 单帧，**单元不再下发**；
+   没有原生形态的（`0x05 RESTART_DEVICE`）只能整单元发到设备自己的 arb——这里的头是**通道标记**
+   （`0x3f0` = admin），不是设备地址。
+2. **隧道**（`0x06`）：裸字节流（katapult 块），按端口 `node_id` 的 arb 发，本来就没有头。
+
+> 反例留档（2026-10-17）：曾有一版把 UNITS 口改成「整单元连头下发」，理由是「设备侧 `mux_input`
+> 没有 arb 参数、只能从头里解」。那是错的——设备侧的裸帧分支本来就是独占路径的合法形状
+> （`src/mux.c` 的 `mux_input`：`buf[0]` 最高位为 0 即交给帧解析器）。真机反证：改回去之后会话行为
+> 一模一样。**头不要在数据路径上重复上线。**
 
 **CAN 单帧 admin 的代理**（这是它与 USART 口最大的不同）：CAN 上的发现/指派对话不走单元，走 `0x3f0`/`0x3f1` 单帧（`generic/canserial.c` 的 `can_process_admin`）。端口两向翻译：
 
@@ -394,8 +419,8 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 |---|---|
 | `[0x00]` 扫描 | `0x3f0 [0x00]` |
 | `[0x01][uuid][id]` 指派 | `0x3f0 [0x01][uuid][id]` **和** `0x3f0 [0x11][uuid][id]`（klipper 应用 / katapult 各认一条） |
-| `[0x02][index][uuid]` 送引导 | `0x3f0 [0x02][uuid]` 单帧 **且**照旧把单元发下去 |
-| `[0x05]` 重启等 | 原样按单元发下去（mux 设备自己的命令） |
+| `[0x02][index][uuid]` 送引导 | `0x3f0 [0x02][uuid]` **单帧**（翻译即全部，不再重发单元） |
+| `[0x05]` 重启等 | 无 CAN 原生形态：整单元原样发到设备自己的 arb（mux 设备自己的命令，头是通道标记） |
 
 带上 uuid 的那条是关键：**单帧与载具无关**，所以它读不懂切片单元的设备也能被送进引导。
 

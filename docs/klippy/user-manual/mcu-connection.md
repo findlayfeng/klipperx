@@ -11,7 +11,7 @@
 | `canbus_fd` | CAN **链路层**：`true` = CAN-FD（64 B/帧），默认 `false` = 经典 CAN（8 B/帧） | 只在 CAN 节有意义（其余节写它会被判「第二个接口」）。不写 = `false`，与今天逐字节同行为 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**2026-10-16 起一进程可跑多份库**：库不再装进程级 `SIGUSR1`（唤醒改按实例 `eventfd`），运行期/配置层那两处「按路径拒绝第二条」的守卫也已去掉；要两份**同进程独立固件**须加载**两份不同文件的拷贝**（`dlopen` 按 inode 识别，同一文件仍返回同一映射），同路径多节则照旧只加载一次并共享。|
 | `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥 |
-| `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥。**配置面仍未接线**：固件的 CAN **端口**后端（`BRIDGE_PORT_CAN`）已经落地并经真机验过（发现/指派/刷写/反复刷），但**这条配置路径**（`[can_device]` + `[mcu child]`）还没放开，配置期仍点名拒绝；命令行侧的 CAN 口完全可用，见[经桥刷下游](#经桥刷下游klipperx-admin-不用-printercfg)一节的 CAN 小节 |
+| `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥。**配置面已接线**：主机为端口节发 `config_can`（带 `can_bitrate`）+ `config_bridge_port`，端口 `index` = 声明顺序（同 `uart_device`）；附着时发 `SET_PORT_NODEID` → 设备命名（CAN 走 `0x3f0` 单帧 + `0x3f1` 应答，不等串口 mux 的重确认）。**已知缺陷（2026-10-17 真机）**：桥侧附着与 admin 通道（发现/指派/送引导/隧道刷写）已验，但**运行期 units 数据面尚未修通**（`identify` 无应答，定位中）；命令行侧的 CAN 口不受影响，见[经桥刷下游](#经桥刷下游klipperx-admin-不用-printercfg)一节的 CAN 小节 |
 
 ```ini
 [mcu]
@@ -199,7 +199,10 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
   正常代价，不是配置错。
 - 桥已在我们上一条命令里被赋过 node id 时，紧接着的**下一条命令**可能先报一次 `opening the bridge: Receive timeout`
   ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）；仍失败就等几秒再试，或用 `--bridge-uuid`。
-- **`printer.cfg` 侧仍未接线**：`[can_device]` 下游端口节仍被配置期点名拒绝（CLI 侧的 CAN 口已可用，见下节）。
+- **`printer.cfg` 侧已接线**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，
+  子设备用 `can:` 按名字引用；附着顺序是「路由（`SET_PORT_NODEID`）→ 设备命名（`0x3f0` 单帧，等 `0x3f1` 应答，
+  超时也算已发出）」。**运行期 units 数据面仍有一条未修通的真机缺陷**（桥侧附着正常、`identify` 无应答，
+  见 [串口复用协议](../developer-manual/serial-mux-protocol.md) 的 CAN 小节）。
 
 ### CAN 下游口（真机已闭环：发现 → 指派 → 写 → 反复写）
 

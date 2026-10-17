@@ -61,14 +61,18 @@ use crate::core::klippy::cmd::stepper::{
 };
 use crate::core::klippy::cmd::uptime::{GetUptime, Uptime};
 use crate::core::klippy::cmd::{GetClock, McuCommand};
-use crate::core::klippy::config::mcu::McuConfig;
+use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::extras::board_pins::BoardPins;
 use crate::core::klippy::mathutil::Xyz;
-use crate::core::klippy::mcu::{pin_number, ConfigBuilder, Mcu, McuChip, McuError};
+use crate::core::klippy::mcu::port_grouping::{self, PortKind};
+use crate::core::klippy::mcu::{
+    bridge_attach, bridge_ports, ids, load_config as load_mcu_object, pin_number, ConfigBuilder,
+    Mcu, McuChip, McuError, McuObject,
+};
 use crate::core::klippy::motion::{Axis, StepCommand, Stepper, Trapq};
 use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
-use crate::core::klippy::printer::Printer;
+use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::ManualReactor;
 
 /// The first step rate to try, in steps per second.
@@ -244,6 +248,7 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (config, _sources) = Config::from_file(&args.config_file)?;
     let names = select_mcus(&config, &args.mcu, args.all_mcus)
         .map_err(|err| format!("{err} in {}", args.config_file))?;
+    refuse_driven_bridges(&config, &names)?;
 
     // The run's pin vocabulary: one chip per `[mcu]` section (so `[board_pins]`
     // may name any of them) and the config's aliases, loaded through the same
@@ -255,31 +260,32 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Connect one board at a time: each opens its own port and runs its own
     // identify, and a board that refuses must not stop the others from being
-    // driven — its failure is reported at the end instead.
-    let mut boards: Vec<(McuConfig, Arc<Mcu>)> = Vec::new();
+    // driven — its failure is reported at the end instead. A `uart:`/`can:`
+    // device is opened through its bridge (`open_board`), and the bridge hosts
+    // are loaded once per bridge so two devices on one bridge share the one
+    // session its link needs.
+    let mut boards: Vec<OpenedBoard> = Vec::new();
+    let mut hosts: Vec<(String, Arc<BridgeHost>)> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for name in &names {
-        let connected = match resolve_mcu(&config, name) {
-            Ok(mcu_config) => match connect(&mcu_config).await {
-                Ok(mcu) => Ok((mcu_config, mcu)),
-                Err(err) => Err(err.to_string()),
-            },
-            Err(err) => Err(err),
-        };
-        match connected {
-            Ok((mcu_config, mcu)) => {
+        match open_board(&config, &mut hosts, name).await {
+            Ok(board) => {
                 println!(
                     "{}",
                     tagged(
                         name,
                         format!(
                             "connected to MCU '{}' ({} command(s) in its dictionary)",
-                            mcu_config.name,
-                            mcu.dictionary().map(|d| d.commands().len()).unwrap_or(0)
+                            board.mcu_config.name,
+                            board
+                                .mcu
+                                .dictionary()
+                                .map(|d| d.commands().len())
+                                .unwrap_or(0)
                         )
                     )
                 );
-                boards.push((mcu_config, mcu));
+                boards.push(board);
             }
             Err(err) => {
                 println!("{}", tagged(name, format!("connect failed: {err}")));
@@ -326,23 +332,39 @@ enum BoardOutcome {
 /// Returns the board failures (part of the command's closing error) and how
 /// many boards ran their task.
 async fn drive_boards(
-    boards: Vec<(McuConfig, Arc<Mcu>)>,
+    boards: Vec<OpenedBoard>,
     config: &Config,
     args: &StressArgs,
     pins: &Arc<PrinterPins>,
 ) -> (Vec<String>, usize) {
-    let named = !args.all_mcus;
-    let (mcu_configs, connections): (Vec<McuConfig>, Vec<Arc<Mcu>>) = boards.into_iter().unzip();
+    let mut mcu_configs: Vec<McuConfig> = Vec::with_capacity(boards.len());
+    let mut connections: Vec<Arc<Mcu>> = Vec::with_capacity(boards.len());
+    let mut bridges: Vec<Option<Arc<BridgeHost>>> = Vec::with_capacity(boards.len());
+    for board in boards {
+        mcu_configs.push(board.mcu_config);
+        connections.push(board.mcu);
+        bridges.push(board.bridge);
+    }
     // One future per connected board, polled together: the ramps interleave on
-    // the same runtime, each with its own port, tasks and state. `named` says
-    // which boards the command promised a stepper: every board except the ones
-    // `--all-mcus` enumerated (that flag takes names of none of its own). The
-    // sessions move into these futures — nothing outside the join below holds
-    // one, or the reconnect's `drop(mcu)` would close nothing.
+    // the same runtime, each with its own port, tasks and state. The sessions
+    // move into these futures — nothing outside the join below holds one, or the
+    // reconnect's `drop(mcu)` would close nothing. A board's bridge host moves
+    // with it, and closes when its last device is done.
     let ramps = connections
         .into_iter()
         .zip(&mcu_configs)
-        .map(|(mcu, mcu_config)| run_board(mcu_config, mcu, args.task, config, args, named, pins))
+        .zip(&bridges)
+        .map(|((mcu, mcu_config), bridge)| {
+            run_board(
+                mcu_config,
+                mcu,
+                bridge.as_deref(),
+                args.task,
+                config,
+                args,
+                pins,
+            )
+        })
         .collect::<Vec<_>>();
     let mut failures = Vec::new();
     let mut ran = 0usize;
@@ -368,12 +390,16 @@ async fn drive_boards(
 async fn run_board(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     task: Task,
     config: &Config,
     args: &StressArgs,
-    named: bool,
     pins: &Arc<PrinterPins>,
 ) -> Result<BoardOutcome, Box<dyn std::error::Error>> {
+    // Whether the command promised this board a stepper: every board except the
+    // ones `--all-mcus` enumerated itself (that flag takes names of none of its
+    // own).
+    let named = !args.all_mcus;
     // The session's only reference from the moment this future runs: a caller
     // holding a clone would leave `configure_steppers`' `drop(mcu)` in the
     // `ResetRequired` reconnect releasing nothing, so the old receive task
@@ -385,9 +411,9 @@ async fn run_board(
         mcu_config.name
     );
     match task {
-        Task::Step => step_stress(mcu_config, mcu, config, args, named, pins).await,
+        Task::Step => step_stress(mcu_config, mcu, bridge, config, args, named, pins).await,
         Task::Comm => comm_stress(mcu, args).await.map(|()| BoardOutcome::Ran),
-        Task::Motion => motion_smoke(mcu_config, mcu, config, pins)
+        Task::Motion => motion_smoke(mcu_config, mcu, bridge, config, pins)
             .await
             .map(|()| BoardOutcome::Ran),
     }
@@ -482,6 +508,7 @@ fn summary_line(mcu: &str, kind: &str, last_good: Option<f64>, unit: &str) -> St
 async fn step_stress(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     config: &Config,
     args: &StressArgs,
     named: bool,
@@ -515,7 +542,7 @@ async fn step_stress(
 
     // The handshake can reconnect (a firmware with no `config_reset` reboots), so
     // bind the events only once the connection is final.
-    let (oids, mcu) = configure_steppers(mcu_config, mcu, pins, &steppers).await?;
+    let (oids, mcu) = configure_steppers(mcu_config, mcu, bridge, pins, &steppers).await?;
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
 
@@ -926,6 +953,14 @@ fn select_mcus(config: &Config, requested: &[String], all: bool) -> Result<Vec<S
 ///
 /// The error says which section is missing; the caller adds where it looked
 /// (the config file).
+///
+/// The parse gets the **whole config** (not just the section), because a
+/// `uart:` / `can:` section's transport is defined by a sibling section: the
+/// `[uart_device]` / `[can_device]` its reference names has to be found
+/// (`config/wrapper.rs::with_config`), and the port grouping that decides
+/// shared/legacy/named is the whole config's (`mcu/port_grouping.rs`). Without
+/// it every bridge-port device was refused with "the config has no
+/// [uart_device …] section".
 fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
     let section = find_mcu_section(config, name).ok_or_else(|| {
         if name == "mcu" {
@@ -934,8 +969,342 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
             format!("no [mcu {name}] section")
         }
     })?;
-    McuConfig::new(&ConfigWrapper::new(section, AccessTracking::shared()))
-        .map_err(|err| err.to_string())
+    McuConfig::new(&ConfigWrapper::with_config(
+        section,
+        AccessTracking::shared(),
+        None,
+        config,
+    ))
+    .map_err(|err| err.to_string())
+}
+
+/// How one selected board's session is opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Connection {
+    /// A transport of the board's own (`serial:`, `canbus_interface:`,
+    /// `host_library:`, `test:`): opened and identified directly.
+    Direct,
+    /// A device on a bridge's downstream port (`uart:`/`can:`): it has no
+    /// transport of its own to open, and is reached on the **bridge's** link
+    /// with the port-level route (`mcu/bridge_attach.rs`).
+    BridgePort,
+}
+
+/// Which of the two a parsed section asks for.
+fn connection_of(mcu_config: &McuConfig) -> Connection {
+    match mcu_config.transport {
+        Transport::BridgePort { .. } => Connection::BridgePort,
+        _ => Connection::Direct,
+    }
+}
+
+/// The `[mcu]` a bridge-port device's port section names as its bridge: the
+/// `uart_mcu:` / `can_mcu:` of the section the device's `uart:` / `can:`
+/// reference resolved to.
+///
+/// Read raw, the way the pre-scans in `mcu/bridge_ports.rs` read it: the port
+/// section's factory is what validates the name, so a config that got this far
+/// has already checked that the `[mcu]` exists.
+fn bridge_of_port(config: &Config, mcu_config: &McuConfig) -> Result<String, String> {
+    let Transport::BridgePort { port, kind, .. } = &mcu_config.transport else {
+        return Err(format!("MCU '{}' is on no bridge port", mcu_config.name));
+    };
+    let option = bridge_port_option(*kind);
+    config
+        .sections()
+        .find(|section| section.identifier() == *port)
+        .and_then(|section| section.get_text(option))
+        .map(|text| text.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| format!("no [{port}] section writing '{option}:'"))
+}
+
+/// The option a port section names its bridge with: `uart_mcu` /
+/// `can_mcu` (`mcu/bridge_ports.rs`).
+fn bridge_port_option(kind: PortKind) -> &'static str {
+    match kind {
+        PortKind::Uart => "uart_mcu",
+        PortKind::Can => "can_mcu",
+    }
+}
+
+/// Every port section of `bridge`, in config order.
+///
+/// **All** of them, not only the port the run drives: a port's index on its
+/// bridge is its declaration order among that bridge's ports
+/// (`mcu/bridge_ports.rs::wire_bridge_port`), and the firmware's router numbers
+/// ports by the order the host's `config_bridge_port` commands arrive. Loading a
+/// subset would renumber the port under test and route its frames to another
+/// one.
+fn port_sections<'a>(config: &'a Config, bridge: &str) -> Vec<&'a ConfigSection> {
+    config
+        .sections()
+        .filter(|section| matches!(section.id.as_str(), "uart_device" | "can_device"))
+        .filter(|section| {
+            let option = if section.id == "uart_device" {
+                bridge_port_option(PortKind::Uart)
+            } else {
+                bridge_port_option(PortKind::Can)
+            };
+            section
+                .get_text(option)
+                .map(|text| text.trim() == bridge)
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// A bridge brought up for the devices behind its ports.
+///
+/// A scratch printer — the shape [`build_pin_registry`] uses for the pin
+/// vocabulary — carrying exactly what the attach pass looks up by name: the
+/// bridge's `[mcu]` object and its `[uart_device]` / `[can_device]` sections,
+/// built by production's own factories so each port takes the index and the
+/// builder commands production would give it. The device under test is **not**
+/// loaded: it is reached through this bridge, and an object of its own would
+/// open a second session under one id.
+///
+/// The printer has to outlive every session opened through it: the bridge's
+/// link **is** the downstream device's link, so dropping the bridge closes it.
+struct BridgeHost {
+    /// Where the bridge and its ports are registered, by section identifier.
+    printer: Arc<Printer>,
+    /// The bridge's `[mcu]` object: the session a port is resolved against has
+    /// to be up before a device on that port can be.
+    bridge: Arc<McuObject>,
+    /// The id each device was given, by section name, for as long as this host
+    /// lives: a session reopened after a `reset` must be addressed by the id its
+    /// previous one had. The allocator hands out a fresh id per registration
+    /// (`mcu/ids.rs`), and a CAN bus uuid may only be registered once, so a
+    /// reconnect without this would take a different id or fail outright.
+    ids: Mutex<Vec<(String, u32)>>,
+}
+
+impl BridgeHost {
+    /// Load `bridge` and every port section that names it.
+    ///
+    /// Bridge first, then its ports — the order the loader's two phases produce
+    /// (`[mcu]` is an `early` section; port sections come with the generic walk)
+    /// and the order a port needs, because wiring one queues its commands on the
+    /// bridge's builder (`mcu/bridge_ports.rs::wire_bridge_port`).
+    fn load(config: &Config, bridge: &str) -> Result<Self, String> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        // `McuObject::new` expects the pin registry the loader registers before
+        // any section; nothing here resolves a pin, but the object is built the
+        // way production builds it.
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .map_err(|err| format!("pins: {err}"))?;
+        let section = find_mcu_section(config, bridge).ok_or_else(|| {
+            if bridge == "mcu" {
+                "no [mcu] section".to_string()
+            } else {
+                format!("no [mcu {bridge}] section")
+            }
+        })?;
+        let identifier = section.identifier();
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, config);
+        let parsed =
+            load_mcu_object(&wrapper, &printer).map_err(|err| format!("[{identifier}]: {err}"))?;
+        printer
+            .add_object(&identifier, parsed)
+            .map_err(|err| format!("[{identifier}]: {err}"))?;
+        let bridge_object = printer
+            .lookup_object_as::<McuObject>(&identifier)
+            .ok_or_else(|| format!("[{identifier}] did not load as an MCU"))?;
+        // The port grouping the attach pass reads is the **device's** section's
+        // business in production (its factory registers it, `mcu/object.rs`);
+        // this host has no device object, so the same grouping is registered
+        // here from the whole config.
+        port_grouping::ensure(&printer, &wrapper)
+            .map_err(|err| format!("[{identifier}]: {err}"))?;
+        for port in port_sections(config, bridge) {
+            let identifier = port.identifier();
+            let wrapper = ConfigWrapper::with_config(port, AccessTracking::shared(), None, config);
+            let loaded = if port.id == "uart_device" {
+                bridge_ports::load_uart_device(&wrapper, &printer)
+            } else {
+                bridge_ports::load_can_device(&wrapper, &printer)
+            }
+            .map_err(|err| format!("[{identifier}]: {err}"))?;
+            printer
+                .add_object(&identifier, loaded)
+                .map_err(|err| format!("[{identifier}]: {err}"))?;
+        }
+        Ok(Self {
+            printer,
+            bridge: bridge_object,
+            ids: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Bring the bridge's own session up, once per run.
+    ///
+    /// This is the load's `connect` and nothing else: identify, the
+    /// configuration handshake that creates the ports in the firmware's router,
+    /// and the clock a session is given. A second device on the same bridge
+    /// finds it already up and is resolved against it.
+    async fn bring_up(&self) -> Result<(), String> {
+        if self.bridge.mcu().is_some() {
+            return Ok(());
+        }
+        self.bridge
+            .connect()
+            .await
+            .map_err(|err| format!("the bridge did not come up: {err}"))
+    }
+}
+
+/// The bridge host for `mcu_config`'s port, loaded once per run.
+///
+/// Two devices on one bridge share it: their frames travel the same link, and a
+/// second session on it would be a second reader on the bridge's port.
+fn bridge_host(
+    config: &Config,
+    hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    mcu_config: &McuConfig,
+) -> Result<Arc<BridgeHost>, String> {
+    let bridge = bridge_of_port(config, mcu_config)?;
+    if let Some((_, host)) = hosts.iter().find(|(name, _)| name == &bridge) {
+        return Ok(Arc::clone(host));
+    }
+    let host = Arc::new(BridgeHost::load(config, &bridge)?);
+    hosts.push((bridge, Arc::clone(&host)));
+    Ok(host)
+}
+
+/// The id a bridge-port device's session is addressed by, from the bridge
+/// host's own allocator — the sequence the bridge took its id from, so the two
+/// cannot collide (`mcu/ids.rs`).
+///
+/// Allocated the way the loader allocates one for the device's section
+/// (`mcu/object.rs`): a CAN port's member is a CAN device and registers its
+/// uuid, every other transport takes the lowest free id. A device that already
+/// has one keeps it: a reopened session is the same board, on the same port.
+fn assign_id(host: &BridgeHost, mcu_config: &McuConfig) -> Result<u32, String> {
+    if let Some((_, id)) = host
+        .ids
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .iter()
+        .find(|(name, _)| name == &mcu_config.name)
+    {
+        return Ok(*id);
+    }
+    let allocator = ids::ensure(&host.printer).map_err(|err| err.to_string())?;
+    let id = if let Transport::BridgePort {
+        uuid,
+        kind: PortKind::Can,
+        ..
+    } = &mcu_config.transport
+    {
+        let uuid = uuid.ok_or_else(|| {
+            format!(
+                "MCU '{}': a [can_device] member writes no uuid, so it has no node id to take",
+                mcu_config.name
+            )
+        })?;
+        allocator
+            .register_can(&mcu_config.name, uuid, mcu_config.id)
+            .map_err(|err| err.to_string())?
+    } else {
+        allocator
+            .register(&mcu_config.name)
+            .map_err(|err| err.to_string())?
+    };
+    host.ids
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push((mcu_config.name.clone(), id));
+    Ok(id)
+}
+
+/// Open a bridge-port device's session: the bridge first, then the port's route
+/// and the device's own naming handshake (`mcu/bridge_attach.rs`), then the
+/// identify every session runs.
+async fn connect_bridged(
+    host: &BridgeHost,
+    mcu_config: &McuConfig,
+) -> Result<Arc<Mcu>, std::io::Error> {
+    host.bring_up().await.map_err(std::io::Error::other)?;
+    let id = assign_id(host, mcu_config).map_err(std::io::Error::other)?;
+    let link = bridge_attach::resolve(&host.printer, mcu_config)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    let interface = bridge_attach::open(&host.printer, &link, id)
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    Mcu::connect(&mcu_config.name, interface)
+        .await
+        .map_err(|err| std::io::Error::other(format!("{}: {err}", mcu_config.name)))
+}
+
+/// One board the run opened: its section, its session, and — for a device on a
+/// bridge port — the bridge that session travels.
+struct OpenedBoard {
+    mcu_config: McuConfig,
+    mcu: Arc<Mcu>,
+    /// The bridge whose link carries this session (`uart:` / `can:`), or `None`
+    /// for a board on a transport of its own. Held so the bridge outlives the
+    /// session: it is dropped when the last device on it is, and a reconnect
+    /// re-attaches through it.
+    bridge: Option<Arc<BridgeHost>>,
+}
+
+/// Open one selected board's session, whichever of the two kinds it is.
+async fn open_board(
+    config: &Config,
+    hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    name: &str,
+) -> Result<OpenedBoard, String> {
+    let mcu_config = resolve_mcu(config, name)?;
+    match connection_of(&mcu_config) {
+        Connection::Direct => {
+            let mcu = connect(&mcu_config).await.map_err(|err| err.to_string())?;
+            Ok(OpenedBoard {
+                mcu_config,
+                mcu,
+                bridge: None,
+            })
+        }
+        Connection::BridgePort => {
+            let host = bridge_host(config, hosts, &mcu_config)?;
+            let mcu = connect_bridged(&host, &mcu_config)
+                .await
+                .map_err(|err| err.to_string())?;
+            Ok(OpenedBoard {
+                mcu_config,
+                mcu,
+                bridge: Some(host),
+            })
+        }
+    }
+}
+
+/// Refuse a run that names both a bridge and a device on one of its ports.
+///
+/// A bridge-port device's bring-up opens the bridge itself — `resolve` needs the
+/// bridge's session up, and its link is where the device's frames travel — so a
+/// bridge the run also drives would be opened twice: two sessions, two readers
+/// on one port, and every frame answered to whoever wins. One run drives one
+/// side of a bridge.
+fn refuse_driven_bridges(config: &Config, names: &[String]) -> Result<(), String> {
+    for name in names {
+        let Ok(mcu_config) = resolve_mcu(config, name) else {
+            // A board that does not resolve is reported as its own failure later.
+            continue;
+        };
+        if connection_of(&mcu_config) != Connection::BridgePort {
+            continue;
+        }
+        let bridge = bridge_of_port(config, &mcu_config)?;
+        if names.iter().any(|other| other == &bridge) {
+            return Err(format!(
+                "MCU '{name}' hangs on a port of '{bridge}', which this run also drives: the device \
+                 is reached through the bridge's own session, so the two cannot be driven at once — \
+                 name one of them"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The `--task motion` smoke: drive the board's first stepper through the host's
@@ -952,6 +1321,7 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
 async fn motion_smoke(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     config: &Config,
     pins: &Arc<PrinterPins>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -968,7 +1338,7 @@ async fn motion_smoke(
     let Some(section) = steppers.into_iter().next() else {
         return Err(no_stepper_error(&mcu_config.name, &rejected).into());
     };
-    move_one_axis(mcu_config, mcu, pins, section, DISTANCE, SPEED).await
+    move_one_axis(mcu_config, mcu, bridge, pins, section, DISTANCE, SPEED).await
 }
 
 /// Drive one `section` through the host's motion path and read its position
@@ -982,6 +1352,7 @@ async fn motion_smoke(
 async fn move_one_axis(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     pins: &Arc<PrinterPins>,
     section: StepperSource,
     distance: f64,
@@ -1003,8 +1374,14 @@ async fn move_one_axis(
             )
         )
     );
-    let (oids, mcu) =
-        configure_steppers(mcu_config, mcu, pins, std::slice::from_ref(&section)).await?;
+    let (oids, mcu) = configure_steppers(
+        mcu_config,
+        mcu,
+        bridge,
+        pins,
+        std::slice::from_ref(&section),
+    )
+    .await?;
     let oid = oids[0];
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
 
@@ -1090,13 +1467,20 @@ async fn move_one_axis(
 async fn step_soak(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     pins: &Arc<PrinterPins>,
     section: StepperSource,
     rate: f64,
     seconds: f64,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let (oids, mcu) =
-        configure_steppers(mcu_config, mcu, pins, std::slice::from_ref(&section)).await?;
+    let (oids, mcu) = configure_steppers(
+        mcu_config,
+        mcu,
+        bridge,
+        pins,
+        std::slice::from_ref(&section),
+    )
+    .await?;
     let oid = oids[0];
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
@@ -1598,11 +1982,22 @@ async fn connect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
 }
 
 /// Reopen the board after it was told to `reset`, retrying while it re-enumerates.
-async fn reconnect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
+///
+/// `bridge` is the link a `uart:`/`can:` device travels: its reopen is a fresh
+/// attach through the same bridge port (the bridge itself is already up), never
+/// a transport of its own.
+async fn reconnect(
+    mcu_config: &McuConfig,
+    bridge: Option<&BridgeHost>,
+) -> Result<Arc<Mcu>, std::io::Error> {
     let mut last = String::new();
     for _ in 0..RECONNECT_ATTEMPTS {
         tokio::time::sleep(RECONNECT_DELAY).await;
-        match connect(mcu_config).await {
+        let attempt = match bridge {
+            Some(host) => connect_bridged(host, mcu_config).await,
+            None => connect(mcu_config).await,
+        };
+        match attempt {
             Ok(mcu) => return Ok(mcu),
             Err(err) => last = err.to_string(),
         }
@@ -1684,6 +2079,7 @@ fn load_board_pins(
 async fn configure_steppers(
     mcu_config: &McuConfig,
     mut mcu: Arc<Mcu>,
+    bridge: Option<&BridgeHost>,
     pins: &PrinterPins,
     sections: &[StepperSource],
 ) -> Result<(Vec<u8>, Arc<Mcu>), std::io::Error> {
@@ -1785,7 +2181,7 @@ async fn configure_steppers(
                     mcu_config.name
                 );
                 drop(mcu);
-                mcu = reconnect(mcu_config).await?;
+                mcu = reconnect(mcu_config, bridge).await?;
                 println!(
                     "{}",
                     tagged(
@@ -2253,6 +2649,153 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Devices behind a bridge's downstream port (`uart:` / `can:`)
+    // -----------------------------------------------------------------------
+
+    /// The identity the fixture's child writes, one spelling for the config text
+    /// and the assertions.
+    const CHILD_UUID: [u8; 6] = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+
+    /// A config with a bridge, two of its UART ports, and a named device on the
+    /// **second** one — the shape a real printer has.
+    ///
+    /// The bridge is a `test:` fake, so the whole file parses and loads without a
+    /// device: what is under test is the stress-side bring-up, not a transport.
+    fn bridge_config() -> Config {
+        let dict = klipperx_test_support::test_dicts_dir().join("linuxprocess-bridge.dict");
+        let text = format!(
+            "[mcu bridge]\ntest: dict={}\n\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\n\
+             [uart_device uart1]\nuart_mcu: bridge\nuart_oid: uart1\n\n\
+             [mcu child]\nuart: uart1\nuuid: 11aa22bb33cc\n",
+            dict.display()
+        );
+        Config::from_text(&text).expect("a bridge config parses").0
+    }
+
+    /// A `uart:` device on a bridge port parses, and the run brings it up
+    /// **through the bridge** rather than on a transport of its own.
+    ///
+    /// This is the root cause pinned down: the section's transport names a
+    /// sibling section, so a parse without the whole config refused every
+    /// bridge-port device with "the config has no [uart_device uart1] section".
+    #[test]
+    fn a_device_on_a_bridge_port_resolves_to_the_bridge_bring_up() {
+        let config = bridge_config();
+
+        let child = resolve_mcu(&config, "child").expect("a bridge-port child resolves");
+        match &child.transport {
+            Transport::BridgePort { port, uuid, kind } => {
+                assert_eq!(port, "uart_device uart1");
+                assert_eq!(*kind, PortKind::Uart);
+                assert_eq!(*uuid, Some(CHILD_UUID));
+            }
+            other => panic!("a uart: section is a bridge port, got {other:?}"),
+        }
+        assert_eq!(connection_of(&child), Connection::BridgePort);
+        assert_eq!(
+            bridge_of_port(&config, &child).expect("the port names its bridge"),
+            "bridge"
+        );
+
+        // The bridge itself is a board like any other, and a board on a
+        // transport of its own keeps the bring-up it always had.
+        let bridge = resolve_mcu(&config, "bridge").expect("the bridge is a board");
+        assert_eq!(connection_of(&bridge), Connection::Direct);
+        assert!(
+            bridge_of_port(&config, &bridge).is_err(),
+            "a board on its own transport is on no port"
+        );
+        let (serial, _) =
+            Config::from_text("[mcu]\nserial: /dev/ttyACM0\n").expect("a serial config parses");
+        let direct = resolve_mcu(&serial, "mcu").expect("a serial section resolves");
+        assert!(matches!(direct.transport, Transport::Serial { .. }));
+        assert_eq!(connection_of(&direct), Connection::Direct);
+    }
+
+    /// The bridge host the run builds loads the bridge and **every** port of it,
+    /// in declaration order — and then the attach pass resolves the device's own
+    /// port against the bridge's session.
+    ///
+    /// The ports' indices are the point of loading all of them: a port's index on
+    /// its bridge is its declaration order among that bridge's ports
+    /// (`mcu/bridge_ports.rs::wire_bridge_port`), and the firmware's router
+    /// numbers ports by the order the host's `config_bridge_port` commands
+    /// arrive. Loading only the port under test would route its frames to the
+    /// first port instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_host_loads_every_port_and_resolves_the_devices_own() {
+        use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
+
+        let config = bridge_config();
+        let host = BridgeHost::load(&config, "bridge").expect("the bridge host loads");
+        for (port, index) in [("uart_device uart0", 0u8), ("uart_device uart1", 1)] {
+            let loaded = host
+                .printer
+                .lookup_object_as::<bridge_ports::UartPort>(port)
+                .unwrap_or_else(|| panic!("[{port}] is loaded"));
+            assert_eq!(
+                loaded.index(),
+                Some(index),
+                "[{port}]'s index on its bridge"
+            );
+        }
+        // The device under test is not loaded as an object of its own: it is
+        // reached through the bridge, and a second object would open a second
+        // session under one id.
+        assert!(host
+            .printer
+            .lookup_object_as::<McuObject>("mcu child")
+            .is_none());
+        // Loading opens nothing: the bridge's session is the run's to make.
+        assert!(host.bridge.mcu().is_none());
+
+        host.bring_up().await.expect("the bridge comes up");
+        let child = resolve_mcu(&config, "child").expect("the child resolves");
+        let link = bridge_attach::resolve(&host.printer, &child)
+            .expect("the port resolves once the bridge is up");
+        assert_eq!(link.index, 1, "the port the device names, not the first");
+        assert_eq!(link.named, Some(CHILD_UUID));
+        assert_eq!(
+            link.flags, MUX_PORT_UNITS,
+            "a named device's port speaks units"
+        );
+        // The open is the attach pass's, on the bridge's link: a `test:` bridge
+        // carries no downstream device, and that is its own refusal — nothing
+        // here opened a transport of the child's.
+        let err = bridge_attach::open(&host.printer, &link, 4)
+            .expect_err("a test: bridge carries no downstream device");
+        assert!(
+            err.to_string().contains("cannot carry a downstream device"),
+            "{err}"
+        );
+    }
+
+    /// A run that names a bridge **and** a device on one of its ports is refused
+    /// before anything is opened: the device's bring-up opens the bridge itself,
+    /// so the bridge would get two sessions — two readers on one port.
+    #[test]
+    fn a_run_cannot_drive_a_bridge_and_a_device_on_its_port() {
+        let config = bridge_config();
+        assert!(
+            refuse_driven_bridges(&config, &["child".to_string()]).is_ok(),
+            "the device alone opens the bridge on its own"
+        );
+        let err = refuse_driven_bridges(&config, &["bridge".to_string(), "child".to_string()])
+            .expect_err("one run drives one side of a bridge");
+        assert!(err.contains("hangs on a port of 'bridge'"), "{err}");
+
+        let (serial, _) = Config::from_text(
+            "[mcu]\nserial: /dev/ttyACM0\n\n[mcu zboard]\nserial: /dev/ttyACM1\n",
+        )
+        .expect("two serial boards parse");
+        assert!(
+            refuse_driven_bridges(&serial, &["mcu".to_string(), "zboard".to_string()]).is_ok(),
+            "boards on transports of their own never conflict"
+        );
+    }
+
     /// The `stress` subcommand's arguments, so a test can parse command lines.
     #[derive(clap::Parser)]
     struct Cli {
@@ -2656,7 +3199,17 @@ mod tests {
         .expect("a short, coarse ramp parses")
         .stress;
         let pins = build_pin_registry(&config).expect("the pin registry builds");
-        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args, &pins).await;
+        let (failures, ran) = drive_boards(
+            vec![OpenedBoard {
+                mcu_config,
+                mcu,
+                bridge: None,
+            }],
+            &config,
+            &args,
+            &pins,
+        )
+        .await;
         assert!(
             failures.is_empty(),
             "the board's ramp does not fail: {failures:?}"
@@ -2747,7 +3300,17 @@ mod tests {
         .stress;
         let pins = build_pin_registry(&config).expect("the pin registry builds");
 
-        let (failures, ran) = drive_boards(vec![(mcu_config, mcu)], &config, &args, &pins).await;
+        let (failures, ran) = drive_boards(
+            vec![OpenedBoard {
+                mcu_config,
+                mcu,
+                bridge: None,
+            }],
+            &config,
+            &args,
+            &pins,
+        )
+        .await;
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(ran, 1, "the comm ramp identified and ran its stages");
     }
@@ -3358,9 +3921,17 @@ mod tests {
             find_steppers(machine.config(), "mcu", &mcu, &pins).0,
             "stepper_x",
         );
-        move_one_axis(&mcu_config, mcu, &pins, section, DISTANCE_MM, SPEED_MM_S)
-            .await
-            .expect("R5: the firmware's step count must match the move");
+        move_one_axis(
+            &mcu_config,
+            mcu,
+            None,
+            &pins,
+            section,
+            DISTANCE_MM,
+            SPEED_MM_S,
+        )
+        .await
+        .expect("R5: the firmware's step count must match the move");
     }
 
     /// R11 — a short, controlled step soak against a real board.
@@ -3413,7 +3984,7 @@ mod tests {
             find_steppers(machine.config(), "mcu", &mcu, &pins).0,
             "stepper_x",
         );
-        let rate = step_soak(&mcu_config, mcu, &pins, section, RATE, SECONDS)
+        let rate = step_soak(&mcu_config, mcu, None, &pins, section, RATE, SECONDS)
             .await
             .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
         println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");

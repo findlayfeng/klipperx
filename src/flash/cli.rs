@@ -20,7 +20,7 @@ use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket
 use crate::core::klippy::interface::HostMux;
 
 use super::bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
-use super::bridge_session::{BridgePort, BridgeTarget, PortReset};
+use super::bridge_session::{BridgePort, BridgeTarget, PortReset, PortRoute};
 use super::session;
 use super::transport;
 
@@ -132,29 +132,30 @@ pub struct FlashArgs {
     pub firmware: Option<PathBuf>,
 }
 
-/// The command line of `admin bridge config`: the bridge's downstream ports, as a
-/// declaration.
+/// The command line of `admin bridge config`: the bridge to ask which UART slots
+/// it offers.
 ///
-/// The bridge side of [`FlashArgs`], and **only** the declaration: the bridge's
-/// oid and port tables are built, and the command stops. Nothing is reset
-/// ([`admin reset`](ResetArgs) does that), no route is named and no tunnel is
-/// opened ([`admin bridge port`](BridgePortArgs) does that), and no firmware is
-/// written ([`admin flash`](FlashArgs) does that).
+/// The bridge side of [`FlashArgs`], and **only** the question: the bridge is
+/// opened, identified, and asked what its backend can carry
+/// (`BRIDGE_UART_COUNT`), and the command stops. Nothing is declared, nothing is
+/// reset ([`admin reset`](ResetArgs) does that), no port is named or tunnelled
+/// ([`admin bridge port`](BridgePortArgs) does that), and no firmware is written
+/// ([`admin flash`](FlashArgs) does that).
 #[derive(Parser, Debug)]
 #[command(
     name = "config",
     version,
-    about = "Declare a bridge's downstream ports, the port table a port-level \
-             command needs, without naming a target, opening a tunnel, resetting \
-             a device, or flashing anything",
+    about = "List the UART slots a bridge offers — one line per port it can be \
+             given — without declaring a port, naming a target, opening a \
+             tunnel, resetting a device, or flashing anything",
     arg_required_else_help = true
 )]
 pub struct BridgeConfigArgs {
-    /// Serial tty of the **bridge** to configure (`/dev/ttyUSB0`)
+    /// Serial tty of the **bridge** to ask (`/dev/ttyUSB0`)
     #[arg(long, value_name = "TTY")]
     pub bridge: Option<String>,
 
-    /// Host library (`libklipper_host.so`) of a **bridge** to configure, when the
+    /// Host library (`libklipper_host.so`) of a **bridge** to ask, when the
     /// bridge is an in-process host library instead of a serial board
     #[arg(long, value_name = "SO")]
     pub bridge_library: Option<String>,
@@ -177,23 +178,28 @@ pub struct BridgeConfigArgs {
     #[arg(long = "port-tty", value_name = "SLOT:PATH")]
     pub port_tty: Vec<String>,
 
-    /// Line speed every declared port opens at, in baud (default 250000)
+    /// Line speed every listed slot opens at, in baud (default 250000)
     #[arg(long, value_name = "BAUD")]
     pub baud: Option<u32>,
 
-    /// How many downstream ports to declare, in order (default 1; the plan's
-    /// port numbering is the declaration order)
+    /// How many UART slots to assume when the bridge reports no
+    /// `BRIDGE_UART_COUNT` (an older firmware; default 1)
     #[arg(long, value_name = "N")]
     pub port_count: Option<u8>,
 }
 
-/// The command line of `admin bridge port`: one declared port, named and
-/// tunnelled.
+/// The command line of `admin bridge port`: one declared port, **enabled** —
+/// declared if the bridge does not have it, named, and tunnelled.
 ///
 /// The bridge side of [`FlashArgs`] after
-/// [`admin bridge config`](BridgeConfigArgs): the target's port is named with the
-/// legacy route and its flashing tunnel is opened, and the command stops. No
-/// device is reset ([`admin reset`](ResetArgs) does that) and nothing is flashed
+/// [`admin bridge config`](BridgeConfigArgs) has said which slots exist: the
+/// port is declared on the bridge (`config_uart` + `config_bridge_port`), named
+/// the **units** way by default (the wire format the mux's devices speak, which
+/// is what makes the port's device addressable by id and its answers
+/// forwardable), and its flashing tunnel is opened; the command stops. `--legacy`
+/// names it the old way instead — no `MUX_PORT_UNITS` — which is what a stock
+/// katapult board behind the port still needs. No device is reset
+/// ([`admin reset`](ResetArgs) does that) and nothing is flashed
 /// ([`admin flash`](FlashArgs) does that).
 #[derive(Parser, Debug)]
 #[command(
@@ -231,39 +237,55 @@ pub struct BridgePortArgs {
     #[arg(long = "port-tty", value_name = "SLOT:PATH")]
     pub port_tty: Vec<String>,
 
-    /// Bridge port to name and tunnel, the declaration's index — a port
-    /// `admin bridge config` declared
+    /// Bridge port to enable and tunnel, the declaration's index — the order
+    /// its UART slot was declared in
     #[arg(long, value_name = "INDEX")]
     pub port: Option<u8>,
 
     /// Node id the bridge names that port with, 1..=255
     #[arg(long, value_name = "ID")]
     pub port_nodeid: Option<u8>,
+
+    /// Line speed the port opens at, in baud (default 250000; a serial bridge's
+    /// own link opens at the same rate)
+    #[arg(long, value_name = "BAUD")]
+    pub baud: Option<u32>,
+
+    /// Name the port the legacy way instead of units: the wire format a device
+    /// that predates the mux speaks — a stock katapult board behind the port,
+    /// whose raw frames the port heads with its own reply id
+    #[arg(long)]
+    pub legacy: bool,
 }
 
-/// A `bridge config` command line, as a plan: the bridge's link and the ports to
-/// declare, all validated before any device is opened.
+/// A `bridge config` command line, as a plan: the bridge's link and the speed
+/// its slots would open at, all validated before any device is opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeConfigPlan {
     /// How the bridge's own link is reached.
     pub source: BridgeLinkSource,
-    /// The line speed every declared port opens at.
+    /// The line speed a listed slot would open at.
     pub baud: u32,
-    /// The ports to declare, in index order.
-    pub ports: Vec<BridgePort>,
+    /// How many slots to assume when the bridge reports no
+    /// `BRIDGE_UART_COUNT` — the fallback for a firmware that predates it.
+    pub port_count: u8,
 }
 
 /// A `bridge port` command line, as a plan: the bridge's link and the port to
-/// name and tunnel, validated before any device is opened.
+/// declare, name and tunnel, validated before any device is opened.
 ///
-/// The link opens at [`DEFAULT_BAUD`]: this command declares no port, so there is
-/// no port speed to choose.
+/// The link opens at `baud`, the same rate the port is declared at: a serial
+/// bridge carries both on its own wire, exactly as a bridge flash does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgePortPlan {
     /// How the bridge's own link is reached.
     pub source: BridgeLinkSource,
-    /// The port to name (legacy) and open the tunnel on.
+    /// The line speed the port is declared at (and the link opens at).
+    pub baud: u32,
+    /// The port to declare, name and tunnel.
     pub target: BridgeTarget,
+    /// How the port is named: units (the default) or legacy.
+    pub route: PortRoute,
 }
 
 /// The command line of `admin reset`.
@@ -605,9 +627,9 @@ fn plan_bridge_link(
 /// naming the first mistake.
 ///
 /// Every rejection happens before any device is opened. The bridge's link is the
-/// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); the port plan is
-/// `--port-count` ports at one speed. No port is named and no reset is chosen:
-/// this command only declares the table.
+/// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); the speed is
+/// what a listed slot would open at, and `--port-count` is only the fallback for
+/// a bridge that cannot answer with its own count.
 pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, String> {
     let source = plan_bridge_link(
         &args.bridge,
@@ -621,18 +643,10 @@ pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, S
     if port_count == 0 {
         return Err("--port-count must be at least 1".into());
     }
-    // The declaration carries only the port's slot and speed; no reset runs in
-    // this command, so every entry's reset is the unused placeholder.
-    let ports = (0..port_count)
-        .map(|_| BridgePort {
-            baud,
-            reset: PortReset::ResetPort,
-        })
-        .collect();
     Ok(BridgeConfigPlan {
         source,
         baud,
-        ports,
+        port_count,
     })
 }
 
@@ -641,9 +655,10 @@ pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, S
 ///
 /// Every rejection happens before any device is opened. The bridge's link is the
 /// same one [`plan_bridge`] builds (shared [`plan_bridge_link`]); `--port` says
-/// which declared port to name and `--port-nodeid` the id the bridge routes it
-/// to — neither has a guessable default, and the id has to be a usable one (not
-/// zero, not the bridge's own link id).
+/// which slot to enable and `--port-nodeid` the id the bridge names it with —
+/// neither has a guessable default, and the id has to be a usable one (not
+/// zero, not the bridge's own link id). `--legacy` picks the wire format the
+/// port is named for.
 pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String> {
     let source = plan_bridge_link(
         &args.bridge,
@@ -669,9 +684,15 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
     }
     Ok(BridgePortPlan {
         source,
+        baud: args.baud.unwrap_or(DEFAULT_BAUD),
         target: BridgeTarget {
             index: port,
             node_id,
+        },
+        route: if args.legacy {
+            PortRoute::Legacy
+        } else {
+            PortRoute::Units
         },
     })
 }
@@ -1009,13 +1030,16 @@ fn open_link(source: &BridgeLinkSource, baud: u32) -> Result<BridgeLink, BridgeF
     }
 }
 
-/// `admin bridge config`: open the bridge, identify it, declare the plan's ports —
-/// and stop.
+/// `admin bridge config`: open the bridge, identify it, ask its firmware which
+/// UART slots its backend offers — and stop.
 ///
-/// Nothing is reset, no route is named and no tunnel is opened: the bridge is
-/// left with its port table, and the report says what was declared and which
-/// indexes the next commands have to name. The runtime is built here for the same
-/// reason [`run_bridge_flash`] builds one — the link is opened inside it.
+/// Nothing is declared, reset, named or tunnelled: the bridge is left exactly as
+/// it was, and the report says which slots a
+/// [`admin bridge port`](BridgePortArgs) can enable. The slots come from the
+/// firmware's own `BRIDGE_UART_COUNT`; a bridge that predates the constant is
+/// reported as such and falls back to the plan's `--port-count`. The runtime is
+/// built here for the same reason [`run_bridge_flash`] builds one — the link is
+/// opened inside it.
 pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_bridge_config(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1026,73 +1050,130 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
-        link.declare_ports(&plan.ports).await?;
+        let uarts = link.uart_count();
+        let mcu = link.mcu_name();
         link.close();
-        for line in bridge_config_lines(&plan.ports) {
+        for line in bridge_config_lines(&plan, uarts, mcu.as_deref()) {
             println!("{line}");
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
-/// The last word of a successful `admin bridge config`: the ports it declared —
-/// one line each, with the slot and speed — and the **indexes** a later
-/// `admin bridge port` or `admin flash` names with `--port`.
+/// The last word of a successful `admin bridge config`: the slots the bridge's
+/// backend offers, one line each with the speed a port on it would open at, and
+/// the command that enables one.
 ///
-/// The indexes are the positions of the entries the declaration carried, so the
-/// list and the bridge's port table cannot disagree: a declaration that stopped
-/// short (it failed, and said why) never reaches this report.
-fn bridge_config_lines(ports: &[BridgePort]) -> Vec<String> {
-    let mut lines = vec![format!("declared: {} port(s)", ports.len())];
-    for (index, port) in ports.iter().enumerate() {
-        lines.push(format!("  port {index}: slot {index} baud {}", port.baud));
-    }
-    let indexes = ports
-        .iter()
-        .enumerate()
-        .map(|(index, _)| index.to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    lines.push(format!(
-        "available port indexes: {}",
-        if indexes.is_empty() {
-            "(none)".to_string()
-        } else {
-            indexes
+/// `uarts` is the firmware's own `BRIDGE_UART_COUNT` — `None` on a firmware that
+/// predates the constant, which the report names and then covers with the plan's
+/// `--port-count` instead of pretending the bridge answered.
+fn bridge_config_lines(
+    plan: &BridgeConfigPlan,
+    uarts: Option<u8>,
+    mcu: Option<&str>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let count = match uarts {
+        Some(count) => count,
+        None => {
+            lines.push(format!(
+                "note: this bridge reports no BRIDGE_UART_COUNT (an older firmware); \
+                 assuming {} slot(s) from --port-count",
+                plan.port_count
+            ));
+            plan.port_count
         }
-    ));
+    };
+    let assumed = if uarts.is_some() { "" } else { " (assumed)" };
+    lines.push(format!("available uarts: {count}{assumed}"));
+    for slot in 0..count {
+        lines.push(format!(
+            "  uart {slot}: {} baud default slot ({})",
+            plan.baud,
+            uart_slot_note(mcu)
+        ));
+    }
+    lines.push("enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string());
     lines
 }
 
-/// `admin bridge port`: open the bridge, identify it, name the plan's port
-/// (legacy) and open its tunnel — and stop.
+/// How the arch names a port's stream, for a line of `admin bridge config`.
 ///
-/// The port has to be one `admin bridge config` declared: a port-level command
-/// that names a port the bridge does not have is dropped in silence, and nothing
-/// is reset or flashed here. The runtime is built here for the same reason
-/// [`run_bridge_flash`] builds one — the link is opened inside it.
+/// The dictionary carries the count (`BRIDGE_UART_COUNT`) but not the names: which
+/// USART or tty a slot ends up on is a build-time fact of the backend
+/// (`MCU` names the arch; the pin or path is fixed where the backend opens it), so
+/// it is written here from those backends and named as theirs.
+fn uart_slot_note(mcu: Option<&str>) -> &'static str {
+    match mcu {
+        // `third_party/klipper/src/stm32/bridge_serial.c`: USART1, RX PA10 /
+        // TX PA9 (`CONFIG_STM32_BRIDGE_SERIAL_USART1`), fixed at build time.
+        Some(mcu) if mcu.starts_with("stm32") => "arch-named USART1 PA10/PA9",
+        // `third_party/klipper/src/linux/bridge.c`: the tty the launcher put in
+        // `KLIPPER_BRIDGE_PORT_0`.
+        Some("linux") => "arch-named tty from KLIPPER_BRIDGE_PORT_0",
+        // A host library's ttys are its host's to name (`klipper_host_port`,
+        // one per slot), so nothing here can say more than that.
+        Some(_) => "arch-named",
+        None => "arch-named",
+    }
+}
+
+/// `admin bridge port`: open the bridge, identify it, restart it so its RAM port
+/// table starts empty, declare the port, name it on the plan's route and open its
+/// tunnel — and stop.
+///
+/// Nothing is reset beyond the bridge's own restart and nothing is flashed. The
+/// declaration comes first because a port-level command that names a port the
+/// bridge does not have is dropped in silence, and the restart comes before both
+/// because the table a previous run built is still there (`config_uart` on an
+/// open slot shuts the firmware down). The runtime is built here for the same
+/// reason [`run_bridge_flash`] builds one — the link is opened inside it.
 pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_bridge_port(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let link = open_link(&plan.source, DEFAULT_BAUD)?;
+        let mut link = open_link(&plan.source, plan.baud)?;
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
-        link.open_target_port(plan.target)?;
+        link.reset().await?;
+        link.declare_ports(&declared_ports(plan.target.index, plan.baud))
+            .await?;
+        link.open_target_port(plan.target, plan.route)?;
         link.close();
-        report_bridge_port(plan.target);
+        report_bridge_port(plan.target, plan.route);
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
-/// The last word of a successful `admin bridge port`: the port the bridge routes
-/// and the tunnel it opened.
-fn report_bridge_port(target: BridgeTarget) {
+/// The declaration `admin bridge port` sends: every port up to and including
+/// `index`, at one speed.
+///
+/// The bridge numbers a port by the order its declaration rows reach it, so a
+/// port at `index` exists only after the ports below it do. No reset runs in this
+/// command, so each entry's reset is the unused placeholder
+/// [`BridgePort::reset`] carries.
+fn declared_ports(index: u8, baud: u32) -> Vec<BridgePort> {
+    (0..=index)
+        .map(|_| BridgePort {
+            baud,
+            reset: PortReset::ResetPort,
+        })
+        .collect()
+}
+
+/// The last word of a successful `admin bridge port`: the port the bridge now has,
+/// the id it routes it by, the wire format it was named for, and the tunnel it
+/// opened.
+fn report_bridge_port(target: BridgeTarget, route: PortRoute) {
+    let route = match route {
+        PortRoute::Units => "units",
+        PortRoute::Legacy => "legacy",
+    };
     println!(
-        "target: port {} nodeid {}, tunnel open",
+        "target: port {} nodeid {}, {route} route, tunnel open",
         target.index, target.node_id
     );
 }
@@ -1908,9 +1989,9 @@ mod tests {
         plan_bridge_config(&args)
     }
 
-    /// The serial config plan in full: one port at the default speed and nothing
-    /// else — this command declares the table and stops, so it names no target
-    /// and opens no tunnel.
+    /// The serial config plan in full: the link, the speed a slot would open at,
+    /// and the count to assume when the bridge cannot say — this command asks the
+    /// bridge and stops, so it names no target and opens no tunnel.
     #[test]
     fn test_a_bridge_config_plan() {
         let plan =
@@ -1923,20 +2004,78 @@ mod tests {
             }
         );
         assert_eq!(plan.baud, DEFAULT_BAUD);
+        assert_eq!(plan.port_count, 1);
+    }
+
+    /// The report is the slots the **bridge** offers, one line each, with the
+    /// rate a port on it would open at and the arch's own naming of the stream —
+    /// and nothing that claims a port was declared.
+    #[test]
+    fn test_a_bridge_config_report_lists_the_uarts_the_bridge_offers() {
+        let plan = planned_bridge_config(&["--bridge", "/dev/ttyUSB0", "--baud", "115200"])
+            .expect("a bridge config plan");
         assert_eq!(
-            plan.ports,
-            vec![BridgePort {
-                baud: DEFAULT_BAUD,
-                reset: PortReset::ResetPort,
-            }]
+            bridge_config_lines(&plan, Some(2), Some("stm32f103xe")),
+            vec![
+                "available uarts: 2".to_string(),
+                "  uart 0: 115200 baud default slot (arch-named USART1 PA10/PA9)".to_string(),
+                "  uart 1: 115200 baud default slot (arch-named USART1 PA10/PA9)".to_string(),
+                "enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string(),
+            ]
         );
     }
 
-    /// `admin bridge config`'s report: the declared ports, then the greppable
-    /// `available port indexes:` line a later `admin bridge port` / `admin flash`
-    /// takes its `--port` from.
+    /// A bridge whose firmware predates `BRIDGE_UART_COUNT` is said to be one, and
+    /// the count falls back to `--port-count` rather than pretending the bridge
+    /// answered.
     #[test]
-    fn test_a_bridge_config_report_lists_the_available_port_indexes() {
+    fn test_a_bridge_config_report_falls_back_on_an_old_firmware() {
+        let plan = planned_bridge_config(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port-count",
+            "3",
+            "--baud",
+            "250000",
+        ])
+        .expect("a bridge config plan");
+        assert_eq!(
+            bridge_config_lines(&plan, None, Some("linux")),
+            vec![
+                "note: this bridge reports no BRIDGE_UART_COUNT (an older firmware); \
+                 assuming 3 slot(s) from --port-count"
+                    .to_string(),
+                "available uarts: 3 (assumed)".to_string(),
+                "  uart 0: 250000 baud default slot (arch-named tty from KLIPPER_BRIDGE_PORT_0)"
+                    .to_string(),
+                "  uart 1: 250000 baud default slot (arch-named tty from KLIPPER_BRIDGE_PORT_0)"
+                    .to_string(),
+                "  uart 2: 250000 baud default slot (arch-named tty from KLIPPER_BRIDGE_PORT_0)"
+                    .to_string(),
+                "enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string(),
+            ]
+        );
+    }
+
+    /// The arch's naming comes from the `MCU` constant, and a build that declares
+    /// none (the host library) says exactly that much.
+    #[test]
+    fn test_a_bridge_config_names_the_arch_that_fixes_the_uart() {
+        assert_eq!(uart_slot_note(None), "arch-named");
+        assert_eq!(
+            uart_slot_note(Some("linux")),
+            "arch-named tty from KLIPPER_BRIDGE_PORT_0"
+        );
+        assert_eq!(
+            uart_slot_note(Some("stm32f103xe")),
+            "arch-named USART1 PA10/PA9"
+        );
+    }
+
+    /// `--port-count` is the fallback count and `--baud` the speed a slot would
+    /// open at: neither declares anything by itself.
+    #[test]
+    fn test_a_bridge_config_plan_carries_the_fallback_and_the_speed() {
         let plan = planned_bridge_config(&[
             "--bridge",
             "/dev/ttyUSB0",
@@ -1945,62 +2084,9 @@ mod tests {
             "--baud",
             "115200",
         ])
-        .expect("a three-port plan");
-        assert_eq!(
-            bridge_config_lines(&plan.ports),
-            vec![
-                "declared: 3 port(s)".to_string(),
-                "  port 0: slot 0 baud 115200".to_string(),
-                "  port 1: slot 1 baud 115200".to_string(),
-                "  port 2: slot 2 baud 115200".to_string(),
-                "available port indexes: 0, 1, 2".to_string(),
-            ]
-        );
-    }
-
-    /// The index list is the **declared** entries' own positions, not a count: a
-    /// table of two ports declared at different speeds reports its two slots and
-    /// nothing wider.
-    #[test]
-    fn test_a_bridge_config_report_follows_the_declared_ports() {
-        let ports = [
-            BridgePort {
-                baud: 250_000,
-                reset: PortReset::ResetPort,
-            },
-            BridgePort {
-                baud: 115_200,
-                reset: PortReset::ResetPort,
-            },
-        ];
-        assert_eq!(
-            bridge_config_lines(&ports),
-            vec![
-                "declared: 2 port(s)".to_string(),
-                "  port 0: slot 0 baud 250000".to_string(),
-                "  port 1: slot 1 baud 115200".to_string(),
-                "available port indexes: 0, 1".to_string(),
-            ]
-        );
-    }
-
-    /// `--port-count` declares that many ports, all at `--baud`.
-    #[test]
-    fn test_a_bridge_config_declares_the_named_port_count() {
-        let plan = planned_bridge_config(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port-count",
-            "3",
-            "--baud",
-            "115200",
-        ])
-        .expect("a three-port plan");
-        assert_eq!(plan.ports.len(), 3);
-        assert!(
-            plan.ports.iter().all(|port| port.baud == 115_200),
-            "every port opens at --baud"
-        );
+        .expect("a three-slot fallback plan");
+        assert_eq!(plan.port_count, 3);
+        assert_eq!(plan.baud, 115_200);
     }
 
     /// The host-library bridge carries its identity and its port ttys, the same

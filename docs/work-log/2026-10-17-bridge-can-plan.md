@@ -294,9 +294,13 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
    UART/CAN 且 CAN 先声明时会互换后端；现在 `config_can` 走 `port_backend_can_open` 不看 slot，
    主机给 `config_uart` 的 slot 改成**该桥上的 UART 序号**（U11b）。
 3. **CAN 上游 attach（桥经 CAN 被宿主连）与 `fdcan` 的过滤器实现：挂起（用户决定）**，不属本期。
-4. **ISO-TP 端口载具（P2/U7）**：仍留在规划里，但明确是**运行期**能力，与刷机无关。
+4. **ISO-TP 端口载具（P2/U7）**：只作**运行期**能力，与刷机无关——已落地并在真机闭环
+   （见下文「桥端口载具的第二处 BS=0 残留」）。
 
-**已知缺口 → U5b**：CAN 单帧 admin（`0x3f0`/`0x3f1`）未代理，而且端口开时也没有人装 admin 过滤器，所以**经桥扫描/指派一台未指派的 CAN 下游设备现在还不可能**。这是真机测试的前置单元（U5b，§3 已排），不是本轮遗留缺陷。
+**U5b 已补齐**（原缺口：CAN 单帧 admin `0x3f0`/`0x3f1` 不代理、端口开时也没人装 admin 过滤器 ⇒ 经桥扫描/指派
+一台未指派的 CAN 下游设备不可能）：现在 `bridge_can_open` 直接装 `0x3f1` 过滤器、`bridge_can_admin_write`
+把 `QUERY_UNASSIGNED`/`SET_KLIPPER_NODEID`（`0x01`+`0x11` 双发）/`REQUEST_BOOTLOADER` 翻成单帧，
+真机 `admin scan → 指派 → 0x02 送引导 → 隧道刷写` 全通。
 
 ## 实施记录：四台设备压测轮（2026-10-17 晚）
 
@@ -343,4 +347,40 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 - **修复后的实测（主机直连，上游 USBCANBUS 当收发器，F446 + F103，1 Mbit）**：`identify` 139 条、
   `motion` 绿、**comm 742 req/s**（切片 2272，约 1/3）、**step 首段 10 000 steps/s 即超时**。
   也就是说 ISO-TP 是「能跑但不适合高步频」的运行期载具——经典 8 B 帧下每条命令约 2 帧的代价摆在
-  那里。桥端口载具的复测待 F446 回到桥固件后补。
+  那里。
+
+### 桥端口载具的第二处 BS=0 残留（`68341040`）
+
+上一节的修复只改了设备半（`src/generic/isotp.c`）。**桥半 `bridge_can_isotp.c` 的 `tx_block_limited`
+也补了，但发送循环尾巴上那段旧的 `if (!s->tx_block)` 忘了删**：流控帧的 `BS=0`（本项目的对端恒发这个）
+被记成 `tx_block=0`，发完**第一个**连续帧就当成「本块已用完」去等下一个永远不来的 FC，25 ms 后丢消息。
+
+症状与定位路径（都对真机取过证，记下来免得重走）：
+
+- `klippy` 表现为「`identify` 偶尔通、配置握手必超时」：identify 单元 10 B = 首帧 + 1 个连续帧，
+  刚好卡在「发得完」这条线上；再长一条（任何 `config_*`）就停在 13 B（首帧 6 + 首个 CF 7）。
+- 桥侧计数器（`examples/bridge-read.rs` + `debug_read`）：某次失败会话后 `bridge_can_nodes[0].isotp.lost`
+  = 28（主机那一轮正是几十次 identify 重试），而同一时刻 `rx_overrun`/`tx_overrun`/`tx_isotp_busy`
+  全是 0——不是拥塞丢，是**等 FC 超时**把消息放弃了。
+- 设备侧（F103 SWD + `halt`，地址取自 `out4/klipper.elf` 的 DWARF）：`CanData.assigned_id=0x10a`、
+  `mux_assigned=5`、`SchedStatus.shutdown_status=0`、`Isotp.queue_max` 随主机每秒重试 +1（每条应答
+  都被排上了），`tx_sent` 停在 10/13——即设备**收得到、答得出去**，缺的是桥把整条消息发完。
+- 抓帧法（无适配器也能看总线）：`halt` 住设备后让主机跑一次会话，CAN 外设仍在收，帧会**冻在
+  FIFO0 输出邮箱**里：`mdw 0x400065b0 4`（RIR/RDTR/RDLR/RDHR，数据在两个字里是小端）；按 1 Mbit
+  算 `0x21400000>>21 = 0x10a`，数据 `10 0a ed 42 08 10 01 00` = 首帧 + 首 6 字节，一眼看出**只有**
+  首帧、后面没有连续帧。
+- 修法：删掉那段（`isotp.c` 早已在 `2644195c` 里删过，桥半漏了），连续帧一直发到消息完。
+
+**修复后的桥端口实测**（F446 桥 `target/hw-can-bridge/out15/klipper.bin` = 53 588 B，下游刷 ISO-TP 应用
+`target/hw-can-downstream-isotp/out4/klipper.bin` = 44 560 B，1 Mbit，`bench-can-isotp.cfg`，release）：
+
+| 项目 | 结果 |
+|---|---|
+| 整会话（identify + 配置握手 + 周期 `get_clock`） | ✅ 连跑 5 次全绿，`mcu` 150 条 / `downstream` 139 条 |
+| `comm` | **244 req/s**（305 崩，backlog 一步到 135） |
+| `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`） |
+| `motion` | ✅ `motion smoke OK` |
+
+即：**桥端口载具与主机直连载具现在是同一个功能面**（都通了），代价也同源——经典 8 B 帧 + 首帧/流控帧
+往返。桥这一跳把 comm 从直连的 742 再砍到 244（多一跳 USB CDC + 桥内任务转交），`step` 反而不受影响
+（瓶颈在下游固件脉冲生成）。切片仍是默认推荐。

@@ -582,8 +582,10 @@ klipper 设备半的叙述**逐条对齐**：
   **`depends on CANSERIAL`、且只编 classical**。**`vcan` 上的端到端已落地**：`linux` 架构的
   SocketCAN 控制台（`LINUX_CANSERIAL`）让真 `klipper.elf` 能当 can-serial 节点，主机侧已实测
   跑通完整 `[mcu]` 连接（admin 指派 → identify → `get_clock`/stats）；剩下的未落地项只有
-  **CAN 下游端口已落地**（`BRIDGE_PORT_CAN`：`generic/bridge_can.c`，单帧 admin 代理已验）；
-  仍未接的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 CAN **上游** attach。
+  **CAN 下游端口已落地**（`BRIDGE_PORT_CAN`：`generic/bridge_can.c`，单帧 admin 代理已验）与它的
+  **ISO-TP 端口载具**（`CONFIG_BRIDGE_PORT_CAN_ISOTP`，`MUX_PORT_ISOTP` 按端口声明、**只用于运行期**，
+  隧道永远切片）都已真机闭环；`printer.cfg` 的 `[can_device]` 端口节已接线（`can_bitrate` +
+  `can_protocol`，要求 `uuid:`）。仍未接的是 CAN **上游** attach（桥经 CAN 被宿主连，已挂起）。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

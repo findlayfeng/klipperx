@@ -104,9 +104,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
 
 use super::serial::{
-    admin_unit, assignment_request, encode_header, parse_assignment_ack, set_node_id_for,
-    set_port_node_id, tunnel_block, TunnelRegistry, TunnelSink, UnitStream, ADMIN_LISTEN,
-    ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+    admin_unit, assignment_request, encode_header, parse_assignment_ack, request_bootloader_unit,
+    set_node_id_for, set_port_node_id, tunnel_block, TunnelRegistry, TunnelSink, UnitStream,
+    ADMIN_LISTEN, ASSIGN_ATTACH_ATTEMPTS, ASSIGN_ATTACH_TIMEOUT, CMD_RESET_PORT,
     CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL, HEADER_BYTES,
 };
 use super::shared::resource_for;
@@ -1240,8 +1240,12 @@ impl HostDevice {
     ///
     /// # Errors
     /// The same as [`HostDevice::send_admin`].
-    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_admin(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index])[HEADER_BYTES..])
+    pub fn send_request_bootloader(
+        &self,
+        index: u8,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<(), InterfaceError> {
+        self.send_admin(&request_bootloader_unit(index, uuid)[HEADER_BYTES..])
     }
 
     /// Toggle the flashing tunnel of bridge port `index` —
@@ -3153,7 +3157,7 @@ mod host_tests {
         // the arb it arrived on — the admin listen id.
         let reset = admin_unit(&[CMD_REQUEST_BOOTLOADER, 0]);
         device
-            .send_request_bootloader(0)
+            .send_request_bootloader(0, None)
             .expect("REQUEST_BOOTLOADER goes in");
         let down = read_pty(&pty.master, reset.len(), window);
         let (arb, frame) = unit_parts(&down);

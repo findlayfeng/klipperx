@@ -3,7 +3,8 @@
 //! flashing tunnel, drive the katapult session over that tunnel, and clear the
 //! tunnel.
 //!
-//! This module is the seam between the two halves T5 built. [`open_bridge`] is
+//! This module is the seam between the two halves T5 built.
+//! [`open_bridge`](super::bridge_session::open_bridge) is
 //! the front half (declaration, per-port reset, target routing, tunnel on);
 //! [`TunnelBridge`] is the data path (a `Read + Write` face over the port's
 //! tunnel units). Both need a **link handle** the host holds directly, and a
@@ -22,8 +23,9 @@
 //!    [`BridgeLink::open_serial`], then [`BridgeLink::identify`]) — the
 //!    declaration commands are klipper messages, so the dictionary has to come
 //!    from the running bridge before anything of them can be encoded.
-//! 2. **open_bridge** — the target's port is declared, its device reset, and the
-//!    tunnel opened ([`BridgeLink::flash`]).
+//! 2. **the port** — the plan's ports are declared, its devices reset, a **CAN**
+//!    target is handed the node id its bootloader lost, and the tunnel opened
+//!    ([`BridgeLink::flash`]).
 //! 3. **the session** — the bridge's port carries a katapult byte stream, the
 //!    [`TunnelBridge`] adapter wraps the session's frames into tunnel units, and
 //!    [`session::flash_with_config`] runs connect → send_block × N → eof →
@@ -37,7 +39,8 @@
 //! The module knows the bridge only through the link handle and the plan its
 //! caller gives it: which port the target sits on, that device's id, and the
 //! reset each declared port's device takes are the caller's to say
-//! ([`BridgePort`], [`BridgeTarget`]), exactly as [`open_bridge`] documents.
+//! ([`BridgePort`], [`BridgeTarget`]), exactly as
+//! [`open_bridge`](super::bridge_session::open_bridge) documents.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
@@ -57,9 +60,10 @@ use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
-    declare_port as send_declare_port, declare_ports as send_declare_ports, open_bridge,
-    open_target_port as send_open_target_port, reset_port as send_port_reset, slot_kind,
-    BridgeError, BridgePort, BridgeTarget, PortKind, PortReset, PortRoute,
+    declare_port as send_declare_port, declare_ports as send_declare_ports,
+    open_target_port as send_open_target_port, reset_port as send_port_reset,
+    reset_ports as send_port_resets, slot_kind, BridgeError, BridgePort, BridgeTarget, PortKind,
+    PortReset, PortRoute,
 };
 use super::frame::command::CONNECT;
 use super::session::{self, FlashError, SessionConfig, Summary};
@@ -103,6 +107,35 @@ const REQUEST_BOOTLOADER_TO_BRIDGE: u8 = 0xFF;
 
 /// How long a restarted bridge may take to answer again before a run gives up.
 const RESET_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a **CAN** target's port is left to itself after its bootloader reset,
+/// before the run hands the katapult behind it a node id
+/// ([`BridgeLink::flash`]).
+///
+/// The reset only gets the device *out of* its application (the port's entry
+/// wait covers that); that the bootloader is then up and listening on the admin
+/// id is nothing the host can observe — nothing acknowledges a bootloader
+/// request, and a bridge link carries no way to probe what sits behind a port.
+/// So the run waits a bounded spell it cannot verify: one second is far longer
+/// than a katapult restart takes, and short enough to pay once per flash.
+const BOOTLOADER_SETTLE: Duration = Duration::from_millis(1000);
+
+/// How long a run waits **after** that assignment before it opens the tunnel.
+///
+/// katapult does not acknowledge `SET_NODEID` ([`ASSIGN_CONFIRM_WINDOW`] is the
+/// same silence), so there is no receipt to wait on: this is only time for the
+/// device to adopt the id, so the session's first `CONNECT` is not the frame that
+/// races the assignment.
+const ASSIGN_SETTLE: Duration = Duration::from_millis(300);
+
+/// The line a flash run against a **CAN** slot prints when it was given no
+/// `--assign-uuid`.
+///
+/// The tunnel is addressed by the id the device has just lost, so the session
+/// behind it reaches nobody unless the caller names the board to assign it to —
+/// which is the tool's whole reason to say so rather than flash into silence.
+const CAN_NO_ASSIGN_HINT: &str = "a CAN device loses its node id when its bootloader starts; \
+     pass --assign-uuid to have it assigned before the session";
 
 /// The identify budget of one reopen attempt while a restarted bridge is coming
 /// back up; a boot that is not finished yet answers nothing, and the attempt is
@@ -230,19 +263,28 @@ enum BridgeOpen {
 /// when `uuid` is `None`, finding it first.
 ///
 /// A bridge's node id lives in its firmware's RAM, so a run with no
-/// `--bridge-uuid` has to **find** the bridge. An unassigned one answers only
-/// the discovery broadcast (the query `klipperx admin scan --port` makes); an assigned
-/// one stays quiet on that broadcast and answers the plain re-confirmation
-/// instead. So this broadcasts first and falls back to the re-confirmation: the
-/// flag is an optional override, never a requirement, for both a first open and
-/// a reopen after a restart.
+/// `--bridge-uuid` has to **find** the bridge. An unassigned one answers the
+/// discovery broadcast (the query `klipperx admin scan --port` makes) and is
+/// named with what it answered; an assigned one stays quiet on that broadcast,
+/// so the scan finding nothing means the bridge already carries an id — and
+/// then it is attached on the id this run opens it as, with no assignment
+/// handshake in between. The flag is an optional override, never a requirement,
+/// for both a first open and a reopen after a restart.
+///
+/// The id is the whole address for the assigned case: `mcu_id`
+/// ([`BRIDGE_MCU_ID`] for every caller this tool has) is the id the bridge was
+/// given, so nothing has to be asked before the link is used — and the
+/// re-confirmation handshake is a wait a working bridge can fail (a bridge this
+/// very tool named answered nothing to it, which is what made a second command
+/// against it fail with `Receive timeout`). `identify`, which every caller runs
+/// next, is what proves the bridge answers on that id.
 ///
 /// # Errors
 /// [`BridgeFlashError::AmbiguousBridge`] when more than one unassigned bridge
 /// answers — naming the wrong one would restart and re-assign the wrong board —
-/// [`BridgeFlashError::UnassignedSerial`] when neither the broadcast nor the
-/// re-confirmation reaches a bridge, and [`BridgeFlashError::Open`] when the tty
-/// cannot be opened.
+/// [`BridgeFlashError::BridgeNotFound`] when the scan found no unassigned bridge
+/// **and** the assigned-id attach failed too, and [`BridgeFlashError::Open`]
+/// when the tty cannot be opened.
 fn attach_bridge(
     path: &Path,
     baud: u32,
@@ -256,19 +298,21 @@ fn attach_bridge(
             // Several bridges cannot be told apart, and a wrong guess would
             // restart and re-assign the wrong one: the caller has to choose.
             Err(e @ BridgeFlashError::AmbiguousBridge { .. }) => return Err(e),
-            // Nothing unassigned answered: the bridge may already carry an id,
-            // which answers the re-confirmation rather than the broadcast. A
-            // silent line reaches neither, which is the unassigned report.
+            // Nothing unassigned answered, so the bridge is one that already
+            // has an id: register the link on the id this run opens it as
+            // ([`serial::attach_downstream`] writes nothing and waits for no
+            // answer, which is the point), and let the identify that follows
+            // be the proof. A line that answers nothing at all fails there,
+            // with the two failures this error reports kept apart.
             Err(BridgeFlashError::Open(InterfaceError::Timeout)) => {
-                return serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, None).map_err(
-                    |e| match e {
-                        InterfaceError::Timeout => BridgeFlashError::UnassignedSerial {
-                            path: path.to_path_buf(),
-                            baud,
-                        },
-                        e => BridgeFlashError::Open(e),
-                    },
-                );
+                return serial::attach_downstream(path, baud, mcu_id).map_err(|error| {
+                    BridgeFlashError::BridgeNotFound {
+                        path: path.to_path_buf(),
+                        baud,
+                        id: mcu_id,
+                        error,
+                    }
+                });
             }
             Err(e) => return Err(e),
         },
@@ -283,7 +327,7 @@ impl BridgeOpen {
     ///
     /// # Errors
     /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
-    /// [`BridgeFlashError::UnassignedSerial`] / [`BridgeFlashError::AmbiguousBridge`]
+    /// [`BridgeFlashError::BridgeNotFound`] / [`BridgeFlashError::AmbiguousBridge`]
     /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise.
     fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
         match self {
@@ -409,6 +453,28 @@ fn discover_bridge_uuid(path: &Path, baud: u32) -> Result<[u8; 6], BridgeFlashEr
     }
 }
 
+/// The uuid a run assigns **between** the target port's reset and the tunnel, or
+/// `None` when nothing is to be assigned.
+///
+/// Only a **CAN** slot: a CAN device's node id lives in its own RAM, so the
+/// katapult the reset just started comes up without one — and the tunnel's
+/// frames are addressed by exactly that id (the host writes `0x100 + 2 * id`),
+/// so without the assignment they reach nobody. A UART slot is not that case: its
+/// port carries a byte stream that one device on the line reads, addressed by
+/// nothing, so there is no id to lose and nothing to re-assign.
+///
+/// `assign` is `--assign-uuid`, the identity of the board behind the target port
+/// — the same identity `admin bridge port --assign-uuid` gives an id to. Without
+/// it nothing is assigned (the behaviour a bridge flash always had) and a CAN
+/// target says so ([`CAN_NO_ASSIGN_HINT`]), because the session behind the
+/// tunnel would otherwise talk to nobody.
+fn bootloader_assign(kind: PortKind, assign: Option<[u8; 6]>) -> Option<[u8; 6]> {
+    match kind {
+        PortKind::Can => assign,
+        PortKind::Uart => None,
+    }
+}
+
 /// A bridge the flash host has open, with the `Mcu` over it and the two faces
 /// the run needs: the [`Interface`] for the port-level commands, and the device
 /// itself for the tunnel's downlink and the sink registration.
@@ -487,20 +553,22 @@ impl BridgeLink {
     /// `mcu_id`.
     ///
     /// A bridge's link carries its downstream devices' frames too, so its port
-    /// is opened shared and addressed by id (`serial::attach`), which also runs
-    /// the assignment handshake. `uuid` is the bridge **board's** own identity:
-    /// naming it skips the search. With `None` the bridge is **found** — the
-    /// discovery broadcast an unassigned board answers, or the plain
-    /// re-confirmation an already-assigned one answers instead — so
-    /// `--bridge-uuid` is an optional override, not a requirement.
+    /// is opened shared and addressed by id: by `serial::attach` when the
+    /// bridge has to be **named** (which runs the assignment handshake), by
+    /// `serial::attach_downstream` when it already carries the id and there is
+    /// nothing to name. `uuid` is the bridge **board's** own identity: naming it
+    /// skips the search. With `None` the bridge is **found** — the discovery
+    /// broadcast an unassigned board answers, or, when that finds nothing, the
+    /// id this run opens it as — so `--bridge-uuid` is an optional override,
+    /// not a requirement.
     ///
     /// # Errors
-    /// [`BridgeFlashError::UnassignedSerial`] when no uuid names the bridge and
-    /// neither the discovery broadcast nor the re-confirmation reaches one,
-    /// [`BridgeFlashError::AmbiguousBridge`] when several unassigned bridges
-    /// answer the broadcast, and [`BridgeFlashError::Open`] when the port cannot
-    /// be opened, `mcu_id` is outside the addressable range, or the handshake
-    /// with a named bridge times out or is refused.
+    /// [`BridgeFlashError::BridgeNotFound`] when no uuid names the bridge, the
+    /// discovery scan finds nothing unassigned, **and** the attach on `mcu_id`
+    /// fails, [`BridgeFlashError::AmbiguousBridge`] when several unassigned
+    /// bridges answer the broadcast, and [`BridgeFlashError::Open`] when the
+    /// port cannot be opened, `mcu_id` is outside the addressable range, or the
+    /// handshake with a named bridge times out or is refused.
     pub fn open_serial(
         path: &Path,
         baud: u32,
@@ -769,6 +837,32 @@ impl BridgeLink {
         }
     }
 
+    /// Reset every declared port's device the way its plan entry says —
+    /// [`open_bridge`](super::bridge_session::open_bridge)'s step 2, after
+    /// [`declare_ports`](BridgeLink::declare_ports)
+    /// so each unit addresses a port the bridge has.
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down over
+    /// a reset (its reason included), and [`BridgeFlashError::Bridge`] when the
+    /// link refuses a port-level write.
+    pub async fn reset_ports(
+        &self,
+        ports: &[BridgePort],
+        target: BridgeTarget,
+    ) -> Result<(), BridgeFlashError> {
+        match send_port_resets(&self.live().link, ports, target).await {
+            Ok(()) => match self.take_shutdown() {
+                Some(reason) => Err(BridgeFlashError::Shutdown { reason }),
+                None => Ok(()),
+            },
+            Err(e) => Err(match self.take_shutdown() {
+                Some(reason) => BridgeFlashError::Shutdown { reason },
+                None => BridgeFlashError::Bridge(e),
+            }),
+        }
+    }
+
     /// Name the target's port on `route` and open its flashing tunnel —
     /// `admin bridge port`'s whole job (that command declares the port first,
     /// since a bridge's port table lives in RAM and starts empty).
@@ -856,14 +950,18 @@ impl BridgeLink {
         })
     }
 
-    /// The whole bridge flash: open the target's port
-    /// ([`open_bridge`]), run the katapult session over its tunnel, then clear
-    /// the tunnel.
+    /// The whole bridge flash: declare the plan's ports, reset them, hand a
+    /// **CAN** target the node id its bootloader lost, run the katapult session
+    /// over the port's tunnel, then clear the tunnel.
     ///
-    /// `ports` and `target` are the plan [`open_bridge`] takes — the port order
+    /// `ports` and `target` are the plan
+    /// [`open_bridge`](super::bridge_session::open_bridge) takes — the port order
     /// is the bridge's numbering, and only a **legacy** route (no port flags)
-    /// serves the raw uplink the tunnel carries, so [`open_bridge`] names the
-    /// target that one way. `progress` is [`session::flash_with_config`]'s.
+    /// serves the raw uplink the tunnel carries, so the target is named that one
+    /// way. `assign` is `--assign-uuid`: the identity of the board behind the
+    /// target port, given the target's node id again after its bootloader reset
+    /// ([`bootloader_assign`] says when that happens and why). `progress` is
+    /// [`session::flash_with_config`]'s.
     ///
     /// A target whose plan reset is [`PortReset::Bootloader`] was **sent back to
     /// its bootloader** and is still coming up when the tunnel opens, so nothing
@@ -884,16 +982,18 @@ impl BridgeLink {
     /// arb, [`BridgeFlashError::Reset`] when the bridge could not be taken back
     /// to a clean state, [`BridgeFlashError::Shutdown`] when the bridge's
     /// firmware shuts down while the port is declared (its reason included),
-    /// [`BridgeFlashError::Bridge`] when [`open_bridge`] fails for any other
-    /// reason, [`BridgeFlashError::Session`] when the katapult session fails,
+    /// [`BridgeFlashError::Bridge`] when a declaration, a reset or the tunnel
+    /// fails for any other reason (the pre-session assignment's refusals
+    /// included), [`BridgeFlashError::Session`] when the katapult session fails,
     /// and [`BridgeFlashError::Teardown`] when only the tunnel clearing fails.
     pub async fn flash(
         &mut self,
         ports: &[BridgePort],
         target: BridgeTarget,
+        assign: Option<[u8; 6]>,
         payload: &[u8],
         cfg: &SessionConfig,
-        progress: impl FnMut(&str),
+        mut progress: impl FnMut(&str),
     ) -> Result<Summary, BridgeFlashError> {
         let node_id = u32::from(target.node_id);
         let down_arb = assign::arb_id(node_id).ok_or(BridgeFlashError::Unaddressable {
@@ -906,14 +1006,28 @@ impl BridgeLink {
         // declaration.
         self.reset().await?;
 
-        if let Err(e) = open_bridge(&self.live().mcu, &self.live().link, ports, target).await {
-            // A declaration the bridge refused shuts its firmware down, and the
-            // reason is the whole story: report that, not the timeout behind it.
-            return Err(match self.take_shutdown() {
-                Some(reason) => BridgeFlashError::Shutdown { reason },
-                None => BridgeFlashError::Bridge(e),
-            });
+        // `open_bridge`'s steps, one at a time rather than in one call: a CAN
+        // target's node id is handed over **between** its reset and the tunnel,
+        // so the two cannot be fused. A declaration or a reset the bridge refuses
+        // shuts its firmware down, and the reason is the whole story — report
+        // that, not the timeout behind it.
+        self.declare_ports(ports).await?;
+        self.reset_ports(ports, target).await?;
+        let kind = self.slot_kind(target.index);
+        match bootloader_assign(kind, assign) {
+            Some(uuid) => {
+                // The bootloader is up (or nearly) after the reset, and its
+                // address is what the tunnel will carry: hand it the id the
+                // restart dropped, then give it a moment before the session's
+                // first frame follows.
+                tokio::time::sleep(BOOTLOADER_SETTLE).await;
+                self.assign_node_id(uuid, target.node_id)?;
+                tokio::time::sleep(ASSIGN_SETTLE).await;
+            }
+            None if kind == PortKind::Can => progress(CAN_NO_ASSIGN_HINT),
+            None => {}
         }
+        self.open_target_port(target, PortRoute::Legacy)?;
         if let Some(reason) = self.take_shutdown() {
             return Err(BridgeFlashError::Shutdown { reason });
         }
@@ -1105,20 +1219,30 @@ async fn run_session<R: std::io::Read, W: std::io::Write>(
 pub enum BridgeFlashError {
     /// The bridge's device could not be opened or attached.
     Open(InterfaceError),
-    /// A **serial** bridge never answered the assignment handshake and no
-    /// `--bridge-uuid` named it: without an identity the host can only send the
-    /// re-confirmation request, which an unassigned board does not answer (see
-    /// [`BridgeLink::open_serial`]) — so a silent line is unassigned or absent,
-    /// and only the caller can tell.
-    UnassignedSerial {
-        /// The tty the handshake went out on.
+    /// No bridge was reached on a **serial** link opened without a
+    /// `--bridge-uuid`, by either route: the discovery scan found nothing
+    /// unassigned to name, and attaching the link on the id this run opens the
+    /// bridge as failed too (`error`).
+    ///
+    /// The two are reported apart because they mean different things: an empty
+    /// scan is the normal answer of a bridge that already carries an id, while
+    /// the id attach is the line that never came up — a tty with no bridge on
+    /// it, one parked in its bootloader, or an id nothing answers on.
+    BridgeNotFound {
+        /// The tty both routes used.
         path: PathBuf,
         /// The line speed it opened at.
         baud: u32,
+        /// The id the attach route named the bridge with ([`BRIDGE_MCU_ID`] for
+        /// every caller this tool has).
+        id: u32,
+        /// What the attach on that id failed with.
+        error: InterfaceError,
     },
     /// The identify handshake failed — no dictionary, so no declaration.
     Identify(McuError),
-    /// [`open_bridge`] refused or failed a step.
+    /// [`open_bridge`](super::bridge_session::open_bridge) refused or failed a
+    /// step.
     Bridge(BridgeError),
     /// The bridge could not be taken back to a clean state before the
     /// declaration: the self-restart could not be sent, or the bridge did not
@@ -1160,9 +1284,15 @@ impl fmt::Display for BridgeFlashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BridgeFlashError::Open(e) => write!(f, "opening the bridge: {e}"),
-            BridgeFlashError::UnassignedSerial { path, baud } => write!(
+            BridgeFlashError::BridgeNotFound {
+                path,
+                baud,
+                id,
+                error,
+            } => write!(
                 f,
-                "opening the bridge: {} at {baud} baud did not answer; if the bridge has no \
+                "opening the bridge: the discovery scan on {} found no unassigned bridge, and \
+                 attaching it as id {id} at {baud} baud failed: {error}; if the bridge has no \
                  node id yet it needs --bridge-uuid (take it from `klipperx admin scan --port {}`)",
                 path.display(),
                 path.display()
@@ -1195,12 +1325,12 @@ impl std::error::Error for BridgeFlashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BridgeFlashError::Open(e) | BridgeFlashError::Teardown(e) => Some(e),
+            BridgeFlashError::BridgeNotFound { error, .. } => Some(error),
             BridgeFlashError::PortReset(e) => Some(e),
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
             BridgeFlashError::Unaddressable { .. }
-            | BridgeFlashError::UnassignedSerial { .. }
             | BridgeFlashError::Reset(_)
             | BridgeFlashError::AmbiguousBridge { .. }
             | BridgeFlashError::Shutdown { .. } => None,
@@ -1259,7 +1389,7 @@ mod tests {
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
-    use crate::flash::bridge_session::{BridgePort, BridgeTarget, PortReset};
+    use crate::flash::bridge_session::{open_bridge, BridgePort, BridgeTarget, PortReset};
     use crate::flash::fake::{FakeBootloader, Quirk};
     use crate::flash::frame::{build_frame, command};
     use crate::flash::session::SessionConfig;
@@ -1511,7 +1641,7 @@ mod tests {
         };
         let payload: Vec<u8> = (0..100u8).collect();
         let summary = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the bridge flash completes");
 
@@ -1909,30 +2039,103 @@ mod tests {
         drop(firmware);
     }
 
-    /// A serial bridge that never answers is reported as an **unassigned**
-    /// link, naming the flag that fixes it: the bare serial layer's
-    /// "Receive timeout" leaves the caller with nothing to act on.
+    /// A serial bridge the discovery scan does **not** find is attached on the
+    /// id this session opens it as, without a re-confirmation handshake: that is
+    /// the shape of every command after the first one, because the bridge the
+    /// last command named stays quiet on the broadcast.
     ///
-    /// The pty is the silent bridge: nothing on its far end answers the
-    /// handshake, which is exactly what an unassigned board does — an assigned
-    /// one would answer the re-confirmation `uuid: None` sends.
+    /// The pty is that bridge — nothing on its far end answers anything at all,
+    /// which is the harsher case: the scan answers nothing (so the fallback is
+    /// what runs), and the link it hands back is live even though the far end
+    /// never confirmed anything. The wait the old fallback ran is gone: this
+    /// open writes nothing and blocks on no answer, and the identify every
+    /// caller runs next is what reports a line with no bridge on it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_a_silent_serial_bridge_is_reported_as_unassigned() {
+    async fn test_a_scan_that_finds_nothing_still_attaches_the_bridge_by_its_id() {
         let pty = Pty::new();
-        let err = match BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, None) {
-            Ok(_) => panic!("nothing answers on this pty, so the attach has to fail"),
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, None)
+            .expect("an unassigned scan falls back to the id this session uses");
+
+        // The fallback asks the bridge for nothing: a silent pty produces no
+        // answer of any kind, and the open still returns — the identify that
+        // follows is where a bridge that is not there fails.
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            link.identify(Duration::from_millis(300)),
+        )
+        .await
+        .expect("the identify was not bounded")
+        .expect_err("the pty answers nothing, so the identify has to fail");
+        assert!(matches!(err, BridgeFlashError::Identify(_)), "{err}");
+
+        link.close();
+        drop(link);
+    }
+
+    /// No bridge at all: the scan finds nothing unassigned **and** the attach on
+    /// the id this session uses fails. Both are reported, and apart — the empty
+    /// scan is the normal answer of a named bridge, so `did not answer` alone
+    /// would leave the caller guessing which half was the problem.
+    ///
+    /// The id here is `0`, which no wire format can address, so the second route
+    /// is what fails; the flag that would have skipped both is in the text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_bridge_no_route_reaches_names_both_failures() {
+        let pty = Pty::new();
+        let err = match BridgeLink::open_serial(&pty.path, 250_000, 0, None) {
+            Ok(_) => panic!("no id and no scan answer, so the open has to fail"),
             Err(e) => e,
         };
         let text = err.to_string();
         assert!(
             matches!(
                 err,
-                BridgeFlashError::UnassignedSerial { baud: 250_000, .. }
+                BridgeFlashError::BridgeNotFound {
+                    id: 0,
+                    baud: 250_000,
+                    ..
+                }
             ),
             "{text}"
         );
+        assert!(
+            text.contains("found no unassigned bridge"),
+            "the empty scan is reported: {text}"
+        );
+        assert!(
+            text.contains("attaching it as id 0") && text.contains("failed:"),
+            "the failed id attach is reported too: {text}"
+        );
         assert!(text.contains("--bridge-uuid"), "{text}");
         assert!(text.contains("klipperx admin scan --port"), "{text}");
+    }
+
+    /// The pre-session assignment is a **CAN** slot's business, and only when the
+    /// caller named the board: a CAN device's node id is what the tunnel's frames
+    /// are addressed by, and the katapult a bootloader reset starts comes up
+    /// without one, so the run hands it back before the session. A UART slot's
+    /// byte stream carries no addressing to lose, so an `--assign-uuid` there is
+    /// not acted on — and a CAN slot without one is reported instead of flashing
+    /// into a tunnel nothing answers.
+    #[test]
+    fn test_the_pre_session_assignment_is_a_can_targets_and_needs_a_uuid() {
+        let uuid = [0x21, 0x22, 0x23, 0x24, 0x25, 0x26];
+
+        assert_eq!(bootloader_assign(PortKind::Can, Some(uuid)), Some(uuid));
+        assert_eq!(bootloader_assign(PortKind::Can, None), None);
+        assert_eq!(bootloader_assign(PortKind::Uart, Some(uuid)), None);
+        assert_eq!(bootloader_assign(PortKind::Uart, None), None);
+
+        // The line the caller gets when nothing will be assigned on the slot
+        // whose id the bootloader just dropped.
+        assert!(
+            CAN_NO_ASSIGN_HINT.contains("loses its node id"),
+            "{CAN_NO_ASSIGN_HINT}"
+        );
+        assert!(
+            CAN_NO_ASSIGN_HINT.contains("--assign-uuid"),
+            "{CAN_NO_ASSIGN_HINT}"
+        );
     }
 
     /// A `Read` that records the bytes it hands through: the tunnel's uplink
@@ -2195,7 +2398,7 @@ mod tests {
             node_id: TARGET_NODE_ID,
         };
         let err = link
-            .flash(&ports, target, &[0u8; 8], &test_config(), |_| {})
+            .flash(&ports, target, None, &[0u8; 8], &test_config(), |_| {})
             .await
             .expect_err("a port that cannot be opened shuts the bridge down");
 
@@ -2259,7 +2462,7 @@ mod tests {
         let payload: Vec<u8> = (0..100u8).collect();
 
         let first = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the first run completes");
         // The second run starts against the firmware the first left — the same
@@ -2267,7 +2470,7 @@ mod tests {
         // instance seen twice, which is exactly what shut the firmware down
         // before the reset existed.
         let second = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the second run completes against the same bridge");
 
@@ -2336,7 +2539,7 @@ mod tests {
         let blocks = IMAGE / 64;
 
         let summary = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the whole image flashes through the bridge");
         assert_eq!(summary.bytes_flashed, IMAGE);
@@ -2506,7 +2709,7 @@ mod tests {
             let payload: Vec<u8> = (0..*size).map(|i| ((i * 7 + round) % 256) as u8).collect();
             let expected_blocks = (payload.len() + 63) / 64;
             let summary = link
-                .flash(&ports, target, &payload, &test_config(), |_| {})
+                .flash(&ports, target, None, &payload, &test_config(), |_| {})
                 .await
                 .unwrap_or_else(|e| panic!("round {round} ({size} bytes): {e}"));
             assert_eq!(summary.bytes_flashed, *size, "round {round}");
@@ -2606,11 +2809,11 @@ mod tests {
         let payload: Vec<u8> = (0..100u8).collect();
 
         let first = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the first run, after finding the bridge by scan");
         let second = link
-            .flash(&ports, target, &payload, &test_config(), |_| {})
+            .flash(&ports, target, None, &payload, &test_config(), |_| {})
             .await
             .expect("the second run, after finding the bridge by scan again");
 

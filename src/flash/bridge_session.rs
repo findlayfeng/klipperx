@@ -44,7 +44,7 @@
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
 use crate::core::klippy::cmd::uart::{ConfigBridgePort, PortConfig};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::interface::devices::serial::{PortCarrier, MUX_PORT_UNITS};
+use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
 use crate::core::klippy::interface::{Interface, InterfaceError};
 use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
 use crate::core::klippy::msg::MsgError;
@@ -86,28 +86,22 @@ const UNITS_PORT_FLAGS: u8 = MUX_PORT_UNITS;
 /// [`PortRoute::Legacy`] because the katapult tunnel reads the raw uplink
 /// ([`LEGACY_PORT_FLAGS`]); a stock katapult board behind a port is the same
 /// case, which is why `admin bridge port --legacy` keeps it.
-///
-/// A units route also has a **carrier** — classical CAN frames sliced at eight
-/// bytes, or ISO-TP — which is the port's own answer and not the route's
-/// ([`PortCarrier`], `admin bridge port --port-carrier`). It rides on the same
-/// flags byte ([`PortRoute::flags`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortRoute {
-    /// The device speaks units: `MUX_PORT_UNITS` set, plus the carrier's bit.
+    /// The device speaks units: `MUX_PORT_UNITS` set, and the port forwards
+    /// them as bare CAN/UART slices.
     Units,
     /// The device predates the mux: no flags.
     Legacy,
 }
 
 impl PortRoute {
-    /// The `flags` byte [`Interface::send_set_port_node_id`] carries.
-    ///
-    /// `carrier` is the port's, and only a units route carries one: a legacy
-    /// route's byte is `0` — no units at all, so nothing to carry as slices or
-    /// as ISO-TP messages.
-    fn flags(self, carrier: PortCarrier) -> u8 {
+    /// The `flags` byte [`Interface::send_set_port_node_id`] carries: a units
+    /// route says so, a legacy route's byte is `0` — no units at all, which is
+    /// [`LEGACY_PORT_FLAGS`].
+    fn flags(self) -> u8 {
         match self {
-            Self::Units => carrier.flags(),
+            Self::Units => MUX_PORT_UNITS,
             Self::Legacy => LEGACY_PORT_FLAGS,
         }
     }
@@ -397,7 +391,7 @@ pub async fn open_bridge(
 ) -> Result<BridgeReady, BridgeError> {
     declare_ports(mcu, ports).await?;
     reset_ports(link, ports, target, None).await?;
-    open_target_port(link, target, PortRoute::Legacy, PortCarrier::Cans)?;
+    open_target_port(link, target, PortRoute::Legacy)?;
     Ok(BridgeReady {
         ports: ports.to_vec(),
         target,
@@ -590,21 +584,16 @@ pub async fn request_bootloader(
 /// target [`PortRoute::Legacy`] because the tunnel's uplink is the raw frame
 /// stream a legacy port serves.
 ///
-/// `carrier` is the port's carrier, which only a units route puts on the wire
-/// ([`PortRoute::flags`]). The tunnel is unaffected either way: what it carries
-/// is the katapult stream, whose only carrier is slices.
-///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
 pub fn open_target_port(
     link: &Interface,
     target: BridgeTarget,
     route: PortRoute,
-    carrier: PortCarrier,
 ) -> Result<(), BridgeError> {
     // The target's route first, then the tunnel that makes the port carry the
     // katapult stream.
-    link.send_set_port_node_id(target.index, target.node_id, route.flags(carrier))?;
+    link.send_set_port_node_id(target.index, target.node_id, route.flags())?;
     link.send_set_port_tunnel(target.index)?;
     Ok(())
 }
@@ -625,7 +614,7 @@ mod tests {
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN,
         CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID,
-        CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC, MUX_PORT_ISOTP, MUX_PORT_UNITS,
+        CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC, MUX_PORT_UNITS,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
@@ -1172,7 +1161,7 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        open_target_port(&link, target, PortRoute::Legacy, PortCarrier::Cans)
+        open_target_port(&link, target, PortRoute::Legacy)
             .expect("the route and the tunnel go out");
 
         // Two admin units are expected (the route and the tunnel), so seeing
@@ -1218,7 +1207,7 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        open_target_port(&link, target, PortRoute::Units, PortCarrier::Cans)
+        open_target_port(&link, target, PortRoute::Units)
             .expect("the units route and the tunnel go out");
 
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
@@ -1250,66 +1239,6 @@ mod tests {
                 Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 0])),
             ],
             "the declaration comes first, then the units naming, then the tunnel"
-        );
-    }
-
-    /// An **ISO-TP** port is named with both flag bits — `MUX_PORT_UNITS`
-    /// and [`MUX_PORT_ISOTP`] — in the same `SET_PORT_NODEID` the unit port
-    /// gets, and the tunnel after it is unchanged: the carrier is the port's, the
-    /// tunnel's own stream stays what it is.
-    #[tokio::test]
-    async fn test_an_isotp_port_is_named_with_the_carrier_bit() {
-        let pty = Pty::new();
-        let link = shared_serial_link(&pty);
-        let mcu = bridge_mcu("bridge", &link);
-
-        declare_port(
-            &mcu,
-            0,
-            BridgePort {
-                baud: 250_000,
-                bitrate: CAN_BITRATE,
-                reset: PortReset::ResetPort,
-            },
-        )
-        .await
-        .expect("the port declares");
-        let target = BridgeTarget {
-            index: 0,
-            node_id: TARGET_NODE_ID,
-        };
-        open_target_port(&link, target, PortRoute::Units, PortCarrier::Isotp)
-            .expect("the isotp route and the tunnel go out");
-
-        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
-            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
-        });
-        let parser = mux_parser();
-        assert_eq!(
-            steps(&parser, &units),
-            vec![
-                Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(2)]),
-                Step::Command(
-                    "config_uart".to_string(),
-                    vec![
-                        ArgValue::UInt8(0),
-                        ArgValue::UInt32(250_000),
-                        ArgValue::UInt8(0),
-                    ],
-                ),
-                Step::Command(
-                    "config_bridge_port".to_string(),
-                    vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
-                ),
-                Step::Admin(admin_payload(&[
-                    CMD_SET_PORT_NODEID,
-                    0,
-                    TARGET_NODE_ID,
-                    MUX_PORT_UNITS | MUX_PORT_ISOTP,
-                ])),
-                Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 0])),
-            ],
-            "the isotp port is named with both bits, and the tunnel follows it"
         );
     }
 

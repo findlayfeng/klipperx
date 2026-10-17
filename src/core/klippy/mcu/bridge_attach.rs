@@ -1936,6 +1936,65 @@ mod tests {
         );
     }
 
+    /// A **USB-console bridge carrying a CAN port** — the bench shape: the
+    /// bridge's own link is a native USB CDC console (a `serial:` path, so the
+    /// port goes through the mux), and the device under test hangs on its CAN
+    /// controller. The route unit must carry the carrier the config asked for:
+    /// `0x01` for the default sliced carrier and `0x03` (`UNITS|ISOTP`) when the
+    /// port section says `can_protocol: isotp`.
+    ///
+    /// The two carriers differ only in that byte on this path: naming a CAN
+    /// device is the same `SET_PORT_NODEID` + `SET_KLIPPER_NODEID` pair, because
+    /// an assignment travels as CAN's own admin frame whatever the device reads
+    /// its stream as. That is what makes `can_protocol:` a runtime choice rather
+    /// than a rebuild.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_usb_console_bridge_routes_a_can_port_with_its_carrier() {
+        let named = [0x12, 0xf9, 0x12, 0xed, 0x38, 0x73];
+        let mcu_id = 7u32;
+
+        for (carrier, flags) in [
+            (PortCarrier::Cans, MUX_PORT_UNITS),
+            (PortCarrier::Isotp, MUX_PORT_UNITS | serial::MUX_PORT_ISOTP),
+        ] {
+            let pty = Pty::new();
+            let printer = Arc::new(Printer::new(ManualReactor::shared()));
+            let link = BridgePortLink {
+                // A USB CDC console: one `serial:` path, addressed by id (the
+                // bridge's downstream devices travel it too).
+                transport: Transport::Serial {
+                    path: pty.path.display().to_string(),
+                    baud: serial::DEFAULT_BAUD,
+                    uuid: Some([0x56, 0xec, 0x31, 0x27, 0x22, 0x4a]),
+                },
+                index: 0,
+                flags: carrier.flags(),
+                named: Some(named),
+                kind: PortKind::Can,
+            };
+            assert_eq!(link.flags, flags, "{} carrier", carrier.name());
+
+            // Silence is success on a CAN port: naming it completes.
+            open(&printer, &link, mcu_id).expect("a silent CAN device is still named");
+
+            let mut expected = serial::set_port_node_id(0, mcu_id as u8, flags);
+            expected.extend_from_slice(
+                &serial::set_node_id_for(named, mcu_id).expect("id 7 is addressable"),
+            );
+            let seen = read_pty(&pty.master, expected.len(), Duration::from_secs(3));
+            assert_eq!(
+                seen, expected,
+                "the route unit carries the carrier ({:#04x}), then the device's \
+                 SET_KLIPPER_NODEID",
+                flags
+            );
+            assert!(
+                read_pty(&pty.master, 1, Duration::from_millis(200)).is_empty(),
+                "nothing else goes down a CAN port while it is being named"
+            );
+        }
+    }
+
     /// The whole config-driven path for a **named** child: over the real bridge
     /// library and a real pty, `[mcu child] uart: uart0 uuid: …` comes up far
     /// enough that the child's naming handshake is carried to the bridge's port.

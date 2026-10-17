@@ -18,7 +18,9 @@
 //!    commands alone are what initializes a bridge for a flash run.
 //! 2. **reset** each port's device, the way the plan says ([`PortReset`]) —
 //!    written at the line for a device with no admin channel, restarted through
-//!    it for one that has.
+//!    it for one that has, and for a device being sent into its bootloader a
+//!    route of its own: units for the request, legacy again before the tunnel
+//!    ([`request_bootloader`]).
 //! 3. **name the target** and **open its tunnel** — `SET_PORT_NODEID` with no
 //!    port flags (a *legacy* route) and `SET_PORT_TUNNEL`, the toggle that makes
 //!    the port carry the katapult raw byte stream instead of mux units.
@@ -41,6 +43,7 @@
 use crate::core::klippy::cmd::allocate_oids::AllocateOids;
 use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart};
 use crate::core::klippy::cmd::McuCommand;
+use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
 use crate::core::klippy::interface::{Interface, InterfaceError};
 use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::msg::MsgError;
@@ -56,6 +59,34 @@ use std::time::Duration;
 /// A units route would therefore swallow it in silence, so a flashing target is
 /// named this one way.
 const LEGACY_PORT_FLAGS: u8 = 0;
+
+/// The port flags a target is named with while its device is asked to enter its
+/// bootloader: a **units** route, the only one that delivers that command.
+///
+/// The request goes down as an admin unit. A legacy port has the bridge strip
+/// the mux header off it, and the device's parser then rejects the bare `KXID`
+/// frame — the marker's sequence byte is not one it looks for — so a request
+/// written onto a legacy route never arrives. A units port forwards the unit
+/// whole, header included, and the device's admin channel acts on it
+/// (`bridge_forward_to_port` in `third_party/klipper/src/bridge.c`).
+///
+/// Only that one request travels a units route, and only for a moment:
+/// [`request_bootloader`] names the port back to a legacy route before it
+/// returns, because the tunnel's uplink needs one.
+const UNITS_PORT_FLAGS: u8 = MUX_PORT_UNITS;
+
+/// How long a port is left in units mode after the bootloader request — time for
+/// the device to write its bootloader marker and reset into katapult.
+///
+/// Nothing answers in that window: the device is leaving its firmware, so there
+/// is no command to wait on. Nor is there a probe to wait on — a bridge link
+/// carries none for what sits behind a port, so re-identifying the *bridge*
+/// would only prove the bridge is alive, at the price of restarting the frame
+/// sequence [`Mcu`] owns. A plain sleep is therefore the whole observable, and
+/// the session's own `CONNECT` retries
+/// ([`BridgeLink::flash`](crate::flash::bridge_flash::BridgeLink::flash))
+/// cover a device that needs longer than this.
+const BOOTLOADER_ENTRY_WAIT: Duration = Duration::from_secs(5);
 
 /// The most ports one session can declare: two oids per port (its UART object
 /// and the port object), and both counts travel in `allocate_oids count=%c`,
@@ -112,7 +143,9 @@ pub enum PortReset {
     ResetPort,
     /// The named device entering its bootloader (`CMD_REQUEST_BOOTLOADER`);
     /// needs a device that answers the admin channel, and it comes back as a
-    /// katapult that takes time to answer.
+    /// katapult that takes time to answer. The request only travels a units
+    /// route, so [`reset_ports`] sends it through one and names the port back
+    /// to a legacy route afterwards ([`request_bootloader`]).
     Bootloader,
 }
 
@@ -233,6 +266,10 @@ impl From<MsgError> for BridgeError {
 /// firmware needs, so a session either runs to the end or fails with the bridge
 /// as it was.
 ///
+/// A port whose plan reset is [`PortReset::Bootloader`] costs the session
+/// [`BOOTLOADER_ENTRY_WAIT`] on top: its device has to leave its firmware before
+/// the tunnel opens ([`request_bootloader`]).
+///
 /// # Errors
 /// [`BridgeError::TooManyPorts`] when the plan is wider than the oid byte can
 /// number, [`BridgeError::Mcu`] when the connection cannot spell or flush a
@@ -244,7 +281,7 @@ pub async fn open_bridge(
     target: BridgeTarget,
 ) -> Result<BridgeReady, BridgeError> {
     declare_ports(mcu, ports).await?;
-    reset_ports(link, ports)?;
+    reset_ports(link, ports, target).await?;
     open_target_port(link, target)?;
     Ok(BridgeReady {
         ports: ports.to_vec(),
@@ -294,13 +331,30 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
 
 /// Reset every declared port's device, the way its plan says — [`open_bridge`]'s
 /// step 2, after [`declare_ports`] so each command addresses a port the bridge
-/// has.
+/// has. Ports are judged one at a time: a plan's other ports keep the single
+/// unit their own reset is.
+///
+/// A [`PortReset::Bootloader`] port is the one case that cannot be one unit
+/// ([`request_bootloader`]), and it needs an id to name the route with — the
+/// reason `target` is here. A plan carries an id only for the target, so a
+/// bootloader reset on any **other** port falls back to the bare unit
+/// [`reset_port`] sends, the request a legacy route strips.
 ///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
-pub fn reset_ports(link: &Interface, ports: &[BridgePort]) -> Result<(), BridgeError> {
+pub async fn reset_ports(
+    link: &Interface,
+    ports: &[BridgePort],
+    target: BridgeTarget,
+) -> Result<(), BridgeError> {
     for (index, port) in ports.iter().enumerate() {
-        reset_port(link, index as u8, port.reset)?;
+        let index = index as u8;
+        match port.reset {
+            PortReset::Bootloader if index == target.index => {
+                request_bootloader(link, index, target.node_id).await?
+            }
+            reset => reset_port(link, index, reset)?,
+        }
     }
     Ok(())
 }
@@ -308,8 +362,16 @@ pub fn reset_ports(link: &Interface, ports: &[BridgePort]) -> Result<(), BridgeE
 /// Reset one declared port's device the way `reset` says: a line pulse on the
 /// port ([`PortReset::ResetPort`]), the device's own restart
 /// ([`PortReset::RestartDevice`]), or its entry into the bootloader
-/// ([`PortReset::Bootloader`]). [`reset_ports`] and `admin reset --port` share
-/// this one spelling of the three admin units.
+/// ([`PortReset::Bootloader`]) — one admin unit each. `admin reset --port` is the
+/// caller that has an index and no id, and this is that call.
+///
+/// The bootloader unit here is the **bare** one, and a legacy route strips it on
+/// its way down, so it only arrives on a port already named units. Naming a port
+/// is what an id is needed for, and `admin reset --port` has none: its
+/// `--port-reset bootloader` therefore reaches a device only behind a port a
+/// previous `admin bridge port` (or flash run) named units, and it cannot put the
+/// route back to legacy. [`reset_ports`] takes the whole route instead
+/// ([`request_bootloader`]).
 ///
 /// The port has to be one the bridge has **declared** — the firmware drops a
 /// port-level command that names a port it does not have, in silence.
@@ -322,6 +384,35 @@ pub fn reset_port(link: &Interface, index: u8, reset: PortReset) -> Result<(), B
         PortReset::ResetPort => link.send_reset_port(index)?,
         PortReset::Bootloader => link.send_request_bootloader(index)?,
     }
+    Ok(())
+}
+
+/// Ask the device behind `index` to enter its bootloader, through the route that
+/// can carry the request — [`PortReset::Bootloader`]'s whole sequence, three
+/// units where the other two resets take one.
+///
+/// A **legacy** route cannot deliver this command (see [`UNITS_PORT_FLAGS`]), and
+/// a **units** route cannot carry the tunnel a flash run then needs: a raw frame
+/// coming up a units port is dropped without a word (`bridge_port_raw_up` in
+/// `third_party/klipper/src/bridge.c`), and the katapult stream is exactly that.
+/// So: name the port units, send the request, give the device
+/// [`BOOTLOADER_ENTRY_WAIT`] to leave its firmware, and name the port legacy
+/// again — ready for the tunnel. `node_id` is the id the device answers to, and
+/// both namings carry it.
+///
+/// # Errors
+/// [`BridgeError::Link`] when the link refuses a port-level write. A write that
+/// fails after the first naming leaves the port **units**: the sequence cannot
+/// restore a route it could not write.
+pub async fn request_bootloader(
+    link: &Interface,
+    index: u8,
+    node_id: u8,
+) -> Result<(), BridgeError> {
+    link.send_set_port_node_id(index, node_id, UNITS_PORT_FLAGS)?;
+    link.send_request_bootloader(index)?;
+    tokio::time::sleep(BOOTLOADER_ENTRY_WAIT).await;
+    link.send_set_port_node_id(index, node_id, LEGACY_PORT_FLAGS)?;
     Ok(())
 }
 
@@ -356,7 +447,7 @@ mod tests {
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN,
         CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID,
-        CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC,
+        CMD_SET_PORT_TUNNEL, HEADER_BYTES, MAGIC, MUX_PORT_UNITS,
     };
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
@@ -490,6 +581,57 @@ mod tests {
             .into_iter()
             .filter(|step| matches!(step, Step::Admin(..)) && !is_reset(step))
             .collect()
+    }
+
+    /// [`expected_steps`]' admin half for a plan whose target (index 1) is sent
+    /// into its bootloader: the other port's pulse, then the target's three
+    /// units — units naming, the request, legacy naming — and then
+    /// [`open_target_port`]'s own legacy naming and the tunnel.
+    ///
+    /// The legacy naming appears twice on purpose: [`request_bootloader`]
+    /// restores the route it broke, and [`open_target_port`] establishes the
+    /// route it needs, each without knowing the other ran. Both are the same
+    /// four-byte idempotent unit.
+    fn expected_bootloader_admin_steps() -> Vec<Step> {
+        vec![
+            Step::Admin(admin_payload(&[CMD_RESET_PORT, 0])),
+            Step::Admin(admin_payload(&[
+                CMD_SET_PORT_NODEID,
+                1,
+                TARGET_NODE_ID,
+                MUX_PORT_UNITS,
+            ])),
+            Step::Admin(admin_payload(&[CMD_REQUEST_BOOTLOADER, 1])),
+            Step::Admin(admin_payload(&[
+                CMD_SET_PORT_NODEID,
+                1,
+                TARGET_NODE_ID,
+                LEGACY_PORT_FLAGS,
+            ])),
+            Step::Admin(admin_payload(&[
+                CMD_SET_PORT_NODEID,
+                1,
+                TARGET_NODE_ID,
+                LEGACY_PORT_FLAGS,
+            ])),
+            Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 1])),
+        ]
+    }
+
+    /// Whether a step is the admin unit for `command` naming port `index`: the
+    /// command byte and the port byte right after the `KXID` marker.
+    fn is_command_for_port(step: &Step, command: u8, index: u8) -> bool {
+        let Step::Admin(bytes) = step else {
+            return false;
+        };
+        let Some(kxid) = bytes
+            .windows(MAGIC.len())
+            .position(|w| w == MAGIC.as_slice())
+        else {
+            return false;
+        };
+        bytes.get(kxid + MAGIC.len()) == Some(&command)
+            && bytes.get(kxid + MAGIC.len() + 1) == Some(&index)
     }
 
     /// Whether a step is a port-reset unit (`0x04`/`0x05`): the admin unit's
@@ -727,10 +869,127 @@ mod tests {
         );
     }
 
+    /// The bootloader request's three units, in order: the port named **units**
+    /// (the only route that delivers the request), the request itself, and the
+    /// port named **legacy** again (the only route the tunnel's raw uplink
+    /// serves). Time is paused, so the wait between the request and the restore
+    /// costs the test nothing.
+    #[tokio::test]
+    async fn test_request_bootloader_names_units_sends_the_request_and_returns_to_legacy() {
+        tokio::time::pause();
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+
+        request_bootloader(&link, 1, TARGET_NODE_ID)
+            .await
+            .expect("the three units go out");
+
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 3
+        });
+        let parser = mux_parser();
+        assert_eq!(
+            steps(&parser, &units),
+            vec![
+                Step::Admin(admin_payload(&[
+                    CMD_SET_PORT_NODEID,
+                    1,
+                    TARGET_NODE_ID,
+                    MUX_PORT_UNITS,
+                ])),
+                Step::Admin(admin_payload(&[CMD_REQUEST_BOOTLOADER, 1])),
+                Step::Admin(admin_payload(&[
+                    CMD_SET_PORT_NODEID,
+                    1,
+                    TARGET_NODE_ID,
+                    LEGACY_PORT_FLAGS,
+                ])),
+            ],
+            "the request travels a units route, and the route is legacy again afterwards"
+        );
+    }
+
+    /// A plan whose target is sent into its bootloader: the target's three
+    /// units sit where its one reset unit would, between the other ports' resets
+    /// and the target's naming, and the other port keeps its single pulse — no
+    /// units naming, no request, no second naming.
+    ///
+    /// The wait inside the sequence is real time here: [`open_bridge`] also runs
+    /// the declaration barrier, whose own timeout must not be auto-advanced. A
+    /// fixture that acks nothing makes the connection re-send its declaration
+    /// block through that wait, so only the admin units on the wire are compared
+    /// — the declaration is [`test_open_bridge_declares_resets_and_opens_the_tunnel_in_order`]'s.
+    #[tokio::test]
+    async fn test_open_bridge_takes_a_bootloader_port_through_units_and_back_to_legacy() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
+
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                reset: PortReset::ResetPort,
+            },
+            BridgePort {
+                baud: 115_200,
+                reset: PortReset::Bootloader,
+            },
+        ];
+        let target = BridgeTarget {
+            index: 1,
+            node_id: TARGET_NODE_ID,
+        };
+        open_bridge(&mcu, &link, &ports, target)
+            .await
+            .expect("the session runs");
+
+        // Six admin units close the sequence (one pulse, the target's three,
+        // its naming and the tunnel).
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 6
+        });
+        let parser = mux_parser();
+        let observed: Vec<Step> = steps(&parser, &units)
+            .into_iter()
+            .filter(|step| matches!(step, Step::Admin(..)))
+            .collect();
+        assert_eq!(
+            observed,
+            expected_bootloader_admin_steps(),
+            "the bootloader port's units where its reset would be, then its naming \
+             and the tunnel"
+        );
+        assert_eq!(
+            observed
+                .iter()
+                .filter(|step| is_command_for_port(step, CMD_RESET_PORT, 0))
+                .count(),
+            1,
+            "the non-bootloader port keeps its one pulse"
+        );
+        for command in [
+            CMD_SET_PORT_NODEID,
+            CMD_REQUEST_BOOTLOADER,
+            CMD_SET_PORT_TUNNEL,
+        ] {
+            assert!(
+                observed
+                    .iter()
+                    .all(|step| !is_command_for_port(step, command, 0)),
+                "port 0 has no bootloader sequence and no tunnel: only the target's port does"
+            );
+        }
+    }
+
     /// `admin reset --port`'s one write: the port-reset unit (`0x04`, a line pulse),
     /// the restart-device unit (`0x05`), or the request-bootloader unit (`0x02`),
     /// each naming the port it means. No receipt, so the wire bytes are the whole
     /// evidence.
+    ///
+    /// The bootloader unit here is the **bare** one [`reset_port`] sends: a legacy
+    /// route strips it, which is why [`request_bootloader`] is the route a flash
+    /// run takes, and this is the call `admin reset --port` can make without an
+    /// id to name a port with.
     #[tokio::test]
     async fn test_reset_port_sends_the_one_port_reset_unit() {
         let pty = Pty::new();

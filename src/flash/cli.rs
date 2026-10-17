@@ -119,7 +119,8 @@ pub struct FlashArgs {
     pub port_nodeid: Option<u8>,
 
     /// Reset the target port's device gets before the tunnel opens (bridge
-    /// flashes only; `reset-port` or `restart-device`, default `reset-port`)
+    /// flashes only; `reset-port`, `restart-device` or `bootloader`, default
+    /// `reset-port`)
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
 
@@ -313,8 +314,9 @@ pub struct ResetArgs {
     #[arg(long, value_name = "INDEX")]
     pub port: Option<u8>,
 
-    /// How a `--port` device is reset: `reset-port` (a line pulse) or
-    /// `restart-device` (its own restart), default `reset-port`
+    /// How a `--port` device is reset: `reset-port` (a line pulse),
+    /// `restart-device` (its own restart) or `bootloader` (send it into its
+    /// bootloader), default `reset-port`
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
 }
@@ -712,14 +714,15 @@ pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
     })
 }
 
-/// Parse `--port-reset`: the two resets [`PortReset`] has, in the spelling the
+/// Parse `--port-reset`: the three resets [`PortReset`] has, in the spelling the
 /// port-level commands carry.
 fn parse_port_reset(text: Option<&str>) -> Result<PortReset, String> {
     match text {
         None | Some("reset-port") => Ok(PortReset::ResetPort),
         Some("restart-device") => Ok(PortReset::RestartDevice),
+        Some("bootloader") => Ok(PortReset::Bootloader),
         Some(other) => Err(format!(
-            "--port-reset expects 'reset-port' or 'restart-device', got '{other}'"
+            "--port-reset expects 'reset-port', 'restart-device' or 'bootloader', got '{other}'"
         )),
     }
 }
@@ -1495,6 +1498,29 @@ mod tests {
         );
     }
 
+    /// The `--port-reset bootloader` spelling on the flash line: the target
+    /// port's device is sent into its bootloader ([`PortReset::Bootloader`]),
+    /// which is the run [`admin flash`](FlashArgs) then waits for `CONNECT` on.
+    #[test]
+    fn test_a_bridge_flash_plan_can_send_the_target_to_its_bootloader() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "--port-reset",
+            "bootloader",
+            "fw.bin",
+        ])
+        .expect("a bridge plan");
+        let Action::BridgeFlash { target, .. } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(target.reset, PortReset::Bootloader);
+    }
+
     /// The host-library bridge line: the library, its identity, its port ttys,
     /// the target's port and id, and the target port's reset.
     #[test]
@@ -1705,6 +1731,7 @@ mod tests {
         .expect_err("not a reset");
         assert!(err.contains("reset-port"), "{err}");
         assert!(err.contains("restart-device"), "{err}");
+        assert!(err.contains("bootloader"), "{err}");
 
         let err = planned(&[
             "--bridge-library",
@@ -2142,6 +2169,25 @@ mod tests {
                 reset: PortReset::ResetPort,
             }
         );
+
+        // `bootloader` is the third spelling: the one a flash run reaches a
+        // running application by.
+        let plan = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "2",
+            "--port-reset",
+            "bootloader",
+        ])
+        .expect("a port reset plan into the bootloader");
+        assert_eq!(
+            plan.target,
+            ResetTarget::Port {
+                index: 2,
+                reset: PortReset::Bootloader,
+            }
+        );
     }
 
     /// A reset method belongs to a port: without `--port` there is one reset, the
@@ -2168,6 +2214,7 @@ mod tests {
         .expect_err("not a reset");
         assert!(err.contains("reset-port"), "{err}");
         assert!(err.contains("restart-device"), "{err}");
+        assert!(err.contains("bootloader"), "{err}");
     }
 
     /// The bridge's link is one of the two, never both and never neither.

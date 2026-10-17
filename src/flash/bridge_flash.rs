@@ -230,19 +230,28 @@ enum BridgeOpen {
 /// when `uuid` is `None`, finding it first.
 ///
 /// A bridge's node id lives in its firmware's RAM, so a run with no
-/// `--bridge-uuid` has to **find** the bridge. An unassigned one answers only
-/// the discovery broadcast (the query `klipperx admin scan --port` makes); an assigned
-/// one stays quiet on that broadcast and answers the plain re-confirmation
-/// instead. So this broadcasts first and falls back to the re-confirmation: the
-/// flag is an optional override, never a requirement, for both a first open and
-/// a reopen after a restart.
+/// `--bridge-uuid` has to **find** the bridge. An unassigned one answers the
+/// discovery broadcast (the query `klipperx admin scan --port` makes) and is
+/// named with what it answered; an assigned one stays quiet on that broadcast,
+/// so the scan finding nothing means the bridge already carries an id — and
+/// then it is attached on the id this run opens it as, with no assignment
+/// handshake in between. The flag is an optional override, never a requirement,
+/// for both a first open and a reopen after a restart.
+///
+/// The id is the whole address for the assigned case: `mcu_id`
+/// ([`BRIDGE_MCU_ID`] for every caller this tool has) is the id the bridge was
+/// given, so nothing has to be asked before the link is used — and the
+/// re-confirmation handshake is a wait a working bridge can fail (a bridge this
+/// very tool named answered nothing to it, which is what made a second command
+/// against it fail with `Receive timeout`). `identify`, which every caller runs
+/// next, is what proves the bridge answers on that id.
 ///
 /// # Errors
 /// [`BridgeFlashError::AmbiguousBridge`] when more than one unassigned bridge
 /// answers — naming the wrong one would restart and re-assign the wrong board —
-/// [`BridgeFlashError::UnassignedSerial`] when neither the broadcast nor the
-/// re-confirmation reaches a bridge, and [`BridgeFlashError::Open`] when the tty
-/// cannot be opened.
+/// [`BridgeFlashError::BridgeNotFound`] when the scan found no unassigned bridge
+/// **and** the assigned-id attach failed too, and [`BridgeFlashError::Open`]
+/// when the tty cannot be opened.
 fn attach_bridge(
     path: &Path,
     baud: u32,
@@ -256,19 +265,21 @@ fn attach_bridge(
             // Several bridges cannot be told apart, and a wrong guess would
             // restart and re-assign the wrong one: the caller has to choose.
             Err(e @ BridgeFlashError::AmbiguousBridge { .. }) => return Err(e),
-            // Nothing unassigned answered: the bridge may already carry an id,
-            // which answers the re-confirmation rather than the broadcast. A
-            // silent line reaches neither, which is the unassigned report.
+            // Nothing unassigned answered, so the bridge is one that already
+            // has an id: register the link on the id this run opens it as
+            // ([`serial::attach_downstream`] writes nothing and waits for no
+            // answer, which is the point), and let the identify that follows
+            // be the proof. A line that answers nothing at all fails there,
+            // with the two failures this error reports kept apart.
             Err(BridgeFlashError::Open(InterfaceError::Timeout)) => {
-                return serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, None).map_err(
-                    |e| match e {
-                        InterfaceError::Timeout => BridgeFlashError::UnassignedSerial {
-                            path: path.to_path_buf(),
-                            baud,
-                        },
-                        e => BridgeFlashError::Open(e),
-                    },
-                );
+                return serial::attach_downstream(path, baud, mcu_id).map_err(|error| {
+                    BridgeFlashError::BridgeNotFound {
+                        path: path.to_path_buf(),
+                        baud,
+                        id: mcu_id,
+                        error,
+                    }
+                });
             }
             Err(e) => return Err(e),
         },
@@ -283,7 +294,7 @@ impl BridgeOpen {
     ///
     /// # Errors
     /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
-    /// [`BridgeFlashError::UnassignedSerial`] / [`BridgeFlashError::AmbiguousBridge`]
+    /// [`BridgeFlashError::BridgeNotFound`] / [`BridgeFlashError::AmbiguousBridge`]
     /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise.
     fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
         match self {
@@ -487,20 +498,22 @@ impl BridgeLink {
     /// `mcu_id`.
     ///
     /// A bridge's link carries its downstream devices' frames too, so its port
-    /// is opened shared and addressed by id (`serial::attach`), which also runs
-    /// the assignment handshake. `uuid` is the bridge **board's** own identity:
-    /// naming it skips the search. With `None` the bridge is **found** — the
-    /// discovery broadcast an unassigned board answers, or the plain
-    /// re-confirmation an already-assigned one answers instead — so
-    /// `--bridge-uuid` is an optional override, not a requirement.
+    /// is opened shared and addressed by id: by `serial::attach` when the
+    /// bridge has to be **named** (which runs the assignment handshake), by
+    /// `serial::attach_downstream` when it already carries the id and there is
+    /// nothing to name. `uuid` is the bridge **board's** own identity: naming it
+    /// skips the search. With `None` the bridge is **found** — the discovery
+    /// broadcast an unassigned board answers, or, when that finds nothing, the
+    /// id this run opens it as — so `--bridge-uuid` is an optional override,
+    /// not a requirement.
     ///
     /// # Errors
-    /// [`BridgeFlashError::UnassignedSerial`] when no uuid names the bridge and
-    /// neither the discovery broadcast nor the re-confirmation reaches one,
-    /// [`BridgeFlashError::AmbiguousBridge`] when several unassigned bridges
-    /// answer the broadcast, and [`BridgeFlashError::Open`] when the port cannot
-    /// be opened, `mcu_id` is outside the addressable range, or the handshake
-    /// with a named bridge times out or is refused.
+    /// [`BridgeFlashError::BridgeNotFound`] when no uuid names the bridge, the
+    /// discovery scan finds nothing unassigned, **and** the attach on `mcu_id`
+    /// fails, [`BridgeFlashError::AmbiguousBridge`] when several unassigned
+    /// bridges answer the broadcast, and [`BridgeFlashError::Open`] when the
+    /// port cannot be opened, `mcu_id` is outside the addressable range, or the
+    /// handshake with a named bridge times out or is refused.
     pub fn open_serial(
         path: &Path,
         baud: u32,
@@ -1105,16 +1118,25 @@ async fn run_session<R: std::io::Read, W: std::io::Write>(
 pub enum BridgeFlashError {
     /// The bridge's device could not be opened or attached.
     Open(InterfaceError),
-    /// A **serial** bridge never answered the assignment handshake and no
-    /// `--bridge-uuid` named it: without an identity the host can only send the
-    /// re-confirmation request, which an unassigned board does not answer (see
-    /// [`BridgeLink::open_serial`]) — so a silent line is unassigned or absent,
-    /// and only the caller can tell.
-    UnassignedSerial {
-        /// The tty the handshake went out on.
+    /// No bridge was reached on a **serial** link opened without a
+    /// `--bridge-uuid`, by either route: the discovery scan found nothing
+    /// unassigned to name, and attaching the link on the id this run opens the
+    /// bridge as failed too (`error`).
+    ///
+    /// The two are reported apart because they mean different things: an empty
+    /// scan is the normal answer of a bridge that already carries an id, while
+    /// the id attach is the line that never came up — a tty with no bridge on
+    /// it, one parked in its bootloader, or an id nothing answers on.
+    BridgeNotFound {
+        /// The tty both routes used.
         path: PathBuf,
         /// The line speed it opened at.
         baud: u32,
+        /// The id the attach route named the bridge with ([`BRIDGE_MCU_ID`] for
+        /// every caller this tool has).
+        id: u32,
+        /// What the attach on that id failed with.
+        error: InterfaceError,
     },
     /// The identify handshake failed — no dictionary, so no declaration.
     Identify(McuError),
@@ -1160,9 +1182,15 @@ impl fmt::Display for BridgeFlashError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BridgeFlashError::Open(e) => write!(f, "opening the bridge: {e}"),
-            BridgeFlashError::UnassignedSerial { path, baud } => write!(
+            BridgeFlashError::BridgeNotFound {
+                path,
+                baud,
+                id,
+                error,
+            } => write!(
                 f,
-                "opening the bridge: {} at {baud} baud did not answer; if the bridge has no \
+                "opening the bridge: the discovery scan on {} found no unassigned bridge, and \
+                 attaching it as id {id} at {baud} baud failed: {error}; if the bridge has no \
                  node id yet it needs --bridge-uuid (take it from `klipperx admin scan --port {}`)",
                 path.display(),
                 path.display()
@@ -1195,12 +1223,12 @@ impl std::error::Error for BridgeFlashError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             BridgeFlashError::Open(e) | BridgeFlashError::Teardown(e) => Some(e),
+            BridgeFlashError::BridgeNotFound { error, .. } => Some(error),
             BridgeFlashError::PortReset(e) => Some(e),
             BridgeFlashError::Identify(e) => Some(e),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
             BridgeFlashError::Unaddressable { .. }
-            | BridgeFlashError::UnassignedSerial { .. }
             | BridgeFlashError::Reset(_)
             | BridgeFlashError::AmbiguousBridge { .. }
             | BridgeFlashError::Shutdown { .. } => None,
@@ -1909,27 +1937,72 @@ mod tests {
         drop(firmware);
     }
 
-    /// A serial bridge that never answers is reported as an **unassigned**
-    /// link, naming the flag that fixes it: the bare serial layer's
-    /// "Receive timeout" leaves the caller with nothing to act on.
+    /// A serial bridge the discovery scan does **not** find is attached on the
+    /// id this session opens it as, without a re-confirmation handshake: that is
+    /// the shape of every command after the first one, because the bridge the
+    /// last command named stays quiet on the broadcast.
     ///
-    /// The pty is the silent bridge: nothing on its far end answers the
-    /// handshake, which is exactly what an unassigned board does — an assigned
-    /// one would answer the re-confirmation `uuid: None` sends.
+    /// The pty is that bridge — nothing on its far end answers anything at all,
+    /// which is the harsher case: the scan answers nothing (so the fallback is
+    /// what runs), and the link it hands back is live even though the far end
+    /// never confirmed anything. The wait the old fallback ran is gone: this
+    /// open writes nothing and blocks on no answer, and the identify every
+    /// caller runs next is what reports a line with no bridge on it.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_a_silent_serial_bridge_is_reported_as_unassigned() {
+    async fn test_a_scan_that_finds_nothing_still_attaches_the_bridge_by_its_id() {
         let pty = Pty::new();
-        let err = match BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, None) {
-            Ok(_) => panic!("nothing answers on this pty, so the attach has to fail"),
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, None)
+            .expect("an unassigned scan falls back to the id this session uses");
+
+        // The fallback asks the bridge for nothing: a silent pty produces no
+        // answer of any kind, and the open still returns — the identify that
+        // follows is where a bridge that is not there fails.
+        let err = tokio::time::timeout(
+            Duration::from_secs(20),
+            link.identify(Duration::from_millis(300)),
+        )
+        .await
+        .expect("the identify was not bounded")
+        .expect_err("the pty answers nothing, so the identify has to fail");
+        assert!(matches!(err, BridgeFlashError::Identify(_)), "{err}");
+
+        link.close();
+        drop(link);
+    }
+
+    /// No bridge at all: the scan finds nothing unassigned **and** the attach on
+    /// the id this session uses fails. Both are reported, and apart — the empty
+    /// scan is the normal answer of a named bridge, so `did not answer` alone
+    /// would leave the caller guessing which half was the problem.
+    ///
+    /// The id here is `0`, which no wire format can address, so the second route
+    /// is what fails; the flag that would have skipped both is in the text.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_bridge_no_route_reaches_names_both_failures() {
+        let pty = Pty::new();
+        let err = match BridgeLink::open_serial(&pty.path, 250_000, 0, None) {
+            Ok(_) => panic!("no id and no scan answer, so the open has to fail"),
             Err(e) => e,
         };
         let text = err.to_string();
         assert!(
             matches!(
                 err,
-                BridgeFlashError::UnassignedSerial { baud: 250_000, .. }
+                BridgeFlashError::BridgeNotFound {
+                    id: 0,
+                    baud: 250_000,
+                    ..
+                }
             ),
             "{text}"
+        );
+        assert!(
+            text.contains("found no unassigned bridge"),
+            "the empty scan is reported: {text}"
+        );
+        assert!(
+            text.contains("attaching it as id 0") && text.contains("failed:"),
+            "the failed id attach is reported too: {text}"
         );
         assert!(text.contains("--bridge-uuid"), "{text}");
         assert!(text.contains("klipperx admin scan --port"), "{text}");

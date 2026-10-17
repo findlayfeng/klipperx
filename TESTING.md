@@ -261,6 +261,37 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
   没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
 
+### 真机结果（2026-10-17，四台设备压测轮）
+
+拓扑：**UART 桥** STM32F103（2×USART，`e512c60ac0e6`）+ 槽 0 上的下游 `97abe031988e`；
+**CAN 桥** STM32F446（CAN1 PB8/PB9 @1 Mbit，`56ec3127224a`）+ 下游 `12f912ed3873`。
+工具：`klipperx stress`（release 构建）+ `klippy`；配置留档在仓库根 `bench-uart.cfg` /
+`bench-uart-500k.cfg` / `bench-can.cfg` / `bench-all4.cfg`（未入库，手测用）。
+
+**这一轮压出来的四个缺陷（都已修并在真机复验）**：
+
+| 症状 | 根因 | 修复 |
+|---|---|---|
+| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`b2ee68a`） |
+| UART 下游每次会话后 mux 身份从 `97abe031988e` 变成 `7eabe031988e`，重连再也握不上手，须重新上电 | **上游 console bug**：`encode_acknak.min_size = 0`，`transmit_room()` 压缩后把 5 字节 ack 写到 `transmit_buf[96..100]`，帧尾 `0x7e` 落在 `mux_identity[0]`（250 kbaud 饱和链路几乎每个 ack 都走压缩分支） | `min_size = MESSAGE_MIN` + ack 短路遵守 `buf_size`（`df4ed17c`） |
+| CAN 下游 `identify` 永远超时；scan / 指派 / 送引导 / 隧道刷写全通 | CAN 侧 `can_decode_nodeid()` 给的是**仲裁 id**，被当成 node id 交给 mux 设备半 ⇒ 设备发出的帧头是 `mux_encode_header(0)`（`80 00`，没有地址），也拒收发给它的单元 | 交接米跑 wire 上的 node id（`7ca47634`） |
+| `[can_device]` 配置期 shutdown：`Pin PB8 reserved for CAN - can't reserve for bridge_can` | 端口型 build 同一对引脚被 `RESERVE_PINS_CAN` 与 `RESERVE_PINS_bridge_can` 各声明一次 | 引脚由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下只声明一次（`24cc4eba`） |
+
+**吞吐与余量（`stress`，release 构建）**：
+
+| 拓扑 | 下游 comm 单独 | 与桥并发 | 桥自己 comm | 下游 step 上限 | motion |
+|---|---|---|---|---|---|
+| UART 250 kbaud | 930 req/s | 1160 | 2270(debug)/2834(release) | — | — |
+| UART 500 kbaud | 1814 req/s | 1452 | 2834 | 145 455 steps/s | ✅ |
+| CAN 1 Mbit（切片） | 2268 req/s | 2270 | 2834（并发时掉到 1816） | 15 625 steps/s | ✅ |
+
+读法（详见 [MCU 连接方式 → 桥下游链路的吞吐与余量](docs/klippy/user-manual/mcu-connection.md#桥下游链路的吞吐与余量真机实测)）：
+250 k 是纯线速瓶颈；并发损耗**不对称**（UART 损被中继侧 ~20%，CAN 损桥自己 ~36%）；CAN 的 step 低是
+8 B 帧下 `queue_step` 要拆两帧、压测突发下发超过一段的提前量（真实主机是连续投递，不是突发）。
+
+**CAN 端口运行期会话已闭环**：`identify` → 配置握手 → 周期 `get_clock`，同一拓扑连续两次 `klippy` 都成功。
+仍未覆盖：ISO-TP 载具的端口侧（U7/U8，未实现）、CAN 上游 attach（桥经 CAN 被宿主连）。
+
 ## 范围外的真板项（不属最小打印任务，未排期）
 
 - **双板时序/漂移**：第二块板（`[mcu zboard]`）跨 MCU 停轴、小时级运行的实际晶振漂移与

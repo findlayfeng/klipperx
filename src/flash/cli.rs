@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket};
+use crate::core::klippy::interface::devices::canserial::{self, AdminBus, CanbusAdminSocket};
+use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::HostMux;
 
 use super::bridge_flash::{
@@ -352,10 +353,25 @@ pub struct BridgePortPlan {
     name = "reset",
     version,
     about = "Reset a bridge itself, or a device on one of its ports, through \
-             the bridge's admin channel",
+             the bridge's admin channel — or send a board on a CAN bus into its \
+             bootloader",
     arg_required_else_help = true
 )]
 pub struct ResetArgs {
+    /// CAN bus this host is on, when the board to reset sits on it directly
+    /// rather than behind a bridge (`can0`)
+    ///
+    /// The direct link `admin flash --interface` writes over: the board is
+    /// named by its CANbus UUID and reached by the bus's admin broadcast, with
+    /// no bridge in the way.
+    #[arg(long)]
+    pub interface: Option<String>,
+
+    /// CANbus UUID of the board to reset on that bus, twelve hex digits in the
+    /// order a `[mcu] uuid:` option is written in (`--interface` only)
+    #[arg(long)]
+    pub uuid: Option<String>,
+
     /// Serial tty of the **bridge** whose device to reset (`/dev/ttyUSB0`)
     #[arg(long, value_name = "TTY")]
     pub bridge: Option<String>,
@@ -401,6 +417,12 @@ pub struct ResetArgs {
     /// The board leaves the application, so its tty changes: katapult enumerates
     /// as `usb-katapult_<mcu>_<serial>`, which is what `admin flash --device`
     /// writes. A host library has no bootloader, and says so.
+    ///
+    /// With `--interface` it is the **direct CAN** form instead
+    /// (`--interface can0 --uuid <hex> --bootloader`): the board is sent the
+    /// bus's bootloader request and answers as katapult on the same bus, which
+    /// is what `admin flash --interface` writes. It is the only reset a CAN bus
+    /// carries.
     #[arg(long)]
     pub bootloader: bool,
 }
@@ -423,16 +445,33 @@ pub enum ResetTarget {
     },
 }
 
-/// A `reset` command line, as a plan: the bridge's link and what to reset, all
+/// A `reset` command line, as a plan: what is reached and what it is sent, all
 /// validated before any device is opened.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResetPlan {
-    /// How the bridge's own link is reached.
-    pub source: BridgeLinkSource,
-    /// The line speed the bridge's link opens at.
-    pub baud: u32,
-    /// What to reset.
-    pub target: ResetTarget,
+pub enum ResetPlan {
+    /// A bridge, over its own link: the bridge itself, or a device on one of
+    /// its ports.
+    Bridge {
+        /// How the bridge's own link is reached.
+        source: BridgeLinkSource,
+        /// The line speed the bridge's link opens at.
+        baud: u32,
+        /// What to reset.
+        target: ResetTarget,
+    },
+    /// A board on a CAN bus this host is attached to, with no bridge in the
+    /// way: the bus's bootloader request is broadcast for it
+    /// (`admin reset --interface can0 --uuid <hex> --bootloader`).
+    ///
+    /// The one reset a direct CAN link has. The board is a running application
+    /// that still answers its node id, so the request reaches it by UUID on the
+    /// admin id rather than by an address — and once it takes it, nothing does.
+    Can {
+        /// The bus the request goes out on.
+        interface: String,
+        /// The board the request names.
+        uuid: [u8; 6],
+    },
 }
 
 /// What a command line asks the tool to do: the two entry points the
@@ -813,12 +852,32 @@ fn plan_assign_uuid(
 /// Turn a `reset` command line into the plan it asks for, or an error naming the
 /// first mistake.
 ///
-/// Every rejection happens before any device is opened. The bridge's link is the
-/// same one the flash and configure lines build ([`plan_bridge_link`]); the only
-/// choice is `--port` (a declared port's device, the way `--port-reset` says) or
-/// no `--port` (the bridge itself). `--port-reset` without `--port` is a mistake:
-/// the bridge self-restart is the one reset there is.
+/// Every rejection happens before any device is opened. The line is one of two
+/// shapes: a **bridge** — the same link the flash and configure lines build
+/// ([`plan_bridge_link`]), where the only choice is `--port` (a declared port's
+/// device, the way `--port-reset` says) or no `--port` (the bridge itself) — or
+/// a **CAN bus** this host is on (`--interface`, the direct link
+/// `admin flash --interface` writes), where `--uuid` names the board and
+/// `--bootloader` is the only reset there is. `--port-reset` without `--port`
+/// is a mistake: the bridge self-restart is the one reset there is.
 pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
+    if let Some(interface) = args.interface.as_deref() {
+        return plan_reset_can(args, interface);
+    }
+    if args.uuid.is_some() {
+        return Err(
+            "--uuid names a board on a CAN bus: give --interface, the bus it is on \
+                    (a bridge's target is named by --port-nodeid)"
+                .into(),
+        );
+    }
+    if args.bridge.is_none() && args.bridge_library.is_none() {
+        return Err(
+            "give --bridge (a bridge's link), --bridge-library (a host library) or \
+                    --interface (a CAN bus this host is on)"
+                .into(),
+        );
+    }
     let source = plan_bridge_link(
         &args.bridge,
         &args.bridge_library,
@@ -856,11 +915,69 @@ pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
             reset: parse_port_reset(args.port_reset.as_deref())?,
         },
     };
-    Ok(ResetPlan {
+    Ok(ResetPlan::Bridge {
         source,
         baud,
         target,
     })
+}
+
+/// The **direct CAN** `reset` line: a bus this host is on and the board to send
+/// into its bootloader.
+///
+/// No bridge is involved, so the bridge's own options are refused here by name
+/// rather than ignored, and `--bootloader` is required: an application that is
+/// running is what the request is for, and there is no other reset on the bus.
+fn plan_reset_can(args: &ResetArgs, interface: &str) -> Result<ResetPlan, String> {
+    if args.bridge.is_some() || args.bridge_library.is_some() {
+        return Err(
+            "give either --interface (a CAN bus this host is on) or --bridge \
+                    (a bridge's link), not both"
+                .into(),
+        );
+    }
+    if let Some(flag) = stray_can_reset_argument(args) {
+        return Err(format!(
+            "{flag} belongs to a bridge's link; --interface names a CAN bus this host is on \
+             directly"
+        ));
+    }
+    if !args.bootloader {
+        return Err(
+            "--interface needs --bootloader: a board on a CAN bus is sent its bootloader \
+                    request, which is the only reset the bus carries"
+                .into(),
+        );
+    }
+    let uuid = args
+        .uuid
+        .as_deref()
+        .ok_or("--interface needs --uuid: which board on the bus to park in its bootloader")?;
+    Ok(ResetPlan::Can {
+        interface: interface.to_string(),
+        uuid: parse_uuid(uuid)?,
+    })
+}
+
+/// The first bridge-only option on a `reset` line that names a **CAN bus**, if
+/// any — so the direct line names the option that belongs elsewhere instead of
+/// ignoring it.
+fn stray_can_reset_argument(args: &ResetArgs) -> Option<&'static str> {
+    if args.port.is_some() {
+        Some("--port")
+    } else if args.port_reset.is_some() {
+        Some("--port-reset")
+    } else if args.bridge_uuid.is_some() {
+        Some("--bridge-uuid")
+    } else if args.host_identity.is_some() {
+        Some("--host-identity")
+    } else if !args.port_tty.is_empty() {
+        Some("--port-tty")
+    } else if args.baud.is_some() {
+        Some("--baud")
+    } else {
+        None
+    }
 }
 
 /// Parse `--port-reset`: the three resets [`PortReset`] has, in the spelling the
@@ -1374,26 +1491,43 @@ fn uuid_hex(uuid: [u8; 6]) -> String {
 }
 
 /// `admin reset`: open the bridge, identify it, and reset what the plan names —
-/// the bridge itself, or a declared port's device.
+/// the bridge itself, or a declared port's device — or, when the plan names a
+/// **CAN bus** instead, send that board its bootloader request.
 ///
-/// The result line is the confirmation: the bridge's self-reset confirms itself
+/// The bridge's result line is the confirmation: its self-reset confirms itself
 /// by answering again ([`BridgeLink::reset`]'s bounded reopen + identify), while
 /// a port-level reset has no receipt and can only be reported as sent. The
 /// runtime is built here for the same reason [`run_bridge_flash`] builds one.
+///
+/// A direct CAN reset needs none of that: one admin frame on the bus is the
+/// whole of it, and it is sent by [`request_can_bootloader`] before any runtime
+/// exists.
 pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_reset(&args)?;
+    let (source, baud, target) = match plan {
+        ResetPlan::Can { interface, uuid } => {
+            request_can_bootloader(&interface, uuid)?;
+            report_reset_can_bootloader(&interface, uuid);
+            return Ok(());
+        }
+        ResetPlan::Bridge {
+            source,
+            baud,
+            target,
+        } => (source, baud, target),
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
-        let mut link = open_link(&plan.source, plan.baud)?;
+        let mut link = open_link(&source, baud)?;
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
-        match plan.target {
+        match target {
             ResetTarget::Bridge => {
                 link.reset().await?;
-                report_reset_bridge(&plan.source);
+                report_reset_bridge(&source);
             }
             ResetTarget::BridgeBootloader => {
                 link.reset_to_bootloader().await?;
@@ -1407,6 +1541,29 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
         link.close();
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+/// Send a board on `interface` its bootloader request: one admin frame on the
+/// bus, which is the whole of a direct CAN reset.
+///
+/// The frame is the bus's broadcast ([`canserial::request_bootloader_frame`]),
+/// so the socket only has to write it — the same [`CanbusAdminSocket`]
+/// `admin flash --query` listens with, which is also why the request reaches a
+/// board that has never had a node id.
+fn request_can_bootloader(interface: &str, uuid: [u8; 6]) -> Result<(), InterfaceError> {
+    let mut bus = CanbusAdminSocket::open(interface)?;
+    bus.send(&canserial::request_bootloader_frame(uuid))
+}
+
+/// The last word of a direct CAN reset: the frame went out with no receipt —
+/// the board stops answering the id it had, which is what the request is for —
+/// and katapult comes up on the same bus, so the write is the CAN line too.
+fn report_reset_can_bootloader(interface: &str, uuid: [u8; 6]) {
+    let uuid = uuid_hex(uuid);
+    println!(
+        "reset: board {uuid} on {interface} (into its bootloader, sent with no receipt; give it a \
+         moment, then write it with `admin flash --interface {interface} --uuid {uuid} <firmware>`)"
+    );
 }
 
 /// The last word of a bridge self-reset: the bridge came back and identified
@@ -2672,6 +2829,21 @@ mod tests {
         plan_reset(&args)
     }
 
+    /// The bridge side of a reset plan: its link, its line speed and what it
+    /// resets. The cases that only look at those three read them here, so the
+    /// direct CAN shape stays a shape of its own rather than a field that is
+    /// empty on it.
+    fn bridge_reset(plan: &ResetPlan) -> (&BridgeLinkSource, u32, &ResetTarget) {
+        match plan {
+            ResetPlan::Bridge {
+                source,
+                baud,
+                target,
+            } => (source, *baud, target),
+            ResetPlan::Can { .. } => panic!("a bridge reset plan, got {plan:?}"),
+        }
+    }
+
     /// `--bootloader` parks the bridge itself in katapult, which is the state
     /// `admin flash --device` writes it from: the same admin channel as the
     /// restart, with the device half's request instead.
@@ -2679,7 +2851,7 @@ mod tests {
     fn test_a_reset_plan_for_the_bridge_into_its_bootloader() {
         let plan = planned_reset(&["--bridge", "/dev/ttyUSB0", "--bootloader"])
             .expect("a bridge bootloader plan");
-        assert_eq!(plan.target, ResetTarget::BridgeBootloader);
+        assert_eq!(*bridge_reset(&plan).2, ResetTarget::BridgeBootloader);
     }
 
     /// The three ways `--bootloader` can be asked for the wrong thing: a port's
@@ -2715,10 +2887,11 @@ mod tests {
     #[test]
     fn test_a_reset_plan_for_the_bridge_itself() {
         let plan = planned_reset(&["--bridge", "/dev/ttyUSB0"]).expect("a bridge reset plan");
-        assert_eq!(plan.target, ResetTarget::Bridge);
-        assert_eq!(plan.baud, DEFAULT_BAUD);
+        let (source, baud, target) = bridge_reset(&plan);
+        assert_eq!(*target, ResetTarget::Bridge);
+        assert_eq!(baud, DEFAULT_BAUD);
         assert_eq!(
-            plan.source,
+            *source,
             BridgeLinkSource::Serial {
                 tty: "/dev/ttyUSB0".into(),
                 uuid: None,
@@ -2740,7 +2913,7 @@ mod tests {
         ])
         .expect("a port reset plan");
         assert_eq!(
-            plan.target,
+            *bridge_reset(&plan).2,
             ResetTarget::Port {
                 index: 1,
                 reset: PortReset::RestartDevice,
@@ -2750,7 +2923,7 @@ mod tests {
         let plan = planned_reset(&["--bridge", "/dev/ttyUSB0", "--port", "0"])
             .expect("the port's reset defaults to the line pulse");
         assert_eq!(
-            plan.target,
+            *bridge_reset(&plan).2,
             ResetTarget::Port {
                 index: 0,
                 reset: PortReset::ResetPort,
@@ -2769,7 +2942,7 @@ mod tests {
         ])
         .expect("a port reset plan into the bootloader");
         assert_eq!(
-            plan.target,
+            *bridge_reset(&plan).2,
             ResetTarget::Port {
                 index: 2,
                 reset: PortReset::Bootloader,
@@ -2804,11 +2977,12 @@ mod tests {
         assert!(err.contains("bootloader"), "{err}");
     }
 
-    /// The bridge's link is one of the two, never both and never neither.
+    /// The bridge's link is one of the three, never two and never none.
     #[test]
     fn test_a_reset_link_is_required() {
         let err = planned_reset(&["--port", "0"]).expect_err("which bridge?");
         assert!(err.contains("--bridge"), "{err}");
+        assert!(err.contains("--interface"), "{err}");
 
         let err = planned_reset(&[
             "--bridge",
@@ -2818,5 +2992,119 @@ mod tests {
         ])
         .expect_err("one link or the other");
         assert!(err.contains("--bridge-library"), "{err}");
+    }
+
+    /// A **direct CAN** reset: the bus this host is on and the board to send
+    /// into its bootloader. No bridge, no node id — the request is a broadcast
+    /// the board takes by UUID, and katapult then answers on the same bus.
+    #[test]
+    fn test_a_reset_plan_for_a_board_on_a_can_bus() {
+        let plan = planned_reset(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--bootloader",
+        ])
+        .expect("a direct CAN bootloader plan");
+        assert_eq!(
+            plan,
+            ResetPlan::Can {
+                interface: "can0".into(),
+                uuid: [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            }
+        );
+    }
+
+    /// The four ways the direct CAN line can be asked for the wrong thing: no
+    /// `--uuid`, no `--bootloader` (the only reset a bus carries), something
+    /// that is not an identity, and the two links on one line. Each is named
+    /// where the mistake is made.
+    #[test]
+    fn test_a_can_reset_names_what_it_is_missing() {
+        let err = planned_reset(&["--interface", "can0", "--bootloader"])
+            .expect_err("which board on the bus?");
+        assert!(err.contains("--uuid"), "{err}");
+
+        let err = planned_reset(&["--interface", "can0", "--uuid", "11aa22bb33cc"])
+            .expect_err("a bus has one reset, and it is --bootloader");
+        assert!(err.contains("--bootloader"), "{err}");
+
+        let err = planned_reset(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33c",
+            "--bootloader",
+        ])
+        .expect_err("not twelve hex digits");
+        assert!(err.contains("twelve hex digits"), "{err}");
+
+        let err = planned_reset(&[
+            "--interface",
+            "can0",
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--bootloader",
+        ])
+        .expect_err("one link or the other");
+        assert!(err.contains("--interface"), "{err}");
+        assert!(err.contains("--bridge"), "{err}");
+    }
+
+    /// The bridge's own options are named on the CAN line rather than silently
+    /// dropped, `--port` included.
+    #[test]
+    fn test_a_can_reset_refuses_the_bridge_options() {
+        let err = planned_reset(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--bootloader",
+            "--port",
+            "0",
+        ])
+        .expect_err("a bus has no ports");
+        assert!(err.contains("--port"), "{err}");
+        assert!(err.contains("belongs to a bridge"), "{err}");
+
+        let err = planned_reset(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--port-reset",
+            "bootloader",
+        ])
+        .expect_err("a bus has no ports");
+        assert!(err.contains("--port-reset"), "{err}");
+
+        let err = planned_reset(&[
+            "--interface",
+            "can0",
+            "--uuid",
+            "11aa22bb33cc",
+            "--bootloader",
+            "--baud",
+            "500000",
+        ])
+        .expect_err("a bus has no line speed");
+        assert!(err.contains("--baud"), "{err}");
+    }
+
+    /// `--uuid` names a board on a bus: without `--interface` there is no bus
+    /// to send it on, and a bridge's target is named by its port's id instead.
+    #[test]
+    fn test_a_uuid_without_an_interface_is_named() {
+        let err = planned_reset(&["--bridge", "/dev/ttyUSB0", "--uuid", "11aa22bb33cc"])
+            .expect_err("a bridge target is named by --port-nodeid");
+        assert!(err.contains("--interface"), "{err}");
+        assert!(err.contains("--port-nodeid"), "{err}");
+
+        let err = planned_reset(&["--uuid", "11aa22bb33cc"]).expect_err("a board on what?");
+        assert!(err.contains("--interface"), "{err}");
     }
 }

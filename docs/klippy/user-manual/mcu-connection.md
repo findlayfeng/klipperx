@@ -312,12 +312,18 @@ sudo ip link set dev can0 txqueuelen 128               # 默认 10 会在压测�
 和上一节的桥端口对比：同样的 1 Mbit、同样的下游板，**主机直连的 step 是 145 455，而桥 CAN 端口只有
 15 625** —— 我们桥端口的 per-frame 转发在突发命令负载下代价明显更高（待查）。
 
-两个已知缺口（都在工具侧，记在这里免得再踩）：
+直连 CAN 的**送引导**现在是工具的一部分（两个旧缺口已补齐）：
 
-- **`admin flash --interface can0` 不会请求引导**（上游 `flash_can.py` 有 `-r`）。现在要先手工送一帧
-  `REQUEST_BOOTLOADER`：`cansend can0 3f0#02<uuid 12 位十六进制>`，等约 2 s 再 `admin flash`。
-- **`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器**，会报
-  `canbus: the MCU id has not been assigned`；在配置里给该节写显式 `canbus_nodeid:` 即可跑。
+```sh
+# 先把板子送进引导（不再需要手工 cansend）
+klipperx admin reset --interface can0 --uuid <12 位> --bootloader
+# 等约 2 s，再刷
+klipperx admin flash --interface can0 --uuid <12 位> <固件.bin>
+```
+
+- `admin reset` 的直连 CAN 形态与串口形态同语义：它发的是与载具无关的 `0x3f0 [0x02][uuid]` 单帧。
+- `stress` 给**直连 CAN** 的 MCU 也从同一条 id 序列分配节点号（与桥的端口设备同一分配器，因此两者
+  不会撞号）；不再需要手写 `canbus_nodeid:`（写了也尊重，冲突仍由分配器报错）。
 
 ### 换下游控制台的波特率（UART 口）
 

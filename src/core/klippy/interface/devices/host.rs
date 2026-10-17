@@ -903,8 +903,8 @@ impl HostDevice {
     /// out — the same failure a shared serial port misses its handshake on.
     ///
     /// `host_port_paths` is the tty each of this MCU's bridge ports opens, as
-    /// `(slot, path)` — the port index and the `uart_path:` the config wrote for
-    /// it (`mcu/bridge_ports.rs`). It is handed to the library **before**
+    /// `(slot, path)` — the port's **UART slot** and the `uart_path:` the config
+    /// wrote for it (`mcu/bridge_ports.rs`). It is handed to the library before
     /// klipper comes up (`klipper_host_port`), so a port's stream is what the
     /// host says it is rather than what the library was built with; the paths
     /// are only read when this call is the one that loads the library, exactly

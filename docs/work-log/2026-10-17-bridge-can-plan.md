@@ -206,7 +206,7 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 | 预算 | 现值 | 每条目消耗 | 折算上限 |
 |---|---|---|---|
 | 桥端口槽 | `src/bridge.c:65` 固定 **4** 槽 | 1 端口/槽 | UART 已占 2 ⇒ CAN 端口最多 2 |
-| bxCAN 过滤器 bank | F103 **14** 个（`stm32/can.c:136-172`：`0x3f0` 占 1、自身 `id`/`id+1` **各占 1**，32 位精确掩码） | 每 node 2 bank（`id`、`id+1`）；admin 1 | **(14-1)/2 = 6 node**；改用「bit0 掩码」一格盯一对 ⇒ **13 node**（U4 按这一形态做） |
+| bxCAN 过滤器 bank | F103 **14** 个（`stm32/can.c:136-172`：`0x3f0` 占 1、自身 `id`/`id+1` **各占 1**，32 位精确掩码）；追加项表 `CANHW_EXTRA_FILTERS = 8`（bank 3..10，已实现） | 每 node 1 格（bit0 掩码盯 `id`/`id+1` 一对） | 实现上限 **8 node**（bank 3..10）；硬件上限 11（bank 3..13） |
 | RAM | 桥固件当前 data 52 + bss **3996 B / 20480 B**（余 ~16 KB） | 切片：每 node ≈ rx 130 B + tx 排队 ≈ 200 B；ISO-TP 再加状态 + 2 条消息队列 ≈ 420 B ⇒ **切片 ~330 B、ISO-TP ~750 B 每 node** | 8 node ≈ 6 KB（可行）；16 node ≈ 12 KB（吃紧，还叠着 2×256 B/端口的 USART 缓冲） |
 | `bridge.c` 的 `id→port` 表 | `MUX_MAX_NODE_ID+1` = **256** 项 | 1 项/id | 不构成限制 |
 
@@ -231,3 +231,25 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
    需要一次复位 + 端口载具保持 —— 第一版不验这段。
 5. **子模组改动**（D4/D5）：`bridge.h`/`canbus.h` 的接口扩展要在 `upstream-deviations.md` 登记，
    并在 katapult 侧同步评估（katapult 的 `canhw_set_filter` 同形，本期不改 katapult）。
+
+## 8. 实施记录
+
+### 2026-10-17：U1 / U4 落地（固件骨架，已合入子模组 `klipperx`）
+
+| 单元 | 提交（`third_party/klipper`） | 结果 |
+|---|---|---|
+| U1 端口后端分派层 | `ee7cf27c` + `53676321`，合入 `95007ed4` | 新 `src/stm32/bridge_port.c` 独占 `uart_backend_*` 三个符号与 `DECL_CONSTANT("BRIDGE_UART_COUNT")`；`bridge_serial.c` 改名并暴露 `bridge_serial_slot_count()`；`BRIDGE_SERIAL_SLOT_COUNT` 写成编译期和（`DECL_CONSTANT` 只折常量表达式） |
+| U4 过滤器可追加 | `1630f1f5`，合入 `8c746e5e` | `CANBUS_FILTER_MULTI`（无 prompt）+ `canhw_add_filter(arb, mask)`：stm32 bxCAN 用 bank 3..10，上限 8，`canhw_set_filter` 在 `FA1R=0` 之后**重装追加项**（否则节点号一变就静默丢） |
+
+**验证**：子模组侧 `stm32f103-usb-mux-bridge` / `stm32f103-can-mux` / `stm32f103-can-isotp` / 真机 `target/hw-bridge/klipper.config` 全编过（后者 `BRIDGE_UART_COUNT = 2`）；主仓 `cargo test --workspace` **3206 通过 / 15 ignored**，13 个测试二进制全绿。
+
+### 结构发现（改了两条口径，后续单元必须照这个写）
+
+1. **D6（新增裁定）**：`generic/canbus.c` 与 arch 驱动今天挂在 `CONFIG_CANSERIAL` 下，而 `stm32/can.c` 的 IRQ 直接调 `canbus_process_data()`/`canbus_notify_tx()`，后者转给 canserial——**「只要驱动不要节点」编不出来**。端口后端要求把 `$(canbus-src-y)` 与 `generic/canbus.c` 移到 `CONFIG_CANBUS` 下，`canbus.c` 里的 canserial 调用加守卫，并加桥端口分派点。**仍不 select `CANSERIAL`/`MUX_CAN`**（D1 不变）。
+2. **D4 补强**：`struct bridge_port_ops` 加**可选** `.node_id(ctx, uint8_t)` 回调，由 `bridge.c` 在记下某个 id 时调用——过滤器只能在那一刻才知道要听谁；CAN 后端在回调里装过滤器，`canhw_add_filter` 返回 `-1` 或能力未开时 **`shutdown` 并点名**，不许静默听不见。
+3. **`shutdown` 归属**：`canhw_add_filter` 只返回 `-1`，由 `bridge_can.c` 翻成一条总线级 `shutdown` 文案，不引入全局聚合层。
+4. **过滤器上限已定**：`CANHW_EXTRA_FILTERS = 8` ⇒ 配合 `BRIDGE_CAN_NODE_MAX = 4` 有一倍余量；一个 node 用「bit0 掩码」一格（`id & ~1` + `0x7FE`）盯 `id`/`id+1` 一对。
+
+### 进行中
+
+**U2**（CAN 端口后端切片载具 + D6 管线解绑 + `.node_id` 回调 + 新构建目标 `stm32f103-usb-can-bridge`）：分支 `agents/feat-bridge-can-backend`（klipper worktree `can-port-backend`）。

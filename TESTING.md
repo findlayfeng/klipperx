@@ -284,9 +284,10 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 对比：同样 1 Mbit、同样下游板，主机直连的 `step` 是 **145 455**，而 klipperx 桥的 CAN 端口只有
 **15 625**（9 倍差）；说明桥端口的 per-frame 转发在突发命令负载下代价更高，待查。
 
-工具侧两个缺口（本轮踩到）：`admin flash --interface can0` 不会请求引导（需手工 `cansend` 一帧
-`0x3f0 [0x02][uuid]`）；`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器，必须写显式
-`canbus_nodeid:`。
+工具侧两个缺口已补齐（2026-10-18）：`admin reset --interface can0 --uuid <12 位> --bootloader`
+能直接从主机侧把板子送进引导（不再要手工 `cansend` 一帧 `0x3f0 [0x02][uuid]`）；`stress` 给连
+`canbus_interface` 的 MCU 也从同一条 id 序列分配节点号（不再要手写 `canbus_nodeid:`）。两者的
+主机侧验收是单测（`flasher/cli` 与 `stress` 的分配器用例），**未上真机重跑**。
 
 ### 真机结果（2026-10-17，四台设备压测轮）
 

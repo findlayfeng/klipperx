@@ -28,6 +28,15 @@ use super::transport;
 /// given, in baud — `flashtool.py`'s default.
 const DEFAULT_BAUD: u32 = 250_000;
 
+/// The bus rate a CAN flash opens its port at, in bits per second — 1 Mbit,
+/// the default `[canbus]` and the rate `flashtool.py` uses.
+///
+/// On a CAN slot `--baud` is the bus bitrate, not a line speed: this layer does
+/// not tell the two port kinds apart yet (a port is still declared as a UART,
+/// `bridge_session`), so it carries this constant for the CAN case until the
+/// declaration path names the port's bus.
+pub const CAN_DEFAULT_BITRATE: u32 = 1_000_000;
+
 /// The node id a CAN flash assigns the board when `--nodeid` is not given:
 /// `CANBUS_NODEID_OFFSET` in `flashtool.py`, the bottom of the range the
 /// katapult admin commands accept (`nodeid >= 128`).

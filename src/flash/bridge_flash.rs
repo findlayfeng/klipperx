@@ -102,7 +102,7 @@ const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
 /// `--bridge-uuid` waits for an answer, after the restart dropped the bridge's
 /// node id.
 ///
-/// The scan is the one `klipperx scan --port` uses; it runs to the end of this
+/// The scan is the one `klipperx admin scan --port` uses; it runs to the end of this
 /// window even after a board answers, so the budget is the price of not knowing
 /// the identity up front. Long enough for a board to finish coming back up,
 /// short enough that [`RESET_TIMEOUT`] still has room to retry.
@@ -172,7 +172,7 @@ enum BridgeOpen {
 ///
 /// A bridge's node id lives in its firmware's RAM, so a run with no
 /// `--bridge-uuid` has to **find** the bridge. An unassigned one answers only
-/// the discovery broadcast (the query `klipperx scan --port` makes); an assigned
+/// the discovery broadcast (the query `klipperx admin scan --port` makes); an assigned
 /// one stays quiet on that broadcast and answers the plain re-confirmation
 /// instead. So this broadcasts first and falls back to the re-confirmation: the
 /// flag is an optional override, never a requirement, for both a first open and
@@ -262,7 +262,7 @@ impl BridgeOpen {
 /// [`BridgeLink::reset`] performs drops it; a run that has no `--bridge-uuid`
 /// to name the bridge with has to **find** it, and the discovery broadcast is
 /// how — the one query an unassigned board answers, the same call
-/// `klipperx scan --port` makes.
+/// `klipperx admin scan --port` makes.
 ///
 /// # Errors
 /// [`BridgeFlashError::AmbiguousBridge`] when more than one bridge answers:
@@ -596,7 +596,7 @@ impl BridgeLink {
                 path, uuid: None, ..
             } => format!(
                 "; no --bridge-uuid was given and the discovery scan found no unassigned \
-                 bridge — pass --bridge-uuid (take it from `klipperx scan --port {}`)",
+                 bridge — pass --bridge-uuid (take it from `klipperx admin scan --port {}`)",
                 path.display()
             ),
             _ => String::new(),
@@ -810,7 +810,7 @@ impl fmt::Display for BridgeFlashError {
             BridgeFlashError::UnassignedSerial { path, baud } => write!(
                 f,
                 "opening the bridge: {} at {baud} baud did not answer; if the bridge has no \
-                 node id yet it needs --bridge-uuid (take it from `klipperx scan --port {}`)",
+                 node id yet it needs --bridge-uuid (take it from `klipperx admin scan --port {}`)",
                 path.display(),
                 path.display()
             ),
@@ -824,7 +824,7 @@ impl fmt::Display for BridgeFlashError {
             BridgeFlashError::AmbiguousBridge { count, path } => write!(
                 f,
                 "{count} unassigned bridges answered on {}; pass --bridge-uuid to name this \
-                 one (take it from `klipperx scan --port {}`)",
+                 one (take it from `klipperx admin scan --port {}`)",
                 path.display(),
                 path.display()
             ),
@@ -1285,7 +1285,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("--bridge-uuid"), "{text}");
-        assert!(text.contains("klipperx scan --port"), "{text}");
+        assert!(text.contains("klipperx admin scan --port"), "{text}");
     }
 
     /// A `Read` that records the bytes it hands through: the tunnel's uplink
@@ -1888,7 +1888,7 @@ mod tests {
     }
 
     /// A bridge→host answer to the discovery broadcast, as the firmware's
-    /// `mux_need_nodeid` builds it and `klipperx scan --port` decodes: the admin
+    /// `mux_need_nodeid` builds it and `klipperx admin scan --port` decodes: the admin
     /// reply header, then the `KXID` frame carrying [`RESP_NEED_NODEID`] and the
     /// six uuid bytes ([`serial::RESP_NEED_NODEID`], no application byte).
     fn unassigned_answer(uuid: [u8; 6]) -> Vec<u8> {

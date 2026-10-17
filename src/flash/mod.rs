@@ -48,9 +48,11 @@ pub(crate) mod fake;
 #[cfg(test)]
 mod tests;
 
-pub use bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
+pub use bridge_flash::{
+    AssignReport, BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT,
+};
 pub use bridge_session::{
-    open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget, PortReset, PortRoute,
+    open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget, PortKind, PortReset, PortRoute,
 };
 pub use frame::{build_frame, crc16_ccitt, Frame, FrameScanner};
 pub use session::{

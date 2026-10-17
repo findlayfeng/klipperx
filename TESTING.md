@@ -193,10 +193,10 @@
   node id，再经**单元**完成 mux 扫描/采纳（`SET_KLIPPER_NODEID`）、确认本节点回帧带应答头、
   `uuid` 冲突时 `shutdown`；然后一台桥经 CAN 上游带 N 台下游设备（UNITS 口/legacy 口两种）并跑
   `SET_PORT_NODEID`/`RESET_PORT`。判定：同 M1-1/M1-2 的 identify + `get_clock`，且**单元不被截断**。
-  **缺件（软件侧也已声明）**：`[can_device]` 下游端口节与固件 `BRIDGE_PORT_CAN` 端口后端未实现
-  （配置期点名拒绝）；本环境无 CAN 外设，固件 `MUX_CAN` 目前只有**构建级**验证
-  （`test/configs/stm32f103-can-mux.config` 让闸门真的编那段代码）。无真板时可在
-  `CAP_NET_ADMIN` 容器里用 `vcan` 搭两节点（本仓无此夹具先例，属可选）。
+  **缺件（2026-10-17 复核，已缩小）**：固件的 CAN **下游端口**后端（`BRIDGE_PORT_CAN`）与它的
+  单帧 admin 代理**已经落地并真机验过**（见下方「经桥刷 CAN 下游」，F446 桥 + F103 下游，含可反复刷）；
+  仍未接线的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 **CAN 上游 attach**
+  （桥自己经 CAN 被宿主连）。
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
   admin 单元属点火不管）的频率也需观察。
@@ -314,6 +314,29 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 
   **仍未验（写在明处）**：`--legacy` 口上的 stock katapult（只验了单测夹具）；
   host 库当桥时的多槽并行刷写；`scan --bridge` 的漏报率（只有“一片一板”的拓扑）。
+
+  #### 经桥刷 **CAN** 下游（2026-10-17，拓扑：主机 ─USB→ F446 桥 ─CAN 1 Mbit/s→ F103）
+
+  | # | 验项 | 命令 | 实测结果 |
+  |---|---|---|---|
+  | 1 | CAN-only 桥列槽 | `admin bridge config --bridge <F446>` | `available uarts: 1`、`uart 0: 250000 baud default slot (CAN1 PB8/PB9)` |
+  | 2 | 经 CAN 口发现下游 | `admin scan --bridge <F446> --ports 0` | `Found uuid=12f912ed3873, Application: CanBoot, via port 0` |
+  | 3 | 指派 | `admin bridge port … --port 0 --port-nodeid 7 --assign-uuid 12f912ed3873` | `assign: … (sent, no confirmation — katapult does not acknowledge it, which is normal)` |
+  | 4 | 经 CAN 隧道刷写 | `admin flash --bridge <F446> … --port 0 --port-nodeid 7 <fw>` | `complete: 43284 bytes in 677 blocks` |
+  | 5 | **可反复刷**（目标正跑应用） | 同上 + `--port-reset bootloader --assign-uuid …` | `complete: 43284 bytes in 677 blocks`；刷完扫描见 `Application: Klipper` |
+  | 6 | **应用载具无关**：下游跑 `CONFIG_ISOTP` 应用 | 同上（刷 ISO-TP 应用 → 再一条命令刷回切片应用） | `complete: 44468 bytes in 695 blocks` → `complete: 43284 bytes in 677 blocks` |
+  | 7 | 桥自己进引导 | `admin reset --bridge <F446> --bootloader` | 板子以 `usb-katapult_stm32f446xx_<serial>` 重新枚举，随后 `admin flash --device` 写它 |
+
+  CAN 专属判据：① `0x3f1` 的 `[0x20][uuid][app]` 被包成带端口路径的单元上行（第 2 行）；
+  ② 隧道帧的 arb = `0x100 + 2*7`（端口 `node_id`），上行按 `reply_arb_id` 回；
+  ③ **CAN 的 node id 是 RAM 态**，所以流程必须是「指派 → 送引导 → 再指派 → 隧道」（第 5 行从应用态
+  一次成功，就是这三步都在断言内的证据）；④ 第 6 行证明「应用把字节流做成 ISO-TP」不影响刷机——
+  送引导走的是 `0x3f0 [0x02][uuid]` 单帧，与载具无关。
+
+  真机踩过、已修/已写进手册的坑：F446 那块板是 **12 MHz 晶振**（必须 `LOW_LEVEL_OPTIONS` +
+  `STM32_CLOCK_REF_12M`，否则 PLL 算错、USB 不枚举）；**F4 的 Kconfig 没有 8 KiB 引导选项**，
+  默认 32 KiB ⇒ 应用在 `0x8008000`；**F1 上 USB 与 CAN1 RX0 共用中断向量 20**，F103 做 CAN 桥只能
+  用 USART 控制台；`0x02` 必须以**带单元头的单元**发到设备自己的 arb（否则 mux 设备不认）。
 
 ## 怎么算清零
 

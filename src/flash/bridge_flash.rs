@@ -1281,6 +1281,11 @@ mod tests {
     /// **real** mux library: the bridge forwards the request-bootloader unit
     /// (`0x02`) to the port it names, and the port's pty is where that lands —
     /// the whole action a reset run has, with no receipt to wait for.
+    ///
+    /// The one unit is all `admin reset` can do: it has no id to name a port
+    /// with. A flash run's bootloader step names the port **units** first, the
+    /// only route that does not strip this very unit on its way down
+    /// ([`request_bootloader`](crate::flash::bridge_session::request_bootloader)).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_admin_reset_sends_the_target_port_into_its_bootloader() {
         let _serial = HOST_LIBRARY_TEST_LOCK

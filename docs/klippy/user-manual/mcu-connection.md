@@ -11,7 +11,7 @@
 | `canbus_fd` | CAN **链路层**：`true` = CAN-FD（64 B/帧），默认 `false` = 经典 CAN（8 B/帧） | 只在 CAN 节有意义（其余节写它会被判「第二个接口」）。不写 = `false`，与今天逐字节同行为 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**2026-10-16 起一进程可跑多份库**：库不再装进程级 `SIGUSR1`（唤醒改按实例 `eventfd`），运行期/配置层那两处「按路径拒绝第二条」的守卫也已去掉；要两份**同进程独立固件**须加载**两份不同文件的拷贝**（`dlopen` 按 inode 识别，同一文件仍返回同一映射），同路径多节则照旧只加载一次并共享。|
 | `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥 |
-| `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥。**配置面已接线**：主机为端口节发 `config_can`（带 `can_bitrate`）+ `config_bridge_port`，端口 `index` = 声明顺序（同 `uart_device`）；附着时发 `SET_PORT_NODEID` → 设备命名（CAN 走 `0x3f0` 单帧 + `0x3f1` 应答，不等串口 mux 的重确认）。**已知缺陷（2026-10-17 真机）**：桥侧附着与 admin 通道（发现/指派/送引导/隧道刷写）已验，但**运行期 units 数据面尚未修通**（`identify` 无应答，定位中）；命令行侧的 CAN 口不受影响，见[经桥刷下游](#经桥刷下游klipperx-admin-不用-printercfg)一节的 CAN 小节 |
+| `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥。**配置面已接线且真机跑通**：主机为端口节发 `config_can`（带 `can_bitrate`）+ `config_bridge_port`，端口 `index` = 声明顺序（同 `uart_device`）；附着时发 `SET_PORT_NODEID` → 设备命名（CAN 走 `0x3f0` 单帧 + `0x3f1` 应答，不等串口 mux 的重确认）。运行期会话（`identify` + 配置握手 + 周期 `get_clock`）已真机验过，可反复附着；吞吐数字见[桥下游链路的吞吐与余量](#桥下游链路的吞吐与余量真机实测) |
 
 ```ini
 [mcu]
@@ -199,10 +199,12 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
   正常代价，不是配置错。
 - 桥已在我们上一条命令里被赋过 node id 时，紧接着的**下一条命令**可能先报一次 `opening the bridge: Receive timeout`
   ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）；仍失败就等几秒再试，或用 `--bridge-uuid`。
-- **`printer.cfg` 侧已接线**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，
+- **`printer.cfg` 侧已接线并真机跑通**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，
   子设备用 `can:` 按名字引用；附着顺序是「路由（`SET_PORT_NODEID`）→ 设备命名（`0x3f0` 单帧，等 `0x3f1` 应答，
-  超时也算已发出）」。**运行期 units 数据面仍有一条未修通的真机缺陷**（桥侧附着正常、`identify` 无应答，
-  见 [串口复用协议](../developer-manual/serial-mux-protocol.md) 的 CAN 小节）。
+  超时也算已发出）」，之后 `identify` + 配置握手走 CAN 端口的中继会话（真机已通，可反复附着）。
+  一个踩过的坑记在这里：CAN 设备的 node id 在固件里有两种表示——**总线上的仲裁 id**
+  （`0x100 + 2n`，`CanData.assigned_id`、过滤器用这个）与**节点号**（1..255，mux 头/寻址用这个），
+  两者不能混用；混用会让设备发出的帧带一个「没有地址」的单元头，主机只能看到 `no slot for mcu …`。
 
 ### CAN 下游口（真机已闭环：发现 → 指派 → 写 → 反复写）
 
@@ -237,6 +239,58 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
   用 F4（F446 已实测：CAN 在 PB8/PB9，应用落在 32 KiB 引导分区后的 `0x8008000`——F4 的 Kconfig
   **没有 8 KiB 引导选项**；F446 那块板是 **12 MHz 晶振**，`make menuconfig` 要选
   `LOW_LEVEL_OPTIONS` + `STM32_CLOCK_REF_12M`，否则 PLL 算错、USB 不枚举）。
+
+## 桥下游链路的吞吐与余量（真机实测）
+
+测法：`klipperx stress <配置> <板> --task comm|step|motion`（release 构建；debug 构建会自己先到瓶颈，
+同一档差 ~20%）。`comm` 量的是**小消息往返**（一问一答 `get_clock`，每往返约 22 B），`step` 量的是
+**单向批量命令**（`queue_step`），`motion` 是一整段运动链路的冒烟。
+
+| 拓扑 | 下游 comm（单独） | 下游 comm（与桥并发） | 桥自己 comm | 下游 step 上限 | motion |
+|---|---|---|---|---|---|
+| UART 250 kbaud（默认） | **930** req/s | 1160 | 2270（debug）/2834（release） | — | — |
+| UART **500 kbaud** | **1814** req/s | 1452 | 2834 | **145 455** steps/s | ✅ |
+| CAN 1 Mbit（切片） | **2268** req/s | 2270 | 2834 | **15 625** steps/s | ✅ |
+
+参照：同类 F103 **直连 USB** 的步进上限是 339 623 steps/s、往返 3552 req/s（[压力测试](../developer-manual/stress.md)），
+所以“桥中转 + mux”在这两条指标上大约要打 4 折（步进）和 8 折（往返）。
+
+怎么读这几列：
+
+- **250 k 是纯线速瓶颈**：25 KB/s ÷ 每往返约 22 B ≈ 1136，所以 930 就是打满了；这也是把控制台
+  编成 **500 k**（或 1 M，若 USART 分频允许）的理由。只做工具头/传感器/风扇的板子 250 k 足够；
+  **桥后要驱动步进的板子建议 500 k 起**。
+- **并发不是简单相加**：共享的是桥的 USB CDC 前端 + 固件中转，而且两个方向损耗不对称——
+  UART 中继便宜，损失的是**被中继的一侧**（1814→1452，~20%）；CAN 中继贵（每帧 8 B 切片/重组 +
+  过滤器 + 任务），损失的是**桥自己的控制台**（2834→1816，~36%），被中继的 CAN 下游反而不再掉。
+  挂多块板时按这个口径估算，不要拿单板数字直接乘。
+- **CAN 的 step 数字低，是 8 B 帧的代价**：一条 `queue_step`（约 12 B）在经典 CAN 上要拆两帧，
+  每帧 ~130 µs；压测把一段的命令**突发**下发（50 条 ≈ 26 ms 总线时间），超过一段 10 ms 的提前量，
+  于是先到 `Timer too close`。真实主机是随移动队列连续发（有 1–2 s 预投），不是突发，所以现场能力
+  比这个数字好；但它确实说明 **CAN 端口不适合当作高步频板的唯一链路**，而 UART 500 k 可以。
+- **延迟**：中继 RTT 在 250 k 约 1.39 ms，500 k 约减半，CAN 1 Mbit 同量级；klipper 的移动队列
+  有 1–2 s 深度，这点延迟无感，但不要拿它接“高速步进 + 极小 buffer”的组合。
+
+### 换下游控制台的波特率（UART 口）
+
+三个波特率必须对上：**应用控制台**（编进固件的 `SERIAL_BAUD`）、**桥端口**（`uart_baud`，随会话声明）、
+**katapult**（固定 250 k）。因此 0x02“去引导”与隧道字节可能要用**不同的** `--baud`：
+
+```sh
+B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UART 桥
+# ① 去引导：用“应用当前”的波特率（本例应用已刷成 500 k）
+./target/release/klipperx admin reset --bridge $B --bridge-uuid <桥 uuid> \
+    --port 0 --port-reset bootloader --baud 500000
+# ② 刷写：用 katapult 的 250 k（隧道与引导侧必须同速）
+./target/release/klipperx admin flash --bridge $B --bridge-uuid <桥 uuid> \
+    --port 0 --port-nodeid 7 --baud 250000 <固件.bin>
+```
+
+- 构建设置：`SERIAL_BAUD` 只有开了 `LOW_LEVEL_OPTIONS` 才有 prompt，否则 `olddefconfig` 会把它推回
+  250000（见[构建 MCU 固件](firmware-build.md)）。
+- 安全性：只要应用还活着就不会锁死——波特率错只是“这条命令没人听”，重发正确的 `--baud` 即可。
+- 会话侧改回对应值：`[uart_device] uart_baud: 500000`，且**必须与下游固件编进去的波特率一致**，
+  不一致的现象是 `identify` 超时（像设备挂了）。
 
 ## 固件重启方式（`restart_method`）
 

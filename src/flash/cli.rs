@@ -19,8 +19,10 @@ use clap::Parser;
 use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket};
 use crate::core::klippy::interface::HostMux;
 
-use super::bridge_flash::{BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
-use super::bridge_session::{BridgePort, BridgeTarget, PortReset, PortRoute};
+use super::bridge_flash::{
+    AssignReport, BridgeFlashError, BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT,
+};
+use super::bridge_session::{BridgePort, BridgeTarget, PortKind, PortReset, PortRoute};
 use super::session;
 use super::transport;
 
@@ -28,13 +30,14 @@ use super::transport;
 /// given, in baud — `flashtool.py`'s default.
 const DEFAULT_BAUD: u32 = 250_000;
 
-/// The bus rate a CAN flash opens its port at, in bits per second — 1 Mbit,
-/// the default `[canbus]` and the rate `flashtool.py` uses.
+/// The bus rate a bridge's **CAN** slot is declared at, in bits per second —
+/// 1 Mbit, the default `[canbus]` and the rate `flashtool.py` uses.
 ///
-/// On a CAN slot `--baud` is the bus bitrate, not a line speed: this layer does
-/// not tell the two port kinds apart yet (a port is still declared as a UART,
-/// `bridge_session`), so it carries this constant for the CAN case until the
-/// declaration path names the port's bus.
+/// The two port kinds take different rates and neither is a default for the
+/// other: `--baud` is a **UART** slot's line rate, this is the CAN slot's bus rate
+/// (`config_can bitrate=%u`, which is the port's `canhw_set_rate`). Which slot is
+/// which is the bridge's to say (`BridgeLink::slot_kind`), so one command line can
+/// carry both with neither being a guess.
 pub const CAN_DEFAULT_BITRATE: u32 = 1_000_000;
 
 /// The node id a CAN flash assigns the board when `--nodeid` is not given:
@@ -84,6 +87,14 @@ pub struct FlashArgs {
     /// Line speed, in baud (serial flashes only; default 250000)
     #[arg(long)]
     pub baud: Option<u32>,
+
+    /// Bus rate of a bridge's **CAN** slot, in bits per second (bridge flashes
+    /// only; default 1000000)
+    //
+    // The other kind's rate: a UART slot is opened at `--baud`, the CAN slot at
+    // this. Which slot a port is comes from the bridge's own dictionary.
+    #[arg(long, value_name = "BPS")]
+    pub can_bitrate: Option<u32>,
 
     /// Serial tty of a **bridge** to flash a downstream board through: the
     /// board behind the port named by `--port` is the target, reached over the
@@ -246,8 +257,9 @@ pub struct BridgePortArgs {
     #[arg(long = "port-tty", value_name = "SLOT:PATH")]
     pub port_tty: Vec<String>,
 
-    /// Bridge port to enable and tunnel, the declaration's index — the order
-    /// its UART slot was declared in
+    /// Bridge port to enable and tunnel, the declaration's index — the slot the
+    /// bridge numbers the port with, which is the order its ports were declared
+    /// in
     #[arg(long, value_name = "INDEX")]
     pub port: Option<u8>,
 
@@ -255,10 +267,26 @@ pub struct BridgePortArgs {
     #[arg(long, value_name = "ID")]
     pub port_nodeid: Option<u8>,
 
+    /// Identity of the board behind the port to **give** that node id, twelve
+    /// hex digits (the UUID a bridge scan reported; only with `--port-nodeid`)
+    //
+    // Optional: without it the port is only named, and the board behind it keeps
+    // whatever id it has — a board with none cannot be named at all.
+    #[arg(long, value_name = "HEX")]
+    pub assign_uuid: Option<String>,
+
     /// Line speed the port opens at, in baud (default 250000; a serial bridge's
-    /// own link opens at the same rate)
+    /// own link opens at the same rate, and only a **UART** slot uses it)
     #[arg(long, value_name = "BAUD")]
     pub baud: Option<u32>,
+
+    /// Bus rate the **CAN** slot opens at, in bits per second (default 1000000)
+    //
+    // Not a line speed: a UART slot's stream is opened at `--baud`, the CAN
+    // slot's at this rate (`config_can bitrate=%u`). The two never substitute for
+    // each other, and which slot is which is the bridge's to say.
+    #[arg(long, value_name = "BPS")]
+    pub can_bitrate: Option<u32>,
 
     /// Name the port the legacy way instead of units: the wire format a device
     /// that predates the mux speaks — a stock katapult board behind the port,
@@ -291,10 +319,15 @@ pub struct BridgePortPlan {
     pub source: BridgeLinkSource,
     /// The line speed the port is declared at (and the link opens at).
     pub baud: u32,
+    /// The bus rate the CAN slot is declared at, when the port is that slot.
+    pub bitrate: u32,
     /// The port to declare, name and tunnel.
     pub target: BridgeTarget,
     /// How the port is named: units (the default) or legacy.
     pub route: PortRoute,
+    /// The board to **assign** [`BridgePortPlan::target`]'s node id to, when
+    /// `--assign-uuid` named one.
+    pub assign: Option<[u8; 6]>,
 }
 
 /// The command line of `admin reset`.
@@ -430,6 +463,8 @@ pub struct BridgeFlashTarget {
     /// The line speed the target's port — and, for a serial bridge, its own
     /// link — opens at.
     pub baud: u32,
+    /// The bus rate the CAN slot opens at, when the target's port is that slot.
+    pub bitrate: u32,
     /// The target's port index on the bridge: the plan [`open_bridge`] is given
     /// has one entry per port up to and including it.
     ///
@@ -504,6 +539,8 @@ fn stray_bridge_argument(args: &FlashArgs) -> Option<&'static str> {
         Some("--host-identity")
     } else if args.bridge_uuid.is_some() {
         Some("--bridge-uuid")
+    } else if args.can_bitrate.is_some() {
+        Some("--can-bitrate")
     } else if !args.port_tty.is_empty() {
         Some("--port-tty")
     } else {
@@ -556,6 +593,7 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
     let reset = parse_port_reset(args.port_reset.as_deref())?;
     let firmware = firmware_or_err(args)?;
     let baud = args.baud.unwrap_or(DEFAULT_BAUD);
+    let bitrate = args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE);
     let source = plan_bridge_link(
         &args.bridge,
         &args.bridge_library,
@@ -567,6 +605,7 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
         target: BridgeFlashTarget {
             source,
             baud,
+            bitrate,
             port,
             node_id,
             reset,
@@ -680,7 +719,7 @@ pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, S
 /// which slot to enable and `--port-nodeid` the id the bridge names it with —
 /// neither has a guessable default, and the id has to be a usable one (not
 /// zero, not the bridge's own link id). `--legacy` picks the wire format the
-/// port is named for.
+/// port is named for, and `--assign-uuid` the board to give that id.
 pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String> {
     let source = plan_bridge_link(
         &args.bridge,
@@ -689,6 +728,9 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
         args.host_identity.as_deref(),
         &args.port_tty,
     )?;
+    // The pair first: an assignment without an id is a half-instruction, and the
+    // message should name that pair rather than only the missing half.
+    let assign = plan_assign_uuid(args.assign_uuid.as_deref(), args.port_nodeid)?;
     let port = args
         .port
         .ok_or("bridge port needs --port: which declared bridge port the target is on")?;
@@ -707,6 +749,7 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
     Ok(BridgePortPlan {
         source,
         baud: args.baud.unwrap_or(DEFAULT_BAUD),
+        bitrate: args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE),
         target: BridgeTarget {
             index: port,
             node_id,
@@ -716,7 +759,31 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
         } else {
             PortRoute::Units
         },
+        assign,
     })
+}
+
+/// The `--assign-uuid` line: the identity of the board to give
+/// `--port-nodeid`, or the mistake that keeps it from being sent.
+///
+/// The two go together and neither has a guessable default: an assignment names a
+/// board by its UUID and gives it one id, so `--assign-uuid` without
+/// `--port-nodeid` is a half-instruction rather than one to complete. The identity
+/// itself is the same twelve hex digits `--uuid` takes, most significant byte
+/// first — the order the admin `SET_NODEID` frame carries it in.
+fn plan_assign_uuid(
+    assign_uuid: Option<&str>,
+    port_nodeid: Option<u8>,
+) -> Result<Option<[u8; 6]>, String> {
+    let Some(text) = assign_uuid else {
+        return Ok(None);
+    };
+    if port_nodeid.is_none() {
+        return Err("--assign-uuid needs --port-nodeid: the id the named board is given".into());
+    }
+    parse_hex6(text)
+        .map(Some)
+        .ok_or_else(|| format!("--assign-uuid expects twelve hex digits, got '{text}'"))
 }
 
 /// Turn a `reset` command line into the plan it asks for, or an error naming the
@@ -1015,6 +1082,7 @@ fn run_bridge_flash(
         let ports: Vec<BridgePort> = (0..=target.port)
             .map(|index| BridgePort {
                 baud: target.baud,
+                bitrate: target.bitrate,
                 reset: if index == target.port {
                     target.reset
                 } else {
@@ -1162,14 +1230,17 @@ fn uart_slot_note(mcu: Option<&str>) -> &'static str {
 
 /// `admin bridge port`: open the bridge, identify it, restart it so its RAM port
 /// table starts empty, declare the port, name it on the plan's route and open its
-/// tunnel — and stop.
+/// tunnel — and, when `--assign-uuid` named one, give that board the port's node
+/// id — and stop.
 ///
 /// Nothing is reset beyond the bridge's own restart and nothing is flashed. The
 /// declaration comes first because a port-level command that names a port the
 /// bridge does not have is dropped in silence, and the restart comes before both
 /// because the table a previous run built is still there (`config_uart` on an
-/// open slot shuts the firmware down). The runtime is built here for the same
-/// reason [`run_bridge_flash`] builds one — the link is opened inside it.
+/// open slot shuts the firmware down). The assignment comes last: it addresses a
+/// **board**, by UUID, and the port is what that board's answers will travel
+/// once it has an id. The runtime is built here for the same reason
+/// [`run_bridge_flash`] builds one — the link is opened inside it.
 pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_bridge_port(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1181,26 +1252,40 @@ pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::E
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         link.reset().await?;
-        link.declare_ports(&declared_ports(plan.target.index, plan.baud))
+        link.declare_ports(&declared_ports(plan.target.index, plan.baud, plan.bitrate))
             .await?;
         link.open_target_port(plan.target, plan.route)?;
+        // The slot the port is says what the assignment reached: the admin
+        // channel is the bridge's, so it goes to every port, and a UART slot has
+        // to say so rather than imply the unit was addressed to it.
+        let kind = link.slot_kind(plan.target.index);
+        let assigned = match plan.assign {
+            Some(uuid) => Some((uuid, link.assign_node_id(uuid, plan.target.node_id)?)),
+            None => None,
+        };
         link.close();
         report_bridge_port(plan.target, plan.route);
+        if let Some((uuid, outcome)) = assigned {
+            report_assign(uuid, plan.target, outcome, kind);
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
 /// The declaration `admin bridge port` sends: every port up to and including
-/// `index`, at one speed.
+/// `index`, at one line speed and one bus rate.
 ///
 /// The bridge numbers a port by the order its declaration rows reach it, so a
-/// port at `index` exists only after the ports below it do. No reset runs in this
-/// command, so each entry's reset is the unused placeholder
+/// port at `index` exists only after the ports below it do. Neither rate is a
+/// guess for the other: the bridge's own slot table says which kind each port is
+/// ([`BridgeLink::slot_kind`]), and only the rate that kind takes is used. No
+/// reset runs in this command, so each entry's reset is the unused placeholder
 /// [`BridgePort::reset`] carries.
-fn declared_ports(index: u8, baud: u32) -> Vec<BridgePort> {
+fn declared_ports(index: u8, baud: u32, bitrate: u32) -> Vec<BridgePort> {
     (0..=index)
         .map(|_| BridgePort {
             baud,
+            bitrate,
             reset: PortReset::ResetPort,
         })
         .collect()
@@ -1218,6 +1303,45 @@ fn report_bridge_port(target: BridgeTarget, route: PortRoute) {
         "target: port {} nodeid {}, {route} route, tunnel open",
         target.index, target.node_id
     );
+}
+
+/// The `--assign-uuid` line of a `admin bridge port` run: which board was given
+/// which id, where the unit went, and whether the board answered.
+///
+/// The two outcomes are reported apart because only one of them is evidence.
+/// katapult does not acknowledge `SET_NODEID`, so "sent, no confirmation" is the
+/// normal result; a confirmed assignment means a device answered on the id that
+/// names it. `kind` is the slot that was enabled, and it decides the scope line:
+/// the unit travelled the **bridge's** admin channel, which every port receives,
+/// so on a UART slot it reached all of them and the board with that UUID is the one
+/// that adopts it (`BridgeLink::slot_kind`).
+fn report_assign(uuid: [u8; 6], target: BridgeTarget, outcome: AssignReport, kind: PortKind) {
+    let evidence = match outcome {
+        AssignReport::Confirmed => "confirmed by the board".to_string(),
+        AssignReport::Sent => "sent, no confirmation — katapult does not acknowledge it, which \
+                               is normal"
+            .to_string(),
+    };
+    let scope = match kind {
+        PortKind::Can => format!("the CAN slot at port {}", target.index),
+        PortKind::Uart => format!(
+            "port {}, a UART slot — the bridge broadcasts the admin channel to every port, \
+             so the assignment went to all of them",
+            target.index
+        ),
+    };
+    println!(
+        "assign: board {} given nodeid {} via {scope} ({evidence})",
+        uuid_hex(uuid),
+        target.node_id
+    );
+}
+
+/// Six bytes as the twelve hex digits the command line spells an identity with,
+/// most significant byte first — the same order `--uuid` and `--assign-uuid` take
+/// and the scan reports.
+fn uuid_hex(uuid: [u8; 6]) -> String {
+    uuid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// `admin reset`: open the bridge, identify it, and reset what the plan names —
@@ -1644,6 +1768,7 @@ mod tests {
                         uuid: None,
                     },
                     baud: DEFAULT_BAUD,
+                    bitrate: CAN_DEFAULT_BITRATE,
                     port: 1,
                     node_id: 7,
                     reset: PortReset::ResetPort,
@@ -1713,6 +1838,7 @@ mod tests {
                     port_ttys: vec![(0, "/dev/pts/3".into()), (1, "/dev/pts/4".into())],
                 },
                 baud: 115_200,
+                bitrate: CAN_DEFAULT_BITRATE,
                 port: 1,
                 node_id: 9,
                 reset: PortReset::RestartDevice,
@@ -2254,6 +2380,71 @@ mod tests {
                 node_id: 7,
             }
         );
+        // The two port kinds' rates are separate, and neither is the other's
+        // default: a UART slot takes the line speed, the CAN slot this bitrate.
+        assert_eq!(plan.baud, DEFAULT_BAUD);
+        assert_eq!(plan.bitrate, CAN_DEFAULT_BITRATE);
+    }
+
+    /// `--can-bitrate` is the **CAN** slot's bus rate and `--baud` stays the UART
+    /// slots' line speed: one plan carries both, and declaring a port uses the one
+    /// its slot takes (`BridgeLink::slot_kind`).
+    #[test]
+    fn test_a_bridge_port_plan_carries_the_can_bitrate_beside_the_line_speed() {
+        let plan = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "--baud",
+            "115200",
+            "--can-bitrate",
+            "500000",
+        ])
+        .expect("a CAN slot's rate and a UART slot's speed, on one line");
+        assert_eq!(plan.baud, 115_200);
+        assert_eq!(plan.bitrate, 500_000);
+    }
+
+    /// A bridge **flash** carries the same pair: its plan declares the ports up to
+    /// the target, so it needs the CAN slot's rate as much as `bridge port` does.
+    #[test]
+    fn test_a_bridge_flash_plan_carries_the_can_bitrate() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "--can-bitrate",
+            "500000",
+            "fw.bin",
+        ])
+        .expect("a bridge flash plan");
+        let Action::BridgeFlash { target, .. } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(target.bitrate, 500_000);
+        assert_eq!(target.baud, DEFAULT_BAUD);
+    }
+
+    /// `--can-bitrate` belongs to a bridge: a direct serial or CAN line has no
+    /// bridge slot to open, and the option is named as the mistake it is.
+    #[test]
+    fn test_a_can_bitrate_needs_a_bridge() {
+        let err = planned(&[
+            "--device",
+            "/dev/ttyACM0",
+            "--can-bitrate",
+            "500000",
+            "fw.bin",
+        ])
+        .expect_err("a serial flash has no bridge CAN slot");
+        assert!(err.contains("--can-bitrate"), "{err}");
+        assert!(err.contains("--bridge"), "{err}");
     }
 
     /// Both the port and the id the bridge routes it to are required: neither has
@@ -2321,6 +2512,75 @@ mod tests {
         ])
         .expect_err("the bridge's own link id is not the target's");
         assert!(err.contains("--port-nodeid"), "{err}");
+    }
+
+    /// `--assign-uuid` names the **board** the port's node id is given to: the
+    /// UUID a scan reported, carried as its six bytes most significant first.
+    #[test]
+    fn test_a_bridge_port_plan_assigns_the_named_board() {
+        let plan = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "128",
+            "--assign-uuid",
+            "0123456789ab",
+        ])
+        .expect("an assignment plan");
+        assert_eq!(plan.assign, Some([0x01, 0x23, 0x45, 0x67, 0x89, 0xab]));
+        assert_eq!(plan.target.node_id, 128, "the id the board is given");
+
+        // Naming a port without naming a board is the other half of the same
+        // command line: it declares, names and tunnels, and assigns nothing.
+        let plan = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+        ])
+        .expect("a port with no board to assign");
+        assert_eq!(plan.assign, None);
+    }
+
+    /// `--assign-uuid` without `--port-nodeid` is a half-instruction, and the
+    /// message names the pair rather than only the missing half.
+    #[test]
+    fn test_an_assign_uuid_needs_a_target_id() {
+        let err = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--assign-uuid",
+            "0123456789ab",
+        ])
+        .expect_err("an assignment needs an id to give");
+        assert!(err.contains("--assign-uuid"), "{err}");
+        assert!(err.contains("--port-nodeid"), "{err}");
+    }
+
+    /// The identity is the same twelve hex digits `--uuid` takes, and anything
+    /// else is a mistyped board rather than one to round.
+    #[test]
+    fn test_an_assign_uuid_is_twelve_hex_digits() {
+        for bad in ["0123456789a", "0123456789abc", "0123456789zz"] {
+            let err = planned_bridge_port(&[
+                "--bridge",
+                "/dev/ttyUSB0",
+                "--port",
+                "0",
+                "--port-nodeid",
+                "128",
+                "--assign-uuid",
+                bad,
+            ])
+            .expect_err("not an identity");
+            assert!(err.contains("--assign-uuid"), "{bad}: {err}");
+        }
     }
 
     /// The bridge's link is one of the two here too.

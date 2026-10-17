@@ -57,7 +57,8 @@ use crate::core::klippy::interface::devices::serial::{
     discovery_query, serial_query_unassigned, UnassignedNode as SerialNode, UnassignedScan,
     UnitSink, ADMIN_REPLY, HEADER_BYTES,
 };
-use crate::flash::{BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
+use crate::flash::cli::CAN_DEFAULT_BITRATE;
+use crate::flash::{BridgeLink, BridgePort, PortReset, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
 
 /// How long a scan listens for one bridge port's answers, in seconds — the same
 /// window a direct scan uses, and the value `--timeout` overrides.
@@ -141,10 +142,18 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
     pub timeout: f64,
 
-    /// Line speed, in baud (serial and bridge scans; a bridge opens its ports at
-    /// the same rate)
+    /// Line speed, in baud (serial and bridge scans; a bridge opens its UART
+    /// slots at the same rate)
     #[arg(long)]
     pub baud: Option<u32>,
+
+    /// Bus rate a bridge opens its **CAN** slot at, in bits per second (bridge
+    /// scans only; default 1000000)
+    //
+    // The other kind's rate: a UART slot is declared at `--baud`, the CAN slot at
+    // this one, and which slot is which is the bridge's own to say.
+    #[arg(long, value_name = "BPS")]
+    pub can_bitrate: Option<u32>,
 }
 
 /// Entry point for the `scan` subcommand.
@@ -183,6 +192,7 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.bridge.as_deref().expect("checked above"),
             uuid,
             args.baud.unwrap_or(DEFAULT_BAUD),
+            args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE),
             &ports,
             window,
             |index, node| println!("{}", bridge_line(&node, index)),
@@ -192,6 +202,11 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.bridge_uuid.is_some() {
         return Err("--bridge-uuid needs --bridge".into());
+    }
+    if args.can_bitrate.is_some() {
+        return Err(
+            "--can-bitrate needs --bridge: it is the rate a bridge's CAN slot opens at".into(),
+        );
     }
     if args.ports.is_some() {
         return Err("--ports needs --bridge: which bridge's ports to scan".into());
@@ -323,6 +338,7 @@ fn bridge_query_unassigned(
     tty: &str,
     uuid: Option<[u8; 6]>,
     baud: u32,
+    bitrate: u32,
     ports: &[u8],
     window: Duration,
     mut report: impl FnMut(u8, SerialNode),
@@ -334,6 +350,7 @@ fn bridge_query_unassigned(
         tty,
         uuid,
         baud,
+        bitrate,
         ports,
         window,
         &mut report,
@@ -345,6 +362,7 @@ fn bridge_query_unassigned(
             tty,
             uuid,
             baud,
+            bitrate,
             ports,
             window,
             &mut report,
@@ -379,6 +397,7 @@ fn bridge_scan_pass(
     tty: &str,
     uuid: Option<[u8; 6]>,
     baud: u32,
+    bitrate: u32,
     ports: &[u8],
     window: Duration,
     report: &mut impl FnMut(u8, SerialNode),
@@ -415,7 +434,7 @@ fn bridge_scan_pass(
     match attribution {
         Attribution::Path => {
             for &index in ports {
-                declare_ports(&runtime, &link, baud, &mut declared, index)?;
+                declare_ports(&runtime, &link, baud, bitrate, &mut declared, index)?;
             }
             handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
             for unit in collect_answers(&answers, window) {
@@ -441,7 +460,7 @@ fn bridge_scan_pass(
         }
         Attribution::Declaration => {
             for &index in ports {
-                declare_ports(&runtime, &link, baud, &mut declared, index)?;
+                declare_ports(&runtime, &link, baud, bitrate, &mut declared, index)?;
                 discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
                 handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
                 for unit in collect_answers(&answers, window) {
@@ -462,16 +481,25 @@ fn bridge_scan_pass(
 
 /// Declare the bridge's ports up to `last`, in ascending index — the bridge
 /// numbers a port by the order its declaration rows reach it, and a port can
-/// only be declared once — remembering how many are declared.
+/// only be declared once — remembering how many are declared. Each port is a plan
+/// entry with both rates; the bridge's own slot table says which one its bus takes
+/// ([`BridgeLink::declare_port`]), and the reset is the unused placeholder
+/// [`BridgePort::reset`] carries.
 fn declare_ports(
     runtime: &tokio::runtime::Runtime,
     link: &BridgeLink,
     baud: u32,
+    bitrate: u32,
     declared: &mut u8,
     last: u8,
 ) -> Result<(), Box<dyn std::error::Error>> {
     while *declared <= last {
-        runtime.block_on(link.declare_port(*declared, baud))?;
+        let port = BridgePort {
+            baud,
+            bitrate,
+            reset: PortReset::ResetPort,
+        };
+        runtime.block_on(link.declare_port(*declared, port))?;
         *declared += 1;
     }
     Ok(())
@@ -642,6 +670,7 @@ mod tests {
             host_identity: None,
             timeout: DEFAULT_TIMEOUT,
             baud: None,
+            can_bitrate: None,
         }
     }
 
@@ -977,6 +1006,7 @@ mod tests {
             bridge.serial_path().to_str().expect("a utf-8 path"),
             Some(BRIDGE_SCAN_UUID),
             DEFAULT_BAUD,
+            CAN_DEFAULT_BITRATE,
             &[0],
             BRIDGE_SCAN_WINDOW,
             |index, node| heard.push((index, node)),
@@ -1092,7 +1122,14 @@ mod tests {
         let (sink, answers) = UnitSink::channel();
         handle.set_unit_sink(ADMIN_REPLY, sink);
         runtime
-            .block_on(link.declare_port(0, DEFAULT_BAUD))
+            .block_on(link.declare_port(
+                0,
+                BridgePort {
+                    baud: DEFAULT_BAUD,
+                    bitrate: CAN_DEFAULT_BITRATE,
+                    reset: PortReset::ResetPort,
+                },
+            ))
             .expect("the bridge declares its port");
         handle
             .send_admin(&discovery_query()[HEADER_BYTES..])
@@ -1120,6 +1157,7 @@ mod tests {
             bridge.serial_path().to_str().expect("a utf-8 path"),
             Some(BRIDGE_SCAN_UUID),
             DEFAULT_BAUD,
+            CAN_DEFAULT_BITRATE,
             &[0],
             BRIDGE_SCAN_WINDOW,
             |index, node| heard.push((index, node)),
@@ -1171,5 +1209,13 @@ mod tests {
         };
         let err = run(args).expect_err("ports belong to a bridge");
         assert!(err.to_string().contains("--ports"), "{err}");
+
+        let args = ScanArgs {
+            can_bitrate: Some(500_000),
+            ..default_args()
+        };
+        let err = run(args).expect_err("a bridge's CAN slot has a bus rate");
+        assert!(err.to_string().contains("--can-bitrate"), "{err}");
+        assert!(err.to_string().contains("--bridge"), "{err}");
     }
 }

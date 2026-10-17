@@ -43,7 +43,6 @@
 //! [`open_bridge`](super::bridge_session::open_bridge) documents.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,8 +50,7 @@ use crate::core::klippy::assign;
 use crate::core::klippy::event::{McuEvent, Shutdown};
 use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{
-    self, set_node_id_for, SharedSerialHandle, TunnelSink, UnassignedNode, UnitSink, ADMIN_REPLY,
-    HEADER_BYTES,
+    self, set_node_id_for, SharedSerialHandle, TunnelSink, UnitSink, ADMIN_REPLY, HEADER_BYTES,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{HostMux, Interface};
@@ -496,8 +494,7 @@ impl BridgeOpen {
 }
 
 /// Write one assignment unit on a **shared serial** bridge's admin channel and
-/// wait up to [`ASSIGN_CONFIRM_WINDOW`] for the board it names to answer.
-///
+/// wait up to [`ASSIGN_CONFIRM_WINDOW`] for the board it names to answer.///
 /// `unit` is the whole admin unit ([`set_node_id_for`]'s spelling); the channel
 /// writes the header, so only the frame behind it goes out — the same split every
 /// `send_set_port_node_id`-style send makes. The wait registers a sink on
@@ -515,7 +512,7 @@ fn assign_through_shared(
     let written = handle.send_admin(&unit[HEADER_BYTES..]);
     // Nothing is waited for when nothing was written: a refused write is the
     // caller's error, and a full window behind it would only hide it.
-    let confirmed = written.is_ok() && answers_for(&answers, uuid, ASSIGN_CONFIRM_WINDOW);
+    let confirmed = written.is_ok() && serial::answers_for(&answers, uuid, ASSIGN_CONFIRM_WINDOW);
     handle.clear_unit_sink(ADMIN_REPLY);
     written?;
     Ok(if confirmed {
@@ -523,30 +520,6 @@ fn assign_through_shared(
     } else {
         AssignReport::Sent
     })
-}
-
-/// Whether a unit naming `uuid` arrives within `window`.
-///
-/// The whole window is read, not just the first unit: another device on another
-/// port may be talking, and its answer is not this board's confirmation. A unit
-/// that does not parse as an answer, or names another UUID, is dropped and the
-/// wait goes on.
-fn answers_for(answers: &Receiver<Vec<u8>>, uuid: [u8; 6], window: Duration) -> bool {
-    let deadline = Instant::now() + window;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return false;
-        }
-        match answers.recv_timeout(remaining) {
-            Ok(unit) => {
-                if UnassignedNode::from_unit(&unit).is_some_and(|node| node.uuid == uuid) {
-                    return true;
-                }
-            }
-            Err(_) => return false,
-        }
-    }
 }
 
 /// Broadcast the unassigned query on the bridge's tty and return the identity
@@ -3637,7 +3610,7 @@ mod tests {
         });
 
         assert!(
-            !answers_for(&answers, uuid, Duration::from_millis(500)),
+            !serial::answers_for(&answers, uuid, Duration::from_millis(500)),
             "another board's answer is not this one's confirmation"
         );
         responder.join().expect("the responder thread");

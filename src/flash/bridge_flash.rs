@@ -94,15 +94,23 @@ const ATTACH_ATTEMPTS: u32 = 3;
 /// How long a run waits between two attach attempts: the pause the residual
 /// state needed in practice, long enough that the bridge has finished whatever
 /// it was still doing with the previous session when the offer is repeated.
-const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(1_500);
+///
+/// Four seconds rather than one and a half: measured on the board, the residual
+/// state cleared somewhere in the 8–10 s after the previous command, and one
+/// attempt of its own already costs a couple of seconds (the discovery scan plus
+/// the handshake), so a shorter pause spends the budget without ever reaching
+/// the side of that window where the bridge answers again.
+const ATTACH_RETRY_DELAY: Duration = Duration::from_millis(4_000);
 
 /// How long the whole attach retry may take, all attempts and pauses included.
 ///
 /// The bound that matters: an attempt on a bridge with no `--bridge-uuid` runs
 /// the discovery scan first ([`DISCOVER_WINDOW`], two seconds) and its own
 /// handshake after it, so the attempt count alone would let a bridge that really
-/// is unreachable cost far longer than the wait it would save.
-const ATTACH_BUDGET: Duration = Duration::from_secs(5);
+/// is unreachable cost far longer than the wait it would save. 25 s covers the
+/// measured window (a retry ~8 s later is what succeeded) with one attempt to
+/// spare; a bridge that is genuinely gone still fails inside this bound.
+const ATTACH_BUDGET: Duration = Duration::from_secs(25);
 
 /// How long the bridge's identify handshake may take before a run gives up.
 ///

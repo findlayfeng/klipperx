@@ -52,7 +52,9 @@ use crate::core::klippy::interface::{HostMux, Interface};
 use crate::core::klippy::mcu::{Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
-use super::bridge_session::{open_bridge, BridgeError, BridgePort, BridgeTarget};
+use super::bridge_session::{
+    configure_bridge, open_bridge, BridgeError, BridgePort, BridgeReady, BridgeTarget,
+};
 use super::session::{self, FlashError, SessionConfig, Summary};
 use std::fmt;
 
@@ -600,6 +602,40 @@ impl BridgeLink {
         }
     }
 
+    /// Prepare a bridge for a flashing tunnel **without resetting anything**:
+    /// declare `ports`, name the target's port (legacy), and open that port's
+    /// tunnel — [`open_bridge`]'s work after the per-port resets.
+    ///
+    /// `admin configure-bridge` is the caller: the bridge is configured but no
+    /// device is [reset](crate::flash::bridge_session::PortReset), and the bridge
+    /// itself is not restarted either ([`reset`](BridgeLink::reset) is a separate
+    /// step). What was declared and where the tunnel was opened come back in the
+    /// [`BridgeReady`].
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down while
+    /// the port is declared (its reason included), and
+    /// [`BridgeFlashError::Bridge`] when [`configure_bridge`] fails for any other
+    /// reason.
+    pub async fn configure(
+        &self,
+        ports: &[BridgePort],
+        target: BridgeTarget,
+    ) -> Result<BridgeReady, BridgeFlashError> {
+        match configure_bridge(&self.live().mcu, &self.live().link, ports, target).await {
+            Ok(ready) => {
+                if let Some(reason) = self.take_shutdown() {
+                    return Err(BridgeFlashError::Shutdown { reason });
+                }
+                Ok(ready)
+            }
+            Err(e) => Err(match self.take_shutdown() {
+                Some(reason) => BridgeFlashError::Shutdown { reason },
+                None => BridgeFlashError::Bridge(e),
+            }),
+        }
+    }
+
     /// The whole bridge flash: open the target's port
     /// ([`open_bridge`]), run the katapult session over its tunnel, then clear
     /// the tunnel.
@@ -1083,6 +1119,71 @@ mod tests {
         // its drop is not synchronous with `drop(link)`: close it, let the
         // blocked device read see the shutdown, then wait the library out — all
         // under `_serial`, whose scope is the whole test.
+        link.close();
+        drop(link);
+        wait_for_library_unload(&library);
+    }
+
+    /// `admin configure-bridge` over the **real** mux library: the bridge's port
+    /// is declared, the target's port named legacy, and its tunnel opened — and
+    /// nothing follows. No device is reset and no session runs, so the port's pty
+    /// stays silent (a reset pulse or a katapult frame would show there), which
+    /// is what [`BridgeLink::configure`] promises.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_configure_over_the_real_library_leaves_the_port_silent() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let port = Pty::new();
+        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let path = library.display().to_string();
+
+        let link = BridgeLink::open_host_library(
+            Path::new(&path),
+            host_mux_for(&path),
+            BRIDGE_MCU_ID,
+            &[(0u8, port.path.display().to_string())],
+        )
+        .expect("the muxed library opens and attaches");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the bridge identifies");
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let ready = link
+            .configure(&ports, target)
+            .await
+            .expect("the bridge configures without resetting or flashing");
+        assert_eq!(ready.ports, ports.to_vec());
+        assert_eq!(ready.target, target);
+
+        // The port's pty is watched for the whole window: a configure writes
+        // nothing down it, so the fake bootloader behind it hears no CONNECT and
+        // no frame at all reaches the port.
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "a configure writes nothing to the port's pty, got {:?}",
+            recorded.lock().unwrap()
+        );
+        assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
+
         link.close();
         drop(link);
         wait_for_library_unload(&library);

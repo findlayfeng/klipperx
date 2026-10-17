@@ -75,6 +75,34 @@ const LEGACY_PORT_FLAGS: u8 = 0;
 /// returns, because the tunnel's uplink needs one.
 const UNITS_PORT_FLAGS: u8 = MUX_PORT_UNITS;
 
+/// How a port is named: which wire the device behind it speaks.
+///
+/// The host's call, never a build-time one (`mux.h` MUX_PORT_UNITS):
+/// [`PortRoute::Units`] is a device that speaks the mux (the route a device is
+/// **enabled** with — it is addressed by id and its uplink is forwarded whole),
+/// and [`PortRoute::Legacy`] a device that predates it, whose raw frames the
+/// port heads with its own reply id. A flash run names its target
+/// [`PortRoute::Legacy`] because the katapult tunnel reads the raw uplink
+/// ([`LEGACY_PORT_FLAGS`]); a stock katapult board behind a port is the same
+/// case, which is why `admin bridge port --legacy` keeps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortRoute {
+    /// The device speaks units: `MUX_PORT_UNITS` set.
+    Units,
+    /// The device predates the mux: no flags.
+    Legacy,
+}
+
+impl PortRoute {
+    /// The `flags` byte [`Interface::send_set_port_node_id`] carries.
+    fn flags(self) -> u8 {
+        match self {
+            Self::Units => UNITS_PORT_FLAGS,
+            Self::Legacy => LEGACY_PORT_FLAGS,
+        }
+    }
+}
+
 /// How long a port is left in units mode after the bootloader request — time for
 /// the device to write its bootloader marker and reset into katapult.
 ///
@@ -282,7 +310,7 @@ pub async fn open_bridge(
 ) -> Result<BridgeReady, BridgeError> {
     declare_ports(mcu, ports).await?;
     reset_ports(link, ports, target).await?;
-    open_target_port(link, target)?;
+    open_target_port(link, target, PortRoute::Legacy)?;
     Ok(BridgeReady {
         ports: ports.to_vec(),
         target,
@@ -329,7 +357,43 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
     Ok(())
 }
 
-/// Reset every declared port's device, the way its plan says — [`open_bridge`]'s
+/// Declare **one** port at `index` the way [`declare_ports`] declares the
+/// plan's first `index + 1` — for a caller whose declarations are scattered by
+/// work in between (a bridge scan declares a port, scans through it, then
+/// declares the next).
+///
+/// The bridge numbers a port by the order `config_bridge_port` reaches it, so
+/// ports are declared in ascending index from 0 with nothing else allocating
+/// oids in between; `index` is that order's next free number, and the oid pair
+/// follows [`declare_ports`]'s scheme (`index * 2` the UART object, `index * 2
+/// + 1` the port that carries it).
+///
+/// # Errors
+/// [`BridgeError::TooManyPorts`] when `index` is past what the oid byte can
+/// number (nothing is sent), [`BridgeError::Mcu`] when a command cannot be
+/// spelled or the barrier is not reached in time.
+pub async fn declare_port(mcu: &Mcu, index: u8, baud: u32) -> Result<(), BridgeError> {
+    if usize::from(index) >= MAX_BRIDGE_PORTS {
+        return Err(BridgeError::TooManyPorts {
+            ports: usize::from(index) + 1,
+        });
+    }
+    mcu.send(AllocateOids::NAME, &AllocateOids { count: 2 }.args())?;
+    let uart_oid = index * 2;
+    let uart = ConfigUart {
+        oid: uart_oid,
+        baud,
+        slot: index,
+    };
+    mcu.send(ConfigUart::NAME, &uart.args())?;
+    let bridge_port = ConfigBridgePort {
+        oid: uart_oid + 1,
+        uart: uart_oid,
+    };
+    mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
+    mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
+    Ok(())
+}
 /// step 2, after [`declare_ports`] so each command addresses a port the bridge
 /// has. Ports are judged one at a time: a plan's other ports keep the single
 /// unit their own reset is.
@@ -416,17 +480,23 @@ pub async fn request_bootloader(
     Ok(())
 }
 
-/// Name the target's port (a legacy route) and open its flashing tunnel —
+/// Name the target's port `route` says and open its flashing tunnel —
 /// [`open_bridge`]'s step 3, after the declaration (and any resets) so the
 /// bridge has the port to route and toggle. `admin bridge port` is the standalone
-/// caller: it names one already-declared port and stops there.
+/// caller: it declares and names one port and stops there; a flash run names its
+/// target [`PortRoute::Legacy`] because the tunnel's uplink is the raw frame
+/// stream a legacy port serves.
 ///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
-pub fn open_target_port(link: &Interface, target: BridgeTarget) -> Result<(), BridgeError> {
-    // The target's route first (legacy, so the raw uplink is served), then the
-    // tunnel that makes the port carry the katapult stream.
-    link.send_set_port_node_id(target.index, target.node_id, LEGACY_PORT_FLAGS)?;
+pub fn open_target_port(
+    link: &Interface,
+    target: BridgeTarget,
+    route: PortRoute,
+) -> Result<(), BridgeError> {
+    // The target's route first, then the tunnel that makes the port carry the
+    // katapult stream.
+    link.send_set_port_node_id(target.index, target.node_id, route.flags())?;
     link.send_set_port_tunnel(target.index)?;
     Ok(())
 }
@@ -849,7 +919,8 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        open_target_port(&link, target).expect("the route and the tunnel go out");
+        open_target_port(&link, target, PortRoute::Legacy)
+            .expect("the route and the tunnel go out");
 
         // Two admin units are expected (the route and the tunnel), so seeing
         // both means the window is done.
@@ -866,6 +937,58 @@ mod tests {
         assert!(
             observed.iter().all(|step| !is_reset(step)),
             "naming a port and opening its tunnel resets nothing"
+        );
+    }
+
+    /// `admin bridge port`'s whole job on a port a device speaks units behind:
+    /// the port is **declared** first (a port-level command that names a port the
+    /// bridge does not have is dropped in silence), then named `MUX_PORT_UNITS`,
+    /// then tunnelled — and that order is the wire order, in one connection.
+    #[tokio::test]
+    async fn test_a_units_port_is_declared_before_it_is_named_and_tunnelled() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
+
+        declare_port(&mcu, 0, 250_000)
+            .await
+            .expect("the port declares");
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        open_target_port(&link, target, PortRoute::Units)
+            .expect("the units route and the tunnel go out");
+
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+        });
+        let parser = mux_parser();
+        assert_eq!(
+            steps(&parser, &units),
+            vec![
+                Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(2)]),
+                Step::Command(
+                    "config_uart".to_string(),
+                    vec![
+                        ArgValue::UInt8(0),
+                        ArgValue::UInt32(250_000),
+                        ArgValue::UInt8(0),
+                    ],
+                ),
+                Step::Command(
+                    "config_bridge_port".to_string(),
+                    vec![ArgValue::UInt8(1), ArgValue::UInt8(0)],
+                ),
+                Step::Admin(admin_payload(&[
+                    CMD_SET_PORT_NODEID,
+                    0,
+                    TARGET_NODE_ID,
+                    MUX_PORT_UNITS,
+                ])),
+                Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 0])),
+            ],
+            "the declaration comes first, then the units naming, then the tunnel"
         );
     }
 

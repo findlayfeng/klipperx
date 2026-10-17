@@ -11,8 +11,9 @@
 //! | host → MCU | `config_bridge_port oid=%c port=%c` |
 //!
 //! Which of the two `config_*` commands creates the stream depends on the bus
-//! the port is ([`PortConfig`]): `config_uart` for a serial port, at `baud`,
-//! `config_can` for a CAN bus port, at `bitrate`. Either way the command creates
+//! the port is (`mcu/bridge_ports.rs` for a port the config declares,
+//! [`PortConfig`] on the `flash` side): `config_uart` for a serial port, at
+//! `baud`, `config_can` for a CAN bus port, at `bitrate`. Either way the command creates
 //! the object and opens the bus behind it (the firmware's `src/uart.c`, and the
 //! CAN object's own module); a stream it cannot open, or a rate it cannot set,
 //! shuts the firmware down with a message naming why, so a port that cannot be
@@ -39,6 +40,13 @@ use crate::core::klippy::msg::proto::ArgValue;
 /// removed `BRIDGE_PORT_SERIAL_BAUD` Kconfig option defaulted to, so a config
 /// that never wrote a rate keeps the line it had.
 pub const DEFAULT_UART_BAUD: u32 = 250_000;
+
+/// The bus rate a port gets when the config writes no `can_bitrate:`.
+///
+/// 1 Mbit/s: the rate the CAN plans in this repository write for a bridge's CAN
+/// slot (`flash/bridge_session.rs`), so a config that never wrote a rate keeps
+/// the bus it had.
+pub const DEFAULT_CAN_BITRATE: u32 = 1_000_000;
 
 /// `config_uart oid=%c baud=%u slot=%c` — create a UART object and open its
 /// stream.
@@ -72,8 +80,8 @@ impl McuCommand for ConfigUart {
 /// as a downstream port's stream.
 ///
 /// The CAN twin of [`ConfigUart`]: same three parameters, `bitrate` in place of
-/// the line rate. It is built by [`PortConfig`] and covered by unit tests only —
-/// the loader declares no CAN port yet, so nothing sends it.
+/// the line rate. Two callers queue it: [`crate::core::klippy::mcu::bridge_ports`]
+/// for a `[can_device]` port at load, and [`PortConfig`] on the `flash` side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigCan {
     /// The object id the firmware allocates for this CAN bus object.

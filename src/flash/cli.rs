@@ -1127,6 +1127,7 @@ fn report_reset_port(index: u8, reset: PortReset) {
     let method = match reset {
         PortReset::ResetPort => "reset-port",
         PortReset::RestartDevice => "restart-device",
+        PortReset::Bootloader => "bootloader",
     };
     println!("reset: port {index} ({method}), sent with no receipt");
 }

@@ -88,7 +88,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `[verify_heater <不存在的 heater>]` | 报 `Unknown heater` | 报装载器的 `Section '…' is not a valid config section` | [配置手册](../user-manual/config.md) |
 | `[virtual_sdcard]` 细节 | `path` 做 `expanduser`/`normpath`；回放让出用 `gcode.get_mutex().test()`；有 `stats` | `path` 原样用于目录列举；让出用 `tokio::task::yield_now()`；无 `stats` | [模块表](README.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 | MCU 连接 `restart_method` | 值域 `command`/`arduino`/`cheetah`/`rpi_usb`，都是「复位这条连接」 | 多一个上游没有的 **`admin`**：经桥转发 `RESTART_DEVICE (0x05)`，让**桥下游的命名设备**重启自己的固件（进引导的 `REQUEST_BOOTLOADER (0x02)` 属刷写工具、**不属** `restart_method`）；桥下游 legacy 设备的线级复位改由**端口节**的 `uart_restart_method` 决定；共享串口仍在解析层被强制成 `command` | [MCU 连接方式](../user-manual/mcu-connection.md)、[串口复用协议](serial-mux-protocol.md) |
-| 固件构建的源文件去重 | 每个 `src-$(CONFIG_*) +=` 各列各的；各载体在上游天然互斥，从不重复 | 架构 makefile include 之后加一行 `src-y := $(call uniq,$(src-y))`（**保序去重，不是 `sort`**）：本仓的 `MUX_SERIAL` 可与 `USBSERIAL` 同开，多个载体都会列 `<arch>/chipid.c` ⇒ 重复链接（并让 `compile_time_request` 计入两次）。**保序本身是 ABI**：字典的 message id 按 `src-y` 顺序发放（`buildcommands.py`），排序会把每个目标的字典重新编号，而测试、golden 数据与已记录的线上形状都引用那些 id | `third_party/klipper/Makefile` |
+| 固件构建的源文件去重 | 每个 `src-$(CONFIG_*) +=` 各列各的；各载体在上游天然互斥，从不重复 | 架构 makefile include 之后加一行 `src-y := $(call uniq,$(src-y))`（**保序去重，不是 `sort`**）：本仓的 `MUX_SERIAL` 可与 `USBSERIAL` 同开，多个载体都会列 `<arch>/chipid.c` ⇒ 重复链接（并让 `compile_time_request` 计入两次）。**保序本身是 ABI**：字典的 message id 按 `src-y` 顺序发放（`buildcommands.py`），排序会把每个目标的字典重新编号，而测试、golden 数据与已记录的线上形状都引用那些 id。顶层 `Makefile` 只包装调用它（`OUT`/`KCONFIG_CONFIG` 外移，见 4.3），不改 `src-y` | `third_party/klipper/Makefile` |
 | API 若干已知差异 | 上游 `machine`/`calibration`/`get_status` 等更完整 | 缺 `probe_path`/`rapid_path`、部分 `get_status` 字段未返回等 | [API 参考](../third-party-dev/api-reference.md) |
 
 ## 3. 暂缓/未实现（本仓没做，方向上不排除）
@@ -144,6 +144,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 项 | 位置 | 干什么 |
 |---|---|---|
 | `KLIPPERX_*` 环境变量族 | [`README.md` → 环境变量](../../../README.md#环境变量开发与测试)、[测试](testing.md) | 构建/测试/诊断开关（语料范围、字典集、TRACE、硬件串口…） |
+| 顶层固件构建（根 `Makefile` / `Kconfig` / `scripts/firmware-config.py`） | `Makefile`、`Kconfig`、`kconfig/katapult.kconfig`、`firmware.config`、[构建 MCU 固件](../user-manual/firmware-build.md) | 一次共享配置编 klipper 与 katapult 两份：根 `Makefile` 只是包装调用两个子模组的 Makefile（`OUT`/`KCONFIG_CONFIG` 外移到 `out/firmware/`，子模组只读），配置由根 `Kconfig`（klipper 树 + katapult 专属菜单）解析后投影/派生。上游只有单目标构建 |
 | 上游语料复用 harness | `src/core/klippy/upstream.rs`、[回归测试](regression-tests.md) | 把上游 `test/klippy/*.test` 当只读 fixture 跑（上游只有自己的 `test_klippy.py`） |
 | `crates/test-support` | [回归测试](regression-tests.md) | 构建期按 `KLIPPERX_ARCHES` 编 `.dict`、解析 klipper 检出位置 |
 | 字典驱动应答机 `SimulatorDevice` | `src/core/klippy/interface/devices/simulator.rs`、[回归测试](regression-tests.md) | test-only 假 MCU：按字典**应答** identify/配置握手/时钟/序号，走真实主机路径（上游回归是 `-d`/`-o` 短路、不回应，语义不同） |
@@ -158,7 +159,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 |---|---|---|---|
 | 桥的三个端口后端与 `BRIDGE_UART_COUNT` | 上游没有桥，也没有「一个 UART 对象该接到哪条流」这一层 | 固件里三个后端各自实现 `uart_backend_open`/`uart_backend_port_ops`：`src/stm32/bridge_serial.c`（编译期固定的 USART1，RX PA10 / TX PA9）、`src/linux/bridge.c`（`KLIPPER_BRIDGE_PORT_0` 一条静态流）、`src/host/bridge.c`（每槽一路流，`KLIPPER_HOST_PORT_SLOTS` = 4）。三者各自 `DECL_CONSTANT("BRIDGE_UART_COUNT", …)`（1 / 1 / 4），主机据此列 `--port`——固件不再报端口表。另外两件事上游也没有：**端口表只在桥的 RAM 里**（复位即空，每条命令都得重新声明），以及 `config_uart`/`config_bridge_port` **打开即生效、无 finalize**（`src/uart.c:44-96`） | [串口复用协议](serial-mux-protocol.md)、[MCU 连接方式](../user-manual/mcu-connection.md) |
 | 口形态（UNITS/legacy）与隧道上行 | 上游的串口只有一个线格式 | 口形态是**主机每次命令的选择**（`SET_PORT_NODEID` 的 `flags` bit0 `MUX_PORT_UNITS`），不是编译期事实；隧道模式（`0x06`）与它正交。**UNITS 口也能上行隧道块**：`SET_PORT_NODEID` 无论 `flags` 都记 `node_id`，所以 `bridge_port_tunnel_up` 在两种口上都能给块加应答头（此前只在 legacy 口记 id，UNITS 口的隧道上行静默丢；2026-10-17 修） | [串口复用协议](serial-mux-protocol.md) |
-| **katapult fork 的 mux 构建**（`MUX_SERIAL`） | 上游 katapult 的串口控制台只会说裸帧，因此只能直连刷写 | 本仓的 katapult 子模组新增 `src/mux.c` / `src/mux.h` / `src/generic/mux_chipid.c`，把**引导加载程序自身**接进同一套单元：单元头、`KXID` admin 信道（`0x00`/`0x01`/`0x02`/`0x05`）、自己的帧出线时加 `reply_arb_id` 应答头（无 id 时不加）、身份 = `fasthash64(芯片 UID, 0xA16231A7)` 低 6 字节（与 klipper/CAN 同派生）。**默认 n**（`src/Kconfig`，`depends on SERIAL && HAVE_CHIPID`），帮助文本自己声明与上游 flashtool 不兼容——它只服务「经桥寻址的部署」 | [串口复用协议](serial-mux-protocol.md)、[TESTING.md](../../../TESTING.md) |
+| **katapult fork 的 mux 构建**（`MUX_SERIAL`） | 上游 katapult 的串口控制台只会说裸帧，因此只能直连刷写 | 本仓的 katapult 子模组新增 `src/mux.c` / `src/mux.h` / `src/generic/mux_chipid.c`，把**引导加载程序自身**接进同一套单元：单元头、`KXID` admin 信道（`0x00`/`0x01`/`0x02`/`0x05`）、自己的帧出线时加 `reply_arb_id` 应答头（无 id 时不加）、身份 = `fasthash64(芯片 UID, 0xA16231A7)` 低 6 字节（与 klipper/CAN 同派生）。**默认 n**（`src/Kconfig`，`depends on SERIAL && HAVE_CHIPID`），帮助文本自己声明与上游 flashtool 不兼容——它只服务「经桥寻址的部署」。根构建在串口目标上把 klipper 的 `MUX_SERIAL` 同步给它（`make menuconfig`） | [串口复用协议](serial-mux-protocol.md)、[TESTING.md](../../../TESTING.md) |
 
 ### 4.5 一条负向结论
 

@@ -443,7 +443,9 @@ CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU �
 
 `third_party/katapult` 是本仓 fork 的副本，它多了一个**可选**构建选项 `MUX_SERIAL`
 （`src/Kconfig:39`，**默认 n**）：选上后 katapult 自己的串口控制台也说单元，于是**同一个引导程序**
-既能被直连，也能挂在桥的下游口上被寻址、被刷写。契约与本页对 klipper 设备半的叙述**逐条对齐**：
+既能被直连，也能挂在桥的下游口上被寻址、被刷写。根构建（`make menuconfig`）在串口目标上会把 klipper
+的 `MUX_SERIAL` 同步给 katapult；USB CDC 目标不提供（依赖是 `SERIAL && HAVE_CHIPID`）。契约与本页对
+klipper 设备半的叙述**逐条对齐**：
 
 | 侧 | 文件 | 做什么 |
 |----|------|--------|

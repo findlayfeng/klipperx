@@ -32,6 +32,7 @@
 //! | `uart_oid` / `can_oid` | the name the host knows this port by (required, non-empty) |
 //! | `uart_baud` | the port's line rate, a positive integer (optional; `250000` when absent) |
 //! | `can_bitrate` | the port's bus rate, a positive integer (optional; `1000000` when absent) |
+//! | `can_protocol` | the carrier the port speaks its units over: `cans` (8-byte slices) or `isotp` (one unit per message); any other value is a config error (optional, `cans` when absent) |
 //! | `uart_path` | the tty the bridge's **host library** opens for this port, a non-empty string (optional) |
 //! | `uart_restart_method` | the **line-level** reset the bridge gives a legacy device on this port — `arduino` (DTR) or `cheetah` (RTS/DTR); any other value is a config error (optional) |
 //!
@@ -69,6 +70,7 @@ use crate::core::klippy::cmd::uart::{
 };
 use crate::core::klippy::config::mcu::Transport;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::interface::devices::serial::PortCarrier;
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -247,6 +249,11 @@ pub struct CanPort {
     oid: String,
     /// The bus rate the firmware opens the port's CAN controller at.
     bitrate: u32,
+    /// The carrier the port speaks a device's units over (`can_protocol:`):
+    /// classical CAN frames sliced at eight bytes, or ISO-TP. It is what the
+    /// port-level `SET_PORT_NODEID` flags byte says ([`Self::protocol`],
+    /// [`crate::core::klippy::mcu::bridge_attach`]).
+    protocol: PortCarrier,
     /// The port's index on its bridge — its declaration order among the
     /// bridge's ports, which is what the port-level `SET_PORT_NODEID` carries
     /// and what `config_can` sends as a slot placeholder the firmware ignores
@@ -260,18 +267,21 @@ impl CanPort {
     ///
     /// # Errors
     /// A missing or empty required option, a `can_mcu` that names no `[mcu]`
-    /// section, or a non-positive or unparsable `can_bitrate` — each message
-    /// names the section (and the target, for an unknown MCU).
+    /// section, a non-positive or unparsable `can_bitrate`, or a
+    /// `can_protocol` that is neither `cans` nor `isotp` — each message names the
+    /// section (and the target, for an unknown MCU).
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let name = section_name(config, "can_device")?;
         let mcu = require_mcu(config, "can_mcu")?;
         let oid = require_text(config, "can_oid")?;
         let bitrate = parse_rate(config, "can_bitrate")?.unwrap_or(DEFAULT_CAN_BITRATE);
+        let protocol = parse_protocol(config)?;
         Ok(Self {
             name,
             mcu,
             oid,
             bitrate,
+            protocol,
             index: None,
         })
     }
@@ -295,6 +305,17 @@ impl CanPort {
     /// The bus rate the firmware opens the port's CAN controller at.
     pub fn bitrate(&self) -> u32 {
         self.bitrate
+    }
+
+    /// The carrier this port speaks its device's units over — `cans` unless the
+    /// section wrote `can_protocol: isotp`.
+    ///
+    /// The attach pass turns it into the port-level `SET_PORT_NODEID` flags byte
+    /// (`bridge_attach::port_flags`), which is the one thing the firmware reads
+    /// it from: the port then segments a unit into ISO-TP messages (or slices
+    /// it into frames) on that port alone.
+    pub fn protocol(&self) -> PortCarrier {
+        self.protocol
     }
 
     /// The port's index on its bridge — its declaration order among the
@@ -742,6 +763,25 @@ fn parse_rate(config: &ConfigWrapper, option: &str) -> Result<Option<u32>, Confi
     }
 }
 
+/// The `can_protocol:` carrier an optional `[can_device]` option names, `cans`
+/// when it is absent.
+///
+/// The two spellings are the interface's, not this section's
+/// ([`PortCarrier::parse`]): the command line's `--port-carrier` writes the same
+/// words, so one vocabulary and one place the bit is assembled.
+fn parse_protocol(config: &ConfigWrapper) -> Result<PortCarrier, ConfigError> {
+    let Some(text) = config.get_str("can_protocol") else {
+        return Ok(PortCarrier::Cans);
+    };
+    PortCarrier::parse(&text).ok_or_else(|| {
+        ConfigError::new(format!(
+            "Section '{}' has an invalid can_protocol: '{text}' (expected one of {})",
+            config.identifier(),
+            PortCarrier::NAMES.join(", ")
+        ))
+    })
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -752,7 +792,7 @@ mod tests {
 
     use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::config::access::AccessTracking;
-    use crate::core::klippy::config::Config;
+    use crate::core::klippy::config::{check_unused, Config};
     use crate::core::klippy::reactor::ManualReactor;
 
     /// Parse `text` into a config the wrappers can reach siblings through.
@@ -976,6 +1016,89 @@ mod tests {
             with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_bitrate: 500000\n");
         let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
         assert_eq!(port.bitrate(), 500_000);
+    }
+
+    /// `can_protocol` is optional and says which carrier the port speaks its
+    /// units over: `cans` (the default, 8-byte slices) or `isotp`.
+    #[test]
+    fn a_can_port_takes_the_carrier_the_config_writes() {
+        let config = with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.protocol(), PortCarrier::Cans);
+
+        let config =
+            with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_protocol: cans\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.protocol(), PortCarrier::Cans);
+
+        let config =
+            with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_protocol: isotp\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.protocol(), PortCarrier::Isotp);
+    }
+
+    /// A `can_protocol` that is neither carrier is refused by value, with the two
+    /// that are accepted, so the config can be fixed from the message.
+    #[test]
+    fn a_can_port_with_an_invalid_carrier_is_refused() {
+        for value in ["can", "ISO", "slices", "fd", ""] {
+            let config = with_mcu(&format!(
+                "[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_protocol: {value}\n"
+            ));
+
+            let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+
+            assert!(
+                err.to_string().contains("invalid can_protocol"),
+                "{value}: {err}"
+            );
+            assert!(err.to_string().contains(value), "{value}: {err}");
+            assert!(err.to_string().contains("cans, isotp"), "{value}: {err}");
+        }
+    }
+
+    /// `can_protocol` is a `[can_device]` option and nothing else's: written on a
+    /// `[uart_device]`, no factory reads it, so `check_unused` reports it as an
+    /// undefined option for that section.
+    #[test]
+    fn only_a_can_device_reads_can_protocol() {
+        let text = "[mcu]\n\
+                    [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
+                    can_protocol: isotp\n";
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let sect = config
+            .get_section("uart_device uart0")
+            .expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(sect, Arc::clone(&access), None, &config);
+
+        UartPort::new(&wrapper).expect("the uart port reads its own options");
+
+        // `[mcu]` itself is not loaded here (no factory ran), which is the one
+        // exemption the check takes: the section under test is the port's.
+        let err = check_unused(&config, &access, &["mcu".to_string()])
+            .expect_err("can_protocol is not read here");
+        let text = err.to_string();
+        assert!(text.contains("can_protocol"), "{text}");
+        assert!(text.contains("uart_device uart0"), "{text}");
+    }
+
+    /// The other half of the same rule: a `[can_device]` that writes
+    /// `can_protocol` leaves nothing unread.
+    #[test]
+    fn a_can_device_reads_its_can_protocol() {
+        let text = "[mcu]\n\
+                    [can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n\
+                    can_protocol: isotp\n";
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let sect = config.get_section("can_device can0").expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(sect, Arc::clone(&access), None, &config);
+
+        let port = CanPort::new(&wrapper).expect("the can port reads its own options");
+        assert_eq!(port.protocol(), PortCarrier::Isotp);
+
+        check_unused(&config, &access, &["mcu".to_string()]).expect("no option is left unread");
     }
 
     #[test]

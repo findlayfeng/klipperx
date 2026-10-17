@@ -543,6 +543,19 @@ pub const ASSIGN_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 /// the request and waits another `ASSIGN_ATTACH_TIMEOUT`.
 pub const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
 
+/// How long a device behind a **CAN** port is given to answer its assignment
+/// ([`SharedSerialHandle::name_can_device`]), at most.
+///
+/// The same listening a flash run does on [`ADMIN_REPLY`], for a shorter spell:
+/// a CAN device adopts `SET_NODEID` in silence (`generic/canserial.c`
+/// `can_process_set_klipper_nodeid`; katapult too), so the normal outcome is an
+/// empty window and the only thing the wait can buy is a device that does
+/// answer. A bring-up pays it once per CAN child, where the flash run
+/// (`ASSIGN_CONFIRM_WINDOW` in `flash/bridge_flash.rs`) pays its second for one
+/// assignment a caller asked for — one round trip on a bridge's wire is all it
+/// takes to hear an answer or stop waiting for one.
+pub const CAN_ASSIGN_CONFIRM_WINDOW: Duration = Duration::from_millis(300);
+
 /// How many bytes one `read` may bring in. Bounds the reader's stack buffer;
 /// larger reads simply take another turn.
 const READ_CHUNK: usize = 1024;
@@ -1782,6 +1795,40 @@ fn wait_for_ack(slot: &McuSlot, timeout: Duration) -> Option<u32> {
     }
 }
 
+/// Whether an admin answer naming `uuid` arrives within `window`.
+///
+/// The one reader of a port's [`ADMIN_REPLY`] units that both the flash tool
+/// (`flash/bridge_flash.rs::assign_through_shared`) and a CAN port's naming
+/// ([`SharedSerialHandle::name_can_device`]) wait on: a device behind a bridge
+/// port answers a discovery broadcast — and a mux device an assignment — with
+/// its `NEED_NODEID` and uuid, which the bridge heads with that id.
+///
+/// The whole window is read, not just the first unit: another device on another
+/// port may be talking, and its answer is not this board's confirmation. A unit
+/// that does not parse as an answer, or names another UUID, is dropped and the
+/// wait goes on.
+pub(crate) fn answers_for(
+    answers: &std::sync::mpsc::Receiver<Vec<u8>>,
+    uuid: [u8; 6],
+    window: Duration,
+) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match answers.recv_timeout(remaining) {
+            Ok(unit) => {
+                if UnassignedNode::from_unit(&unit).is_some_and(|node| node.uuid == uuid) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 impl SharedSerialPort {
     /// The port this was opened on.
     pub fn path(&self) -> &Path {
@@ -2347,6 +2394,62 @@ impl SharedSerialHandle {
             }
         }
         Err(InterfaceError::Timeout)
+    }
+
+    /// Name a device behind a **CAN** port: the `SET_NODE_ID` unit, then the
+    /// device's own answer on the bus's admin reply id — **not** the serial
+    /// mux's re-confirm.
+    ///
+    /// The unit itself is the one [`Self::handshake`] writes, and it is right
+    /// for a CAN port: the bridge's port translates it into the bus's single
+    /// admin frame (`0x3f0 [0x01][uuid][nodeid]`,
+    /// `generic/bridge_can.c::bridge_can_admin_write`). What a CAN device never
+    /// answers is the assignment **request** that follows it — a serial mux
+    /// device re-confirms with the `KXID` pseudo-frame, a CAN device's admin
+    /// channel speaks one short frame per command and nothing for this one — so
+    /// [`Self::handshake`] over a CAN port can only time out on a correct
+    /// assignment, and the re-confirm is why a named device on a `[can_device]`
+    /// never came up.
+    ///
+    /// The answer a CAN device *can* give is on [`ADMIN_REPLY`]: its
+    /// `NEED_NODEID`, which the port rebuilds into the unit
+    /// [`UnassignedNode::from_unit`] reads. Even that is optional — the
+    /// assignment is adopted in silence — so this succeeds whether or not it
+    /// comes, and only reports it, exactly as a flash run tells
+    /// `AssignReport::Confirmed` from `Sent`. `window` is
+    /// [`CAN_ASSIGN_CONFIRM_WINDOW`], and the listener is removed before this
+    /// returns either way, so a later scan finds the port as it was.
+    ///
+    /// The port's attach lock is held for the whole wait, as [`Self::handshake`]
+    /// holds it: one port has one listener per id, and two namings must not
+    /// replace each other's while they wait.
+    ///
+    /// Returns whether the device answered.
+    ///
+    /// # Errors
+    /// [`InterfaceError::Other`] for an id the wire cannot address,
+    /// [`InterfaceError::ConnectionLost`] when the port or this handle has been
+    /// shut down, and [`InterfaceError::SendError`] when the write fails. A
+    /// silent device is not an error.
+    pub fn name_can_device(&self, uuid: [u8; 6], mcu_id: u32) -> Result<bool, InterfaceError> {
+        let unit = set_node_id_for(uuid, mcu_id).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} is outside the range a mux header can address"
+            ))
+        })?;
+        let _attaching = self.port.attach_lock.lock().unwrap();
+        if self.stopped.load(Ordering::SeqCst) || self.port.stopped.load(Ordering::SeqCst) {
+            return Err(InterfaceError::ConnectionLost);
+        }
+        let (sink, answers) = UnitSink::channel();
+        self.set_unit_sink(ADMIN_REPLY, sink);
+        let written = self.send_admin(&unit[HEADER_BYTES..]);
+        // Nothing is waited for when nothing was written: a refused write is the
+        // caller's error, and a full window behind it would only hide it.
+        let answered = written.is_ok() && answers_for(&answers, uuid, CAN_ASSIGN_CONFIRM_WINDOW);
+        self.clear_unit_sink(ADMIN_REPLY);
+        written?;
+        Ok(answered)
     }
 
     /// Take this handle's slot out of the port's map — only when the entry
@@ -2920,6 +3023,92 @@ mod mux_tests {
             &device_unit(mcu_id, &Frame::encode(6, b"alive")),
         );
         assert_eq!(handle.receive(), Some(Frame::new(6, b"alive".to_vec())));
+    }
+
+    /// A device on a **CAN** port is named with the assignment alone, and the
+    /// bus's own answer is what the wait reads.
+    ///
+    /// The mux's re-confirm is what must **not** go out: a CAN device's admin
+    /// channel speaks one short frame per command and answers nothing for an
+    /// assignment, so [`SharedSerialHandle::handshake`] over a CAN port can only
+    /// time out on a correct assignment — which is what kept a `[can_device]`
+    /// child from coming up on a real bridge.
+    #[test]
+    fn a_can_port_is_named_with_the_assignment_and_reads_the_bus_answer() {
+        let pty = Pty::new();
+        let uuid = [0x12, 0xf9, 0x12, 0xed, 0x38, 0x73];
+        let mcu_id = 7;
+
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, mcu_id)
+            .expect("a downstream attach does not handshake");
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        let worker = Arc::clone(&handle);
+        let thread = thread::spawn(move || worker.name_can_device(uuid, mcu_id));
+
+        // One unit, and nothing behind it: the assignment request the mux
+        // answers is never written on a CAN port.
+        assert_eq!(
+            read_n_within(&pty.master, set.len(), Duration::from_secs(5)),
+            set,
+            "the CAN port's admin channel carries SET_KLIPPER_NODEID and nothing else"
+        );
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "no assignment request follows: a CAN device never answers one"
+        );
+
+        // The device's answer arrives on the bus's admin reply id, which the
+        // port rebuilds into the unit the wait parses.
+        master_write(&pty.master, &admin_answer(uuid, None));
+        assert!(
+            thread
+                .join()
+                .expect("the naming thread")
+                .expect("the assignment went out"),
+            "the answer names this uuid, so the device is reported as confirmed"
+        );
+        assert!(
+            !handle.port.units.has(ADMIN_REPLY),
+            "the listener is taken down before returning, so a later scan finds the port as it \
+             was"
+        );
+    }
+
+    /// A **silent** CAN device is named all the same: it adopts the id and says
+    /// nothing (`generic/canserial.c::can_process_set_klipper_nodeid`, and
+    /// katapult likewise), so an empty window is `Ok(false)` rather than
+    /// [`InterfaceError::Timeout`] — the difference between a CAN port's naming
+    /// and the mux handshake, and what lets a real `[can_device]` child come up.
+    #[test]
+    fn a_can_port_names_a_silent_device_and_leaves_no_listener() {
+        let pty = Pty::new();
+        let uuid = [0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a];
+        let mcu_id = 4;
+
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, mcu_id)
+            .expect("a downstream attach does not handshake");
+        let answered = handle
+            .name_can_device(uuid, mcu_id)
+            .expect("silence is not a failure on a CAN port");
+
+        assert!(
+            !answered,
+            "nothing answered: the device took the id in silence"
+        );
+        let set = set_node_id_for(uuid, mcu_id).expect("a valid mcu id");
+        assert_eq!(
+            read_n_within(&pty.master, set.len(), Duration::from_secs(5)),
+            set,
+            "the assignment went out, with no request behind it"
+        );
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "nothing else was written: the mux's request is not part of a CAN port's naming"
+        );
+        assert!(
+            !handle.port.units.has(ADMIN_REPLY),
+            "the listener outlived the wait no more here than it did with an answer"
+        );
     }
 
     #[test]

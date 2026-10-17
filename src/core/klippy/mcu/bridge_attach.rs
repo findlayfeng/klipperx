@@ -37,14 +37,17 @@
 //!   bridge must own before they reach the device; sent ahead of it, the bridge
 //!   drops them and the handshake times out with nothing downstream.
 //!
-//! A CAN port ([`can_device`]) takes the same route as a named uart port: the
+//! A CAN port ([`can_device`]) takes the same route as a named uart port — the
 //! firmware's CAN port backend (`BRIDGE_PORT_CAN`) opens the bridge's own CAN
 //! controller at the port's `can_bitrate` and the router addresses it like any
-//! other port. The one thing a CAN port cannot be is **legacy**: CAN addressing
-//! is by uuid, and the host has to name the device's CAN node id with the
-//! device's own handshake, so a `can:` child that writes no `uuid:` is refused
-//! by name ([`resolve`]) instead of being given a route that could never be
-//! addressed.
+//! other port — but **not** the same naming: the route is the same
+//! `SET_PORT_NODEID`, the naming is `SET_KLIPPER_NODEID` and at most the bus's
+//! own answer, never the mux's re-confirm, which a CAN device does not answer
+//! ([`LinkHandle::name_can_device`]). The one thing a CAN port cannot be is
+//! **legacy**: CAN addressing is by uuid, and the host has to name the device's
+//! CAN node id with the device's own handshake, so a `can:` child that writes no
+//! `uuid:` is refused by name ([`resolve`]) instead of being given a route that
+//! could never be addressed.
 //!
 //! The bridge's own transport decides how the downstream handle is opened, and
 //! the two kinds it can be are exactly the two mux links: a shared serial port
@@ -70,6 +73,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+/// How long a **CAN** device is left to adopt the id [`open`] has just handed
+/// it, before the caller's first frame is addressed to that id.
+///
+/// The assignment itself is not acknowledged ([`LinkHandle::name_can_device`]),
+/// and the device takes the id — and re-aims its CAN filter at it — in its own
+/// task once the admin frame arrives. Nothing the host can read says that
+/// happened, so this is a bounded grace the host cannot verify, the attach-side
+/// counterpart of a flash run's `ASSIGN_SETTLE`
+/// (`flash/bridge_flash.rs`): long enough for one task cycle on the device,
+/// short enough to pay once per CAN child.
+const CAN_ASSIGN_SETTLE: Duration = Duration::from_millis(100);
+
 /// Where a downstream device attaches, resolved from the child's config and the
 /// bridge's identify answer.
 ///
@@ -92,9 +107,18 @@ pub(crate) struct BridgePortLink {
     /// device speaks units — every port but a legacy one, CAN included.
     pub flags: u8,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
-    /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`):
-    /// a device behind a port answers the mux itself, unlike a legacy one.
+    /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`): a
+    /// device behind a port has an admin channel of its own, unlike a legacy
+    /// one. Which channel answers it — the serial mux's or the CAN bus's — is
+    /// [`Self::kind`]'s question.
     pub named: Option<[u8; 6]>,
+    /// The port's **kind**, which decides how a named device is named: a uart
+    /// port's device answers the serial mux's re-confirm, a CAN port's device
+    /// answers the bus's admin channel instead and never that re-confirm — see
+    /// [`LinkHandle::handshake`] and [`LinkHandle::name_can_device`]. The flags
+    /// byte cannot stand in for it: a CAN port and a named uart port carry the
+    /// same one ([`port_flags`]).
+    pub kind: PortKind,
 }
 
 /// Resolve the child's `uart:`/`can:` transport to the bridge port it names.
@@ -206,6 +230,7 @@ pub(crate) fn resolve(
         index,
         flags,
         named: *uuid,
+        kind: *kind,
     })
 }
 
@@ -256,6 +281,9 @@ impl LinkHandle {
     /// opened: `SET_KLIPPER_NODEID` plus a re-confirm request, each answered by
     /// the device. The route must already be in ([`open`] sends it first), or
     /// the units reach no port and the handshake times out.
+    ///
+    /// This is the **uart** port's naming. A CAN port's device never answers
+    /// the re-confirm and is named with [`Self::name_can_device`] instead.
     fn handshake(&self, named: [u8; 6], mcu_id: u32, index: u8) -> Result<(), KlippyError> {
         match self {
             Self::Host { device, library } => device.attach(named, mcu_id).map_err(|err| {
@@ -271,6 +299,48 @@ impl LinkHandle {
                         "serial {path}: SET_KLIPPER_NODEID handshake on port {index} failed: {err}"
                     ))
                 }),
+        }
+    }
+
+    /// Name a device behind a **CAN** port: `SET_KLIPPER_NODEID`, then at most
+    /// the bus's own answer — never the serial mux's re-confirm.
+    ///
+    /// A CAN device's admin channel answers a discovery broadcast and adopts an
+    /// assignment in silence
+    /// ([`serial::SharedSerialHandle::name_can_device`] has the wire), so a
+    /// silent device is named, not failed: the re-confirm [`Self::handshake`]
+    /// waits for is a mux device's and would only waste the whole budget before
+    /// reporting a correct assignment as a timeout.
+    ///
+    /// A **host-library** link cannot look at the bus at all — the port is the
+    /// firmware's, and a library reference carries no admin-reply listener — so
+    /// its half sends the assignment alone and reports no answer.
+    ///
+    /// Returns whether the device answered.
+    fn name_can_device(&self, named: [u8; 6], mcu_id: u32, index: u8) -> Result<bool, KlippyError> {
+        match self {
+            Self::Host { device, library } => {
+                let unit = serial::set_node_id_for(named, mcu_id).ok_or_else(|| {
+                    KlippyError::Connection(format!(
+                        "host_library {library}: mcu id {mcu_id} is outside the range a mux header \
+                         can address"
+                    ))
+                })?;
+                device
+                    .send_admin(&unit[serial::HEADER_BYTES..])
+                    .map_err(|err| {
+                        KlippyError::Connection(format!(
+                            "host_library {library}: SET_KLIPPER_NODEID on CAN port {index} \
+                             failed: {err}"
+                        ))
+                    })?;
+                Ok(false)
+            }
+            Self::Serial { handle, path } => handle.name_can_device(named, mcu_id).map_err(|err| {
+                KlippyError::Connection(format!(
+                    "serial {path}: SET_KLIPPER_NODEID on CAN port {index} failed: {err}"
+                ))
+            }),
         }
     }
 }
@@ -359,17 +429,20 @@ fn open_link_handle(
 /// 1. `SET_PORT_NODEID(index, mcu_id, flags)` — the bridge's **route**. It is
 ///    sent before anything else the caller writes, because until the bridge has
 ///    it, `mcu_id` names no port and frames under it go nowhere.
-/// 2. For a **named** device ([`BridgePortLink::named`]), its own naming
-///    handshake: `SET_KLIPPER_NODEID(uuid, mcu_id)` plus a re-confirm request
-///    (a legacy device has no admin channel and gets only step 1). It must come
-///    **after** the route: the handshake's units are addressed to `mcu_id`, so
-///    with no route the bridge drops them and the device never hears a word.
+/// 2. For a **named** device ([`BridgePortLink::named`]), its own naming: for a
+///    uart port the handshake `SET_KLIPPER_NODEID(uuid, mcu_id)` plus a
+///    re-confirm request, for a **CAN** port the assignment and at most the
+///    bus's answer (a legacy device has no admin channel and gets only step 1).
+///    It must come **after** the route: the handshake's units are addressed to
+///    `mcu_id`, so with no route the bridge drops them and the device never
+///    hears a word. Which naming a port takes is [`BridgePortLink::kind`]'s
+///    answer — a CAN device never answers the mux's re-confirm.
 ///
 /// # Errors
 /// [`KlippyError::Config`] for a bridge link that cannot carry a downstream
 /// device (a CAN upstream, or a transport with no mux); [`KlippyError::Connection`]
-/// for a failed open, a failed `SET_PORT_NODEID`, or a named device's handshake
-/// that never completes.
+/// for a failed open, a failed `SET_PORT_NODEID`, or a named **uart** device's
+/// handshake that never completes (a CAN device's silence is not a failure).
 pub(crate) fn open(
     printer: &Printer,
     link: &BridgePortLink,
@@ -387,17 +460,36 @@ pub(crate) fn open(
         .send_set_port_node_id(link.index, id, link.flags)
         .map_err(|err| route_error(link.index, id, link.flags, err))?;
     if let Some(named) = link.named {
-        handle.handshake(named, mcu_id, link.index)?;
+        match link.kind {
+            PortKind::Uart => handle.handshake(named, mcu_id, link.index)?,
+            PortKind::Can => {
+                let answered = handle.name_can_device(named, mcu_id, link.index)?;
+                if !answered {
+                    debug!(
+                        "bridge port {}: CAN device id {mcu_id} took the id in silence (a CAN \
+                         device answers a query, not an assignment)",
+                        link.index
+                    );
+                }
+                // The device adopts the id and switches the bus filter on it in
+                // its own task; the host cannot see that switch happen, and the
+                // next frame it sends is addressed to the new id. So this is a
+                // bounded grace the host cannot verify, exactly as the flash
+                // run's `ASSIGN_SETTLE` is after the assignment it makes.
+                std::thread::sleep(CAN_ASSIGN_SETTLE);
+            }
+        }
     }
     debug!(
-        "bridge port {}: attaching downstream device id {mcu_id} ({}, {})",
+        "bridge port {}: attaching downstream device id {mcu_id} ({}, {}, {})",
         link.index,
         if link.flags == 0 { "legacy" } else { "units" },
         if link.named.is_some() {
             "named"
         } else {
             "unnamed"
-        }
+        },
+        link.kind.section_type()
     );
     Ok(interface)
 }
@@ -871,6 +963,7 @@ mod tests {
                 index: 0,
                 flags: 0,
                 named: None,
+                kind: PortKind::Uart,
             };
 
             let err = open_link(&printer, &link, 7).unwrap_err();
@@ -1750,6 +1843,7 @@ mod tests {
             index: 0,
             flags: MUX_PORT_UNITS,
             named: Some(named),
+            kind: PortKind::Uart,
         };
 
         let result = open(&printer, &link, mcu_id);
@@ -1772,6 +1866,55 @@ mod tests {
             seen, expected,
             "the route unit first, then the named device's SET_KLIPPER_NODEID and a routed \
              request per attempt"
+        );
+    }
+
+    /// A named device behind a **CAN** port is named with the assignment alone:
+    /// the same route unit first, then `SET_KLIPPER_NODEID` — and **not** the
+    /// serial mux's re-confirm, which a CAN device never answers.
+    ///
+    /// The re-confirm is the bug this pins: over the same pty, a CAN port that
+    /// ran the uart path wrote [`serial::ASSIGN_ATTACH_ATTEMPTS`] assignment
+    /// requests after a correct assignment and then failed the bring-up with the
+    /// handshake's `Receive timeout` — what a real `[can_device]` child did on a
+    /// REV `F446` bridge, where the CLI's own attach (same port, same uuid) was
+    /// working. The silence below is the device's normal answer (a CAN device
+    /// adopts an id and says nothing), so unlike the uart test this one does not
+    /// end in a timeout: the port is named.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_can_port_is_named_without_the_mux_reconfirm() {
+        let pty = Pty::new();
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let named = [0x12, 0xf9, 0x12, 0xed, 0x38, 0x73];
+        let mcu_id = 7u32;
+        let link = BridgePortLink {
+            transport: Transport::Serial {
+                path: pty.path.display().to_string(),
+                baud: serial::DEFAULT_BAUD,
+                uuid: None,
+            },
+            index: 0,
+            flags: MUX_PORT_UNITS,
+            named: Some(named),
+            kind: PortKind::Can,
+        };
+
+        // Silence is success on a CAN port: no answer is expected at all.
+        open(&printer, &link, mcu_id).expect("a silent CAN device is still named");
+
+        let mut expected = serial::set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        expected.extend_from_slice(
+            &serial::set_node_id_for(named, mcu_id).expect("id 7 is addressable"),
+        );
+        let seen = read_pty(&pty.master, expected.len(), Duration::from_secs(3));
+        assert_eq!(
+            seen, expected,
+            "the route unit, then the CAN device's SET_KLIPPER_NODEID and nothing else"
+        );
+        assert!(
+            read_pty(&pty.master, 1, Duration::from_millis(200)).is_empty(),
+            "a CAN device never answers the mux's assignment request, so the port must not \
+             write one"
         );
     }
 

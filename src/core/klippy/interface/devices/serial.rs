@@ -3332,6 +3332,183 @@ mod mux_tests {
     }
 
     // -----------------------------------------------------------------------
+    // The unit registry: whole units under an id no MCU owns, handed to the
+    // listener registered for that id — a scan reading a bridge's admin answers.
+    // -----------------------------------------------------------------------
+
+    /// One whole unit under `arb`: the header [`encode_header`] writes, then one
+    /// legal klipper frame — the shape a bridge's downstream devices answer with.
+    fn unit_for(arb: u32, frame: &Frame) -> Vec<u8> {
+        let mut unit = encode_header(arb);
+        unit.extend_from_slice(&frame.raw_bytes());
+        unit
+    }
+
+    #[test]
+    fn a_unit_no_mcu_owns_is_delivered_whole_to_the_sink_of_its_arb() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+        let (sink, units) = UnitSink::channel();
+        handle4.set_unit_sink(ADMIN_REPLY, sink);
+
+        let unit = unit_for(ADMIN_REPLY, &Frame::new(1, b"answer".to_vec()));
+        master_write(&pty.master, &unit);
+
+        // Byte for byte, header included: the listener reassembles nothing.
+        assert_eq!(
+            units
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the unit is delivered to its arb's sink"),
+            unit,
+            "the whole unit arrives exactly as it was written"
+        );
+
+        // And it went nowhere else: the unit names an id no MCU owns.
+        assert!(
+            !wait_for_frame(
+                &handle4.slot,
+                &Frame::new(1, b"answer".to_vec()),
+                Duration::from_millis(200)
+            ),
+            "an admin answer never reaches an MCU slot"
+        );
+    }
+
+    #[test]
+    fn clearing_a_unit_sink_restores_the_drop_and_leaves_the_slot_alone() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+        let (sink, units) = UnitSink::channel();
+        handle4.set_unit_sink(ADMIN_REPLY, sink);
+
+        // A live listener takes the first answer.
+        master_write(
+            &pty.master,
+            &unit_for(ADMIN_REPLY, &Frame::new(6, b"first".to_vec())),
+        );
+        assert!(
+            units.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the registered listener takes the unit"
+        );
+
+        // Cleared: the answer under the admin id is dropped again, the way it
+        // was before there were listeners. The ordinary unit behind it is the
+        // barrier — units are dispatched in order, so hearing it says the answer
+        // before it is already handled (dropped, not queued, and the drop
+        // stopped at that unit rather than eating the stream).
+        handle4.clear_unit_sink(ADMIN_REPLY);
+        let mut wire = unit_for(ADMIN_REPLY, &Frame::new(7, b"dropped".to_vec()));
+        wire.extend_from_slice(&device_unit(4, &Frame::encode(8, b"alive")));
+        master_write(&pty.master, &wire);
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(8, b"alive".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the port keeps dispatching the units of a real MCU"
+        );
+        assert!(units.try_recv().is_err(), "a cleared listener gets nothing");
+    }
+
+    #[test]
+    fn a_unit_sink_and_an_mcu_slot_do_not_take_each_others_units() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+        let (sink, units) = UnitSink::channel();
+        handle4.set_unit_sink(ADMIN_REPLY, sink);
+
+        // The slot's unit: an ordinary data frame under MCU 4's answer id.
+        master_write(&pty.master, &device_unit(4, &Frame::encode(2, b"slot")));
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(2, b"slot".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "an MCU's own unit still reaches its slot"
+        );
+        assert!(
+            units.recv_timeout(Duration::from_millis(200)).is_err(),
+            "an MCU's own unit is not handed to the admin listener"
+        );
+
+        // The sink's unit: the admin id, which no MCU owns.
+        let admin = unit_for(ADMIN_REPLY, &Frame::new(3, b"admin".to_vec()));
+        master_write(&pty.master, &admin);
+        assert_eq!(
+            units
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the admin unit is delivered"),
+            admin,
+            "the listener gets the admin unit whole"
+        );
+        assert!(
+            !wait_for_frame(
+                &handle4.slot,
+                &Frame::new(3, b"admin".to_vec()),
+                Duration::from_millis(200)
+            ),
+            "and the admin unit is not handed to a slot"
+        );
+    }
+
+    #[test]
+    fn registering_a_second_unit_sink_replaces_the_first() {
+        let pty = Pty::new();
+        let handle4 = attach_within(&pty, 4);
+
+        let (first, first_units) = UnitSink::channel();
+        handle4.set_unit_sink(ADMIN_REPLY, first);
+        let (second, second_units) = UnitSink::channel();
+        handle4.set_unit_sink(ADMIN_REPLY, second);
+
+        // The newer listener takes the unit; the replaced one is gone with its
+        // registration (its sender went with the map entry).
+        let unit = unit_for(ADMIN_REPLY, &Frame::new(4, b"replaced".to_vec()));
+        master_write(&pty.master, &unit);
+        assert_eq!(
+            second_units
+                .recv_timeout(Duration::from_secs(2))
+                .expect("the newer listener takes the unit"),
+            unit
+        );
+        assert!(
+            first_units
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "the replaced listener gets nothing"
+        );
+
+        // One clear removes the replacement: the id has no listener at all, and
+        // the unit is dropped (the ordinary unit behind it is the barrier).
+        handle4.clear_unit_sink(ADMIN_REPLY);
+        let mut wire = unit_for(ADMIN_REPLY, &Frame::new(5, b"after clear".to_vec()));
+        wire.extend_from_slice(&device_unit(4, &Frame::encode(9, b"after clear")));
+        master_write(&pty.master, &wire);
+        assert!(
+            wait_for_frame(
+                &handle4.slot,
+                &Frame::new(9, b"after clear".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the port keeps dispatching the units of a real MCU"
+        );
+        assert!(
+            second_units.try_recv().is_err(),
+            "one clear unregisters the arb"
+        );
+        assert!(
+            !wait_for_frame(
+                &handle4.slot,
+                &Frame::new(5, b"after clear".to_vec()),
+                Duration::from_millis(200)
+            ),
+            "a cleared id's unit goes nowhere"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // The assignment pseudo-frame: shape, old-firmware behavior, and the
     // handshake's own codec.
     // -----------------------------------------------------------------------

@@ -172,6 +172,23 @@ send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调
 配置上这个压力 stepper。测试结束时板子通常停在 shutdown 状态，下一次
 运行（或正常的主机）会重新配置它。
 
+## 直连 CAN 的 MCU
+
+`[mcu …] canbus_interface: can0` 这种**直连 CAN**的节，`stress` 不走 `[mcu_ids]` 分配器
+（它只解析一个 `[mcu]` 节，没有整份配置的装载期），所以会报
+`canbus: the MCU id has not been assigned`。在该节里写显式的 `canbus_nodeid:` 即可：
+
+```ini
+[mcu child]
+canbus_interface: can0
+uuid: 12f912ed3873
+canbus_nodeid: 4        # stress 需要它；正式 printer.cfg 里可以省，由 [mcu_ids] 分配
+```
+
+节点固件要和载具配套：直连 CAN 的节点是**裸 canserial**（不要 `MUX_CAN`），而挂在 klipperx 桥 CAN
+端口上的节点必须带 `MUX_CAN`。两者的实测数字见 [MCU 连接方式](../user-manual/mcu-connection.md) 的
+「桥下游链路的吞吐与余量」与「主机直连 CAN」两节。
+
 ## 要求与缺口
 
 - 配置里必须有 `[mcu …]`（或 `[mcu]`）；`--task step` 还要该板名下带 `step_pin`/`dir_pin` 的

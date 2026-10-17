@@ -160,20 +160,29 @@ U9b 只决定「能否也按 ISO-TP 刷」，不影响主线能不能通。
 
 | # | 设备 | 用途 | 备注 |
 |---|---|---|---|
-| 1 | **桥板**：STM32F103ZE（现有那块 devloop1）+ **CAN 收发器模块**（3.3 V：SN65HVD230/TCAN332 一类） | 桥：USB CDC 控制台，CAN 当它的下游口 | CAN 接 **PB8(RX)/PB9(TX)**，避开 USB 的 PA11/PA12（D2） |
-| 2 | **下游 CAN 板 ×1**：STM32F103ZE + 同款收发器 | 两条路径的被测设备 | 需要能刷两套固件：klipper `CANSERIAL`(±`MUX_CAN`) 与 klipper `CANSERIAL`+`ISOTP`；引导态用 stock katapult（CAN 载体，裸切片） |
-| 3 | **120 Ω ×2** | 总线两端终端 | 桥板与下游板各一端 |
+| 1 | **CAN 测试专板 A（新，桥）**：STM32F103ZE + **CAN 收发器模块**（3.3 V：SN65HVD230/TCAN332 一类） | 桥：USB CDC 控制台，CAN 当它的下游口 | CAN 接 **PB8(RX)/PB9(TX)**，避开 USB 的 PA11/PA12（D2） |
+| 2 | **CAN 测试专板 B（新，下游）**：STM32F103ZE + 同款收发器 | 两条载具的被测设备 | 需能刷两套应用固件：klipper `CANSERIAL`(±`MUX_CAN`) 与 `CANSERIAL`+`ISOTP`；引导态 stock katapult（CAN 载体，裸切片） |
+| 3 | **120 Ω ×2** | 总线两端终端 | 新桥板与新下游板各一端 |
 | 4 | 双绞线 + 共地 | 物理层 | 短距离即可，但两端终端不能省 |
-| 5 | ~~**USB-CAN 适配器**~~（**本期无，不做前置**） | 直连对照（`admin flash --interface can0`）、`candump` 观察 | 没有它照样能验：桥板自己就是 CAN 的另一端；代价是「主机直连刷」与总线嗅探两条旁证缺席，真机报告里要写明 |
-| 6 | **保留现有两块板**（桥 + 下游），下游板**复用**：按需刷切片 / ISO-TP 两套应用固件 | 覆盖两条载具的最小集合 | 一 CAN 口一 node 的第一版上限下够用；要验多节点上限（§6）时再加板 |
+| 5 | ~~**USB-CAN 适配器**~~（**本期无，不做前置**） | 直连对照（`admin flash --interface can0`）、`candump` 观察 | 没有它照样能验：新桥板自己就是 CAN 的另一端；代价是「主机直连刷」与总线嗅探两条旁证缺席，真机报告里要写明 |
+| 6 | **机上现有两块板（桥 + UART 下游）保持现状、不动** | **UART 拓扑的回归基线**：CAN 工作的每一轮闸门后，都用它们把现有 UART 刷写（含可反复刷）重跑一遍 | 不刷、不改配置；它们是「新固件没把旧拓扑搞坏」的唯一真机证据 |
 | 7 | 软件侧替代：`CAP_NET_ADMIN` 容器 + `vcan0` | 无板时先验主机逻辑（非本仓闸门先例） | 真机不是它的替代 |
+
+**同时接两套设备时的纪律**：CAN 测试板与现有两块板会同时挂在主机上（`by-id` 不同、芯片 UID 不同），每条命令都要**显式给 `--bridge <CAN 桥板的 by-id>`**；
+新桥板首次使用时是未指派状态，要么先 `admin scan` 取 uuid / 或用 `--bridge-uuid`，**不要拿旧桥的 `e512c60ac0e6` 去开**（会白白重启旧桥）。
 
 **非本清单**：CAN-FD 收发器与 FDCAN 板（固件半边未做）、RS-485。
 
 ## 5. 真机揭幕时的命令序列（预排，便于验证产出手感）
 
 ```sh
-B=/dev/serial/by-id/usb-Klipper_stm32f103xe_<桥>
+# ⓿ 回归基线（每一轮 CAN 工作前后都跑）：用机上现有两块板验旧 UART 拓扑没回退
+klipperx admin bridge config --bridge <旧桥 by-id>            # 应仍报 uart 0/1
+klipperx admin flash --bridge <旧桥 by-id> --bridge-uuid e512c60ac0e6 \
+    --port 0 --port-nodeid 7 <现有下游 fw.bin>                 # 应仍 complete: N bytes
+
+# 以下均指向新 CAN 测试板（by-id 与旧桥不同）
+B=/dev/serial/by-id/usb-Klipper_stm32f103xe_<新桥>
 # ① 桥的口表：应看到 UART 槽 + 一个 CAN 槽
 klipperx admin bridge config --bridge $B
 # ② 把 CAN 槽启起来：UNITS 载具（cans / isotp 两选一）

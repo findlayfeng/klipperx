@@ -117,28 +117,65 @@ enum Commands {
     #[command(arg_required_else_help = true)]
     Stress(klipperx::stress::StressArgs),
 
+    /// Administer boards directly: scan for them, flash them, reset them, and
+    /// prepare a bridge
+    //
+    // The bench tools that talk to boards without a config file, gathered under
+    // one verb so the top level stays the host's. Naming `admin` and nothing
+    // else is a question, so `arg_required_else_help` answers it with the help.
+    #[command(arg_required_else_help = true)]
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommands,
+    },
+}
+
+/// The `admin` command family: one subcommand per board-level job.
+///
+/// This is the board bench, not the host: nothing here reads a `printer.cfg`,
+/// and each subcommand is a single direct operation. The family is behind
+/// `admin` so the top-level verbs stay the host's own.
+#[derive(clap::Subcommand, Debug)]
+enum AdminCommands {
     /// List the boards that have no node id yet, on a CAN bus or a serial port
     //
-    // A bench tool, not part of the host: it needs no config file, and the query
-    // it sends is a broadcast that changes no board's state — the UUIDs it prints
-    // are what a `[mcu]` section then names in `uuid`. The transport is an
-    // argument, not a second command, and it has no default: `--interface <name>`
-    // scans that CAN bus and `--port <tty>` scans that serial port, while naming
-    // neither is not a scan but a question — hence `arg_required_else_help`, like
-    // `api` and `stress`: a bare `scan` prints the help rather than guessing at a
-    // bus.
+    // The query is a broadcast that changes no board's state — the UUIDs it
+    // prints are what a `[mcu]` section then names in `uuid`. The transport is
+    // an argument, not a second command, and it has no default:
+    // `--interface <name>` scans that CAN bus and `--port <tty>` scans that
+    // serial port, while naming neither is not a scan but a question — hence
+    // `arg_required_else_help`, like `api` and `stress`: a bare `admin scan`
+    // prints the help rather than guessing at a bus.
     #[command(arg_required_else_help = true)]
     Scan(klipperx::scan::ScanArgs),
 
     /// Flash firmware to a board running the katapult bootloader
     //
-    // One direct link, one firmware file, one katapult session — the grammar the
-    // standalone `flash` binary used to speak, now the subcommand's: a serial
-    // tty/USB path or a SocketCAN bus, chosen by the arguments. Naming neither
-    // is not a flash with a guess but a question, so a bare `flash` prints this
-    // help, the same courtesy `klippy` and `scan` get.
+    // One direct link, one firmware file, one katapult session — the grammar
+    // the standalone `flash` binary used to speak: a serial tty/USB path or a
+    // SocketCAN bus, chosen by the arguments, or a bridge's downstream port.
+    // Naming no link is not a flash with a guess but a question, so a bare
+    // `admin flash` prints this help.
     #[command(arg_required_else_help = true)]
     Flash(klipperx::flash::cli::FlashArgs),
+
+    /// Prepare a bridge: declare its downstream ports, name the target's port,
+    /// and open its flashing tunnel
+    //
+    // The bridge side of `flash` without the flash and without a reset: the
+    // bridge's port table is built, the target's port is named with the legacy
+    // route, and its tunnel is opened. Resetting a device is `admin reset`'s
+    // job and flashing is `admin flash`'s.
+    #[command(name = "configure-bridge", arg_required_else_help = true)]
+    ConfigureBridge(klipperx::flash::cli::ConfigureBridgeArgs),
+
+    /// Reset a bridge itself, or a device on one of its ports
+    //
+    // The admin-channel reset: without `--port` the bridge restarts itself (the
+    // step `flash` does before declaring ports), and with `--port` the device
+    // behind that declared port is reset, the way `--port-reset` says.
+    #[command(arg_required_else_help = true)]
+    Reset(klipperx::flash::cli::ResetArgs),
 }
 
 fn main() {
@@ -151,8 +188,7 @@ fn main() {
         (Some(Commands::Api(args)), _) => client::run_api(args).map(|()| 0),
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
-        (Some(Commands::Scan(args)), _) => klipperx::scan::run(args).map(|()| 0),
-        (Some(Commands::Flash(args)), _) => klipperx::flash::cli::run(args).map(|()| 0),
+        (Some(Commands::Admin { command }), _) => run_admin(command),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };
@@ -163,6 +199,18 @@ fn main() {
             error!("Error: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Run one `admin` subcommand: the board bench's single direct operations.
+fn run_admin(command: AdminCommands) -> Result<i32, Box<dyn std::error::Error>> {
+    match command {
+        AdminCommands::Scan(args) => klipperx::scan::run(args).map(|()| 0),
+        AdminCommands::Flash(args) => klipperx::flash::cli::run(args).map(|()| 0),
+        AdminCommands::ConfigureBridge(args) => {
+            klipperx::flash::cli::run_configure_bridge(args).map(|()| 0)
+        }
+        AdminCommands::Reset(args) => klipperx::flash::cli::run_reset(args).map(|()| 0),
     }
 }
 
@@ -488,10 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn test_the_scan_subcommand_has_no_default_transport() {
-        // A bare `scan` is a question, not an instruction: with no default bus
-        // the subcommand prints its help instead of scanning something guessed.
-        let error = parse(&["scan"]).expect_err("a scan needs a transport");
+    fn test_the_scan_subcommand_is_under_admin() {
+        // A bare `admin scan` is a question, not an instruction: with no default
+        // bus the subcommand prints its help instead of scanning something
+        // guessed.
+        let error = parse(&["admin", "scan"]).expect_err("a scan needs a transport");
         let help = error.to_string();
         assert!(
             help.contains("--interface") && help.contains("--port"),
@@ -499,40 +548,58 @@ mod tests {
         );
 
         // The CAN side names the bus, and may take the window.
-        let cli = parse(&["scan", "--interface", "can1", "--timeout", "0.5"])
+        let cli = parse(&["admin", "scan", "--interface", "can1", "--timeout", "0.5"])
             .expect("both options are the subcommand's");
         match cli.command {
-            Some(Commands::Scan(args)) => {
+            Some(Commands::Admin {
+                command: AdminCommands::Scan(args),
+            }) => {
                 assert_eq!(args.interface.as_deref(), Some("can1"));
                 assert_eq!(args.timeout, 0.5);
             }
-            other => panic!("expected `scan`, got {other:?}"),
+            other => panic!("expected `admin scan`, got {other:?}"),
         }
 
         // The serial side names a port, and with it the line speed; the window
         // is still the subcommand's own default.
-        let cli = parse(&["scan", "--port", "/dev/ttyACM0", "--baud", "115200"])
-            .expect("the port and the line speed are the subcommand's");
+        let cli = parse(&[
+            "admin",
+            "scan",
+            "--port",
+            "/dev/ttyACM0",
+            "--baud",
+            "115200",
+        ])
+        .expect("the port and the line speed are the subcommand's");
         match cli.command {
-            Some(Commands::Scan(args)) => {
+            Some(Commands::Admin {
+                command: AdminCommands::Scan(args),
+            }) => {
                 assert_eq!(args.port.as_deref(), Some("/dev/ttyACM0"));
                 assert_eq!(args.baud, Some(115200));
                 assert_eq!(args.timeout, 2.0);
             }
-            other => panic!("expected `scan`, got {other:?}"),
+            other => panic!("expected `admin scan`, got {other:?}"),
         }
     }
 
     #[test]
     fn test_the_scan_subcommand_and_its_options_are_in_the_help() {
         // Found by reading `--help`, like the other bench tools: the top level
-        // lists the one scan subcommand, and the subcommand's own help names
-        // both transports' options.
+        // lists the one `admin` family, and its `scan` help names both
+        // transports' options.
         let error = parse(&["--help"]).expect_err("the help is not a command line");
         let help = error.to_string();
-        assert!(help.contains("scan"), "{help}");
+        assert!(help.contains("admin"), "{help}");
 
-        let error = parse(&["scan", "--help"]).expect_err("the help is not a scan");
+        let error = parse(&["admin", "--help"]).expect_err("the help is not a scan");
+        let help = error.to_string();
+        assert!(help.contains("scan"), "{help}");
+        assert!(help.contains("flash"), "{help}");
+        assert!(help.contains("configure-bridge"), "{help}");
+        assert!(help.contains("reset"), "{help}");
+
+        let error = parse(&["admin", "scan", "--help"]).expect_err("the help is not a scan");
         let help = error.to_string();
         for option in ["--interface", "--port", "--timeout", "--baud"] {
             assert!(help.contains(option), "{option} is missing from:\n{help}");
@@ -542,29 +609,32 @@ mod tests {
     #[test]
     fn test_the_flash_subcommand_reuses_the_flash_grammar() {
         // The standalone `flash` binary is gone; its grammar is the
-        // subcommand's, option for option. A bare `flash` is still a question
-        // answered with the help, and naming a link and a firmware is still a
-        // flash.
-        let error = parse(&["flash"]).expect_err("a flash needs a link");
+        // subcommand's, option for option. A bare `admin flash` is still a
+        // question answered with the help, and naming a link and a firmware is
+        // still a flash.
+        let error = parse(&["admin", "flash"]).expect_err("a flash needs a link");
         let help = error.to_string();
         assert!(help.contains("--device"), "{help}");
 
-        let cli = parse(&["flash", "--device", "/dev/ttyACM0", "fw.bin"])
+        let cli = parse(&["admin", "flash", "--device", "/dev/ttyACM0", "fw.bin"])
             .expect("the link and the firmware are the subcommand's");
         match cli.command {
-            Some(Commands::Flash(args)) => {
+            Some(Commands::Admin {
+                command: AdminCommands::Flash(args),
+            }) => {
                 assert_eq!(args.device.as_deref(), Some("/dev/ttyACM0"));
                 assert_eq!(
                     args.firmware.as_deref(),
                     Some(std::path::Path::new("fw.bin"))
                 );
             }
-            other => panic!("expected `flash`, got {other:?}"),
+            other => panic!("expected `admin flash`, got {other:?}"),
         }
 
         // The CAN spelling and the query shortcut travel too: the subcommand
         // is the binary's grammar, not a copy of part of it.
         let cli = parse(&[
+            "admin",
             "flash",
             "--interface",
             "can0",
@@ -574,23 +644,121 @@ mod tests {
         ])
         .expect("the CAN link is the subcommand's");
         match cli.command {
-            Some(Commands::Flash(args)) => {
+            Some(Commands::Admin {
+                command: AdminCommands::Flash(args),
+            }) => {
                 assert_eq!(args.interface.as_deref(), Some("can0"));
                 assert_eq!(args.uuid.as_deref(), Some("11aa22bb33cc"));
             }
-            other => panic!("expected `flash`, got {other:?}"),
+            other => panic!("expected `admin flash`, got {other:?}"),
         }
-        let cli = parse(&["flash", "-q", "--interface", "can0"]).expect("a query is a flash");
+        let cli =
+            parse(&["admin", "flash", "-q", "--interface", "can0"]).expect("a query is a flash");
         match cli.command {
-            Some(Commands::Flash(args)) => assert!(args.query),
-            other => panic!("expected `flash`, got {other:?}"),
+            Some(Commands::Admin {
+                command: AdminCommands::Flash(args),
+            }) => assert!(args.query),
+            other => panic!("expected `admin flash`, got {other:?}"),
         }
 
         // And the help names the options, like the other bench tools.
-        let error = parse(&["flash", "--help"]).expect_err("the help is not a flash");
+        let error = parse(&["admin", "flash", "--help"]).expect_err("the help is not a flash");
         let help = error.to_string();
         for option in ["--device", "--interface", "--uuid", "-q"] {
             assert!(help.contains(option), "{option} is missing from:\n{help}");
+        }
+    }
+
+    #[test]
+    fn test_the_configure_bridge_subcommand_is_under_admin() {
+        // A bare `admin configure-bridge` is a question (which bridge?),
+        // answered with the help.
+        let error = parse(&["admin", "configure-bridge"]).expect_err("a bridge has to be named");
+        let help = error.to_string();
+        assert!(help.contains("--bridge"), "{help}");
+        assert!(help.contains("--port-nodeid"), "{help}");
+
+        // The bridge side of the flash grammar, plus the port plan.
+        let cli = parse(&[
+            "admin",
+            "configure-bridge",
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "--port-count",
+            "2",
+        ])
+        .expect("the bridge side of the flash grammar");
+        match cli.command {
+            Some(Commands::Admin {
+                command: AdminCommands::ConfigureBridge(args),
+            }) => {
+                assert_eq!(args.bridge.as_deref(), Some("/dev/ttyUSB0"));
+                assert_eq!(args.port, Some(1));
+                assert_eq!(args.port_nodeid, Some(7));
+                assert_eq!(args.port_count, Some(2));
+            }
+            other => panic!("expected `admin configure-bridge`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_reset_subcommand_is_under_admin() {
+        // A bare `admin reset` is a question (which bridge?), answered with the
+        // help.
+        let error = parse(&["admin", "reset"]).expect_err("a bridge has to be named");
+        let help = error.to_string();
+        assert!(help.contains("--bridge"), "{help}");
+        assert!(help.contains("--port-reset"), "{help}");
+
+        // The bridge side of the flash grammar, plus the port choice.
+        let cli = parse(&[
+            "admin",
+            "reset",
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-reset",
+            "restart-device",
+        ])
+        .expect("the bridge side of the flash grammar");
+        match cli.command {
+            Some(Commands::Admin {
+                command: AdminCommands::Reset(args),
+            }) => {
+                assert_eq!(args.bridge.as_deref(), Some("/dev/ttyUSB0"));
+                assert_eq!(args.port, Some(1));
+                assert_eq!(args.port_reset.as_deref(), Some("restart-device"));
+            }
+            other => panic!("expected `admin reset`, got {other:?}"),
+        }
+
+        // Without `--port` it is the bridge itself; nothing else is required.
+        let cli = parse(&["admin", "reset", "--bridge", "/dev/ttyUSB0"])
+            .expect("the bridge alone is a reset");
+        match cli.command {
+            Some(Commands::Admin {
+                command: AdminCommands::Reset(args),
+            }) => assert!(args.port.is_none()),
+            other => panic!("expected `admin reset`, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_the_top_level_scan_and_flash_are_gone() {
+        // The two moved under `admin`, with no alias left behind. `klipperx`
+        // still has a default host whose positional is a config file, so a bare
+        // `scan` (or `flash`) is read as that config file, not as a subcommand:
+        // what the move has to guarantee is that no `admin` subcommand answers
+        // to the old top-level spelling.
+        for name in ["scan", "flash"] {
+            let cli = parse(&[name]).expect("the default host takes it as a config file");
+            assert!(cli.command.is_none(), "{name} is not a subcommand any more");
+            assert_eq!(cli.host.host.config_file.as_deref(), Some(name));
         }
     }
 }

@@ -65,7 +65,7 @@ use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::interface::devices::host::HostDevice;
-use crate::core::klippy::interface::devices::serial::{self, MUX_PORT_UNITS};
+use crate::core::klippy::interface::devices::serial::{self, PortCarrier};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::printer::Printer;
 use std::path::Path;
@@ -103,8 +103,13 @@ pub(crate) struct BridgePortLink {
     pub index: u8,
     /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port
     /// ([`PortGroups::is_legacy`], one uart-port device with no `uuid:`), whose
-    /// device is spoken to in raw frames; [`MUX_PORT_UNITS`] for a port whose
-    /// device speaks units — every port but a legacy one, CAN included.
+    /// device is spoken to in raw frames; otherwise the port's carrier bits
+    /// ([`PortCarrier::flags`]) —
+    /// [`MUX_PORT_UNITS`](crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS)
+    /// for a port whose device
+    /// speaks units (every port but a legacy one, CAN included), plus
+    /// [`serial::MUX_PORT_ISOTP`](crate::core::klippy::interface::devices::serial::MUX_PORT_ISOTP)
+    /// when the port's carrier is ISO-TP (`[can_device] can_protocol: isotp`).
     pub flags: u8,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
     /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`): a
@@ -165,8 +170,9 @@ pub(crate) fn resolve(
     // configuration time (`mcu/bridge_ports.rs`): its declaration order among
     // the bridge's ports, which is the index the firmware's router gave it. A
     // uart and a can port answer the same question, so each section object is
-    // read for its own two answers.
-    let (bridge, index) = match *kind {
+    // read for its own two answers — plus, for a CAN port, the carrier its
+    // device's units travel over (`can_protocol:`).
+    let (bridge, index, carrier) = match *kind {
         PortKind::Uart => {
             let section = printer.lookup_object_as::<UartPort>(port).ok_or_else(|| {
                 config_error(format!("MCU '{}': no port section '{port}'", config.name))
@@ -174,7 +180,9 @@ pub(crate) fn resolve(
             let index = section
                 .index()
                 .ok_or_else(|| not_configured(config, port))?;
-            (section.mcu().to_string(), index)
+            // A UART port speaks slices and nothing else: ISO-TP is a CAN
+            // carrier, and the section has no option to say otherwise.
+            (section.mcu().to_string(), index, PortCarrier::Cans)
         }
         PortKind::Can => {
             let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
@@ -183,7 +191,7 @@ pub(crate) fn resolve(
             let index = section
                 .index()
                 .ok_or_else(|| not_configured(config, port))?;
-            (section.mcu().to_string(), index)
+            (section.mcu().to_string(), index, section.protocol())
         }
     };
 
@@ -224,7 +232,7 @@ pub(crate) fn resolve(
                 config.name
             ))
         })?;
-    let flags = port_flags(&groups, port);
+    let flags = port_flags(&groups, port, carrier);
     Ok(BridgePortLink {
         transport: bridge_config.transport,
         index,
@@ -498,23 +506,23 @@ pub(crate) fn open(
 ///
 /// A legacy port's device does not speak the mux, so the bridge strips the
 /// header going down and heads a raw frame coming up (`0`); every other port's
-/// device speaks units, which the bridge must know ([`MUX_PORT_UNITS`]). The
-/// judgment is the port grouping's ([`PortGroups::is_legacy`]) — the same one
-/// that refused a legacy device on a shared port at load — and `0` is exactly
-/// its byte, so the caller has no second answer to keep.
+/// device speaks units, which the bridge must know
+/// ([`serial::MUX_PORT_UNITS`]), and on
+/// a port that says so, ISO-TP rather than slices ([`PortCarrier::flags`], the
+/// one place that byte's bits are assembled). The legacy judgment is the port
+/// grouping's ([`PortGroups::is_legacy`]) — the same one that refused a legacy
+/// device on a shared port at load — and `0` is exactly its byte, so the caller
+/// has no second answer to keep.
 ///
 /// A CAN port is never legacy, whatever its member wrote: CAN addressing is by
-/// uuid, so a `[can_device]` has no raw-frame shape at all and its byte is
-/// always [`MUX_PORT_UNITS`].
-fn port_flags(groups: &PortGroups, port: &str) -> u8 {
-    if groups.kind(port) == Some(PortKind::Can) {
-        return MUX_PORT_UNITS;
+/// uuid, so a `[can_device]` has no raw-frame shape at all. Its byte is
+/// therefore `carrier`'s — [`serial::MUX_PORT_UNITS`] for `can_protocol: cans` (the
+/// default) and both bits for `isotp`.
+fn port_flags(groups: &PortGroups, port: &str, carrier: PortCarrier) -> u8 {
+    if groups.kind(port) != Some(PortKind::Can) && groups.is_legacy(port) {
+        return 0;
     }
-    if groups.is_legacy(port) {
-        0
-    } else {
-        MUX_PORT_UNITS
-    }
+    carrier.flags()
 }
 
 /// The refusal a port section that the loader never wired gives [`resolve`]:
@@ -664,6 +672,8 @@ pub(crate) fn wait_for_mux_library_unload(path: &std::path::Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
 
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::{Config, ConfigWrapper};
@@ -912,7 +922,7 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let flags = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0", PortCarrier::Cans);
 
         assert_eq!(flags, 0);
     }
@@ -928,7 +938,7 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let flags = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0", PortCarrier::Cans);
 
         assert_eq!(flags, MUX_PORT_UNITS);
     }
@@ -1794,14 +1804,15 @@ mod tests {
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
         );
 
-        let flags = port_flags(&groups, "uart_device uart0");
+        let flags = port_flags(&groups, "uart_device uart0", PortCarrier::Cans);
 
         assert_eq!(flags, MUX_PORT_UNITS);
     }
 
-    /// A CAN port's flags byte is **always** the units one: a `[can_device]` has
-    /// no legacy (raw-frame) shape — the branch does not look at the member's
-    /// `uuid:` at all, it asks the port's kind.
+    /// A CAN port's flags byte is **always** the units one — or the units one
+    /// plus the ISO-TP bit when its `can_protocol:` says so: a `[can_device]`
+    /// has no legacy (raw-frame) shape, so the branch never looks at the
+    /// member's `uuid:` and always carries a carrier.
     #[test]
     fn a_can_port_always_sends_the_units_flag() {
         let groups = port_groups(
@@ -1815,7 +1826,14 @@ mod tests {
             !groups.is_legacy("can_device can0"),
             "a CAN port is never legacy"
         );
-        assert_eq!(port_flags(&groups, "can_device can0"), MUX_PORT_UNITS);
+        assert_eq!(
+            port_flags(&groups, "can_device can0", PortCarrier::Cans),
+            MUX_PORT_UNITS
+        );
+        assert_eq!(
+            port_flags(&groups, "can_device can0", PortCarrier::Isotp),
+            MUX_PORT_UNITS | serial::MUX_PORT_ISOTP
+        );
     }
 
     /// The order `open` exists for, over a real serial link on a pty: the

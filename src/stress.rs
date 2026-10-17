@@ -275,9 +275,10 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     // the one session its link needs.
     let mut boards: Vec<OpenedBoard> = Vec::new();
     let mut hosts: Vec<(String, Arc<BridgeHost>)> = Vec::new();
+    let allocator = run_allocator(&config)?;
     let mut failures: Vec<String> = Vec::new();
     for name in &names {
-        match open_board(&config, &mut hosts, name, args.task).await {
+        match open_board(&config, &mut hosts, &allocator, name, args.task).await {
             Ok(board) => {
                 println!(
                     "{}",
@@ -1103,7 +1104,11 @@ impl BridgeHost {
     /// (`[mcu]` is an `early` section; port sections come with the generic walk)
     /// and the order a port needs, because wiring one queues its commands on the
     /// bridge's builder (`mcu/bridge_ports.rs::wire_bridge_port`).
-    fn load(config: &Config, bridge: &str) -> Result<Self, String> {
+    ///
+    /// `allocator` is the **run's** (`run_allocator`), registered on this host's
+    /// printer before the bridge loads so the bridge and its ports' devices take
+    /// their ids from the same sequence as every other board the run opens.
+    fn load(config: &Config, bridge: &str, allocator: &Arc<ids::McuIds>) -> Result<Self, String> {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
         // `McuObject::new` expects the pin registry the loader registers before
         // any section; nothing here resolves a pin, but the object is built the
@@ -1111,6 +1116,13 @@ impl BridgeHost {
         printer
             .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
             .map_err(|err| format!("pins: {err}"))?;
+        // The run's allocator, so the ids this bridge and its ports take are
+        // drawn from the same sequence as the boards opened beside them — a
+        // `[mcu]` on the same CAN bus must not be handed one of their ids.
+        let shared: Arc<dyn PrinterObject> = Arc::<ids::McuIds>::clone(allocator);
+        printer
+            .add_object(ids::MCU_IDS_OBJECT, shared)
+            .map_err(|err| format!("mcu_ids: {err}"))?;
         let section = find_mcu_section(config, bridge).ok_or_else(|| {
             if bridge == "mcu" {
                 "no [mcu] section".to_string()
@@ -1178,9 +1190,15 @@ impl BridgeHost {
 fn bridge_host(
     config: &Config,
     hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    allocator: &Arc<ids::McuIds>,
     mcu_config: &McuConfig,
 ) -> Result<Arc<BridgeHost>, String> {
-    host_of_bridge(config, hosts, &bridge_of_port(config, mcu_config)?)
+    host_of_bridge(
+        config,
+        hosts,
+        allocator,
+        &bridge_of_port(config, mcu_config)?,
+    )
 }
 
 /// The run's host for the `[mcu]` section of `bridge`, loaded once per run.
@@ -1193,14 +1211,66 @@ fn bridge_host(
 fn host_of_bridge(
     config: &Config,
     hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    allocator: &Arc<ids::McuIds>,
     bridge: &str,
 ) -> Result<Arc<BridgeHost>, String> {
     if let Some((_, host)) = hosts.iter().find(|(name, _)| name == bridge) {
         return Ok(Arc::clone(host));
     }
-    let host = Arc::new(BridgeHost::load(config, bridge)?);
+    let host = Arc::new(BridgeHost::load(config, bridge, allocator)?);
     hosts.push((bridge.to_string(), Arc::clone(&host)));
     Ok(host)
+}
+
+/// The run's MCU id allocator: production's single sequence (`mcu/ids.rs`),
+/// one per run, with every explicit `canbus_nodeid` in the config reserved
+/// first.
+///
+/// A stress run parses `[mcu]` sections itself instead of loading them
+/// (`resolve_mcu`), so the allocator the loader would have filled in is the
+/// run's to make — and it has to be **one** allocator: a direct CAN board, a
+/// bridge's own board, and the board behind one of its ports all end up on the
+/// same bus, so an id one of them takes is taken for the others
+/// ([`assign_can_id`], [`BridgeHost::load`], [`assign_id`]).
+///
+/// Reserving the written ids first is what the loader does before a section
+/// registers (`mcu/object.rs::load_config`): an auto id then steps over them, so
+/// a `[mcu]` that writes `canbus_nodeid: 5` keeps 5 wherever it sits in the
+/// file.
+fn run_allocator(config: &Config) -> Result<Arc<ids::McuIds>, String> {
+    let printer = Arc::new(Printer::new(ManualReactor::shared()));
+    let allocator = ids::ensure(&printer).map_err(|err| err.to_string())?;
+    if let Some(section) = config.sections().find(|section| section.id == "mcu") {
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, config);
+        allocator.reserve_explicit(&wrapper);
+    }
+    Ok(allocator)
+}
+
+/// Give a board opened on a **CAN family** transport the node id its link is
+/// addressed by, from the run's allocator.
+///
+/// A `[mcu]` section on a CAN bus names its board by `uuid:`; the node id is the
+/// allocator's, which production's loader fills in when it loads the section
+/// (`mcu/object.rs::load_config` registers it, `Transport::open` then refuses to
+/// open without it). A stress run never loads the section it drives, so the
+/// registration is made here — on the run's single allocator, so the id cannot
+/// be one a bridge's port took.
+///
+/// A written `canbus_nodeid` is the board's own answer and is kept: the same
+/// `register_can` call claims it, so an id two sections both claim is still the
+/// allocator's error to report (`mcu/ids.rs`). Every other transport is left
+/// alone — this is the CAN link's own requirement.
+fn assign_can_id(allocator: &ids::McuIds, mcu_config: &mut McuConfig) -> Result<(), String> {
+    let uuid = match &mcu_config.transport {
+        Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => *uuid,
+        _ => return Ok(()),
+    };
+    let id = allocator
+        .register_can(&mcu_config.name, uuid, mcu_config.id)
+        .map_err(|err| err.to_string())?;
+    mcu_config.id = Some(id);
+    Ok(())
 }
 
 /// The id a bridge-port device's session is addressed by, from the bridge
@@ -1331,6 +1401,10 @@ impl BoardLink {
 
 /// Open one selected board's session, whichever of the three kinds it is.
 ///
+/// `allocator` is the run's (`run_allocator`): a direct CAN board takes its node
+/// id from it here, and a bridge host registers it so its ports' devices take
+/// theirs from the same sequence.
+///
 /// A bridge is opened two ways, because the two tasks use the firmware
 /// differently:
 ///
@@ -1350,12 +1424,20 @@ impl BoardLink {
 async fn open_board(
     config: &Config,
     hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    allocator: &Arc<ids::McuIds>,
     name: &str,
     task: Task,
 ) -> Result<OpenedBoard, String> {
     let mcu_config = resolve_mcu(config, name)?;
     match connection_of(config, &mcu_config) {
         Connection::Direct => {
+            // A CAN board's node id is the allocator's, and a run that parsed
+            // the section itself has to make the registration the loader would
+            // have made (`assign_can_id`). The config kept on the board carries
+            // it, so a reopened session after a `reset` is addressed by the same
+            // id.
+            let mut mcu_config = mcu_config;
+            assign_can_id(allocator, &mut mcu_config)?;
             let mcu = connect(&mcu_config).await.map_err(|err| err.to_string())?;
             Ok(OpenedBoard {
                 mcu_config,
@@ -1364,7 +1446,7 @@ async fn open_board(
             })
         }
         Connection::BridgePort => {
-            let host = bridge_host(config, hosts, &mcu_config)?;
+            let host = bridge_host(config, hosts, allocator, &mcu_config)?;
             let mcu = connect_bridged(&host, &mcu_config)
                 .await
                 .map_err(|err| err.to_string())?;
@@ -1375,7 +1457,7 @@ async fn open_board(
             })
         }
         Connection::Bridge => {
-            let host = host_of_bridge(config, hosts, &mcu_config.name)?;
+            let host = host_of_bridge(config, hosts, allocator, &mcu_config.name)?;
             // The bridge's configuration as production parsed it: the same
             // section parse `resolve_mcu` makes, plus the load-time decisions
             // only the whole config can make — the id the allocator handed out,
@@ -2807,6 +2889,36 @@ mod tests {
         Config::from_text(&text).expect("a bridge config parses").0
     }
 
+    /// The identity the CAN fixture's direct board writes, one spelling for the
+    /// config text and the assertions.
+    const DIRECT_UUID: [u8; 6] = [0x44, 0xdd, 0x55, 0xee, 0x66, 0xff];
+
+    /// A bridge with a **CAN** device on one of its ports, beside a board on the
+    /// bus **directly** — the shape where the two kinds of CAN board share one
+    /// bus, and therefore one id sequence.
+    ///
+    /// `direct_nodeid` is what the direct section writes as `canbus_nodeid`:
+    /// `None` is the config a user has — the board names its `uuid` and the
+    /// allocator decides the id.
+    fn can_bus_config(direct_nodeid: Option<u32>) -> Config {
+        let dict = klipperx_test_support::test_dicts_dir().join("linuxprocess-bridge.dict");
+        let nodeid = direct_nodeid
+            .map(|id| format!("canbus_nodeid: {id}\n"))
+            .unwrap_or_default();
+        let text = format!(
+            "[mcu bridge]\ntest: dict={}\n\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\n\
+             [mcu direct]\nuuid: {}\ncanbus_interface: can1\n{nodeid}",
+            dict.display(),
+            DIRECT_UUID
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        Config::from_text(&text).expect("a CAN bus config parses").0
+    }
+
     /// The identity the serial fixture's bridge writes, one spelling for the
     /// config text and the assertions.
     const BRIDGE_UUID: [u8; 6] = [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f];
@@ -2832,6 +2944,74 @@ mod tests {
             .0
     }
 
+    /// A `[mcu]` on a CAN bus names its board by `uuid`; the node id it is
+    /// addressed by is the allocator's, and a stress run that parses the section
+    /// itself has to ask for one — otherwise `Transport::open` refuses the link
+    /// ("canbus: the MCU id has not been assigned"), which is what made a
+    /// `canbus_interface: can0` board need a hand-written `canbus_nodeid`.
+    #[test]
+    fn a_can_board_without_a_nodeid_takes_one_from_the_runs_allocator() {
+        let config = can_bus_config(None);
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let mut direct = resolve_mcu(&config, "direct").expect("the board resolves");
+        assert_eq!(direct.id, None, "parsing keeps only a written nodeid");
+        assert!(
+            matches!(direct.transport, Transport::Can { .. }),
+            "the fixture's board is on the bus directly, got {:?}",
+            direct.transport
+        );
+        // The gap the fix closes, said by the transport itself: no id, no link.
+        let err = direct
+            .open()
+            .expect_err("a CAN link needs an id to address");
+        assert!(err.contains("has not been assigned"), "{err}");
+
+        assign_can_id(&allocator, &mut direct).expect("the allocator hands one out");
+        assert_eq!(
+            direct.id,
+            Some(4),
+            "the first id in the sequence (`NODEID_FIRST`)"
+        );
+    }
+
+    /// A written `canbus_nodeid` is the board's answer, not a guess to replace:
+    /// it is kept, and the auto sequence steps over it for every other board.
+    #[test]
+    fn a_written_canbus_nodeid_is_kept() {
+        let config = can_bus_config(Some(7));
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let mut direct = resolve_mcu(&config, "direct").expect("the board resolves");
+        assert_eq!(direct.id, Some(7), "parsing keeps the written id");
+        assign_can_id(&allocator, &mut direct).expect("the claim is registered");
+        assert_eq!(direct.id, Some(7), "the allocator does not second-guess it");
+
+        // Everything else on the bus steps over 7: the bridge takes 4, the CAN
+        // device behind its port 5.
+        let host = BridgeHost::load(&config, "bridge", &allocator).expect("the bridge host loads");
+        assert_eq!(host.bridge.id(), Some(4));
+        let child = resolve_mcu(&config, "child").expect("the port's device resolves");
+        assert_eq!(assign_id(&host, &child), Ok(5));
+    }
+
+    /// One id sequence for the whole bus: a bridge's own board, the CAN device
+    /// behind one of its ports, and a board on the bus **directly** never land on
+    /// the same node id — the collision two allocators would have produced.
+    #[test]
+    fn can_boards_on_one_bus_take_distinct_ids() {
+        let config = can_bus_config(None);
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let host = BridgeHost::load(&config, "bridge", &allocator).expect("the bridge host loads");
+        let child = resolve_mcu(&config, "child").expect("the port's device resolves");
+        let child_id = assign_id(&host, &child).expect("the port's device takes an id");
+        let mut direct = resolve_mcu(&config, "direct").expect("the board resolves");
+        assign_can_id(&allocator, &mut direct).expect("its id comes from the same sequence");
+        let direct_id = direct.id.expect("the board was given one");
+
+        assert_eq!(host.bridge.id(), Some(4), "the bridge first, as it loads");
+        assert_eq!(child_id, 5, "then the device behind its port");
+        assert_eq!(direct_id, 6, "then the board opened beside them");
+    }
+
     /// A bridge's own `[mcu]` section carries the load-time decisions that make
     /// its link openable: the baud of an id-addressed serial path, the board's
     /// `uuid`, and the id its session is addressed by.
@@ -2846,7 +3026,9 @@ mod tests {
     #[test]
     fn the_bridges_own_configuration_is_stamped_as_an_id_addressed_link() {
         let config = serial_bridge_config();
-        let host = BridgeHost::load(&config, "bridge").expect("the serial bridge host loads");
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let host =
+            BridgeHost::load(&config, "bridge", &allocator).expect("the serial bridge host loads");
         assert_eq!(
             host.bridge.shared_baud(),
             Some(500_000),
@@ -2955,7 +3137,8 @@ mod tests {
         use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
 
         let config = bridge_config();
-        let host = BridgeHost::load(&config, "bridge").expect("the bridge host loads");
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let host = BridgeHost::load(&config, "bridge", &allocator).expect("the bridge host loads");
         for (port, index) in [("uart_device uart0", 0u8), ("uart_device uart1", 1)] {
             let loaded = host
                 .printer
@@ -3058,7 +3241,8 @@ mod tests {
     async fn under_comm_the_bridge_and_its_ports_devices_share_one_session() {
         let config = bridge_config();
         let mut hosts = Vec::new();
-        let board = open_board(&config, &mut hosts, "bridge", Task::Comm)
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let board = open_board(&config, &mut hosts, &allocator, "bridge", Task::Comm)
             .await
             .expect("the bridge comes up");
         assert_eq!(hosts.len(), 1, "one host per bridge");
@@ -3081,7 +3265,7 @@ mod tests {
         // session: no second one, no second bridge session (`serial::attach`
         // registers a slot per id, and two ids on one bridge is not a shape the
         // mux has). The fixture's `test:` bridge is what stops the attach here.
-        let err = match open_board(&config, &mut hosts, "child", Task::Comm).await {
+        let err = match open_board(&config, &mut hosts, &allocator, "child", Task::Comm).await {
             Err(err) => err,
             Ok(_) => panic!("a test: bridge carries no downstream device"),
         };
@@ -3099,7 +3283,8 @@ mod tests {
 
         let config = bridge_config();
         let mut hosts = Vec::new();
-        let board = open_board(&config, &mut hosts, "bridge", Task::Comm)
+        let allocator = run_allocator(&config).expect("the run's allocator");
+        let board = open_board(&config, &mut hosts, &allocator, "bridge", Task::Comm)
             .await
             .expect("the bridge comes up");
         let args = Cli::try_parse_from([
@@ -3130,7 +3315,8 @@ mod tests {
         for task in [Task::Step, Task::Motion] {
             let config = bridge_config();
             let mut hosts = Vec::new();
-            let board = open_board(&config, &mut hosts, "bridge", task)
+            let allocator = run_allocator(&config).expect("the run's allocator");
+            let board = open_board(&config, &mut hosts, &allocator, "bridge", task)
                 .await
                 .unwrap_or_else(|err| panic!("{task:?}: {err}"));
             let host = Arc::clone(&hosts[0].1);

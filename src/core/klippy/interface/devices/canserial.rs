@@ -61,8 +61,8 @@ use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
     admin_unit, encode_header, request_bootloader_unit, set_port_node_id, tunnel_block,
-    TunnelRegistry, TunnelSink, UnitStream, CMD_RESET_PORT, CMD_RESTART_DEVICE,
-    CMD_SET_PORT_TUNNEL,
+    TunnelRegistry, TunnelSink, UnitStream, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+    CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -410,6 +410,27 @@ impl CanSerialLink {
 pub fn query_unassigned_frame() -> CanFrame {
     CanFrame::new(ADMIN_ID, &[CMD_QUERY_UNASSIGNED])
         .expect("the query is one byte, which fits in a CAN frame")
+}
+
+/// The admin frame that asks the board with `uuid` to leave its application and
+/// park in its bootloader.
+///
+/// The request byte, then the UUID most significant byte first — the seven data
+/// bytes `cansend can0 3f0#02<uuid>` writes, and the only shape the device side
+/// acts on (`can_process_request_bootloader` refuses a frame shorter than seven
+/// bytes and one whose bytes 1..7 are another board's UUID,
+/// `src/generic/canserial.c`). It is addressed to no node: the board still runs
+/// an application whose node id it is about to lose, so the bus broadcast is
+/// what reaches it — the same frame `scripts/flash_can.py`'s `_jump_to_bootloader`
+/// sends.
+///
+/// Nothing answers this: a board that took the request stops answering the id it
+/// had, which is what the caller is waiting for.
+pub fn request_bootloader_frame(uuid: [u8; 6]) -> CanFrame {
+    let mut data = [0u8; 7];
+    data[0] = CMD_REQUEST_BOOTLOADER;
+    data[1..].copy_from_slice(&uuid);
+    CanFrame::new(ADMIN_ID, &data).expect("the request is seven bytes, which fits in a CAN frame")
 }
 
 /// One board's answer to [`query_unassigned_frame`]: the UUID it is remembered
@@ -1664,6 +1685,29 @@ mod tests {
         assert_eq!(abi[4], 1, "one data byte");
         assert_eq!(&abi[8..9], [0x00]);
         assert_eq!(&abi[9..], [0; CAN_DATA_BYTES - 1], "no padding is sent");
+    }
+
+    #[test]
+    fn test_the_request_bootloader_frame_is_the_admin_broadcast() {
+        // `scripts/flash_can.py::_jump_to_bootloader`: the admin id with the
+        // request byte and the board's UUID, most significant byte first — the
+        // bytes `cansend can0 3f0#02<uuid>` writes.
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let frame = request_bootloader_frame(uuid);
+        assert_eq!(frame.id(), ADMIN_ID);
+        assert_eq!(frame.data(), [0x02, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]);
+
+        // The literal the task's manual work used: `3f0#02` then the uuid.
+        let raw = frame.to_abi(CanWire::Classical).unwrap();
+        let abi = raw.as_bytes();
+        assert_eq!(u32::from_ne_bytes([abi[0], abi[1], abi[2], abi[3]]), 0x3f0);
+        assert_eq!(abi[4], 7, "seven data bytes, which is the device's minimum");
+        assert_eq!(
+            &abi[8..15],
+            [0x02, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            "the request byte, then the uuid"
+        );
+        assert_eq!(&abi[15..], [0; 1], "no padding is sent");
     }
 
     #[test]

@@ -89,6 +89,14 @@ pub const IDENTIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// (`BRIDGE_MAX_PORTS` is 8), so this index always means the bridge.
 const RESTART_DEVICE_TO_BRIDGE: u8 = 0xFF;
 
+/// The same index for the **bootloader** request
+/// ([`BridgeLink::reset_to_bootloader`]): `REQUEST_BOOTLOADER [0x02][index]`
+/// takes the arm `RESTART_DEVICE` does, so an index naming no port reaches the
+/// bridge's own device half (`mux.c`: `mux_process_request_bootloader` →
+/// `bootloader_request`), which leaves the firmware parked in katapult instead
+/// of restarting it.
+const REQUEST_BOOTLOADER_TO_BRIDGE: u8 = 0xFF;
+
 /// How long a restarted bridge may take to answer again before a run gives up.
 const RESET_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -547,6 +555,33 @@ impl BridgeLink {
         let fresh = self.reopen().await?;
         self.live = Some(fresh);
         self.watch_shutdown();
+        Ok(())
+    }
+
+    /// Park the **bridge itself** in its bootloader, so `flash --device` can
+    /// write the bridge's own firmware.
+    ///
+    /// The command is the device half's `REQUEST_BOOTLOADER [0x02][0xFF]`
+    /// ([`REQUEST_BOOTLOADER_TO_BRIDGE`]) rather than a restart, and nothing is
+    /// reopened: the application is what answered, so its tty is gone once the
+    /// bootloader has the board - katapult enumerates under its own identity
+    /// (`usb-katapult_<mcu>_<serial>`), which is the path `flash --device`
+    /// takes.
+    ///
+    /// A host library has no bootloader to park in, and says so.
+    pub async fn reset_to_bootloader(&mut self) -> Result<(), BridgeFlashError> {
+        if matches!(self.open, BridgeOpen::Host { .. }) {
+            return Err(BridgeFlashError::Reset(
+                "a host library has no bootloader: only a board's own firmware can enter one"
+                    .into(),
+            ));
+        }
+        self.live()
+            .link
+            .send_request_bootloader(REQUEST_BOOTLOADER_TO_BRIDGE)
+            .map_err(|e| {
+                BridgeFlashError::Reset(format!("sending the bootloader request failed: {e}"))
+            })?;
         Ok(())
     }
 

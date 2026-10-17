@@ -350,6 +350,15 @@ pub struct ResetArgs {
     /// bootloader), default `reset-port`
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
+
+    /// Park the **bridge itself** in its bootloader instead of restarting its
+    /// firmware (`--bridge` only; takes no `--port`)
+    ///
+    /// The board leaves the application, so its tty changes: katapult enumerates
+    /// as `usb-katapult_<mcu>_<serial>`, which is what `admin flash --device`
+    /// writes. A host library has no bootloader, and says so.
+    #[arg(long)]
+    pub bootloader: bool,
 }
 
 /// What a `reset` command line asks to reset.
@@ -357,6 +366,10 @@ pub struct ResetArgs {
 pub enum ResetTarget {
     /// The bridge itself, through its own admin channel.
     Bridge,
+    /// The bridge itself, into its bootloader: the same admin channel, with the
+    /// device half's `REQUEST_BOOTLOADER` instead of a restart, so the board
+    /// parks in katapult and `flash --device` can write it.
+    BridgeBootloader,
     /// A declared port's device, the way `reset` says.
     Port {
         /// The port index the device sits behind.
@@ -723,8 +736,23 @@ pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
         &args.port_tty,
     )?;
     let baud = args.baud.unwrap_or(DEFAULT_BAUD);
-    let target = match args.port {
-        None => {
+    let target = match (args.port, args.bootloader) {
+        (Some(_), true) => {
+            return Err("--bootloader resets the bridge itself; it takes no --port".into())
+        }
+        (None, true) => {
+            if args.port_reset.is_some() {
+                return Err("--bootloader and --port-reset name two different things: \
+                            the first parks the bridge in its bootloader, the second \
+                            only applies to --port"
+                    .into());
+            }
+            if args.bridge_library.is_some() {
+                return Err("--bootloader needs a board: a host library has no bootloader".into());
+            }
+            ResetTarget::BridgeBootloader
+        }
+        (None, false) => {
             if args.port_reset.is_some() {
                 return Err(
                     "--port-reset needs --port: without one the bridge itself is reset".into(),
@@ -732,7 +760,7 @@ pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
             }
             ResetTarget::Bridge
         }
-        Some(index) => ResetTarget::Port {
+        (Some(index), false) => ResetTarget::Port {
             index,
             reset: parse_port_reset(args.port_reset.as_deref())?,
         },
@@ -1214,6 +1242,10 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
                 link.reset().await?;
                 report_reset_bridge(&plan.source);
             }
+            ResetTarget::BridgeBootloader => {
+                link.reset_to_bootloader().await?;
+                report_reset_bridge_bootloader();
+            }
             ResetTarget::Port { index, reset } => {
                 link.reset_port(index, reset)?;
                 report_reset_port(index, reset);
@@ -1235,6 +1267,16 @@ fn report_reset_bridge(source: &BridgeLinkSource) {
             println!("reset: bridge (host library, restart is a no-op)")
         }
     }
+}
+
+/// The last word of a bridge-to-bootloader reset: the request went out with no
+/// receipt (the same silence every reset keeps), and the board is what answers
+/// on its katapult identity from here on.
+fn report_reset_bridge_bootloader() {
+    println!(
+        "reset: bridge (into its bootloader; write it with `admin flash --device \
+         <its usb-katapult_… tty>`)"
+    );
 }
 
 /// The last word of a port-device reset: the admin unit went out, with no
@@ -2312,6 +2354,44 @@ mod tests {
     fn planned_reset(args: &[&str]) -> Result<ResetPlan, String> {
         let args = parse_reset(args).expect("a command line clap accepted");
         plan_reset(&args)
+    }
+
+    /// `--bootloader` parks the bridge itself in katapult, which is the state
+    /// `admin flash --device` writes it from: the same admin channel as the
+    /// restart, with the device half's request instead.
+    #[test]
+    fn test_a_reset_plan_for_the_bridge_into_its_bootloader() {
+        let plan = planned_reset(&["--bridge", "/dev/ttyUSB0", "--bootloader"])
+            .expect("a bridge bootloader plan");
+        assert_eq!(plan.target, ResetTarget::BridgeBootloader);
+    }
+
+    /// The three ways `--bootloader` can be asked for the wrong thing: a port's
+    /// reset method, a port index, and a host library (which has no
+    /// bootloader). Each is named where the mistake is made.
+    #[test]
+    fn test_a_bootloader_reset_refuses_the_things_it_is_not() {
+        let err = planned_reset(&["--bridge", "/dev/ttyUSB0", "--bootloader", "--port", "0"])
+            .expect_err("a port index with --bootloader");
+        assert!(err.contains("takes no --port"), "{err}");
+
+        let err = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bootloader",
+            "--port-reset",
+            "bootloader",
+        ])
+        .expect_err("a port reset method with --bootloader");
+        assert!(err.contains("--bootloader and --port-reset"), "{err}");
+
+        let err = planned_reset(&[
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+            "--bootloader",
+        ])
+        .expect_err("a host library has no bootloader");
+        assert!(err.contains("has no bootloader"), "{err}");
     }
 
     /// No `--port` means the bridge itself: the self-restart the flash run does

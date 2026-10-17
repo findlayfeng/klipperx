@@ -8,11 +8,14 @@
 //! stream at — the firmware reports neither, because the host creates the port
 //! at configuration time instead: [`load_uart_device`] queues the
 //! `config_uart` / `config_bridge_port` pair on the bridge's builder and takes
-//! the port's **index** (its declaration order among the bridge's ports) from
-//! the bridge — the same number `config_uart` travels with, and the same one
-//! the host names the port's tty with. [`load_can_device`] does the same for a
-//! CAN port, with `config_can` in place of `config_uart`; a CAN port has no tty,
-//! so none of the `uart_path` reading applies to it. Both kinds share **one**
+//! the port's **index** (its declaration order among the bridge's ports) and its
+//! **UART slot** (which UART of the bridge it is — the number `config_uart`
+//! travels with, and the same one the host names the port's tty with) from the
+//! bridge. [`load_can_device`] does the same for a
+//! CAN port, with `config_can` in place of `config_uart`; a CAN port has no tty
+//! and no slot of its own, so none of the `uart_path` reading applies to it and
+//! the slot it sends is its index, as a placeholder the firmware ignores. Both
+//! kinds share **one**
 //! port table per bridge and one index counter, and the order that number counts
 //! is the loader's section order — `can_device` sections before `uart_device`
 //! ones at the same `order` value (`load.rs`'s table), declaration order within
@@ -99,8 +102,9 @@ pub struct UartPort {
     /// the config writes one.
     restart_method: Option<McuRestartMethod>,
     /// The port's index on its bridge: its declaration order among the bridge's
-    /// ports, which is what the port-level `SET_PORT_NODEID` travels with — and
-    /// the slot `config_uart` carries.
+    /// ports, which is what the port-level `SET_PORT_NODEID` travels with. The
+    /// slot `config_uart` carries is a different number — the port's UART slot
+    /// (`McuObject::next_bridge_uart_slot`).
     ///
     /// `None` until the loader's factory has wired the port to its bridge
     /// ([`load_uart_device`], which queues the `config_uart` /
@@ -244,9 +248,10 @@ pub struct CanPort {
     /// The bus rate the firmware opens the port's CAN controller at.
     bitrate: u32,
     /// The port's index on its bridge — its declaration order among the
-    /// bridge's ports, which is what the port-level `SET_PORT_NODEID` travels
-    /// with — and the slot `config_can` carries ([`UartPort::index`]'s meaning:
-    /// `None` for a section parsed outside the loader).
+    /// bridge's ports, which is what the port-level `SET_PORT_NODEID` carries
+    /// and what `config_can` sends as a slot placeholder the firmware ignores
+    /// (a CAN port names no UART slot). `None` for a section parsed outside the
+    /// loader.
     index: Option<u8>,
 }
 
@@ -353,17 +358,24 @@ pub fn load_can_device(
 /// The firmware has no port of its own to report: the host creates it. So this
 /// queues the pair `cmd::uart` defines on the **bridge's** builder, in order —
 /// `config_uart` creates the byte stream at the section's rate (`250000` when
-/// the section wrote none) on the port's slot, and `config_bridge_port` hands it
-/// to the router as a downstream port — and takes the next port index from the
-/// bridge. Both commands and the index have to agree: the bridge numbers ports
-/// by the order its `config_bridge_port` commands arrive, so the
+/// the section wrote none) on the port's **UART slot**, and `config_bridge_port`
+/// hands it to the router as a downstream port — and takes the next port index
+/// from the bridge. Both commands and the index have to agree: the bridge
+/// numbers ports by the order its `config_bridge_port` commands arrive, so the
 /// section-declaration order the loader calls this in is the port's index.
 ///
-/// The index is also the **slot** the port's tty was named with, so the two are
-/// one number rather than two counters: `config_uart` carries it, and a
-/// host-library bridge is told `(slot, uart_path)` before the library comes up
-/// ([`McuObject::add_host_port_path`], read back by
-/// `McuObject::connect`).
+/// The slot and the index are **two numbers**: the index counts every port on
+/// the bridge, CAN ones included, while the slot says which UART of the bridge
+/// this port is (`McuObject::next_bridge_uart_slot`). The firmware opens a USART
+/// by the slot `config_uart` carries and knows nothing of the index
+/// (`third_party/klipper/src/stm32/bridge_port.c`), so a `[can_device]` declared
+/// before this section moves the index but not the slot — sending the index as
+/// the slot would hand the port another USART, with no error to show for it.
+///
+/// A host-library bridge is told `(slot, uart_path)` before the library comes up
+/// ([`McuObject::add_host_port_path`], read back by `McuObject::connect`), and
+/// that slot is this same UART slot: the library registers the tty under it and
+/// the firmware later looks the tty up by `config_uart`'s slot.
 ///
 /// The `[mcu]` a port named is a config-section existence check in
 /// [`require_mcu`]; [`bridge_object`] is the next step — the builder the
@@ -399,20 +411,25 @@ fn wire_bridge_port(
     let port_oid = builder
         .create_oid()
         .map_err(|err| cannot_take(config, &bridge_name, err))?;
-    // The port's index is its declaration order among the bridge's ports
-    // (`McuObject::next_bridge_port_index`); it is taken before the commands are
-    // queued because `config_uart` carries it as the port's slot.
+    // The port's index is its declaration order among the bridge's ports,
+    // CAN ones included (`McuObject::next_bridge_port_index`), and its slot is
+    // which UART of the bridge it is (`McuObject::next_bridge_uart_slot`). Both
+    // are taken before the commands are queued: `config_uart` carries the slot
+    // and `config_bridge_port` numbers the port by the index.
     let index = bridge.next_bridge_port_index(&config.identifier())?;
+    let slot = bridge.next_bridge_uart_slot();
     port.set_index(index);
     if let Some(path) = port.path() {
-        bridge.add_host_port_path(index, path.to_string());
+        // The library registers the tty under the slot the firmware will look
+        // it up by — `config_uart`'s, so the UART slot rather than the index.
+        bridge.add_host_port_path(slot, path.to_string());
     }
     let baud = port.baud().unwrap_or(DEFAULT_UART_BAUD);
     builder
         .add_config_cmd(&ConfigUart {
             oid: uart_oid,
             baud,
-            slot: index,
+            slot,
         })
         .map_err(|err| cannot_take(config, &bridge_name, err))?;
     builder
@@ -427,12 +444,18 @@ fn wire_bridge_port(
 /// Queue one CAN port's firmware configuration on its bridge, and take the
 /// port's index from the bridge.
 ///
-/// [`wire_bridge_port`]'s CAN twin, in the same order and with the same two
-/// numbers: `config_can` creates a CAN controller object at the section's
-/// `can_bitrate` (`1000000` when the section wrote none) on the port's slot, and
-/// `config_bridge_port` hands that object to the router as a downstream port. A
-/// CAN port has no tty, so nothing here names a path: the controller is the
-/// bridge's own hardware, opened by the firmware at the rate it is given.
+/// [`wire_bridge_port`]'s CAN twin, in the same order: `config_can` creates a
+/// CAN controller object at the section's `can_bitrate` (`1000000` when the
+/// section wrote none), and `config_bridge_port` hands that object to the router
+/// as a downstream port. A CAN port has no tty, so nothing here names a path:
+/// the controller is the bridge's own hardware, opened by the firmware at the
+/// rate it is given.
+///
+/// Its `config_can` slot is the port's **index**, a placeholder the wire format
+/// declares and the firmware ignores: a CAN port names no slot of its own — the
+/// controller it opens is the only one the build gives the bridge
+/// (`third_party/klipper/src/stm32/bridge_port.c` reads no slot for it), so
+/// there is nothing to pick by one.
 ///
 /// # Errors
 /// [`ConfigError`] when the bridge's object cannot be found, or when the
@@ -452,9 +475,10 @@ fn wire_can_port(
     let port_oid = builder
         .create_oid()
         .map_err(|err| cannot_take(config, &bridge_name, err))?;
-    // The index is the port's declaration order among the bridge's ports, and
-    // `config_can` carries it as the port's slot — one number, as for a UART
-    // port.
+    // The index is the port's declaration order among the bridge's ports, which
+    // is what `config_bridge_port` numbers the port by, and `config_can` carries
+    // it as a placeholder only: the firmware opens the build's one CAN controller
+    // and ignores the slot on the wire.
     let index = bridge.next_bridge_port_index(&config.identifier())?;
     port.set_index(index);
     builder
@@ -1059,12 +1083,12 @@ mod tests {
         );
     }
 
-    /// The port index is the number both the port's tty and `config_uart` travel
-    /// with: the loader hands the bridge one pair per `uart_path:` port, keyed by
-    /// the index its port was given — the second port's slot is 1, not 0, and a
-    /// port that writes no path contributes nothing.
+    /// The port's tty is registered under its **UART slot** — the number
+    /// `config_uart` carries, which is how the firmware looks the tty up again.
+    /// Two UART ports are slots 0 and 1, and a port that writes no path
+    /// contributes nothing.
     #[test]
-    fn a_host_library_bridge_registers_its_ports_paths_under_their_index() {
+    fn a_host_library_bridge_registers_its_ports_paths_under_their_slot() {
         let printer = load(
             "[mcu bridge]\nhost_library: /lib/libklipper_host.so\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
@@ -1075,16 +1099,165 @@ mod tests {
 
         assert_eq!(
             host_port_paths(&printer, "mcu bridge"),
-            vec![(1, "/dev/serial/by-id/usb-board".to_string())]
+            vec![(1, "/dev/serial/by-id/usb-board".to_string())],
+            "uart1 is the bridge's second UART, so its stream is slot 1"
         );
-        // The two counters are one: the port's index — which the port-level
-        // `SET_PORT_NODEID` carries — is what the path is keyed by.
+    }
+
+    /// A tty is registered under the port's **UART slot**, not its port index:
+    /// with a `[can_device]` declared first, the UART port's index is 1 but it
+    /// is the bridge's first UART, so the library must be told slot 0 — the
+    /// number `config_uart` will carry and the firmware will open the tty by.
+    /// Registering it under the index would leave the port on the slot another
+    /// USART answers to.
+    #[test]
+    fn a_host_library_bridge_registers_a_path_under_the_uart_slot_not_the_index() {
+        let printer = load(
+            "[mcu bridge]\nhost_library: /lib/libklipper_host.so\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             uart_path: /dev/serial/by-id/usb-board\n",
+        )
+        .expect("a host-library bridge takes the port's path");
+
+        assert_eq!(
+            host_port_paths(&printer, "mcu bridge"),
+            vec![(0, "/dev/serial/by-id/usb-board".to_string())],
+            "the UART port is the bridge's first UART (slot 0), whatever its index is"
+        );
         assert_eq!(
             printer
-                .lookup_object_as::<UartPort>("uart_device uart1")
+                .lookup_object_as::<UartPort>("uart_device uart0")
                 .expect("the port registered")
                 .index(),
-            Some(1)
+            Some(1),
+            "its index is still the declaration order `SET_PORT_NODEID` carries"
+        );
+    }
+
+    /// Two UART ports on one bridge are slots 0 and 1 and indices 0 and 1: with
+    /// no CAN port in the way the two numbers agree.
+    #[test]
+    fn two_uart_ports_take_the_slots_zero_and_one() {
+        let printer = load(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
+             [uart_device uart1]\nuart_mcu: bridge\nuart_oid: uart1\n",
+        )
+        .expect("the UART ports wire onto their bridge");
+
+        let bridge = printer
+            .lookup_object_as::<McuObject>("mcu bridge")
+            .expect("the bridge registered");
+        assert_eq!(
+            bridge.config().queued_config_commands(),
+            vec![
+                (
+                    ConfigUart::NAME,
+                    ConfigUart {
+                        oid: 0,
+                        baud: DEFAULT_UART_BAUD,
+                        slot: 0,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 1, port: 0 }.args()
+                ),
+                (
+                    ConfigUart::NAME,
+                    ConfigUart {
+                        oid: 2,
+                        baud: DEFAULT_UART_BAUD,
+                        slot: 1,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 3, port: 2 }.args()
+                ),
+            ],
+            "each UART port opens its own stream on its own slot, then the bridge port"
+        );
+        let index = |name: &str| {
+            printer
+                .lookup_object_as::<UartPort>(name)
+                .unwrap_or_else(|| panic!("the printer has [{name}]"))
+                .index()
+        };
+        assert_eq!(index("uart_device uart0"), Some(0));
+        assert_eq!(index("uart_device uart1"), Some(1));
+    }
+
+    /// A `[can_device]` declared before a `[uart_device]` moves the UART port's
+    /// **index** but not its **slot**: the CAN port takes index 0 (and sends it
+    /// as `config_can`'s placeholder slot, which the firmware ignores), so the
+    /// UART port's index is 1 — but it is the bridge's first UART, so its
+    /// `config_uart` slot is 0. Sending the index there would name the wrong
+    /// USART and the two ports would swap backends with no error.
+    #[test]
+    fn a_can_port_declared_first_leaves_the_uart_slot_at_zero() {
+        let printer = load(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n",
+        )
+        .expect("the mixed ports wire onto their bridge");
+
+        assert_eq!(
+            printer
+                .lookup_object_as::<CanPort>("can_device can0")
+                .expect("the can port registered")
+                .index(),
+            Some(0),
+            "the CAN port is declared first, so it is port 0"
+        );
+        assert_eq!(
+            printer
+                .lookup_object_as::<UartPort>("uart_device uart0")
+                .expect("the uart port registered")
+                .index(),
+            Some(1),
+            "the UART port shares that one port table, so its index is 1"
+        );
+
+        let bridge = printer
+            .lookup_object_as::<McuObject>("mcu bridge")
+            .expect("the bridge registered");
+        assert_eq!(
+            bridge.config().queued_config_commands(),
+            vec![
+                (
+                    ConfigCan::NAME,
+                    ConfigCan {
+                        oid: 0,
+                        bitrate: DEFAULT_CAN_BITRATE,
+                        slot: 0,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 1, port: 0 }.args()
+                ),
+                (
+                    ConfigUart::NAME,
+                    ConfigUart {
+                        oid: 2,
+                        baud: DEFAULT_UART_BAUD,
+                        slot: 0,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 3, port: 2 }.args()
+                ),
+            ],
+            "the CAN port sends its index as a placeholder slot; the UART port opens slot 0, \
+             the bridge's first USART, not its own index 1"
         );
     }
 

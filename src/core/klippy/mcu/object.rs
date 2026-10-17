@@ -232,6 +232,20 @@ pub struct McuObject {
     /// and "how many ports this bridge has". Only a bridge is ever asked; a
     /// plain `[mcu]` never is.
     bridge_ports: AtomicU16,
+    /// How many UART ports have claimed a slot on this MCU as a bridge.
+    ///
+    /// A UART port's **slot** is a different number from its index: the index
+    /// counts every port on the bridge, CAN ones included, while the firmware
+    /// picks a USART by the slot `config_uart` carries and by nothing else
+    /// (`third_party/klipper/src/stm32/bridge_port.c`: the UART slots are
+    /// `0..bridge_serial_slot_count()-1`, and a CAN port names no slot at all).
+    /// So the slot is "which UART of this bridge the port is" — the count of
+    /// UART ports declared before it, whatever their indices are. Keeping the
+    /// two apart is what stops a `[can_device]` declared before a
+    /// `[uart_device]` from handing that UART port the wrong USART.
+    ///
+    /// Only a UART port takes from it; a CAN port takes an index only.
+    bridge_uart_slots: AtomicU16,
     /// The periodic recalibration timer, cancelled on drop.
     recalibrate_timer: Mutex<Option<TimerHandle>>,
     /// The periodic clock poll timer (`mcu_clock_poll`), cancelled on drop.
@@ -277,6 +291,7 @@ impl McuObject {
             last_stats: Arc::new(Mutex::new(None)),
             secondary_sync: Mutex::new(None),
             bridge_ports: AtomicU16::new(0),
+            bridge_uart_slots: AtomicU16::new(0),
             recalibrate_timer: Mutex::new(None),
             clock_poll_timer: Mutex::new(None),
             printer: Arc::downgrade(printer),
@@ -345,6 +360,26 @@ impl McuObject {
         Ok(index as u8)
     }
 
+    /// Take the next UART slot for this MCU as a bridge.
+    ///
+    /// A UART port's slot is not its index (see the field): it is how many UART
+    /// ports this bridge already has, so a bridge whose `[can_device]` sections
+    /// are declared first still gives its first UART port slot 0. That is the
+    /// number `config_uart` carries and the number the port's tty is registered
+    /// under, both of which the firmware resolves a USART by.
+    ///
+    /// The one-byte bound is the index counter's: every port takes an index
+    /// before its slot, so a bridge still inside the index range is inside this
+    /// one too.
+    pub fn next_bridge_uart_slot(&self) -> u8 {
+        let slot = self.bridge_uart_slots.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            slot <= u16::from(u8::MAX),
+            "a UART slot past the one-byte range, without the index counter refusing first"
+        );
+        slot as u8
+    }
+
     /// What this MCU's `host_library:` path attaches with, when the config
     /// calls it muxed.
     ///
@@ -371,7 +406,10 @@ impl McuObject {
     /// Called by the port section's factory while the config loads
     /// (`mcu/bridge_ports.rs`), before anything connects: the library is told
     /// every pair before it comes up, so a port's tty has to be known by then.
-    /// `slot` is the port's index — the same number `config_uart` carries.
+    /// `slot` is the port's **UART slot** — the same number `config_uart`
+    /// carries, which is how the firmware looks the tty up again
+    /// (`klipper_host_port` and `port_backend_open` both key on it). It is not
+    /// the port's index: a CAN port declared first takes no slot.
     pub fn add_host_port_path(&self, slot: u8, path: String) {
         self.host_port_paths
             .lock()

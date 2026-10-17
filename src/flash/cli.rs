@@ -203,6 +203,86 @@ pub struct ConfigureBridgePlan {
     pub target: BridgeTarget,
 }
 
+/// The command line of `admin reset`.
+///
+/// The bridge side of [`FlashArgs`], and one choice: without `--port` the
+/// **bridge itself** is reset (the self-restart [`flash`](FlashArgs) does before
+/// it declares ports), and with `--port` a **declared port's device** is, the way
+/// `--port-reset` says.
+#[derive(Parser, Debug)]
+#[command(
+    name = "reset",
+    version,
+    about = "Reset a bridge itself, or a device on one of its ports, through the 
+             bridge's admin channel",
+    arg_required_else_help = true
+)]
+pub struct ResetArgs {
+    /// Serial tty of the **bridge** whose device to reset (`/dev/ttyUSB0`)
+    #[arg(long, value_name = "TTY")]
+    pub bridge: Option<String>,
+
+    /// Host library (`libklipper_host.so`) of a **bridge** to reset through,
+    /// when the bridge is an in-process host library instead of a serial board
+    #[arg(long, value_name = "SO")]
+    pub bridge_library: Option<String>,
+
+    /// Identity of the **serial bridge** board itself, twelve hex digits — the
+    /// same spelling `flash --bridge-uuid` uses
+    #[arg(long, value_name = "HEX")]
+    pub bridge_uuid: Option<String>,
+
+    /// Identity a host-library bridge answers the serial mux with, twelve hex
+    /// digits (only with `--bridge-library`; default all zeros)
+    #[arg(long, value_name = "HEX")]
+    pub host_identity: Option<String>,
+
+    /// A host-library bridge's port tty, `<slot>:<path>` (only with
+    /// `--bridge-library`; repeatable)
+    #[arg(long = "port-tty", value_name = "SLOT:PATH")]
+    pub port_tty: Vec<String>,
+
+    /// Line speed the bridge's link opens at, in baud (default 250000)
+    #[arg(long, value_name = "BAUD")]
+    pub baud: Option<u32>,
+
+    /// A declared bridge port whose device to reset; without it, the bridge
+    /// itself
+    #[arg(long, value_name = "INDEX")]
+    pub port: Option<u8>,
+
+    /// How a `--port` device is reset: `reset-port` (a line pulse) or
+    /// `restart-device` (its own restart), default `reset-port`
+    #[arg(long, value_name = "METHOD")]
+    pub port_reset: Option<String>,
+}
+
+/// What a `reset` command line asks to reset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetTarget {
+    /// The bridge itself, through its own admin channel.
+    Bridge,
+    /// A declared port's device, the way `reset` says.
+    Port {
+        /// The port index the device sits behind.
+        index: u8,
+        /// The reset that port's device gets.
+        reset: PortReset,
+    },
+}
+
+/// A `reset` command line, as a plan: the bridge's link and what to reset, all
+/// validated before any device is opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResetPlan {
+    /// How the bridge's own link is reached.
+    pub source: BridgeLinkSource,
+    /// The line speed the bridge's link opens at.
+    pub baud: u32,
+    /// What to reset.
+    pub target: ResetTarget,
+}
+
 /// What a command line asks the tool to do: the two entry points the
 /// [`crate::flash`] session has, over the transport the arguments named.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -515,6 +595,44 @@ pub fn plan_configure_bridge(args: &ConfigureBridgeArgs) -> Result<ConfigureBrid
             index: port,
             node_id,
         },
+    })
+}
+
+/// Turn a `reset` command line into the plan it asks for, or an error naming the
+/// first mistake.
+///
+/// Every rejection happens before any device is opened. The bridge's link is the
+/// same one the flash and configure lines build ([`plan_bridge_link`]); the only
+/// choice is `--port` (a declared port's device, the way `--port-reset` says) or
+/// no `--port` (the bridge itself). `--port-reset` without `--port` is a mistake:
+/// the bridge self-restart is the one reset there is.
+pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
+    let source = plan_bridge_link(
+        &args.bridge,
+        &args.bridge_library,
+        args.bridge_uuid.as_deref(),
+        args.host_identity.as_deref(),
+        &args.port_tty,
+    )?;
+    let baud = args.baud.unwrap_or(DEFAULT_BAUD);
+    let target = match args.port {
+        None => {
+            if args.port_reset.is_some() {
+                return Err(
+                    "--port-reset needs --port: without one the bridge itself is reset".into(),
+                );
+            }
+            ResetTarget::Bridge
+        }
+        Some(index) => ResetTarget::Port {
+            index,
+            reset: parse_port_reset(args.port_reset.as_deref())?,
+        },
+    };
+    Ok(ResetPlan {
+        source,
+        baud,
+        target,
     })
 }
 
@@ -853,6 +971,61 @@ fn report_configure_bridge(ready: &BridgeReady) {
         ready.target.index,
         ready.target.node_id,
     );
+}
+
+/// `admin reset`: open the bridge, identify it, and reset what the plan names —
+/// the bridge itself, or a declared port's device.
+///
+/// The result line is the confirmation: the bridge's self-reset confirms itself
+/// by answering again ([`BridgeLink::reset`]'s bounded reopen + identify), while
+/// a port-level reset has no receipt and can only be reported as sent. The
+/// runtime is built here for the same reason [`run_bridge_flash`] builds one.
+pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let plan = plan_reset(&args)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let mut link = open_link(&plan.source, plan.baud)?;
+        tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
+        match plan.target {
+            ResetTarget::Bridge => {
+                link.reset().await?;
+                report_reset_bridge(&plan.source);
+            }
+            ResetTarget::Port { index, reset } => {
+                link.reset_port(index, reset)?;
+                report_reset_port(index, reset);
+            }
+        }
+        link.close();
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+}
+
+/// The last word of a bridge self-reset: the bridge came back and identified
+/// again, except for a host library, whose `mcu_restart` is a no-op.
+fn report_reset_bridge(source: &BridgeLinkSource) {
+    match source {
+        BridgeLinkSource::Serial { .. } => {
+            println!("reset: bridge (restarted and identified again)")
+        }
+        BridgeLinkSource::Library { .. } => {
+            println!("reset: bridge (host library, restart is a no-op)")
+        }
+    }
+}
+
+/// The last word of a port-device reset: the admin unit went out, with no
+/// receipt — the same silence a reset has everywhere else.
+fn report_reset_port(index: u8, reset: PortReset) {
+    let method = match reset {
+        PortReset::ResetPort => "reset-port",
+        PortReset::RestartDevice => "restart-device",
+    };
+    println!("reset: port {index} ({method}), sent with no receipt");
 }
 
 /// The last word of a successful flash.
@@ -1774,6 +1947,107 @@ mod tests {
         ])
         .expect_err("one link or the other");
         assert!(err.contains("--bridge"), "{err}");
+        assert!(err.contains("--bridge-library"), "{err}");
+    }
+
+    /// Parse a `reset` command line the way the shell would.
+    fn parse_reset(args: &[&str]) -> Result<ResetArgs, clap::Error> {
+        ResetArgs::try_parse_from(std::iter::once("reset").chain(args.iter().copied()))
+    }
+
+    /// A parsed `reset` line and the plan it makes.
+    fn planned_reset(args: &[&str]) -> Result<ResetPlan, String> {
+        let args = parse_reset(args).expect("a command line clap accepted");
+        plan_reset(&args)
+    }
+
+    /// No `--port` means the bridge itself: the self-restart the flash run does
+    /// before it declares ports.
+    #[test]
+    fn test_a_reset_plan_for_the_bridge_itself() {
+        let plan = planned_reset(&["--bridge", "/dev/ttyUSB0"]).expect("a bridge reset plan");
+        assert_eq!(plan.target, ResetTarget::Bridge);
+        assert_eq!(plan.baud, DEFAULT_BAUD);
+        assert_eq!(
+            plan.source,
+            BridgeLinkSource::Serial {
+                tty: "/dev/ttyUSB0".into(),
+                uuid: None,
+            }
+        );
+    }
+
+    /// `--port N` resets that port's device, the way `--port-reset` says; the
+    /// default is the line pulse.
+    #[test]
+    fn test_a_reset_plan_for_a_port_device() {
+        let plan = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-reset",
+            "restart-device",
+        ])
+        .expect("a port reset plan");
+        assert_eq!(
+            plan.target,
+            ResetTarget::Port {
+                index: 1,
+                reset: PortReset::RestartDevice,
+            }
+        );
+
+        let plan = planned_reset(&["--bridge", "/dev/ttyUSB0", "--port", "0"])
+            .expect("the port's reset defaults to the line pulse");
+        assert_eq!(
+            plan.target,
+            ResetTarget::Port {
+                index: 0,
+                reset: PortReset::ResetPort,
+            }
+        );
+    }
+
+    /// A reset method belongs to a port: without `--port` there is one reset, the
+    /// bridge's own, and a method on this line is a mistake to name.
+    #[test]
+    fn test_a_reset_port_method_without_a_port_is_named() {
+        let err = planned_reset(&["--bridge", "/dev/ttyUSB0", "--port-reset", "restart-device"])
+            .expect_err("the bridge has one reset");
+        assert!(err.contains("--port-reset"), "{err}");
+        assert!(err.contains("--port"), "{err}");
+    }
+
+    /// The method is spelled like the flash line's `--port-reset`.
+    #[test]
+    fn test_a_reset_port_method_is_checked() {
+        let err = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-reset",
+            "reboot",
+        ])
+        .expect_err("not a reset");
+        assert!(err.contains("reset-port"), "{err}");
+        assert!(err.contains("restart-device"), "{err}");
+    }
+
+    /// The bridge's link is one of the two, never both and never neither.
+    #[test]
+    fn test_a_reset_link_is_required() {
+        let err = planned_reset(&["--port", "0"]).expect_err("which bridge?");
+        assert!(err.contains("--bridge"), "{err}");
+
+        let err = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--bridge-library",
+            "/lib/libklipper_host.so",
+        ])
+        .expect_err("one link or the other");
         assert!(err.contains("--bridge-library"), "{err}");
     }
 }

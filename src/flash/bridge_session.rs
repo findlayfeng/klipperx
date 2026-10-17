@@ -311,11 +311,25 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
 /// [`BridgeError::Link`] when the link refuses a port-level write.
 pub fn reset_ports(link: &Interface, ports: &[BridgePort]) -> Result<(), BridgeError> {
     for (index, port) in ports.iter().enumerate() {
-        let index = index as u8;
-        match port.reset {
-            PortReset::RestartDevice => link.send_restart_device(index)?,
-            PortReset::ResetPort => link.send_reset_port(index)?,
-        }
+        reset_port(link, index as u8, port.reset)?;
+    }
+    Ok(())
+}
+
+/// Reset one declared port's device the way `reset` says: a line pulse on the
+/// port ([`PortReset::ResetPort`]) or the device's own restart
+/// ([`PortReset::RestartDevice`]). [`reset_ports`] and `admin reset --port`
+/// share this one spelling of the two admin units.
+///
+/// The port has to be one the bridge has **declared** — the firmware drops a
+/// port-level command that names a port it does not have, in silence.
+///
+/// # Errors
+/// [`BridgeError::Link`] when the link refuses a port-level write.
+pub fn reset_port(link: &Interface, index: u8, reset: PortReset) -> Result<(), BridgeError> {
+    match reset {
+        PortReset::RestartDevice => link.send_restart_device(index)?,
+        PortReset::ResetPort => link.send_reset_port(index)?,
     }
     Ok(())
 }
@@ -693,6 +707,31 @@ mod tests {
                 .filter(|step| !is_reset(step))
                 .collect::<Vec<_>>(),
             "configure is flash's declaration + naming + tunnel, minus the resets"
+        );
+    }
+
+    /// `admin reset --port`'s one write: the port-reset unit (`0x04`, a line pulse)
+    /// or the restart-device unit (`0x05`), each naming the port it means. No
+    /// receipt, so the wire bytes are the whole evidence.
+    #[tokio::test]
+    async fn test_reset_port_sends_the_one_port_reset_unit() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+
+        reset_port(&link, 2, PortReset::ResetPort).expect("the pulse goes out");
+        reset_port(&link, 3, PortReset::RestartDevice).expect("the restart goes out");
+
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+        });
+        let parser = mux_parser();
+        assert_eq!(
+            steps(&parser, &units),
+            vec![
+                Step::Admin(admin_payload(&[CMD_RESET_PORT, 2])),
+                Step::Admin(admin_payload(&[CMD_RESTART_DEVICE, 3])),
+            ],
+            "the two resets are the firmware's own units, naming their port"
         );
     }
 

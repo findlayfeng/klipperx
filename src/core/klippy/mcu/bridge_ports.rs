@@ -10,7 +10,14 @@
 //! `config_uart` / `config_bridge_port` pair on the bridge's builder and takes
 //! the port's **index** (its declaration order among the bridge's ports) from
 //! the bridge — the same number `config_uart` travels with, and the same one
-//! the host names the port's tty with. Grouping ports with the `[mcu]` sections that reference them, and
+//! the host names the port's tty with. [`load_can_device`] does the same for a
+//! CAN port, with `config_can` in place of `config_uart`; a CAN port has no tty,
+//! so none of the `uart_path` reading applies to it. Both kinds share **one**
+//! port table per bridge and one index counter, and the order that number counts
+//! is the loader's section order — `can_device` sections before `uart_device`
+//! ones at the same `order` value (`load.rs`'s table), declaration order within
+//! each kind — which is also the order the `config_bridge_port` commands arrive
+//! in, because this module queues them as it is called. Grouping ports with the `[mcu]` sections that reference them, and
 //! everything transport-shaped, is later work — this module only parses each
 //! port section once and holds the answers.
 //!
@@ -21,6 +28,7 @@
 //! | `uart_mcu` / `can_mcu` | the `[mcu]` this port sits on; a section name, `mcu` for the bare `[mcu]` (required) |
 //! | `uart_oid` / `can_oid` | the name the host knows this port by (required, non-empty) |
 //! | `uart_baud` | the port's line rate, a positive integer (optional; `250000` when absent) |
+//! | `can_bitrate` | the port's bus rate, a positive integer (optional; `1000000` when absent) |
 //! | `uart_path` | the tty the bridge's **host library** opens for this port, a non-empty string (optional) |
 //! | `uart_restart_method` | the **line-level** reset the bridge gives a legacy device on this port — `arduino` (DTR) or `cheetah` (RTS/DTR); any other value is a config error (optional) |
 //!
@@ -53,7 +61,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::cmd::uart::{ConfigBridgePort, ConfigUart, DEFAULT_UART_BAUD};
+use crate::core::klippy::cmd::uart::{
+    ConfigBridgePort, ConfigCan, ConfigUart, DEFAULT_CAN_BITRATE, DEFAULT_UART_BAUD,
+};
 use crate::core::klippy::config::mcu::Transport;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::load::section;
@@ -145,7 +155,7 @@ impl UartPort {
         let name = section_name(config, "uart_device")?;
         let mcu = require_mcu(config, "uart_mcu")?;
         let oid = require_text(config, "uart_oid")?;
-        let baud = parse_baud(config, "uart_baud")?;
+        let baud = parse_rate(config, "uart_baud")?;
         let path = parse_path(config)?;
         let restart_method = match config.get_str("uart_restart_method") {
             None => None,
@@ -231,20 +241,34 @@ pub struct CanPort {
     mcu: String,
     /// The oid name the firmware reports for this port.
     oid: String,
+    /// The bus rate the firmware opens the port's CAN controller at.
+    bitrate: u32,
+    /// The port's index on its bridge — its declaration order among the
+    /// bridge's ports, which is what the port-level `SET_PORT_NODEID` travels
+    /// with — and the slot `config_can` carries ([`UartPort::index`]'s meaning:
+    /// `None` for a section parsed outside the loader).
+    index: Option<u8>,
 }
 
 impl CanPort {
     /// Parse one `[can_device <name>]` section.
     ///
     /// # Errors
-    /// A missing or empty required option, or a `can_mcu` that names no `[mcu]`
-    /// section — each message names the section (and the target, for an
-    /// unknown MCU).
+    /// A missing or empty required option, a `can_mcu` that names no `[mcu]`
+    /// section, or a non-positive or unparsable `can_bitrate` — each message
+    /// names the section (and the target, for an unknown MCU).
     pub fn new(config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let name = section_name(config, "can_device")?;
         let mcu = require_mcu(config, "can_mcu")?;
         let oid = require_text(config, "can_oid")?;
-        Ok(Self { name, mcu, oid })
+        let bitrate = parse_rate(config, "can_bitrate")?.unwrap_or(DEFAULT_CAN_BITRATE);
+        Ok(Self {
+            name,
+            mcu,
+            oid,
+            bitrate,
+            index: None,
+        })
     }
 
     /// The name other sections reference this port by (the section's sub).
@@ -261,6 +285,25 @@ impl CanPort {
     /// The oid name the firmware reports for this port.
     pub fn oid(&self) -> &str {
         &self.oid
+    }
+
+    /// The bus rate the firmware opens the port's CAN controller at.
+    pub fn bitrate(&self) -> u32 {
+        self.bitrate
+    }
+
+    /// The port's index on its bridge — its declaration order among the
+    /// bridge's ports, which is what the port-level `SET_PORT_NODEID` carries.
+    ///
+    /// `None` for a section parsed outside the loader (see the field); a port
+    /// the loader built always has one.
+    pub fn index(&self) -> Option<u8> {
+        self.index
+    }
+
+    /// Record the index the bridge's port counter handed out.
+    pub(crate) fn set_index(&mut self, index: u8) {
+        self.index = Some(index);
     }
 }
 
@@ -293,12 +336,15 @@ pub fn load_uart_device(
 /// Upstream's `load_config_prefix` shape for `[can_device <name>]`.
 ///
 /// # Errors
-/// As [`CanPort::new`].
+/// As [`CanPort::new`], plus the bridge's own configuration failing to take
+/// this port ([`wire_can_port`]).
 pub fn load_can_device(
     config: &ConfigWrapper,
-    _printer: &Arc<Printer>,
+    printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    Ok(Arc::new(CanPort::new(config)?))
+    let mut port = CanPort::new(config)?;
+    wire_can_port(config, printer, &mut port)?;
+    Ok(Arc::new(port))
 }
 
 /// Queue one UART port's firmware configuration on its bridge, and take the
@@ -320,9 +366,8 @@ pub fn load_can_device(
 /// `McuObject::connect`).
 ///
 /// The `[mcu]` a port named is a config-section existence check in
-/// [`require_mcu`]; the object lookup here is the next step — the builder the
-/// commands go on — and can only fail if the section is not there, which the
-/// loader guarantees for a config it accepted.
+/// [`require_mcu`]; [`bridge_object`] is the next step — the builder the
+/// commands go on.
 ///
 /// # Errors
 /// [`ConfigError`] when the bridge's object cannot be found, when the port
@@ -335,19 +380,7 @@ fn wire_bridge_port(
     port: &mut UartPort,
 ) -> Result<(), ConfigError> {
     let bridge_name = port.mcu().to_string();
-    let identifier = if bridge_name == "mcu" {
-        "mcu".to_string()
-    } else {
-        format!("mcu {bridge_name}")
-    };
-    let bridge = printer
-        .lookup_object_as::<McuObject>(&identifier)
-        .ok_or_else(|| {
-            ConfigError::new(format!(
-                "Section '{}': unknown MCU '{bridge_name}'",
-                config.identifier()
-            ))
-        })?;
+    let bridge = bridge_object(config, printer, &bridge_name)?;
     // `uart_path:` names the tty the bridge's host library opens for this port,
     // and only a host-library bridge has a library that opens one. Anywhere else
     // the option would sit there unfollowed, so it is refused by name instead.
@@ -360,14 +393,12 @@ fn wire_bridge_port(
         )));
     }
     let builder = bridge.config();
-    let on = |err: crate::core::klippy::mcu::McuError| {
-        ConfigError::new(format!(
-            "Section '{}': MCU '{bridge_name}' cannot take the port: {err}",
-            config.identifier()
-        ))
-    };
-    let uart_oid = builder.create_oid().map_err(on)?;
-    let port_oid = builder.create_oid().map_err(on)?;
+    let uart_oid = builder
+        .create_oid()
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
+    let port_oid = builder
+        .create_oid()
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
     // The port's index is its declaration order among the bridge's ports
     // (`McuObject::next_bridge_port_index`); it is taken before the commands are
     // queued because `config_uart` carries it as the port's slot.
@@ -383,14 +414,104 @@ fn wire_bridge_port(
             baud,
             slot: index,
         })
-        .map_err(on)?;
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
     builder
         .add_config_cmd(&ConfigBridgePort {
             oid: port_oid,
             port: uart_oid,
         })
-        .map_err(on)?;
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
     Ok(())
+}
+
+/// Queue one CAN port's firmware configuration on its bridge, and take the
+/// port's index from the bridge.
+///
+/// [`wire_bridge_port`]'s CAN twin, in the same order and with the same two
+/// numbers: `config_can` creates a CAN controller object at the section's
+/// `can_bitrate` (`1000000` when the section wrote none) on the port's slot, and
+/// `config_bridge_port` hands that object to the router as a downstream port. A
+/// CAN port has no tty, so nothing here names a path: the controller is the
+/// bridge's own hardware, opened by the firmware at the rate it is given.
+///
+/// # Errors
+/// [`ConfigError`] when the bridge's object cannot be found, or when the
+/// bridge's builder refuses another command or port (oid exhaustion, or a
+/// bridge already at its port limit).
+fn wire_can_port(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+    port: &mut CanPort,
+) -> Result<(), ConfigError> {
+    let bridge_name = port.mcu().to_string();
+    let bridge = bridge_object(config, printer, &bridge_name)?;
+    let builder = bridge.config();
+    let can_oid = builder
+        .create_oid()
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
+    let port_oid = builder
+        .create_oid()
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
+    // The index is the port's declaration order among the bridge's ports, and
+    // `config_can` carries it as the port's slot — one number, as for a UART
+    // port.
+    let index = bridge.next_bridge_port_index(&config.identifier())?;
+    port.set_index(index);
+    builder
+        .add_config_cmd(&ConfigCan {
+            oid: can_oid,
+            bitrate: port.bitrate(),
+            slot: index,
+        })
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
+    builder
+        .add_config_cmd(&ConfigBridgePort {
+            oid: port_oid,
+            port: can_oid,
+        })
+        .map_err(|err| cannot_take(config, &bridge_name, err))?;
+    Ok(())
+}
+
+/// The bridge object a port section's `*_mcu` names, looked up under the same
+/// spelling the section writes: `mcu` for the bare section, `mcu <sub>`
+/// otherwise.
+///
+/// The section's `*_mcu` is a config-section existence check in [`require_mcu`];
+/// this is the next step — the object whose builder the port's commands go on —
+/// and can only fail if the section is not there, which the loader guarantees
+/// for a config it accepted.
+fn bridge_object(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+    bridge_name: &str,
+) -> Result<Arc<McuObject>, ConfigError> {
+    let identifier = if bridge_name == "mcu" {
+        "mcu".to_string()
+    } else {
+        format!("mcu {bridge_name}")
+    };
+    printer
+        .lookup_object_as::<McuObject>(&identifier)
+        .ok_or_else(|| {
+            ConfigError::new(format!(
+                "Section '{}': unknown MCU '{bridge_name}'",
+                config.identifier()
+            ))
+        })
+}
+
+/// The refusal a bridge's builder gives a port it cannot take, naming the
+/// section and the bridge it asked.
+fn cannot_take(
+    config: &ConfigWrapper,
+    bridge_name: &str,
+    err: crate::core::klippy::mcu::McuError,
+) -> ConfigError {
+    ConfigError::new(format!(
+        "Section '{}': MCU '{bridge_name}' cannot take the port: {err}",
+        config.identifier()
+    ))
 }
 
 /// Whether `bridge` opens its ports itself: its own transport is a host library,
@@ -579,17 +700,17 @@ fn require_mcu(config: &ConfigWrapper, option: &str) -> Result<String, ConfigErr
     Ok(mcu)
 }
 
-/// An optional positive-integer option (`uart_baud`).
+/// An optional positive-integer rate option (`uart_baud`, `can_bitrate`).
 ///
-/// Absent is `None` (the port inherits whatever the later transport pass
-/// decides); written must parse as a positive integer, the same rule
-/// `config/mcu.rs` applies to an MCU's `baud`.
-fn parse_baud(config: &ConfigWrapper, option: &str) -> Result<Option<u32>, ConfigError> {
+/// Absent is `None` (the port's own default applies: `250000` for a line rate,
+/// `1000000` for a bus rate); written must parse as a positive integer, the
+/// same rule `config/mcu.rs` applies to an MCU's `baud`.
+fn parse_rate(config: &ConfigWrapper, option: &str) -> Result<Option<u32>, ConfigError> {
     let Some(text) = config.get_str(option) else {
         return Ok(None);
     };
     match text.trim().parse::<u32>() {
-        Ok(baud) if baud > 0 => Ok(Some(baud)),
+        Ok(rate) if rate > 0 => Ok(Some(rate)),
         _ => Err(ConfigError::new(format!(
             "Section '{}' has an invalid {option}: '{text}' (expected a positive integer)",
             config.identifier()
@@ -605,6 +726,7 @@ fn parse_baud(config: &ConfigWrapper, option: &str) -> Result<Option<u32>, Confi
 mod tests {
     use super::*;
 
+    use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::reactor::ManualReactor;
@@ -803,6 +925,36 @@ mod tests {
     }
 
     #[test]
+    fn a_can_port_with_an_invalid_bitrate_is_refused() {
+        let config =
+            with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_bitrate: fast\n");
+        let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+        assert!(err.to_string().contains("invalid can_bitrate"), "{err}");
+        assert!(err.to_string().contains("fast"), "{err}");
+
+        // A rate that parses but is not positive is the same refusal: a CAN
+        // controller has no zero-rate bus.
+        let config = with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_bitrate: 0\n");
+        let err = CanPort::new(&wrap(&config, "can_device can0")).unwrap_err();
+        assert!(err.to_string().contains("invalid can_bitrate"), "{err}");
+    }
+
+    /// `can_bitrate` is optional: a port that writes none is opened at the
+    /// default 1 Mbit/s, and one that writes a rate keeps it.
+    #[test]
+    fn a_can_port_takes_the_bitrate_the_config_writes() {
+        let config = with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.bitrate(), DEFAULT_CAN_BITRATE);
+        assert_eq!(port.bitrate(), 1_000_000);
+
+        let config =
+            with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_bitrate: 500000\n");
+        let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
+        assert_eq!(port.bitrate(), 500_000);
+    }
+
+    #[test]
     fn the_port_sections_load_and_hold_no_unused_options() {
         // The end-to-end contract: a config with an `[mcu]` and both port
         // sections loads clean — every port option this factory reads is
@@ -823,13 +975,15 @@ mod tests {
         assert_eq!(uart.oid(), "uart0");
         assert_eq!(
             uart.index(),
-            Some(0),
-            "the loader assigned the port its declaration order"
+            Some(1),
+            "the loader wires a bridge's can_device sections before its uart_device ones, and \
+             both kinds share the one port table"
         );
         let can = printer
             .lookup_object_as::<CanPort>("can_device can0")
             .expect("the can port registered");
         assert_eq!(can.oid(), "can0");
+        assert_eq!(can.index(), Some(0));
     }
 
     /// Load `text` through the real loader — the same walk a config file takes,
@@ -945,5 +1099,68 @@ mod tests {
         .expect("a host-library bridge loads without a path");
 
         assert!(host_port_paths(&printer, "mcu bridge").is_empty());
+    }
+
+    /// A CAN port is wired onto its bridge the way a UART port is: the pair
+    /// `config_can` (the port's own rate and slot) then `config_bridge_port`
+    /// (handing that stream to the router) is queued on the bridge's builder in
+    /// declaration order, and each port takes the index that order gives it.
+    ///
+    /// `config_can`'s `bitrate` comes from the port section's `can_bitrate:`
+    /// (`1000000` when it writes none) and its `slot` from the index the bridge
+    /// handed out — the same number the port-level `SET_PORT_NODEID` carries.
+    #[test]
+    fn a_can_port_queues_its_config_commands_on_its_bridge() {
+        let printer = load(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\ncan_bitrate: 500000\n\
+             [can_device can1]\ncan_mcu: bridge\ncan_oid: can1\n",
+        )
+        .expect("CAN ports wire onto their bridge");
+
+        let index = |name: &str| {
+            printer
+                .lookup_object_as::<CanPort>(name)
+                .unwrap_or_else(|| panic!("the printer has [{name}]"))
+                .index()
+        };
+        assert_eq!(index("can_device can0"), Some(0), "the first port is 0");
+        assert_eq!(index("can_device can1"), Some(1), "the next is 1");
+
+        let bridge = printer
+            .lookup_object_as::<McuObject>("mcu bridge")
+            .expect("the bridge registered");
+        assert_eq!(
+            bridge.config().queued_config_commands(),
+            vec![
+                (
+                    ConfigCan::NAME,
+                    ConfigCan {
+                        oid: 0,
+                        bitrate: 500_000,
+                        slot: 0,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 1, port: 0 }.args()
+                ),
+                (
+                    ConfigCan::NAME,
+                    ConfigCan {
+                        oid: 2,
+                        bitrate: DEFAULT_CAN_BITRATE,
+                        slot: 1,
+                    }
+                    .args()
+                ),
+                (
+                    ConfigBridgePort::NAME,
+                    ConfigBridgePort { oid: 3, port: 2 }.args()
+                ),
+            ],
+            "each port queues its own stream at its own rate and slot, then the bridge port"
+        );
     }
 }

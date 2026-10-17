@@ -352,10 +352,20 @@ impl Interface {
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
     /// is not a bridge link.
-    pub(crate) fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
+    ///
+    /// `uuid` names the board the request is for. A CAN port turns a
+    /// uuid-carrying request into the bus's single admin frame
+    /// (`0x3f0 [0x02][uuid]`), which the device reads whatever carrier its own
+    /// stream uses, and *also* sends the mux
+    /// unit for a device that reads units. Without it only the unit travels.
+    pub(crate) fn send_request_bootloader(
+        &self,
+        index: u8,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<(), InterfaceError> {
         match &self.transport {
-            Transport::SharedSerial(handle) => handle.send_request_bootloader(index),
-            Transport::CanSerial(device) => device.send_request_bootloader(index),
+            Transport::SharedSerial(handle) => handle.send_request_bootloader(index, uuid),
+            Transport::CanSerial(device) => device.send_request_bootloader(index, uuid),
             Transport::Host(device) => {
                 if !device.is_mux() {
                     return Err(InterfaceError::Other(
@@ -365,7 +375,7 @@ impl Interface {
                             .to_string(),
                     ));
                 }
-                device.send_request_bootloader(index)
+                device.send_request_bootloader(index, uuid)
             }
             _ => Err(InterfaceError::Other(
                 "REQUEST_BOOTLOADER needs a link that carries port mux units (a shared serial \

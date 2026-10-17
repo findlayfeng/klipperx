@@ -18,11 +18,15 @@
 //! CAN object's own module); a stream it cannot open, or a rate it cannot set,
 //! shuts the firmware down with a message naming why, so a port that cannot be
 //! brought up fails the configuration instead of the bridge coming up without
-//! it. `slot` is the port's **index** on the bridge, which is also the slot the
-//! host named that port's bus with before the library came up
-//! (`Interface::host_mux`) — so the firmware opens the port the host meant, not
-//! a path baked into the build. `config_bridge_port` hands that object to the
-//! router as a downstream port: the bridge numbers ports by the order these
+//! it. `config_uart`'s `slot` is the port's **UART slot**: which UART of the
+//! bridge it is, which is also the slot the host named that port's bus with
+//! before the library came up (`Interface::host_mux`) — so the firmware opens
+//! the port the host meant, not a path baked into the build. It is not the
+//! port's index (that counts every port, CAN ones included): the firmware picks
+//! a USART by this slot alone (`src/stm32/bridge_port.c`). `config_can`'s slot is
+//! the index, a placeholder the firmware ignores — a CAN port names no slot. The
+//! `config_bridge_port` command that follows hands each object to the router as
+//! a downstream port: the bridge numbers ports by the order these
 //! commands arrive, and the `index` of the port-level `SET_PORT_NODEID`
 //! (`interface/devices::serial::set_port_node_id`) is that number, so the host
 //! queues the pairs in the order the port sections are declared
@@ -56,11 +60,14 @@ pub struct ConfigUart {
     pub oid: u8,
     /// The line rate the stream is opened at.
     pub baud: u32,
-    /// The port slot the stream belongs to (`third_party/klipper/src/uart.c`):
-    /// the port's **index** on its bridge (`mcu/bridge_ports.rs`), which is the
-    /// same number the host named that port's tty with (`klipper_host_port`,
-    /// before the library comes up). The firmware opens the tty registered for
-    /// this slot, or the build's default when the host named none.
+    /// The UART slot the stream belongs to (`third_party/klipper/src/port.c`,
+    /// `src/stm32/bridge_port.c`): which UART of the bridge this port is
+    /// (`mcu/bridge_ports.rs`), **not** the port's index — the index counts
+    /// every port on the bridge, CAN ones included, while the firmware picks a
+    /// USART by this number alone. It is also the number the host named that
+    /// port's tty with (`klipper_host_port`, before the library comes up). The
+    /// firmware opens the tty registered for this slot, or the build's default
+    /// when the host named none.
     pub slot: u8,
 }
 
@@ -88,8 +95,11 @@ pub struct ConfigCan {
     pub oid: u8,
     /// The bus rate the object is opened at, in bits per second.
     pub bitrate: u32,
-    /// The port slot the object belongs to, the same number [`ConfigUart`]
-    /// carries for a serial port: the port's index on its bridge.
+    /// The port slot the object belongs to. A CAN port names no slot: the
+    /// firmware opens the build's one CAN controller and ignores this field
+    /// (`src/stm32/bridge_port.c`'s `port_backend_can_open`), so what is sent is
+    /// the port's **index** as a placeholder. [`ConfigUart`]'s slot is a real
+    /// number by contrast — the port's UART slot.
     pub slot: u8,
 }
 

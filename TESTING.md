@@ -261,6 +261,34 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
   没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
 
+### 真机结果（2026-10-17，主机直连 CAN：上游 USB-CAN 桥）
+
+做法：把 F446 桥板刷成**上游 klipper 的 `USBCANBUS`**（`src/generic/usb_canbus.c`，USB id
+`1d50:606f`，46 500 B，PB8/PB9 @1 Mbit、12 MHz 晶振、katapult 32 KiB 偏移），内核 `gs_usb` 自动绑定后
+得到 `can0`（`ip link set dev can0 up type can bitrate 1000000` + `txqueuelen 128`）。这条路径不需要
+额外买 USB-CAN 适配器，而且**桥板自己也是总线上的一个 CAN 节点**（固件声明 `CANBUS_BRIDGE=1`）。
+
+节点固件是关键差异：直连 CAN 的节点**不能带 `MUX_CAN`**（裸 canserial；带头会被主机的帧解析器当垃圾），
+而挂在 klipperx 桥 CAN 端口上的节点**必须带 `MUX_CAN`**。两者都用 SBW 刷（见下）。
+
+| 项目 | 结果 |
+|---|---|
+| `admin scan --interface can0` | 两颗：桥板自己 `56ec3127224a`、下游 `12f912ed3873` |
+| `klippy` 附着下游 | ✅ `MCU 'child' identified: 139 messages` |
+| `admin flash --interface can0`（切片节点 40 824 B / ISO-TP 节点 42 040 B） | ✅ 638 / 657 块，但需先 `cansend can0 3f0#02<uuid>` 送引导（工具侧缺口） |
+| 单节点 `comm` | **2272 req/s**（2842 崩） |
+| 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`） |
+| 单节点 `motion` | ✅ |
+| **双节点并发**（桥板自身 + 下游，同一条 can0） | 两颗都 **2272 req/s**（聚合 ≈ 4.5k 往返/秒） |
+| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP` 无 mux） | ❌ 运行期未通。`candump` 可见完整 `FF → FC(30 00 00) → CF → ack` 双向交换，但主机仍重发 `identify` 并判超时 ⇒ 线级协议正常，问题在「重组完成的消息交上去之后」 |
+
+对比：同样 1 Mbit、同样下游板，主机直连的 `step` 是 **145 455**，而 klipperx 桥的 CAN 端口只有
+**15 625**（9 倍差）；说明桥端口的 per-frame 转发在突发命令负载下代价更高，待查。
+
+工具侧两个缺口（本轮踩到）：`admin flash --interface can0` 不会请求引导（需手工 `cansend` 一帧
+`0x3f0 [0x02][uuid]`）；`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器，必须写显式
+`canbus_nodeid:`。
+
 ### 真机结果（2026-10-17，四台设备压测轮）
 
 拓扑：**UART 桥** STM32F103（2×USART，`e512c60ac0e6`）+ 槽 0 上的下游 `97abe031988e`；

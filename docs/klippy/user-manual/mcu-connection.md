@@ -272,6 +272,55 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
 - **延迟**：中继 RTT 在 250 k 约 1.39 ms，500 k 约减半，CAN 1 Mbit 同量级；klipper 的移动队列
   有 1–2 s 深度，这点延迟无感，但不要拿它接“高速步进 + 极小 buffer”的组合。
 
+### 主机直连 CAN：把一块板子当 USB-CAN 收发器
+
+不想买 USB-CAN 适配器时，**一块 F4（或任何同时支持 USB 与 CAN 的板子）刷上游 klipper 的
+`USBCANBUS`** 就能当收发器：它是 Linux 眼里的「虚拟 USB-CAN 设备」，内核 `gs_usb` 驱动绑定后创建
+`can0`，主机就按普通 SocketCAN 说话（`[mcu …] canbus_interface: can0`）。这与上一节的**桥下游 CAN
+端口**是两条完全不同的路径：
+
+| | 桥下游 CAN 端口（`[can_device]`） | 上游 USB-CAN 桥（本节） |
+|---|---|---|
+| 固件 | klipperx 的桥 + `CONFIG_BRIDGE_PORT_CAN` | 上游 `CONFIG_USBCANBUS`（USB id `1d50:606f`） |
+| 主机侧 | USB CDC 控制台 + 端口命令（`SET_PORT_NODEID` 等） | SocketCAN `can0` |
+| 下游节点固件 | **必须带 `MUX_CAN`**（端口转发的是单元） | **必须不带 `MUX_CAN`**（裸 canserial；带头会被主机的帧解析器当垃圾） |
+| CAN 载具 | 切片（默认）或 ISO-TP（`can_protocol: isotp`） | 切片（`cans`）或 ISO-TP（`canbus_protocol: isotp`） |
+
+前置（root，一次）：
+
+```sh
+sudo modprobe gs_usb                                   # 多数发行版 udev 会按 1d50:606f 自动加载
+sudo ip link set dev can0 up type can bitrate 1000000
+sudo ip link set dev can0 txqueuelen 128               # 默认 10 会在压测时静默丢帧
+```
+
+> Linux 的 `bitrate` 被 klipper 忽略（总线速率是编进固件的），但接口必须 `UP` 内核才转帧；
+> 桥板每次复位/重刷固件后这个接口会被 DOWN 掉，写进 `/etc/network/interfaces.d/can0` 的
+> `allow-hotplug` 可以省掉重敲。
+
+实测（2026-10-17，F446 桥板刷 `USBCANBUS` + F103 节点 + F446 自己也是总线上的一个节点，
+1 Mbit、`txqueuelen 128`、release 构建）：
+
+| 项目 | 结果 |
+|---|---|
+| `admin scan --interface can0` | 两颗都列出（桥板自己 `56ec3127224a` 与下游 `12f912ed3873`） |
+| `admin flash --interface can0 --uuid …` | ✅ 638 / 657 块，但**得先把板子送进引导**（见下「缺口」） |
+| 单节点 `comm`（下游） | **2272 req/s**（2842 崩） |
+| 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`＝固件脉冲生成上限） |
+| 单节点 `motion` | ✅ `motion smoke OK` |
+| **双节点并发**（桥板自身 + 下游，同一条 `can0`） | 两颗都 **2272 req/s**，聚合 ≈ 4.5k 往返/秒，互不拖累 |
+| ISO-TP（`canbus_protocol: isotp`） | ❌ 运行期未通：`candump` 能看到完整的 FF/FC/CF 与 ack 交换，但主机仍重发 `identify` 并判超时（重组完成的消息没被上层消费） |
+
+和上一节的桥端口对比：同样的 1 Mbit、同样的下游板，**主机直连的 step 是 145 455，而桥 CAN 端口只有
+15 625** —— 我们桥端口的 per-frame 转发在突发命令负载下代价明显更高（待查）。
+
+两个已知缺口（都在工具侧，记在这里免得再踩）：
+
+- **`admin flash --interface can0` 不会请求引导**（上游 `flash_can.py` 有 `-r`）。现在要先手工送一帧
+  `REQUEST_BOOTLOADER`：`cansend can0 3f0#02<uuid 12 位十六进制>`，等约 2 s 再 `admin flash`。
+- **`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器**，会报
+  `canbus: the MCU id has not been assigned`；在配置里给该节写显式 `canbus_nodeid:` 即可跑。
+
 ### 换下游控制台的波特率（UART 口）
 
 三个波特率必须对上：**应用控制台**（编进固件的 `SERIAL_BAUD`）、**桥端口**（`uart_baud`，随会话声明）、

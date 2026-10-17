@@ -387,7 +387,7 @@ pub async fn open_bridge(
     target: BridgeTarget,
 ) -> Result<BridgeReady, BridgeError> {
     declare_ports(mcu, ports).await?;
-    reset_ports(link, ports, target).await?;
+    reset_ports(link, ports, target, None).await?;
     open_target_port(link, target, PortRoute::Legacy)?;
     Ok(BridgeReady {
         ports: ports.to_vec(),
@@ -497,14 +497,15 @@ pub async fn reset_ports(
     link: &Interface,
     ports: &[BridgePort],
     target: BridgeTarget,
+    uuid: Option<[u8; 6]>,
 ) -> Result<(), BridgeError> {
     for (index, port) in ports.iter().enumerate() {
         let index = index as u8;
         match port.reset {
             PortReset::Bootloader if index == target.index => {
-                request_bootloader(link, index, target.node_id).await?
+                request_bootloader(link, index, target.node_id, uuid).await?
             }
-            reset => reset_port(link, index, reset)?,
+            reset => reset_port(link, index, reset, uuid)?,
         }
     }
     Ok(())
@@ -529,11 +530,16 @@ pub async fn reset_ports(
 ///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
-pub fn reset_port(link: &Interface, index: u8, reset: PortReset) -> Result<(), BridgeError> {
+pub fn reset_port(
+    link: &Interface,
+    index: u8,
+    reset: PortReset,
+    uuid: Option<[u8; 6]>,
+) -> Result<(), BridgeError> {
     match reset {
         PortReset::RestartDevice => link.send_restart_device(index)?,
         PortReset::ResetPort => link.send_reset_port(index)?,
-        PortReset::Bootloader => link.send_request_bootloader(index)?,
+        PortReset::Bootloader => link.send_request_bootloader(index, uuid)?,
     }
     Ok(())
 }
@@ -559,9 +565,10 @@ pub async fn request_bootloader(
     link: &Interface,
     index: u8,
     node_id: u8,
+    uuid: Option<[u8; 6]>,
 ) -> Result<(), BridgeError> {
     link.send_set_port_node_id(index, node_id, UNITS_PORT_FLAGS)?;
-    link.send_request_bootloader(index)?;
+    link.send_request_bootloader(index, uuid)?;
     tokio::time::sleep(BOOTLOADER_ENTRY_WAIT).await;
     link.send_set_port_node_id(index, node_id, LEGACY_PORT_FLAGS)?;
     Ok(())
@@ -1243,7 +1250,7 @@ mod tests {
         let pty = Pty::new();
         let link = shared_serial_link(&pty);
 
-        request_bootloader(&link, 1, TARGET_NODE_ID)
+        request_bootloader(&link, 1, TARGET_NODE_ID, None)
             .await
             .expect("the three units go out");
 
@@ -1360,9 +1367,9 @@ mod tests {
         let pty = Pty::new();
         let link = shared_serial_link(&pty);
 
-        reset_port(&link, 2, PortReset::ResetPort).expect("the pulse goes out");
-        reset_port(&link, 3, PortReset::RestartDevice).expect("the restart goes out");
-        reset_port(&link, 4, PortReset::Bootloader).expect("the bootloader request goes out");
+        reset_port(&link, 2, PortReset::ResetPort, None).expect("the pulse goes out");
+        reset_port(&link, 3, PortReset::RestartDevice, None).expect("the restart goes out");
+        reset_port(&link, 4, PortReset::Bootloader, None).expect("the bootloader request goes out");
 
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
             units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 3

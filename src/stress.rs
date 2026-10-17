@@ -2909,7 +2909,7 @@ mod tests {
             "[mcu bridge]\ntest: dict={}\n\n\
              [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n\n\
              [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\n\
-             [mcu direct]\nuuid: {}\ncanbus_interface: vcan9\n{nodeid}",
+             [mcu direct]\nuuid: {}\ncanbus_interface: can1\n{nodeid}",
             dict.display(),
             DIRECT_UUID
                 .iter()

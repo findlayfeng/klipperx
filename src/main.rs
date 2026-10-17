@@ -174,11 +174,15 @@ enum AdminCommands {
         command: AdminBridgeCommands,
     },
 
-    /// Reset a bridge itself, or a device on one of its ports
+    /// Reset a bridge itself, or a device on one of its ports, or send a board
+    /// on a CAN bus into its bootloader
     //
     // The admin-channel reset: without `--port` the bridge restarts itself (the
     // step `flash` does before declaring ports), and with `--port` the device
     // behind that declared port is reset, the way `--port-reset` says.
+    // `--interface can0 --uuid <hex> --bootloader` is the direct CAN form: one
+    // admin frame on the bus, which parks the board in katapult so
+    // `admin flash --interface` can write it.
     #[command(arg_required_else_help = true)]
     Reset(klipperx::flash::cli::ResetArgs),
 }

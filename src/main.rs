@@ -137,13 +137,15 @@ enum Commands {
 /// `admin` so the top-level verbs stay the host's own.
 #[derive(clap::Subcommand, Debug)]
 enum AdminCommands {
-    /// List the boards that have no node id yet, on a CAN bus or a serial port
+    /// Scan boards with no node id yet: a CAN bus, a serial port, a host
+    /// library, or a bridge's ports
     //
     // The query is a broadcast that changes no board's state — the UUIDs it
     // prints are what a `[mcu]` section then names in `uuid`. The transport is
     // an argument, not a second command, and it has no default:
-    // `--interface <name>` scans that CAN bus and `--port <tty>` scans that
-    // serial port, while naming neither is not a scan but a question — hence
+    // `--interface <name>` scans that CAN bus, `--port <tty>` scans that serial
+    // port, and `--bridge <tty>` enables a bridge's ports and scans the devices
+    // behind them, while naming none is not a scan but a question — hence
     // `arg_required_else_help`, like `api` and `stress`: a bare `admin scan`
     // prints the help rather than guessing at a bus.
     #[command(arg_required_else_help = true)]
@@ -159,14 +161,13 @@ enum AdminCommands {
     #[command(arg_required_else_help = true)]
     Flash(klipperx::flash::cli::FlashArgs),
 
-    /// Prepare a bridge, in its two halves: `config` declares its downstream
-    /// ports, `port` names one and opens its tunnel
+    /// Prepare a bridge, in its two halves: `config` lists the UART slots it
+    /// offers, `port` enables one and opens its tunnel
     //
-    // The bridge side of `flash` without the flash and without a reset, split
-    // where the bridge's own state is: the declaration is what makes a port
-    // exist for any later port-level command, and the route-and-tunnel is what
-    // makes one carry the katapult stream. Resetting a device is `admin reset`'s
-    // job and flashing is `admin flash`'s.
+    // The bridge side of `flash` without the flash and without a reset: `config`
+    // asks the firmware what its backend can carry, and `port` declares a port,
+    // names it and opens it for the katapult stream. Resetting a device is
+    // `admin reset`'s job and flashing is `admin flash`'s.
     #[command(arg_required_else_help = true)]
     Bridge {
         #[command(subcommand)]
@@ -184,19 +185,20 @@ enum AdminCommands {
 
 /// The `admin bridge` family: the bridge's two halves, one subcommand each.
 ///
-/// `config` declares the bridge's downstream ports — the table a port-level
-/// command needs — and stops; `port` names one of those ports and opens its
-/// flashing tunnel. Neither resets a device and neither flashes anything.
+/// `config` lists the UART slots the bridge's backend offers — the ports it can be
+/// given — and stops; `port` enables one of those ports (declares it if the bridge
+/// does not have it, names it, and opens its flashing tunnel). Neither resets a
+/// device and neither flashes anything.
 #[derive(clap::Subcommand, Debug)]
 enum AdminBridgeCommands {
-    /// Declare a bridge's downstream ports, the table a port-level command needs
+    /// List the UART slots a bridge offers, one line per port it can be given
     //
     // Naming no bridge is not a config with a guess but a question, so a bare
     // `admin bridge config` prints this help (`arg_required_else_help` in
     // `BridgeConfigArgs`).
     Config(klipperx::flash::cli::BridgeConfigArgs),
 
-    /// Name one declared bridge port and open its flashing tunnel
+    /// Enable one bridge port (declare it, name it, open its tunnel)
     //
     // The same question rule: without a bridge (or without `--port` and
     // `--port-nodeid`) it prints this help rather than talking to something

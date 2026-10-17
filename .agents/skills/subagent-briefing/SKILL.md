@@ -25,7 +25,8 @@ description: 给子代理（worker/scout/reviewer）写任务书的模板与纪�
 目录/边界：
 - 工作区：<绝对路径>（分支 <agents/…>，基 <commit>；本 worktree 只有你一个写者）
 - 可改：<文件清单>；禁止改：<文档/third_party/…>
-- 构建验证只写自己的临时目录（KCONFIG_CONFIG/OUT 外移）；worktree 里 cargo 要内联
+- 构建验证只写自己的临时目录（`KCONFIG_CONFIG`/`OUT` 外移）；固件构建用仓库根 `make`（产物落本 worktree 的
+  `out/firmware/`，子模组只读）；worktree 里 cargo 要内联
   KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper
 
 已核实的现状与规格（直接用，禁再侦察）：<file:line 级的事实、公式、字节、文案>

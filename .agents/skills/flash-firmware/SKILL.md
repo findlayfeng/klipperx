@@ -25,7 +25,7 @@ description: 构建并刷写 Klipper 目标板固件、用调试器（SWD）排�
 
 ```bash
 ./venv/bin/pyocd load -O connect_mode=halt -O frequency=1000000 -e chip \
-  --target stm32f103ze third_party/klipper/out/klipper.elf
+  --target stm32f103ze out/firmware/klipper/klipper.elf
 ```
 
 ## 第二原则：读内存/flash 前必须停核
@@ -54,7 +54,7 @@ printf 'halt\nread32 0x1FFFF7E8\nread32 0x08000000\nreset\nquit\n' | \
      `klipperx api -a /tmp/klippy_uds objects/query '{"objects":{"mcu child":null}}'`
      ↔ `make` 输出里的 `Version: <hash>`（实测刷对时两者一致）。
 2. **必要时回读比对**：`halt` 后 `savemem 0x08000000 0x10000 /tmp/board.bin`，与
-   `third_party/klipper/out/klipper.bin` 比对。**必须在 halt 态读**；同一会话连读两次都应对得上
+   `out/firmware/klipper/klipper.bin` 比对。**必须在 halt 态读**；同一会话连读两次都应对得上
    （读不可重复 ⇒ 读法不对，别拿它当证据）。
 3. **USB 链路的注意**：设备复位/刷写后会**重新枚举**，tty 号可能变（实测 `ttyACM1`→`ttyACM2`）——
    配置与脚本一律用 **by-id/by-path**，别写死 `/dev/ttyACM0`。`ls /dev/serial/by-id/` 只能证明
@@ -62,13 +62,17 @@ printf 'halt\nread32 0x1FFFF7E8\nread32 0x08000000\nreset\nquit\n' | \
 
 ## 构建（本仓）
 
-- 板子的 kconfig 在子模组：`third_party/klipper/.config`；就地构建 `cd third_party/klipper && make`
-  → `out/klipper.elf`、`out/klipper.bin`。
-- **改了 `Makefile`/`Kconfig`/源文件后先 `rm -rf out` 再 make**：`src-y` 顺序变化不会让
-  `compile_time_request` 的 recipe 重跑，`out/` 会残留旧序号的产物（曾因此把旧镜像刷进板子）。
-- 构建矩阵目标在 `third_party/klipper/test/configs/*.config`：要让某条固件路径进闸门
-  （例如 USB CDC 的 mux 接线、MCU 的 `mcu_restart()`），就加一份目标。
-- 只读分支/并行任务的验证构建，把 `KCONFIG_CONFIG`/`OUT` 指到自建目录，别覆盖板子那份 `.config`/`out/`。
+- 固件在**仓库根**构建（一次共享配置出两份）：`make`（klipper + katapult）、`make klipper`、
+  `make katapult`；配置用 `make menuconfig`（种子 `firmware.config`，工作配置 `.config`），
+  细则见 [构建 MCU 固件](../../../docs/klippy/user-manual/firmware-build.md)。
+  产物：`out/firmware/klipper/klipper.{bin,elf}`、`out/firmware/katapult/{katapult,deployer}.{bin,elf}`。
+- **改了子模组的 `Makefile`/`Kconfig`/源文件后先 `make clean` 再 `make`**：`src-y` 顺序变化不会让
+  `compile_time_request` 的 recipe 重跑，`out/firmware/` 会残留旧序号的产物（曾因此把旧镜像刷进板子）。
+- 构建矩阵目标在 `third_party/klipper/test/configs/*.config`：那是**闸门**目标（`cargo test` 的字典构建），
+  不是用户侧配置；要让某条固件路径进闸门（例如 USB CDC 的 mux 接线、MCU 的 `mcu_restart()`），就加一份目标。
+  用户侧配置走 `make menuconfig`。
+- worktree/并行任务的验证构建：仓库根 `make` 本来就只写本检出的 `out/firmware/` 与 `.config`，子模组只读；
+  在 worktree 里配 `KLIPPERX_KLIPPER_DIR` / `KLIPPERX_KATAPULT_DIR` 指向主检出即可。
 
 ## 排障经验（均来自本板实测）
 

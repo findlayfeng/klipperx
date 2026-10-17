@@ -26,7 +26,8 @@
    独立提交。worktree 里 `third_party/klipper` 保持**空目录**——不 `git submodule update`（属规则 6 禁止的
    远程交互），**也不拷**主检出的子模组（相对 gitfile 会失效）；构建/语料用
    `KLIPPERX_KLIPPER_DIR=<主检出>/third_party/klipper` 指向主检出（共享同一份检出是安全的：只写各自
-   `OUT_DIR`）；`third_party/katapult` 同理——保持空目录，读取用 `KLIPPERX_KATAPULT_DIR=<主检出>/third_party/katapult`。**命令、目录布局、子模组 worktree、并发构建与收尾见
+   `OUT_DIR`；**板子固件用仓库根 `make`**，写各自检出/worktree 的 `out/firmware/` 与 `.config`，子模组只读）；
+   `third_party/katapult` 同理——保持空目录，读取用 `KLIPPERX_KATAPULT_DIR=<主检出>/third_party/katapult`。**命令、目录布局、子模组 worktree、并发构建与收尾见
    [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md)。**此命令只由 main 执行，见规则 5。
 3. **开工前先看状态**：`git status` 确认工作区干净再切分支；发现已有未提交改动先报告，
    不要替用户 stash 或丢弃。
@@ -172,6 +173,7 @@ git config core.hooksPath .githooks
 | 改 `src/core/klippy/`（消息、MCU、命令、事件、配置、G-Code…） | [开发手册](docs/klippy/developer-manual/README.md) |
 | 改 `crates/klippy-api` / `klippy-client` 或对外 API 形状 | [第三方开发手册](docs/klippy/third-party-dev/README.md) + 开发手册的 `api` 一节 |
 | 写测试 / 查覆盖 | [测试](docs/klippy/developer-manual/testing.md)、[`TESTING.md`](TESTING.md) |
+| 构建 / 刷写板子固件 | [构建 MCU 固件](docs/klippy/user-manual/firmware-build.md)、[`flash-firmware`](.agents/skills/flash-firmware/SKILL.md) |
 | 推进上游回归 | [回归测试](docs/klippy/developer-manual/regression-tests.md) |
 | 查看当前待办与工单 | [`TODO.md`](TODO.md) |
 | 一次性分析/盘点背景 | [工作记录](docs/work-log/README.md)（非规范） |
@@ -185,6 +187,9 @@ git config core.hooksPath .githooks
 ## 常用命令
 
 ```bash
+make                                    # 板子固件：一次共享配置编 katapult + klipper 两份（见 docs/klippy/user-manual/firmware-build.md）
+make klipper / make katapult            # 只编一份
+make menuconfig                         # 改共享目标与两侧选项
 cargo test --workspace                  # 全量闸门：单元测试 + 集成测试（虚拟 workspace 必须带 --workspace 或 -p）
 cargo test -p klipperx --lib <过滤>     # 单包过滤——快，但不含 klippy-client 的集成测试
 cargo build --workspace --all-targets   # 构建告警应为 0

@@ -32,20 +32,22 @@ description: 不用编程器给板子更新/开发 katapult 自身：deployer �
 | `FLASH_APPLICATION_ADDRESS` | **deployer 的链接基址**（`armcm_deployer.lds.S:14` ORIGIN；`LAUNCH > APP` 时先垫 `LAUNCH-APP` 再放代码 ⇒ bin 内容实际落在 LAUNCH，objcopy 剥前导空隙） | 0x08002000（选 2000 后） |
 | `LAUNCH_APP_ADDRESS`（choice `STM32_APP_START_*`） | **CONNECT 自报的 start**（`flashcmd.c:26`）+ 写保护下限 + katapult 跳应用的地址 | 0x08002000 |
 
-**唯一要改的一行**（实测）：`.config` 里 `CONFIG_STM32_FLASH_START_0000=y` →
-`CONFIG_STM32_FLASH_START_2000=y`（choice 有无条件 prompt，`olddefconfig` 不会重算掉），
-然后 `make olddefconfig && make`。
+**唯一要改的一处**（实测）：在仓库根 `make menuconfig` 里把共享目标的引导偏移从 "No bootloader"
+改成 "8KiB bootloader"（`STM32_FLASH_START_2000`；也可以直接改 `.config` 后 `make olddefconfig`），
+然后 `make katapult`。这会把 katapult 的 `LAUNCH_APP_ADDRESS`（`STM32_APP_START_2000`）一起对上，
+并让 deployer 被构建。派生后的 katapult 配置在 `out/firmware/katapult.config`（可当证据看）。
 
 ## 自举四步（本机实测命令）
 
-### 1. 构建
+### 1. 构建（仓库根）
 
 ```sh
-cd third_party/katapult
-# 按上表核对/修改 .config 后：
-make olddefconfig
-make        # 产出 out/katapult.bin（=新引导镜像）与 out/deployer.bin（内嵌它）
+make menuconfig   # 共享目标：8KiB bootloader（应用在 0x8002000）
+make katapult     # 产出 out/firmware/katapult/katapult.bin（新引导）与 deployer.bin（内嵌它）
 ```
+
+尺寸上限由 katapult 自己的 `buildbinary.py` 按 `LAUNCH_APP_ADDRESS - FLASH_START` 检查
+（8KiB 偏移 = 8192 B），超了构建直接失败。
 
 ### 2. 刷前静态核验（不过不刷；没恢复舱时尤其）
 
@@ -58,17 +60,18 @@ make        # 产出 out/katapult.bin（=新引导镜像）与 out/deployer.bin�
 
 ### 3. 刷前读回（只读、零风险的终极保险）
 
-用 `REQUEST_BLOCK(0x14)` 把 0x08000000 起 `len(katapult.bin)` 字节读回与 `out/katapult.bin`
-比对——**True 才代表「板上在跑的 == 我们这份构建」**，deployer 写入即零变化彩排（首跑必做）。
+用 `REQUEST_BLOCK(0x14)` 把 0x08000000 起 `len(katapult.bin)` 字节读回与
+`out/firmware/katapult/katapult.bin` 比对——**True 才代表「板上在跑的 == 我们这份构建」**，
+deployer 写入即零变化彩排（首跑必做）。
 应答布局（踩过坑）：payload = `orig_cmd(4) + addr(4) + data`——**addr 在帧偏移 8、data 从 12 起**
 （别拿 4 当 addr）。USB 双缓冲要先 prime：`01 88 90 00 e5 e9 99 03`（CRC 值 0xE9E5，**LE 上线**）。
 
 ### 4. 刷 deployer + 验证
 
 ```sh
-cargo build --bin flash            # 本仓 T4b 的独立 bin（会自动 prime）
-target/debug/flash --device /dev/serial/by-id/usb-katapult_stm32f103xe_<chipid>-if00 \
-    third_party/katapult/out/deployer.bin
+# `klipperx admin flash` 会自动 prime
+cargo run -- admin flash --device /dev/serial/by-id/usb-katapult_stm32f103xe_<chipid>-if00 \
+    out/firmware/katapult/deployer.bin
 ```
 
 预期输出：`connect: … start 0x08002000` → N/N written → `eof: 3 pages` → N/N verify →

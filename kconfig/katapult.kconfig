@@ -1,0 +1,59 @@
+# Bootloader-side options: the ones only katapult has.
+#
+# The symbol names and defaults are katapult's own
+# (third_party/katapult/src/Kconfig); `scripts/firmware-config.py` forwards
+# the values to that tree, so what is chosen here is what the bootloader is
+# built with.  Nothing in this menu affects the klipper application.
+#
+# Not merged on purpose:
+#   - the USB device id: katapult keeps 0x6177 (the id flashing tools look
+#     for), klipper keeps 0x614e.
+#   - the deployer: katapult derives BUILD_DEPLOYER from the bootloader
+#     offset, so a "no bootloader" build does not get one.
+#   - the optimization level: katapult builds -Os (size), klipper -O2.
+#
+# One limitation to know about: on STM32, katapult's application slot is its
+# own choice and its items are conditional on the processor.  An STM32F103 (the
+# reference board) only offers 4/8 KiB (STM32_APP_START_1000/2000); F2/F4/H750
+# add 16/32 KiB and H7 128 KiB.  The shared bootloader menu is klipper's (it
+# also has 2/20/28/34/48/64/128+0.5 KiB), so a pair outside what katapult offers
+# for that chip is refused at build time with the offsets named.
+
+menu "Katapult bootloader"
+
+config ENABLE_DOUBLE_RESET
+    bool "Enter the bootloader on a rapid double reset"
+    default y
+    help
+        Reset the board twice in quick succession to stay in the bootloader
+        instead of starting the application.  This is how a board with no
+        button and no software request is recovered.
+
+config ENABLE_BUTTON
+    bool "Enter the bootloader on a button or GPIO state"
+    default n
+    help
+        Sample a pin at startup and stay in the bootloader while it is held.
+        The pin is not configured by the application.
+
+config BUTTON_PIN
+    string "Button GPIO pin"
+    depends on ENABLE_BUTTON
+    help
+        A pin name as Klipper spells it (e.g. "PA0").  Preface it with '!'
+        to invert the sense (held low).
+
+config ENABLE_LED
+    bool "Drive a status LED from the bootloader"
+    default n
+    help
+        Keep one pin driven as an output while the bootloader runs, so the
+        board shows it is in bootloader mode.
+
+config STATUS_LED_PIN
+    string "Status LED GPIO pin"
+    depends on ENABLE_LED
+    help
+        A pin name as Klipper spells it (e.g. "PC13").
+
+endmenu

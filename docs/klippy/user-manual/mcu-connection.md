@@ -309,7 +309,7 @@ sudo ip link set dev can0 txqueuelen 128               # 默认 10 会在压测�
 | 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`＝固件脉冲生成上限） |
 | 单节点 `motion` | ✅ `motion smoke OK` |
 | **双节点并发**（桥板自身 + 下游，同一条 `can0`） | 两颗都 **2272 req/s**，聚合 ≈ 4.5k 往返/秒，互不拖累 |
-| ISO-TP（`canbus_protocol: isotp`） | ❌ 运行期未通：`candump` 能看到完整的 FF/FC/CF 与 ack 交换，但主机仍重发 `identify` 并判超时（重组完成的消息没被上层消费） |
+| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP`、无 mux） | ✅ 运行期通了：`identify` 139 条、`motion` 绿；**comm 742 req/s**（切片是 2272）、**step 首段 10 000 steps/s 就不过**（命令突发在 ISO-TP 下每条约 2 帧，代价约为切片的 3 倍——高步频板不要用 ISO-TP） |
 
 和上一节的桥端口对比：同样的 1 Mbit、同样的下游板，**主机直连的 step 是 145 455，而桥 CAN 端口只有
 15 625** —— 我们桥端口的 per-frame 转发在突发命令负载下代价明显更高（待查）。

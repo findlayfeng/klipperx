@@ -325,3 +325,22 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 **压测同时确认的两个结构事实**：并发损耗不对称（UART 损被中继的一侧 ~20%，CAN 损桥自己的控制台 ~36%，
 因为 CAN 中继在桥固件里更贵）；CAN 的 `queue_step` 在经典帧下每条拆两帧，压测的**突发下发**会先撞
 `Timer too close`（真实主机是随移动队列连续投递，所以现场能力好于这个数字，但高步频板仍建议走 UART 500 k）。
+
+## 实施记录：ISO-TP 载具（U7/U8/U9/U12/U14）与那条 BS=0 的教训
+
+- **固件（U7/U8/U9）**：新增 `src/generic/bridge_can_isotp.{c,h}`——per-node 的 ISO-TP 收发状态，
+  载具由 `SET_PORT_NODEID` 的 flags bit1（`MUX_PORT_ISOTP`）声明，**隧道强制切片**；构建闸门
+  `test/configs/stm32f446-usb-can-bridge-isotp.config`（端口型桥 51 476 B → 开载具 53 264 B）。
+- **主机（U12/U14）**：`[can_device] can_protocol: cans|isotp`、`admin bridge port --port-carrier`、
+  `admin bridge config` 报告载具；`admin flash` 刻意没有载具参数（隧道恒切片）。flags 字节只有一处组装
+  （`PortCarrier::flags()`）。
+- **真机第一个结论（重要）**：两条 ISO-TP 路径（桥端口载具、主机直连 `canbus_protocol: isotp`）**都失败了**，
+  而且失败形态一模一样：`candump` 上 FF → FC(`30 00 00`) → **只有 1 个 CF** → 25 ms 后静默超时。
+  根因在两端固件：把流控帧的 **`BS=0` 当成了「本块 0 帧」**而不是「不限」，于是每条消息发完首帧 + 一个
+  连续帧就去等永远不会来的下一个 FC。**主机半（`isotp_proto.rs` 的 `block_left: Option`）本来就是对的**，
+  所以 22+8 条单测从未暴露它——只有真机 + 抓包能看出来。
+- 修法：`tx_block_limited` 与 `tx_block` 分开记（`2644195c`），BS=0 继续流式发，有限块才停等 FC。
+- **修复后的实测（主机直连，上游 USBCANBUS 当收发器，F446 + F103，1 Mbit）**：`identify` 139 条、
+  `motion` 绿、**comm 742 req/s**（切片 2272，约 1/3）、**step 首段 10 000 steps/s 即超时**。
+  也就是说 ISO-TP 是「能跑但不适合高步频」的运行期载具——经典 8 B 帧下每条命令约 2 帧的代价摆在
+  那里。桥端口载具的复测待 F446 回到桥固件后补。

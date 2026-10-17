@@ -65,7 +65,7 @@
 | # | 裁定 | 理由 | 代价 |
 |---|---|---|---|
 | **D1** | CAN 端口后端 = 新文件 `src/generic/bridge_can.c`，只依赖 `canbus.h` 的板级钩子；**不 select `CANSERIAL`、不 select `MUX_CAN`**，只 `select CANBUS` 拉驱动 | 避开 `mux_send` 双实现（§1.2-2）；端口不绑本节点 id，才能听多个下游 id | 端口后端自己管过滤器与 rx 分桶 |
-| **D2** | CAN 引脚从控制台 `choice` 里解耦：新增 `STM32_BRIDGE_CAN_PB8_PB9`（低层选项）等端口专用引脚项，`select CANBUS` + `select BRIDGE_PORT_CAN`，与 USB 控制台共存 | 拓扑 B 的全部意义就是「USB 控制台 + CAN 端口」；用 PB8/PB9 避开 USB 的 PA11/PA12 | 对上游 Kconfig 的偏离，必须进 `upstream-deviations.md` |
+| **D2** | CAN 引脚从控制台 `choice` 里解耦：新增 `STM32_BRIDGE_CAN_PB8_PB9`（低层选项）等端口专用引脚项，`select CANBUS` + `select BRIDGE_PORT_CAN`，与 USB 控制台共存 | 拓扑 B 的全部意义就是「USB 控制台 + CAN 端口」；但 **F1 上做不到**：USB 与 CAN1 RX0 是同一个中断向量（20，`USB_LP_CAN1_RX0_IRQn`），上游同一规则（`HAVE_STM32_USBCANBUS depends on !MACH_STM32F1`）。⇒ F103 要 CAN 端口就拿 USART 做控制台（需 `LOW_LEVEL_OPTIONS`）+ USB-UART 转换器；要 USB 控制台就换 F4（USB OTG + CAN1） | 对上游 Kconfig 的偏离，必须进 `upstream-deviations.md`；Kconfig 里写成 `depends on !(MACH_STM32F1 && USBSERIAL)` |
 | **D4** | 端口的 CAN arb 来源：**UNITS 口从单元头解**（`mux_decode_header`→`mux_node_id_from_arb`→`mux_arb_id`）；**legacy/tunnel 口用端口记的 `node_id`**（`SET_PORT_NODEID` 两种形态都记 id，协议页 `:298-316` 已如此） | `bridge.h` 的 `write` 拿不到 arb；legacy 剥头后 arb 丢失 | `bridge.h` 加只读访问器 `bridge_port_node_id(int)`（子模组小改，本规划已批准） |
 | **D5** | 过滤器扩为**可追加**：新增 `canhw_add_filter(uint32_t arb)`（上限固定，bxCAN 走 bank 池，linux 空实现），`canhw_set_filter` 保持原义 | 下游每个 node 要两条 arb（`0x100+2n`、`+1`），单 id 接口不够 | 改 `generic/canbus.h` + 各 arch `can.c`（子模组改动，本规划已批准） |
 
@@ -84,6 +84,7 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 | **U2** | **CAN 端口后端本体**：`uart_backend_open`（CAN 忽略 `baud`，只接受「CAN 槽」；占用则 `UART_OPEN_BUSY`）、`port_ops.write`（解单元头→arb→≤8 B 切片→`canbus_send`；发不出去就整块留队重试，永不切块）、`reset = NULL`、`set_port` 记 index | 新 `src/generic/bridge_can.c` | 单元测试级：给定「单元字节 → 期望帧序列（arb+分片）」的纯函数可测；`canbus_send` 返回 -1 时不丢块（桩函数断言重试） |
 | **U3** | **Kconfig 解耦 + 构建开关**：新增 `BRIDGE_PORT_CAN`（`select UART`）；STM32 侧端口专用引脚项（D2，PB8/PB9 先做，其余按需）`select CANBUS` + `select BRIDGE_PORT_CAN`；**不 select `CANSERIAL`/`MUX_CAN`** | `src/Kconfig`、`src/stm32/Kconfig`、`src/{Makefile,stm32/Makefile}` | 新 config 能同时开出 `USBSERIAL` + `MUX_SERIAL` + `BRIDGE_PORT_SERIAL` + `BRIDGE_PORT_CAN`，且 `mux_send` 只有一份（链接通过） |
 | **U4** | **过滤器追加接口**（D5）：`canhw_add_filter(arb)`；bxCAN 的 bank 分配（`0x3f0`+自身 id 之外追加下游 id 对）、`fdcan.c` 同形、linux 空实现、rp2040/lpc176x 至少编译通过 | `src/generic/canbus.h`、`src/{stm32/can.c,stm32/fdcan.c,linux/can.c,...}` | 每 arch 编译 0 告警；超出上限时报错（`shutdown` 附带原因），不静默丢 |
+| **U5b** | （**下一单元，真机的前置**）**CAN 单帧 admin 代理**：桥代发 `0x3f0`（查询 `[0x00]`、指派 `[0x01\|0x11][uuid6][nodeid]`、清号 `[0x12]`），并把 `0x3f1` 的 `NEED_NODEID` 应答（`[0x20][uuid6][app]`）**包成带端口路径的单元上行**（`mux_unit_with_path` 同形）；端口开时无条件装 `0x3f1` 过滤器。没有它，未指派的 CAN 下游设备无法被发现/指派，`admin scan --bridge --ports <can槽>` 与首次刷写均不成立 | `src/generic/bridge_can.c`（下行代发 + 上行包装）、`src/bridge.c`（广播分发时识别 CAN 端口）、`src/stm32/can.c`（过滤器） | 单元级：查询→应答→指派→重扫四步的帧序列测试；未指派设备经桥能取到 uuid 与端口路径；重复指派幂等 |
 | **U5** | **收侧分桶 + arb 来源**：`canbus_process_data` 在 `CONFIG_BRIDGE_PORT_CAN` 时把「下游 arb」的帧交给 bridge_can 的 per-node 重组缓冲（**不进** `CanData.receive_buf`），凑齐一个整单元/整块后 `bridge_port_input(index, …)`；`bridge.h` 加 `bridge_port_node_id(int)` 供 legacy/tunnel 口取 arb | `src/generic/canserial.c`（分派点）、`src/generic/bridge_can.c`、`src/bridge.{h,c}` | 纯函数测试：两个 node 的帧交错到达 → 两条独立流各自完整；无 node_id 的 legacy 口收到数据不 panic（丢弃 + 计数） |
 | **U6** | **构建闸门配置**：`test/configs/stm32f103-usb-can-bridge.config`（USB CDC + `MUX_SERIAL` + 两个 USART 端口 + CAN 端口） | `third_party/klipper/test/configs/` | 闸门 `cargo test --workspace` 里被编过（现有机制按目录遍历，`crates/test-support/build.rs:151-197`），字典能产出 |
 ### P3 主机：配置面与 attach
@@ -118,7 +119,7 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 
 | # | 设备 | 用途 | 备注 |
 |---|---|---|---|
-| 1 | **CAN 测试专板 A（新，桥）**：STM32F103ZE + **CAN 收发器模块**（3.3 V：SN65HVD230/TCAN332 一类） | 桥：USB CDC 控制台，CAN 当它的下游口 | CAN 接 **PB8(RX)/PB9(TX)**，避开 USB 的 PA11/PA12（D2） |
+| 1 | **CAN 测试专板 A（新，桥）**，二选一：<br>(a) **F103 + USART 控制台**（USART2，需 `LOW_LEVEL_OPTIONS`）+ **USB-UART 转换器**；<br>(b) **F4（如 F407）+ USB CDC 控制台** | 桥：控制台 + CAN 当它的下游口 | **F103 上 USB 与 CAN 共向量 20，不可共存**（见 D2）；两种形态都能跑，区别只在主机侧链路是串口还是 USB CDC |
 | 2 | **CAN 测试专板 B（新，下游）**：STM32F103ZE + 同款收发器 | 下游端口的被测设备 | 需能刷 `CANSERIAL`(±`MUX_CAN`) 的应用固件；引导态 stock katapult（CAN 载体，裸切片） |
 | 3 | **120 Ω ×2** | 总线两端终端 | 新桥板与新下游板各一端 |
 | 4 | 双绞线 + 共地 | 物理层 | 短距离即可，但两端终端不能省 |
@@ -175,4 +176,11 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 
 ### 进行中
 
-**U2**（CAN 端口后端切片载具 + D6 管线解绑 + `.node_id` 回调 + 新构建目标 `stm32f103-usb-can-bridge`）：分支 `agents/feat-bridge-can-backend`（klipper worktree `can-port-backend`）。
+**U2** ✅ 已合入（`18e35da4` / `7d578035` / `62ec8298`，合入 `29aaa353`）：`CONFIG_BRIDGE_PORT_CAN` + `src/generic/bridge_can.c`——CAN 管线从 CANserial 节点解绑（`canbus.c` 加守卫、`canbus-src-y` 拆出 `canbus-driver-src-y`）、`bridge_port_ops` 的 `.node_id` 钩子装过滤器、`write` 解单元头得 arb（legacy/隧道口用端口 `node_id`）、收侧按 node 分桶后交路由器；构建闸门 `test/configs/stm32f103-serial-can-bridge.config`。
+
+**审出的 P1（已修）**：`bridge_can_task` 原本在 `irq_save()` 里调 `bridge_port_input()`——那是路由入口（会组帧、路由、写别的端口），不能隔着关中断跑；改成「锁内只拷出 + 腾空间，锁外再交路由器」（`62ec8298`）。
+
+
+**验证（4 条构建全 rc=0）**：新目标 `BRIDGE_UART_COUNT=2` 且 `bridge_can.o` 有七个 `T bridge_can_*`；`usb-mux-bridge`（count=1）、`can-mux`、真机 `target/hw-bridge/klipper.config`（count=2）均**无** `bridge_can_*` 符号；主仓 `cargo test --workspace` 3206 通过 / 15 ignored。
+
+**已知缺口 → U5b**：CAN 单帧 admin（`0x3f0`/`0x3f1`）未代理，而且端口开时也没有人装 admin 过滤器，所以**经桥扫描/指派一台未指派的 CAN 下游设备现在还不可能**。这是真机测试的前置单元（U5b，§3 已排），不是本轮遗留缺陷。

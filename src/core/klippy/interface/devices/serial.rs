@@ -1147,6 +1147,85 @@ impl TunnelRegistry {
     }
 }
 
+/// One listener for whole units headed with one arbitration id: the scan end of
+/// an admin channel.
+///
+/// A bridge's downstream devices answer a discovery broadcast on
+/// [`ADMIN_REPLY`], an id no MCU owns, so those units reach no slot and the
+/// reader drops them (see [`dispatch`]). A listener registered with
+/// [`SharedSerialHandle::set_unit_sink`] gets each one whole — header included,
+/// the shape [`UnassignedScan::feed`] takes — on the receiver
+/// [`UnitSink::channel`] returns; dropping it is how a listener leaves.
+#[derive(Debug, Clone)]
+pub struct UnitSink {
+    units: mpsc::Sender<Vec<u8>>,
+}
+
+impl UnitSink {
+    /// A sink and the receiver it hands whole units to.
+    pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let (units, receiver) = mpsc::channel();
+        (Self { units }, receiver)
+    }
+
+    /// Hand one whole unit over; `false` when the receiver is gone.
+    fn deliver(&self, unit: &[u8]) -> bool {
+        self.units.send(unit.to_vec()).is_ok()
+    }
+}
+
+/// One link's unit listeners, keyed by the arbitration id their units are
+/// headed with — the admin channel's counterpart to [`TunnelRegistry`].
+///
+/// The difference is what is handed over: a tunnel listener gets the frame's
+/// bytes (a whole katapult block), a unit listener the unit as it arrived
+/// ([`ADMIN_REPLY`]'s header included), because a scan answer is read as a
+/// unit. Delivering to an id nobody registered answers `false`, and the reader
+/// drops that unit the way it did before there were listeners; a receiver that
+/// has gone away is unregistered on the delivery that finds it.
+#[derive(Debug, Default)]
+pub(crate) struct UnitRegistry {
+    sinks: Mutex<HashMap<u32, UnitSink>>,
+}
+
+impl UnitRegistry {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route `arb`'s whole units to `sink` from now on; a second registration
+    /// under the same id replaces the first.
+    pub(crate) fn register(&self, arb: u32, sink: UnitSink) {
+        self.sinks.lock().unwrap().insert(arb, sink);
+    }
+
+    /// Stop routing `arb`'s whole units; an unregistered id is a no-op.
+    pub(crate) fn clear(&self, arb: u32) {
+        self.sinks.lock().unwrap().remove(&arb);
+    }
+
+    /// Whether `arb` has a live listener — what the reader asks before it
+    /// accepts a unit no MCU owns.
+    pub(crate) fn has(&self, arb: u32) -> bool {
+        self.sinks.lock().unwrap().contains_key(&arb)
+    }
+
+    /// Hand one whole unit to `arb`'s listener, if any. `false` when nobody
+    /// listens — including a listener whose receiver has been dropped, which is
+    /// removed here so a later delivery does not try it again.
+    pub(crate) fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
+        let mut sinks = self.sinks.lock().unwrap();
+        match sinks.get(&arb).map(|sink| sink.deliver(unit)) {
+            Some(true) => true,
+            Some(false) => {
+                sinks.remove(&arb);
+                false
+            }
+            None => false,
+        }
+    }
+}
+
 /// One board's answer to [`discovery_query`]: the UUID it is remembered by,
 /// and the application it runs.
 ///
@@ -1441,6 +1520,10 @@ pub struct SharedSerialPort {
     /// units are headed with — the uplink half of a flashing tunnel
     /// ([`SharedSerialHandle::set_tunnel_sink`]).
     tunnels: TunnelRegistry,
+    /// The listeners for whole units under an id no MCU owns — a bridge's
+    /// admin answers, which a scan reads
+    /// ([`SharedSerialHandle::set_unit_sink`]).
+    units: UnitRegistry,
     stopped: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1655,6 +1738,7 @@ impl SharedSerialPort {
             attach_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
             tunnels: TunnelRegistry::new(),
+            units: UnitRegistry::new(),
             stopped: AtomicBool::new(false),
             reader: Mutex::new(None),
         });
@@ -1814,8 +1898,12 @@ fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut boo
         };
 
         // Not an arbitration id this port routes (neither an MCU's listener id
-        // nor an answer id): no unit can start here.
-        if assign::mcu_id_from_arb(arb).is_none() {
+        // nor an answer id): no unit can start here — unless a scan listener is
+        // registered for it. A bridge's downstream devices answer on
+        // `ADMIN_REPLY`, which no MCU owns, and a scan is exactly the listener
+        // for those.
+        let routed = assign::mcu_id_from_arb(arb).is_some();
+        if !routed && !port.units.has(arb) {
             drop_to_sync(pending, needs_sync);
             continue;
         }
@@ -1836,10 +1924,9 @@ fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut boo
                 let block = &pending[consumed..consumed + frame];
                 if !port.tunnels.deliver(arb, block) {
                     debug!(
-                        "shared serial {}: no tunnel listener; dropping {}-byte tunnel unit for mcu {}",
+                        "shared serial {}: no tunnel listener; dropping {}-byte tunnel unit for arb {arb:#x}",
                         port.path.display(),
                         HEADER_BYTES + frame,
-                        assign::mcu_id_from_arb(arb).expect("checked above"),
                     );
                 }
                 pending.drain(..consumed + frame);
@@ -1849,6 +1936,18 @@ fn dispatch(port: &SharedSerialPort, pending: &mut Vec<u8>, needs_sync: &mut boo
 
         let unit_len = consumed + frame_len;
         let unit = &pending[..unit_len];
+        if !routed {
+            // A whole unit under an id no MCU owns: a scan answer, handed over
+            // as it arrived. A listener that left between the check above and
+            // here is a unit nobody wants, so the stream resynchronises as it
+            // did before there were listeners.
+            if !port.units.deliver(arb, unit) {
+                drop_to_sync(pending, needs_sync);
+                continue;
+            }
+            pending.drain(..unit_len);
+            continue;
+        }
         if let Some(mcu_id) = parse_assignment_ack(unit) {
             // The answer to a handshake: it goes to the ack slot, not to
             // `incoming`, where it would look like a malformed frame.
@@ -1972,6 +2071,24 @@ impl SharedSerialHandle {
     /// Stop routing `arb`'s tunnel units to the sink registered for it.
     pub fn clear_tunnel_sink(&self, arb: u32) {
         self.port.tunnels.clear(arb);
+    }
+
+    /// Route this port's **whole units** headed with `arb` to `sink`: how a
+    /// scan reads a bridge's admin answers.
+    ///
+    /// `arb` is [`ADMIN_REPLY`] — the id every device behind the bridge answers
+    /// a discovery broadcast on, which no MCU owns, so without a listener the
+    /// reader drops those units. The sink gets each unit as it arrived (header
+    /// included: [`UnassignedScan::feed`]'s shape). Registering the same id
+    /// twice replaces the first sink; [`Self::clear_unit_sink`] removes it, and
+    /// so does dropping the receiver (see [`UnitSink::channel`]).
+    pub(crate) fn set_unit_sink(&self, arb: u32, sink: UnitSink) {
+        self.port.units.register(arb, sink);
+    }
+
+    /// Stop routing `arb`'s whole units to the sink registered for it.
+    pub(crate) fn clear_unit_sink(&self, arb: u32) {
+        self.port.units.clear(arb);
     }
 
     /// Send one admin-channel unit to the bridge on this port: the

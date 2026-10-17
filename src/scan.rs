@@ -44,7 +44,9 @@
 //! [`discovery_query`]: crate::core::klippy::interface::devices::serial::discovery_query
 
 use clap::Args;
-use std::time::Duration;
+use std::path::Path;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use crate::core::klippy::interface::devices::canserial::{
     query_unassigned, CanbusAdminSocket, UnassignedNode as CanNode,
@@ -52,15 +54,35 @@ use crate::core::klippy::interface::devices::canserial::{
 use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::SerialDevice;
 use crate::core::klippy::interface::devices::serial::{
-    serial_query_unassigned, UnassignedNode as SerialNode,
+    discovery_query, serial_query_unassigned, UnassignedNode as SerialNode, UnassignedScan,
+    UnitSink, ADMIN_REPLY, HEADER_BYTES,
 };
+use crate::flash::{BridgeLink, BRIDGE_MCU_ID, IDENTIFY_TIMEOUT};
 
-/// How long a scan listens, in seconds: the window Klipper's tool uses.
+/// How long a scan listens for one bridge port's answers, in seconds — the same
+/// window a direct scan uses, and the value `--timeout` overrides.
 const DEFAULT_TIMEOUT: f64 = 2.0;
 
 /// The line speed a serial scan opens the port at when `--baud` is not given,
 /// in baud.
 const DEFAULT_BAUD: u32 = 250_000;
+
+/// The quiet window a bridge scan waits out before each round and after it, in
+/// milliseconds.
+///
+/// A bridge's discovery broadcast is fanned out to **every** port it has, so an
+/// answer can arrive after its own round's window has closed — and the next
+/// round's answers are the only ones that may be attributed to the next port.
+/// A quiet window after each round takes those late answers out of the stream
+/// (and drops them, rather than reporting them against the wrong port), and the
+/// one before the first round does the same for anything left over from an
+/// earlier broadcast. Three hundred milliseconds is several times a round trip on
+/// the wire a bridge carries.
+const BRIDGE_SILENCE_WINDOW: Duration = Duration::from_millis(300);
+
+/// The port indexes a bridge scan enables and scans when `--ports` is not given:
+/// the bridge's first port.
+const DEFAULT_BRIDGE_PORTS: [u8; 1] = [0];
 
 #[derive(Args, Debug)]
 pub struct ScanArgs {
@@ -84,6 +106,25 @@ pub struct ScanArgs {
     #[arg(long)]
     pub host_library: Option<String>,
 
+    /// A **bridge** to scan instead of a bus, a port or a library: the device
+    /// path of its console (`/dev/ttyACM0`). Each answer is reported with the
+    /// `--ports` index it came through
+    #[arg(long, value_name = "TTY")]
+    pub bridge: Option<String>,
+
+    /// Identity of the **serial bridge** board itself, twelve hex digits — the
+    /// same spelling `flash --bridge-uuid` uses (only with `--bridge`)
+    //
+    // Optional: without it the bridge is found by the discovery scan when it
+    // carries no node id yet, exactly as the other bridge commands find it.
+    #[arg(long, value_name = "HEX")]
+    pub bridge_uuid: Option<String>,
+
+    /// Bridge port indexes to enable and scan, in order (`0`; only with
+    /// `--bridge`)
+    #[arg(long, value_name = "INDEX,INDEX")]
+    pub ports: Option<String>,
+
     /// The identity the host library answers the serial mux with: twelve hex
     /// digits, the order a `[mcu] uuid:` option is written in (default
     /// `000000000000`; host library scans only)
@@ -98,7 +139,8 @@ pub struct ScanArgs {
     #[arg(long, default_value_t = DEFAULT_TIMEOUT)]
     pub timeout: f64,
 
-    /// Line speed, in baud (serial scans only)
+    /// Line speed, in baud (serial and bridge scans; a bridge opens its ports at
+    /// the same rate)
     #[arg(long)]
     pub baud: Option<u32>,
 }
@@ -117,6 +159,40 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
     // command has one: giving it alone asks for a device that is not there.
     if args.host_identity.is_some() && args.host_library.is_none() {
         return Err("--host-identity needs --host-library".into());
+    }
+
+    // The bridge is a transport of its own, and its own flags only mean
+    // something with it: `--bridge-uuid` names the board, `--ports` the ports a
+    // scan round enables.
+    if args.bridge.is_some() {
+        if let Some(other) = bridge_conflict(&args) {
+            return Err(format!("give either --bridge or {other}, not both").into());
+        }
+        let uuid = args
+            .bridge_uuid
+            .as_deref()
+            .map(parse_identity)
+            .transpose()?;
+        let ports = match args.ports.as_deref() {
+            Some(text) => parse_ports(text)?,
+            None => DEFAULT_BRIDGE_PORTS.to_vec(),
+        };
+        let total = bridge_query_unassigned(
+            args.bridge.as_deref().expect("checked above"),
+            uuid,
+            args.baud.unwrap_or(DEFAULT_BAUD),
+            &ports,
+            window,
+            |index, node| println!("{}, port {index}", serial_line(&node)),
+        )?;
+        println!("{}", total_line(total));
+        return Ok(());
+    }
+    if args.bridge_uuid.is_some() {
+        return Err("--bridge-uuid needs --bridge".into());
+    }
+    if args.ports.is_some() {
+        return Err("--ports needs --bridge: which bridge's ports to scan".into());
     }
 
     match (&args.port, &args.interface, &args.host_library) {
@@ -169,7 +245,152 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
         // command line, where `arg_required_else_help` prints the help instead
         // (see the `scan` variant in `main.rs`).
         (None, None, None) => {
-            Err("give --interface (CAN), --port (serial) or --host-library".into())
+            Err("give --interface (CAN), --port (serial), --host-library or --bridge".into())
+        }
+    }
+}
+
+/// The other transport a `--bridge` command line also named, if any — the
+/// argument the mistake is named after.
+fn bridge_conflict(args: &ScanArgs) -> Option<&'static str> {
+    match (&args.interface, &args.port, &args.host_library) {
+        (Some(_), _, _) => Some("--interface (CAN)"),
+        (_, Some(_), _) => Some("--port (serial)"),
+        (_, _, Some(_)) => Some("--host-library"),
+        _ => None,
+    }
+}
+
+/// Parse `--ports`: the bridge port indexes a scan enables and scans, in the
+/// order they are given.
+///
+/// The bridge numbers a port by declaration order, so an index is a slot a
+/// backend offers — the same number `admin bridge config` lists — and a repeat is
+/// a mistake rather than a second scan of the same port.
+fn parse_ports(text: &str) -> Result<Vec<u8>, String> {
+    let mut ports: Vec<u8> = Vec::new();
+    for part in text.split(',') {
+        let index = part.trim().parse::<u8>().map_err(|_| {
+            format!(
+                "--ports expects bridge port indexes like 0,1, got '{}",
+                part.trim()
+            )
+        })?;
+        if ports.contains(&index) {
+            return Err(format!("--ports names port {index} twice"));
+        }
+        ports.push(index);
+    }
+    if ports.is_empty() {
+        return Err("--ports needs at least one bridge port index".into());
+    }
+    Ok(ports)
+}
+
+/// Scan the devices behind `bridge`'s ports: enable the ports `ports` names and
+/// broadcast a discovery query through each, reporting every answer with the
+/// port it came through.
+///
+/// The bridge's port table lives in its firmware's RAM and starts empty after a
+/// restart, so this run builds it: each round declares the next port (one slot
+/// per round, in ascending index, because the bridge numbers a port by the order
+/// its declaration rows reach it) and then broadcasts through the table it has.
+/// The broadcast itself is the bridge's — a bridge fans every admin broadcast out
+/// to **all** its ports, which is why the rounds are separated by quiet windows
+/// ([`BRIDGE_SILENCE_WINDOW`]) and why an answer belongs to the round it arrived
+/// in: only a port declared in that round can have answered for the first time.
+///
+/// This needs the bridge's own serial port ([`SharedSerialHandle`]) rather than
+/// its frame channel: a downstream device answers on [`ADMIN_REPLY`], an id no
+/// MCU owns, so the answers reach a listener registered on the port and never a
+/// slot.
+///
+/// # Errors
+/// Whatever opening, identifying or declaring the bridge fails with. A bridge
+/// that answers nothing is **not** an error: the scan reports `Total 0 uuids
+/// found`, exactly as a quiet bus does.
+///
+/// [`SharedSerialHandle`]: crate::core::klippy::interface::devices::serial::SharedSerialHandle
+fn bridge_query_unassigned(
+    tty: &str,
+    uuid: Option<[u8; 6]>,
+    baud: u32,
+    ports: &[u8],
+    window: Duration,
+    mut report: impl FnMut(u8, SerialNode),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // The link is opened inside the runtime: its connection captures the
+    // runtime's handle for the transport tasks it starts (`Interface::handle`).
+    let link = runtime.block_on(async {
+        let mut link = BridgeLink::open_serial(Path::new(tty), baud, BRIDGE_MCU_ID, uuid)?;
+        tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
+        // A port can only be declared once, and the table a previous run built
+        // is still in the firmware's RAM: restart it so this run's declarations
+        // start from an empty table.
+        link.reset().await?;
+        Ok::<BridgeLink, Box<dyn std::error::Error>>(link)
+    })?;
+
+    let handle = link
+        .shared_handle()
+        .expect("a serial bridge is on a shared serial port")
+        .clone();
+    let (sink, answers) = UnitSink::channel();
+    handle.set_unit_sink(ADMIN_REPLY, sink);
+
+    // Anything still arriving from an earlier broadcast is not this run's.
+    discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
+
+    let mut scan = UnassignedScan::new();
+    let mut declared: u8 = 0;
+    for &index in ports {
+        while declared <= index {
+            runtime.block_on(link.declare_port(declared, baud))?;
+            declared += 1;
+        }
+        discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
+        handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
+        let deadline = Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match answers.recv_timeout(remaining) {
+                Ok(unit) => {
+                    if let Some(node) = scan.feed(&unit) {
+                        report(index, node);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        // A late answer belongs to no port this run could name, so it is
+        // dropped here instead of being reported against the next one.
+        discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
+    }
+    let total = scan.total();
+    handle.clear_unit_sink(ADMIN_REPLY);
+    link.close();
+    Ok(total)
+}
+
+/// Drop whatever the scan listener collects for `window` — the quiet window
+/// between two rounds.
+fn discard_answers(answers: &Receiver<Vec<u8>>, window: Duration) {
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        if answers.recv_timeout(remaining).is_err() {
+            return;
         }
     }
 }
@@ -278,6 +499,9 @@ mod tests {
             interface: None,
             port: None,
             host_library: None,
+            bridge: None,
+            bridge_uuid: None,
+            ports: None,
             host_identity: None,
             timeout: DEFAULT_TIMEOUT,
             baud: None,
@@ -524,5 +748,130 @@ mod tests {
             ..default_args()
         };
         run(args).expect("an empty host scan is a scan, not an error");
+    }
+
+    // =======================================================================
+    // Bridge scans
+    // =======================================================================
+
+    /// The identity the bridge fixture is started with, and the one its link is
+    /// named by.
+    const BRIDGE_SCAN_UUID: [u8; 6] = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6];
+
+    /// The identity the device behind the bridge port answers with.
+    const DOWNSTREAM_UUID: [u8; 6] = [0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c];
+
+    /// The window one bridge port's answers get in the tests: long enough for a
+    /// firmware on a pty, short enough not to sit out the default two seconds.
+    const BRIDGE_SCAN_WINDOW: Duration = Duration::from_millis(500);
+
+    /// A bridge with a **mux device** behind its port: the scan enables the port,
+    /// broadcasts through it, and reports the device's answer with the port index
+    /// it came through.
+    ///
+    /// Two real firmware processes: the device (`linuxprocess-mux`, given the
+    /// identity it answers with) and the bridge (`linuxprocess-bridge`), whose
+    /// downstream port is the device's own console pty — the device holds the
+    /// master and the bridge opens the slave, exactly as a board wired to the
+    /// port would sit there.
+    #[test]
+    fn test_a_bridge_scan_reports_a_downstream_mux_device_with_its_port() {
+        let device = klipperx_test_support::LinuxFirmware::spawn_named(DOWNSTREAM_UUID)
+            .expect("the mux firmware process starts");
+        let bridge = klipperx_test_support::LinuxFirmware::spawn_bridge_port(
+            device.serial_path(),
+            BRIDGE_SCAN_UUID,
+        )
+        .expect("the bridge firmware process starts");
+
+        let mut heard: Vec<(u8, SerialNode)> = Vec::new();
+        let total = bridge_query_unassigned(
+            bridge.serial_path().to_str().expect("a utf-8 path"),
+            Some(BRIDGE_SCAN_UUID),
+            DEFAULT_BAUD,
+            &[0],
+            BRIDGE_SCAN_WINDOW,
+            |index, node| heard.push((index, node)),
+        )
+        .expect("the bridge scans");
+
+        assert_eq!(
+            total, 1,
+            "the one device behind the bridge's port 0 answered"
+        );
+        assert_eq!(heard.len(), 1);
+        assert_eq!(
+            heard[0].0, 0,
+            "the answer is attributed to the port it came through"
+        );
+        assert_eq!(heard[0].1.uuid, DOWNSTREAM_UUID);
+    }
+
+    /// A bridge whose port has nothing behind it answers nothing — and that is a
+    /// scan that succeeded, exactly as a quiet bus is: no error, and the total is
+    /// zero.
+    #[test]
+    fn test_a_bridge_scan_with_nothing_behind_the_port_succeeds() {
+        let port = crate::core::klippy::interface::pty::Pty::new();
+        let bridge =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_SCAN_UUID)
+                .expect("the bridge firmware process starts");
+
+        let mut heard = Vec::new();
+        let total = bridge_query_unassigned(
+            bridge.serial_path().to_str().expect("a utf-8 path"),
+            Some(BRIDGE_SCAN_UUID),
+            DEFAULT_BAUD,
+            &[0],
+            BRIDGE_SCAN_WINDOW,
+            |index, node| heard.push((index, node)),
+        )
+        .expect("a silent port is not a failed scan");
+
+        assert_eq!(total, 0);
+        assert!(heard.is_empty(), "nothing answered, so nothing is reported");
+    }
+
+    /// `--ports` is the list of port indexes to enable and scan, in order, and a
+    /// repeated index or a non-number is the mistake it looks like.
+    #[test]
+    fn test_the_bridge_ports_of_a_scan_are_parsed_as_indexes() {
+        assert_eq!(parse_ports("0"), Ok(vec![0]));
+        assert_eq!(parse_ports("0,1"), Ok(vec![0, 1]));
+        assert_eq!(parse_ports(" 1 , 0 "), Ok(vec![1, 0]));
+        assert!(parse_ports("0,0").expect_err("twice").contains("twice"));
+        assert!(parse_ports("0,x")
+            .expect_err("not a number")
+            .contains("--ports"));
+        assert!(parse_ports("")
+            .expect_err("nothing named")
+            .contains("--ports"));
+    }
+
+    /// `--bridge` is a transport of its own: naming another one beside it, or a
+    /// bridge flag without the bridge, is the mistake the message names.
+    #[test]
+    fn test_the_bridge_scan_arguments_do_not_mix_with_other_transports() {
+        let args = ScanArgs {
+            bridge: Some("/dev/ttyACM0".to_string()),
+            port: Some("/dev/ttyUSB0".to_string()),
+            ..default_args()
+        };
+        let err = run(args).expect_err("two transports");
+        assert!(err.to_string().contains("--bridge"), "{err}");
+
+        let args = ScanArgs {
+            bridge_uuid: Some("11aa22bb33cc".to_string()),
+            ..default_args()
+        };
+        let err = run(args).expect_err("a uuid names a bridge");
+        assert!(err.to_string().contains("--bridge-uuid"), "{err}");
+
+        let args = ScanArgs {
+            ports: Some("0,1".to_string()),
+            ..default_args()
+        };
+        let err = run(args).expect_err("ports belong to a bridge");
+        assert!(err.to_string().contains("--ports"), "{err}");
     }
 }

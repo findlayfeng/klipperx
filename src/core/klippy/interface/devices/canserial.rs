@@ -60,8 +60,9 @@ use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
-    admin_unit, encode_header, set_port_node_id, tunnel_block, TunnelRegistry, TunnelSink,
-    UnitStream, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL,
+    admin_unit, encode_header, request_bootloader_unit, set_port_node_id, tunnel_block,
+    TunnelRegistry, TunnelSink, UnitStream, CMD_RESET_PORT, CMD_RESTART_DEVICE,
+    CMD_SET_PORT_TUNNEL,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -795,8 +796,12 @@ impl CanSerialDevice {
     ///
     /// # Errors
     /// The same as [`Device::send`].
-    pub fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
-        self.send_bytes(&admin_unit(&[CMD_REQUEST_BOOTLOADER, index]))
+    pub fn send_request_bootloader(
+        &self,
+        index: u8,
+        uuid: Option<[u8; 6]>,
+    ) -> Result<(), InterfaceError> {
+        self.send_bytes(&request_bootloader_unit(index, uuid))
     }
 
     /// Toggle the flashing tunnel of bridge port `index`:
@@ -1290,8 +1295,8 @@ mod tests {
     use super::*;
     use crate::core::klippy::frame::MESSAGE_PAYLOAD_MAX;
     use crate::core::klippy::interface::devices::serial::{
-        decode_header, HeaderScan, ADMIN_LISTEN, CMD_SET_PORT_NODEID, HEADER_BYTES, MAGIC,
-        MUX_PORT_UNITS,
+        decode_header, HeaderScan, ADMIN_LISTEN, CMD_REQUEST_BOOTLOADER, CMD_SET_PORT_NODEID,
+        HEADER_BYTES, MAGIC, MUX_PORT_UNITS,
     };
 
     /// An encoded Klipper frame to feed through the link.
@@ -2009,7 +2014,7 @@ mod tests {
         // REQUEST_BOOTLOADER (0x02): the flashing tool's command, the same
         // shape aimed at the device rather than at a port of its own.
         let bootloader = admin_unit(&[CMD_REQUEST_BOOTLOADER, 1]);
-        device.send_request_bootloader(1).unwrap();
+        device.send_request_bootloader(1, None).unwrap();
         assert_unit_on_the_wire(&device, &mut wire, &bootloader);
 
         // SET_PORT_TUNNEL (0x06): toggles port 1's flashing tunnel mode, the

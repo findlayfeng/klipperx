@@ -110,7 +110,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位 → P6 多站串口（RS-485，后置）） | — |
+| M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位 → P6 多站串口（RS-485，后置））。**CAN 下游端口（拓扑 B：CAN 当桥的一个端口，两条载具）已定规划**：[work-log](docs/work-log/2026-10-17-bridge-can-plan.md)（U1–U19，到真机前为止） | — |
 | M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——**并入 M1 一起做**：固件命令族落 **P2**（与 `SET_PORT_NODEID` 同机制）、主机侧 `restart_method` 接入落 **P3** | M1 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
@@ -363,7 +363,7 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 `i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
 都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
-"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，覆盖见 [`testing.md`](docs/klippy/developer-manual/testing.md)）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4）、P6 多站串口（RS-485）**整体挂「待测（硬件）」**（需 485 设备，不阻塞进度）。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见 [`TESTING.md`](TESTING.md) 的 M2-1）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见开发手册模块表的 `host_libraries.rs` 行。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 `testing.md` 的 `restart.rs` 行。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
+"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，覆盖见 [`testing.md`](docs/klippy/developer-manual/testing.md)）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4；CAN **下游端口**（拓扑 B，切片载具）的固件/主机/工具拆分已规划，见 [work-log](docs/work-log/2026-10-17-bridge-can-plan.md)，尚未开工）、P6 多站串口（RS-485）**整体挂「待测（硬件）」**（需 485 设备，不阻塞进度）。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见 [`TESTING.md`](TESTING.md) 的 M2-1）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见开发手册模块表的 `host_libraries.rs` 行。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 `testing.md` 的 `restart.rs` 行。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
 
 **工程余项（不阻塞，已排期）**：
 

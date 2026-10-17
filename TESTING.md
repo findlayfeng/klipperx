@@ -202,7 +202,8 @@
   admin 单元属点火不管）的频率也需观察。
 - [ ] **M1-5 板做桥（配置拓扑：`[uart_device]` + `[mcu child]`）** —— M1-1/M1-2 验的都是「宿主库当桥 +
   真板当下游」。端口后端已不再是缺件：`third_party/klipper/src/stm32/bridge_serial.c`
-  （编译期固定的 USART1，RX PA10 / TX PA9）、`src/linux/bridge.c`、`src/host/bridge.c`（4 槽）都在，
+  （总开关 `CONFIG_STM32_BRIDGE_SERIAL` 下多选 USART1/2/3、UART4/5，勾几个就有几个口）、
+  `src/linux/bridge.c`、`src/host/bridge.c`（4 槽）都在，
   且 2026-10-17 已用「真板当桥（USB CDC 控制台 + `MUX_SERIAL`）→ USART1 → 下游」的拓扑把**刷写**
   整链跑通（见「范围外」的「经桥」项）。**待验的是配置面**：真板开 `CONFIG_BRIDGE` + 下游端口，
   宿主按 `[uart_device]` + `[mcu child]`（分别 legacy 与命名各一次）连上去。判定：
@@ -298,7 +299,7 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 
   | # | 验项 | 命令（`<桥>` = 桥的 tty） | 实测结果 |
   |---|---|---|---|
-  | 1 | 列桥的 UART 槽 | `admin bridge config --bridge <桥>` | `available uarts: 1`、`uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)` |
+  | 1 | 列桥的 UART 槽 | `admin bridge config --bridge <桥>` | `available uarts: 2`、`uart 0: 250000 baud default slot (USART1 PA10/PA9)`、`uart 1: … (USART2 PA3/PA2)` |
   | 2 | 启用端口 | `admin bridge port --bridge <桥> --port 0 --port-nodeid 7` | `target: port 0 nodeid 7, units route, tunnel open` |
   | 3 | 经桥发现 | `admin scan --bridge <桥> --ports 0` | `Found uuid=97abe031988e, Application: CanBoot, port 0` + `Total 1 uuids found` |
   | 4 | 经桥刷下游 | `admin flash --bridge <桥> --port 0 --port-nodeid 7 <fw>` | `complete: 43716 bytes in 684 blocks`（verify 全过） |

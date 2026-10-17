@@ -320,13 +320,18 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 
 | 后端 | 文件 | `BRIDGE_UART_COUNT` | 口在哪 |
 |------|------|---------------------|--------|
-| STM32 | `third_party/klipper/src/stm32/bridge_serial.c` | `1` | 编译期固定的 USART1，RX PA10 / TX PA9（`CONFIG_STM32_BRIDGE_SERIAL_USART1`，`RESERVE_PINS_bridge_serial` = `PA10,PA9`） |
+| STM32 | `third_party/klipper/src/stm32/bridge_serial.c` | 选中的 USART 个数（0..=5） | 编译期固定的 USART：总开关 `CONFIG_STM32_BRIDGE_SERIAL`（默认 n，`select` 后端与 `MUX_SERIAL`）下多选 `STM32_BRIDGE_SERIAL_USART1/2/3`、`_UART4/_UART5`，每个勾上的 USART 就是一个口，带自己的引脚、接收环和中断（`RESERVE_PINS_bridge_serial` = `PA10,PA9`、`RESERVE_PINS_bridge_serial_usart2` = `PA3,PA2`…） |
 | linux 进程 | `third_party/klipper/src/linux/bridge.c` | `1` | 环境变量 `KLIPPER_BRIDGE_PORT_0` 给的 tty（只有一条静态流，`uart_backend_open` 拒一切非 0 槽） |
 | host 库 | `third_party/klipper/src/host/bridge.c` | `KLIPPER_HOST_PORT_SLOTS`（= **4**，`host/klipper_host.h`） | 每槽一路独立流（独立 fd / 发送队列 / reset 状态机），tty 由 `klipper_host_port(slot, path)` 在 `init` 前登记，未登记则回落 `CONFIG_HOST_BRIDGE_SERIAL_PATH` |
 
 这个常量**就是「列口」的数据源**：固件不报端口表，只报「我能给几个 UART 对象」；主机据此列出
 可用的 `--port` 序号（`klipperx admin bridge config`，读固件字典里的 `BRIDGE_UART_COUNT`）。
 字典里没有这个常数的是旧固件——`admin bridge config` 会明说，并用 `--port-count`（默认 1）兜底。
+
+**槽序就是端口的身份**：`slot` 是「选中的 USART 按编号升序里的名次」——USART1 在前、UART5 在后；
+只勾 USART2 时它就是**槽 0**，不是槽 1。所以主机**不能**拿「槽号 = 固定 USART 表」硬套，
+`admin bridge config` 的槽名来自后端自己的预留引脚常数（`RESERVE_PINS_bridge_serial*`，有哪个就说明
+哪个 USART 被勾上，值就是它的引脚对），见下文。
 
 ### 桥上的四条命令：`config` / `port` / `scan --bridge` / `flash`
 
@@ -335,12 +340,14 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 动作在三个深度上的出口（只要启口 / 只要发现 / 要刷写）。`config` 是唯一例外：它只打开并 identify，
 **不重启、不声明、不命名、不开隧道、不刷写**。
 
-1. **`admin bridge config --bridge <tty>`** —— 打开、identify，**只读** `BRIDGE_UART_COUNT` 并
+1. **`admin bridge config --bridge <tty>`** —— 打开、identify，**只读** 固件字典并
    列出槽位；不声明端口、不复位设备、不命名、不开隧道、不刷写。输出形如
-   `available uarts: 1` + `  uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)` +
-   一行「用 `admin bridge port --port <slot> --port-nodeid <id>` 启用」。槽位后那句 arch 注记由
-   `MCU` 名字给出（`stm32*` / `linux` / 其它），因为「哪个 USART 或哪条 tty」是后端的编译期事实，
-   字典不携带它。
+   `available uarts: 2` + `  uart 0: 250000 baud default slot (USART1 PA10/PA9)` +
+   `  uart 1: 250000 baud default slot (USART2 PA3/PA2)` +
+   一行「用 `admin bridge port --port <slot> --port-nodeid <id>` 启用」。槽后那句名字**逐个槽来自字典**：
+   stm32 后端给每个勾上的 USART 预留引脚（`RESERVE_PINS_bridge_serial*` = `RX,TX`），主机按后端自己的
+   槽序（USART1、USART2、USART3、UART4、UART5 里有勾的那些）把它们读成 `USART1 PA10/PA9`；后端只报
+   个数、不报槽名的（linux 的单条 tty、host 库的 tty 表）才回落到 `MCU` 给的 arch 注记。
 2. **`admin bridge port --bridge <tty> --port N --port-nodeid ID [--baud] [--legacy]`** —— 打开、
    identify、**重启桥**（空端口表）、声明 `0..=N` 这些口（每个口一对 `config_uart` +
    `config_bridge_port`，`slot` = `index`）、然后 `SET_PORT_NODEID(N, ID, flags)` +

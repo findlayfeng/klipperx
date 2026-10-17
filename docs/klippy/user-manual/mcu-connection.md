@@ -119,9 +119,14 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 **拓扑与前提**（少一条就走不通；固件由仓库根 `make` 构建，见 [构建 MCU 固件](firmware-build.md)）：
 
 1. **桥**：一块开着 `CONFIG_MUX_SERIAL=y` 的板（控制台在 USB CDC 或串口上），下游口在**硬件 UART**
-   上——STM32 桥的端口是编译期固定的 **USART1，RX PA10 / TX PA9**；参考构建
-   `third_party/klipper/test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 + USART1 端口；
-   用户侧在仓库根 `make menuconfig` 里选同样的两项）。
+   上——STM32 桥的口是**多选**的：先开总开关 `CONFIG_STM32_BRIDGE_SERIAL`，再在它下面勾要用的
+   USART1/2/3、UART4/5（勾几个就有几个口；USART1 = PA10/PA9、USART2 = PA3/PA2、USART3 = PB11/PB10、
+   UART4 = PC11/PC10、UART5 = PD2/PC12），`--port N` 的 `N` 就是这些勾上的 USART **按编号升序**里的
+   名次（只勾 USART2 它就是 `--port 0`）。参考构建
+   `third_party/klipper/test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 + USART1、USART2
+   两个口；用户侧在仓库根 `make menuconfig` 里选同样的项）。
+   **旧配置迁移陷阱**：只写 `CONFIG_STM32_BRIDGE_SERIAL_USART1=y` 而没开总开关，`olddefconfig` 会
+   把它**静默丢掉**（子项 `depends on STM32_BRIDGE_SERIAL`），编出来的桥一个口都不报。
    桥也可以是一个开着 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 的 **host 库进程**（最多
    `KLIPPER_HOST_PORT_SLOTS` = 4 个 tty 槽）。
 2. **下游**：它得在一条 **UART 控制台**上（不是 USB CDC——桥只给它一个硬件 UART 口），而且要说单元：
@@ -137,11 +142,14 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 **四个命令（先看再刷）**：
 
 ```sh
-# ① 问桥：它有哪几个 UART 槽（只读固件字典里的 BRIDGE_UART_COUNT，不动桥、不声明端口）
+# ① 问桥：它有哪几个 UART 槽（只读固件字典，不动桥、不声明端口）
 klipperx admin bridge config --bridge /dev/ttyACM0
-#   available uarts: 1
-#     uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)
+#   available uarts: 2
+#     uart 0: 250000 baud default slot (USART1 PA10/PA9)
+#     uart 1: 250000 baud default slot (USART2 PA3/PA2)
 #   enable one with `admin bridge port --port <slot> --port-nodeid <id>`
+# 槽名是固件自己报的（每个勾上的 USART 预留它的引脚，`RESERVE_PINS_bridge_serial*`）；
+# 后端只报个数不报槽名时（linux 单 tty、host 库 tty 表）这里回落成 `arch-named …`。
 
 # ② 启用一个口：声明 → 命名（默认 UNITS）→ 开隧道
 klipperx admin bridge port --bridge /dev/ttyACM0 --port 0 --port-nodeid 7

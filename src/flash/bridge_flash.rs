@@ -40,13 +40,17 @@
 //! ([`BridgePort`], [`BridgeTarget`]), exactly as [`open_bridge`] documents.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::core::klippy::assign;
 use crate::core::klippy::event::{McuEvent, Shutdown};
 use crate::core::klippy::interface::devices::host::HostDevice;
-use crate::core::klippy::interface::devices::serial::{self, SharedSerialHandle, TunnelSink};
+use crate::core::klippy::interface::devices::serial::{
+    self, set_node_id_for, SharedSerialHandle, TunnelSink, UnassignedNode, UnitSink, ADMIN_REPLY,
+    HEADER_BYTES,
+};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{HostMux, Interface};
 use crate::core::klippy::mcu::{Dictionary, Mcu, McuError};
@@ -99,6 +103,17 @@ const RESET_IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// How long to wait between reopen attempts.
 const RESET_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// How long an assignment ([`BridgeLink::assign_node_id`]) waits for the board it
+/// named to answer, at most.
+///
+/// katapult does **not** acknowledge `SET_NODEID`: the board adopts the id and
+/// says nothing, so a silent window is the normal outcome, not a failure. The wait
+/// exists only so that a board which does answer (a mux device re-confirms, and
+/// its answer reads on [`ADMIN_REPLY`] like a scan's) is reported as confirmed
+/// instead of as merely sent. One second is several round trips on a bridge's
+/// wire and short enough to pay on every assignment a caller asks for.
+const ASSIGN_CONFIRM_WINDOW: Duration = Duration::from_secs(1);
 
 /// How long the discovery broadcast a run sends when it has **no**
 /// `--bridge-uuid` waits for an answer, after the restart dropped the bridge's
@@ -161,6 +176,22 @@ impl BridgeDevice {
             BridgeDevice::Shared(handle) => handle.set_tunnel_sink(arb, sink),
         }
     }
+}
+
+/// What an assignment did: the unit went out, and whether the board it named
+/// answered inside [`ASSIGN_CONFIRM_WINDOW`].
+///
+/// Both are successes — [`AssignReport::Sent`] is the **normal** one, because a
+/// katapult board does not acknowledge the command — so they are reported apart
+/// instead of being folded into one "assigned" that would claim more than the
+/// host knows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssignReport {
+    /// The board answered the assignment: the unit arrived and was acted on.
+    Confirmed,
+    /// The unit went out and nothing answered — the silence a katapult board
+    /// keeps on purpose.
+    Sent,
 }
 
 /// How a [`BridgeLink`]'s transport was opened, kept so a run can open a fresh
@@ -271,6 +302,60 @@ impl BridgeOpen {
                 let link = Interface::shared_serial(Arc::clone(&handle));
                 Ok((link, BridgeDevice::Shared(handle)))
             }
+        }
+    }
+}
+
+/// Write one assignment unit on a **shared serial** bridge's admin channel and
+/// wait up to [`ASSIGN_CONFIRM_WINDOW`] for the board it names to answer.
+///
+/// `unit` is the whole admin unit ([`set_node_id_for`]'s spelling); the channel
+/// writes the header, so only the frame behind it goes out — the same split every
+/// `send_set_port_node_id`-style send makes. The wait registers a sink on
+/// [`ADMIN_REPLY`], the id every device behind a bridge answers on and no MCU owns,
+/// for the length of the window only: whether the board answers or not, the sink
+/// is removed before this returns, so a later scan (or a tunnel) finds the port
+/// as it was.
+fn assign_through_shared(
+    handle: &SharedSerialHandle,
+    unit: &[u8],
+    uuid: [u8; 6],
+) -> Result<AssignReport, InterfaceError> {
+    let (sink, answers) = UnitSink::channel();
+    handle.set_unit_sink(ADMIN_REPLY, sink);
+    let written = handle.send_admin(&unit[HEADER_BYTES..]);
+    // Nothing is waited for when nothing was written: a refused write is the
+    // caller's error, and a full window behind it would only hide it.
+    let confirmed = written.is_ok() && answers_for(&answers, uuid, ASSIGN_CONFIRM_WINDOW);
+    handle.clear_unit_sink(ADMIN_REPLY);
+    written?;
+    Ok(if confirmed {
+        AssignReport::Confirmed
+    } else {
+        AssignReport::Sent
+    })
+}
+
+/// Whether a unit naming `uuid` arrives within `window`.
+///
+/// The whole window is read, not just the first unit: another device on another
+/// port may be talking, and its answer is not this board's confirmation. A unit
+/// that does not parse as an answer, or names another UUID, is dropped and the
+/// wait goes on.
+fn answers_for(answers: &Receiver<Vec<u8>>, uuid: [u8; 6], window: Duration) -> bool {
+    let deadline = Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        match answers.recv_timeout(remaining) {
+            Ok(unit) => {
+                if UnassignedNode::from_unit(&unit).is_some_and(|node| node.uuid == uuid) {
+                    return true;
+                }
+            }
+            Err(_) => return false,
         }
     }
 }
@@ -666,6 +751,55 @@ impl BridgeLink {
         route: PortRoute,
     ) -> Result<(), BridgeFlashError> {
         send_open_target_port(&self.live().link, target, route).map_err(BridgeFlashError::Bridge)
+    }
+
+    /// Give the board `uuid` the node id `node_id` — the admin-channel
+    /// assignment, written on the bridge's own admin broadcast, then a bounded
+    /// wait for the board's answer ([`ASSIGN_CONFIRM_WINDOW`]).
+    ///
+    /// This is the step between a scan's answer ("an unassigned CanBoot board is
+    /// behind port N") and the tunnel a flash run needs ("the device answers to
+    /// this id"): a board with no node id cannot be named, so a port cannot be
+    /// routed to it. The unit is [`set_node_id_for`]'s — the one a **direct** CAN
+    /// flash assigns with (`session::assign`) — so a board behind a bridge is
+    /// named exactly as one on the host's own bus.
+    ///
+    /// The admin channel is the **bridge's**, and a bridge fans a unit on it out
+    /// to every port it has: the unit names the board by its **UUID**, not by a
+    /// port, and the board with that identity is the one that adopts it. That is
+    /// what makes the same call work on a CAN slot (the port's device is the only
+    /// one on that bus) and on a UART slot (a mux device behind one has the same
+    /// admin channel), and why the caller is told the unit went to all of them
+    /// rather than to one.
+    ///
+    /// Nothing fails when no answer comes back: katapult does not acknowledge the
+    /// command, so [`AssignReport::Sent`] is the normal result and
+    /// [`AssignReport::Confirmed`] is the bonus of a device that does answer
+    /// (a mux device re-confirms, which reads on [`ADMIN_REPLY`] like a scan
+    /// answer).
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Unaddressable`] when `node_id` names no arb, and
+    /// [`BridgeFlashError::Bridge`] when the link refuses the write.
+    pub fn assign_node_id(
+        &self,
+        uuid: [u8; 6],
+        node_id: u8,
+    ) -> Result<AssignReport, BridgeFlashError> {
+        let unit = set_node_id_for(uuid, u32::from(node_id))
+            .ok_or(BridgeFlashError::Unaddressable { node_id })?;
+        match &self.live().device {
+            BridgeDevice::Shared(handle) => assign_through_shared(handle, &unit, uuid)
+                .map_err(|e| BridgeFlashError::Bridge(BridgeError::Link(e))),
+            // A host library carries the same admin channel but exposes no unit
+            // sink, so what a downstream device answers is not readable here: the
+            // unit is written and reported as sent, which is what a katapult board
+            // does anyway.
+            BridgeDevice::Host(device) => device
+                .send_admin(&unit[HEADER_BYTES..])
+                .map(|()| AssignReport::Sent)
+                .map_err(|e| BridgeFlashError::Bridge(BridgeError::Link(e))),
+        }
     }
 
     /// Reset one **declared** port's device through the bridge's admin channel —
@@ -2747,5 +2881,127 @@ mod tests {
             cfg.tries as usize,
             "one session's tries and no retry behind them"
         );
+    }
+
+    /// Whatever the pty master has within `window`, in one bounded read — the
+    /// bytes a shared port wrote for the far end.
+    fn read_wire(master: &std::fs::File, window: Duration) -> Vec<u8> {
+        let mut poll = libc::pollfd {
+            fd: master.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, window.as_millis() as i32) } <= 0 {
+            return Vec::new();
+        }
+        let mut buf = [0u8; 1024];
+        let mut master = master;
+        match master.read(&mut buf) {
+            Ok(read) => buf[..read].to_vec(),
+            Err(e) => panic!("reading the pty master: {e}"),
+        }
+    }
+
+    /// An assignment on a shared serial bridge writes the **`SET_NODEID`** unit
+    /// the direct CAN path writes — the admin header, the `KXID` frame, the
+    /// assignment opcode, the six UUID bytes and the id — and nothing answering it
+    /// is still a success: katapult does not acknowledge the command, so "sent" is
+    /// the normal report and only a board that speaks up is "confirmed".
+    #[test]
+    fn test_an_assignment_sends_the_set_node_id_unit_and_accepts_the_silence() {
+        let pty = Pty::new();
+        let handle = serial::attach_downstream(&pty.path, 250_000, BRIDGE_MCU_ID)
+            .expect("the shared serial port opens");
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let node_id = 128u8;
+        let unit = set_node_id_for(uuid, u32::from(node_id)).expect("an addressable id");
+
+        let outcome = assign_through_shared(&handle, &unit, uuid).expect("the unit goes out");
+
+        assert_eq!(
+            outcome,
+            AssignReport::Sent,
+            "nothing answered, and that is the normal outcome"
+        );
+
+        let wire = read_wire(&pty.master, Duration::from_secs(1));
+        assert_eq!(wire, unit, "the bytes on the wire are the assignment unit");
+        // Spelled out against the wire as well, so the shape cannot drift inside
+        // `set_node_id_for` unnoticed: the admin listen header, then the `KXID`
+        // marker, the assignment opcode, the UUID most significant byte first, and
+        // the id (one byte) behind it.
+        assert_eq!(
+            &wire[..HEADER_BYTES],
+            &serial::encode_header(serial::ADMIN_LISTEN)
+        );
+        let (header_len, marker) = (HEADER_BYTES, serial::MAGIC.len());
+        assert_eq!(
+            &wire[header_len + 2..header_len + 2 + marker],
+            serial::MAGIC
+        );
+        let payload = &wire[header_len + 2 + marker..];
+        assert_eq!(payload[0], 0x01, "the SET_NODEID opcode");
+        assert_eq!(
+            &payload[1..7],
+            &uuid,
+            "the UUID, most significant byte first"
+        );
+        assert_eq!(payload[7], node_id, "the id the board is given");
+    }
+
+    /// A board that answers the assignment is reported as **confirmed**: the answer
+    /// names its UUID on [`ADMIN_REPLY`], the id a scan reads it on.
+    #[test]
+    fn test_an_assignment_a_board_answers_is_reported_as_confirmed() {
+        let pty = Pty::new();
+        let mut master = pty.master.try_clone().expect("the pty master clones");
+        let handle = serial::attach_downstream(&pty.path, 250_000, BRIDGE_MCU_ID)
+            .expect("the shared serial port opens");
+        let uuid = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let unit = set_node_id_for(uuid, 1).expect("an addressable id");
+
+        // The board's side: it reads the unit and re-confirms with its UUID.
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0u8; 256];
+            if master.read(&mut buf).unwrap_or(0) == 0 {
+                return;
+            }
+            master
+                .write_all(&unassigned_answer(uuid))
+                .expect("the board answers");
+        });
+
+        let outcome = assign_through_shared(&handle, &unit, uuid).expect("the unit goes out");
+
+        assert_eq!(outcome, AssignReport::Confirmed);
+        responder.join().expect("the responder thread");
+    }
+
+    /// An answer that names **another** board is not this board's confirmation: the
+    /// wait reads the whole window and reports the unit as sent.
+    #[test]
+    fn test_an_answer_naming_another_board_confirms_nothing() {
+        let pty = Pty::new();
+        let mut master = pty.master.try_clone().expect("the pty master clones");
+        let handle = serial::attach_downstream(&pty.path, 250_000, BRIDGE_MCU_ID)
+            .expect("the shared serial port opens");
+        let uuid = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+        let (sink, answers) = UnitSink::channel();
+        handle.set_unit_sink(ADMIN_REPLY, sink);
+
+        // Another board on another port, heard while the wait is open.
+        let other = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let responder = std::thread::spawn(move || {
+            master
+                .write_all(&unassigned_answer(other))
+                .expect("the other board answers");
+        });
+
+        assert!(
+            !answers_for(&answers, uuid, Duration::from_millis(500)),
+            "another board's answer is not this one's confirmation"
+        );
+        responder.join().expect("the responder thread");
+        handle.clear_unit_sink(ADMIN_REPLY);
     }
 }

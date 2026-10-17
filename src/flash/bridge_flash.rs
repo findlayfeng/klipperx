@@ -747,6 +747,20 @@ impl BridgeLink {
             .take()
     }
 
+    /// The live `Mcu` of the bridge, once [`identify`](BridgeLink::identify) has
+    /// run.
+    ///
+    /// For tools that speak the MCU protocol to the bridge **directly** rather
+    /// than through its port commands — bench diagnostics read the firmware's
+    /// own state with `debug_read` (which counters the CAN port backend kept,
+    /// which route and flags the router holds); nothing in the flashing path
+    /// needs it. `None` before identify, and while
+    /// [`reset`](BridgeLink::reset) is between the restarted bridge and a fresh
+    /// open.
+    pub fn mcu(&self) -> Option<&Mcu> {
+        self.live.as_ref().map(|live| &live.mcu)
+    }
+
     /// Run the bridge's identify handshake: the dictionary the declaration
     /// commands are encoded from comes from the running firmware, so nothing of
     /// them can be sent before this returns.

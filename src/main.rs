@@ -159,15 +159,19 @@ enum AdminCommands {
     #[command(arg_required_else_help = true)]
     Flash(klipperx::flash::cli::FlashArgs),
 
-    /// Prepare a bridge: declare its downstream ports, name the target's port,
-    /// and open its flashing tunnel
+    /// Prepare a bridge, in its two halves: `config` declares its downstream
+    /// ports, `port` names one and opens its tunnel
     //
-    // The bridge side of `flash` without the flash and without a reset: the
-    // bridge's port table is built, the target's port is named with the legacy
-    // route, and its tunnel is opened. Resetting a device is `admin reset`'s
+    // The bridge side of `flash` without the flash and without a reset, split
+    // where the bridge's own state is: the declaration is what makes a port
+    // exist for any later port-level command, and the route-and-tunnel is what
+    // makes one carry the katapult stream. Resetting a device is `admin reset`'s
     // job and flashing is `admin flash`'s.
-    #[command(name = "configure-bridge", arg_required_else_help = true)]
-    ConfigureBridge(klipperx::flash::cli::ConfigureBridgeArgs),
+    #[command(arg_required_else_help = true)]
+    Bridge {
+        #[command(subcommand)]
+        command: AdminBridgeCommands,
+    },
 
     /// Reset a bridge itself, or a device on one of its ports
     //
@@ -176,6 +180,28 @@ enum AdminCommands {
     // behind that declared port is reset, the way `--port-reset` says.
     #[command(arg_required_else_help = true)]
     Reset(klipperx::flash::cli::ResetArgs),
+}
+
+/// The `admin bridge` family: the bridge's two halves, one subcommand each.
+///
+/// `config` declares the bridge's downstream ports — the table a port-level
+/// command needs — and stops; `port` names one of those ports and opens its
+/// flashing tunnel. Neither resets a device and neither flashes anything.
+#[derive(clap::Subcommand, Debug)]
+enum AdminBridgeCommands {
+    /// Declare a bridge's downstream ports, the table a port-level command needs
+    //
+    // Naming no bridge is not a config with a guess but a question, so a bare
+    // `admin bridge config` prints this help (`arg_required_else_help` in
+    // `BridgeConfigArgs`).
+    Config(klipperx::flash::cli::BridgeConfigArgs),
+
+    /// Name one declared bridge port and open its flashing tunnel
+    //
+    // The same question rule: without a bridge (or without `--port` and
+    // `--port-nodeid`) it prints this help rather than talking to something
+    // guessed.
+    Port(klipperx::flash::cli::BridgePortArgs),
 }
 
 fn main() {
@@ -207,9 +233,14 @@ fn run_admin(command: AdminCommands) -> Result<i32, Box<dyn std::error::Error>> 
     match command {
         AdminCommands::Scan(args) => klipperx::scan::run(args).map(|()| 0),
         AdminCommands::Flash(args) => klipperx::flash::cli::run(args).map(|()| 0),
-        AdminCommands::ConfigureBridge(args) => {
-            klipperx::flash::cli::run_configure_bridge(args).map(|()| 0)
-        }
+        AdminCommands::Bridge { command } => match command {
+            AdminBridgeCommands::Config(args) => {
+                klipperx::flash::cli::run_bridge_config(args).map(|()| 0)
+            }
+            AdminBridgeCommands::Port(args) => {
+                klipperx::flash::cli::run_bridge_port(args).map(|()| 0)
+            }
+        },
         AdminCommands::Reset(args) => klipperx::flash::cli::run_reset(args).map(|()| 0),
     }
 }
@@ -596,7 +627,11 @@ mod tests {
         let help = error.to_string();
         assert!(help.contains("scan"), "{help}");
         assert!(help.contains("flash"), "{help}");
-        assert!(help.contains("configure-bridge"), "{help}");
+        assert!(help.contains("bridge"), "{help}");
+        assert!(
+            !help.contains("configure-bridge"),
+            "the split left no combined subcommand:\n{help}"
+        );
         assert!(help.contains("reset"), "{help}");
 
         let error = parse(&["admin", "scan", "--help"]).expect_err("the help is not a scan");
@@ -670,39 +705,85 @@ mod tests {
     }
 
     #[test]
-    fn test_the_configure_bridge_subcommand_is_under_admin() {
-        // A bare `admin configure-bridge` is a question (which bridge?),
-        // answered with the help.
-        let error = parse(&["admin", "configure-bridge"]).expect_err("a bridge has to be named");
+    fn test_the_bridge_subcommands_are_under_admin() {
+        // `admin bridge` is the family; without one of its halves it is a
+        // question, answered with the help.
+        let error = parse(&["admin", "bridge"]).expect_err("which half?");
+        let help = error.to_string();
+        assert!(help.contains("config"), "{help}");
+        assert!(help.contains("port"), "{help}");
+
+        // `config` is the declaration: the bridge and the port plan, no
+        // `--port`/`--port-nodeid` (nothing is named here).
+        let error = parse(&["admin", "bridge", "config"]).expect_err("which bridge?");
+        let help = error.to_string();
+        assert!(help.contains("--bridge"), "{help}");
+        assert!(help.contains("--port-count"), "{help}");
+
+        let cli = parse(&[
+            "admin",
+            "bridge",
+            "config",
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port-count",
+            "2",
+            "--baud",
+            "115200",
+        ])
+        .expect("the bridge side of the flash grammar");
+        match cli.command {
+            Some(Commands::Admin {
+                command:
+                    AdminCommands::Bridge {
+                        command: AdminBridgeCommands::Config(args),
+                    },
+            }) => {
+                assert_eq!(args.bridge.as_deref(), Some("/dev/ttyUSB0"));
+                assert_eq!(args.port_count, Some(2));
+                assert_eq!(args.baud, Some(115_200));
+            }
+            other => panic!("expected `admin bridge config`, got {other:?}"),
+        }
+
+        // `port` is the route and the tunnel: the bridge plus the two numbers
+        // that name the target.
+        let error = parse(&["admin", "bridge", "port"]).expect_err("which bridge?");
         let help = error.to_string();
         assert!(help.contains("--bridge"), "{help}");
         assert!(help.contains("--port-nodeid"), "{help}");
 
-        // The bridge side of the flash grammar, plus the port plan.
         let cli = parse(&[
             "admin",
-            "configure-bridge",
+            "bridge",
+            "port",
             "--bridge",
             "/dev/ttyUSB0",
             "--port",
             "1",
             "--port-nodeid",
             "7",
-            "--port-count",
-            "2",
         ])
-        .expect("the bridge side of the flash grammar");
+        .expect("the port half of the flash grammar");
         match cli.command {
             Some(Commands::Admin {
-                command: AdminCommands::ConfigureBridge(args),
+                command:
+                    AdminCommands::Bridge {
+                        command: AdminBridgeCommands::Port(args),
+                    },
             }) => {
                 assert_eq!(args.bridge.as_deref(), Some("/dev/ttyUSB0"));
                 assert_eq!(args.port, Some(1));
                 assert_eq!(args.port_nodeid, Some(7));
-                assert_eq!(args.port_count, Some(2));
             }
-            other => panic!("expected `admin configure-bridge`, got {other:?}"),
+            other => panic!("expected `admin bridge port`, got {other:?}"),
         }
+
+        // The combined spelling is gone: `admin` has no such subcommand, so the
+        // two halves are the only way in.
+        let error = parse(&["admin", "configure-bridge"]).expect_err("the combined form is gone");
+        let text = error.to_string();
+        assert!(text.contains("unrecognized subcommand"), "{text}");
     }
 
     #[test]

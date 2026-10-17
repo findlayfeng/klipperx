@@ -280,7 +280,7 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 | 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`） |
 | 单节点 `motion` | ✅ |
 | **双节点并发**（桥板自身 + 下游，同一条 can0） | 两颗都 **2272 req/s**（聚合 ≈ 4.5k 往返/秒） |
-| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP` 无 mux） | ❌ 运行期未通。`candump` 可见完整 `FF → FC(30 00 00) → CF → ack` 双向交换，但主机仍重发 `identify` 并判超时 ⇒ 线级协议正常，问题在「重组完成的消息交上去之后」 |
+| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP` 无 mux） | ✅ 修掉 BS=0 之后通了：`identify` 139；**comm 742 req/s**（切片 2272）、**motion 绿**、**step 首段 10 000 steps/s 即超时**（ISO-TP 每条命令约 2 帧，约为切片 3 倍代价）；修复前 `candump` 已指向真因：设备发 FF → 我们 FC(`30 00 00`) → 设备只发 **1 个 CF** 就停，25 ms 后超时——两端固件都把 `BS=0` 当成「本块 0 帧」而不是「不限」 |
 
 对比：同样 1 Mbit、同样下游板，主机直连的 `step` 是 **145 455**，而 klipperx 桥的 CAN 端口只有
 **15 625**（9 倍差）；说明桥端口的 per-frame 转发在突发命令负载下代价更高，待查。

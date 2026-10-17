@@ -312,13 +312,20 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 | UART 250 kbaud | 930 req/s | 1160 | 2270(debug)/2834(release) | — | — |
 | UART 500 kbaud | 1814 req/s | 1452 | 2834 | 145 455 steps/s | ✅ |
 | CAN 1 Mbit（切片） | 2268 req/s | 2270 | 2834（并发时掉到 1816） | 15 625 steps/s | ✅ |
+| CAN 1 Mbit（桥端口 **ISO-TP 载具**） | 244 req/s | —（未测） | —（未测） | **145 455** steps/s | ✅ |
 
 读法（详见 [MCU 连接方式 → 桥下游链路的吞吐与余量](docs/klippy/user-manual/mcu-connection.md#桥下游链路的吞吐与余量真机实测)）：
 250 k 是纯线速瓶颈；并发损耗**不对称**（UART 损被中继侧 ~20%，CAN 损桥自己 ~36%）；CAN 的 step 低是
 8 B 帧下 `queue_step` 要拆两帧、压测突发下发超过一段的提前量（真实主机是连续投递，不是突发）。
 
 **CAN 端口运行期会话已闭环**：`identify` → 配置握手 → 周期 `get_clock`，同一拓扑连续两次 `klippy` 都成功。
-仍未覆盖：ISO-TP 载具的端口侧（U7/U8，未实现）、CAN 上游 attach（桥经 CAN 被宿主连）。
+
+**CAN 端口 ISO-TP 载具也已闭环**（`bench-can-isotp.cfg`，下游刷 `CONFIG_ISOTP` 应用 44 560 B、
+桥 53 588 B，1 Mbit）：连跑 **5 次全绿**（`mcu` 150 条 / `downstream` 139 条），`comm` **244 req/s**
+（305 崩）、`step` **145 455 steps/s**、`motion` ✅。修的是桥半发送循环里 `BS=0` 的余留判据
+（首帧 + 首个连续帧之后就停等 FC，于是 13 B 以上的单元永远到不了设备）——定位手法是把设备 `halt`
+住后读它的 CAN FIFO0 输出邮箱，帧会冻在里面；详情见工作记录。
+仍未覆盖：CAN 上游 attach（桥经 CAN 被宿主连，挂起）。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 

@@ -60,7 +60,7 @@ serial: /dev/ttyUSB0
 
 **桥的上游链路也是复用**：被 `[uart_device]`/`[can_device]` 的 `*_mcu` 指为桥的那颗 `[mcu]`，其 `serial:`/`host_library:` 路径**按 id 寻址**，与引用颗数无关——这条链路上还跑着桥下游设备的帧（规则 7）。判定式是 `按 id 寻址 = 共享 ∨ 下游设备数 ≥ 1 ∨ 是桥`（`mcu/serial_ports.rs::is_id_addressed`，host 库侧同构 `mcu/host_libraries.rs::path_is_mux`）；**下游设备数**是挂在桥端口节（`uart:`/`can:`）上的 `[mcu]` 个数（`mcu/bridge_ports.rs::bridge_downstream_counts`）。**0 台下游的桥仍按 id 寻址**是刻意口径：桥被 mux 化后输出就带帧头，按裸帧解会错位。
 
-> 设备端**设备半与桥半都已实现，但没有架构默认启用它们**：`src/mux.c` 的设备半（就地解析、答扫描、采纳 node id、id 冲突照 CAN 弃号、剥头交付）与 `src/bridge.c` 的桥半（端口表、`uuid → 端口`/`id → 端口` 路由、扇出、单设备路径剥头加头）都在，host 库还有下游串口端口与 unit 收发接口；**mux 路径的真端到端 attach 已有永久测试**。串口侧已由各 MCU 架构（`chipid_init` 派生身份）与 linux 进程控制台（`-U <12 hex>`）接线、host 库由 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 选上；CAN 侧由 `MUX_CAN` 接线（`depends on CANBUS && HAVE_CHIPID`，同一套单元跑在 CAN 字节流里）。**`linux` 架构现在也能当 can-serial 节点**（`LINUX_CANSERIAL`：SocketCAN 控制台，身份只能由 `-U` 给——linux 没有芯片 id），但 `MUX_CAN` 仍不适用于 linux。**两种载体都刻意不默认开**——单元格式不是上游 klippy 主机说的格式，必须显式选择；误配到没开 mux 的旧固件只会连接失败/握手超时，不会搞乱会话。CAN **下游端口**（`BRIDGE_PORT_CAN`）已落地并经真机验证（见下节 CAN 小节）；仍未接线的是 CAN **上游** attach 与 `printer.cfg` 的 `[can_device]` 端口节。
+> 设备端**设备半与桥半都已实现，但没有架构默认启用它们**：`src/mux.c` 的设备半（就地解析、答扫描、采纳 node id、id 冲突照 CAN 弃号、剥头交付）与 `src/bridge.c` 的桥半（端口表、`uuid → 端口`/`id → 端口` 路由、扇出、单设备路径剥头加头）都在，host 库还有下游串口端口与 unit 收发接口；**mux 路径的真端到端 attach 已有永久测试**。串口侧已由各 MCU 架构（`chipid_init` 派生身份）与 linux 进程控制台（`-U <12 hex>`）接线、host 库由 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 选上；CAN 侧由 `MUX_CAN` 接线（`depends on CANBUS && HAVE_CHIPID`，同一套单元跑在 CAN 字节流里）。**`linux` 架构现在也能当 can-serial 节点**（`LINUX_CANSERIAL`：SocketCAN 控制台，身份只能由 `-U` 给——linux 没有芯片 id），但 `MUX_CAN` 仍不适用于 linux。**两种载体都刻意不默认开**——单元格式不是上游 klippy 主机说的格式，必须显式选择；误配到没开 mux 的旧固件只会连接失败/握手超时，不会搞乱会话。CAN **下游端口**（`BRIDGE_PORT_CAN`）与它的 ISO-TP 端口载具（`BRIDGE_PORT_CAN_ISOTP`，只用于运行期）已落地并经真机验证（见下节 CAN 小节），`printer.cfg` 的 `[can_device]` 端口节也已接线；仍未接线的是 CAN **上游** attach。
 
 ### 线上的形状（设备端实现规格）
 
@@ -252,6 +252,7 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
 | UART 250 kbaud（默认） | **930** req/s | 1160 | 2270（debug）/2834（release） | — | — |
 | UART **500 kbaud** | **1814** req/s | 1452 | 2834 | **145 455** steps/s | ✅ |
 | CAN 1 Mbit（切片） | **2268** req/s | 2270 | 2834 | **15 625** steps/s | ✅ |
+| CAN 1 Mbit（桥端口 **ISO-TP 载具**） | **244** req/s | —（未测） | —（未测） | **145 455** steps/s | ✅ |
 
 参照：同类 F103 **直连 USB** 的步进上限是 339 623 steps/s、往返 3552 req/s（[压力测试](../developer-manual/stress.md)），
 所以“桥中转 + mux”在这两条指标上大约要打 4 折（步进）和 8 折（往返）。
@@ -271,6 +272,13 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
   比这个数字好；但它确实说明 **CAN 端口不适合当作高步频板的唯一链路**，而 UART 500 k 可以。
 - **延迟**：中继 RTT 在 250 k 约 1.39 ms，500 k 约减半，CAN 1 Mbit 同量级；klipper 的移动队列
   有 1–2 s 深度，这点延迟无感，但不要拿它接“高速步进 + 极小 buffer”的组合。
+- **ISO-TP 载具（`can_protocol: isotp`）便宜不了**：同一条 1 Mbit、同一块下游板，切片 **2268** →
+  ISO-TP **244** req/s（约 1/9；切片每往返约 0.44 ms，ISO-TP 约 4 ms，klippy 自报的 srtt 是 5.2 ms）。
+  代价不在带宽而在**往返次数**：一条 22 B 的量测消息在 8 B 经典帧下是 FF + 若干 CF，FF 之后要等
+  接收侧的流控帧，而 CF 由**任务**发（不在中断里），于是每个方向多出两次调度往返；`stress comm`
+  到 244 req/s 就见脊背（backlog 一步跳到 71）。`step` 反而与切片同档（145 455 steps/s，瓶颈在
+  下游固件的脉冲生成），`motion` 绿。**能切片就切片**：ISO-TP 只在“共享总线上要给多台设备分地址、
+  且设备只会讲 ISO-TP”时才值得。
 
 ### 主机直连 CAN：把一块板子当 USB-CAN 收发器
 

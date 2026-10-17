@@ -1227,22 +1227,43 @@ impl UnitRegistry {
 }
 
 /// One board's answer to [`discovery_query`]: the UUID it is remembered by,
-/// and the application it runs.
+/// the application it runs, and the bridge ports it came through.
 ///
 /// This mirrors CAN's
 /// [`UnassignedNode`](crate::core::klippy::interface::devices::canserial::UnassignedNode):
 /// the board answers with [`RESP_NEED_NODEID`], the six UUID bytes most
-/// significant first, and — in the builds that send it — one more byte naming
-/// the application. The UUID and the application byte are read **by position
-/// against the frame's length byte**, so a `0x7e` inside them is ordinary
-/// content: the protocol allows SYNC in message block content.
+/// significant first, and — in the builds that send them — one more byte naming
+/// the application and a port path naming the bridges the answer travelled
+/// through. The UUID is read **by position against the frame's length byte**, so
+/// a `0x7e` inside it is ordinary content: the protocol allows SYNC in message
+/// block content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnassignedNode {
     /// The UUID, most significant byte first.
     pub uuid: [u8; 6],
     /// The application byte the board sent, if it sent one.
     pub application: Option<u8>,
+    /// The bridge ports the answer travelled through, innermost first; empty
+    /// when the board answered directly.
+    ///
+    /// Each bridge appends the index of the port the answer came up on, so a
+    /// board behind one bridge reports one port and a board behind a chain of
+    /// bridges reports one per bridge, in the order the answer passed them. A
+    /// board wired to the host's own wire — or one whose bridge firmware
+    /// predates the path — reports none, which is the same reading.
+    pub ports: Vec<u8>,
 }
+
+/// The top bit of the byte after an answer's UUID: set, that byte is the head of
+/// the answer's port path (its low bits are how many port numbers follow)
+/// rather than the application byte, which never has the bit set.
+const PATH_FLAG: u8 = 0x80;
+
+/// How many port numbers an answer's path may carry — the depth bound the
+/// firmware enforces when a bridge appends its own port (`mux.h`
+/// `MUX_PATH_MAX`). A path past it is a field that does not parse, not one to
+/// read.
+const MAX_PATH_PORTS: usize = 8;
 
 impl UnassignedNode {
     /// The application's name, as Klipper's tool names it in its `Found …`
@@ -1267,10 +1288,10 @@ impl UnassignedNode {
     /// naming [`ADMIN_REPLY`], then a frame whose length byte matches the
     /// bytes present, whose sequence byte is [`ASSIGN_SEQ_BYTE`], whose
     /// trailer and CRC check out, and whose content after [`MAGIC`] begins
-    /// with [`RESP_NEED_NODEID`] followed by the six UUID bytes and an
-    /// optional application byte. Nothing else is checked — in particular a
-    /// UUID of six zero bytes is reported rather than treated as unset,
-    /// because the protocol has no such value.
+    /// with [`RESP_NEED_NODEID`] followed by the six UUID bytes and the two
+    /// optional fields [`Self::tail`] reads. Nothing else is checked — in
+    /// particular a UUID of six zero bytes is reported rather than treated as
+    /// unset, because the protocol has no such value.
     pub fn from_unit(unit: &[u8]) -> Option<Self> {
         let (arb, consumed) = match decode_header(unit) {
             HeaderScan::Complete { arb, consumed } => (arb, consumed),
@@ -1311,14 +1332,56 @@ impl UnassignedNode {
         }
         let mut uuid = [0u8; 6];
         uuid.copy_from_slice(&after_cmd[..6]);
-        // A whole 1-byte application is the only legal extra; more trailing
-        // bytes mean the unit was not this shape.
-        let application = match after_cmd.len() {
-            6 => None,
-            7 => Some(after_cmd[6]),
-            _ => return None,
-        };
-        Some(Self { uuid, application })
+        let (application, ports) = Self::tail(&after_cmd[6..])?;
+        Some(Self {
+            uuid,
+            application,
+            ports,
+        })
+    }
+
+    /// The two optional fields after an answer's UUID — the application byte,
+    /// then the port path — read off the rest of the payload; `None` when those
+    /// bytes are not fields of an answer at all.
+    ///
+    /// Both are optional and both are told apart by the top bit of the byte that
+    /// starts them ([`PATH_FLAG`]): clear is the application byte, set is the
+    /// path's head, whose low bits are how many port numbers follow. So a board
+    /// that sends no application byte but travels a bridge (`[0x20][uuid]
+    /// [0x81][port]`) reads as Klipper behind that port, and the oldest answer of
+    /// all (`[0x20][uuid]`) reads as Klipper directly wired.
+    ///
+    /// A path that does not parse — a count of zero, past [`MAX_PATH_PORTS`], or
+    /// not the number of bytes left in the payload — is dropped on its own rather
+    /// than the whole answer with it: the UUID is still a board worth reporting,
+    /// and a board whose path is unreadable is reported with none, exactly as one
+    /// that answered directly. A byte that is neither a path head nor (any longer)
+    /// an application byte is not a field of this shape at all, and the unit is
+    /// refused as it was before the path existed.
+    fn tail(after_uuid: &[u8]) -> Option<(Option<u8>, Vec<u8>)> {
+        let mut rest = after_uuid;
+        let mut application = None;
+        if let Some((&first, tail)) = rest.split_first() {
+            if first & PATH_FLAG == 0 {
+                application = Some(first);
+                rest = tail;
+            }
+        }
+        let mut ports = Vec::new();
+        if let Some((&head, tail)) = rest.split_first() {
+            if head & PATH_FLAG != 0 {
+                let count = usize::from(head & !PATH_FLAG);
+                if !(1..=MAX_PATH_PORTS).contains(&count) || tail.len() != count {
+                    return Some((application, ports));
+                }
+                ports.extend_from_slice(tail);
+                rest = &[];
+            }
+        }
+        if !rest.is_empty() {
+            return None;
+        }
+        Some((application, ports))
     }
 }
 
@@ -4125,6 +4188,18 @@ mod mux_tests {
         unit
     }
 
+    /// The same answer with `tail` after the UUID, whatever it is: the shape a
+    /// bridge's answer arrives in, where the application byte and the port path
+    /// are each optional and each told apart by the top bit of its first byte.
+    fn admin_answer_tail(uuid: [u8; 6], tail: &[u8]) -> Vec<u8> {
+        let mut body = vec![RESP_NEED_NODEID];
+        body.extend_from_slice(&uuid);
+        body.extend_from_slice(tail);
+        let mut unit = encode_header(ADMIN_REPLY);
+        unit.extend_from_slice(&kxid_unit(&body));
+        unit
+    }
+
     #[test]
     fn the_discovery_query_is_the_admin_broadcast_unit() {
         // The bytes on the wire, exactly: the admin listen id as a checked
@@ -4298,6 +4373,89 @@ mod mux_tests {
         let node = UnassignedNode::from_unit(&unit).expect("an answer");
         assert_eq!(node.application, None);
         assert_eq!(node.application_name(), "Klipper");
+    }
+
+    #[test]
+    fn a_directly_wired_answer_names_no_port() {
+        // The oldest shape there is — `[0x20][uuid]`, no application byte, no
+        // path — and the one every board answers with: nothing to attribute, so
+        // the board is the host's own wire's.
+        let node = UnassignedNode::from_unit(&admin_answer([0x11; 6], None)).unwrap();
+        assert_eq!(node.ports, Vec::<u8>::new());
+    }
+
+    #[test]
+    fn the_application_byte_of_a_bridged_answer_is_read_before_its_path() {
+        // `[0x20][uuid][0x01][0x81][0x00]`: CanBoot behind the answer's bridge
+        // port 0. Both optional fields present, told apart by the top bit of the
+        // byte that starts each — read the wrong way round, `0x01` would be a
+        // path of one port and the answer would lose its application.
+        let node = UnassignedNode::from_unit(&admin_answer_tail([0x11; 6], &[0x11, 0x81, 0x07]))
+            .expect("an answer");
+        assert_eq!(node.application, Some(0x11));
+        assert_eq!(node.application_name(), "CanBoot");
+        assert_eq!(node.ports, vec![0x07]);
+    }
+
+    #[test]
+    fn a_bridged_answer_names_the_port_it_came_up_on() {
+        // A board with no application byte — the shape the firmware's own
+        // devices answer with — behind one bridge, which appended its port: the
+        // byte after the UUID has its top bit set, so it is the path's head
+        // (`0x80 | 1`), not an application.
+        let node = UnassignedNode::from_unit(&admin_answer_tail(
+            [0x0d, 0x1e, 0x2f, 0x3a, 0x4b, 0x5c],
+            &[0x81, 0x00],
+        ))
+        .expect("an answer");
+        assert_eq!(node.application, None);
+        assert_eq!(node.application_name(), "Klipper");
+        assert_eq!(node.ports, vec![0x00]);
+    }
+
+    #[test]
+    fn a_chain_of_bridges_appends_its_ports_in_order() {
+        // Two bridges passed the answer, innermost first: the count says two, and
+        // the ports are read in the order they were appended — `0x82 0x00 0x02`
+        // is "port 0 of the first, port 2 of the last", the chain the host
+        // prints as `via ports 0>2`.
+        let node = UnassignedNode::from_unit(&admin_answer_tail([0x11; 6], &[0x82, 0x00, 0x02]))
+            .expect("an answer");
+        assert_eq!(node.ports, vec![0x00, 0x02]);
+        // The longest legal path is eight ports (`MAX_PATH_PORTS`), which is the
+        // firmware's own bound (`mux.h` `MUX_PATH_MAX`).
+        let mut longest = vec![0x80 | 8];
+        longest.extend(0..8);
+        let node =
+            UnassignedNode::from_unit(&admin_answer_tail([0x11; 6], &longest)).expect("an answer");
+        assert_eq!(node.ports, (0..8).collect::<Vec<u8>>());
+    }
+
+    #[test]
+    fn a_path_that_does_not_parse_is_dropped_and_the_answer_kept() {
+        // A path is the host's only record of where a board sits, so one that
+        // cannot be read is no path at all — never half of one, and never a
+        // panic. The UUID was still heard, so the board is still reported.
+        for (what, tail) in [
+            // A count of zero names no port.
+            ("a count of zero", vec![0x80]),
+            // Nine ports: past the firmware's bound of eight.
+            ("a count past the bound", {
+                let mut tail = vec![0x80 | 9];
+                tail.extend(0..9);
+                tail
+            }),
+            // A count of two with one port's byte behind it.
+            ("a short path", vec![0x82, 0x00]),
+            // A count of one with a byte too many.
+            ("a long path", vec![0x81, 0x00, 0x01]),
+        ] {
+            let node = UnassignedNode::from_unit(&admin_answer_tail([0x11; 6], &tail))
+                .unwrap_or_else(|| panic!("{what} is still an answer"));
+            assert_eq!(node.uuid, [0x11; 6]);
+            assert!(node.ports.is_empty(), "{what} names no port");
+            assert_eq!(node.application, None, "{what} is no application byte");
+        }
     }
 
     #[test]

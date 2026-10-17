@@ -219,7 +219,7 @@
 根本选不了 mux）、以及 `Makefile` 的 `src-y := $(call uniq,$(src-y))`（保留首次出现的**保序去重**；
 `chipid.c` 被多载体各列一次 ⇒ 重复定义 + 重复 `compile_time_request`）。板子 `.config` 现为 `CONFIG_USBSERIAL=y + CONFIG_MUX_SERIAL=y`。
 
-**跑成的**：① `klipperx scan --port /dev/ttyACM1` → `uuid=e512c60ac0e6`（= 该板 UID 的 chipid 派生，
+**跑成的**：① `klipperx admin scan --port /dev/ttyACM1` → `uuid=e512c60ac0e6`（= 该板 UID 的 chipid 派生，
 已用仓库自带 C 版 fasthash64 独立复算一致）⇒ 真机 mux 扫描与身份；② M1-2（宿主库当桥 + 真板命名
 下游）整链 identify（bridge 22 / child 135）；③ M1-3（点名配置错误）；④ M2-3（主机对「复位没发生」
 的显式判定）；⑤ M2-2 控制路径（`RESTART_DEVICE` 经桥转发）。
@@ -238,7 +238,7 @@ C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「�
 **三条语义要分清（真机实测）**：
 - `REQUEST_BOOTLOADER (0x02)`＝**请求进 bootloader**（面向刷写/恢复，**不属** `restart_method` 的取值）；无 bootloader 的下游它是设计内 no-op。
 - `restart_method: admin`＝经桥转发 **`RESTART_DEVICE (0x05)`**，让下游**命名设备重启自己的固件**（不是进引导）。
-- `restart_method: command`（下游桥端口的默认）＝**重启固件本身**：主机把固件的 `reset` 命令当普通帧经**桥按 id 转发**给那台设备（固件侧 `command_reset` → `NVIC_SystemReset()`），**不需要 bootloader**。真机验过：`MCU 'child': resetting the firmware with the 'reset' command` ⇒ 板子确实重启（USB 重新枚举，`ttyACM1` → `ttyACM2`），复位后 `klipperx scan --port /dev/ttyACM2` 仍报同一身份 `e512c60ac0e6`（身份是 chipid 派生，跨复位稳定）。
+- `restart_method: command`（下游桥端口的默认）＝**重启固件本身**：主机把固件的 `reset` 命令当普通帧经**桥按 id 转发**给那台设备（固件侧 `command_reset` → `NVIC_SystemReset()`），**不需要 bootloader**。真机验过：`MCU 'child': resetting the firmware with the 'reset' command` ⇒ 板子确实重启（USB 重新枚举，`ttyACM1` → `ttyACM2`），复位后 `klipperx admin scan --port /dev/ttyACM2` 仍报同一身份 `e512c60ac0e6`（身份是 chipid 派生，跨复位稳定）。
 - **USB CDC 下游的复位会拖累宿主库桥，但现在会自恢复**：下游重新枚举期间 `/dev/ttyACM1` 消失（可能换号），
   桥那一侧此时 `config_uart` 打不开 tty ⇒ `MCU 'bridge' shutdown during connect: config_uart: the UART
 device could not be opened`。主机会**有界等该端口路径回来**（≤10s、100ms 轮询；`uart_path:` 用
@@ -266,7 +266,7 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
-- **katapult 直连刷写真机验证**：带 katapult 引导的板子（应用带偏移）经 `klipperx flash` 子命令直刷——
+- **katapult 直连刷写真机验证**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 子命令直刷——
   USB-CDC 路径（`--device /dev/serial/by-id/usb-Katapult…`：prime → 会话 → verify → `COMPLETE`
   后重枚举）与 CAN 路径（`--interface` + `-u`：admin `0x11/0x12` 指派 + uuid 校验）。判定按
   [flash-firmware](.agents/skills/flash-firmware/SKILL.md) 硬证据口径：刷后设备重枚举为应用

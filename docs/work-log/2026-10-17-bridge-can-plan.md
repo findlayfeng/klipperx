@@ -64,7 +64,7 @@
 - **ISO-TP + 应用**：klipper `CANSERIAL`+`ISOTP`（`stm32f103-can-isotp.config` / `stm32h743-can-isotp.config`）。
 - **ISO-TP + 引导：不存在**。katapult 无 ISO-TP（`third_party/katapult/src/generic/` 无 `isotp.c`），
   设备从「应用 ISO-TP」重启进「引导切片」时，**同一条 arb 上的字节格式会变**。
-  ⇒ 隧道刷写恒按切片（见 D3），ISO-TP 只管运行期。
+  ⇒ 隧道刷写**默认按切片**（见 D3；U9b 给 katapult 补上 ISO-TP 后才可选用 ISO-TP 隧道）。
 
 ---
 
@@ -74,12 +74,31 @@
 |---|---|---|---|
 | **D1** | CAN 端口后端 = 新文件 `src/generic/bridge_can.c`，只依赖 `canbus.h` 的板级钩子；**不 select `CANSERIAL`、不 select `MUX_CAN`**，只 `select CANBUS` 拉驱动 | 避开 `mux_send` 双实现（§1.2-2）；端口不绑本节点 id，才能听多个下游 id | 端口后端自己管过滤器与 rx 分桶 |
 | **D2** | CAN 引脚从控制台 `choice` 里解耦：新增 `STM32_BRIDGE_CAN_PB8_PB9`（低层选项）等端口专用引脚项，`select CANBUS` + `select BRIDGE_PORT_CAN`，与 USB 控制台共存 | 拓扑 B 的全部意义就是「USB 控制台 + CAN 端口」；用 PB8/PB9 避开 USB 的 PA11/PA12 | 对上游 Kconfig 的偏离，必须进 `upstream-deviations.md` |
-| **D3** | 端口载具用 **`SET_PORT_NODEID` 的 `flags` 新增 bit1 `MUX_PORT_ISOTP`（0x02）** 声明，默认切片；**隧道（`0x06`）恒按切片**，与载具标志正交 | flags 已经是「设备说什么」的载体属性；隧道运的是 katapult 裸帧，而 katapult 没有 ISO-TP（§1.5） | 旧桥忽略未知 bit ⇒ 静默按切片处理，需在 `admin bridge config` 报告里回读端口状态以暴露误配 |
+| **D3** | 端口载具用 **`SET_PORT_NODEID` 的 `flags` 新增 bit1 `MUX_PORT_ISOTP`（0x02）** 声明，默认切片；**隧道的默认载具恒为切片**，但可用 `--port-carrier` **单次覆盖**；端口载具与隧道载具正交 | flags 已经是「设备说什么」的载体属性；隧道运的是 katapult 裸帧，而 stock katapult 只有切片（U9b 落地前 ISO-TP 设备也只能按切片刷） | 旧桥忽略未知 bit ⇒ 静默按切片处理，需在 `admin bridge config` 报告里回读端口状态以暴露误配；隧道载具覆盖是命令行开关，不落固件状态 |
 | **D4** | 端口的 CAN arb 来源：**UNITS 口从单元头解**（`mux_decode_header`→`mux_node_id_from_arb`→`mux_arb_id`）；**legacy/tunnel 口用端口记的 `node_id`**（`SET_PORT_NODEID` 两种形态都记 id，协议页 `:298-316` 已如此） | `bridge.h` 的 `write` 拿不到 arb；legacy 剥头后 arb 丢失 | `bridge.h` 加只读访问器 `bridge_port_node_id(int)`（子模组小改，本规划已批准） |
 | **D5** | 过滤器扩为**可追加**：新增 `canhw_add_filter(uint32_t arb)`（上限固定，bxCAN 走 bank 池，linux 空实现），`canhw_set_filter` 保持原义 | 下游每个 node 要两条 arb（`0x100+2n`、`+1`），单 id 接口不够 | 改 `generic/canbus.h` + 各 arch `can.c`（子模组改动，本规划已批准） |
 
 **明确不做**：CAN-FD 固件半边（`struct canbus_msg` 8→64，另案）、拓扑 A（CAN 当桥上游）、
-RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一版上限）。
+RS-485/P6。`[can_device]` 的「一 CAN 口一 node」只是第一版默认上限，扩不扩看 §6。
+
+### 2.1 D3 补充：katapult 的 ISO-TP 兼容（可选单元 U9b，已按实测评估）
+
+**结论：可以，但必须排在「切片跑通」之后，且永不删切片。** 实测与代价：
+
+| 项 | 数字 | 来源 |
+|---|---|---|
+| klipper 侧 `generic/isotp.o` | **flash 1444 B**（text 1432 + data 12）、bss 276 B | `stm32f103-can-isotp.config` 实测 `size` |
+| katapult 现役（mux 版）`katapult.bin` | **4304 B / 8192 B 分区**（余 3888 B） | `out/firmware/katapult/katapult.bin` |
+| 预估加 ISO-TP 后 | ~5.8 KB / 8 KB（余 ~2.4 KB） | 4304 + 1444 + 适配开销 |
+| katapult 侧改动面 | `src/Kconfig` 加 `ISOTP`（`depends on CANSERIAL`，默认 n）；`src/Makefile` 编 `generic/isotp.c`；`src/generic/canserial.c` **三个接点**（tx 任务调 `isotp_task`、`console_sendf` 调 `isotp_send`、rx 在 `command_find_block` 前调 `isotp_receive`）——与 klipper 侧同形 | — |
+| 适配差异 | katapult 无 mux：`ISOTP_MSG_MAX = MESSAGE_MAX`（不 +2 字节头）；CAT 帧 ≤128 B ≤ ISO-TP 4095 上限；`0x3f0` 单帧 admin 不动 | `third_party/katapult/protocol.md`、`src/command.h` |
+
+**为什么仍以切片为默认隧道载具**：① 存量/上游 katapult 只有切片，回滚路径必须是切片；② 引导里多一层
+状态机与 25 ms 定时，刷写是最不能出错的一段；③ 真机矩阵里「ISO-TP 应用 + 切片引导」本来就要验（§4），
+U9b 只决定「能否也按 ISO-TP 刷」，不影响主线能不能通。
+
+**U9b 的硬约束**：与 U7（桥端口 ISO-TP）**共用同一套语义**（8 B classical / 25 ms / CTS·BS=0·STmin=0），
+否则两端对不上；落地后必须补一条「切片失败 → 自动降级重试」的测试，防止工具选错载具时把人卡死在刷写里。
 
 ---
 
@@ -101,7 +120,9 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 | # | 单元 | 落点 | 验收 |
 |---|---|---|---|
 | **U7** | **per-(port,node) ISO-TP 状态**：从 `src/generic/isotp.c` 抽出可多实例化的收发状态（收 SF/FF/CF/FC；发分段 + 等 FC），常量沿用 8 B classical / 25 ms / CTS·BS=0·STmin=0；上限固定（桥 4 端口 × 1 node 起步） | `src/generic/bridge_can_isotp.c`（或 `bridge_can.c` 内分支） | 纯状态机测试：SF/FF+CF/FC 双向、SN 回绕、超时失败；与 `isotp_proto.rs` 的 22 条测试语义对齐（可照抄用例） |
-| **U8** | **载具标志落到写/收路径**（D3）：`MUX_PORT_ISOTP` 时 `write` 走 ISO-TP 分段（目标 arb = 端口 node_id），收走 ISO-TP 重组；隧道恒切片 | `src/generic/bridge_can.c`、`src/bridge.c`（flags 记录）、`src/mux.h`（bit 定义） | 同一端口在两种 flags 下的帧序列测试（切片 vs SF/FF/CF）；隧道模式忽略 ISOTP 位 |
+| **U8** | **载具标志落到写/收路径**（D3）：`MUX_PORT_ISOTP` 时 `write` 走 ISO-TP 分段（目标 arb = 端口 node_id），收走 ISO-TP 重组；隧道载具默认切片、可按 `--port-carrier` 覆盖 | `src/generic/bridge_can.c`、`src/bridge.c`（flags 记录）、`src/mux.h`（bit 定义） | 同一端口在两种 flags 下的帧序列测试（切片 vs SF/FF/CF）；隧道覆盖只改主机侧，不落固件状态 |
+| **U9** | **构建闸门配置**：`test/configs/stm32f103-usb-can-bridge-isotp.config`（U6 + `CONFIG_ISOTP` 在端口侧意义下的编译覆盖） | 同上 | 编过、字典产出 |
+| **U9b** | （可选，**在 U15 与真机切片路径跑通之后**）**katapult 的 ISO-TP 兼容**：见 §2.1——`ISOTP` Kconfig + 三个接点，语义镜像 klipper；主机侧给直连刷写（`src/flash/transport.rs`）补 ISO-TP 变体（复用 `isotp_proto::IsotpState`），供「切片失败自动降级」用 | `third_party/katapult/src/{Kconfig,Makefile,generic/canserial.c}`、`src/flash/transport.rs` | katapult.bin 仍 < 8 KiB 且打印实测大小；切片↔ISO-TP 双向互通测试；**降级测试**：ISO-TP 刷写失败时自动用切片重试并成功 |
 | **U9** | **构建闸门配置**：`test/configs/stm32f103-usb-can-bridge-isotp.config`（U6 + `CONFIG_ISOTP` 在端口侧意义下的编译覆盖） | 同上 | 编过、字典产出 |
 
 ### P3 主机：配置面与 attach
@@ -118,7 +139,7 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 |---|---|---|---|
 | **U13** | `admin bridge config` 报告 CAN 槽：槽名与「这是 CAN 口」的事实（`BRIDGE_UART_COUNT` 仍是总数，另加一个描述 CAN 槽的常量或按 arch 的 `RESERVE_PINS_*` 类比给出） | `src/flash/{bridge_flash.rs,cli.rs}` | 纯函数测试：报告里 CAN 槽行不与 UART 槽混；旧固件（无该常量）文案不变 |
 | **U14** | `admin bridge port` 对 CAN 端口：默认 UNITS + 可选 `--port-carrier cans|isotp`；拒绝组合（CAN + `--legacy` 且无 node_id；CAN + 非默认 baud 提示忽略） | `src/flash/cli.rs` | plan/参数层测试：合法组合成计划、非法组合点名报错；命令序列断言与串口口一致（`SET_PORT_NODEID` flags 多一位） |
-| **U15** | `admin flash --bridge … --port <can槽> --port-nodeid N`：隧道恒切片，端到端走现有 `BridgeLink::flash` | `src/flash/{cli.rs,bridge_flash.rs}` | 单元级：帧序列 = 裸 katapult 块按 8 B 切片、arb = 该 node；失败重试路径与串口一致 |
+| **U15** | `admin flash --bridge … --port <can槽> --port-nodeid N`：隧道按端口载具，默认切片；端到端走现有 `BridgeLink::flash` | `src/flash/{cli.rs,bridge_flash.rs}` | 单元级：帧序列 = 裸 katapult 块按 8 B 切片、arb = 该 node；失败重试路径与串口一致 |
 | **U16** | `admin scan --bridge … --ports <can槽>`：CAN 口上的单元广播与应答归因 | `src/scan.rs` | 纯逻辑测试：应答按 port 归属（路径字节），无应答时报告「该口无设备」 |
 
 ### P5 测试与文档（真机前的闸门）
@@ -126,7 +147,7 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 | # | 单元 | 落点 | 验收 |
 |---|---|---|---|
 | **U17** | 单测补齐：U2/U5/U7/U8 的纯逻辑用桩（`canbus_send` 记录器、假时钟），不依赖真总线；`BRIDGE_UART_COUNT` 分派与槽序 | 各模块 `#[cfg(test)]` | 新增测试全绿；`vcan` 仍不进闸门（与现状一致，只在真机清单里作为可选） |
-| **U18** | 文档同步：协议页（`MUX_PORT_ISOTP`、CAN 端口后端与槽序、隧道恒切片）、用户手册（`[can_device]` 可用、四命令对 CAN 口、`can_protocol`）、`config.md`、`upstream-deviations.md`（D2 的 choice 拆解、D5 的过滤器接口）、`testing.md` 测数与覆盖、`TESTING.md` M1-4 改为「待真机，清单见本文件」 | 见左 | 「`BRIDGE_PORT_CAN` 尚缺」类断言全部消失（`grep` 只剩历史 work-log）；测数用 `cargo test --list` 重数 |
+| **U18** | 文档同步：协议页（`MUX_PORT_ISOTP`、CAN 端口后端与槽序、隧道默认切片与覆盖）、用户手册（`[can_device]` 可用、四命令对 CAN 口、`can_protocol`）、`config.md`、`upstream-deviations.md`（D2 的 choice 拆解、D5 的过滤器接口）、`testing.md` 测数与覆盖、`TESTING.md` M1-4 改为「待真机，清单见本文件」 | 见左 | 「`BRIDGE_PORT_CAN` 尚缺」类断言全部消失（`grep` 只剩历史 work-log）；测数用 `cargo test --list` 重数 |
 | **U19** | 闸门：`cargo test --workspace` 全绿、`cargo fmt --all -- --check`、`cargo build --workspace --all-targets` 0 告警、6 份新老 CAN config 全部编过 | — | 命令与输出贴进收口报告 |
 
 ### P6 真机前检查单（**本规划到此为止，真机另开一轮**）
@@ -143,8 +164,8 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 | 2 | **下游 CAN 板 ×1**：STM32F103ZE + 同款收发器 | 两条路径的被测设备 | 需要能刷两套固件：klipper `CANSERIAL`(±`MUX_CAN`) 与 klipper `CANSERIAL`+`ISOTP`；引导态用 stock katapult（CAN 载体，裸切片） |
 | 3 | **120 Ω ×2** | 总线两端终端 | 桥板与下游板各一端 |
 | 4 | 双绞线 + 共地 | 物理层 | 短距离即可，但两端终端不能省 |
-| 5 | **USB-CAN 适配器（可选）** | 直连对照（`admin flash --interface can0`）、`candump` 观察 | 桥板的 CAN 已被端口占用，不能当主机侧适配器用 |
-| 6 | （可选）第二块下游板 | 「UNITS 口 / 隧道口」两种用法各一块，省得反复刷 | 一端口一 node 是第一版上限 |
+| 5 | ~~**USB-CAN 适配器**~~（**本期无，不做前置**） | 直连对照（`admin flash --interface can0`）、`candump` 观察 | 没有它照样能验：桥板自己就是 CAN 的另一端；代价是「主机直连刷」与总线嗅探两条旁证缺席，真机报告里要写明 |
+| 6 | **保留现有两块板**（桥 + 下游），下游板**复用**：按需刷切片 / ISO-TP 两套应用固件 | 覆盖两条载具的最小集合 | 一 CAN 口一 node 的第一版上限下够用；要验多节点上限（§6）时再加板 |
 | 7 | 软件侧替代：`CAP_NET_ADMIN` 容器 + `vcan0` | 无板时先验主机逻辑（非本仓闸门先例） | 真机不是它的替代 |
 
 **非本清单**：CAN-FD 收发器与 FDCAN 板（固件半边未做）、RS-485。
@@ -159,15 +180,35 @@ klipperx admin bridge config --bridge $B
 klipperx admin bridge port --bridge $B --port <can槽> --port-nodeid 7 --port-carrier cans
 # ③ 经 CAN 口发现下游
 klipperx admin scan --bridge $B --ports <can槽>
-# ④ 经 CAN 口刷下游（隧道恒切片；引导态 = stock katapult）
+# ④ 经 CAN 口刷下游（隧道默认切片；引导态 = stock katapult）
 klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nodeid 7 <fw.bin>
-# ⑤ ISO-TP 路径：设备跑 CANSERIAL+ISOTP 时，端口用 --port-carrier isotp 再 scan/连
+# ⑤ ISO-TP 隧道的可选覆盖（U9b 落地后才有意义；没有它时 ISO-TP 设备也按切片刷）
+klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nodeid 7 \
+    --port-carrier isotp <fw.bin>
 ```
 
 判定口径沿用现有一套（`complete: N bytes in M blocks` 只在 verify 全过后打印；`Found uuid=…, port N`），
 另加两条本拓扑专属：**CAN 槽的帧序列里 arb = `0x100+2*node`**、**ISO-TP 口上是 SF/FF/CF 而非裸切片**。
 
-## 6. 风险（真机前必须先想清）
+## 6. 端口 / 节点上限（U5/U7 的预算，实测定数）
+
+三条预算，取最小者；**第一版建议 `BRIDGE_CAN_NODE_MAX = 4`**（一 CAN 口最多盯 4 个下游 node）。
+
+| 预算 | 现值 | 每条目消耗 | 折算上限 |
+|---|---|---|---|
+| 桥端口槽 | `src/bridge.c:65` 固定 **4** 槽 | 1 端口/槽 | UART 已占 2 ⇒ CAN 端口最多 2 |
+| bxCAN 过滤器 bank | F103 **14** 个（`stm32/can.c:136-172`：`0x3f0` 占 1、自身 `id`/`id+1` **各占 1**，32 位精确掩码） | 每 node 2 bank（`id`、`id+1`）；admin 1 | **(14-1)/2 = 6 node**；改用「bit0 掩码」一格盯一对 ⇒ **13 node**（U4 按这一形态做） |
+| RAM | 桥固件当前 data 52 + bss **3996 B / 20480 B**（余 ~16 KB） | 切片：每 node ≈ rx 130 B + tx 排队 ≈ 200 B；ISO-TP 再加状态 + 2 条消息队列 ≈ 420 B ⇒ **切片 ~330 B、ISO-TP ~750 B 每 node** | 8 node ≈ 6 KB（可行）；16 node ≈ 12 KB（吃紧，还叠着 2×256 B/端口的 USART 缓冲） |
+| `bridge.c` 的 `id→port` 表 | `MUX_MAX_NODE_ID+1` = **256** 项 | 1 项/id | 不构成限制 |
+
+**语义边界**：一个 CAN 口挂多 node 时，只有 **UNITS** 模式成立（同一端口索引反复 `SET_PORT_NODEID(index, id, UNITS)`，
+映射不撤销）；**legacy / 隧道**是「一端口一个 `node_id`」的语义（arb 只能从端口记的 id 推）——
+所以**刷写永远针对该口的那个 `node_id`**。
+
+超出上限时：配置期（主机侧）点名报错；固件侧在 `SET_PORT_NODEID` 收不下时 `shutdown` 并附原因，
+**不得静默听不见某个 node**（这是 CAN 侧最难查的故障形态）。
+
+## 7. 风险（真机前必须先想清）
 
 1. **中断关闭时长**：`mux_input` 在 `irq_save()` 段内就地 memmove，CAN 帧更密（`TESTING.md:200-202`
    已登记）——CAN 端口后端自己也要在 IRQ 里做 per-node 追加，必须复用「关中断小块 + 任务里重组」的
@@ -176,7 +217,8 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
    超限必须 `shutdown` 报错（附原因），不能静默听不见。
 3. **载具误配**（D3 的代价）：设备跑 ISO-TP、端口按切片 ⇒ 字节被解释成垃圾且**看起来像 CRC 错**。
    `admin bridge config` 要能回读端口载具，误配在报告层暴露。
-4. **引导期格式翻转**（§1.5）：ISO-TP 设备的引导是切片。刷写只走隧道（恒切片）就绕开了；
-   若将来要在端口上「拨回应用」再验 ISO-TP，需要一次复位 + 端口载具保持 —— 第一版不验这段。
+4. **引导期格式翻转**（§1.5）：ISO-TP 设备的引导是切片。刷写只走隧道（默认切片）就绕开了；
+   U9b 落地后可选 ISO-TP 隧道，但必须在实测里双向验（含降级）；若将来要在端口上「拨回应用」再验 ISO-TP，
+   需要一次复位 + 端口载具保持 —— 第一版不验这段。
 5. **子模组改动**（D4/D5）：`bridge.h`/`canbus.h` 的接口扩展要在 `upstream-deviations.md` 登记，
    并在 katapult 侧同步评估（katapult 的 `canhw_set_filter` 同形，本期不改 katapult）。

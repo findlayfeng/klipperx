@@ -349,7 +349,7 @@ pub async fn declare_ports(mcu: &Mcu, ports: &[BridgePort]) -> Result<(), Bridge
         mcu.send(ConfigUart::NAME, &uart.args())?;
         let bridge_port = ConfigBridgePort {
             oid: uart_oid + 1,
-            uart: uart_oid,
+            port: uart_oid,
         };
         mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
     }
@@ -388,7 +388,7 @@ pub async fn declare_port(mcu: &Mcu, index: u8, baud: u32) -> Result<(), BridgeE
     mcu.send(ConfigUart::NAME, &uart.args())?;
     let bridge_port = ConfigBridgePort {
         oid: uart_oid + 1,
-        uart: uart_oid,
+        port: uart_oid,
     };
     mcu.send(ConfigBridgePort::NAME, &bridge_port.args())?;
     mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;

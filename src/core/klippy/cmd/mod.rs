@@ -124,7 +124,7 @@ pub use trigger_analog::{
 pub use trsync::{
     ConfigTrsync, TriggerReason, TrsyncSetTimeout, TrsyncStart, TrsyncState, TrsyncTrigger,
 };
-pub use uart::{ConfigBridgePort, ConfigUart, DEFAULT_UART_BAUD};
+pub use uart::{ConfigBridgePort, ConfigCan, ConfigUart, PortConfig, DEFAULT_UART_BAUD};
 
 use crate::core::klippy::mcu::{Dictionary, Enumeration, Mcu, McuError, SendClocks};
 use crate::core::klippy::msg::proto::{ArgType, ArgValue};

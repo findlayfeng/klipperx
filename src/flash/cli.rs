@@ -228,9 +228,11 @@ pub struct BridgeConfigArgs {
 /// port is declared on the bridge (`config_uart` + `config_bridge_port`), named
 /// the **units** way by default (the wire format the mux's devices speak, which
 /// is what makes the port's device addressable by id and its answers
-/// forwardable), and its flashing tunnel is opened; the command stops. `--legacy`
-/// names it the old way instead — no `MUX_PORT_UNITS` — which is what a stock
-/// katapult board behind the port still needs. No device is reset
+/// forwardable) and on the carrier `--port-carrier` picks (`cans`, 8-byte
+/// frames, unless the device behind a CAN slot speaks ISO-TP), and its flashing
+/// tunnel is opened; the command stops. `--legacy` names it the old way instead —
+/// no `MUX_PORT_UNITS`, which is what a stock katapult board behind the port
+/// still needs, and no carrier either. No device is reset
 /// ([`admin reset`](ResetArgs) does that) and nothing is flashed
 /// ([`admin flash`](FlashArgs) does that).
 #[derive(Parser, Debug)]

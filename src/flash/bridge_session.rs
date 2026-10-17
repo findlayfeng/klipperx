@@ -239,31 +239,6 @@ pub async fn open_bridge(
     })
 }
 
-/// Declare the ports and open the target's port and tunnel, **without** resetting
-/// anything — everything [`open_bridge`] does after step 2, for a caller that
-/// wants the bridge configured but no device [reset](PortReset).
-///
-/// `admin configure-bridge` is that caller: it prepares the bridge (its oid
-/// table and port table) and the target's route and flashing tunnel, and stops,
-/// leaving the devices as they were found. `mcu`, `link`, `ports` and `target`
-/// are [`open_bridge`]'s; the three steps and their order are in the module docs.
-///
-/// # Errors
-/// The same as [`declare_ports`] and [`open_target_port`].
-pub async fn configure_bridge(
-    mcu: &Mcu,
-    link: &Interface,
-    ports: &[BridgePort],
-    target: BridgeTarget,
-) -> Result<BridgeReady, BridgeError> {
-    declare_ports(mcu, ports).await?;
-    open_target_port(link, target)?;
-    Ok(BridgeReady {
-        ports: ports.to_vec(),
-        target,
-    })
-}
-
 /// Declare `ports` on the bridge: the oid table, then one stream-and-port pair
 /// per port in index order — the bridge numbers a port by the order
 /// `config_bridge_port` reaches it — then the barrier that makes the
@@ -271,7 +246,8 @@ pub async fn configure_bridge(
 ///
 /// The declaration has to be on the wire before any port-level command: the
 /// bridge builds its port table from it, and a command that names a port it
-/// does not have is dropped in silence.
+/// does not have is dropped in silence. `admin bridge config` is the standalone
+/// caller: it declares the table and stops.
 ///
 /// # Errors
 /// [`BridgeError::TooManyPorts`] when the plan is wider than the oid byte can
@@ -336,7 +312,8 @@ pub fn reset_port(link: &Interface, index: u8, reset: PortReset) -> Result<(), B
 
 /// Name the target's port (a legacy route) and open its flashing tunnel —
 /// [`open_bridge`]'s step 3, after the declaration (and any resets) so the
-/// bridge has the port to route and toggle.
+/// bridge has the port to route and toggle. `admin bridge port` is the standalone
+/// caller: it names one already-declared port and stops there.
 ///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
@@ -481,13 +458,21 @@ mod tests {
         ]
     }
 
-    /// The steps of a configure: [`expected_steps`] without the reset units —
-    /// `configure_bridge`'s declaration, then the target named legacy and its
-    /// tunnel opened, and nothing between them.
-    fn expected_configure_steps(target_node_id: u8) -> Vec<Step> {
+    /// The declaration's steps only: [`expected_steps`] up to the last
+    /// `config_bridge_port`, with nothing after it.
+    fn expected_declaration_steps() -> Vec<Step> {
+        expected_steps(TARGET_NODE_ID)
+            .into_iter()
+            .filter(|step| matches!(step, Step::Command(..)))
+            .collect()
+    }
+
+    /// The port half's steps only: the target named legacy and its tunnel
+    /// opened, with nothing before them.
+    fn expected_target_steps(target_node_id: u8) -> Vec<Step> {
         expected_steps(target_node_id)
             .into_iter()
-            .filter(|step| !is_reset(step))
+            .filter(|step| matches!(step, Step::Admin(..)) && !is_reset(step))
             .collect()
     }
 
@@ -656,12 +641,13 @@ mod tests {
         );
     }
 
-    /// `configure_bridge` is `open_bridge` **without the resets**: the same
-    /// declaration, then the target's port named legacy and its tunnel opened —
-    /// and nothing between them. Comparing the two plans on the wire is what
-    /// pins both the order and the absence of every reset unit.
+    /// `admin bridge config`'s one write: the declaration pairs in index order,
+    /// and nothing else — no route, no tunnel, and above all no reset unit.
+    ///
+    /// The window is fixed because the silence is the evidence: no admin unit
+    /// ever arrives, so there is nothing to wait for.
     #[tokio::test]
-    async fn test_configure_bridge_declares_and_opens_the_tunnel_without_a_reset() {
+    async fn test_declare_ports_sends_the_declaration_and_no_reset() {
         let pty = Pty::new();
         let link = shared_serial_link(&pty);
         let mcu = bridge_mcu("bridge", &link);
@@ -676,18 +662,39 @@ mod tests {
                 reset: PortReset::RestartDevice,
             },
         ];
+        declare_ports(&mcu, &ports)
+            .await
+            .expect("the declaration is sent");
+
+        let units = read_units(&pty.master, Duration::from_millis(500), |_| false);
+        let parser = mux_parser();
+        let observed = steps(&parser, &units);
+        assert_eq!(
+            observed,
+            expected_declaration_steps(),
+            "the declaration pairs in index order and nothing after them"
+        );
+        assert!(
+            observed.iter().all(|step| !is_reset(step)),
+            "declaring ports resets nothing"
+        );
+    }
+
+    /// `admin bridge port`'s write: the target named legacy and its tunnel
+    /// opened, and nothing else — no declaration, no reset.
+    #[tokio::test]
+    async fn test_open_target_port_names_and_tunnels_without_a_reset() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+
         let target = BridgeTarget {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        let ready = configure_bridge(&mcu, &link, &ports, target)
-            .await
-            .expect("the configure runs");
-        assert_eq!(ready.ports, ports.to_vec(), "the plan as it was declared");
-        assert_eq!(ready.target, target);
+        open_target_port(&link, target).expect("the route and the tunnel go out");
 
-        // Only two admin units are expected (the target's route and its
-        // tunnel), so seeing both means every declaration frame is in hand.
+        // Two admin units are expected (the route and the tunnel), so seeing
+        // both means the window is done.
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
             units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
         });
@@ -695,18 +702,12 @@ mod tests {
         let observed = steps(&parser, &units);
         assert_eq!(
             observed,
-            expected_configure_steps(TARGET_NODE_ID),
-            "the declaration pairs in index order, then the target named legacy and its \
-             tunnel opened, with no reset unit anywhere"
+            expected_target_steps(TARGET_NODE_ID),
+            "the target named legacy and its tunnel opened, with nothing before them"
         );
-        // The difference from the flashing prep is exactly the two resets.
-        assert_eq!(
-            observed,
-            expected_steps(TARGET_NODE_ID)
-                .into_iter()
-                .filter(|step| !is_reset(step))
-                .collect::<Vec<_>>(),
-            "configure is flash's declaration + naming + tunnel, minus the resets"
+        assert!(
+            observed.iter().all(|step| !is_reset(step)),
+            "naming a port and opening its tunnel resets nothing"
         );
     }
 

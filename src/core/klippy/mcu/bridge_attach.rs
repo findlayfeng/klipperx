@@ -404,14 +404,12 @@ fn open_link_handle(
         // Every CAN upstream is unwired for downstream devices for the same
         // reason, so both share one refusal rather than falling through to the
         // `{:?}` arm: the wire (`CanFd`) is orthogonal to what is missing.
-        Transport::Can { .. } | Transport::CanFd { .. } => {
-            Err(config_error(
-                "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+        Transport::Can { .. } | Transport::CanFd { .. } => Err(config_error(
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
              carrier and the port-command units exist, but the host-side attach is not \
              wired yet"
-                    .to_string(),
-            ))
-        }
+                .to_string(),
+        )),
         other => Err(config_error(format!(
             "a bridge on {other:?} cannot carry a downstream device"
         ))),

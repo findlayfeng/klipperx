@@ -119,7 +119,8 @@ pub struct FlashArgs {
     pub port_nodeid: Option<u8>,
 
     /// Reset the target port's device gets before the tunnel opens (bridge
-    /// flashes only; `reset-port` or `restart-device`, default `reset-port`)
+    /// flashes only; `reset-port`, `restart-device` or `bootloader`, default
+    /// `reset-port`)
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
 
@@ -313,8 +314,9 @@ pub struct ResetArgs {
     #[arg(long, value_name = "INDEX")]
     pub port: Option<u8>,
 
-    /// How a `--port` device is reset: `reset-port` (a line pulse) or
-    /// `restart-device` (its own restart), default `reset-port`
+    /// How a `--port` device is reset: `reset-port` (a line pulse),
+    /// `restart-device` (its own restart) or `bootloader` (send it into its
+    /// bootloader), default `reset-port`
     #[arg(long, value_name = "METHOD")]
     pub port_reset: Option<String>,
 }
@@ -712,14 +714,15 @@ pub fn plan_reset(args: &ResetArgs) -> Result<ResetPlan, String> {
     })
 }
 
-/// Parse `--port-reset`: the two resets [`PortReset`] has, in the spelling the
+/// Parse `--port-reset`: the three resets [`PortReset`] has, in the spelling the
 /// port-level commands carry.
 fn parse_port_reset(text: Option<&str>) -> Result<PortReset, String> {
     match text {
         None | Some("reset-port") => Ok(PortReset::ResetPort),
         Some("restart-device") => Ok(PortReset::RestartDevice),
+        Some("bootloader") => Ok(PortReset::Bootloader),
         Some(other) => Err(format!(
-            "--port-reset expects 'reset-port' or 'restart-device', got '{other}'"
+            "--port-reset expects 'reset-port', 'restart-device' or 'bootloader', got '{other}'"
         )),
     }
 }
@@ -1010,9 +1013,9 @@ fn open_link(source: &BridgeLinkSource, baud: u32) -> Result<BridgeLink, BridgeF
 /// and stop.
 ///
 /// Nothing is reset, no route is named and no tunnel is opened: the bridge is
-/// left with its port table, and the result line says what was declared. The
-/// runtime is built here for the same reason [`run_bridge_flash`] builds one —
-/// the link is opened inside it.
+/// left with its port table, and the report says what was declared and which
+/// indexes the next commands have to name. The runtime is built here for the same
+/// reason [`run_bridge_flash`] builds one — the link is opened inside it.
 pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
     let plan = plan_bridge_config(&args)?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1025,22 +1028,40 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         link.declare_ports(&plan.ports).await?;
         link.close();
-        report_bridge_config(&plan);
+        for line in bridge_config_lines(&plan.ports) {
+            println!("{line}");
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })
 }
 
-/// The last word of a successful `admin bridge config`: one greppable line naming
-/// every declared port, with its slot and its speed.
-fn report_bridge_config(plan: &BridgeConfigPlan) {
-    let ports = plan
-        .ports
+/// The last word of a successful `admin bridge config`: the ports it declared —
+/// one line each, with the slot and speed — and the **indexes** a later
+/// `admin bridge port` or `admin flash` names with `--port`.
+///
+/// The indexes are the positions of the entries the declaration carried, so the
+/// list and the bridge's port table cannot disagree: a declaration that stopped
+/// short (it failed, and said why) never reaches this report.
+fn bridge_config_lines(ports: &[BridgePort]) -> Vec<String> {
+    let mut lines = vec![format!("declared: {} port(s)", ports.len())];
+    for (index, port) in ports.iter().enumerate() {
+        lines.push(format!("  port {index}: slot {index} baud {}", port.baud));
+    }
+    let indexes = ports
         .iter()
         .enumerate()
-        .map(|(index, port)| format!("port {index} slot {index} baud {}", port.baud))
+        .map(|(index, _)| index.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    println!("declared: {} port(s), {ports}", plan.ports.len());
+    lines.push(format!(
+        "available port indexes: {}",
+        if indexes.is_empty() {
+            "(none)".to_string()
+        } else {
+            indexes
+        }
+    ));
+    lines
 }
 
 /// `admin bridge port`: open the bridge, identify it, name the plan's port
@@ -1127,6 +1148,7 @@ fn report_reset_port(index: u8, reset: PortReset) {
     let method = match reset {
         PortReset::ResetPort => "reset-port",
         PortReset::RestartDevice => "restart-device",
+        PortReset::Bootloader => "bootloader",
     };
     println!("reset: port {index} ({method}), sent with no receipt");
 }
@@ -1494,6 +1516,29 @@ mod tests {
         );
     }
 
+    /// The `--port-reset bootloader` spelling on the flash line: the target
+    /// port's device is sent into its bootloader ([`PortReset::Bootloader`]),
+    /// which is the run [`admin flash`](FlashArgs) then waits for `CONNECT` on.
+    #[test]
+    fn test_a_bridge_flash_plan_can_send_the_target_to_its_bootloader() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "--port-reset",
+            "bootloader",
+            "fw.bin",
+        ])
+        .expect("a bridge plan");
+        let Action::BridgeFlash { target, .. } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(target.reset, PortReset::Bootloader);
+    }
+
     /// The host-library bridge line: the library, its identity, its port ttys,
     /// the target's port and id, and the target port's reset.
     #[test]
@@ -1704,6 +1749,7 @@ mod tests {
         .expect_err("not a reset");
         assert!(err.contains("reset-port"), "{err}");
         assert!(err.contains("restart-device"), "{err}");
+        assert!(err.contains("bootloader"), "{err}");
 
         let err = planned(&[
             "--bridge-library",
@@ -1883,6 +1929,58 @@ mod tests {
                 baud: DEFAULT_BAUD,
                 reset: PortReset::ResetPort,
             }]
+        );
+    }
+
+    /// `admin bridge config`'s report: the declared ports, then the greppable
+    /// `available port indexes:` line a later `admin bridge port` / `admin flash`
+    /// takes its `--port` from.
+    #[test]
+    fn test_a_bridge_config_report_lists_the_available_port_indexes() {
+        let plan = planned_bridge_config(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port-count",
+            "3",
+            "--baud",
+            "115200",
+        ])
+        .expect("a three-port plan");
+        assert_eq!(
+            bridge_config_lines(&plan.ports),
+            vec![
+                "declared: 3 port(s)".to_string(),
+                "  port 0: slot 0 baud 115200".to_string(),
+                "  port 1: slot 1 baud 115200".to_string(),
+                "  port 2: slot 2 baud 115200".to_string(),
+                "available port indexes: 0, 1, 2".to_string(),
+            ]
+        );
+    }
+
+    /// The index list is the **declared** entries' own positions, not a count: a
+    /// table of two ports declared at different speeds reports its two slots and
+    /// nothing wider.
+    #[test]
+    fn test_a_bridge_config_report_follows_the_declared_ports() {
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                reset: PortReset::ResetPort,
+            },
+            BridgePort {
+                baud: 115_200,
+                reset: PortReset::ResetPort,
+            },
+        ];
+        assert_eq!(
+            bridge_config_lines(&ports),
+            vec![
+                "declared: 2 port(s)".to_string(),
+                "  port 0: slot 0 baud 250000".to_string(),
+                "  port 1: slot 1 baud 115200".to_string(),
+                "available port indexes: 0, 1".to_string(),
+            ]
         );
     }
 
@@ -2141,6 +2239,25 @@ mod tests {
                 reset: PortReset::ResetPort,
             }
         );
+
+        // `bootloader` is the third spelling: the one a flash run reaches a
+        // running application by.
+        let plan = planned_reset(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "2",
+            "--port-reset",
+            "bootloader",
+        ])
+        .expect("a port reset plan into the bootloader");
+        assert_eq!(
+            plan.target,
+            ResetTarget::Port {
+                index: 2,
+                reset: PortReset::Bootloader,
+            }
+        );
     }
 
     /// A reset method belongs to a port: without `--port` there is one reset, the
@@ -2167,6 +2284,7 @@ mod tests {
         .expect_err("not a reset");
         assert!(err.contains("reset-port"), "{err}");
         assert!(err.contains("restart-device"), "{err}");
+        assert!(err.contains("bootloader"), "{err}");
     }
 
     /// The bridge's link is one of the two, never both and never neither.

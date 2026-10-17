@@ -138,8 +138,8 @@ pub struct FlashArgs {
 #[command(
     name = "configure-bridge",
     version,
-    about = "Prepare a bridge: declare its downstream ports, name the target's 
-             port, and open its flashing tunnel — without resetting a device or 
+    about = "Prepare a bridge: declare its downstream ports, name the target's \
+             port, and open its flashing tunnel, without resetting a device or \
              flashing anything",
     arg_required_else_help = true
 )]
@@ -213,8 +213,8 @@ pub struct ConfigureBridgePlan {
 #[command(
     name = "reset",
     version,
-    about = "Reset a bridge itself, or a device on one of its ports, through the 
-             bridge's admin channel",
+    about = "Reset a bridge itself, or a device on one of its ports, through \
+             the bridge's admin channel",
     arg_required_else_help = true
 )]
 pub struct ResetArgs {

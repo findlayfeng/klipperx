@@ -164,14 +164,65 @@ enum BridgeOpen {
     },
 }
 
+/// Attach a **shared serial** bridge at `path`, naming it with `uuid` — or,
+/// when `uuid` is `None`, finding it first.
+///
+/// A bridge's node id lives in its firmware's RAM, so a run with no
+/// `--bridge-uuid` has to **find** the bridge. An unassigned one answers only
+/// the discovery broadcast (the query `klipperx scan --port` makes); an assigned
+/// one stays quiet on that broadcast and answers the plain re-confirmation
+/// instead. So this broadcasts first and falls back to the re-confirmation: the
+/// flag is an optional override, never a requirement, for both a first open and
+/// a reopen after a restart.
+///
+/// # Errors
+/// [`BridgeFlashError::AmbiguousBridge`] when more than one unassigned bridge
+/// answers — naming the wrong one would restart and re-assign the wrong board —
+/// [`BridgeFlashError::UnassignedSerial`] when neither the broadcast nor the
+/// re-confirmation reaches a bridge, and [`BridgeFlashError::Open`] when the tty
+/// cannot be opened.
+fn attach_bridge(
+    path: &Path,
+    baud: u32,
+    mcu_id: u32,
+    uuid: Option<[u8; 6]>,
+) -> Result<Arc<SharedSerialHandle>, BridgeFlashError> {
+    let uuid = match uuid {
+        Some(uuid) => uuid,
+        None => match discover_bridge_uuid(path, baud) {
+            Ok(uuid) => uuid,
+            // Several bridges cannot be told apart, and a wrong guess would
+            // restart and re-assign the wrong one: the caller has to choose.
+            Err(e @ BridgeFlashError::AmbiguousBridge { .. }) => return Err(e),
+            // Nothing unassigned answered: the bridge may already carry an id,
+            // which answers the re-confirmation rather than the broadcast. A
+            // silent line reaches neither, which is the unassigned report.
+            Err(BridgeFlashError::Open(InterfaceError::Timeout)) => {
+                return serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, None).map_err(
+                    |e| match e {
+                        InterfaceError::Timeout => BridgeFlashError::UnassignedSerial {
+                            path: path.to_path_buf(),
+                            baud,
+                        },
+                        e => BridgeFlashError::Open(e),
+                    },
+                );
+            }
+            Err(e) => return Err(e),
+        },
+    };
+    serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, Some(uuid))
+        .map_err(BridgeFlashError::Open)
+}
+
 impl BridgeOpen {
     /// Open the transport these parameters name, as a fresh link handle and its
     /// [`Interface`].
     ///
     /// # Errors
     /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
-    /// [`BridgeFlashError::UnassignedSerial`] for a serial bridge that does not
-    /// answer with no uuid given, [`BridgeFlashError::Open`] otherwise.
+    /// [`BridgeFlashError::UnassignedSerial`] / [`BridgeFlashError::AmbiguousBridge`]
+    /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise.
     fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
         match self {
             BridgeOpen::Host {
@@ -193,14 +244,7 @@ impl BridgeOpen {
                 mcu_id,
                 uuid,
             } => {
-                let handle = serial::attach(path, *baud, *mcu_id, SERIAL_ATTACH_TIMEOUT, *uuid)
-                    .map_err(|e| match (*uuid, e) {
-                        (None, InterfaceError::Timeout) => BridgeFlashError::UnassignedSerial {
-                            path: path.clone(),
-                            baud: *baud,
-                        },
-                        (_, e) => BridgeFlashError::Open(e),
-                    })?;
+                let handle = attach_bridge(path, *baud, *mcu_id, *uuid)?;
                 let link = Interface::shared_serial(Arc::clone(&handle));
                 Ok((link, BridgeDevice::Shared(handle)))
             }
@@ -328,20 +372,19 @@ impl BridgeLink {
     ///
     /// A bridge's link carries its downstream devices' frames too, so its port
     /// is opened shared and addressed by id (`serial::attach`), which also runs
-    /// the assignment handshake. `uuid` is the bridge **board's** own identity,
-    /// for a bridge that carries no node id yet: the assignment goes through
-    /// `SET_NODEID`, and only that segment names an unassigned board — the
-    /// plain re-confirmation a `None` uuid sends is answered by assigned
-    /// devices alone, so an unassigned bridge times out instead (see
-    /// [`BridgeFlashError::UnassignedSerial`]). A bridge that already carries
-    /// an id needs no uuid: the re-confirmation is the ordinary handshake.
+    /// the assignment handshake. `uuid` is the bridge **board's** own identity:
+    /// naming it skips the search. With `None` the bridge is **found** — the
+    /// discovery broadcast an unassigned board answers, or the plain
+    /// re-confirmation an already-assigned one answers instead — so
+    /// `--bridge-uuid` is an optional override, not a requirement.
     ///
     /// # Errors
-    /// [`BridgeFlashError::UnassignedSerial`] when the handshake timed out with
-    /// no uuid given — the one failure that has an actionable answer — and
-    /// [`BridgeFlashError::Open`] when the port cannot be opened, `mcu_id` is
-    /// outside the addressable range, or the handshake times out or is refused
-    /// with a uuid given.
+    /// [`BridgeFlashError::UnassignedSerial`] when no uuid names the bridge and
+    /// neither the discovery broadcast nor the re-confirmation reaches one,
+    /// [`BridgeFlashError::AmbiguousBridge`] when several unassigned bridges
+    /// answer the broadcast, and [`BridgeFlashError::Open`] when the port cannot
+    /// be opened, `mcu_id` is outside the addressable range, or the handshake
+    /// with a named bridge times out or is refused.
     pub fn open_serial(
         path: &Path,
         baud: u32,
@@ -527,13 +570,7 @@ impl BridgeLink {
                 // firmware's RAM), so a serial bridge has to be **named** again
                 // before it answers: the uuid the caller gave, or one the
                 // discovery scan finds on its now-unassigned line.
-                let uuid = match uuid {
-                    Some(uuid) => *uuid,
-                    None => discover_bridge_uuid(path, *baud)?,
-                };
-                let handle =
-                    serial::attach(path, *baud, *mcu_id, SERIAL_ATTACH_TIMEOUT, Some(uuid))
-                        .map_err(BridgeFlashError::Open)?;
+                let handle = attach_bridge(path, *baud, *mcu_id, *uuid)?;
                 let link = Interface::shared_serial(Arc::clone(&handle));
                 (link, BridgeDevice::Shared(handle))
             }
@@ -1825,5 +1862,33 @@ mod tests {
         );
         assert!(err.to_string().contains("--bridge-uuid"), "{err}");
         responder.join().expect("the responder thread");
+    }
+
+    /// The **first** open with no `--bridge-uuid` finds an unassigned bridge:
+    /// the firmware is spawned with an identity but no node id, so the plain
+    /// re-confirmation would time out. The discovery broadcast is what names it
+    /// ([`attach_bridge`]'s first half), and the identify that follows proves
+    /// the bridge was adopted and reached — the flag is an optional override.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_first_open_without_a_uuid_finds_an_unassigned_bridge() {
+        const BRIDGE_UUID: [u8; 6] = [0xd1, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6];
+
+        let port = Pty::new();
+        let firmware =
+            klipperx_test_support::LinuxFirmware::spawn_bridge_port(&port.path, BRIDGE_UUID)
+                .expect("the bridge firmware process starts");
+
+        // Nothing names the bridge first: it carries no node id, so only the
+        // discovery broadcast reaches it.
+        let link = BridgeLink::open_serial(firmware.serial_path(), 250_000, BRIDGE_MCU_ID, None)
+            .expect("the discovery scan finds and names the unassigned bridge");
+        tokio::time::timeout(Duration::from_secs(20), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify handshake timed out")
+            .expect("the found bridge identifies");
+
+        link.close();
+        drop(link);
+        drop(firmware);
     }
 }

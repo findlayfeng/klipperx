@@ -37,14 +37,17 @@
 //!   bridge must own before they reach the device; sent ahead of it, the bridge
 //!   drops them and the handshake times out with nothing downstream.
 //!
-//! A CAN port ([`can_device`]) takes the same route as a named uart port: the
+//! A CAN port ([`can_device`]) takes the same route as a named uart port — the
 //! firmware's CAN port backend (`BRIDGE_PORT_CAN`) opens the bridge's own CAN
 //! controller at the port's `can_bitrate` and the router addresses it like any
-//! other port. The one thing a CAN port cannot be is **legacy**: CAN addressing
-//! is by uuid, and the host has to name the device's CAN node id with the
-//! device's own handshake, so a `can:` child that writes no `uuid:` is refused
-//! by name ([`resolve`]) instead of being given a route that could never be
-//! addressed.
+//! other port — but **not** the same naming: the route is the same
+//! `SET_PORT_NODEID`, the naming is `SET_KLIPPER_NODEID` and at most the bus's
+//! own answer, never the mux's re-confirm, which a CAN device does not answer
+//! ([`LinkHandle::name_can_device`]). The one thing a CAN port cannot be is
+//! **legacy**: CAN addressing is by uuid, and the host has to name the device's
+//! CAN node id with the device's own handshake, so a `can:` child that writes no
+//! `uuid:` is refused by name ([`resolve`]) instead of being given a route that
+//! could never be addressed.
 //!
 //! The bridge's own transport decides how the downstream handle is opened, and
 //! the two kinds it can be are exactly the two mux links: a shared serial port
@@ -104,8 +107,10 @@ pub(crate) struct BridgePortLink {
     /// device speaks units — every port but a legacy one, CAN included.
     pub flags: u8,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
-    /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`):
-    /// a device behind a port answers the mux itself, unlike a legacy one.
+    /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`): a
+    /// device behind a port has an admin channel of its own, unlike a legacy
+    /// one. Which channel answers it — the serial mux's or the CAN bus's — is
+    /// [`Self::kind`]'s question.
     pub named: Option<[u8; 6]>,
     /// The port's **kind**, which decides how a named device is named: a uart
     /// port's device answers the serial mux's re-confirm, a CAN port's device

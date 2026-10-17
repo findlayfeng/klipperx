@@ -119,8 +119,8 @@ RS-485/P6、`[can_device]` 的多设备一端口（一 CAN 口一 node 为第一
 
 | # | 设备 | 用途 | 备注 |
 |---|---|---|---|
-| 1 | **CAN 测试专板 A（新，桥）**，二选一：<br>(a) **F103 + USART 控制台**（USART2，需 `LOW_LEVEL_OPTIONS`）+ **USB-UART 转换器**；<br>(b) **F4（如 F407）+ USB CDC 控制台** | 桥：控制台 + CAN 当它的下游口 | **F103 上 USB 与 CAN 共向量 20，不可共存**（见 D2）；两种形态都能跑，区别只在主机侧链路是串口还是 USB CDC |
-| 2 | **CAN 测试专板 B（新，下游）**：STM32F103ZE + 同款收发器 | 下游端口的被测设备 | 需能刷 `CANSERIAL`(±`MUX_CAN`) 的应用固件；引导态 stock katapult（CAN 载体，裸切片） |
+| 1 | **桥：STM32F446**（已就位）+ **CAN 收发器**（3.3V） | 桥：USB CDC 控制台（PA11/PA12），CAN1 在 **PB8(RX)/PB9(TX)** | F4 上 USB 与 CAN1 不共向量，能同时用；应用地址跟 katapult 的 32 KiB 分区（0x8008000） |
+| 2 | **下游：STM32F103**（已就位）+ 同款收发器 | CAN1 在 **PA11/PA12**（因此不能再用 USB，与 D2 一致） | 要能刷应用（`CANSERIAL`±`MUX_CAN`）与引导（stock katapult on CAN，裸切片） |
 | 3 | **120 Ω ×2** | 总线两端终端 | 新桥板与新下游板各一端 |
 | 4 | 双绞线 + 共地 | 物理层 | 短距离即可，但两端终端不能省 |
 | 5 | ~~**USB-CAN 适配器**~~（**本期无，不做前置**） | 直连对照（`admin flash --interface can0`）、`candump` 观察 | 没有它照样能验：新桥板自己就是 CAN 的另一端；代价是「主机直连刷」与总线嗅探两条旁证缺席，真机报告里要写明 |
@@ -182,5 +182,17 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 
 
 **验证（4 条构建全 rc=0）**：新目标 `BRIDGE_UART_COUNT=2` 且 `bridge_can.o` 有七个 `T bridge_can_*`；`usb-mux-bridge`（count=1）、`can-mux`、真机 `target/hw-bridge/klipper.config`（count=2）均**无** `bridge_can_*` 符号；主仓 `cargo test --workspace` 3206 通过 / 15 ignored。
+
+### 2026-10-17 晚：真机拓扑定稿（F446 桥 + F103 下游）与 CAN-only 构建修复
+
+用户提供真实拓扑：**主机 ─USB→ STM32F446（桥）─CAN→ STM32F103（下游）**；桥的 CAN 在 **PB8/PB9**，下游在 **PA11/PA12**（与 D2 的向量约束一致：下游不用 USB）。两块板都已处于引导态（F446 呈现为 `usb-katapult_stm32f446xx_26004B001050563641363020-if00`）。
+
+**新审出的 P1（已修，`07fa67f4`）**：分派层无条件调 USART 后端，所以 **CAN-only build（F446：USB 控制台 + CAN 口，无 USART 口）链接不过**（LTO 报 `unsupported relocation` 于 `uart_backend_set_port`）。修法：串口分支全部用 `#if CONFIG_BRIDGE_PORT_SERIAL` 包；没有串口后端时 CAN 槽从 0 数、ops/set_port 直接答 CAN 后端。新增构建闸门 `test/configs/stm32f446-usb-can-bridge.config`——它就是发现这个 bug 的目标。
+
+**F4 的闪存分区事实**：F4 的 Kconfig **不提供 8 KiB 引导选项**（`STM32_FLASH_START_2000` 只在 F1/F0/G0/G4）；F4 默认 32 KiB ⇒ 当 katapult 是 32 KiB 时应用在 **0x8008000**。真机配置已按此建成 `target/hw-can-bridge/klipper.config`（`target/` 被 ignore，不入库），产物 `target/hw-can-bridge/out/klipper.bin` = **50584 B**，`BRIDGE_UART_COUNT = 1`（只有 CAN 槽）。
+
+**验证**：F446 闸门 + 三条回归（`usb-mux-bridge` count=1 / `serial-can-bridge` count=2 / `can-mux`）+ 真机旧桥配置（count=2）全 rc=0；CAN-only build 的 `bridge_can.o` 七个 `T bridge_can_*`。
+
+**待确认（真机刷写前）**：① F446 上的 katapult 是否按 **32 KiB bootloader**（→ 应用 0x8008000）编的；② CAN 速率——classical CAN 上限 1 Mbit/s，固件现设 `CANBUS_FREQUENCY=1000000`，用户说的「10MHz」需澄清。
 
 **已知缺口 → U5b**：CAN 单帧 admin（`0x3f0`/`0x3f1`）未代理，而且端口开时也没有人装 admin 过滤器，所以**经桥扫描/指派一台未指派的 CAN 下游设备现在还不可能**。这是真机测试的前置单元（U5b，§3 已排），不是本轮遗留缺陷。

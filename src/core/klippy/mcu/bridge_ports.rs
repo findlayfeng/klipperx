@@ -1101,6 +1101,24 @@ mod tests {
         check_unused(&config, &access, &["mcu".to_string()]).expect("no option is left unread");
     }
 
+    /// Through the real loader: a `can_protocol` written on a `[uart_device]`
+    /// is an undefined option for that section, which the load refuses by name
+    /// — a CAN carrier cannot be smuggled onto a UART port.
+    #[test]
+    fn a_can_protocol_on_a_uart_port_stops_the_config_from_loading() {
+        let err = match load(
+            "[mcu]\nserial: /dev/a\n\
+             [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\ncan_protocol: isotp\n",
+        ) {
+            Ok(_) => panic!("a UART port has no carrier to choose"),
+            Err(err) => err,
+        };
+
+        let text = err.to_string();
+        assert!(text.contains("can_protocol"), "{text}");
+        assert!(text.contains("uart_device uart0"), "{text}");
+    }
+
     #[test]
     fn the_port_sections_load_and_hold_no_unused_options() {
         // The end-to-end contract: a config with an `[mcu]` and both port

@@ -321,17 +321,19 @@ admin id `0x3f0`；第二级是「桥 ↔ 下游某口的设备」——用 `SET
 | 后端 | 文件 | `BRIDGE_UART_COUNT` | 口在哪 |
 |------|------|---------------------|--------|
 | STM32（USART） | `third_party/klipper/src/stm32/bridge_serial.c` | 选中的 USART 个数（0..=5） | 编译期固定的 USART：总开关 `CONFIG_STM32_BRIDGE_SERIAL`（默认 n，`select` 后端与 `MUX_SERIAL`）下多选 `STM32_BRIDGE_SERIAL_USART1/2/3`、`_UART4/_UART5`，每个勾上的 USART 就是一个口（`RESERVE_PINS_bridge_serial*` = `RX,TX`） |
-| **STM32（CAN）** | `third_party/klipper/src/generic/bridge_can.c` | **`1`**（排在所有 USART 槽之后） | 一个 bxCAN 控制器：`CONFIG_STM32_BRIDGE_CAN_PB8_PB9`（`select BRIDGE_PORT_CAN` + `CANBUS_FILTER_MULTI`，**不** select `CANSERIAL`/`MUX_CAN`，也**不** select `CANBUS`——端口型 build 不是 CAN 节点）。槽名来自 `RESERVE_PINS_bridge_can` = `PB8,PB9`。**F1 上它 `depends on !(MACH_STM32F1 && USBSERIAL)`**：USB 与 CAN1 RX0 共用中断向量 20 |
+| **STM32（CAN）** | `third_party/klipper/src/generic/bridge_can.c` | **`1`**（计入口数，**不占 USART 槽**） | 一个 bxCAN 控制器：`CONFIG_STM32_BRIDGE_CAN_PB8_PB9`（`select BRIDGE_PORT_CAN` + `CANBUS_FILTER_MULTI`，**不** select `CANSERIAL`/`MUX_CAN`，也**不** select `CANBUS`——端口型 build 不是 CAN 节点）。槽名来自 `RESERVE_PINS_bridge_can` = `PB8,PB9`。**F1 上它 `depends on !(MACH_STM32F1 && USBSERIAL)`**：USB 与 CAN1 RX0 共用中断向量 20 |
 | linux 进程 | `third_party/klipper/src/linux/bridge.c` | `1` | 环境变量 `KLIPPER_BRIDGE_PORT_0` 给的 tty（只有一条静态流，`port_backend_open` 拒一切非 0 槽） |
 | host 库 | `third_party/klipper/src/host/bridge.c` | `KLIPPER_HOST_PORT_SLOTS`（= **4**，`host/klipper_host.h`） | 每槽一路独立流（独立 fd / 发送队列 / reset 状态机），tty 由 `klipper_host_port(slot, path)` 在 `init` 前登记，未登记则回落 `CONFIG_HOST_BRIDGE_SERIAL_PATH` |
 
 **对象层叫 `port`，不叫 `uart`**（`src/port.{c,h}`：`struct port_s`、`port_backend_open/port_ops/set_port`、`PORT_OPEN_*`），因为它装的不只是 UART。两条命令各自创建同一个对象，区别只在速率字段：
 
 ```
-config_uart oid=%c baud=%u slot=%c        # UART 口，baud 真实
-config_can  oid=%c bitrate=%u slot=%c    # CAN 口，bitrate 是**这段总线**的速率（运行期给）
+config_uart oid=%c baud=%u slot=%c        # UART 口：baud 真实，slot 选哪条 USART
+config_can  oid=%c bitrate=%u slot=%c    # CAN 口：bitrate 是**这段总线**的速率；slot 仍发但**被忽略**
 config_bridge_port oid=%c port=%c        # 两种口都交到这里，index = 声明顺序
 ```
+
+**槽号只命名一条 USART 线**：CAN 口走自己的入口 `port_backend_can_open`（一个控制器没有槽可选），所以两种口**怎么混排都不会互换后端**（早先「USART 槽在前、CAN 槽在后」的假设已废）。
 
 CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再重装过滤器与追加表），所以**换下游速率不再需要重烧桥**；设不了（分不出位）报 `PORT_OPEN_BAD_BAUD`。端口型 build 不声明 `CANBUS_FREQUENCY` 常量（那是节点的口径），速率只来自命令。
 
@@ -339,7 +341,12 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 可用的 `--port` 序号（`klipperx admin bridge config`，读固件字典里的 `BRIDGE_UART_COUNT`）。
 字典里没有这个常数的是旧固件——`admin bridge config` 会明说，并用 `--port-count`（默认 1）兜底。
 
-**槽序就是端口的身份**：USART 槽在前（选中的 USART 按编号升序里的名次），CAN 槽在后；只勾 USART2 时它就是**槽 0**；一个 CAN-only 桥（如 F446：USB 控制台 + CAN 口，无 USART 口）只有一个槽 0 且它是 CAN。主机**不能**拿「槽号 = 固定 USART 表」硬套——槽名来自后端自己的预留引脚常数（`RESERVE_PINS_bridge_serial*` / `RESERVE_PINS_bridge_can`），后端只报个数、不报槽名的（linux 单 tty、host 库 tty 表）才回落到 `MCU` 给的 arch 注记。
+**端口身份两套号，别混**：
+
+- **端口 `index`**（`SET_PORT_NODEID`、隧道、`config_bridge_port` 的编号）= 该桥**所有**端口的声明顺序（`bridge_add_port` 按到达顺序编号）；
+- **槽号 `slot`** 只用于 `config_uart` 选一条 USART：它是「选中的 USART 按编号升序里的名次」，只勾 USART2 时就是槽 0。CAN 口没有槽（`config_can` 的 slot 字段被忽略）。
+
+所以主机给 `config_uart` 的 slot 必须是**该桥上的 UART 序号**（第几个 UART 口），不能用端口 index——混排时两者不同。`admin bridge config` 的槽名来自后端自己的预留引脚常数（`RESERVE_PINS_bridge_serial*` / `RESERVE_PINS_bridge_can`），后端只报个数、不报槽名的（linux 单 tty、host 库 tty 表）才回落到 `MCU` 给的 arch 注记。
 
 ### 桥上的四条命令：`config` / `port` / `scan --bridge` / `flash`
 

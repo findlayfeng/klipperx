@@ -283,7 +283,17 @@ klipperx admin flash --bridge $B --bridge-uuid <uuid> --port <can槽> --port-nod
 | R2/U7/U8/U9 主机 | `3bd0463`…`5100c8a` | `ConfigCan`/`PortConfig`、`--can-bitrate`、`--assign-uuid`、刷写前后各指派一次、attach 重试（4 s/25 s） |
 
 **真机结果**（F446 桥 ─CAN 1M→ F103，见 `TESTING.md`）：发现 → 指派 → 送引导 → 隧道刷写 → 再发现 →
-反复刷全部通过；下游应用改成 `CONFIG_ISOTP` 后**一条命令**照样能刷。**仍未做**：ISO-TP **端口**载具
-（P2/U7：per-(port,node) 状态 + `MUX_PORT_ISOTP` + `--port-carrier`），那属运行期，与刷机无关。
+反复刷全部通过；下游应用改成 `CONFIG_ISOTP` 后**一条命令**照样能刷。### 2026-10-17 用户裁定（收口后）
+
+1. **刷机永不使用 ISO-TP —— 列为放弃的改动**：隧道运的是 katapult 裸帧（katapult 只有切片），
+   给 katapult 加 ISO-TP 的 U9b **放弃**；「送引导」改用与载具无关的 `0x3f0 [0x02][uuid]` 单帧
+   （已真机验：ISO-TP 应用一条命令照样能刷）。ISO-TP 只留在**运行期**。
+2. **`[can_device]` 配置面：已做**（U10，`2777aee`/`b1e4159`）：`can_bitrate`（默认 1 Mbit/s）、
+   配置期排 `config_can`+`config_bridge_port`、`resolve` 放开且**要求 `uuid:`**、CAN 口恒 UNITS。
+   连带修掉一个静默 P1（U11a）：原来 slot 同时充当「端口 index」与「USART 选择」，一台桥混排
+   UART/CAN 且 CAN 先声明时会互换后端；现在 `config_can` 走 `port_backend_can_open` 不看 slot，
+   主机给 `config_uart` 的 slot 改成**该桥上的 UART 序号**（U11b）。
+3. **CAN 上游 attach（桥经 CAN 被宿主连）与 `fdcan` 的过滤器实现：挂起（用户决定）**，不属本期。
+4. **ISO-TP 端口载具（P2/U7）**：仍留在规划里，但明确是**运行期**能力，与刷机无关。
 
 **已知缺口 → U5b**：CAN 单帧 admin（`0x3f0`/`0x3f1`）未代理，而且端口开时也没有人装 admin 过滤器，所以**经桥扫描/指派一台未指派的 CAN 下游设备现在还不可能**。这是真机测试的前置单元（U5b，§3 已排），不是本轮遗留缺陷。

@@ -50,8 +50,7 @@ use crate::core::klippy::assign;
 use crate::core::klippy::event::{McuEvent, Shutdown};
 use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{
-    self, set_node_id_for, PortCarrier, SharedSerialHandle, TunnelSink, UnitSink, ADMIN_REPLY,
-    HEADER_BYTES,
+    self, set_node_id_for, SharedSerialHandle, TunnelSink, UnitSink, ADMIN_REPLY, HEADER_BYTES,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{HostMux, Interface};
@@ -998,9 +997,6 @@ impl BridgeLink {
     /// `admin bridge port`'s whole job (that command declares the port first,
     /// since a bridge's port table lives in RAM and starts empty).
     ///
-    /// `carrier` is the port's carrier (`admin bridge port --port-carrier`), and
-    /// it only reaches the wire on a units route ([`PortRoute::flags`]).
-    ///
     /// The port has to be one an earlier
     /// [`declare_ports`](BridgeLink::declare_ports) or
     /// [`declare_port`](BridgeLink::declare_port) made: a port-level command that
@@ -1012,10 +1008,8 @@ impl BridgeLink {
         &self,
         target: BridgeTarget,
         route: PortRoute,
-        carrier: PortCarrier,
     ) -> Result<(), BridgeFlashError> {
-        send_open_target_port(&self.live().link, target, route, carrier)
-            .map_err(BridgeFlashError::Bridge)
+        send_open_target_port(&self.live().link, target, route).map_err(BridgeFlashError::Bridge)
     }
 
     /// Give the board `uuid` the node id `node_id` — the admin-channel
@@ -1180,10 +1174,10 @@ impl BridgeLink {
             None if kind == PortKind::Can => progress(CAN_NO_ASSIGN_HINT),
             None => {}
         }
-        // The tunnel's route is the legacy one, so no carrier travels with it:
-        // what the tunnel carries is the katapult stream, whose only carrier is
-        // slices ([`LEGACY_PORT_FLAGS`]).
-        self.open_target_port(target, PortRoute::Legacy, PortCarrier::Cans)?;
+        // The tunnel's route is the legacy one: what the tunnel carries is the
+        // katapult stream, whose uplink is the raw frame stream
+        // ([`LEGACY_PORT_FLAGS`]).
+        self.open_target_port(target, PortRoute::Legacy)?;
         if let Some(reason) = self.take_shutdown() {
             return Err(BridgeFlashError::Shutdown { reason });
         }
@@ -1924,7 +1918,7 @@ mod tests {
         link.declare_ports(&ports)
             .await
             .expect("the bridge declares its ports without resetting anything");
-        link.open_target_port(target, PortRoute::Legacy, PortCarrier::Cans)
+        link.open_target_port(target, PortRoute::Legacy)
             .expect("the target's port is named and its tunnel opened");
 
         // The port's pty is watched for the whole window: neither half writes

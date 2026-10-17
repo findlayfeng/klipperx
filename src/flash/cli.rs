@@ -17,7 +17,6 @@ use std::time::Duration;
 use clap::Parser;
 
 use crate::core::klippy::interface::devices::canserial::{self, CanbusAdminSocket};
-use crate::core::klippy::interface::devices::serial::PortCarrier;
 use crate::core::klippy::interface::HostMux;
 
 use super::bridge_flash::{
@@ -228,11 +227,10 @@ pub struct BridgeConfigArgs {
 /// port is declared on the bridge (`config_uart` + `config_bridge_port`), named
 /// the **units** way by default (the wire format the mux's devices speak, which
 /// is what makes the port's device addressable by id and its answers
-/// forwardable) and on the carrier `--port-carrier` picks (`cans`, 8-byte
-/// frames, unless the device behind a CAN slot speaks ISO-TP), and its flashing
+/// forwardable), and its flashing
 /// tunnel is opened; the command stops. `--legacy` names it the old way instead —
 /// no `MUX_PORT_UNITS`, which is what a stock katapult board behind the port
-/// still needs, and no carrier either. No device is reset
+/// still needs. No device is reset
 /// ([`admin reset`](ResetArgs) does that) and nothing is flashed
 /// ([`admin flash`](FlashArgs) does that).
 #[derive(Parser, Debug)]
@@ -307,17 +305,6 @@ pub struct BridgePortArgs {
     /// whose raw frames the port heads with its own reply id
     #[arg(long)]
     pub legacy: bool,
-
-    /// Carrier the port speaks its device's units over: `cans` (8-byte frames,
-    /// the default) or `isotp` (one unit per message)
-    ///
-    /// The port's property, not the device's alone: a device running ISO-TP
-    /// behind a port named for slices has its bytes read as garbage, which looks
-    /// like a CRC error. Only a **CAN** slot has a carrier — a UART slot is a
-    /// byte stream with no ISO-TP on it, and saying `isotp` there is refused by
-    /// name. A legacy port has no units at all, so it takes no carrier either.
-    #[arg(long, value_name = "CARRIER")]
-    pub port_carrier: Option<String>,
 }
 
 /// A `bridge config` command line, as a plan: the bridge's link and the speed
@@ -350,11 +337,6 @@ pub struct BridgePortPlan {
     pub target: BridgeTarget,
     /// How the port is named: units (the default) or legacy.
     pub route: PortRoute,
-    /// The carrier the port speaks the device's units over, when the route is
-    /// units: `cans` (slices, the default) or `isotp`. It rides the same
-    /// `SET_PORT_NODEID` flags byte as the route ([`PortRoute`]'s flags), and a
-    /// legacy route carries none.
-    pub carrier: PortCarrier,
     /// The board to **assign** [`BridgePortPlan::target`]'s node id to, when
     /// `--assign-uuid` named one.
     pub assign: Option<[u8; 6]>,
@@ -762,9 +744,7 @@ pub fn plan_bridge_config(args: &BridgeConfigArgs) -> Result<BridgeConfigPlan, S
 /// which slot to enable and `--port-nodeid` the id the bridge names it with —
 /// neither has a guessable default, and the id has to be a usable one (not
 /// zero, not the bridge's own link id). `--legacy` picks the wire format the
-/// port is named for, `--port-carrier` the carrier a **units** port's device
-/// speaks (refused beside `--legacy`, which has no units to carry), and
-/// `--assign-uuid` the board to give that id.
+/// port is named for, and `--assign-uuid` the board to give that id.
 pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String> {
     let source = plan_bridge_link(
         &args.bridge,
@@ -791,7 +771,6 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
              or its tunnel units collide with the bridge's frames"
         ));
     }
-    let carrier = plan_port_carrier(args.port_carrier.as_deref(), args.legacy)?;
     Ok(BridgePortPlan {
         source,
         baud: args.baud.unwrap_or(DEFAULT_BAUD),
@@ -805,57 +784,8 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
         } else {
             PortRoute::Units
         },
-        carrier,
         assign,
     })
-}
-
-/// The `--port-carrier` line: the carrier a units port's device speaks, or the
-/// mistake that keeps it from being sent.
-///
-/// Absent is [`PortCarrier::Cans`], the sliced CAN stream every device speaks
-/// unless it says otherwise. The two spellings are the interface's own
-/// ([`PortCarrier::parse`]), the same words `[can_device] can_protocol:` takes.
-/// `--legacy` beside `isotp` is a contradiction: a legacy port has no units at
-/// all — no `MUX_PORT_UNITS`, so no carrier bit means anything on it.
-fn plan_port_carrier(text: Option<&str>, legacy: bool) -> Result<PortCarrier, String> {
-    let carrier = match text {
-        None => return Ok(PortCarrier::Cans),
-        Some(text) => PortCarrier::parse(text).ok_or_else(|| {
-            format!(
-                "--port-carrier expects one of {}, got '{text}'",
-                PortCarrier::NAMES.join(", ")
-            )
-        })?,
-    };
-    if legacy && carrier != PortCarrier::Cans {
-        return Err(format!(
-            "--legacy and --port-carrier {} name two different ports: a legacy port has no units \
-             at all, so there is nothing to carry as ISO-TP",
-            carrier.name()
-        ));
-    }
-    Ok(carrier)
-}
-
-/// Refuse a carrier the port's **slot** cannot take: ISO-TP is a CAN slot's
-/// carrier, and a UART slot is one byte stream with no ISO-TP on it.
-///
-/// Which kind a slot is comes from the bridge itself ([`BridgeLink::slot_kind`]),
-/// so this can only be asked after the bridge has identified — and it is asked
-/// before anything is named, declared or reset, so a wrong `--port-carrier`
-/// costs one identify and no state. `cans` is every slot's carrier (a UART port
-/// slices for the mux like a CAN one), so only a non-default value can be
-/// refused.
-fn check_port_carrier(carrier: PortCarrier, kind: PortKind, index: u8) -> Result<(), String> {
-    if carrier != PortCarrier::Cans && kind != PortKind::Can {
-        return Err(format!(
-            "--port-carrier {} names the carrier a CAN slot's units travel over, but port {index} \
-             is a UART slot: its stream is a byte pipe, and only a CAN slot segments messages",
-            carrier.name()
-        ));
-    }
-    Ok(())
 }
 
 /// The `--assign-uuid` line: the identity of the board to give
@@ -1257,9 +1187,8 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         let uarts = link.uart_count();
         let slots = link.uart_slots();
-        // Which slot is the CAN slot, when the bridge has one: a port on it is
-        // the only one that carries a carrier, so the report names that slot and
-        // the carrier a `bridge port` run would declare it with.
+        // Which slot is the CAN slot, when the bridge has one: the report names
+        // it so a port declaration can be aimed at the right kind.
         let can_slot =
             uarts.and_then(|count| (0..count).find(|slot| link.slot_kind(*slot) == PortKind::Can));
         let mcu = link.mcu_name();
@@ -1273,8 +1202,7 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
 
 /// The last word of a successful `admin bridge config`: the slots the bridge's
 /// backend offers, one line each with the speed a port on it would open at, the
-/// carrier a port on the **CAN** slot would be declared with, and the command
-/// that enables one.
+/// CAN slot when it reports one, and the command that enables one.
 ///
 /// `uarts` is the firmware's own `BRIDGE_UART_COUNT` — `None` on a firmware that
 /// predates the constant, which the report names and then covers with the plan's
@@ -1282,10 +1210,7 @@ pub fn run_bridge_config(args: BridgeConfigArgs) -> Result<(), Box<dyn std::erro
 /// same firmware's per-slot naming ([`BridgeLink::uart_slots`]) when it has one,
 /// in slot order; a slot it does not name falls back to [`uart_slot_note`].
 /// `can_slot` is the CAN slot when the bridge reports one
-/// ([`BridgeLink::slot_kind`]), and the line below it is there because that
-/// slot's port can be mis-carriered: a device running ISO-TP behind a port named
-/// for slices reads the slices as garbage, and the error it produces looks like a
-/// CRC failure rather than a wrong declaration.
+/// ([`BridgeLink::slot_kind`]).
 fn bridge_config_lines(
     plan: &BridgeConfigPlan,
     uarts: Option<u8>,
@@ -1317,13 +1242,9 @@ fn bridge_config_lines(
         ));
     }
     if let Some(can_slot) = can_slot {
-        // The default, said out loud: the carrier is the port's, and it is the
-        // one thing a device behind a CAN slot can disagree with the host about.
         lines.push(format!(
-            "  can slot {can_slot}: port carrier {default} by default (`--port-carrier {isotp}` \
-             names it for an ISO-TP device)",
-            default = PortCarrier::Cans.name(),
-            isotp = PortCarrier::Isotp.name(),
+            "  can slot {can_slot}: declare a port on it with `admin bridge port --port {can_slot} \
+             --port-nodeid <id>`"
         ));
     }
     lines.push("enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string());
@@ -1373,15 +1294,12 @@ pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::E
         tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
-        // The slot the plan names is the bridge's to say, and so is whether a
-        // carrier belongs on it: a `--port-carrier isotp` on a UART slot is
-        // refused here, before the restart the declaration needs.
+        // The slot the plan names is the bridge's to say.
         let kind = link.slot_kind(plan.target.index);
-        check_port_carrier(plan.carrier, kind, plan.target.index)?;
         link.reset().await?;
         link.declare_ports(&declared_ports(plan.target.index, plan.baud, plan.bitrate))
             .await?;
-        link.open_target_port(plan.target, plan.route, plan.carrier)?;
+        link.open_target_port(plan.target, plan.route)?;
         // The slot the port is says what the assignment reached: the admin
         // channel is the bridge's, so it goes to every port, and a UART slot has
         // to say so rather than imply the unit was addressed to it.
@@ -1390,7 +1308,7 @@ pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::E
             None => None,
         };
         link.close();
-        report_bridge_port(plan.target, plan.route, plan.carrier);
+        report_bridge_port(plan.target, plan.route);
         if let Some((uuid, outcome)) = assigned {
             report_assign(uuid, plan.target, outcome, kind);
         }
@@ -1418,11 +1336,11 @@ fn declared_ports(index: u8, baud: u32, bitrate: u32) -> Vec<BridgePort> {
 }
 
 /// The last word of a successful `admin bridge port`: the port the bridge now has,
-/// the id it routes it by, the wire format it was named for — legacy, or units on
-/// a carrier — and the tunnel it opened.
-fn report_bridge_port(target: BridgeTarget, route: PortRoute, carrier: PortCarrier) {
+/// the id it routes it by, the wire format it was named for — legacy or units —
+/// and the tunnel it opened.
+fn report_bridge_port(target: BridgeTarget, route: PortRoute) {
     let route = match route {
-        PortRoute::Units => format!("units route, {} carrier", carrier.name()),
+        PortRoute::Units => "units route".to_string(),
         PortRoute::Legacy => "legacy route".to_string(),
     };
     println!(
@@ -1559,8 +1477,6 @@ fn report(summary: session::Summary) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::core::klippy::interface::devices::serial::{MUX_PORT_ISOTP, MUX_PORT_UNITS};
 
     /// Parse a command line the way the shell would hand it over.
     fn parse(args: &[&str]) -> Result<FlashArgs, clap::Error> {
@@ -2363,11 +2279,10 @@ mod tests {
         );
     }
 
-    /// A bridge with a **CAN** slot says which slot it is and the carrier a port
-    /// on it would be declared with: the one place a device running ISO-TP behind
-    /// a port named for slices can be caught before the port is enabled.
+    /// A bridge with a **CAN** slot says which slot it is, so a port declaration
+    /// can be aimed at it.
     #[test]
-    fn test_a_bridge_config_report_names_the_can_slots_carrier() {
+    fn test_a_bridge_config_report_names_the_can_slot() {
         let plan =
             planned_bridge_config(&["--bridge", "/dev/ttyUSB0"]).expect("a bridge config plan");
         let slots = vec!["USART1 PA10/PA9".to_string(), "CAN1 PB8/PB9".to_string()];
@@ -2377,24 +2292,24 @@ mod tests {
                 "available uarts: 2".to_string(),
                 "  uart 0: 250000 baud default slot (USART1 PA10/PA9)".to_string(),
                 "  uart 1: 250000 baud default slot (CAN1 PB8/PB9)".to_string(),
-                "  can slot 1: port carrier cans by default (`--port-carrier isotp` names it \
-                 for an ISO-TP device)"
+                "  can slot 1: declare a port on it with `admin bridge port --port 1 \
+                 --port-nodeid <id>`"
                     .to_string(),
                 "enable one with `admin bridge port --port <slot> --port-nodeid <id>`".to_string(),
             ]
         );
     }
 
-    /// A bridge whose firmware reports no CAN slot names no carrier: every slot it
-    /// has is a UART one, and the report says nothing about ISO-TP at all.
+    /// A bridge whose firmware reports no CAN slot says nothing about one: every
+    /// slot it has is a UART one.
     #[test]
-    fn test_a_bridge_config_report_names_no_carrier_without_a_can_slot() {
+    fn test_a_bridge_config_report_names_no_can_slot_without_one() {
         let plan =
             planned_bridge_config(&["--bridge", "/dev/ttyUSB0"]).expect("a bridge config plan");
         let lines = bridge_config_lines(&plan, Some(1), None, None, Some("linux"));
 
         assert!(
-            lines.iter().all(|line| !line.contains("port carrier")),
+            lines.iter().all(|line| !line.contains("can slot")),
             "{lines:?}"
         );
     }
@@ -2597,143 +2512,6 @@ mod tests {
         .expect("a CAN slot's rate and a UART slot's speed, on one line");
         assert_eq!(plan.baud, 115_200);
         assert_eq!(plan.bitrate, 500_000);
-    }
-
-    /// The carrier a port is declared with is the port's own choice: `cans` (the
-    /// sliced CAN stream) unless `--port-carrier` asks for `isotp`, and the route
-    /// is units either way — the carrier rides the route's flags byte.
-    #[test]
-    fn test_a_bridge_port_plan_carries_the_port_carrier() {
-        let plan = planned_bridge_port(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "1",
-            "--port-nodeid",
-            "7",
-        ])
-        .expect("a serial port plan");
-        assert_eq!(plan.route, PortRoute::Units);
-        assert_eq!(plan.carrier, PortCarrier::Cans);
-
-        let plan = planned_bridge_port(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "1",
-            "--port-nodeid",
-            "7",
-            "--port-carrier",
-            "isotp",
-        ])
-        .expect("an ISO-TP port plan");
-        assert_eq!(plan.route, PortRoute::Units);
-        assert_eq!(plan.carrier, PortCarrier::Isotp);
-        assert_eq!(plan.carrier.flags(), MUX_PORT_UNITS | MUX_PORT_ISOTP);
-    }
-
-    /// One vocabulary for the config and the command line: anything but the two
-    /// spellings is refused with both named.
-    #[test]
-    fn test_a_port_carrier_is_one_of_the_two_spellings() {
-        for bad in ["can", "slices", "ISO", "fd", ""] {
-            let err = planned_bridge_port(&[
-                "--bridge",
-                "/dev/ttyUSB0",
-                "--port",
-                "1",
-                "--port-nodeid",
-                "7",
-                "--port-carrier",
-                bad,
-            ])
-            .expect_err("not a carrier");
-
-            assert!(err.contains("--port-carrier"), "{bad}: {err}");
-            assert!(err.contains("cans, isotp"), "{bad}: {err}");
-            assert!(err.contains(bad), "{bad}: {err}");
-        }
-    }
-
-    /// A legacy port has no units at all, so there is nothing on it to carry as
-    /// ISO-TP: the pair is refused by naming both.
-    #[test]
-    fn test_a_legacy_port_takes_no_carrier() {
-        let err = planned_bridge_port(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "1",
-            "--port-nodeid",
-            "7",
-            "--legacy",
-            "--port-carrier",
-            "isotp",
-        ])
-        .expect_err("a legacy port has no units to carry");
-
-        assert!(err.contains("--legacy"), "{err}");
-        assert!(err.contains("--port-carrier isotp"), "{err}");
-
-        // `cans` beside `--legacy` says nothing extra and is accepted: the
-        // legacy byte is `0` whatever carrier is written.
-        let plan = planned_bridge_port(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "1",
-            "--port-nodeid",
-            "7",
-            "--legacy",
-            "--port-carrier",
-            "cans",
-        ])
-        .expect("the default carrier beside --legacy");
-        assert_eq!(plan.route, PortRoute::Legacy);
-    }
-
-    /// Only a CAN slot has a carrier: a UART slot is a byte pipe with no ISO-TP
-    /// on it, and which kind the slot is comes from the bridge, so the refusal is
-    /// the step after identify — before anything is declared or reset.
-    #[test]
-    fn test_an_isotp_carrier_needs_a_can_slot() {
-        assert_eq!(
-            check_port_carrier(PortCarrier::Isotp, PortKind::Can, 1),
-            Ok(())
-        );
-        assert_eq!(
-            check_port_carrier(PortCarrier::Cans, PortKind::Uart, 0),
-            Ok(()),
-            "the default carrier is every slot's"
-        );
-
-        let err = check_port_carrier(PortCarrier::Isotp, PortKind::Uart, 0)
-            .expect_err("a UART slot has no ISO-TP");
-        assert!(err.contains("--port-carrier isotp"), "{err}");
-        assert!(err.contains("port 0"), "{err}");
-        assert!(err.contains("UART slot"), "{err}");
-    }
-
-    /// Flashing never carries ISO-TP: the tunnel moves katapult's raw frames, and
-    /// katapult has only the sliced CAN stream — so the option is not part of the
-    /// flash line at all, and writing it is refused by name rather than silently
-    /// ignored.
-    #[test]
-    fn test_a_flash_takes_no_port_carrier() {
-        let err = parse(&[
-            "--bridge",
-            "/dev/ttyUSB0",
-            "--port",
-            "1",
-            "--port-nodeid",
-            "7",
-            "--port-carrier",
-            "isotp",
-            "fw.bin",
-        ])
-        .expect_err("a flash line has no port carrier");
-
-        assert!(err.to_string().contains("--port-carrier"), "{err}");
     }
 
     /// A bridge **flash** carries the same pair: its plan declares the ports up to

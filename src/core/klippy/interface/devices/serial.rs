@@ -938,77 +938,6 @@ pub(crate) fn admin_unit(payload: &[u8]) -> Vec<u8> {
 /// device that predates the mux.
 pub const MUX_PORT_UNITS: u8 = 0x01;
 
-/// The port flag of [`CMD_SET_PORT_NODEID`] that says the units a port forwards
-/// travel as **ISO-TP messages** — one unit per message — instead of classical
-/// CAN frames sliced at eight bytes.
-///
-/// Only meaningful with [`MUX_PORT_UNITS`] set: a legacy port has no units to
-/// carry, so its byte is `0` whatever carrier was asked for. The bit sits on the
-/// **port**, not on the device: a CAN port whose device speaks ISO-TP is told so
-/// here (`[can_device] can_protocol: isotp`), and the firmware then segments and
-/// reassembles on that port's writes and reads.
-///
-/// A bridge that predates the bit ignores it and keeps slicing, which is why the
-/// carrier a port was declared with is something the host reports rather than
-/// something the wire confirms (see D3 in the bridge CAN plan).
-pub const MUX_PORT_ISOTP: u8 = 0x02;
-
-/// Which carrier a **units** port speaks its units over: classical CAN frames
-/// sliced at eight bytes, or ISO-TP messages.
-///
-/// The four [`MUX_PORT_ISOTP`] bytes of `SET_PORT_NODEID` are assembled from this
-/// one place ([`PortCarrier::flags`]), so no caller spells the bit itself. Which
-/// carrier applies is the port's property — a device that speaks ISO-TP cannot
-/// be reached by the port declaring slices — and the port section says it
-/// (`[can_device] can_protocol:`) or the command line does
-/// (`admin bridge port --port-carrier`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PortCarrier {
-    /// Classical CAN frames: a unit split across 8-byte slices.
-    Cans,
-    /// ISO-TP: a whole unit carried as one message.
-    Isotp,
-}
-
-impl PortCarrier {
-    /// Every spelling [`PortCarrier::parse`] takes, in the order the refusals
-    /// list them.
-    pub const NAMES: &'static [&'static str] = &["cans", "isotp"];
-
-    /// The `SET_PORT_NODEID` flags byte a **units** port carries on this
-    /// carrier — the one place the carrier's bit is assembled.
-    ///
-    /// A legacy port's byte is `0` before this is asked
-    /// (`flash/bridge_session.rs`, `mcu/bridge_attach.rs::port_flags`): there are
-    /// no units on such a port, so no carrier either.
-    pub fn flags(self) -> u8 {
-        match self {
-            Self::Cans => MUX_PORT_UNITS,
-            Self::Isotp => MUX_PORT_UNITS | MUX_PORT_ISOTP,
-        }
-    }
-
-    /// The carrier a spelling names, or `None` for anything else.
-    ///
-    /// The spellings are one vocabulary for both faces that write one: the
-    /// config's `can_protocol:` and the command line's `--port-carrier`.
-    pub fn parse(text: &str) -> Option<Self> {
-        match text.trim() {
-            "cans" => Some(Self::Cans),
-            "isotp" => Some(Self::Isotp),
-            _ => None,
-        }
-    }
-
-    /// The spelling this carrier is written with (`cans`, `isotp`).
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Cans => "cans",
-            Self::Isotp => "isotp",
-        }
-    }
-}
-
 /// The port-level command that names the device behind port `index`: the admin
 /// listen unit carrying `[CMD_SET_PORT_NODEID][index][id][flags]`.
 ///
@@ -4752,42 +4681,6 @@ mod mux_tests {
             &[0x03, 0x01, 0xff, 0x01],
             "the payload is exactly [0x03][index][id][flags] behind the KXID marker"
         );
-    }
-
-    /// The carrier's bit, on the wire: a `cans` port carries `MUX_PORT_UNITS`
-    /// and an `isotp` one adds [`MUX_PORT_ISOTP`] — assembled in one place
-    /// ([`PortCarrier::flags`]), so neither face that declares a carrier can
-    /// spell the mask differently.
-    #[test]
-    fn the_port_carrier_sets_the_isotp_bit_beside_the_units_one() {
-        assert_eq!(PortCarrier::Cans.flags(), MUX_PORT_UNITS);
-        assert_eq!(PortCarrier::Cans.flags(), 0x01);
-        assert_eq!(PortCarrier::Isotp.flags(), MUX_PORT_UNITS | MUX_PORT_ISOTP);
-        assert_eq!(PortCarrier::Isotp.flags(), 0x03);
-        // The fourth payload byte of the port-level command is the flags byte:
-        // an ISO-TP port says both "units" and "ISO-TP", never the second alone
-        // (a legacy port has no units to carry).
-        let unit = set_port_node_id(2, 9, PortCarrier::Isotp.flags());
-        assert_eq!(
-            &unit[HEADER_BYTES + 1 + 1 + MAGIC.len()..unit.len() - 3],
-            &[0x03, 0x02, 0x09, 0x03],
-            "SET_PORT_NODEID(index, id, UNITS|ISOTP)"
-        );
-    }
-
-    /// One vocabulary for both faces that declare a carrier: the config's
-    /// `can_protocol:` and the command line's `--port-carrier`.
-    #[test]
-    fn the_port_carrier_parses_its_two_spellings() {
-        assert_eq!(PortCarrier::parse("cans"), Some(PortCarrier::Cans));
-        assert_eq!(PortCarrier::parse("isotp"), Some(PortCarrier::Isotp));
-        assert_eq!(PortCarrier::parse(" isotp\n"), Some(PortCarrier::Isotp));
-        for unsupported in ["", "can", "ISO", "slices", "fd"] {
-            assert_eq!(PortCarrier::parse(unsupported), None, "{unsupported}");
-        }
-        assert_eq!(PortCarrier::Cans.name(), "cans");
-        assert_eq!(PortCarrier::Isotp.name(), "isotp");
-        assert_eq!(PortCarrier::NAMES, &["cans", "isotp"]);
     }
 
     #[test]

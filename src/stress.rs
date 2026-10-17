@@ -45,6 +45,15 @@
 //! code alone (a board the command *named* is promised a stepper and fails
 //! instead); a run in which no selected board could drive a stepper fails,
 //! because nothing was tested.
+//!
+//! A bridge — the `[mcu]` a `[uart_device]`/`[can_device]` section names as its
+//! `*_mcu` — is a board like any other, and the devices behind its ports are
+//! boards of their own (`uart:`/`can:`). `--task comm` may drive both sides of
+//! one bridge at once: it configures nothing, so the bridge's port table stays
+//! as its load left it, and the bridge and the device ride one link as two slots
+//! (`--all-mcus` finds them both). The step and motion tasks hand the firmware to
+//! this run's own configuration — and a bridge's configuration **is** its port
+//! table — so they drive one side of a bridge, never both.
 
 use clap::Args;
 use std::future::{poll_fn, Future};
@@ -248,7 +257,7 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (config, _sources) = Config::from_file(&args.config_file)?;
     let names = select_mcus(&config, &args.mcu, args.all_mcus)
         .map_err(|err| format!("{err} in {}", args.config_file))?;
-    refuse_driven_bridges(&config, &names)?;
+    refuse_driven_bridges(&config, &names, args.task)?;
 
     // The run's pin vocabulary: one chip per `[mcu]` section (so `[board_pins]`
     // may name any of them) and the config's aliases, loaded through the same
@@ -262,13 +271,13 @@ async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
     // identify, and a board that refuses must not stop the others from being
     // driven — its failure is reported at the end instead. A `uart:`/`can:`
     // device is opened through its bridge (`open_board`), and the bridge hosts
-    // are loaded once per bridge so two devices on one bridge share the one
-    // session its link needs.
+    // are loaded once per bridge so a bridge and the devices on its ports share
+    // the one session its link needs.
     let mut boards: Vec<OpenedBoard> = Vec::new();
     let mut hosts: Vec<(String, Arc<BridgeHost>)> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     for name in &names {
-        match open_board(&config, &mut hosts, name).await {
+        match open_board(&config, &mut hosts, name, args.task).await {
             Ok(board) => {
                 println!(
                     "{}",
@@ -339,31 +348,23 @@ async fn drive_boards(
 ) -> (Vec<String>, usize) {
     let mut mcu_configs: Vec<McuConfig> = Vec::with_capacity(boards.len());
     let mut connections: Vec<Arc<Mcu>> = Vec::with_capacity(boards.len());
-    let mut bridges: Vec<Option<Arc<BridgeHost>>> = Vec::with_capacity(boards.len());
+    let mut links: Vec<BoardLink> = Vec::with_capacity(boards.len());
     for board in boards {
         mcu_configs.push(board.mcu_config);
         connections.push(board.mcu);
-        bridges.push(board.bridge);
+        links.push(board.link);
     }
     // One future per connected board, polled together: the ramps interleave on
     // the same runtime, each with its own port, tasks and state. The sessions
     // move into these futures — nothing outside the join below holds one, or the
-    // reconnect's `drop(mcu)` would close nothing. A board's bridge host moves
-    // with it, and closes when its last device is done.
+    // reconnect's `drop(mcu)` would close nothing. A board's link moves with it,
+    // and a bridge host closes when its last board on it is done.
     let ramps = connections
         .into_iter()
         .zip(&mcu_configs)
-        .zip(&bridges)
-        .map(|((mcu, mcu_config), bridge)| {
-            run_board(
-                mcu_config,
-                mcu,
-                bridge.as_deref(),
-                args.task,
-                config,
-                args,
-                pins,
-            )
+        .zip(&links)
+        .map(|((mcu, mcu_config), link)| {
+            run_board(mcu_config, mcu, link, args.task, config, args, pins)
         })
         .collect::<Vec<_>>();
     let mut failures = Vec::new();
@@ -390,7 +391,7 @@ async fn drive_boards(
 async fn run_board(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     task: Task,
     config: &Config,
     args: &StressArgs,
@@ -403,17 +404,21 @@ async fn run_board(
     // The session's only reference from the moment this future runs: a caller
     // holding a clone would leave `configure_steppers`' `drop(mcu)` in the
     // `ResetRequired` reconnect releasing nothing, so the old receive task
-    // would outlive the reopened port as a second reader on it.
-    assert_eq!(
-        Arc::strong_count(&mcu),
-        1,
-        "board '{}': the run must own its session alone, a clone would keep the old receive task alive",
-        mcu_config.name
-    );
+    // would outlive the reopened port as a second reader on it. A bridge's own
+    // session (`--task comm`) is shared with its ports' devices by design, and
+    // the step task never drives it.
+    if link.owned_alone() {
+        assert_eq!(
+            Arc::strong_count(&mcu),
+            1,
+            "board '{}': the run must own its session alone, a clone would keep the old receive task alive",
+            mcu_config.name
+        );
+    }
     match task {
-        Task::Step => step_stress(mcu_config, mcu, bridge, config, args, named, pins).await,
+        Task::Step => step_stress(mcu_config, mcu, link, config, args, named, pins).await,
         Task::Comm => comm_stress(mcu, args).await.map(|()| BoardOutcome::Ran),
-        Task::Motion => motion_smoke(mcu_config, mcu, bridge, config, pins)
+        Task::Motion => motion_smoke(mcu_config, mcu, link, config, pins)
             .await
             .map(|()| BoardOutcome::Ran),
     }
@@ -508,7 +513,7 @@ fn summary_line(mcu: &str, kind: &str, last_good: Option<f64>, unit: &str) -> St
 async fn step_stress(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     config: &Config,
     args: &StressArgs,
     named: bool,
@@ -542,7 +547,7 @@ async fn step_stress(
 
     // The handshake can reconnect (a firmware with no `config_reset` reboots), so
     // bind the events only once the connection is final.
-    let (oids, mcu) = configure_steppers(mcu_config, mcu, bridge, pins, &steppers).await?;
+    let (oids, mcu) = configure_steppers(mcu_config, mcu, link, pins, &steppers).await?;
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
 
@@ -988,12 +993,23 @@ enum Connection {
     /// transport of its own to open, and is reached on the **bridge's** link
     /// with the port-level route (`mcu/bridge_attach.rs`).
     BridgePort,
+    /// A bridge itself: the MCU a `[uart_device]`/`[can_device]` section names
+    /// as its `*_mcu`. It is a board like any other — and its own link carries
+    /// its ports' devices' frames, so it is addressed by id even when a single
+    /// section names the path (`mcu/serial_ports.rs::is_id_addressed`) and its
+    /// session is the one those devices attach through ([`open_board`]).
+    Bridge,
 }
 
-/// Which of the two a parsed section asks for.
-fn connection_of(mcu_config: &McuConfig) -> Connection {
+/// Which of the three a parsed section asks for.
+///
+/// A bridge's section parses as a transport of its own, so it is told apart from
+/// a plain board by the config's port sections naming it (`*_mcu`) — the same
+/// raw read the ports themselves are found with ([`port_sections`]).
+fn connection_of(config: &Config, mcu_config: &McuConfig) -> Connection {
     match mcu_config.transport {
         Transport::BridgePort { .. } => Connection::BridgePort,
+        _ if !port_sections(config, &mcu_config.name).is_empty() => Connection::Bridge,
         _ => Connection::Direct,
     }
 }
@@ -1164,12 +1180,26 @@ fn bridge_host(
     hosts: &mut Vec<(String, Arc<BridgeHost>)>,
     mcu_config: &McuConfig,
 ) -> Result<Arc<BridgeHost>, String> {
-    let bridge = bridge_of_port(config, mcu_config)?;
-    if let Some((_, host)) = hosts.iter().find(|(name, _)| name == &bridge) {
+    host_of_bridge(config, hosts, &bridge_of_port(config, mcu_config)?)
+}
+
+/// The run's host for the `[mcu]` section of `bridge`, loaded once per run.
+///
+/// A bridge has exactly **one** host: the object that owns its session, the load
+/// that configured its ports for the firmware's router, and the allocator its
+/// ports' devices take their ids from — so the bridge driven as a board and the
+/// devices behind it end up on one session and one id sequence, however the
+/// command line named them.
+fn host_of_bridge(
+    config: &Config,
+    hosts: &mut Vec<(String, Arc<BridgeHost>)>,
+    bridge: &str,
+) -> Result<Arc<BridgeHost>, String> {
+    if let Some((_, host)) = hosts.iter().find(|(name, _)| name == bridge) {
         return Ok(Arc::clone(host));
     }
-    let host = Arc::new(BridgeHost::load(config, &bridge)?);
-    hosts.push((bridge, Arc::clone(&host)));
+    let host = Arc::new(BridgeHost::load(config, bridge)?);
+    hosts.push((bridge.to_string(), Arc::clone(&host)));
     Ok(host)
 }
 
@@ -1237,32 +1267,100 @@ async fn connect_bridged(
         .map_err(|err| std::io::Error::other(format!("{}: {err}", mcu_config.name)))
 }
 
-/// One board the run opened: its section, its session, and — for a device on a
-/// bridge port — the bridge that session travels.
+/// One board the run opened: its section, its session, and — where a bridge is
+/// involved — the host that owns the link the session rides.
 struct OpenedBoard {
     mcu_config: McuConfig,
     mcu: Arc<Mcu>,
-    /// The bridge whose link carries this session (`uart:` / `can:`), or `None`
-    /// for a board on a transport of its own. Held so the bridge outlives the
-    /// session: it is dropped when the last device on it is, and a reconnect
-    /// re-attaches through it.
-    bridge: Option<Arc<BridgeHost>>,
+    /// How this session is held (see [`BoardLink`]).
+    link: BoardLink,
 }
 
-/// Open one selected board's session, whichever of the two kinds it is.
+/// Where a board's session lives relative to a bridge.
+///
+/// The one thing the tasks need to know to report, keep alive, close or reopen a
+/// session.
+enum BoardLink {
+    /// A transport of the run's own (`serial:`, `canbus:`, `test:`) — and a
+    /// bridge under `--task step`/`--task motion`, which opens one of its own
+    /// ([`open_board`]): the run owns the session and reopens it after a
+    /// `reset`.
+    Own,
+    /// A bridge's **own** session (`--task comm`): the `[mcu]` object
+    /// production built for it, the one its ports' devices attach through. The
+    /// run holds it but does not own it — it is neither closed nor reopened
+    /// here, because dropping the run's reference releases nothing. The host is
+    /// kept with the board so the session outlives its ramp.
+    Bridge(Arc<BridgeHost>),
+    /// A device behind a bridge port: its frames travel the bridge's link, and a
+    /// reopen is a fresh attach through the same port (`connect_bridged`).
+    Port(Arc<BridgeHost>),
+}
+
+impl BoardLink {
+    /// Whether this run holds the session **alone** — the condition a `reset`'s
+    /// `drop` relies on to close it before the port is reopened.
+    ///
+    /// A bridge's own session is shared with the devices behind its ports, so
+    /// the run's reference is not the last one; the step task gives a bridge a
+    /// session of its own rather than driving the shared one for exactly this
+    /// reason ([`open_board`]).
+    fn owned_alone(&self) -> bool {
+        !matches!(self, Self::Bridge(_))
+    }
+
+    /// Reopen the board after a `reset`.
+    ///
+    /// A bridge-port device re-attaches through its port (the bridge itself is
+    /// already up); a session of the run's own opens its transport again. A
+    /// bridge's own session is the host's and is not reopened by a run that does
+    /// not own it — the arm reports that instead of reopening the wrong link.
+    async fn reopen(&self, mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
+        match self {
+            Self::Port(host) => connect_bridged(host, mcu_config).await,
+            Self::Own => connect(mcu_config).await,
+            Self::Bridge(host) => Err(std::io::Error::other(format!(
+                "MCU '{}': its session is [{}]'s own, held by the run's bridge host, which the \
+                 step task does not reopen",
+                mcu_config.name,
+                host.bridge.name()
+            ))),
+        }
+    }
+}
+
+/// Open one selected board's session, whichever of the three kinds it is.
+///
+/// A bridge is opened two ways, because the two tasks use the firmware
+/// differently:
+///
+/// - `--task comm` configures nothing (`comm_stress` sends base commands only),
+///   so the bridge is driven through **its own session** — the `[mcu]` object
+///   production built for it, which is also the session its ports' devices
+///   attach through (`mcu/bridge_attach.rs`). One link, one slot per side, two
+///   ramps at once: `--all-mcus` driving the bridge and a device behind one of
+///   its ports.
+/// - `--task step` / `--task motion` hand the firmware to this run's
+///   `ConfigBuilder`, and a bridge's configuration **is** its port table; they
+///   therefore open a session of the run's own, built from the configuration
+///   production parsed for the bridge — the load-time stamps included
+///   (`shared_baud`, `host_mux`, the id), which are what make an id-addressed
+///   bridge link open at all. [`refuse_driven_bridges`] keeps the devices
+///   behind the bridge off such a run.
 async fn open_board(
     config: &Config,
     hosts: &mut Vec<(String, Arc<BridgeHost>)>,
     name: &str,
+    task: Task,
 ) -> Result<OpenedBoard, String> {
     let mcu_config = resolve_mcu(config, name)?;
-    match connection_of(&mcu_config) {
+    match connection_of(config, &mcu_config) {
         Connection::Direct => {
             let mcu = connect(&mcu_config).await.map_err(|err| err.to_string())?;
             Ok(OpenedBoard {
                 mcu_config,
                 mcu,
-                bridge: None,
+                link: BoardLink::Own,
             })
         }
         Connection::BridgePort => {
@@ -1273,34 +1371,82 @@ async fn open_board(
             Ok(OpenedBoard {
                 mcu_config,
                 mcu,
-                bridge: Some(host),
+                link: BoardLink::Port(host),
             })
+        }
+        Connection::Bridge => {
+            let host = host_of_bridge(config, hosts, &mcu_config.name)?;
+            // The bridge's configuration as production parsed it: the same
+            // section parse `resolve_mcu` makes, plus the load-time decisions
+            // only the whole config can make — the id the allocator handed out,
+            // the shared baud of an id-addressed `serial:` path, and the mux
+            // identity of a `host_library:` path (`mcu/object.rs::load_config`).
+            // Reading them off that object rather than deciding them again here
+            // keeps one answer to "is this link addressed by id".
+            let mcu_config = host.bridge.mcu_config().map_err(|err| err.to_string())?;
+            match task {
+                Task::Comm => {
+                    host.bring_up().await?;
+                    let mcu = host.bridge.mcu().ok_or_else(|| {
+                        format!("the bridge '{}' did not come up", mcu_config.name)
+                    })?;
+                    Ok(OpenedBoard {
+                        mcu_config,
+                        mcu,
+                        link: BoardLink::Bridge(host),
+                    })
+                }
+                Task::Step | Task::Motion => {
+                    let mcu = connect(&mcu_config).await.map_err(|err| err.to_string())?;
+                    Ok(OpenedBoard {
+                        mcu_config,
+                        mcu,
+                        link: BoardLink::Own,
+                    })
+                }
+            }
         }
     }
 }
 
-/// Refuse a run that names both a bridge and a device on one of its ports.
+/// Refuse a run in which a bridge's firmware would be taken over while a device
+/// behind one of its ports is driven.
 ///
-/// A bridge-port device's bring-up opens the bridge itself — `resolve` needs the
-/// bridge's session up, and its link is where the device's frames travel — so a
-/// bridge the run also drives would be opened twice: two sessions, two readers
-/// on one port, and every frame answered to whoever wins. One run drives one
-/// side of a bridge.
-fn refuse_driven_bridges(config: &Config, names: &[String]) -> Result<(), String> {
+/// A bridge-port device's bring-up needs the bridge's session up — its link is
+/// where the device's frames travel — so a run driving both sides drives one
+/// session that both board futures hold, one slot each on the same port. That is
+/// what `--task comm` may do: it sends base commands only (`get_clock`) and
+/// configures nothing, so the bridge's port table — the router the device's
+/// `SET_PORT_NODEID` route points into — stays exactly as the bridge's own load
+/// left it.
+///
+/// `--task step`/`--task motion` are the other way round: they send this run's
+/// `ConfigBuilder` configuration, and a bridge's configuration **is** its port
+/// table, so taking the firmware over would drop every port's route. Such a run
+/// holds one side of a bridge, never both.
+fn refuse_driven_bridges(config: &Config, names: &[String], task: Task) -> Result<(), String> {
+    if task == Task::Comm {
+        return Ok(());
+    }
     for name in names {
         let Ok(mcu_config) = resolve_mcu(config, name) else {
             // A board that does not resolve is reported as its own failure later.
             continue;
         };
-        if connection_of(&mcu_config) != Connection::BridgePort {
+        if connection_of(config, &mcu_config) != Connection::BridgePort {
             continue;
         }
         let bridge = bridge_of_port(config, &mcu_config)?;
         if names.iter().any(|other| other == &bridge) {
+            let flag = match task {
+                Task::Step => "step",
+                _ => "motion",
+            };
             return Err(format!(
-                "MCU '{name}' hangs on a port of '{bridge}', which this run also drives: the device \
-                 is reached through the bridge's own session, so the two cannot be driven at once — \
-                 name one of them"
+                "MCU '{name}' hangs on a port of '{bridge}', which this run also drives: a \
+                 bridge's configuration is its port table, and '--task {flag}' hands the firmware \
+                 to this run's own configuration, which would drop every port's route — name one of \
+                 them, or drive both sides with '--task comm', which configures neither"
             ));
         }
     }
@@ -1321,7 +1467,7 @@ fn refuse_driven_bridges(config: &Config, names: &[String]) -> Result<(), String
 async fn motion_smoke(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     config: &Config,
     pins: &Arc<PrinterPins>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1338,7 +1484,7 @@ async fn motion_smoke(
     let Some(section) = steppers.into_iter().next() else {
         return Err(no_stepper_error(&mcu_config.name, &rejected).into());
     };
-    move_one_axis(mcu_config, mcu, bridge, pins, section, DISTANCE, SPEED).await
+    move_one_axis(mcu_config, mcu, link, pins, section, DISTANCE, SPEED).await
 }
 
 /// Drive one `section` through the host's motion path and read its position
@@ -1352,7 +1498,7 @@ async fn motion_smoke(
 async fn move_one_axis(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     pins: &Arc<PrinterPins>,
     section: StepperSource,
     distance: f64,
@@ -1374,14 +1520,8 @@ async fn move_one_axis(
             )
         )
     );
-    let (oids, mcu) = configure_steppers(
-        mcu_config,
-        mcu,
-        bridge,
-        pins,
-        std::slice::from_ref(&section),
-    )
-    .await?;
+    let (oids, mcu) =
+        configure_steppers(mcu_config, mcu, link, pins, std::slice::from_ref(&section)).await?;
     let oid = oids[0];
     let freq = mcu.clock_freq().map_err(std::io::Error::other)?;
 
@@ -1467,20 +1607,14 @@ async fn move_one_axis(
 async fn step_soak(
     mcu_config: &McuConfig,
     mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     pins: &Arc<PrinterPins>,
     section: StepperSource,
     rate: f64,
     seconds: f64,
 ) -> Result<f64, Box<dyn std::error::Error>> {
-    let (oids, mcu) = configure_steppers(
-        mcu_config,
-        mcu,
-        bridge,
-        pins,
-        std::slice::from_ref(&section),
-    )
-    .await?;
+    let (oids, mcu) =
+        configure_steppers(mcu_config, mcu, link, pins, std::slice::from_ref(&section)).await?;
     let oid = oids[0];
     let shutdown_reason: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     bind_shutdown(&mcu, &shutdown_reason)?;
@@ -1983,21 +2117,14 @@ async fn connect(mcu_config: &McuConfig) -> Result<Arc<Mcu>, std::io::Error> {
 
 /// Reopen the board after it was told to `reset`, retrying while it re-enumerates.
 ///
-/// `bridge` is the link a `uart:`/`can:` device travels: its reopen is a fresh
-/// attach through the same bridge port (the bridge itself is already up), never
-/// a transport of its own.
-async fn reconnect(
-    mcu_config: &McuConfig,
-    bridge: Option<&BridgeHost>,
-) -> Result<Arc<Mcu>, std::io::Error> {
+/// The reopen is [`BoardLink::reopen`]'s: a fresh attach through the same bridge
+/// port for a `uart:`/`can:` device (the bridge itself is already up), the
+/// transport's own open for a session the run holds.
+async fn reconnect(mcu_config: &McuConfig, link: &BoardLink) -> Result<Arc<Mcu>, std::io::Error> {
     let mut last = String::new();
     for _ in 0..RECONNECT_ATTEMPTS {
         tokio::time::sleep(RECONNECT_DELAY).await;
-        let attempt = match bridge {
-            Some(host) => connect_bridged(host, mcu_config).await,
-            None => connect(mcu_config).await,
-        };
-        match attempt {
+        match link.reopen(mcu_config).await {
             Ok(mcu) => return Ok(mcu),
             Err(err) => last = err.to_string(),
         }
@@ -2079,7 +2206,7 @@ fn load_board_pins(
 async fn configure_steppers(
     mcu_config: &McuConfig,
     mut mcu: Arc<Mcu>,
-    bridge: Option<&BridgeHost>,
+    link: &BoardLink,
     pins: &PrinterPins,
     sections: &[StepperSource],
 ) -> Result<(Vec<u8>, Arc<Mcu>), std::io::Error> {
@@ -2174,14 +2301,20 @@ async fn configure_steppers(
                 // surviving clone turns it into a no-op and leaves the old
                 // receive task stealing the new session's frames (vA: hundreds
                 // of `Frame with sequence … dropping it` across every reopen).
-                assert_eq!(
-                    Arc::strong_count(&mcu),
-                    1,
-                    "MCU '{}': the old session is still referenced; dropping it would leave its receive task on the port",
-                    mcu_config.name
-                );
+                // A bridge's own session is the exception by construction — it
+                // is shared with its ports' devices — and the step task never
+                // drives it (`open_board`), so asserting here would only be
+                // about a session this path is not allowed to close.
+                if link.owned_alone() {
+                    assert_eq!(
+                        Arc::strong_count(&mcu),
+                        1,
+                        "MCU '{}': the old session is still referenced; dropping it would leave its receive task on the port",
+                        mcu_config.name
+                    );
+                }
                 drop(mcu);
-                mcu = reconnect(mcu_config, bridge).await?;
+                mcu = reconnect(mcu_config, link).await?;
                 println!(
                     "{}",
                     tagged(
@@ -2674,6 +2807,98 @@ mod tests {
         Config::from_text(&text).expect("a bridge config parses").0
     }
 
+    /// The identity the serial fixture's bridge writes, one spelling for the
+    /// config text and the assertions.
+    const BRIDGE_UUID: [u8; 6] = [0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f];
+
+    /// The same shape on the transport a real mux bridge has: a `serial:` path one
+    /// section names, with the board's own `uuid:`.
+    ///
+    /// This is the config whose link has to be *addressed by id* even though a
+    /// single `[mcu]` names it — its ports' devices' frames travel it
+    /// (`mcu/serial_ports.rs::is_id_addressed`).
+    fn serial_bridge_config() -> Config {
+        let text = format!(
+            "[mcu bridge]\nserial: /dev/ttyS9\nbaud: 500000\nuuid: 0a1b2c3d4e5f\n\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\n\
+             [mcu child]\nuart: uart0\nuuid: {}\n",
+            CHILD_UUID
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        Config::from_text(&text)
+            .expect("a serial bridge config parses")
+            .0
+    }
+
+    /// A bridge's own `[mcu]` section carries the load-time decisions that make
+    /// its link openable: the baud of an id-addressed serial path, the board's
+    /// `uuid`, and the id its session is addressed by.
+    ///
+    /// `McuConfig::new` cannot decide any of them — the first two are the whole
+    /// config's call (`mcu/serial_ports.rs`) and the id is the allocator's
+    /// (`mcu/ids.rs`) — so a bridge parsed on its own (`resolve_mcu`) would be
+    /// opened as an **exclusive** port: no id header, no assignment handshake, and
+    /// an identify that never gets an answer from a muxed bridge. The run takes
+    /// the configuration production parsed instead; this pins down that it is the
+    /// stamped one, where `Transport::open` takes its shared-port arm.
+    #[test]
+    fn the_bridges_own_configuration_is_stamped_as_an_id_addressed_link() {
+        let config = serial_bridge_config();
+        let host = BridgeHost::load(&config, "bridge").expect("the serial bridge host loads");
+        assert_eq!(
+            host.bridge.shared_baud(),
+            Some(500_000),
+            "the baud the path's MCUs share"
+        );
+        assert_eq!(
+            host.bridge.id(),
+            Some(4),
+            "the first id the allocator hands out (`NODEID_FIRST`)"
+        );
+
+        let bridge = host
+            .bridge
+            .mcu_config()
+            .expect("the bridge's own configuration");
+        match &bridge.transport {
+            Transport::Serial { path, baud, uuid } => {
+                assert_eq!(path, "/dev/ttyS9");
+                assert_eq!(*baud, 500_000);
+                assert_eq!(
+                    *uuid,
+                    Some(BRIDGE_UUID),
+                    "the board the link is assigned to"
+                );
+            }
+            other => panic!("a serial: section is a serial link, got {other:?}"),
+        }
+        assert_eq!(bridge.shared_baud, Some(500_000));
+        assert_eq!(bridge.id, Some(4));
+
+        // The seam: with these stamps the transport opens through
+        // `serial::attach` (the id-addressed arm), which is where the assignment
+        // handshake happens — there is no tty behind the fixture's path, so the
+        // open fails inside that arm.
+        let err = bridge
+            .open()
+            .expect_err("no tty is behind the fixture's path");
+        assert!(err.contains("shared port attach failed"), "{err}");
+
+        // The same section parsed the way the run used to take it: no stamps, so
+        // the transport falls to the exclusive arm and sends no assignment.
+        let unstamped = resolve_mcu(&config, "bridge").expect("the section resolves");
+        assert_eq!(unstamped.shared_baud, None, "nothing stamped it");
+        let err = unstamped
+            .open()
+            .expect_err("no tty is behind the fixture's path");
+        assert!(
+            !err.contains("shared port attach failed"),
+            "without the stamps the path opens exclusive: {err}"
+        );
+    }
+
     /// A `uart:` device on a bridge port parses, and the run brings it up
     /// **through the bridge** rather than on a transport of its own.
     ///
@@ -2693,16 +2918,17 @@ mod tests {
             }
             other => panic!("a uart: section is a bridge port, got {other:?}"),
         }
-        assert_eq!(connection_of(&child), Connection::BridgePort);
+        assert_eq!(connection_of(&config, &child), Connection::BridgePort);
         assert_eq!(
             bridge_of_port(&config, &child).expect("the port names its bridge"),
             "bridge"
         );
 
-        // The bridge itself is a board like any other, and a board on a
-        // transport of its own keeps the bring-up it always had.
+        // The bridge itself is a board on a transport of its own — and, because
+        // the config's port sections name it, the link its ports' devices
+        // travel; that is what tells it apart from a plain board.
         let bridge = resolve_mcu(&config, "bridge").expect("the bridge is a board");
-        assert_eq!(connection_of(&bridge), Connection::Direct);
+        assert_eq!(connection_of(&config, &bridge), Connection::Bridge);
         assert!(
             bridge_of_port(&config, &bridge).is_err(),
             "a board on its own transport is on no port"
@@ -2711,7 +2937,7 @@ mod tests {
             Config::from_text("[mcu]\nserial: /dev/ttyACM0\n").expect("a serial config parses");
         let direct = resolve_mcu(&serial, "mcu").expect("a serial section resolves");
         assert!(matches!(direct.transport, Transport::Serial { .. }));
-        assert_eq!(connection_of(&direct), Connection::Direct);
+        assert_eq!(connection_of(&serial, &direct), Connection::Direct);
     }
 
     /// The bridge host the run builds loads the bridge and **every** port of it,
@@ -2772,28 +2998,156 @@ mod tests {
         );
     }
 
-    /// A run that names a bridge **and** a device on one of its ports is refused
-    /// before anything is opened: the device's bring-up opens the bridge itself,
-    /// so the bridge would get two sessions — two readers on one port.
+    /// A run may drive both sides of a bridge **only** under `--task comm`: the
+    /// bridge and a device on one of its ports then ride one session, one slot
+    /// each on the same link, and neither configures the firmware — the bridge's
+    /// port table (the router the device's route points into) stays as its own
+    /// load left it.
+    ///
+    /// `--task step`/`--task motion` take the firmware over with this run's
+    /// `ConfigBuilder`, and a bridge's configuration **is** its port table: such
+    /// a run holds one side of a bridge, and says which two boards it could not
+    /// drive together.
     #[test]
-    fn a_run_cannot_drive_a_bridge_and_a_device_on_its_port() {
+    fn a_run_may_drive_both_sides_of_a_bridge_only_under_comm() {
         let config = bridge_config();
+        let both = ["bridge".to_string(), "child".to_string()];
+
+        // The comm task configures neither side, so both can run.
         assert!(
-            refuse_driven_bridges(&config, &["child".to_string()]).is_ok(),
+            refuse_driven_bridges(&config, &both, Task::Comm).is_ok(),
+            "--task comm drives the bridge and a device on its port at once"
+        );
+        assert!(
+            refuse_driven_bridges(&config, &["child".to_string()], Task::Step).is_ok(),
             "the device alone opens the bridge on its own"
         );
-        let err = refuse_driven_bridges(&config, &["bridge".to_string(), "child".to_string()])
-            .expect_err("one run drives one side of a bridge");
-        assert!(err.contains("hangs on a port of 'bridge'"), "{err}");
+        assert!(
+            refuse_driven_bridges(&config, &["bridge".to_string()], Task::Step).is_ok(),
+            "the bridge alone has no device whose route it would drop"
+        );
+
+        // The step and motion tasks would drop every port's route.
+        for task in [Task::Step, Task::Motion] {
+            let err = refuse_driven_bridges(&config, &both, task)
+                .expect_err("a firmware-takeover task drives one side of a bridge");
+            assert!(err.contains("hangs on a port of 'bridge'"), "{err}");
+            assert!(err.contains("port table"), "{err}");
+            assert!(err.contains("--task comm"), "{err}");
+        }
 
         let (serial, _) = Config::from_text(
             "[mcu]\nserial: /dev/ttyACM0\n\n[mcu zboard]\nserial: /dev/ttyACM1\n",
         )
         .expect("two serial boards parse");
         assert!(
-            refuse_driven_bridges(&serial, &["mcu".to_string(), "zboard".to_string()]).is_ok(),
+            refuse_driven_bridges(
+                &serial,
+                &["mcu".to_string(), "zboard".to_string()],
+                Task::Step
+            )
+            .is_ok(),
             "boards on transports of their own never conflict"
         );
+    }
+
+    /// `--task comm`: the bridge is driven through **its own** session — the one
+    /// its ports' devices attach through — so `--all-mcus` can run both sides of
+    /// one bridge at once on one link, one slot each.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_comm_the_bridge_and_its_ports_devices_share_one_session() {
+        let config = bridge_config();
+        let mut hosts = Vec::new();
+        let board = open_board(&config, &mut hosts, "bridge", Task::Comm)
+            .await
+            .expect("the bridge comes up");
+        assert_eq!(hosts.len(), 1, "one host per bridge");
+        let host = Arc::clone(&hosts[0].1);
+        let session = host.bridge.mcu().expect("the host brought the bridge up");
+        assert!(
+            Arc::ptr_eq(&session, &board.mcu),
+            "the bridge board drives the very session its ports' devices attach through"
+        );
+        assert!(
+            !board.link.owned_alone(),
+            "the run shares the bridge's session, so it may not close it by dropping it"
+        );
+        assert_eq!(
+            board.mcu_config.name, "bridge",
+            "the board is the bridge's own section"
+        );
+
+        // A device on one of its ports resolves against that same host and
+        // session: no second one, no second bridge session (`serial::attach`
+        // registers a slot per id, and two ids on one bridge is not a shape the
+        // mux has). The fixture's `test:` bridge is what stops the attach here.
+        let err = match open_board(&config, &mut hosts, "child", Task::Comm).await {
+            Err(err) => err,
+            Ok(_) => panic!("a test: bridge carries no downstream device"),
+        };
+        assert!(err.contains("cannot carry a downstream device"), "{err}");
+        assert_eq!(hosts.len(), 1, "the child reused the bridge's host");
+    }
+
+    /// A comm ramp runs on that shared session: the run's sole-owner assertion is
+    /// about sessions it closes itself, and the bridge's is not one of them — so
+    /// `--all-mcus --task comm` can run the bridge's ramp beside a device's on one
+    /// link instead of failing the hand-off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_comm_ramp_runs_on_the_bridges_shared_session() {
+        use clap::Parser;
+
+        let config = bridge_config();
+        let mut hosts = Vec::new();
+        let board = open_board(&config, &mut hosts, "bridge", Task::Comm)
+            .await
+            .expect("the bridge comes up");
+        let args = Cli::try_parse_from([
+            "stress",
+            "printer.cfg",
+            "--task",
+            "comm",
+            "--stage-seconds",
+            "0.5",
+            "--rate-step",
+            "3000",
+        ])
+        .expect("a short comm ramp parses")
+        .stress;
+        let pins = build_pin_registry(&config).expect("the pin registry builds");
+
+        let (failures, ran) = drive_boards(vec![board], &config, &args, &pins).await;
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(ran, 1, "the ramp ran on the bridge's own session");
+    }
+
+    /// `--task step`/`--task motion`: the bridge opens a session of the run's own,
+    /// because those tasks hand the firmware to this run's `ConfigBuilder` and a
+    /// bridge's configuration is its port table. The session is the run's alone —
+    /// the `reset` path closes it by dropping it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_step_the_bridge_opens_a_session_of_its_own() {
+        for task in [Task::Step, Task::Motion] {
+            let config = bridge_config();
+            let mut hosts = Vec::new();
+            let board = open_board(&config, &mut hosts, "bridge", task)
+                .await
+                .unwrap_or_else(|err| panic!("{task:?}: {err}"));
+            let host = Arc::clone(&hosts[0].1);
+            assert!(
+                host.bridge.mcu().is_none(),
+                "{task:?}: the host's own session is the comm task's, not this one's"
+            );
+            assert!(
+                board.link.owned_alone(),
+                "{task:?}: the run owns the session it will reconfigure"
+            );
+            assert_eq!(
+                Arc::strong_count(&board.mcu),
+                1,
+                "{task:?}: nothing else holds it, so the reset's drop closes it"
+            );
+        }
     }
 
     /// The `stress` subcommand's arguments, so a test can parse command lines.
@@ -3203,7 +3557,7 @@ mod tests {
             vec![OpenedBoard {
                 mcu_config,
                 mcu,
-                bridge: None,
+                link: BoardLink::Own,
             }],
             &config,
             &args,
@@ -3304,7 +3658,7 @@ mod tests {
             vec![OpenedBoard {
                 mcu_config,
                 mcu,
-                bridge: None,
+                link: BoardLink::Own,
             }],
             &config,
             &args,
@@ -3924,7 +4278,7 @@ mod tests {
         move_one_axis(
             &mcu_config,
             mcu,
-            None,
+            &BoardLink::Own,
             &pins,
             section,
             DISTANCE_MM,
@@ -3984,9 +4338,17 @@ mod tests {
             find_steppers(machine.config(), "mcu", &mcu, &pins).0,
             "stepper_x",
         );
-        let rate = step_soak(&mcu_config, mcu, None, &pins, section, RATE, SECONDS)
-            .await
-            .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
+        let rate = step_soak(
+            &mcu_config,
+            mcu,
+            &BoardLink::Own,
+            &pins,
+            section,
+            RATE,
+            SECONDS,
+        )
+        .await
+        .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
         println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
     }
 }

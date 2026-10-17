@@ -226,6 +226,8 @@ CAN 侧的同族常量在 `canserial.rs`。
 | `SET_PORT_TUNNEL` | `0x06` | 主机 → 桥自己 | `[头(0x3f0)][len][0x20]["KXID"][0x06][index][crc16][0x7e]`（**T3**）——把该口置/清为**刷写隧道口**（幂等，见下节与「隧道单元」段） |
 | `NEED_NODEID` | `0x20` | 设备 → 主机 | `[头(0x3f1)][len][0x20]["KXID"][0x20][uuid 大端 6 字节][app?][crc16][0x7e]`（`UnassignedNode::from_unit`） |
 
+- **应答尾部可带「端口路径」（2026-10-17 起）**：`path = [0x80 | count][port0]…`，**无 path = 接口直连**；经桥时每个桥在末尾**追加自己的端口 index**（多层桥时数组自然增长，顺序=内层→外层）。可选字节靠 **bit7** 判别：bit7 清 = app（`0x01`/`0x11`），bit7 置 = path 头（`count ≤ 8`，越界整体丢弃 path 但**不丢应答**）。桥只为这一种应答**重建帧并重算 CRC**，其他单元逐字节不变；旧固件（无 path）与旧解析器均兼容。`admin scan --bridge` 因此直接按 path 报告 `via port N`（多层 `via ports a>b`），原来的「逐口声明 + 轮间静默窗」降级为**应答没带 path 时的兜底**。
+
 - uuid **高位字节在前**；应答末尾可带一枚 application 字节：无字节或 `0x01` = Klipper、
   `0x11` = CanBoot、其它 = `Unknown`（`application_name()`）——一字不带的旧形状也认。
 - uuid/app 按**帧长字节定位**，所以它们里面出现 `0x7e` 是普通内容（帧内容允许 SYNC）。

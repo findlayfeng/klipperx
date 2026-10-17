@@ -12,7 +12,9 @@
 ## 前置（硬件与运行方式）
 
 - **板子**：STM32F103xe（72 MHz，USB `usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00`
-  → `/dev/ttyACM0`），固件 `third_party/klipper/out/klipper.bin`（含 `config_stepper` 等）。
+  → `/dev/ttyACM0`），固件 `out/firmware/klipper/klipper.bin`（仓库根 `make klipper` 产出；
+  目标板与引导偏移由 `firmware.config` / `make menuconfig` 决定，见
+  [构建 MCU 固件](docs/klippy/user-manual/firmware-build.md)；含 `config_stepper` 等）。
 - **最小接线**：X 与 Y 的 `step_pin`/`dir_pin`、X 的 `endstop_pin`、挤出机步进（E 轴）、
   加热棒 + 热敏电阻（`[extruder]`）。**引脚尚未定论**：本节此前写 X = `PB0`/`PB1`，而
   `config.cfg` 的注释写 `PB4`/`PB5`（且那组注释与 `[output_pin] motor_in1..4` 的
@@ -215,7 +217,7 @@
 ### 真机结果（2026-10-15，第一次上板）
 
 板子：`usb-Klipper_stm32f103xe_39FFD7054D47323924610951` → `/dev/ttyACM1`（STM32F103ZE，SWD 刷入：
-`./venv/bin/pyocd load --target stm32f103ze third_party/klipper/out/klipper.elf`）。
+`./venv/bin/pyocd load --target stm32f103ze out/firmware/klipper/klipper.elf`）。
 
 **为这次上板补的固件改动**（子模组）：USB CDC 控制台接 mux（`src/generic/usb_cdc.c` 的 rx/tx 两个
 接点与 `mux_send`）、`MUX_SERIAL` 依赖放宽为 `SERIAL || USBSERIAL`（此前 USB 控制台的板子 `SERIAL=n`，
@@ -234,7 +236,7 @@ C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「�
 （`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
 
 **刷写这台板的正确姿势（本轮踩过，写下来）**：`./venv/bin/pyocd load -O connect_mode=halt
--O frequency=1000000 -e chip --target stm32f103ze third_party/klipper/out/klipper.elf`
+-O frequency=1000000 -e chip --target stm32f103ze out/firmware/klipper/klipper.elf`
 ——默认频率下刷写会**静默失败**（报成功但板上还是旧镜像），chip erase + halt + 1 MHz 才可靠；
 另外**核心处于 sleep 时经 SWD 读内存会全返回 `0xFF`**（必须先 `halt`），否则会误判「flash 是空的」。
 
@@ -278,6 +280,8 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   两轮刷 deployer.bin（83/82 块+verify rc=0），第二轮换血后 `usb-katapult_…_devloop1` 活体
   CONNECT + 读回 `boot==新 katapult.bin`/`app==新 deployer.bin` 双 True（手法见
   [katapult-self-update](.agents/skills/katapult-self-update/SKILL.md)）；**CAN 路径仍未真机**。
+  两个镜像现在由仓库根 `make katapult` 产出：`out/firmware/katapult/katapult.bin` 与
+  `out/firmware/katapult/deployer.bin`（只在共享目标选了非零引导偏移时才有 deployer）。
 - **katapult 刷写真机验证（经桥，2026-10-17 闭环）**：拓扑 = 主机 → 桥（USB-CDC 控制台 +
   `CONFIG_MUX_SERIAL=y`）→ UART1（PA10/PA9）@250000 → 下游。
   **硬前提**（缺一条就跑不通，写进拓扑而不是当成「坑」）：

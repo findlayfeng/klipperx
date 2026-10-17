@@ -116,20 +116,22 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 它与上面「桥下游端口」那套配置期声明是**两件事**：同一套固件能力，一个由 `printer.cfg` 驱动（宿主
 用来连设备），一个由命令行使唤（人用来刷设备）。
 
-**拓扑与前提**（少一条就走不通）：
+**拓扑与前提**（少一条就走不通；固件由仓库根 `make` 构建，见 [构建 MCU 固件](firmware-build.md)）：
 
 1. **桥**：一块开着 `CONFIG_MUX_SERIAL=y` 的板（控制台在 USB CDC 或串口上），下游口在**硬件 UART**
    上——STM32 桥的端口是编译期固定的 **USART1，RX PA10 / TX PA9**；参考构建
-   `third_party/klipper/test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 + USART1 端口）。
+   `third_party/klipper/test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 + USART1 端口；
+   用户侧在仓库根 `make menuconfig` 里选同样的两项）。
    桥也可以是一个开着 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 的 **host 库进程**（最多
    `KLIPPER_HOST_PORT_SLOTS` = 4 个 tty 槽）。
 2. **下游**：它得在一条 **UART 控制台**上（不是 USB CDC——桥只给它一个硬件 UART 口），而且要说单元：
    - 想**当应用用**（既能被刷、也能跑宿主）⇒ 应用固件带 `CONFIG_STM32_SERIAL_USART1=y` +
-     `CONFIG_MUX_SERIAL=y`（构建目标 `test/configs/stm32f103-serial-mux.config`）；
-   - 想**停在引导里被刷**⇒ 引导本身是 **mux 版 katapult**（构建时选上 `MUX_SERIAL`）；stock katapult
-     只说裸帧，只能挂在 `--legacy` 口上。
-   应用还得带 katapult 的偏移（`CONFIG_STM32_FLASH_START_2000=y` ⇒ 应用在 **0x8002000**）才能被
-   引导跳进去。
+     `CONFIG_MUX_SERIAL=y`（闸门里的构建目标是 `test/configs/stm32f103-serial-mux.config`；
+     用户侧在 `make menuconfig` 里选串口控制台 + `MUX_SERIAL`）；
+   - 想**停在引导里被刷**⇒ 引导本身是 **mux 版 katapult**（串口目标的共享构建会把 `MUX_SERIAL`
+     同步给 katapult；stock katapult 只说裸帧，只能挂在 `--legacy` 口上）。
+   应用还得带 katapult 的偏移（`CONFIG_STM32_FLASH_START_2000=y` ⇒ 应用在 **0x8002000**；
+   `make menuconfig` 的共享目标里选 8 KiB bootloader）才能被引导跳进去。
 3. 桥与下游之间的 **UART 速率**（`--baud`，默认 250000）两端一致。
 
 **四个命令（先看再刷）**：
@@ -151,7 +153,7 @@ klipperx admin scan --bridge /dev/ttyACM0 --ports 0
 #   Total 1 uuids found
 
 # ④ 刷写
-klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 klipper.bin
+klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 out/firmware/klipper/klipper.bin
 ```
 
 **它不是流水线**：桥的端口表只活在它的 RAM 里，所以 ②③④ 每条命令都会**重启桥、重新声明端口、
@@ -172,7 +174,7 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 klipper.bin
 
 ```sh
 klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
-  --port-reset bootloader klipper.bin
+  --port-reset bootloader out/firmware/klipper/klipper.bin
 ```
 
 刷完它回到应用；要再刷再来一遍（不需要拔插、也不需要手按复位）。

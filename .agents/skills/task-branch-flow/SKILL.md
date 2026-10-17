@@ -32,6 +32,9 @@ git worktree add ../klipperx.worktrees/<短名> -b agents/<类型>-<主题> work
 
   由 `crates/test-support`（`build.rs` 与 `klipper_dir()`）与 `src/core/klippy/upstream.rs` 统一解析；
   共享同一份检出是安全的（构建只写各自 `OUT_DIR`，`KCONFIG_CONFIG`/`OUT` 显式外移）。
+- **板子固件用仓库根 `make`**（`make` / `make klipper` / `make katapult`，配置 `make menuconfig`）：
+  它也写本检出/worktree 的 `out/firmware/` 与 `.config`，子模组只读；**不要**进子模组里 `make`。
+  见 [构建 MCU 固件](../../../docs/klippy/user-manual/firmware-build.md)。
 - `third_party/katapult` 同样保持空目录；读 katapult 检出的代码用
   `KLIPPERX_KATAPULT_DIR=<主检出>/third_party/katapult`（`katapult_dir()` 解析，同一约定）。
 - 注意：worktree 的 `.cargo/config.toml` 里**不一定**有 `KLIPPERX_KLIPPER_DIR`（主检出的本地改动不带过去），

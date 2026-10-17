@@ -1,0 +1,31 @@
+# One target configuration, two firmware images (katapult + klipper).
+#
+# The target choices live in the Klipper tree and are asked once: katapult's
+# Kconfig defines the same symbols (architecture, processor model, clock
+# reference, communication interface, bootloader offset) with the same values,
+# so a choice made here is what both builds get.  `scripts/firmware-config.py`
+# projects the shared, user-selectable values onto katapult's own Kconfig and
+# lets katapult derive the rest (MCU, clock, flash geometry, HAVE_* selects),
+# exactly as an in-tree katapult build would.
+#
+# `source` is resolved against $srctree, which the build points at the Klipper
+# checkout; the nested `source "src/..."` lines in that tree then resolve
+# there too.  Bootloader-only options (only katapult has them) are declared in
+# kconfig/katapult.kconfig.
+#
+# Requirements and derivations:
+#   - katapult supports the architectures its Kconfig lists (STM32, LPC176x,
+#     RP2040/RP235x) and the processor models its arch Kconfigs list; a target
+#     only Klipper knows fails the derivation with a message.
+#   - the bootloader offset is the shared answer to "where does the app
+#     start": klipper links the application there, katapult is told to launch
+#     there (LAUNCH_APP_ADDRESS) and its deployer writes itself there.
+#   - the USB device id is per firmware and is not merged: katapult keeps its
+#     own (0x6177) so flashing tools find the bootloader, klipper keeps its own
+#     (0x614e).  The vendor id is shared.
+
+source "src/Kconfig"
+
+mainmenu "klipperx firmware: katapult bootloader + klipper application"
+
+rsource "kconfig/katapult.kconfig"

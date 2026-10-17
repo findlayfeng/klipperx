@@ -90,7 +90,12 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 # 取子模组（klipper 里是上游源码、`config/` 与回归语料，katapult 是引导加载程序；克隆时带了 --recurse-submodules 可跳过）
 git submodule update --init third_party/klipper third_party/katapult
 
-# 构建（宿主二进制 klipperx 与 klippy）
+# 构建板子固件：一次共享配置出两份（详见 docs/klippy/user-manual/firmware-build.md）
+make                         # katapult（引导）+ klipper（应用）
+make menuconfig              # 改目标板/通信接口/引导偏移，以及两侧各自的选项
+# 产物：out/firmware/klipper/klipper.bin 与 out/firmware/katapult/katapult.bin（+ deployer.bin）
+
+# 构建宿主二进制（klipperx 与 klippy）
 cargo build --release
 
 # 单进程跑全部单测 + 上游语料（推荐日常用这一条）
@@ -109,8 +114,8 @@ cargo run --release -- config.cfg --tui           # 本进程内开一个终端�
 klipperx console -a /tmp/klippy_uds               # 另开终端连上去
 
 # 刷写带 katapult 引导的板子（`klipperx admin flash` 子命令；直连两条路径，设备需先停在引导态）
-cargo run -- admin flash --device /dev/serial/by-id/usb-Katapult… klipper.bin   # USB-CDC / 独占串口
-cargo run -- admin flash --interface can0 -u <uuid> klipper.bin                # CAN
+cargo run -- admin flash --device /dev/serial/by-id/usb-Katapult… out/firmware/klipper/klipper.bin   # USB-CDC / 独占串口
+cargo run -- admin flash --interface can0 -u <uuid> out/firmware/klipper/klipper.bin                # CAN
 cargo run -- admin flash -q --interface can0     # 列出未指派节点（app=katapult 的 UUID）
 
 # 经桥刷下游（桥 = 一块开着 MUX_SERIAL 的板或一个 host 库；下游在它的 UART 口上）
@@ -119,11 +124,11 @@ cargo run -- admin flash -q --interface can0     # 列出未指派节点（app=k
 cargo run -- admin bridge config --bridge /dev/ttyACM0
 cargo run -- admin bridge port  --bridge /dev/ttyACM0 --port 0 --port-nodeid 7
 cargo run -- admin scan       --bridge /dev/ttyACM0 --ports 0
-cargo run -- admin flash      --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 klipper.bin
+cargo run -- admin flash      --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 out/firmware/klipper/klipper.bin
 
 # 可反复刷：目标正跑应用时先让它自己进引导（0x02 经 UNITS 路由送到设备），刷完可直接再刷
 cargo run -- admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
-  --port-reset bootloader klipper.bin
+  --port-reset bootloader out/firmware/klipper/klipper.bin
 
 # 真机（需要一块板子；见 TESTING.md；指向你自己的 printer 配置，接口从它的 [mcu] 里读）
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest        # 只跑真机 lane（别名，见 .cargo/config.toml）
@@ -143,8 +148,8 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 
 | 变量 | 默认 | 作用 |
 |---|---|---|
-| `KLIPPERX_KLIPPER_DIR` | `<仓库>/third_party/klipper` | 语料、kconfig 片段与 host 库从哪个 klipper 检出读。**git worktree 里没有子模组，靠它指向主检出的那一份**。构建期与运行期读同一个值，改指向会触发重建。 |
-| `KLIPPERX_KATAPULT_DIR` | `<仓库>/third_party/katapult` | katapult 检出（`protocol.md`、bootloader 固件、刷写脚本）从哪读：`katapult_dir()`，与 `KLIPPERX_KLIPPER_DIR` 同一解析约定（非空覆盖、否则树内子模组）。**git worktree 里子模组同样为空**，靠它指向主检出的那一份。 |
+| `KLIPPERX_KLIPPER_DIR` | `<仓库>/third_party/klipper` | 语料、kconfig 片段、host 库与**固件构建**（仓库根 `make`）从哪个 klipper 检出读。**git worktree 里没有子模组，靠它指向主检出的那一份**。构建期与运行期读同一个值，改指向会触发重建。 |
+| `KLIPPERX_KATAPULT_DIR` | `<仓库>/third_party/katapult` | katapult 检出（`protocol.md`、bootloader 固件、刷写脚本）从哪读，**仓库根 `make katapult` 也从这里取源码**：`katapult_dir()`，与 `KLIPPERX_KLIPPER_DIR` 同一解析约定（非空覆盖、否则树内子模组）。**git worktree 里子模组同样为空**，靠它指向主检出的那一份。 |
 | `KLIPPERX_ARCHES` | `linux,avr,stm32,atsam,atsamd,lpc176x,rpxxxx,hc32f460` | 逗号分隔的 MCU 家族列表：构建阶段只为这些家族的 `test/configs/*.config` 生成 `.dict`（各需其工具链：主机 `cc`、`avr-gcc`、`arm-none-eabi-gcc`）；其余运行因缺字典跳过。 |
 | `KLIPPERX_ALL_ARCHES` | 未设置 | 设成任意值即忽略上面的列表，构建 `test/configs/` 下的**全部**目标（含 `pru`、`ar100`、`simu`，需要各自的工具链）。 |
 | `KLIPPERX_UPSTREAM_ALL` | 未设置 | 设成任意值即取消语料忽略列表（当前列表为空，故这只是口径上的保险；字典未构建的运行仍然跑不起来）。 |
@@ -180,6 +185,10 @@ crates/
 docs/                    文档（见下）
 third_party/klipper/     上游 Klipper（git 子模组：语料 + 上游 config + 固件源码）
 third_party/katapult/    Katapult 引导加载程序（git 子模组：katapult 协议 + bootloader 固件 + 刷写脚本）
+Makefile, Kconfig        顶层固件构建：一次共享配置编 katapult 与 klipper 两份固件
+firmware.config          固件种子配置（`make` 的默认目标板/接口/引导偏移）
+kconfig/                 katapult 专属的 Kconfig 片段（引导侧选项）
+out/firmware/            固件产物与派生配置（gitignore）
 ```
 
 ## 文档
@@ -188,7 +197,7 @@ third_party/katapult/    Katapult 引导加载程序（git 子模组：katapult 
 |---|---|
 | [`AGENTS.md`](AGENTS.md) | **开工前先读**：分支/提交约定、worker 纪律、文档同步义务 |
 | [`docs/README.md`](docs/README.md) | 文档总索引 |
-| [用户手册](docs/klippy/user-manual/README.md) | 配置文件参考、G-Code 命令、客户端使用、日志与调试 |
+| [用户手册](docs/klippy/user-manual/README.md) | 固件构建、配置文件参考、G-Code 命令、客户端使用、日志与调试 |
 | [开发手册](docs/klippy/developer-manual/README.md) | 模块架构、消息协议、运动层、测试与回归口径 |
 | [第三方开发手册](docs/klippy/third-party-dev/README.md) | Klippy API 接口定义（端点状态表） |
 | [`TODO.md`](TODO.md) | 当前待办、工单与账本（含语料进度） |

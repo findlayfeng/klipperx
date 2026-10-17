@@ -90,6 +90,39 @@ CARGO_TARGET_DIR=/tmp/t-<短名> cargo test …      # 要并发就各自独立 
   偶发卡住（实测遇到过一次 `futex_wait` 挂住）。
 - 纯文档改动不必跑闸门；**改代码/固件后**、以及**合并前**必须跑。
 
+## 自动化 git 的两颗地雷（脚本 / worker）
+
+本机的 git 配置对人是合理的、对脚本是致命的：
+
+```
+commit.gpgsign = true      # 每次提交都要签名 → 弹 kgpg/pinentry，脚本答不了
+core.editor    = code -w   # 任何 -e 都等 VS Code 窗口关闭 → 没窗口就永远不返回
+```
+
+两者在 `rebase`/`cherry-pick` 里最狠：它们自己会调 `git commit -n -S … -e`。症状是
+**`git rebase --continue` 挂住不返回**，进程表里能看到 `git commit … -S … -e` 与 `code -w`。
+
+正确绕法是用**环境变量**，不是 `git -c`——`-c` 传不进 rebase 自己起的那个 `git commit`：
+
+```bash
+export GIT_CONFIG_COUNT=2
+export GIT_CONFIG_KEY_0=commit.gpgsign   GIT_CONFIG_VALUE_0=false
+export GIT_CONFIG_KEY_1=core.editor      GIT_CONFIG_VALUE_1=true
+```
+
+现成包装器就是 [`scripts/git-safe.sh`](../../../scripts/git-safe.sh)（只影响该进程及其子进程，
+不改用户自己的 git 行为）：
+
+```bash
+scripts/git-safe.sh rebase -i --rebase-merges <base>       # 需要编辑 todo 时另给
+GIT_SEQUENCE_EDITOR='<脚本>' scripts/git-safe.sh rebase -i <base>
+scripts/git-safe.sh commit -m "…"
+```
+
+已经挂住时的抢救：进程表里找 `git rebase --continue` / `git commit -n -S` / `code -w`，
+**只杀被 git 唤起的那条等待链**（`code -w` 的 CLI 等待进程），不要杀 VS Code 主实例——那是
+用户正在用的窗口。`pkill -f` 要当心：模式串会匹配到你自己那条命令，曾把执行它的 shell 一起杀掉。
+
 ## 收尾
 
 ```bash

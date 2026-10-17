@@ -28,13 +28,14 @@ use super::transport;
 /// given, in baud — `flashtool.py`'s default.
 const DEFAULT_BAUD: u32 = 250_000;
 
-/// The bus rate a CAN flash opens its port at, in bits per second — 1 Mbit,
-/// the default `[canbus]` and the rate `flashtool.py` uses.
+/// The bus rate a bridge's **CAN** slot is declared at, in bits per second —
+/// 1 Mbit, the default `[canbus]` and the rate `flashtool.py` uses.
 ///
-/// On a CAN slot `--baud` is the bus bitrate, not a line speed: this layer does
-/// not tell the two port kinds apart yet (a port is still declared as a UART,
-/// `bridge_session`), so it carries this constant for the CAN case until the
-/// declaration path names the port's bus.
+/// The two port kinds take different rates and neither is a default for the
+/// other: `--baud` is a **UART** slot's line rate, this is the CAN slot's bus rate
+/// (`config_can bitrate=%u`, which is the port's `canhw_set_rate`). Which slot is
+/// which is the bridge's to say (`BridgeLink::slot_kind`), so one command line can
+/// carry both with neither being a guess.
 pub const CAN_DEFAULT_BITRATE: u32 = 1_000_000;
 
 /// The node id a CAN flash assigns the board when `--nodeid` is not given:
@@ -84,6 +85,14 @@ pub struct FlashArgs {
     /// Line speed, in baud (serial flashes only; default 250000)
     #[arg(long)]
     pub baud: Option<u32>,
+
+    /// Bus rate of a bridge's **CAN** slot, in bits per second (bridge flashes
+    /// only; default 1000000)
+    //
+    // The other kind's rate: a UART slot is opened at `--baud`, the CAN slot at
+    // this. Which slot a port is comes from the bridge's own dictionary.
+    #[arg(long, value_name = "BPS")]
+    pub can_bitrate: Option<u32>,
 
     /// Serial tty of a **bridge** to flash a downstream board through: the
     /// board behind the port named by `--port` is the target, reached over the
@@ -256,9 +265,17 @@ pub struct BridgePortArgs {
     pub port_nodeid: Option<u8>,
 
     /// Line speed the port opens at, in baud (default 250000; a serial bridge's
-    /// own link opens at the same rate)
+    /// own link opens at the same rate, and only a **UART** slot uses it)
     #[arg(long, value_name = "BAUD")]
     pub baud: Option<u32>,
+
+    /// Bus rate the **CAN** slot opens at, in bits per second (default 1000000)
+    //
+    // Not a line speed: a UART slot's stream is opened at `--baud`, the CAN
+    // slot's at this rate (`config_can bitrate=%u`). The two never substitute for
+    // each other, and which slot is which is the bridge's to say.
+    #[arg(long, value_name = "BPS")]
+    pub can_bitrate: Option<u32>,
 
     /// Name the port the legacy way instead of units: the wire format a device
     /// that predates the mux speaks — a stock katapult board behind the port,
@@ -291,6 +308,8 @@ pub struct BridgePortPlan {
     pub source: BridgeLinkSource,
     /// The line speed the port is declared at (and the link opens at).
     pub baud: u32,
+    /// The bus rate the CAN slot is declared at, when the port is that slot.
+    pub bitrate: u32,
     /// The port to declare, name and tunnel.
     pub target: BridgeTarget,
     /// How the port is named: units (the default) or legacy.
@@ -417,6 +436,8 @@ pub struct BridgeFlashTarget {
     /// The line speed the target's port — and, for a serial bridge, its own
     /// link — opens at.
     pub baud: u32,
+    /// The bus rate the CAN slot opens at, when the target's port is that slot.
+    pub bitrate: u32,
     /// The target's port index on the bridge: the plan [`open_bridge`] is given
     /// has one entry per port up to and including it.
     ///
@@ -491,6 +512,8 @@ fn stray_bridge_argument(args: &FlashArgs) -> Option<&'static str> {
         Some("--host-identity")
     } else if args.bridge_uuid.is_some() {
         Some("--bridge-uuid")
+    } else if args.can_bitrate.is_some() {
+        Some("--can-bitrate")
     } else if !args.port_tty.is_empty() {
         Some("--port-tty")
     } else {
@@ -543,6 +566,7 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
     let reset = parse_port_reset(args.port_reset.as_deref())?;
     let firmware = firmware_or_err(args)?;
     let baud = args.baud.unwrap_or(DEFAULT_BAUD);
+    let bitrate = args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE);
     let source = plan_bridge_link(
         &args.bridge,
         &args.bridge_library,
@@ -554,6 +578,7 @@ fn plan_bridge(args: &FlashArgs) -> Result<Action, String> {
         target: BridgeFlashTarget {
             source,
             baud,
+            bitrate,
             port,
             node_id,
             reset,
@@ -694,6 +719,7 @@ pub fn plan_bridge_port(args: &BridgePortArgs) -> Result<BridgePortPlan, String>
     Ok(BridgePortPlan {
         source,
         baud: args.baud.unwrap_or(DEFAULT_BAUD),
+        bitrate: args.can_bitrate.unwrap_or(CAN_DEFAULT_BITRATE),
         target: BridgeTarget {
             index: port,
             node_id,
@@ -987,6 +1013,7 @@ fn run_bridge_flash(
         let ports: Vec<BridgePort> = (0..=target.port)
             .map(|index| BridgePort {
                 baud: target.baud,
+                bitrate: target.bitrate,
                 reset: if index == target.port {
                     target.reset
                 } else {
@@ -1153,7 +1180,7 @@ pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::E
             .await
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         link.reset().await?;
-        link.declare_ports(&declared_ports(plan.target.index, plan.baud))
+        link.declare_ports(&declared_ports(plan.target.index, plan.baud, plan.bitrate))
             .await?;
         link.open_target_port(plan.target, plan.route)?;
         link.close();
@@ -1163,16 +1190,19 @@ pub fn run_bridge_port(args: BridgePortArgs) -> Result<(), Box<dyn std::error::E
 }
 
 /// The declaration `admin bridge port` sends: every port up to and including
-/// `index`, at one speed.
+/// `index`, at one line speed and one bus rate.
 ///
 /// The bridge numbers a port by the order its declaration rows reach it, so a
-/// port at `index` exists only after the ports below it do. No reset runs in this
-/// command, so each entry's reset is the unused placeholder
+/// port at `index` exists only after the ports below it do. Neither rate is a
+/// guess for the other: the bridge's own slot table says which kind each port is
+/// ([`BridgeLink::slot_kind`]), and only the rate that kind takes is used. No
+/// reset runs in this command, so each entry's reset is the unused placeholder
 /// [`BridgePort::reset`] carries.
-fn declared_ports(index: u8, baud: u32) -> Vec<BridgePort> {
+fn declared_ports(index: u8, baud: u32, bitrate: u32) -> Vec<BridgePort> {
     (0..=index)
         .map(|_| BridgePort {
             baud,
+            bitrate,
             reset: PortReset::ResetPort,
         })
         .collect()
@@ -1602,6 +1632,7 @@ mod tests {
                         uuid: None,
                     },
                     baud: DEFAULT_BAUD,
+                    bitrate: CAN_DEFAULT_BITRATE,
                     port: 1,
                     node_id: 7,
                     reset: PortReset::ResetPort,
@@ -1671,6 +1702,7 @@ mod tests {
                     port_ttys: vec![(0, "/dev/pts/3".into()), (1, "/dev/pts/4".into())],
                 },
                 baud: 115_200,
+                bitrate: CAN_DEFAULT_BITRATE,
                 port: 1,
                 node_id: 9,
                 reset: PortReset::RestartDevice,
@@ -2212,6 +2244,71 @@ mod tests {
                 node_id: 7,
             }
         );
+        // The two port kinds' rates are separate, and neither is the other's
+        // default: a UART slot takes the line speed, the CAN slot this bitrate.
+        assert_eq!(plan.baud, DEFAULT_BAUD);
+        assert_eq!(plan.bitrate, CAN_DEFAULT_BITRATE);
+    }
+
+    /// `--can-bitrate` is the **CAN** slot's bus rate and `--baud` stays the UART
+    /// slots' line speed: one plan carries both, and declaring a port uses the one
+    /// its slot takes (`BridgeLink::slot_kind`).
+    #[test]
+    fn test_a_bridge_port_plan_carries_the_can_bitrate_beside_the_line_speed() {
+        let plan = planned_bridge_port(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "0",
+            "--port-nodeid",
+            "7",
+            "--baud",
+            "115200",
+            "--can-bitrate",
+            "500000",
+        ])
+        .expect("a CAN slot's rate and a UART slot's speed, on one line");
+        assert_eq!(plan.baud, 115_200);
+        assert_eq!(plan.bitrate, 500_000);
+    }
+
+    /// A bridge **flash** carries the same pair: its plan declares the ports up to
+    /// the target, so it needs the CAN slot's rate as much as `bridge port` does.
+    #[test]
+    fn test_a_bridge_flash_plan_carries_the_can_bitrate() {
+        let action = planned(&[
+            "--bridge",
+            "/dev/ttyUSB0",
+            "--port",
+            "1",
+            "--port-nodeid",
+            "7",
+            "--can-bitrate",
+            "500000",
+            "fw.bin",
+        ])
+        .expect("a bridge flash plan");
+        let Action::BridgeFlash { target, .. } = action else {
+            panic!("a bridge line makes a bridge plan");
+        };
+        assert_eq!(target.bitrate, 500_000);
+        assert_eq!(target.baud, DEFAULT_BAUD);
+    }
+
+    /// `--can-bitrate` belongs to a bridge: a direct serial or CAN line has no
+    /// bridge slot to open, and the option is named as the mistake it is.
+    #[test]
+    fn test_a_can_bitrate_needs_a_bridge() {
+        let err = planned(&[
+            "--device",
+            "/dev/ttyACM0",
+            "--can-bitrate",
+            "500000",
+            "fw.bin",
+        ])
+        .expect_err("a serial flash has no bridge CAN slot");
+        assert!(err.contains("--can-bitrate"), "{err}");
+        assert!(err.contains("--bridge"), "{err}");
     }
 
     /// Both the port and the id the bridge routes it to are required: neither has

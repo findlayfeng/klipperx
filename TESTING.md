@@ -134,15 +134,16 @@
   连上，桥收到 `SET_PORT_NODEID(index, id, flags=0)` 后把该 id 的数据单元剥头下发、把下游原始帧
   加上应答头上行。判定：identify + `get_clock` 跑通，下游板全程不参与 admin，日志无 `!!`。
   **2026-10-15 真机结论**：以「宿主库当桥 + 真板（旧/普通固件）当下游」形态验过（见下面「真机结果」）。
-  仍未验的是**板做桥**那一半：MCU 侧还没有 UART 端口后端（`CONFIG_SERIAL_UART` 只有 host 库实现），
-  所以「一块板做桥、其 uart 接下游」目前无法配置。
+  板做桥那一半已不再缺件：stm32/linux 的 UART 端口后端已落地（2026-10-17 经桥刷写已闭环，
+  见「范围外」的「经桥」项），剩下的是**配置拓扑**（`[uart_device]` + `[mcu child]`）的真机 identify，
+  归在 M1-5。
 - [x] **M1-2 桥下游端口 attach（命名设备）** —— 端口上那台**能答 admin** 的设备带 `uuid:`：主机对桥
   发 `SET_PORT_NODEID(index, id, MUX_PORT_UNITS)`，对设备发 `SET_KLIPPER_NODEID` + 重确认握手，
   之后按整单元原样转发。判定：同上跑通，且能与 M1-1 共存于同一桥（一条端口一种形态）。
   **2026-10-15 真机通过**：真板（stm32f103xe，USB CDC 控制台 + `CONFIG_MUX_SERIAL`，身份
   `e512c60ac0e6` = 其 UID 的 chipid 派生值）当命名下游挂在一份宿主库桥后面：`MCU 'bridge'
   identified: 22 messages` / `MCU 'child' identified: 135 messages` / 库 stderr `bridge serial:
-  /dev/ttyACM1 open at 250000 baud (fd N, slot 0)`。仍未验：**板做桥**（同上缺 UART 端口后端）、
+  /dev/ttyACM1 open at 250000 baud (fd N, slot 0)`。仍未验：**配置拓扑下的板做桥**（见 M1-5）、
   两台真设备同桥、真板上的 `irq_save()` 时序与冲突处理。
 - [x] **M1-3 端口配置期的显式失败与 `index` 一致**（M1-P7 起取代旧的「端口表对账」）—— 端口由主机在
   配置期用 `config_uart`/`config_bridge_port` 声明，`index` = 端口节声明顺序。判定：把端口 tty
@@ -197,10 +198,12 @@
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
   admin 单元属点火不管）的频率也需观察。
-- [ ] **M1-5 板做桥（MCU 侧 UART 端口后端）** —— M1-1/M1-2 验的都是「宿主库当桥 + 真板当下游」，「一块
-  真板当桥、其 uart 接下游」今天配置不出来：`CONFIG_SERIAL_UART`（UART 对象层）只有 host 库后端
-  （`src/host/bridge.c`），MCU 侧没有 `bridge_port_ops` 实现。真实测试（待端口后端落地后）：真板开
-  `CONFIG_BRIDGE` + 一个下游端口，下游分别接旧固件板（legacy）与能答 admin 的板（命名）各一次。判定：
+- [ ] **M1-5 板做桥（配置拓扑：`[uart_device]` + `[mcu child]`）** —— M1-1/M1-2 验的都是「宿主库当桥 +
+  真板当下游」。端口后端已不再是缺件：`third_party/klipper/src/stm32/bridge_serial.c`
+  （编译期固定的 USART1，RX PA10 / TX PA9）、`src/linux/bridge.c`、`src/host/bridge.c`（4 槽）都在，
+  且 2026-10-17 已用「真板当桥（USB CDC 控制台 + `MUX_SERIAL`）→ USART1 → 下游」的拓扑把**刷写**
+  整链跑通（见「范围外」的「经桥」项）。**待验的是配置面**：真板开 `CONFIG_BRIDGE` + 下游端口，
+  宿主按 `[uart_device]` + `[mcu child]`（分别 legacy 与命名各一次）连上去。判定：
   同 M1-1/M1-2 的 identify + `get_clock`，命令经真板的桥半转发，且 `irq_save()` 段内时序无丢帧。
 - [ ] **P6 多站串口（RS-485 一类）** —— 端口后端（半双工收发 + 方向控制）尚未实现，主机侧「一个串口
   端口节被多颗命名 `[mcu]` 引用」的分组与判定已有（都带头、各自走自己的 `uuid → id`）。真实测试（待后端
@@ -266,7 +269,7 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
-- **katapult 直连刷写真机验证**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 子命令直刷——
+- **katapult 刷写真机验证（直连）**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 直刷——
   USB-CDC 路径（`--device /dev/serial/by-id/usb-Katapult…`：prime → 会话 → verify → `COMPLETE`
   后重枚举）与 CAN 路径（`--interface` + `-u`：admin `0x11/0x12` 指派 + uuid 校验）。判定按
   [flash-firmware](.agents/skills/flash-firmware/SKILL.md) 硬证据口径：刷后设备重枚举为应用
@@ -275,6 +278,37 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   两轮刷 deployer.bin（83/82 块+verify rc=0），第二轮换血后 `usb-katapult_…_devloop1` 活体
   CONNECT + 读回 `boot==新 katapult.bin`/`app==新 deployer.bin` 双 True（手法见
   [katapult-self-update](.agents/skills/katapult-self-update/SKILL.md)）；**CAN 路径仍未真机**。
+- **katapult 刷写真机验证（经桥，2026-10-17 闭环）**：拓扑 = 主机 → 桥（USB-CDC 控制台 +
+  `CONFIG_MUX_SERIAL=y`）→ UART1（PA10/PA9）@250000 → 下游。
+  **硬前提**（缺一条就跑不通，写进拓扑而不是当成「坑」）：
+  - 桥的端口在**硬件 UART** 上：`test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 +
+    `CONFIG_STM32_BRIDGE_SERIAL_USART1=y`），口的引脚恒为 PA10（RX）/ PA9（TX）；
+  - 下游挂在一条 **UART 控制台**上，且说单元：跑应用的板子带
+    `CONFIG_STM32_SERIAL_USART1=y` + `CONFIG_MUX_SERIAL=y`（`test/configs/stm32f103-serial-mux.config`）；
+    停在引导里的板子得是 **mux 版 katapult**（构建时选上 `MUX_SERIAL`）——stock katapult 只说裸帧，
+    只能挂 `--legacy` 口；
+  - 应用带 katapult 的偏移（`CONFIG_STM32_FLASH_START_2000=y` ⇒ 应用在 **0x8002000**）。
+
+  实测（命令与输出逐条，均为 2026-10-17 本轮真机；四步用法见
+  [MCU 连接方式 → 经桥刷下游](docs/klippy/user-manual/mcu-connection.md) 一节）：
+
+  | # | 验项 | 命令（`<桥>` = 桥的 tty） | 实测结果 |
+  |---|---|---|---|
+  | 1 | 列桥的 UART 槽 | `admin bridge config --bridge <桥>` | `available uarts: 1`、`uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)` |
+  | 2 | 启用端口 | `admin bridge port --bridge <桥> --port 0 --port-nodeid 7` | `target: port 0 nodeid 7, units route, tunnel open` |
+  | 3 | 经桥发现 | `admin scan --bridge <桥> --ports 0` | `Found uuid=97abe031988e, Application: CanBoot, port 0` + `Total 1 uuids found` |
+  | 4 | 经桥刷下游 | `admin flash --bridge <桥> --port 0 --port-nodeid 7 <fw>` | `complete: 43716 bytes in 684 blocks`（verify 全过） |
+  | 5 | 经桥刷 **UART 控制台 + mux** 应用 | 同上 | `complete: 41548 bytes in 650 blocks` |
+  | 6 | **可反复刷**（目标正跑应用） | 同上 + `--port-reset bootloader` | `complete: 41548 bytes in 650 blocks`，rc=0 |
+  | 7 | 经桥把下游引导自更新为 mux 版 katapult | 同上（写 deployer 镜像） | `complete: 4544 bytes in 71 blocks` |
+
+  判定口径：“`complete: N bytes in M blocks`” **只在 verify 逐块比对全过后才打印**
+  （`src/flash/session.rs:391-405`），所以那一行就是「写进去的字节 = 读回来的字节」的证据；
+  第 6 行另外证明了“**不需要拔插/手按复位**就能再刷一遍”（`0x02` 经 UNITS 路由把正跑应用的设备
+  送回引导，会话的 `CONNECT` 重试盖住引导启动时间）。
+
+  **仍未验（写在明处）**：`--legacy` 口上的 stock katapult（只验了单测夹具）；
+  host 库当桥时的多槽并行刷写；`scan --bridge` 的漏报率（只有“一片一板”的拓扑）。
 
 ## 怎么算清零
 

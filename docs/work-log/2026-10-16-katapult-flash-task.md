@@ -369,6 +369,41 @@ T5c 与 T5-tool 已于 2026-10-16 并行派出；**T5b′ 等其中之一落地�
   testing.md 的 host.rs 覆盖面 18 → **21**（20 真库 + 1 缺库）。
 - **附带**：`abandoned/nextest-lane` 入台账（放弃 A：换 runner 做闸门快车道）——原因与可挖掘点见 `docs/abandoned.md`。
 
+**2026-10-17 真机闭环（阶段 2：设备在桥后面能否正确刷入）——已完成**
+
+拓扑：主机 → 桥（真板，USB-CDC 控制台 + `CONFIG_MUX_SERIAL=y`，构建参 `test/configs/stm32f103-usb-mux-bridge.config`）
+→ UART1（PA10/PA9）@250000 → 下游（UART 控制台 + mux 应用 / mux 版 katapult）。
+
+| # | 验项 | 命令 | 实测输出 |
+|---|---|---|---|
+| 1 | 列桥的 UART 槽 | `admin bridge config --bridge <桥>` | `available uarts: 1` / `uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)` |
+| 2 | 启口（默认 UNITS） | `admin bridge port --bridge <桥> --port 0 --port-nodeid 7` | `target: port 0 nodeid 7, units route, tunnel open` |
+| 3 | 经桥发现 | `admin scan --bridge <桥> --ports 0` | `Found uuid=97abe031988e, Application: CanBoot, port 0` + `Total 1 uuids found` |
+| 4 | 刷下游 | `admin flash --bridge <桥> --port 0 --port-nodeid 7 <fw>` | `complete: 43716 bytes in 684 blocks`（verify 全过） |
+| 5 | 刷「UART 控制台 + mux」应用 | 同上 | `complete: 41548 bytes in 650 blocks` |
+| 6 | **反复刷**（目标正跑应用） | 同上 + `--port-reset bootloader` | `complete: 41548 bytes in 650 blocks`，rc=0 |
+| 7 | 经桥把下游引导自更新为 mux 版 katapult | 同上（写 deployer） | `complete: 4544 bytes in 71 blocks` |
+
+- **“complete” 的含义**：那一行只在 verify 逐块比对全过后才打印（`src/flash/session.rs:391-405`），所以它就是
+  “写进去 = 读回来”的硬证据；块数也能对上（若 `CONFIG_BLOCK_SIZE` 是典型的 64 B：684×64 = 43776 ≥ 43716、
+  71×64 = 4544、650×64 = 41600 ≥ 41548，末块补 `0xFF` 至满块——`third_party/katapult/protocol.md:52`）。
+- **第 6 行是本轮最重要的一个结论**：目标**正跑着应用**时，`0x02` 经 UNITS 路由送到设备 → 它自己进引导 → 会话的
+  `CONNECT` 重试盖住引导启动时间 → 刷完回应用，**不需要拔插、不需要手按复位，可以反复刷**。
+- **固件修复：桥侧 UNITS 上行**：`bridge_set_port_nodeid` 无论 `flags` 都记 `node_id`，于是 UNITS 口的隧道上行也成立
+  （之前 UNITS 口 `node_id` 恒 0，`bridge_port_tunnel_up` 第一行就 return：下行照通、上行静默丢）；
+  真库探针 `test_the_bridge_tunnel_uplink_over_a_units_port_over_the_real_library` 修前红/修后绿。
+- **固件新增**：katapult fork 的 `MUX_SERIAL`（默认 n）、三个端口后端（stm32 USART1 / linux / host 4 槽）
+  各自报 `BRIDGE_UART_COUNT`；单元序列与端口形态表已写进
+  [串口复用协议](../klippy/developer-manual/serial-mux-protocol.md)，真机步骤写进
+  [TESTING.md](../../TESTING.md) 与 [MCU 连接方式](../klippy/user-manual/mcu-connection.md)。
+- **剩余待办**：
+  1. 桥已指派、但号不是 `BRIDGE_MCU_ID`（= 1）时，初次 open 会报“没找到未指派的桥”并由人加
+     `--bridge-uuid`——**提示可以自动化**（拿 `admin scan --port` 的结果自动填）；现在只做到“提示 + 可用”。
+  2. `admin scan --bridge` 的端口归属靠“逐口声明 + 300 ms 静默窗”；**最坏情况是漏报（不是错报）**，
+     但在多设备/慢设备下没量过漏报率。
+  3. `--legacy` 口上的 **stock katapult** 只经单测夹具验过，未上真板。
+  4. host 库当桥的多槽并行刷写未上真机（只有 linux 固件后端与真库夹具的软件级整链）。
+
 ## 9. 附录：三路侦察全文（2026-10-16，只读侦察，file:line 级）
 
 - 附录A：katapult 协议与传输层规格（`~/project/katapult`）

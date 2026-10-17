@@ -56,7 +56,7 @@ serial: /dev/ttyUSB0
 - **id**：就是 `[mcu_ids]` 分给该 MCU 的号（**仅 CAN 节**可用 `canbus_nodeid` 显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
 - **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
-- **发现**：还没分配 id 的设备用 `klipperx scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库；单次广播查询 + 截止窗口 + 按 uuid 去重，三种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
+- **发现**：还没分配 id 的设备用 `klipperx admin scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库、`--bridge <tty>` 扫桥下游各口；单次广播查询 + 截止窗口 + 按 uuid 去重，四种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
 
 **桥的上游链路也是复用**：被 `[uart_device]`/`[can_device]` 的 `*_mcu` 指为桥的那颗 `[mcu]`，其 `serial:`/`host_library:` 路径**按 id 寻址**，与引用颗数无关——这条链路上还跑着桥下游设备的帧（规则 7）。判定式是 `按 id 寻址 = 共享 ∨ 下游设备数 ≥ 1 ∨ 是桥`（`mcu/serial_ports.rs::is_id_addressed`，host 库侧同构 `mcu/host_libraries.rs::path_is_mux`）；**下游设备数**是挂在桥端口节（`uart:`/`can:`）上的 `[mcu]` 个数（`mcu/bridge_ports.rs::bridge_downstream_counts`）。**0 台下游的桥仍按 id 寻址**是刻意口径：桥被 mux 化后输出就带帧头，按裸帧解会错位。
 
@@ -109,6 +109,85 @@ uart: uartxx                    # 无 uuid ⇒ legacy，原始帧
 帧形与命令族见[串口复用协议](../developer-manual/serial-mux-protocol.md)）。
 
 > **状态**：**已落地**（2026-10-15 改为配置期声明）。**端口在配置期由主机声明**：主机为每个 `[uart_device]` 发 `config_uart`（带该节的 `uart_baud`）与 `config_bridge_port`（把该 UART 对象接给桥），**端口 `index` = 声明顺序**；固件侧没有端口表；端口 tty **由主机在库 `init` 前按端口槽运行期登记**（`[uart_device] uart_path:`，不写则回落库的构建默认），`shutdown`（如 baud 不可设、tty 打不开、端口数超限）会变成**主机的配置阶段显式报错**。连接时：`legacy` 只向桥发 `SET_PORT_NODEID(index, id, 0)` 之后按原始帧收发；命名设备（写了 `uuid:`）先发同一条（`flags` 带「说单元」位）再做 `SET_KLIPPER_NODEID` + 重确认，之后整单元原样转发。**顺序约束**：桥必须**先于**该子节连接（顺序不对报点名错误，不会自愈）；又因为裸 `[mcu]` 同阶段总先于 `[mcu <名>]` 装载，**桥是裸 `[mcu]` 时子节必须写成 `[mcu <名>]`**。**`[can_device]` 端口暂不能接给桥**（属 P5），会点名报错。
+
+## 经桥刷下游（`klipperx admin …`，不用 `printer.cfg`）
+
+把固件写到挂在桥下游口上的板子，是一组**不读配置文件的板级命令**（全在 `klipperx admin` 下面）。
+它与上面「桥下游端口」那套配置期声明是**两件事**：同一套固件能力，一个由 `printer.cfg` 驱动（宿主
+用来连设备），一个由命令行使唤（人用来刷设备）。
+
+**拓扑与前提**（少一条就走不通）：
+
+1. **桥**：一块开着 `CONFIG_MUX_SERIAL=y` 的板（控制台在 USB CDC 或串口上），下游口在**硬件 UART**
+   上——STM32 桥的端口是编译期固定的 **USART1，RX PA10 / TX PA9**；参考构建
+   `third_party/klipper/test/configs/stm32f103-usb-mux-bridge.config`（USB CDC 控制台 + USART1 端口）。
+   桥也可以是一个开着 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 的 **host 库进程**（最多
+   `KLIPPER_HOST_PORT_SLOTS` = 4 个 tty 槽）。
+2. **下游**：它得在一条 **UART 控制台**上（不是 USB CDC——桥只给它一个硬件 UART 口），而且要说单元：
+   - 想**当应用用**（既能被刷、也能跑宿主）⇒ 应用固件带 `CONFIG_STM32_SERIAL_USART1=y` +
+     `CONFIG_MUX_SERIAL=y`（构建目标 `test/configs/stm32f103-serial-mux.config`）；
+   - 想**停在引导里被刷**⇒ 引导本身是 **mux 版 katapult**（构建时选上 `MUX_SERIAL`）；stock katapult
+     只说裸帧，只能挂在 `--legacy` 口上。
+   应用还得带 katapult 的偏移（`CONFIG_STM32_FLASH_START_2000=y` ⇒ 应用在 **0x8002000**）才能被
+   引导跳进去。
+3. 桥与下游之间的 **UART 速率**（`--baud`，默认 250000）两端一致。
+
+**四个命令（先看再刷）**：
+
+```sh
+# ① 问桥：它有哪几个 UART 槽（只读固件字典里的 BRIDGE_UART_COUNT，不动桥、不声明端口）
+klipperx admin bridge config --bridge /dev/ttyACM0
+#   available uarts: 1
+#     uart 0: 250000 baud default slot (arch-named USART1 PA10/PA9)
+#   enable one with `admin bridge port --port <slot> --port-nodeid <id>`
+
+# ② 启用一个口：声明 → 命名（默认 UNITS）→ 开隧道
+klipperx admin bridge port --bridge /dev/ttyACM0 --port 0 --port-nodeid 7
+#   target: port 0 nodeid 7, units route, tunnel open
+
+# ③ 经桥发现：逐口扫，输出带 port N
+klipperx admin scan --bridge /dev/ttyACM0 --ports 0
+#   Found uuid=97abe031988e, Application: CanBoot, port 0
+#   Total 1 uuids found
+
+# ④ 刷写
+klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 klipper.bin
+```
+
+**它不是流水线**：桥的端口表只活在它的 RAM 里，所以 ②③④ 每条命令都会**重启桥、重新声明端口、
+重新开隧道**（① 只读，不动桥）；上一条的成果不会留给下一条。串起来只是把整件事拆开看一遍——
+真要刷，只跑 ④ 就够。
+
+`--port-nodeid` 是桥给那个口的名字（`1..=255`），**不能是 `1`**——那是桥自己在这条链路上的 id，
+撞了隧道上的块会与桥自己的帧同 arb。
+
+**单独复位也行**：`admin reset --bridge <tty>` 复位**桥自身**（`RESTART_DEVICE(0xFF)` 穿透给它，重开 +
+重 identify 成功才算完）；`admin reset --bridge <tty> --port N [--port-reset reset-port|restart-device|bootloader]`
+复位该口设备（`0x04`/`0x05`/`0x02`，无回执，只能当“已发出”）。**注意**：这里的 `bootloader` 发的是裸
+`0x02`，只有该口已经被命名成 UNITS 时才送得到（且不会把口改回 legacy）；**要“刷之前切引导”，用 ④
+的 `--port-reset bootloader`**——它会自己先切 UNITS、发请求、等 5 s、再切回 legacy 开隧道。
+
+**可反复刷**：目标正跑着应用时，让它在端口上自己进引导——`--port-reset bootloader`（把
+`REQUEST_BOOTLOADER (0x02)` 经 UNITS 路由送到设备、等 5 s、再把口改回 legacy 开隧道）：
+
+```sh
+klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
+  --port-reset bootloader klipper.bin
+```
+
+刷完它回到应用；要再刷再来一遍（不需要拔插、也不需要手按复位）。
+
+**口形态**：`admin bridge port` 默认 **UNITS**（设备说单元）；下游是 stock katapult / 没开 mux 的旧固件时
+加 `--legacy`。`admin flash` 内部一律用 legacy（katapult 隧道的上行本来就是裸帧）。
+
+**已知限制**：
+
+- `admin scan --bridge` 的「哪个设备在哪个口」靠「逐口声明 + 轮间静默窗（`BRIDGE_SILENCE_WINDOW`
+  = 300 ms，窗口内迟到的应答丢掉）」归属，所以最坏情况是**漏报**（少列一个口上的设备），不会错报。
+- 桥已指派、但号不是 `admin` 工具默认的 `1`（`BRIDGE_MCU_ID`）时，初次打开需要
+  `--bridge-uuid <12 位十六进制>` 点名（或先用 `admin scan` 取身份）；每一轮都重启桥的结构下，这是
+  正常代价，不是配置错。
+- 只有 **UART** 下游口能刷；`[can_device]` 的 CAN 端口后端（`BRIDGE_PORT_CAN`）还没实现。
 
 ## 固件重启方式（`restart_method`）
 

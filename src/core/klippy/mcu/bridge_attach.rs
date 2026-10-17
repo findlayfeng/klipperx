@@ -37,19 +37,22 @@
 //!   bridge must own before they reach the device; sent ahead of it, the bridge
 //!   drops them and the handshake times out with nothing downstream.
 //!
-//! A CAN port (`[can_device]`) has no configuration-time object yet (the
-//! firmware's CAN *port backend* - `BRIDGE_PORT_CAN`, a `bridge_port_ops` that
-//! drives a CAN transceiver - does not exist; the CAN mux carrier `MUX_CAN`
-//! itself does), so a `can:` device is refused by name instead of being given a
-//! route to a port the bridge does not have.
+//! A CAN port ([`can_device`]) takes the same route as a named uart port: the
+//! firmware's CAN port backend (`BRIDGE_PORT_CAN`) opens the bridge's own CAN
+//! controller at the port's `can_bitrate` and the router addresses it like any
+//! other port. The one thing a CAN port cannot be is **legacy**: CAN addressing
+//! is by uuid, and the host has to name the device's CAN node id with the
+//! device's own handshake, so a `can:` child that writes no `uuid:` is refused
+//! by name ([`resolve`]) instead of being given a route that could never be
+//! addressed.
 //!
 //! The bridge's own transport decides how the downstream handle is opened, and
 //! the two kinds it can be are exactly the two mux links: a shared serial port
 //! ([`serial::attach_downstream`]) or a host library
 //! ([`HostDevice::load_downstream`]). A bridge reached over CAN carries its
 //! downstream frames inside the CAN payload: the firmware carrier (`MUX_CAN`)
-//! and the port-command units exist, but the host-side attach and the CAN
-//! *port* backend (`BRIDGE_PORT_CAN`) do not, so it is refused here.
+//! and the port-command units exist, but the host-side attach does not, so it
+//! is refused here.
 
 use super::bridge_ports::{CanPort, UartPort};
 use super::host_libraries::{HostLibraries, HOST_LIBRARIES_OBJECT};
@@ -86,7 +89,7 @@ pub(crate) struct BridgePortLink {
     /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port
     /// ([`PortGroups::is_legacy`], one uart-port device with no `uuid:`), whose
     /// device is spoken to in raw frames; [`MUX_PORT_UNITS`] for a port whose
-    /// device speaks units.
+    /// device speaks units — every port but a legacy one, CAN included.
     pub flags: u8,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
     /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`):
@@ -109,7 +112,7 @@ pub(crate) struct BridgePortLink {
 /// # Errors
 /// [`KlippyError::Config`] for everything here: a bridge that has not connected,
 /// a port section that carries no index (a section built outside the loader), or
-/// a CAN port, which has no configuration-time object yet.
+/// a CAN child that writes no `uuid:`.
 pub(crate) fn resolve(
     printer: &Printer,
     config: &McuConfig,
@@ -120,40 +123,44 @@ pub(crate) fn resolve(
             config.name
         )));
     };
-    // A CAN downstream port has no configuration-time object yet: the firmware's
-    // CAN port backend (`BRIDGE_PORT_CAN`) does not exist, so there is no port
-    // the child could be routed to. (The CAN mux carrier `MUX_CAN` does exist -
-    // it carries units over a CAN *upstream*; a CAN *downstream* port is a
-    // separate `bridge_port_ops`.) Refuse it by name instead of sending a route
-    // to a port the bridge does not have (which would drop it in silence).
-    if *kind == PortKind::Can {
-        let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
-            config_error(format!("MCU '{}': no port section '{port}'", config.name))
-        })?;
+    // A CAN port addresses its boards by uuid (rule 6, `mcu/port_grouping.rs`),
+    // and the device's CAN node id is assigned to it by its **own** naming
+    // handshake — there is no legacy shape on a CAN bus. So a `can:` child with
+    // no `uuid:` has no identity to give the device, and is refused here by
+    // name rather than routed to a port it could never be addressed on.
+    if *kind == PortKind::Can && uuid.is_none() {
         return Err(config_error(format!(
-            "MCU '{}': bridge '{}' cannot host port '{}' (a [can_device]): a CAN downstream \
-             port is not created at configuration time yet (the firmware's CAN port backend, \
-             BRIDGE_PORT_CAN, does not exist)",
-            config.name,
-            section.mcu(),
-            section.name()
+            "MCU '{}': a [can_device] port addresses its boards by uuid, so this device must \
+             write one (`uuid: <12 hex digits>`); without it the host cannot assign the device \
+             its CAN node id on '{port}'",
+            config.name
         )));
     }
-    // The port section object and the `[mcu]` it says is the bridge. A UART
-    // port's index is the one the host assigned it when it created the port at
+    // The port section object and the `[mcu]` it says is the bridge. A port's
+    // index is the one the host assigned it when it created the port at
     // configuration time (`mcu/bridge_ports.rs`): its declaration order among
-    // the bridge's ports, which is the index the firmware's router gave it.
-    let (bridge, index) = {
-        let section = printer.lookup_object_as::<UartPort>(port).ok_or_else(|| {
-            config_error(format!("MCU '{}': no port section '{port}'", config.name))
-        })?;
-        let index = section.index().ok_or_else(|| {
-            config_error(format!(
-                "MCU '{}': port section '{port}' was not configured for its bridge",
-                config.name
-            ))
-        })?;
-        (section.mcu().to_string(), index)
+    // the bridge's ports, which is the index the firmware's router gave it. A
+    // uart and a can port answer the same question, so each section object is
+    // read for its own two answers.
+    let (bridge, index) = match *kind {
+        PortKind::Uart => {
+            let section = printer.lookup_object_as::<UartPort>(port).ok_or_else(|| {
+                config_error(format!("MCU '{}': no port section '{port}'", config.name))
+            })?;
+            let index = section
+                .index()
+                .ok_or_else(|| not_configured(config, port))?;
+            (section.mcu().to_string(), index)
+        }
+        PortKind::Can => {
+            let section = printer.lookup_object_as::<CanPort>(port).ok_or_else(|| {
+                config_error(format!("MCU '{}': no port section '{port}'", config.name))
+            })?;
+            let index = section
+                .index()
+                .ok_or_else(|| not_configured(config, port))?;
+            (section.mcu().to_string(), index)
+        }
     };
 
     // The bridge object, registered under the same spelling the port section
@@ -402,12 +409,28 @@ pub(crate) fn open(
 /// judgment is the port grouping's ([`PortGroups::is_legacy`]) — the same one
 /// that refused a legacy device on a shared port at load — and `0` is exactly
 /// its byte, so the caller has no second answer to keep.
+///
+/// A CAN port is never legacy, whatever its member wrote: CAN addressing is by
+/// uuid, so a `[can_device]` has no raw-frame shape at all and its byte is
+/// always [`MUX_PORT_UNITS`].
 fn port_flags(groups: &PortGroups, port: &str) -> u8 {
+    if groups.kind(port) == Some(PortKind::Can) {
+        return MUX_PORT_UNITS;
+    }
     if groups.is_legacy(port) {
         0
     } else {
         MUX_PORT_UNITS
     }
+}
+
+/// The refusal a port section that the loader never wired gives [`resolve`]:
+/// nothing assigned it an index, so the child has no route to name.
+fn not_configured(config: &McuConfig, port: &str) -> KlippyError {
+    config_error(format!(
+        "MCU '{}': port section '{port}' was not configured for its bridge",
+        config.name
+    ))
 }
 
 /// Wrap a failed `SET_PORT_NODEID` as the connection error [`open`] reports,
@@ -716,14 +739,16 @@ mod tests {
         assert!(text.contains("0..=255"), "{text}");
     }
 
-    /// A `can:` device is refused by name: a CAN downstream port has no
-    /// configuration-time object yet, so there is no route for it to travel.
+    /// A `can:` device resolves like a named uart one: the CAN port section the
+    /// host created at configuration time **is** the route, so the old "a CAN
+    /// downstream port does not exist yet" refusal is gone.
     ///
-    /// The refusal is the port section's own — its `can_mcu` names the bridge —
-    /// and comes before the not-yet-connected check, because no bridge state
-    /// can make a CAN port exist.
+    /// With the bridge not yet connected the error is the config-order one, which
+    /// is only reached after the port section and the index the loader gave it
+    /// have been found — so this pins that the CAN branch of `resolve` runs to the
+    /// same place a uart port does.
     #[test]
-    fn a_can_port_is_refused_by_name() {
+    fn a_can_port_resolves_like_a_named_uart_port() {
         let printer = printer_with(
             "[mcu bridge]\ntest: dict=/does/not/matter\n\
              [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\
@@ -734,12 +759,49 @@ mod tests {
         let err = resolve(&printer, &config).unwrap_err();
 
         let text = err.to_string();
-        assert!(text.contains("MCU 'child'"), "{text}");
         assert!(
-            text.contains("bridge 'bridge' cannot host port 'can0'"),
+            text.contains("MCU 'child' hangs on a port of 'bridge'"),
             "{text}"
         );
-        assert!(text.contains("BRIDGE_PORT_CAN"), "{text}");
+        assert!(
+            !text.contains("BRIDGE_PORT_CAN") && !text.contains("cannot host port"),
+            "the CAN-port refusal must be gone: {text}"
+        );
+    }
+
+    /// A CAN port is never legacy: the device's CAN node id is assigned by its
+    /// own naming handshake, which needs the child's `uuid:`. A `can:` child
+    /// without one is refused by name, saying why.
+    ///
+    /// The transport parse refuses a uuid-less CAN member before a config can
+    /// load at all (rule 6, `mcu/port_grouping.rs`), so the shape `resolve` must
+    /// refuse on its own is built here: the same child with its identity removed.
+    #[test]
+    fn a_can_child_without_a_uuid_is_refused_by_name() {
+        let printer = printer_with(
+            "[mcu bridge]\ntest: dict=/does/not/matter\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+        );
+        let config = McuConfig {
+            transport: Transport::BridgePort {
+                port: "can_device can0".to_string(),
+                uuid: None,
+                kind: PortKind::Can,
+            },
+            ..child_config(&printer, "child")
+        };
+
+        let err = resolve(&printer, &config).unwrap_err();
+
+        let text = err.to_string();
+        assert!(text.contains("MCU 'child'"), "{text}");
+        assert!(
+            text.contains("a [can_device] port addresses its boards by uuid"),
+            "{text}"
+        );
+        assert!(text.contains("uuid: <12 hex digits>"), "{text}");
+        assert!(text.contains("can_device can0"), "{text}");
     }
 
     // -----------------------------------------------------------------------
@@ -1635,6 +1697,25 @@ mod tests {
         let flags = port_flags(&groups, "uart_device uart0");
 
         assert_eq!(flags, MUX_PORT_UNITS);
+    }
+
+    /// A CAN port's flags byte is **always** the units one: a `[can_device]` has
+    /// no legacy (raw-frame) shape — the branch does not look at the member's
+    /// `uuid:` at all, it asks the port's kind.
+    #[test]
+    fn a_can_port_always_sends_the_units_flag() {
+        let groups = port_groups(
+            "[mcu bridge]\nserial: /dev/a\n\
+             [mcu child]\ncan: can0\nuuid: 11aa22bb33cc\n\
+             [can_device can0]\ncan_mcu: bridge\ncan_oid: can0\n",
+        );
+
+        assert_eq!(groups.kind("can_device can0"), Some(PortKind::Can));
+        assert!(
+            !groups.is_legacy("can_device can0"),
+            "a CAN port is never legacy"
+        );
+        assert_eq!(port_flags(&groups, "can_device can0"), MUX_PORT_UNITS);
     }
 
     /// The order `open` exists for, over a real serial link on a pty: the

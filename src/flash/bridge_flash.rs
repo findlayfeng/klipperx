@@ -53,8 +53,8 @@ use crate::core::klippy::mcu::{Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
-    configure_bridge, open_bridge, reset_port as send_port_reset, BridgeError, BridgePort,
-    BridgeReady, BridgeTarget, PortReset,
+    declare_ports as send_declare_ports, open_bridge, open_target_port as send_open_target_port,
+    reset_port as send_port_reset, BridgeError, BridgePort, BridgeTarget, PortReset,
 };
 use super::session::{self, FlashError, SessionConfig, Summary};
 use std::fmt;
@@ -603,33 +603,25 @@ impl BridgeLink {
         }
     }
 
-    /// Prepare a bridge for a flashing tunnel **without resetting anything**:
-    /// declare `ports`, name the target's port (legacy), and open that port's
-    /// tunnel — [`open_bridge`]'s work after the per-port resets.
+    /// Declare `ports` on the bridge — its oid table and its port table — and
+    /// stop there.
     ///
-    /// `admin configure-bridge` is the caller: the bridge is configured but no
-    /// device is [reset](crate::flash::bridge_session::PortReset), and the bridge
-    /// itself is not restarted either ([`reset`](BridgeLink::reset) is a separate
-    /// step). What was declared and where the tunnel was opened come back in the
-    /// [`BridgeReady`].
+    /// `admin bridge config` is the caller: the declaration is the whole job, so
+    /// nothing is reset, no route is named, and no tunnel is opened. The
+    /// declaration is what a later port-level command needs — the bridge drops a
+    /// command that names a port it does not have, in silence — so it goes first.
     ///
     /// # Errors
     /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down while
-    /// the port is declared (its reason included), and
-    /// [`BridgeFlashError::Bridge`] when [`configure_bridge`] fails for any other
-    /// reason.
-    pub async fn configure(
-        &self,
-        ports: &[BridgePort],
-        target: BridgeTarget,
-    ) -> Result<BridgeReady, BridgeFlashError> {
-        match configure_bridge(&self.live().mcu, &self.live().link, ports, target).await {
-            Ok(ready) => {
-                if let Some(reason) = self.take_shutdown() {
-                    return Err(BridgeFlashError::Shutdown { reason });
-                }
-                Ok(ready)
-            }
+    /// the ports are declared (its reason included), and
+    /// [`BridgeFlashError::Bridge`] when [`send_declare_ports`] fails for any
+    /// other reason.
+    pub async fn declare_ports(&self, ports: &[BridgePort]) -> Result<(), BridgeFlashError> {
+        match send_declare_ports(&self.live().mcu, ports).await {
+            Ok(()) => match self.take_shutdown() {
+                Some(reason) => Err(BridgeFlashError::Shutdown { reason }),
+                None => Ok(()),
+            },
             Err(e) => Err(match self.take_shutdown() {
                 Some(reason) => BridgeFlashError::Shutdown { reason },
                 None => BridgeFlashError::Bridge(e),
@@ -637,14 +629,28 @@ impl BridgeLink {
         }
     }
 
+    /// Name the target's port (a **legacy** route, so the raw uplink is served)
+    /// and open its flashing tunnel — `admin bridge port`'s whole job.
+    ///
+    /// The port has to be one an earlier
+    /// [`declare_ports`](BridgeLink::declare_ports) made (`admin bridge config`):
+    /// a port-level command that names a port the bridge does not have is
+    /// dropped in silence.
+    ///
+    /// # Errors
+    /// [`BridgeFlashError::Bridge`] when the link refuses the write.
+    pub fn open_target_port(&self, target: BridgeTarget) -> Result<(), BridgeFlashError> {
+        send_open_target_port(&self.live().link, target).map_err(BridgeFlashError::Bridge)
+    }
+
     /// Reset one **declared** port's device through the bridge's admin channel —
     /// `admin reset --port`. The same two units [`flash`](BridgeLink::flash) sends
     /// before a session (`0x04`/`0x05`), for a caller that only wants the reset.
     ///
-    /// The port has to be one the bridge has already **declared** (a
-    /// `configure-bridge`, or a flash run's own declaration): a port-level command
-    /// that names a port the bridge does not have is dropped in silence, and no
-    /// receipt comes back either way.
+    /// The port has to be one the bridge has already **declared** (an
+    /// `admin bridge config`, or a flash run's own declaration): a port-level
+    /// command that names a port the bridge does not have is dropped in silence,
+    /// and no receipt comes back either way.
     ///
     /// # Errors
     /// [`BridgeFlashError::PortReset`] when the link refuses the write.
@@ -1148,13 +1154,14 @@ mod tests {
         wait_for_library_unload(&library);
     }
 
-    /// `admin configure-bridge` over the **real** mux library: the bridge's port
-    /// is declared, the target's port named legacy, and its tunnel opened — and
-    /// nothing follows. No device is reset and no session runs, so the port's pty
-    /// stays silent (a reset pulse or a katapult frame would show there), which
-    /// is what [`BridgeLink::configure`] promises.
+    /// `admin bridge config` and `admin bridge port` over the **real** mux
+    /// library: the bridge's ports are declared by the first, the target's port
+    /// named legacy and its tunnel opened by the second — and nothing follows. No
+    /// device is reset and no session runs, so the port's pty stays silent (a
+    /// reset pulse or a katapult frame would show there), which is what
+    /// [`BridgeLink::declare_ports`] and [`BridgeLink::open_target_port`] promise.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_configure_over_the_real_library_leaves_the_port_silent() {
+    async fn test_the_config_and_port_halves_leave_the_port_silent() {
         let _serial = HOST_LIBRARY_TEST_LOCK
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
@@ -1183,14 +1190,13 @@ mod tests {
             index: 0,
             node_id: TARGET_NODE_ID,
         };
-        let ready = link
-            .configure(&ports, target)
+        link.declare_ports(&ports)
             .await
-            .expect("the bridge configures without resetting or flashing");
-        assert_eq!(ready.ports, ports.to_vec());
-        assert_eq!(ready.target, target);
+            .expect("the bridge declares its ports without resetting anything");
+        link.open_target_port(target)
+            .expect("the target's port is named and its tunnel opened");
 
-        // The port's pty is watched for the whole window: a configure writes
+        // The port's pty is watched for the whole window: neither half writes
         // nothing down it, so the fake bootloader behind it hears no CONNECT and
         // no frame at all reaches the port.
         let fake = FakeBootloader::new();
@@ -1203,7 +1209,7 @@ mod tests {
 
         assert!(
             recorded.lock().unwrap().is_empty(),
-            "a configure writes nothing to the port's pty, got {:?}",
+            "the config and port halves write nothing to the port's pty, got {:?}",
             recorded.lock().unwrap()
         );
         assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
@@ -1249,11 +1255,7 @@ mod tests {
             baud: 250_000,
             reset: PortReset::ResetPort,
         }];
-        let target = BridgeTarget {
-            index: 0,
-            node_id: TARGET_NODE_ID,
-        };
-        link.configure(&ports, target)
+        link.declare_ports(&ports)
             .await
             .expect("the restarted bridge accepts a declaration");
 

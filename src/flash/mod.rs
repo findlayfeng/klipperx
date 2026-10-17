@@ -30,8 +30,8 @@
 //!   whole katapult blocks through a bridge port in tunnel mode.
 //! - [`transport`] — the two direct byte streams: an exclusive serial
 //!   tty/USB link and a SocketCAN node session.
-//! - [`cli`] — the `admin flash` / `admin configure-bridge` / `admin reset`
-//!   arguments and actions.
+//! - [`cli`] — the `admin flash` / `admin bridge config` / `admin bridge port` /
+//!   `admin reset` arguments and actions.
 //! - `fake` (tests only) — the in-process scripted bootloader the session
 //!   scenarios run against.
 

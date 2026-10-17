@@ -67,17 +67,15 @@ const DEFAULT_TIMEOUT: f64 = 2.0;
 /// in baud.
 const DEFAULT_BAUD: u32 = 250_000;
 
-/// The quiet window a bridge scan waits out before each round and after it, in
+/// The quiet window a bridge scan waits out before a broadcast and after it, in
 /// milliseconds.
 ///
-/// A bridge's discovery broadcast is fanned out to **every** port it has, so an
-/// answer can arrive after its own round's window has closed — and the next
-/// round's answers are the only ones that may be attributed to the next port.
-/// A quiet window after each round takes those late answers out of the stream
-/// (and drops them, rather than reporting them against the wrong port), and the
-/// one before the first round does the same for anything left over from an
-/// earlier broadcast. Three hundred milliseconds is several times a round trip on
-/// the wire a bridge carries.
+/// A bridge's discovery broadcast is fanned out to **every** port it has, so the
+/// answers it produces outlive the round that asked for them: whatever is still
+/// arriving after a round is dropped rather than reported against the next one,
+/// and the one before the first broadcast takes anything left over from an
+/// earlier scan out of the stream. Three hundred milliseconds is several times a
+/// round trip on the wire a bridge carries.
 const BRIDGE_SILENCE_WINDOW: Duration = Duration::from_millis(300);
 
 /// The port indexes a bridge scan enables and scans when `--ports` is not given:
@@ -108,7 +106,8 @@ pub struct ScanArgs {
 
     /// A **bridge** to scan instead of a bus, a port or a library: the device
     /// path of its console (`/dev/ttyACM0`). Each answer is reported with the
-    /// `--ports` index it came through
+    /// port it came through — the one its bridge appended to it, or the
+    /// `--ports` round it arrived in for a bridge that appends none
     #[arg(long, value_name = "TTY")]
     pub bridge: Option<String>,
 
@@ -122,6 +121,9 @@ pub struct ScanArgs {
 
     /// Bridge port indexes to enable and scan, in order (`0`; only with
     /// `--bridge`)
+    ///
+    /// All of them are scanned in the same round; only a bridge whose answers
+    /// carry no port path needs one round per port to tell them apart.
     #[arg(long, value_name = "INDEX,INDEX")]
     pub ports: Option<String>,
 
@@ -183,7 +185,7 @@ pub fn run(args: ScanArgs) -> Result<(), Box<dyn std::error::Error>> {
             args.baud.unwrap_or(DEFAULT_BAUD),
             &ports,
             window,
-            |index, node| println!("{}, port {index}", serial_line(&node)),
+            |index, node| println!("{}", bridge_line(&node, index)),
         )?;
         println!("{}", total_line(total));
         return Ok(());
@@ -287,18 +289,24 @@ fn parse_ports(text: &str) -> Result<Vec<u8>, String> {
     Ok(ports)
 }
 
-/// Scan the devices behind `bridge`'s ports: enable the ports `ports` names and
-/// broadcast a discovery query through each, reporting every answer with the
+/// Scan the devices behind `bridge`'s ports, reporting every answer with the
 /// port it came through.
 ///
-/// The bridge's port table lives in its firmware's RAM and starts empty after a
-/// restart, so this run builds it: each round declares the next port (one slot
-/// per round, in ascending index, because the bridge numbers a port by the order
-/// its declaration rows reach it) and then broadcasts through the table it has.
-/// The broadcast itself is the bridge's — a bridge fans every admin broadcast out
-/// to **all** its ports, which is why the rounds are separated by quiet windows
-/// ([`BRIDGE_SILENCE_WINDOW`]) and why an answer belongs to the round it arrived
-/// in: only a port declared in that round can have answered for the first time.
+/// Which port an answer belongs to is the bridge's own to say: a bridge appends
+/// the index of the port it heard the answer on to the answer's port path
+/// (`mux.h` NEED_NODEID), so this declares every port it names, broadcasts
+/// once, and takes each answer's port from the path it carries
+/// ([`Attribution::Path`]). One round instead of one per port, and a chain of
+/// bridges reads as a chain: each of them appends its own port.
+///
+/// A bridge whose firmware predates the path appends nothing, and an answer
+/// naming no port cannot be attributed that way — a bridge fans every broadcast
+/// out to **all** its ports, so such an answer says which device but never
+/// where. Those get the rounds a bridge scan used to be alone
+/// ([`Attribution::Declaration`]): one port declared per round, a broadcast
+/// through the table as it grows, and an answer first heard in a round belongs
+/// to that round's port. Both passes report into the same [`UnassignedScan`], so
+/// an answer heard by the first is not reported again by the second.
 ///
 /// This needs the bridge's own serial port ([`SharedSerialHandle`]) rather than
 /// its frame channel: a downstream device answers on [`ADMIN_REPLY`], an id no
@@ -319,6 +327,62 @@ fn bridge_query_unassigned(
     window: Duration,
     mut report: impl FnMut(u8, SerialNode),
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut scan = UnassignedScan::new();
+    let unattributed = bridge_scan_pass(
+        &mut scan,
+        Attribution::Path,
+        tty,
+        uuid,
+        baud,
+        ports,
+        window,
+        &mut report,
+    )?;
+    if unattributed {
+        bridge_scan_pass(
+            &mut scan,
+            Attribution::Declaration,
+            tty,
+            uuid,
+            baud,
+            ports,
+            window,
+            &mut report,
+        )?;
+    }
+    Ok(scan.total())
+}
+
+/// How a bridge scan attributes an answer to a port.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Attribution {
+    /// From the answer's own port path: every port declared up front, one
+    /// broadcast, and each answer naming the port it came up on.
+    Path,
+    /// From the declaration round: one port declared per round, a broadcast
+    /// through the table as it grows, and an answer heard for the first time in
+    /// a round belongs to that round's port. The fallback for a bridge whose
+    /// answers name no port.
+    Declaration,
+}
+
+/// One scan of `bridge`'s ports — open, identify, clear the port table, declare,
+/// broadcast, read — reporting into `scan` and answering whether any answer
+/// arrived without a port path.
+///
+/// Each pass opens its own connection (a port can only be declared once, and the
+/// table a previous run built still lives in the firmware's RAM), so the
+/// fallback pass starts from an empty table without touching this one's link.
+fn bridge_scan_pass(
+    scan: &mut UnassignedScan,
+    attribution: Attribution,
+    tty: &str,
+    uuid: Option<[u8; 6]>,
+    baud: u32,
+    ports: &[u8],
+    window: Duration,
+    report: &mut impl FnMut(u8, SerialNode),
+) -> Result<bool, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -346,38 +410,87 @@ fn bridge_query_unassigned(
     // Anything still arriving from an earlier broadcast is not this run's.
     discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
 
-    let mut scan = UnassignedScan::new();
+    let mut unattributed = false;
     let mut declared: u8 = 0;
-    for &index in ports {
-        while declared <= index {
-            runtime.block_on(link.declare_port(declared, baud))?;
-            declared += 1;
-        }
-        discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
-        handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
-        let deadline = Instant::now() + window;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
+    match attribution {
+        Attribution::Path => {
+            for &index in ports {
+                declare_ports(&runtime, &link, baud, &mut declared, index)?;
             }
-            match answers.recv_timeout(remaining) {
-                Ok(unit) => {
+            handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
+            for unit in collect_answers(&answers, window) {
+                let Some(heard) = SerialNode::from_unit(&unit) else {
+                    continue;
+                };
+                if heard.ports.is_empty() {
+                    // Not recorded: the fallback pass is what reports it, and a
+                    // uuid already in `scan` would be deduplicated there.
+                    unattributed = true;
+                    continue;
+                }
+                if let Some(node) = scan.feed(&unit) {
+                    // The port of the bridge this scan talks to: the last one
+                    // the path names, its own append.
+                    let port = *node
+                        .ports
+                        .last()
+                        .expect("an answer with a path names a port");
+                    report(port, node);
+                }
+            }
+        }
+        Attribution::Declaration => {
+            for &index in ports {
+                declare_ports(&runtime, &link, baud, &mut declared, index)?;
+                discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
+                handle.send_admin(&discovery_query()[HEADER_BYTES..])?;
+                for unit in collect_answers(&answers, window) {
                     if let Some(node) = scan.feed(&unit) {
                         report(index, node);
                     }
                 }
-                Err(_) => break,
+                // A late answer belongs to no port this run could name, so it is
+                // dropped here instead of being reported against the next one.
+                discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
             }
         }
-        // A late answer belongs to no port this run could name, so it is
-        // dropped here instead of being reported against the next one.
-        discard_answers(&answers, BRIDGE_SILENCE_WINDOW);
     }
-    let total = scan.total();
     handle.clear_unit_sink(ADMIN_REPLY);
     link.close();
-    Ok(total)
+    Ok(unattributed)
+}
+
+/// Declare the bridge's ports up to `last`, in ascending index — the bridge
+/// numbers a port by the order its declaration rows reach it, and a port can
+/// only be declared once — remembering how many are declared.
+fn declare_ports(
+    runtime: &tokio::runtime::Runtime,
+    link: &BridgeLink,
+    baud: u32,
+    declared: &mut u8,
+    last: u8,
+) -> Result<(), Box<dyn std::error::Error>> {
+    while *declared <= last {
+        runtime.block_on(link.declare_port(*declared, baud))?;
+        *declared += 1;
+    }
+    Ok(())
+}
+
+/// The units the scan listener collects within `window`, in arrival order.
+fn collect_answers(answers: &Receiver<Vec<u8>>, window: Duration) -> Vec<Vec<u8>> {
+    let deadline = Instant::now() + window;
+    let mut units = Vec::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return units;
+        }
+        match answers.recv_timeout(remaining) {
+            Ok(unit) => units.push(unit),
+            Err(_) => return units,
+        }
+    }
 }
 
 /// Drop whatever the scan listener collects for `window` — the quiet window
@@ -444,9 +557,33 @@ fn can_line(node: &CanNode) -> String {
 }
 
 /// One serial answer, in the same shape (the serial node keeps its UUID as
-/// bytes, so the twelve hex digits are formatted here).
+/// bytes, so the twelve hex digits are formatted here), and the port path the
+/// answer travelled when it names one.
 fn serial_line(node: &SerialNode) -> String {
-    found_line(uuid_hex(node.uuid), node.application_name())
+    let line = found_line(uuid_hex(node.uuid), node.application_name());
+    match node.ports.as_slice() {
+        [] => line,
+        [port] => format!("{line}, via port {port}"),
+        ports => {
+            let chain: Vec<String> = ports.iter().map(u8::to_string).collect();
+            format!("{line}, via ports {}", chain.join(">"))
+        }
+    }
+}
+
+/// One answer heard behind a bridge: the line every transport prints, plus the
+/// port it came through.
+///
+/// An answer that carries a port path says so itself ([`serial_line`]): the
+/// bridge it came through appended its own port index. One that carries none can
+/// only be attributed by the round it arrived in, and `round_port` is that
+/// round's port — the reading a bridge scan had before the path existed.
+fn bridge_line(node: &SerialNode, round_port: u8) -> String {
+    if node.ports.is_empty() {
+        format!("{}, port {round_port}", serial_line(node))
+    } else {
+        serial_line(node)
+    }
 }
 
 /// One answer, as Klipper's own tool prints it: twelve hex digits of UUID with
@@ -528,7 +665,21 @@ mod tests {
 
     /// A serial answer, as the port stream would report it.
     fn serial_node(uuid: [u8; 6], application: Option<u8>) -> SerialNode {
-        SerialNode { uuid, application }
+        SerialNode {
+            uuid,
+            application,
+            ports: Vec::new(),
+        }
+    }
+
+    /// A serial answer that came up through the bridges `ports` names, innermost
+    /// first.
+    fn serial_node_via(uuid: [u8; 6], ports: &[u8]) -> SerialNode {
+        SerialNode {
+            uuid,
+            application: None,
+            ports: ports.to_vec(),
+        }
     }
 
     #[test]
@@ -571,6 +722,43 @@ mod tests {
     fn test_the_total_line_counts_the_boards() {
         assert_eq!(total_line(0), "Total 0 uuids found");
         assert_eq!(total_line(3), "Total 3 uuids found");
+    }
+
+    #[test]
+    fn test_an_answer_behind_a_bridge_names_the_port_it_came_through() {
+        // The port is the answer's own: the bridge appended it, so the line says
+        // it — and a change of depth does not: a directly wired board prints what
+        // it always did.
+        assert_eq!(
+            serial_line(&serial_node_via([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], &[0])),
+            "Found uuid=11aa22bb33cc, Application: Klipper, via port 0"
+        );
+        // Two bridges passed this one, innermost first: the chain reads in that
+        // order, `>` between the hops.
+        assert_eq!(
+            serial_line(&serial_node_via(
+                [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+                &[0, 2]
+            )),
+            "Found uuid=11aa22bb33cc, Application: Klipper, via ports 0>2"
+        );
+    }
+
+    #[test]
+    fn test_a_bridge_answer_without_a_path_keeps_the_round_port() {
+        // A bridge that appends no path (`Attribution::Declaration`'s fallback)
+        // leaves the answer attributable only by the round it arrived in, which
+        // is the line a bridge scan printed before the path existed — and the
+        // path, when there is one, is not printed twice.
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        assert_eq!(
+            bridge_line(&serial_node_via(uuid, &[]), 2),
+            "Found uuid=11aa22bb33cc, Application: Klipper, port 2"
+        );
+        assert_eq!(
+            bridge_line(&serial_node_via(uuid, &[0]), 2),
+            serial_line(&serial_node_via(uuid, &[0]))
+        );
     }
 
     #[test]
@@ -805,6 +993,116 @@ mod tests {
             "the answer is attributed to the port it came through"
         );
         assert_eq!(heard[0].1.uuid, DOWNSTREAM_UUID);
+        assert_eq!(
+            heard[0].1.ports,
+            vec![0],
+            "the port is the answer's own, appended by the bridge that heard it \
+             (`mux.h` NEED_NODEID): the device sits on port 0 of the bridge this \
+             scan talks to"
+        );
+    }
+
+    /// The frame one bridged answer travels in, byte for byte: appending the
+    /// port means building the frame again, so its length byte, its CRC over
+    /// `[len][seq][payload]` and its trailer are the new payload's own. Read off
+    /// a real bridge's console — the only place that frame exists — with the
+    /// bridge's port declared the way a scan declares it.
+    ///
+    /// This is the firmware half's pin: the host's [`SerialNode::from_unit`]
+    /// checks the CRC it reads, so the scan test above already fails on a frame
+    /// left with its old CRC — here the bytes are checked directly instead of
+    /// through a parser.
+    #[test]
+    fn test_a_bridged_answer_is_one_frame_rebuilt_around_its_appended_path() {
+        use crate::core::klippy::frame::{
+            MESSAGE_HEADER_SIZE, MESSAGE_POS_LEN, MESSAGE_POS_SEQ, MESSAGE_SYNC,
+            MESSAGE_TRAILER_SIZE,
+        };
+        use crate::core::klippy::interface::devices::serial::{
+            encode_header, ASSIGN_SEQ_BYTE, MAGIC, RESP_NEED_NODEID,
+        };
+
+        let device = klipperx_test_support::LinuxFirmware::spawn_named(DOWNSTREAM_UUID)
+            .expect("the mux firmware process starts");
+        let bridge = klipperx_test_support::LinuxFirmware::spawn_bridge_port(
+            device.serial_path(),
+            BRIDGE_SCAN_UUID,
+        )
+        .expect("the bridge firmware process starts");
+
+        let unit = bridge_answer_unit(bridge.serial_path(), BRIDGE_SCAN_UUID);
+        assert_eq!(
+            &unit[..HEADER_BYTES],
+            &encode_header(ADMIN_REPLY)[..],
+            "the answer is on the admin reply id"
+        );
+        let frame = &unit[HEADER_BYTES..];
+        let len = frame[MESSAGE_POS_LEN] as usize;
+        assert_eq!(
+            frame.len(),
+            len,
+            "the length byte counts the bytes of the rebuilt frame"
+        );
+        assert_eq!(frame[MESSAGE_POS_SEQ], ASSIGN_SEQ_BYTE);
+        assert_eq!(frame[len - 1], MESSAGE_SYNC, "the trailer is its own SYNC");
+        let content = &frame[MESSAGE_HEADER_SIZE..len - MESSAGE_TRAILER_SIZE];
+        assert_eq!(&content[..MAGIC.len()], &MAGIC[..], "the answer rides KXID");
+        let mut expected = vec![RESP_NEED_NODEID];
+        expected.extend_from_slice(&DOWNSTREAM_UUID);
+        expected.extend_from_slice(&[0x81, 0x00]); // one port, index 0
+        assert_eq!(
+            &content[MAGIC.len()..],
+            &expected[..],
+            "the payload is the device's answer with the bridge's port appended"
+        );
+        let crc = crate::crc16_ccitt!(&frame[..len - MESSAGE_TRAILER_SIZE]);
+        assert_eq!(
+            ((frame[len - 3] as u16) << 8) | frame[len - 2] as u16,
+            crc,
+            "the CRC covers the appended port: a frame still carrying the CRC \
+             of the payload it arrived with would fail here"
+        );
+    }
+
+    /// One unit read off a bridge's console, as the bytes that arrived: the
+    /// bridge identified, its port 0 declared, one discovery broadcast, and the
+    /// first unit to come up on the admin reply id.
+    fn bridge_answer_unit(tty: &Path, uuid: [u8; 6]) -> Vec<u8> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the bridge link");
+        let link = runtime
+            .block_on(async {
+                let mut link =
+                    BridgeLink::open_serial(tty, DEFAULT_BAUD, BRIDGE_MCU_ID, Some(uuid))?;
+                tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
+                    .await
+                    .map_err(|_| {
+                        format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}")
+                    })??;
+                link.reset().await?;
+                Ok::<BridgeLink, Box<dyn std::error::Error>>(link)
+            })
+            .expect("the bridge answers an identify");
+        let handle = link
+            .shared_handle()
+            .expect("a serial bridge is on a shared serial port")
+            .clone();
+        let (sink, answers) = UnitSink::channel();
+        handle.set_unit_sink(ADMIN_REPLY, sink);
+        runtime
+            .block_on(link.declare_port(0, DEFAULT_BAUD))
+            .expect("the bridge declares its port");
+        handle
+            .send_admin(&discovery_query()[HEADER_BYTES..])
+            .expect("the query goes in");
+        let unit = answers
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the device behind the port answers");
+        handle.clear_unit_sink(ADMIN_REPLY);
+        link.close();
+        unit
     }
 
     /// A bridge whose port has nothing behind it answers nothing — and that is a

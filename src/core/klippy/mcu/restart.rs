@@ -519,6 +519,7 @@ impl Reenumeration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::mcu::port_grouping::PortKind;
 
     /// A config whose transport is never opened by these tests.
     fn no_transport(method: McuRestartMethod) -> McuConfig {
@@ -804,6 +805,8 @@ mod tests {
             // The port command path does not read it: this link is hand-built
             // for the reset family, which never names a device.
             named: None,
+            // Nor this: the reset family names no device, so no naming runs.
+            kind: PortKind::Uart,
         };
 
         // One temporary downstream handle, one command: the reset unit goes out
@@ -847,6 +850,7 @@ mod tests {
             index: 0,
             flags: 0,
             named: None,
+            kind: PortKind::Uart,
         };
 
         let err = open_bridge_link(&printer, &link, 7).unwrap_err();
@@ -949,6 +953,7 @@ mod tests {
             index: 3,
             flags: MUX_PORT_UNITS,
             named: Some([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+            kind: PortKind::Uart,
         };
 
         let interface = open_bridge_link(&printer, &link, 9).expect("the bridge link opens");

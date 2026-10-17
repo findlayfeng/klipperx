@@ -3567,6 +3567,113 @@ mod host_tests {
         wait_for_unload_blocking(&mux_library_path());
     }
 
+    /// The tunnel on a port the host named to speak **units**
+    /// (`SET_PORT_NODEID(0, id, MUX_PORT_UNITS)`), which is how the flashing
+    /// tool names a target whose device it has already told what it is.
+    ///
+    /// The two port properties are independent: the flags say what the device
+    /// behind the port speaks, the tunnel says the line is a bootloader's raw
+    /// katapult stream. A port carries both in the ordinary flashing order —
+    /// name it (units, because the mux build behind it answered a scan), send
+    /// REQUEST_BOOTLOADER through it, then turn the tunnel on to talk to the
+    /// bootloader that came up. The tunnel's uplink is headed with the port's
+    /// reply id either way: the bootloader answers no scan and speaks no
+    /// units, so the id on the port — not the flags — is what names it.
+    ///
+    /// This is the case that used to be dropped in silence: the bridge kept the
+    /// port's id only for a legacy port, so a units port's tunnel read a
+    /// bootloader stream with no address to send it up under.
+    #[test]
+    fn test_the_bridge_tunnel_uplink_over_a_units_port_over_the_real_library() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // A port id of its own, so nothing here rides on the legacy port the
+        // other tunnel probes name 7.
+        const UNITS_PORT_ID: u8 = 11;
+
+        let pty = Pty::new();
+        let identity = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let mut device =
+            HostDevice::load_bytes_with_ports(mux_library_path(), Some(identity), &port_zero(&pty))
+                .expect("the mux host library opens");
+        configure_port_zero(&mut device);
+        device
+            .write(&set_port_node_id(0, UNITS_PORT_ID, MUX_PORT_UNITS))
+            .expect("SET_PORT_NODEID goes in");
+        device
+            .send_set_port_tunnel(0)
+            .expect("the tunnel is on the port");
+
+        let mut units = UnitStream::new();
+        let window = Duration::from_secs(5);
+        let quiet = Duration::from_millis(500);
+        let arb = assign::arb_id(u32::from(UNITS_PORT_ID)).expect("id 11");
+        let reply = assign::reply_arb_id(u32::from(UNITS_PORT_ID)).expect("id 11");
+
+        // A. Downlink, and the ordering proof the pty writes below rely on:
+        //    the console applies the units it parses in order, so a block that
+        //    reaches the port shows the tunnel was on before it. The tunnel's
+        //    wire rule wins over the port's flags — the block goes down bare,
+        //    with no unit header around it.
+        let down_unit =
+            tunnel_unit(arb, &TUNNEL_CONNECT).expect("the golden Connect is one whole block");
+        device.write(&down_unit).expect("the tunnel unit goes in");
+        let down = read_pty(&pty.master, TUNNEL_CONNECT.len(), window);
+        assert_eq!(
+            down, TUNNEL_CONNECT,
+            "a units-named port in tunnel mode writes the block down bare"
+        );
+
+        // B. Uplink: the bootloader's blocks come up whole, one unit each, on
+        //    the port's reply id — the path a units-named port had no id for.
+        (&pty.master)
+            .write_all(&TUNNEL_ACK)
+            .expect("the ack block goes into the port");
+        let (unit_arb, unit) = read_stream_unit(&mut device, &mut units, window)
+            .expect("the block comes up as a tunnel unit on a units-named port");
+        assert_eq!(
+            unit_arb, reply,
+            "a units-named port's tunnel units are headed with the port's reply id"
+        );
+        assert_eq!(
+            &unit[HEADER_BYTES..],
+            TUNNEL_ACK.as_slice(),
+            "the block travels byte for byte"
+        );
+
+        // C. The tunnel off again: the port is the units port it was named as,
+        //    so a headed unit goes down whole, header and all. That is also the
+        //    ordering proof for the read below.
+        device
+            .send_set_port_tunnel(0)
+            .expect("the tunnel is off again");
+        let mut headed_down = encode_header(arb);
+        headed_down.extend_from_slice(&TUNNEL_CONNECT);
+        device.write(&headed_down).expect("the headed unit goes in");
+        let down = read_pty(&pty.master, headed_down.len(), window);
+        assert_eq!(
+            down, headed_down,
+            "a units port forwards the whole unit again once the tunnel is off"
+        );
+
+        // D. And a units port still heads no raw frame up, now or with the id
+        //    the naming gave it: the raw rule is the legacy port's alone, so
+        //    keeping an id on a units port must not open it.
+        let stray = [0x08, 0x21, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        (&pty.master)
+            .write_all(&stray)
+            .expect("the stray frame goes into the port");
+        assert!(
+            read_stream_unit(&mut device, &mut units, quiet).is_none(),
+            "a units port heads no raw frame up, named or not"
+        );
+
+        drop(device);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
     /// Pump bytes between a pty's master end and a [`FakeBootloader`] until
     /// `stop` is set, recording everything the bridge wrote to the port.
     ///

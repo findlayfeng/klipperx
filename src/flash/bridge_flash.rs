@@ -53,9 +53,8 @@ use crate::core::klippy::mcu::{Mcu, McuError};
 
 use super::bridge::{TunnelBridge, TunnelLink};
 use super::bridge_session::{
-    configure_bridge, declare_ports as send_declare_ports, open_bridge,
-    open_target_port as send_open_target_port, reset_port as send_port_reset, BridgeError,
-    BridgePort, BridgeReady, BridgeTarget, PortReset,
+    declare_ports as send_declare_ports, open_bridge, open_target_port as send_open_target_port,
+    reset_port as send_port_reset, BridgeError, BridgePort, BridgeTarget, PortReset,
 };
 use super::session::{self, FlashError, SessionConfig, Summary};
 use std::fmt;
@@ -604,40 +603,6 @@ impl BridgeLink {
         }
     }
 
-    /// Prepare a bridge for a flashing tunnel **without resetting anything**:
-    /// declare `ports`, name the target's port (legacy), and open that port's
-    /// tunnel — [`open_bridge`]'s work after the per-port resets.
-    ///
-    /// `admin configure-bridge` is the caller: the bridge is configured but no
-    /// device is [reset](crate::flash::bridge_session::PortReset), and the bridge
-    /// itself is not restarted either ([`reset`](BridgeLink::reset) is a separate
-    /// step). What was declared and where the tunnel was opened come back in the
-    /// [`BridgeReady`].
-    ///
-    /// # Errors
-    /// [`BridgeFlashError::Shutdown`] when the bridge's firmware shuts down while
-    /// the port is declared (its reason included), and
-    /// [`BridgeFlashError::Bridge`] when [`configure_bridge`] fails for any other
-    /// reason.
-    pub async fn configure(
-        &self,
-        ports: &[BridgePort],
-        target: BridgeTarget,
-    ) -> Result<BridgeReady, BridgeFlashError> {
-        match configure_bridge(&self.live().mcu, &self.live().link, ports, target).await {
-            Ok(ready) => {
-                if let Some(reason) = self.take_shutdown() {
-                    return Err(BridgeFlashError::Shutdown { reason });
-                }
-                Ok(ready)
-            }
-            Err(e) => Err(match self.take_shutdown() {
-                Some(reason) => BridgeFlashError::Shutdown { reason },
-                None => BridgeFlashError::Bridge(e),
-            }),
-        }
-    }
-
     /// Declare `ports` on the bridge — its oid table and its port table — and
     /// stop there.
     ///
@@ -682,10 +647,10 @@ impl BridgeLink {
     /// `admin reset --port`. The same two units [`flash`](BridgeLink::flash) sends
     /// before a session (`0x04`/`0x05`), for a caller that only wants the reset.
     ///
-    /// The port has to be one the bridge has already **declared** (a
-    /// `configure-bridge`, or a flash run's own declaration): a port-level command
-    /// that names a port the bridge does not have is dropped in silence, and no
-    /// receipt comes back either way.
+    /// The port has to be one the bridge has already **declared** (an
+    /// `admin bridge config`, or a flash run's own declaration): a port-level
+    /// command that names a port the bridge does not have is dropped in silence,
+    /// and no receipt comes back either way.
     ///
     /// # Errors
     /// [`BridgeFlashError::PortReset`] when the link refuses the write.

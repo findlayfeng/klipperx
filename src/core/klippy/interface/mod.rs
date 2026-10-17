@@ -370,6 +370,48 @@ impl Interface {
         }
     }
 
+    /// Ask the device behind bridge port `index` to enter its bootloader
+    /// ([`CMD_REQUEST_BOOTLOADER`](devices::serial::CMD_REQUEST_BOOTLOADER)),
+    /// the bridge forwarding the command to that port.
+    ///
+    /// The command a **flashing tool** addresses a device with: the device
+    /// writes a bootloader-request marker and resets, so it comes back in
+    /// katapult rather than in the firmware that was running. No receipt, and
+    /// the device has to re-enumerate/restart before `CONNECT` reaches it, so a
+    /// caller that uses this waits for the answer
+    /// ([`BridgeLink::flash`](crate::flash::bridge_flash::BridgeLink::flash)).
+    /// Like `SET_PORT_NODEID` the command travels the bridge's admin channel,
+    /// so only a link that carries port mux units does: a shared serial port, a
+    /// muxed host library, or a can-serial CAN link (an ISO-TP link carries
+    /// blocks, not mux units).
+    ///
+    /// # Errors
+    /// The device's own error, or [`InterfaceError::Other`] when this interface
+    /// is not a bridge link.
+    pub(crate) fn send_request_bootloader(&self, index: u8) -> Result<(), InterfaceError> {
+        match &self.transport {
+            Transport::SharedSerial(handle) => handle.send_request_bootloader(index),
+            Transport::CanSerial(device) => device.send_request_bootloader(index),
+            Transport::Host(device) => {
+                if !device.is_mux() {
+                    return Err(InterfaceError::Other(
+                        "REQUEST_BOOTLOADER needs a link that carries port mux units (a shared \
+                         serial port, a muxed host library, or a can-serial link); this host \
+                         library reference has no mux, so no bridge is listening"
+                            .to_string(),
+                    ));
+                }
+                device.send_request_bootloader(index)
+            }
+            _ => Err(InterfaceError::Other(
+                "REQUEST_BOOTLOADER needs a link that carries port mux units (a shared serial \
+                 port, a muxed host library, or a can-serial link); this interface is not one \
+                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                    .to_string(),
+            )),
+        }
+    }
+
     /// Toggle the flashing tunnel of bridge port `index`
     /// ([`CMD_SET_PORT_TUNNEL`](devices::serial::CMD_SET_PORT_TUNNEL)).
     ///

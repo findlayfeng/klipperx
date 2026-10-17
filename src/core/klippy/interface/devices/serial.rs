@@ -889,7 +889,7 @@ pub fn discovery_query() -> Vec<u8> {
 /// The uuid is what makes the request reach a device whose own byte stream is
 /// not slices: a CAN port translates a uuid-carrying request into the bus's
 /// single admin frame (`0x3f0 [0x02][uuid]`, `generic/canserial.c`), which a
-/// device reads whatever carrier it speaks — an ISO-TP application included.
+/// device reads whatever its own stream uses.
 /// Without it the request can only travel as the mux unit itself, which needs a
 /// device that reads units. `None` keeps that older, unit-only shape.
 pub(crate) fn request_bootloader_unit(index: u8, uuid: Option<[u8; 6]>) -> Vec<u8> {

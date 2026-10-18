@@ -470,6 +470,7 @@ mod tests {
                 "virtual_sdcard",
                 "z_tilt",
                 "static_digital_output",
+                "static_pwm_clock",
                 "ad5206",
                 "adxl345",
                 "dac084S085",

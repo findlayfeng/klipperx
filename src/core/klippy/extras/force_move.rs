@@ -635,6 +635,210 @@ mod tests {
         (printer, setup)
     }
 
+    /// The steps this stepper's compressor has emitted so far — the
+    /// `queue_step` batches the firmware would receive.
+    fn steps_emitted(toolhead: &Arc<ToolHeadObject>, name: &str) -> i64 {
+        toolhead
+            .stepper_step_history(name, 1000, 0, u64::MAX)
+            .map(|history| history.steps.iter().map(|step| step.step_count).sum())
+            .unwrap_or(0)
+    }
+
+    /// `FORCE_MOVE` really drives the motor: the move is generated and handed
+    /// to the transport for the named stepper, so `queue_step` batches exist.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_force_move_generates_steps_on_the_named_stepper() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return;
+        }
+        let (printer, setup) = up_machine(&dict).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            gcode
+                .run_script("SET_KINEMATIC_POSITION X=0 Y=0 Z=0")
+                .await
+                .map_err(|e| e.to_string())?;
+            let before = steps_emitted(&toolhead, "stepper_x");
+
+            gcode
+                .run_script("FORCE_MOVE STEPPER=stepper_x DISTANCE=10 VELOCITY=100")
+                .await
+                .map_err(|e| format!("force move: {e}"))?;
+
+            let emitted = steps_emitted(&toolhead, "stepper_x") - before;
+            if emitted == 0 {
+                return Err("FORCE_MOVE produced no queue_step for stepper_x".to_string());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `STEPPER_BUZZ` drives both halves: the forward and the reverse move each
+    /// produce their own `queue_step` runs, in opposite directions, and the ten
+    /// pairs net out to zero.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_stepper_buzz_generates_steps_in_both_directions() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return;
+        }
+        let (printer, setup) = up_machine(&dict).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            gcode
+                .run_script("SET_KINEMATIC_POSITION X=0 Y=0 Z=0")
+                .await
+                .map_err(|e| e.to_string())?;
+
+            gcode
+                .run_script("STEPPER_BUZZ STEPPER=stepper_x")
+                .await
+                .map_err(|e| format!("buzz: {e}"))?;
+
+            let history = toolhead
+                .stepper_step_history("stepper_x", 1000, 0, u64::MAX)
+                .ok_or("stepper_x is not in the motion queue")?;
+            let forward: i64 = history
+                .steps
+                .iter()
+                .filter(|step| step.step_count > 0)
+                .map(|step| step.step_count)
+                .sum();
+            let reverse: i64 = history
+                .steps
+                .iter()
+                .filter(|step| step.step_count < 0)
+                .map(|step| step.step_count)
+                .sum();
+            if forward == 0 || reverse == 0 {
+                return Err(format!(
+                    "the buzz stepped {forward} forward and {reverse} back, not both"
+                ));
+            }
+            // Ten one-millimetre moves each way, 0.0125 mm per step: 800 steps
+            // per direction, so the pairs cancel.
+            if forward != 800 || reverse != -800 {
+                return Err(format!(
+                    "the buzz stepped {forward}/{reverse}, not 800/-800"
+                ));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// The force move never enters the toolhead's main trapq: the planner only
+    /// sees the dwell that keeps the timeline moving, no axis motion. That is
+    /// what keeps `FORCE_MOVE` out of the kinematics — downstream `G1` moves go
+    /// on planning from where they were.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_force_move_does_not_enter_the_main_trapq() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return;
+        }
+        let (printer, setup) = up_machine(&dict).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            gcode
+                .run_script("SET_KINEMATIC_POSITION X=0 Y=0 Z=0")
+                .await
+                .map_err(|e| e.to_string())?;
+            let main = toolhead
+                .main_trapq()
+                .ok_or("the toolhead is not connected")?;
+            let before = toolhead.print_time();
+
+            gcode
+                .run_script("FORCE_MOVE STEPPER=stepper_x DISTANCE=10 VELOCITY=100")
+                .await
+                .map_err(|e| format!("force move: {e}"))?;
+
+            let segments = toolhead
+                .trapq_extract(main, 100, before, toolhead.print_time() + 1.0)
+                .ok_or("the toolhead is not connected")?;
+            let moved: Vec<_> = segments
+                .iter()
+                .filter(|segment| segment.axes_r.x() != 0.0 || segment.axes_r.y() != 0.0)
+                .collect();
+            if !moved.is_empty() {
+                return Err(format!("the force move reached the main trapq: {moved:?}"));
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// An unhomed machine can be force-moved — the move bypasses the kinematics,
+    /// so no homing is required (upstream's `manual_move` never checks) — while
+    /// a kinematic move on the same machine is still refused with `Must home
+    /// axis first`. The force move must not have opened a hole in that check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_unhomed_machine_force_moves_but_still_refuses_a_kinematic_move() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return;
+        }
+        let (printer, setup) = up_machine(&dict).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            let before = steps_emitted(&toolhead, "stepper_x");
+
+            gcode
+                .run_script("FORCE_MOVE STEPPER=stepper_x DISTANCE=10 VELOCITY=100")
+                .await
+                .map_err(|e| format!("force move on an unhomed machine: {e}"))?;
+            if steps_emitted(&toolhead, "stepper_x") - before == 0 {
+                return Err("the force move on an unhomed machine stepped nothing".to_string());
+            }
+
+            // The kinematics is untouched by it: the unhomed machine still
+            // refuses a planned move.
+            let err = gcode.run_script("G1 X10 F600").await.unwrap_err();
+            if !err.to_string().contains("Must home axis first") {
+                return Err(format!("G1 on an unhomed machine said {err}"));
+            }
+
+            // And `SET_KINEMATIC_POSITION` is the re-sync upstream documents.
+            gcode
+                .run_script("SET_KINEMATIC_POSITION X=0 Y=0 Z=0")
+                .await
+                .map_err(|e| e.to_string())?;
+            gcode
+                .run_script("G1 X10 F600")
+                .await
+                .map_err(|e| format!("G1 after the re-sync: {e}"))?;
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
     /// `STEPPER_BUZZ` and `FORCE_MOVE` end to end: the buzz runs ten
     /// forward/reverse pairs with upstream's dwells, neither command moves the
     /// planner, and a normal `G1` still works on the original kinematics

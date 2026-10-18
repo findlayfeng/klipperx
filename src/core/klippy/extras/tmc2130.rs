@@ -14,9 +14,9 @@
 //!
 //! # What is not here
 //!
-//! The `tmc/stallguard_dump` bulk endpoint (`tmc.TMCStallguardDump`,
-//! `tmc.py:228-317`) is not registered, so `available_sensors` does not list it
-//! and the `stallguard_dump` query is unavailable. Nothing else is missing.
+//! The `tmc/stallguard_dump` endpoint is registered like every other chip's,
+//! and this one streams the SG2 result out of `DRV_STATUS.sg_result` (the chip
+//! has no `SG_RESULT` register of its own). Nothing else is missing.
 
 use std::collections::HashMap;
 use std::sync::Arc;

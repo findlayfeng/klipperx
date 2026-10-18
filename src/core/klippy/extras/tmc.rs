@@ -31,13 +31,14 @@
 //! exchange would hang. The driver-side cache (`fields.registers`) still tracks
 //! every write, so `DUMP_TMC` reports what was configured.
 //!
-//! The UART transport is likewise not wired for a live MCU in this unit: a
-//! non-file-output read or write reports
-//! [`McuError::Config`](crate::core::klippy::mcu::McuError::Config) rather than
-//! silently doing nothing. The SPI transports the `tmc2130`/`tmc5160`/`tmc2240`
-//! drivers share, and the TMC2660's own, are provided by a separate `tmc_spi`
-//! module and short-circuit the same way: under file output a read answers 0
-//! and a write is dropped.
+//! Both transports are **live**: the UART one ([`crate::core::klippy::extras::tmc_uart`])
+//! sends `tmcuart_send` / `tmcuart_response` pairs, the SPI ones
+//! ([`crate::core::klippy::extras::tmc_spi`]) `spi_send` / `spi_transfer`
+//! frames. Under file output — the corpus runs — neither touches a bus: a read
+//! answers 0 and a write is dropped without a frame, because the fake firmware
+//! never answers `tmcuart_response` / `spi_transfer_response` and a real
+//! exchange would hang. The driver-side cache (`fields.registers`) still tracks
+//! every write, so `DUMP_TMC` reports what was configured.
 //!
 //! # Deliberate deviation: the stallguard dump's read path
 //!
@@ -362,13 +363,17 @@ pub struct TmcRegister {
 /// `MCU_TMC_uart`).
 ///
 /// The methods map a register *name* to its bus address through the chip's own
-/// table; the driver never sees addresses. Under file output a read answers 0
-/// and a write is dropped (see the module docs).
+/// table; the driver never sees addresses. Both implementations
+/// ([`crate::core::klippy::extras::tmc_uart`],
+/// [`crate::core::klippy::extras::tmc_spi`]) are live; under file output a read
+/// answers 0 and a write is dropped (see the module docs).
 pub trait TmcTransport: Send + Sync {
     /// Read a register, with the read time (`get_register_raw`).
     ///
     /// # Errors
-    /// The bus error, or the "not wired outside file output" refusal.
+    /// The bus error, a frame that never decoded (the read paths retry a few
+    /// times first), or `Unable to read tmc uart '<x>' register <REG>` once the
+    /// retries are spent.
     fn get_register_raw(&self, reg_name: &str) -> Result<TmcRegister, McuError>;
 
     /// Read a register's value (`get_register`).
@@ -382,7 +387,9 @@ pub trait TmcTransport: Send + Sync {
     /// Write a register (`set_register`).
     ///
     /// # Errors
-    /// The bus error, or the "not wired outside file output" refusal.
+    /// The bus error, or `Unable to write tmc uart '<x>' register <REG>` when
+    /// the read-back (the UART's `IFCNT`, the SPI chain's echoed value) never
+    /// matches after the retries.
     fn set_register(
         &self,
         reg_name: &str,

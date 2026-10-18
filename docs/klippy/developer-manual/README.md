@@ -492,7 +492,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 | `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |
 | `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`），以及 `coordinate_descent`（上游 `mathutil.py:16-49` 的近似最小二乘：步长 `1.0` 起、`>1e-5` 与万轮上限、改善 `*1.1`/不改善 `*0.9`）——H9 调平族 `z_tilt`/`bed_tilt` 平面拟合的依赖 |
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
-| `ui/` | 便利启动的两个服务：`klipperx mainsail`（静态服务；缺 `dist` 时首次 `npm ci && npm run build`，之后只检查 `dist/index.html` 比 `package-lock.json` 新）与 `klipperx moonraker`（自管 venv：`<venv>/klipperx-requirements.sha256` 记依赖表哈希，缺失或不一致才 `pip install`；源码解析 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ 子模块）。HTTP 静态服务用现有 tokio 手写（不引入 crate）。**这是快速起环境的便利通道，不是生产部署路径** |
+| `ui/` | 便利启动的两个服务：`klipperx mainsail`（静态托管；站点三层 `--dir` → **编进二进制的那份** → `third_party/mainsail/dist`，**不在本机编译前端**；`build.rs` 扫 `assets/mainsail/` 生成 `EMBEDDED_MAINSAIL`（`include_bytes!` 静态表，目录缺失或为空即 `None`））与 `klipperx moonraker`（自管 venv：`<venv>/klipperx-requirements.sha256` 记依赖表哈希，缺失或不一致才 `pip install`；源码解析 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ 子模块）。HTTP 静态服务用现有 tokio 手写（不引入 crate）。**这是快速起环境的便利通道，不是生产部署路径**；发布时 `cp -r third_party/mainsail/dist/. assets/mainsail/ && cargo build --release`（`assets/mainsail/` 不入库） |
 
 ## 二进制
 

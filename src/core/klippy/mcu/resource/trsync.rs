@@ -273,6 +273,28 @@ impl McuTrsync {
                 report_ticks: 0,
                 expire_reason: 0,
             })?;
+            // Clear the report timer **a killed previous process left on this
+            // oid**: the firmware deletes a group's report and expire timers
+            // only in `trsync_trigger` or on a new `trsync_start`
+            // (`src/trsync.c:171-186`), so a host killed mid-homing leaves the
+            // feed running — and `restart_method: admin` reconnects to that same
+            // firmware instead of resetting it, on the same oid (`config_trsync`
+            // is re-sent with the same number). A clean exit leaves nothing
+            // behind, which is why the symptom only appears after a kill.
+            //
+            // The `init` list is what makes it deterministic: sent on **every**
+            // connect, after `config_trsync` assigned the oid (`mcu/config.rs`,
+            // upstream's `_send_config` `init` pass). It is safe on a group that
+            // was never started: `trsync_do_trigger` skips the trigger itself
+            // (`!(flags & TSF_CAN_TRIGGER)`), while both `sched_del_timer` calls
+            // and the one `trsync_state` report still happen
+            // (`src/trsync.c:31-53,171-186`) — that report reaches a dispatch
+            // that is not armed, and a reason-2 report with `can_trigger=0` only
+            // records a reason the next `start` resets.
+            builder.add_init_cmd(&TrsyncTrigger {
+                oid,
+                reason: TriggerReason::HostRequest as u8,
+            })?;
             if let Some(router) = router.upgrade() {
                 router.register(&registered);
             }
@@ -545,8 +567,10 @@ impl TrsyncRegistry {
     ///
     /// Two callers, two reasons, one binding:
     /// [`McuChip::attach`](super::pin::McuChip::attach) binds on every session
-    /// the chip gets, so a report that arrives before anything is armed (a
-    /// killed host's leftover periodic feed) is dropped in silence; and
+    /// the chip gets — right after `identify`, before the configuration
+    /// handshake — so a report that arrives before anything is armed (a killed
+    /// previous process's leftover periodic feed) is already routed and dropped
+    /// in silence; it is never unbound for that session's lifetime.
     /// [`McuTrsync::start`] binds again before arming, so a homing move on a
     /// firmware that cannot report fails there instead of waiting forever.
     ///
@@ -1267,6 +1291,81 @@ mod tests {
 
         assert!(mcu.has_message("trsync_state"));
         mcu.bind_event::<TrsyncState, _>(|_| {}).unwrap();
+    }
+
+    /// A previous process killed mid-homing leaves the firmware's report timer
+    /// running on this oid; the session that reconnects must neither warn about
+    /// its reports nor leave the feed alive.
+    ///
+    /// `restart_method: admin` reconnects to the same firmware instead of
+    /// resetting it, and the configuration is reused on the same oid, so the
+    /// leftover `trsync_state` feed keeps arriving on a group this session has
+    /// not armed. A clean exit leaves no timer behind — which is why the symptom
+    /// was intermittent (only after a kill).
+    #[tokio::test]
+    async fn test_a_killed_process_leftover_feed_is_silent_and_cleared_on_connect() {
+        // The previous session: a group was armed and the process died without
+        // a `trsync_trigger` (upstream's `MCU_trsync.stop`), so the firmware's
+        // report timer is still re-arming itself (`src/trsync.c:57-65`).
+        let wire = RecordingWire::new();
+        let previous = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        previous.install_dictionary(dictionary()).unwrap();
+        previous.set_clock_base(0);
+        let previous_guard = SessionGuard(Arc::clone(&previous));
+        let chip = chip("mcu", Arc::clone(&previous));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let trsync = first(&dispatch);
+        // The configuration a reconnect reuses — its `init` list is what every
+        // connect sends *after* `config_trsync` assigned the oid.
+        let built = chip.config().build(&previous).unwrap();
+        dispatch.start(0.0).unwrap();
+        drop(previous_guard);
+
+        // The replacement session, as the next `connect` brings it up.
+        let session = identified_mcu("mcu");
+        let _guard = SessionGuard(Arc::clone(&session));
+        chip.attach(Arc::clone(&session));
+
+        // (a) The leftover feed has a router from the session's first moment,
+        // so it is dropped in silence instead of logged as an unhandled
+        // message (`mcu/mod.rs`).
+        assert!(
+            session.has_event_handler::<TrsyncState>(),
+            "the reconnected session must route trsync_state before anything is armed"
+        );
+        let registry = chip.trsync_registry();
+        registry.route(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: true,
+            trigger_reason: 0,
+            clock: 1_000,
+        });
+        assert_eq!(
+            dispatch.completion().reason(),
+            None,
+            "a report for a group this session never armed must not complete anything"
+        );
+
+        // (b) The connect tells this oid to stop reporting. The `init` list is
+        // sent on every connect after the configuration (`mcu/config.rs`), and
+        // the firmware's `trsync_trigger` deletes both timers even for a group
+        // that cannot trigger (`src/trsync.c:31-53,171-186`).
+        let mut parser = Parser::new();
+        dictionary().install(&mut parser).unwrap();
+        let cleared: Vec<Vec<ArgValue>> = built
+            .init
+            .iter()
+            .flat_map(|payload| parser.decode(payload.clone()).unwrap_or_default())
+            .filter(|(msg, _)| msg.name == "trsync_trigger")
+            .map(|(_, args)| args)
+            .collect();
+        assert!(
+            cleared.contains(&vec![
+                ArgValue::UInt8(trsync.oid()),
+                ArgValue::UInt8(TriggerReason::HostRequest as u8),
+            ]),
+            "the connect must clear the leftover report timer on this oid: {cleared:?}"
+        );
     }
 
     /// The restart list disarms every group, upstream's `on_restart`

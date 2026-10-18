@@ -631,6 +631,7 @@ fn cmd_set_pin(
         // `TEMPLATE=` (possibly empty: an unsubscribe, which moves nothing).
         let schedule = Arc::clone(schedule);
         return template_eval.set_template(
+            &format!("output_pin {}", schedule.name()),
             gcmd,
             Arc::new(move |text| schedule.send_async(render_value(text))),
         );
@@ -920,6 +921,52 @@ mod tests {
         chip.created.lock().unwrap()[index].clone()
     }
 
+    fn pwm(chip: &FakeChip, index: usize) -> Arc<FakePwm> {
+        chip.pwms.lock().unwrap()[index].clone()
+    }
+
+    /// The duties a PWM was handed by the immediate path.
+    fn pwm_updates(chip: &FakeChip, index: usize) -> Vec<f64> {
+        pwm(chip, index).updates.lock().unwrap().clone()
+    }
+
+    /// File a `[display_template <name>]` section into the shared registry.
+    fn add_display_template(printer: &Arc<Printer>, name: &str, options: &[(&str, &str)]) {
+        let mut section = ConfigSection::new("display_template", Some(name));
+        for (key, value) in options {
+            section.parameters.insert(
+                (*key).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        crate::core::klippy::extras::led::load_display_template(&wrap(&section), printer)
+            .expect("the template loads");
+    }
+
+    /// The shared evaluator a `TEMPLATE=` subscription lands in.
+    fn evaluator(printer: &Arc<Printer>) -> Arc<PrinterTemplateEvaluator> {
+        crate::core::klippy::extras::template_evaluator::lookup_template_eval(printer)
+            .expect("the evaluator is created on first use")
+    }
+
+    /// A printer object whose status counts reads, so a template that reads it
+    /// renders a different number on every render pass.
+    #[derive(Default)]
+    struct CountingStatus {
+        reads: Mutex<u32>,
+    }
+
+    impl PrinterObject for CountingStatus {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            let mut reads = self
+                .reads
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            *reads += 1;
+            json!({ "value": *reads })
+        }
+    }
+
     #[test]
     fn test_a_digital_output_is_configured_with_its_levels() {
         let (printer, chip) = printer();
@@ -963,15 +1010,128 @@ mod tests {
     }
 
     #[test]
-    fn test_set_pin_requires_a_value() {
+    fn test_set_pin_requires_exactly_one_of_value_and_template() {
         let (printer, _chip) = printer();
         OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+        add_display_template(&printer, "hot", &[("text", "0.5")]);
+
+        // Neither word, and both words: upstream answers the same error
+        // (`output_pin.py:256-257`).
+        for line in [
+            "SET_PIN PIN=fan",
+            "SET_PIN PIN=fan VALUE=1 TEMPLATE=hot",
+            "SET_PIN PIN=fan TEMPLATE=hot VALUE=1",
+        ] {
+            let err = gcode(&printer).run_script_sync(line).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "SET_PIN command must specify VALUE or TEMPLATE",
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_pin_template_must_name_a_declared_template_and_declared_params() {
+        let (printer, _chip) = printer();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[])), &printer).unwrap();
+        add_display_template(
+            &printer,
+            "hot",
+            &[("param_myvar", "0.25"), ("text", "{param_myvar}")],
+        );
+
+        // The three refusals upstream's `set_template` makes, with its wording
+        // (`output_pin.py:168-182`).
+        let err = gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=nosuch")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unknown display_template 'nosuch'");
 
         let err = gcode(&printer)
-            .run_script_sync("SET_PIN PIN=fan")
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=hot PARAM_NOPE=1")
             .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Invalid display_template parameter: param_nope"
+        );
 
-        assert!(err.to_string().contains("missing VALUE"), "{err}");
+        let err = gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=hot PARAM_MYVAR=abc")
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Unable to parse 'abc' as a literal");
+    }
+
+    #[test]
+    fn test_a_pin_template_re_renders_and_lands_on_the_pin() {
+        let (printer, chip) = printer();
+        // A template that reads a counter, so two render passes differ.
+        add_display_template(&printer, "hot", &[("text", "{printer.test_counter.value}")]);
+        printer
+            .add_object(
+                "test_counter",
+                Arc::new(CountingStatus::default()) as Arc<dyn PrinterObject>,
+            )
+            .unwrap();
+        OutputPin::new(&wrap(&section("fan", "PA1", &[("pwm", "true")])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=hot")
+            .unwrap();
+
+        // One timer period's worth of rendering, twice: each render hands its
+        // text to the pin, which parses it and drives it.
+        let eval = evaluator(&printer);
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(pwm_updates(&chip, 0), [1.0]);
+        assert_eq!(eval.render_once(0.5), Some(1.0));
+        assert_eq!(pwm_updates(&chip, 0), [1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_an_empty_template_argument_unsubscribes() {
+        let (printer, chip) = printer();
+        add_display_template(&printer, "half", &[("text", "0.5")]);
+        OutputPin::new(&wrap(&section("fan", "PA1", &[("pwm", "true")])), &printer).unwrap();
+
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=half")
+            .unwrap();
+        let eval = evaluator(&printer);
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(pwm_updates(&chip, 0), [0.5]);
+
+        // `TEMPLATE=` cancels the subscription, and with nothing left the timer
+        // retires itself (`output_pin.py:165-167`, `:131-136`).
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=")
+            .unwrap();
+        assert_eq!(eval.render_once(0.5), None);
+        assert_eq!(pwm_updates(&chip, 0), [0.5], "nothing more was driven");
+    }
+
+    #[test]
+    fn test_a_failed_render_and_a_non_numeric_one_drive_zero() {
+        let (printer, chip) = printer();
+        // `{printer.no.such}` is a strict-undefined failure; `"ready"` renders
+        // fine but is not a number. Both end up at `0.` with a logged error
+        // (`output_pin.py:148-152, 245-250`).
+        add_display_template(&printer, "broken", &[("text", "{printer.no.such}")]);
+        add_display_template(&printer, "word", &[("text", "ready")]);
+        OutputPin::new(&wrap(&section("fan", "PA1", &[("pwm", "true")])), &printer).unwrap();
+        let eval = evaluator(&printer);
+
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=broken")
+            .unwrap();
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(pwm_updates(&chip, 0), [0.0]);
+
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=word")
+            .unwrap();
+        assert_eq!(eval.render_once(0.5), Some(1.0));
+        assert_eq!(pwm_updates(&chip, 0), [0.0, 0.0]);
     }
 
     #[test]

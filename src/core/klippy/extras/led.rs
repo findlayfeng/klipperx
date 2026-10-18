@@ -7,7 +7,8 @@
 //! while here they share [`LEDHelper`] and [`lookup_display_templates`] as one
 //! seam. `display_template` lands next to its consumers for the same reason
 //! upstream's lookup crosses `led.py` → `output_pin.py` → `display/display.py`:
-//! nothing else in this host creates or reads a template.
+//! the sections are filed here, and the one reader that renders them is
+//! [`template_evaluator`](super::template_evaluator).
 //!
 //! | section | upstream | options read |
 //! |---|---|---|

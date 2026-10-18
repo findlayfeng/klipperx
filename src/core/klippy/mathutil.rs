@@ -23,23 +23,25 @@ pub const AXES: usize = 4;
 
 /// How many axes a [`Coord`] has room for.
 ///
-/// This is a capacity, not a count: raising it must not change any observable
-/// behaviour. Iteration and serialization go by [`Coord::len`], and `MAX_AXES`
-/// only appears in type declarations (the backing array's length), never in a
-/// loop bound or an index.
-pub const MAX_AXES: usize = 4;
+/// This is a capacity, not a count: iteration and serialization go by
+/// [`Coord::len`], and `MAX_AXES` only appears in type declarations (the
+/// backing array's length), never in a loop bound or an index. Upstream's
+/// positions grow a slot per extra axis (`toolhead.py:378-385`,
+/// `add_extra_axis` appends to `commanded_pos`), so the room is eight: the
+/// four modelled axes plus four extra ones.
+pub const MAX_AXES: usize = 8;
 
-/// A toolhead position: `x`, `y`, `z`, `e`.
+/// A toolhead position: `x`, `y`, `z`, `e`, and any extra axes after them.
 ///
 /// Upstream's `Coord` is a `tuple` subclass whose constructor pads a shorter
-/// sequence with zeros (`klippy/gcode.py:12-17`). The axes live in a
-/// fixed-capacity `[f64; MAX_AXES]` with the number in use in `len`, so the
-/// type stays `Copy` and indexable in the motion hot paths (`Move`, `trapq`)
-/// while the container can later carry more than the four modelled axes; the
-/// named accessors keep the call sites readable.
+/// sequence with zeros and keeps a longer one as it is (`klippy/gcode.py:12-17`).
+/// The axes live in a fixed-capacity `[f64; MAX_AXES]` with the number in use
+/// in `len`, so the type stays `Copy` and indexable in the motion hot paths
+/// (`Move`, `trapq`) while the container can carry more than the four modelled
+/// axes; the named accessors keep the call sites readable.
 ///
 /// It deliberately holds no `Option`: a position is always `len` numbers, and
-/// every constructor here sets `len` to [`AXES`]. The one place a coordinate
+/// every constructor here sets `len` to at least [`AXES`]. The one place a coordinate
 /// can be *unknown* is the reverse mapping in `Kinematics::calc_position`,
 /// which returns `[Option<f64>; 3]` instead (a delta that cannot be solved, a
 /// rail that is not homed).
@@ -52,25 +54,33 @@ pub struct Coord {
 impl Coord {
     /// A coordinate from its four axes.
     pub const fn new(x: f64, y: f64, z: f64, e: f64) -> Self {
-        Self {
-            axes: [x, y, z, e],
-            len: AXES,
-        }
+        let mut axes = [0.0; MAX_AXES];
+        axes[X_AXIS] = x;
+        axes[Y_AXIS] = y;
+        axes[Z_AXIS] = z;
+        axes[E_AXIS] = e;
+        Self { axes, len: AXES }
     }
 
-    /// A coordinate from a shorter or equal sequence, padding with zeros.
+    /// A coordinate from any sequence: pad a short one with zeros, keep a long
+    /// one.
     ///
     /// This is upstream's constructor semantics (`klippy/gcode.py:14-16`):
-    /// `Coord::from_axes([1., 2.])` is `(1, 2, 0, 0)`. Extra values are
-    /// ignored, matching the tuple slice upstream would build.
+    /// `Coord::from_axes([1., 2.])` is `(1, 2, 0, 0)` and
+    /// `Coord::from_axes([1., 2., 3., 4., 5.])` keeps all five, with
+    /// [`Coord::len`] five. Values past [`MAX_AXES`] have no slot and are
+    /// dropped — the one place this container is narrower than upstream's
+    /// unbounded tuple.
     pub fn from_axes(axes: impl IntoIterator<Item = f64>) -> Self {
         let mut coord = [0.0; MAX_AXES];
-        for (slot, value) in coord[..AXES].iter_mut().zip(axes) {
+        let mut len = 0;
+        for (slot, value) in coord.iter_mut().zip(axes) {
             *slot = value;
+            len += 1;
         }
         Self {
             axes: coord,
-            len: AXES,
+            len: len.max(AXES),
         }
     }
 
@@ -99,12 +109,11 @@ impl Coord {
         self.axes[E_AXIS]
     }
 
-    /// An axis by index ([`X_AXIS`] … [`E_AXIS`]).
+    /// An axis by index ([`X_AXIS`] … up to the extra axes).
     ///
     /// # Panics
-    /// When `axis` is not below [`Coord::len`]. A coordinate carries a fixed
-    /// number of axes, so an out-of-range index is a bug in the caller — an
-    /// unused slot must never be read as a zero.
+    /// When `axis` is not below [`Coord::len`]. An out-of-range index is a bug
+    /// in the caller — an unused slot must never be read as a zero.
     pub const fn axis(&self, axis: usize) -> f64 {
         assert!(axis < self.len);
         self.axes[axis]
@@ -482,10 +491,24 @@ mod tests {
         // Upstream's constructor pads to four (`klippy/gcode.py:14-16`).
         assert_eq!(Coord::from_axes([1.0, 2.0]), Coord::new(1.0, 2.0, 0.0, 0.0));
         assert_eq!(Coord::from_axes([]), Coord::new(0.0, 0.0, 0.0, 0.0));
-        assert_eq!(
-            Coord::from_axes([1.0, 2.0, 3.0, 4.0, 5.0]),
-            Coord::new(1.0, 2.0, 3.0, 4.0)
-        );
+    }
+
+    #[test]
+    fn test_a_long_sequence_keeps_its_extra_axes() {
+        // ... and keeps what comes after the fourth (`gcode.py:14-16`).
+        let coord = Coord::from_axes([1.0, 2.0, 3.0, 4.0, 5.0]);
+
+        assert_eq!(coord.len(), 5);
+        assert_eq!(coord.as_slice(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert_eq!(coord.axis(4), 5.0);
+        assert_ne!(coord, Coord::new(1.0, 2.0, 3.0, 4.0));
+    }
+
+    #[test]
+    fn test_axes_past_the_capacity_are_dropped() {
+        let coord = Coord::from_axes(std::iter::repeat(1.0).take(MAX_AXES + 2));
+
+        assert_eq!(coord.len(), MAX_AXES);
     }
 
     #[test]
@@ -499,11 +522,12 @@ mod tests {
     }
 
     #[test]
-    fn test_len_is_four_for_every_constructor() {
+    fn test_len_is_at_least_four_for_every_constructor() {
         assert_eq!(Coord::new(1.0, 2.0, 3.0, 4.0).len(), AXES);
         assert_eq!(Coord::default().len(), AXES);
         assert_eq!(Coord::from_axes([1.0]).len(), AXES);
         assert_eq!(Coord::from([1.0, 2.0, 3.0, 4.0]).len(), AXES);
+        assert_eq!(Coord::from_axes([1.0, 2.0, 3.0, 4.0, 5.0]).len(), AXES + 1);
     }
 
     #[test]
@@ -513,27 +537,22 @@ mod tests {
             Coord::new(1.0, 2.0, 3.0, 4.0),
             Coord::from_axes([1.0, 2.0, 3.0, 4.0])
         );
-        // The unused tail is not part of the value ...
-        assert_eq!(
-            Coord {
-                axes: [1.0, 2.0, 0.0, 0.0],
-                len: 2
-            },
-            Coord {
-                axes: [1.0, 2.0, 9.0, 9.0],
-                len: 2
-            }
-        );
-        // ... but the length is: a shorter coordinate with the same axes is
-        // not the same position. (No constructor builds one yet, so the
-        // struct literal stands in for the future `axis_map` path.)
+        // The length is part of the value: a fifth axis, even a zero one, is a
+        // different position from a four-axis one.
         assert_ne!(
-            Coord {
-                axes: [1.0, 2.0, 0.0, 0.0],
-                len: 2
-            },
-            Coord::new(1.0, 2.0, 0.0, 0.0)
+            Coord::from_axes([1.0, 2.0, 3.0, 4.0]),
+            Coord::from_axes([1.0, 2.0, 3.0, 4.0, 0.0])
         );
+        // The unused tail (slots past `len`) is not part of the value.
+        let one = Coord {
+            axes: [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            len: 4,
+        };
+        let other = Coord {
+            axes: [1.0, 2.0, 0.0, 0.0, 9.0, 9.0, 9.0, 9.0],
+            len: 4,
+        };
+        assert_eq!(one, other);
     }
 
     #[test]

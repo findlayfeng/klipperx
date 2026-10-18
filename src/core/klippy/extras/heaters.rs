@@ -11,6 +11,11 @@
 //! and its [`HeaterControl`] takeover come from
 //! (`crate::core::klippy::extras::pid_calibrate`).
 //!
+//! The registry also registers `TURN_OFF_HEATERS`
+//! (`PrinterHeaters.turn_off_all_heaters`), which is the first line of
+//! `[idle_timeout]`'s default script — without it an idle machine keeps the bed
+//! and hotend at their targets.
+//!
 //! The object has no `[heaters]` section of its own — upstream loads it by name
 //! (`printer.load_object(config, 'heaters')`) and so does [`ensure`], which is
 //! also where the built-in sensor modules are brought in (upstream reads
@@ -43,9 +48,12 @@ use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
 /// The name other modules look the registry up by.
 pub const HEATERS_OBJECT: &str = "heaters";
 
-/// The longest a heater PWM change may sit before the firmware falls back
-/// (upstream `MAX_HEAT_TIME`, `heaters.py:14`).
-#[allow(dead_code)]
+/// The longest a heater PWM change may sit before the firmware falls back to
+/// the pin's shutdown value (upstream `MAX_HEAT_TIME`, `heaters.py:14`).
+///
+/// This is the firmware's watchdog: a host that hangs (rather than exits) stops
+/// sending readings, and after this long the MCU takes the heater pin down
+/// itself instead of holding the last duty cycle.
 const MAX_HEAT_TIME: f64 = 3.0;
 /// The temperature the PID's first derivative is measured against
 /// (upstream `AMBIENT_TEMP`, `heaters.py:15`).
@@ -63,6 +71,8 @@ const PID_SETTLE_DELTA: f64 = 1.0;
 const PID_SETTLE_SLOPE: f64 = 0.1;
 /// `cmd_TEMPERATURE_WAIT_help` (`heaters.py:366`).
 const TEMPERATURE_WAIT_HELP: &str = "Wait for a temperature on a sensor";
+/// `cmd_TURN_OFF_HEATERS_help` (`heaters.py:319`).
+const TURN_OFF_HEATERS_HELP: &str = "Turn off all heaters";
 
 /// The toolhead a `set_temperature` wait flushes through, upstream's
 /// `lookup_object("toolhead")` (`heaters.py:352,361`).
@@ -322,6 +332,16 @@ impl Heater {
 
     /// One sensor reading: run the control loop and update the smoothed
     /// temperature (`Heater.temperature_callback`).
+    ///
+    /// The value the control asks for goes through the first half of upstream's
+    /// `Heater.set_pwm` guard: a heater with no target (`target_temp <= 0`) gets
+    /// zero, whatever the control computed (`heaters.py:72-74`). The second
+    /// half of that guard — `read_time > verify_mainthread_time` — needs the
+    /// host's main-thread deadline in the reading's own clock, which this host
+    /// does not have: `verify_mainthread_time` is set by upstream's periodic
+    /// `Heater.stats` in estimated print time, while a reading's `read_time` is
+    /// either a raw firmware clock or an `estimated_print_time`-mapped one
+    /// depending on the sensor (see [`Self::get_temp`]).
     pub fn temperature_callback(&self, read_time: f64, temp: f64) {
         let mut state = self.lock();
         let time_diff = read_time - state.last_temp_time;
@@ -333,6 +353,7 @@ impl Heater {
             ..
         } = &mut *state;
         let value = control.update(read_time, temp, target_temp, self.max_power);
+        let value = if *target_temp <= 0.0 { 0.0 } else { value };
         // Upstream schedules the change at `read_time + pwm_delay`; print-time
         // scheduling is C1d, so the output goes out immediately.
         if let Some(pwm) = &self.pwm {
@@ -495,6 +516,42 @@ impl PrinterHeaters {
                     true,
                 )
                 .expect("M105 is a valid, unique command name");
+
+            let weak_heaters = Arc::downgrade(self);
+            gcode
+                .register_command(
+                    "TURN_OFF_HEATERS",
+                    sync(move |_gcmd: &GcodeCommand| {
+                        if let Some(heaters) = weak_heaters.upgrade() {
+                            heaters.turn_off_all_heaters();
+                        }
+                        Ok(())
+                    }),
+                    Some(TURN_OFF_HEATERS_HELP),
+                    false,
+                )
+                .expect("TURN_OFF_HEATERS is a valid, unique command name");
+        }
+    }
+
+    /// Give every registered heater a target of zero
+    /// (`PrinterHeaters.turn_off_all_heaters`, `heaters.py:283-285,319-321`).
+    ///
+    /// What upstream's `cmd_TURN_OFF_HEATERS` runs, and what the default
+    /// `[idle_timeout]` script's first line reaches. Upstream also calls it from
+    /// `gcode:request_restart`; this host raises no such event handler here.
+    fn turn_off_all_heaters(&self) {
+        let heaters: Vec<Arc<Heater>> = self
+            .heaters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for heater in heaters {
+            // Zero is never range-checked: upstream's `set_temp` guards with
+            // `if degrees and ...` (`heaters.py:109`).
+            let _ = heater.set_temp(0.0);
         }
     }
 
@@ -797,8 +854,12 @@ impl PrinterHeaters {
             config.get_float_bounded("pwm_cycle_time", Some(0.100), None, None, Some(0.0), None)?;
 
         // Set up the heater pin as a PWM output, as upstream does
-        // (`heaters.py:56-61`). The `max_duration` limit is off: the host
-        // drives the pin immediately, not on a print-time schedule (C1d).
+        // (`heaters.py:56-62`). The maximum duration is upstream's
+        // `MAX_HEAT_TIME`: the firmware takes the pin down if the host stops
+        // refreshing it, which covers a host that hangs rather than exits.
+        // The host drives the pin immediately rather than on a print-time
+        // schedule (C1d), so every sensor reading re-sends the value and keeps
+        // the deadline pushed out.
         let heater_pin = config.get("heater_pin", None)?;
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -807,7 +868,7 @@ impl PrinterHeaters {
             .setup_pwm(&heater_pin, None)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         pwm.setup_cycle_time(pwm_cycle_time, false);
-        pwm.setup_max_duration(0.0);
+        pwm.setup_max_duration(MAX_HEAT_TIME);
         pwm.setup_start_value(0.0, 0.0);
 
         // Build the control algorithm.
@@ -1170,12 +1231,20 @@ mod tests {
         }
     }
 
-    /// A PWM that accepts everything.
+    /// A PWM that accepts everything, and records the `max_duration` limits it
+    /// was set up with, in call order.
     #[derive(Debug)]
-    struct FakePwm;
+    struct FakePwm {
+        max_durations: Arc<Mutex<Vec<f64>>>,
+    }
 
     impl PwmOut for FakePwm {
-        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_max_duration(&self, max_duration: f64) {
+            self.max_durations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(max_duration);
+        }
         fn setup_cycle_time(&self, _cycle_time: f64, _hardware: bool) {}
         fn setup_start_value(&self, _start: f64, _shutdown: f64) {}
         fn set_pwm(&self, _clock: u32, _value: f64) -> Result<(), McuError> {
@@ -1189,9 +1258,13 @@ mod tests {
         }
     }
 
-    /// A chip that only exists so a pin description resolves.
-    #[derive(Debug)]
-    struct NoopChip;
+    /// A chip that only exists so a pin description resolves. The PWM it hands
+    /// out logs into [`Self::pwm_log`].
+    #[derive(Debug, Default)]
+    struct NoopChip {
+        /// Every `setup_max_duration` limit a PWM from this chip was given.
+        pwm_log: Arc<Mutex<Vec<f64>>>,
+    }
 
     impl PinChip for NoopChip {
         fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
@@ -1199,7 +1272,9 @@ mod tests {
         }
 
         fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
-            Ok(Arc::new(FakePwm))
+            Ok(Arc::new(FakePwm {
+                max_durations: Arc::clone(&self.pwm_log),
+            }))
         }
     }
 
@@ -1219,6 +1294,11 @@ mod tests {
 
     /// As [`ready_printer`], on a clock the test can step.
     fn ready_printer_on(reactor: Arc<dyn Reactor>) -> Arc<Printer> {
+        ready_printer_with(NoopChip::default(), reactor)
+    }
+
+    /// As [`ready_printer`], over the given chip.
+    fn ready_printer_with(chip: NoopChip, reactor: Arc<dyn Reactor>) -> Arc<Printer> {
         let printer = Arc::new(Printer::new(reactor));
         printer
             .add_object(
@@ -1227,9 +1307,17 @@ mod tests {
             )
             .unwrap();
         let pins = Arc::new(PrinterPins::new());
-        pins.register_chip("mcu", Arc::new(NoopChip)).unwrap();
+        pins.register_chip("mcu", Arc::new(chip)).unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
         printer
+    }
+
+    /// As [`ready_printer`], also returning the `setup_max_duration` limits the
+    /// heater pins' PWMs were given, in call order.
+    fn ready_printer_logging_pwm() -> (Arc<Printer>, Arc<Mutex<Vec<f64>>>) {
+        let chip = NoopChip::default();
+        let log = Arc::clone(&chip.pwm_log);
+        (ready_printer_with(chip, ManualReactor::shared()), log)
     }
 
     #[test]
@@ -1416,6 +1504,68 @@ mod tests {
         assert!((0.0..=1.0).contains(&power), "{power}");
         // Far below target, the PID output should be saturated high.
         assert!(power > 0.5, "{power}");
+    }
+
+    /// `heaters.py:62`: a heater pin's firmware maximum duration is upstream's
+    /// `MAX_HEAT_TIME`, so a host that stops sending readings lets the firmware
+    /// take the pin down instead of holding the last duty cycle.
+    #[test]
+    fn test_a_heater_gives_its_pin_the_upstream_max_duration() {
+        let (printer, max_durations) = ready_printer_logging_pwm();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+        ]);
+        heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        assert_eq!(
+            *max_durations.lock().unwrap_or_else(|p| p.into_inner()),
+            [MAX_HEAT_TIME]
+        );
+    }
+
+    /// `heaters.py:72-74`: a heater with no target sends no power, however cold
+    /// the reading is — a bang-bang control below `target - max_delta` arms
+    /// itself, and must not reach the pin while nothing asked for heat.
+    #[test]
+    fn test_a_heater_with_no_target_sends_no_power() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "-50"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+            ("max_delta", "2"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        // `target - max_delta` is -2, so -5 is a reading bang-bang would heat
+        // for if the target were anything but zero.
+        heater.temperature_callback(1.0, -5.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+
+        // With a target it still heats as before.
+        heater.set_temp(200.0).unwrap();
+        heater.temperature_callback(2.0, -5.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
     }
 
     /// `PrinterHeaters.lookup_heater` (`heaters.py:288-292`).
@@ -1933,6 +2083,107 @@ mod tests {
             .expect("the wait ends once the reading reaches the minimum");
         // Each poll reports the real table: `T0:20.0 /200.0` at t=0 and t=1 s.
         assert_eq!(emitted(&lines), ["T0:20.0 /200.0", "T0:20.0 /200.0"]);
+    }
+
+    /// `PrinterHeaters.turn_off_all_heaters` (`heaters.py:283-285,319-321`):
+    /// every registered heater loses its target — a bed, an extruder and a
+    /// `heater_generic` — and M105 reports the zero.
+    #[tokio::test]
+    async fn test_turn_off_heaters_zeroes_every_heater_target() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        // One section per heater kind, each on its own pin.
+        let build = |id: &str, sub: Option<&str>, pin: &str| {
+            let mut section = ConfigSection::new(id, sub);
+            for (key, value) in [
+                ("sensor_type", "Fake"),
+                ("heater_pin", pin),
+                ("min_temp", "0"),
+                ("max_temp", "250"),
+                ("min_extrude_temp", "0"),
+                ("control", "watermark"),
+            ] {
+                section
+                    .parameters
+                    .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+            }
+            section
+        };
+        let extruder = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("extruder", None, "PA0")),
+                &printer,
+                Some("T0"),
+            )
+            .unwrap();
+        let bed = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("heater_bed", None, "PA1")),
+                &printer,
+                Some("B"),
+            )
+            .unwrap();
+        let generic = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("heater_generic", Some("extra"), "PA2")),
+                &printer,
+                None,
+            )
+            .unwrap();
+        for (heater, target) in [(&extruder, 200.0), (&bed, 60.0), (&generic, 100.0)] {
+            heater.set_temp(target).unwrap();
+        }
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let lines = captured_lines(&gcode);
+
+        gcode
+            .run_script("TURN_OFF_HEATERS")
+            .await
+            .expect("TURN_OFF_HEATERS runs");
+
+        for heater in [&extruder, &bed, &generic] {
+            assert_eq!(
+                heater.target_temp(),
+                0.0,
+                "{} keeps a target",
+                heater.name()
+            );
+        }
+        gcode.run_script("M105").await.expect("M105 runs");
+        assert_eq!(emitted(&lines), ["B:0.0 /0.0 T0:0.0 /0.0"]);
+    }
+
+    /// The command is upstream's: help `"Turn off all heaters"`, and the ready
+    /// table only — upstream registers it without `when_not_ready`
+    /// (`heaters.py:255-256`), unlike M105 next to it.
+    #[test]
+    fn test_turn_off_heaters_is_registered_with_upstreams_help() {
+        let printer = ready_printer();
+        let _heaters = ensure(&printer).unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+
+        let before_ready = gcode.get_status(0.0);
+        assert_eq!(before_ready["commands"]["M105"], json!({}));
+        assert!(
+            before_ready["commands"].get("TURN_OFF_HEATERS").is_none(),
+            "{before_ready}"
+        );
+
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let ready = gcode.get_status(0.0);
+        assert_eq!(
+            ready["commands"]["TURN_OFF_HEATERS"]["help"],
+            "Turn off all heaters"
+        );
     }
 
     // ------------------------------------------------------------------

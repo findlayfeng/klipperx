@@ -2708,18 +2708,17 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
 }
 
 /// The refusal a force move gives a stepper the toolhead's motion queue does
-/// not hold — the `` `[manual_stepper]` `` a `MOVE=` has not installed yet, or
-/// a carriage no kinematics put in the queue.
+/// not hold — a `[manual_stepper]` no `MOVE=` has installed yet, or a carriage
+/// no kinematics put in the queue.
 ///
 /// Upstream has no such case: every `MCU_stepper` allocates a syncemitter in
 /// `motion_queuing` as it is built (`klippy/stepper.py:50-56`), so its flush
 /// generates steps for all of them, wired into a rail or not. This port's queue
 /// holds the toolhead's and the extruders' steppers plus the ones
-/// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a `[manual_stepper]`
-/// installs there on its first `MOVE=`
-/// (`[manual_stepper](crate::core::klippy::extras::manual_stepper)`'s
-/// `ensure_motion`); taking the stepper over here instead would fight that
-/// module for its one-shot `PrinterStepper::take_stepper`.
+/// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a
+/// [`manual_stepper`](crate::core::klippy::extras::manual_stepper) installs
+/// there on its first `MOVE=`; taking the stepper over here instead would fight
+/// that module for its one-shot `PrinterStepper::take_stepper`.
 ///
 /// So the move is refused rather than carried on the timeline alone: `MSCNT`
 /// holding still with a command that reported success is the one answer these

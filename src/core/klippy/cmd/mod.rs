@@ -494,6 +494,25 @@ impl Mcu {
             .await
     }
 
+    /// [`Mcu::call_msg_clocked`] whose response must also carry `oid`.
+    ///
+    /// The TMC UART needs both at once: several chips share one MCU, and a
+    /// write carries the `minclock` gate of the print time it was asked for.
+    ///
+    /// # Errors
+    /// As [`Mcu::call_msg`].
+    pub(crate) async fn call_msg_oid_clocked<C: McuCommand, R: McuResponse>(
+        &self,
+        cmd: &C,
+        oid: u8,
+        clocks: SendClocks,
+        timeout: Duration,
+    ) -> Result<R, McuError> {
+        let dictionary = self.require_dictionary()?;
+        self.call_typed::<C, R>(cmd, Some(oid), timeout, Some(dictionary), clocks)
+            .await
+    }
+
     /// Typed call that also works **before** the identify handshake.
     ///
     /// The identify exchange is the only one that precedes the dictionary, so

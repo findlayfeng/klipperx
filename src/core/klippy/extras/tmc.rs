@@ -1477,7 +1477,40 @@ impl TmcErrorCheck {
     ///
     /// A failing read shuts the printer down and retires the timer, as
     /// upstream returns `NEVER`.
+    ///
+    /// The exchange itself runs **off** the reactor: a TMC read blocks on the
+    /// bus, and the reactor's task is what schedules steps. Inline, one slow
+    /// UART exchange stalls it — measured on the bench, a 5 s read timeout made
+    /// the reactor miss a digital-out deadline (`Missed scheduling of next
+    /// digital out event`) and the printer shut down with the motor idle.
     fn periodic_check(self: &Arc<Self>, eventtime: f64) -> Option<f64> {
+        let this = Arc::clone(self);
+        // The machine always has a runtime; a unit test does not, and there the
+        // check runs inline so it can be asserted on.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if this.check_and_report().is_err() {
+                        this.stop_checks();
+                    }
+                });
+                Some(eventtime + CHECK_INTERVAL)
+            }
+            Err(_) => match self.check_and_report() {
+                Ok(()) => Some(eventtime + CHECK_INTERVAL),
+                Err(()) => {
+                    self.stop_checks();
+                    None
+                }
+            },
+        }
+    }
+
+    /// Run the register and temperature queries, shutting the printer down on a
+    /// fault.
+    ///
+    /// `Err(())` says the fault was reported; the caller retires the timer.
+    fn check_and_report(&self) -> Result<(), ()> {
         let result = self
             .query_register(&self.drv, false)
             .and_then(|_| match &self.gstat {
@@ -1485,16 +1518,13 @@ impl TmcErrorCheck {
                 None => Ok(()),
             })
             .and_then(|_| self.query_temperature());
-        match result {
-            Ok(()) => Some(eventtime + CHECK_INTERVAL),
-            Err(err) => {
-                if let Some(printer) = self.printer.upgrade() {
-                    printer.invoke_shutdown(&err.to_string());
-                }
-                self.stop_checks();
-                None
+        if let Err(err) = result {
+            if let Some(printer) = self.printer.upgrade() {
+                printer.invoke_shutdown(&err.to_string());
             }
+            return Err(());
         }
+        Ok(())
     }
 
     /// Stop the periodic timer (`stop_checks`). Idempotent.

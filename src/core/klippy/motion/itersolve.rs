@@ -168,6 +168,31 @@ impl StepKinematics {
             || (self.active_flags.intersects(AxisFlags::Z) && segment.axes_r.z() != 0.0)
     }
 
+    /// The print time of the first queued move this stepper moves during, or
+    /// `None` while there is no such move before `flush_time`
+    /// (`itersolve_check_active`, `chelper/itersolve.c:216-231`).
+    ///
+    /// Only moves the solver has **not** generated yet are considered (its
+    /// `last_flush_time` is the horizon it reached): a move that is already
+    /// done can no longer need a motor energised, and its steps are on the MCU's
+    /// timeline already. The move's **start** time is what upstream reports —
+    /// it is the print time the motor's enable is scheduled at, so the driver is
+    /// on before the first step of that move is due.
+    pub fn check_active(&self, trapq: &Trapq, flush_time: f64) -> Option<f64> {
+        for segment in trapq.moves() {
+            if self.last_flush_time >= segment.end_time() {
+                continue;
+            }
+            if self.is_active(segment) {
+                return Some(segment.print_time);
+            }
+            if flush_time <= segment.end_time() {
+                return None;
+            }
+        }
+        None
+    }
+
     /// The stepper position for a toolhead position
     /// (`itersolve_calc_position_from_coord`): a zero-acceleration move at
     /// `pos`, evaluated in its middle.

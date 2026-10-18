@@ -855,7 +855,17 @@ impl McuObject {
     /// ([`McuConfig::open_retrying`]) and the printer's exit request ends the
     /// wait. The reopen after a `reset` passes `false` — its own loop already
     /// retries, and nesting the two would multiply the two budgets.
-    fn open_interface(&self, config: &McuConfig, retrying: bool) -> Result<Interface, KlippyError> {
+    ///
+    /// The wait runs on the blocking pool, not here: the retry sleeps between
+    /// attempts, and the machine runtime has two workers carrying the reactor
+    /// dispatcher and the send/receive tasks — a sleep of up to the retry budget
+    /// on one of them would stall everything the reactor owns for the whole
+    /// wait.
+    async fn open_interface(
+        &self,
+        config: &McuConfig,
+        retrying: bool,
+    ) -> Result<Interface, KlippyError> {
         if matches!(config.transport, Transport::BridgePort { .. }) {
             let printer = self.printer.upgrade().ok_or_else(|| {
                 KlippyError::Internal(format!(
@@ -875,19 +885,19 @@ impl McuObject {
         if !retrying {
             return config.open().map_err(KlippyError::Connection);
         }
-        let stop = || self.exit_requested();
-        config.open_retrying(&stop).map_err(KlippyError::Connection)
-    }
-
-    /// Whether the printer has been asked to leave its run loop.
-    ///
-    /// A connect that is waiting for a port polls this: an exit request —
-    /// Ctrl-C, `FIRMWARE_RESTART` — must end the wait, not be answered after the
-    /// retry budget.
-    fn exit_requested(&self) -> bool {
-        self.printer
-            .upgrade()
-            .is_some_and(|printer| printer.exit_requested())
+        let config = config.clone();
+        let printer = self.printer.upgrade();
+        tokio::task::spawn_blocking(move || {
+            let stop = move || {
+                printer
+                    .as_ref()
+                    .is_none_or(|printer| printer.exit_requested())
+            };
+            config.open_retrying(&stop)
+        })
+        .await
+        .map_err(|err| KlippyError::Internal(format!("the port retry task failed: {err}")))?
+        .map_err(KlippyError::Connection)
     }
 
     /// Open the port and identify the firmware, retrying while a rebooted board
@@ -895,14 +905,14 @@ impl McuObject {
     ///
     /// `reset` restarts the MCU, and a native-USB board disappears from the bus
     /// and re-enumerates, so the port may not be openable for a moment
-    /// (`mcu/restart.rs`). Only a bring-up that follows a reset uses this: a
-    /// plain start opens the port once and reports the error, so a missing
-    /// device is not hidden behind a retry.
+    /// (`mcu/restart.rs`). A bring-up that follows a reset retries the whole
+    /// open-and-handshake conversation here; the plain start retries only the
+    /// open (`McuConfig::open_retrying`), so a protocol error is never retried.
     async fn open_and_connect(&self, config: &McuConfig) -> Result<Arc<Mcu>, KlippyError> {
         let mut last = String::new();
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
-            let interface = match self.open_interface(config, false) {
+            let interface = match self.open_interface(config, false).await {
                 Ok(interface) => interface,
                 Err(err) => {
                     last = err.to_string();
@@ -1699,7 +1709,7 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = match self.open_interface(&config, true) {
+                let interface = match self.open_interface(&config, true).await {
                     Ok(interface) => interface,
                     Err(err) => return Err(self.recover_lost_child_port(&config, err).await),
                 };
@@ -2479,6 +2489,40 @@ mod tests {
             start.elapsed() < serial::OPEN_RETRY_BUDGET,
             "an exit request must not wait the budget, took {:?}",
             start.elapsed()
+        );
+    }
+
+    /// The wait happens on the blocking pool, so a connect that is sitting on a
+    /// port that is not there yet does not stop the runtime it was called from.
+    ///
+    /// The machine runtime runs two workers (`klippy.rs`), one of which carries
+    /// the reactor dispatcher: a retry that slept on a worker would stall every
+    /// timer, every send/receive task and the API for the whole budget. A
+    /// current-thread runtime is the sharpest form of the test — nothing at all
+    /// runs on it while a task blocks it.
+    #[tokio::test]
+    async fn test_waiting_for_a_port_does_not_block_the_runtime() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let waited = connect_to_a_missing_port(&printer()).await;
+        ticker.abort();
+
+        assert!(waited.to_string().contains("gave up"), "{waited}");
+        // The budget is 300 ms in a test build: a runtime that kept running
+        // ticks ~15 times, one that was blocked ticks none.
+        let ticks = ticks.load(Ordering::SeqCst);
+        assert!(
+            ticks >= 5,
+            "the runtime was blocked for the wait ({ticks} ticks)"
         );
     }
 

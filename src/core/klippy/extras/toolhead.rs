@@ -3686,12 +3686,31 @@ async fn home_unified(
     for rail in rails {
         // A rail whose endstop never fired comes back as `0.0`
         // (`mcu/resource/endstop.rs`); `home_axis` below reads the same value.
-        let trigger_time = rail
+        let trigger_time = match rail
             .endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
-            .map_err(command_error)?;
+        {
+            Ok(trigger_time) => trigger_time,
+            Err(err) => {
+                // The wait itself failed: the rail's dispatch never reported a
+                // trigger and `HOME_WAIT_TIMEOUT` gave up on it (a comms
+                // timeout reaches the same place). Stop the other rails' trsyncs
+                // too — the failing rail's `home_wait` stopped its own — so
+                // nothing is left armed in the firmware for a move this host has
+                // given up on; then end the move and settle the planner where
+                // the drip ran to, as the missed path below does.
+                for other in rails.iter().filter(|other| !Arc::ptr_eq(other, rail)) {
+                    if let Some(dispatch) = other.endstop().and_then(|endstop| endstop.dispatch()) {
+                        dispatch.stop();
+                    }
+                }
+                send(printer, &KlippyEvent::HomingHomingMoveEnd);
+                settle_halt_position(connected, target);
+                return Err(command_error(err));
+            }
+        };
         if trigger_time <= 0.0 {
             // Upstream keeps walking the rails after a miss, so its last note
             // is still recorded; this host errors right after the move-end
@@ -3803,7 +3822,21 @@ async fn home_axis(
         }
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // The wait itself failed — the dispatch's trigger report never
+            // arrived and `HOME_WAIT_TIMEOUT` failed it as a communication
+            // timeout. `home_wait` already disarmed the endstop and stopped its
+            // trsync in the firmware; what is left is to end the move the way
+            // the miss below does (event, planner settled where the drip ran to)
+            // and raise the error, so `G28` fails instead of parking the script
+            // that started it.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            settle_halt_position(connected, home);
+            return Err(command_error(err));
+        }
+    };
     // A miss: upstream raises "No trigger on {name} after full movement" from
     // `homing_move` **after** the move-end event (`homing.py:119`). Without
     // this the axis would be marked homed at its endstop after driving the
@@ -3969,7 +4002,16 @@ async fn probing_move(
         // run past 30 minutes).
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // A failed wait (the dispatch's report never arrived) still ends the
+            // probe: pair the begin event and raise the error, as the miss below
+            // does.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            return Err(command_error(err));
+        }
+    };
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
 
     // No trigger: upstream raises "No trigger on {name} after full movement"

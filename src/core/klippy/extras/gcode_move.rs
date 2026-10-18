@@ -806,7 +806,8 @@ fn cmd_get_position(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), Comma
         return Err(CommandError::new("Printer not ready"));
     };
     let position = toolhead.position().unwrap_or_default();
-    gcmd.respond_info(&position_lines(&report, position, &object.lock()));
+    let lines = position_lines(&report, position, &object.lock());
+    gcmd.respond_info(&lines);
     Ok(())
 }
 
@@ -828,8 +829,9 @@ fn position_lines(report: &PositionReport, toolhead_position: Coord, state: &Mov
         .collect::<Vec<_>>()
         .join(" ");
     // An axis the inverse solver cannot recover falls back to the commanded
-    // position; upstream has no answer at all there (it formats a `None` and
-    // raises), so there is nothing to match.
+    // position, which is what `calc_toolhead_pos` does for the same case
+    // (`homing.py:74-75`: `cp if cp is not None else tp`). Upstream's
+    // `GET_POSITION` has no answer there — it formats the `None` and raises.
     let kin_pos = report
         .kinematic
         .into_iter()
@@ -1255,13 +1257,16 @@ mod tests {
     }
 
     /// An axis the inverse solver cannot recover is printed from the commanded
-    /// position; upstream formats the `None` and raises, so there is no `%.6f`
-    /// to match (`calc_position` answers `None` in the cases `trilateration`
-    /// does).
+    /// position, **per axis** — `calc_toolhead_pos` does the same
+    /// (`homing.py:74-75`: `cp if cp is not None else tp`), and upstream's
+    /// `GET_POSITION` has no answer at all there (it formats the `None` and
+    /// raises).
     #[test]
     fn test_get_position_falls_back_to_the_commanded_position() {
         let mut report = cartesian_report();
-        report.kinematic = [None, None, None];
+        // Only Y is unrecoverable, and the two that are keep their solved
+        // values — neither the commanded ones nor a stand-in zero.
+        report.kinematic = [Some(11.0), None, Some(1.0)];
         let position = Coord::new(12.5, -25.0, 3.0, 0.0);
         let state = MoveState::default();
 
@@ -1269,7 +1274,7 @@ mod tests {
 
         assert_eq!(
             lines.lines().nth(2),
-            Some("kinematic: X:12.500000 Y:-25.000000 Z:3.000000")
+            Some("kinematic: X:11.000000 Y:-25.000000 Z:1.000000")
         );
     }
 

@@ -48,6 +48,16 @@
 //! `async` code that `.await`s; a callback is for work that is already ready to
 //! do.
 //!
+//! # Panics in a callback
+//!
+//! A callback that panics does not take the dispatcher down with it: the panic
+//! is caught, logged as an `error!` naming the callback, and the timer is
+//! retired — the dispatcher keeps running every other timer, so a bug in one
+//! module cannot silently freeze the whole machine. The same holds for the two
+//! other things the dispatcher calls: the latency notifier
+//! ([`Reactor::set_latency_notifier`]) and the flush callbacks of the motion
+//! queue (`motion::queuing`).
+//!
 //! # Latency
 //!
 //! Because the dispatcher runs callbacks one at a time, a slow one is directly
@@ -67,6 +77,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tracing::error;
 
 /// A timer callback: given the event time, return the next wake time.
 ///
@@ -117,6 +129,21 @@ pub struct LatencyReport {
 /// Shared (`Arc`) so the dispatcher can clone it out and call it without
 /// holding the lock that holds it.
 pub type LatencyCallback = Arc<dyn Fn(LatencyReport) + Send + Sync>;
+
+/// The message a caught panic carried, for a log line.
+///
+/// `panic!("literal")` carries a `&'static str` and a formatted one a `String`;
+/// a `panic_any` payload is neither, so its type is named rather than dropping
+/// the message from the log altogether.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// The machine's clock and its timers.
 ///
@@ -414,11 +441,19 @@ impl Dispatcher {
             }
         };
         if let Some(callback) = callback {
-            callback(LatencyReport {
-                eventtime,
-                busy,
-                callbacks,
-            });
+            // The notifier is another callback the dispatcher runs, so it is
+            // isolated the same way a timer is: a panic in it must not end the
+            // dispatcher.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(LatencyReport {
+                    eventtime,
+                    busy,
+                    callbacks,
+                });
+            }));
+            if let Err(payload) = result {
+                error!("latency notifier panicked: {}", panic_message(&*payload));
+            }
         }
     }
 }
@@ -457,6 +492,35 @@ impl Ord for TimerEntry {
             .waketime
             .total_cmp(&self.waketime)
             .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+/// Run one timer callback, catching a panic in it.
+///
+/// A panic in a callback must not end the dispatcher: that would silently stop
+/// **every** timer — MCU clock polling, idle timeouts, subscription pushes —
+/// while the machine still looks like it is running. The panic is logged with
+/// the name the callback was registered under, and the timer is dropped: a
+/// panicking callback returns no next wake time, so there is nothing to
+/// reschedule it for, and its state after a panic is not trustworthy.
+///
+/// The rest of the round still runs, so one broken timer does not make the
+/// timers behind it late.
+fn run_timer_callback(
+    name: &'static str,
+    callback: &mut TimerCallback,
+    eventtime: f64,
+) -> Option<f64> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(eventtime))) {
+        Ok(next) => next,
+        Err(payload) => {
+            error!(
+                callback = name,
+                "timer callback panicked, timer retired: {}",
+                panic_message(&*payload)
+            );
+            None
+        }
     }
 }
 
@@ -549,7 +613,7 @@ async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instan
             // one is visible in the next callback's `eventtime`.
             let started = origin.elapsed().as_secs_f64();
             let lateness = started - entry.waketime;
-            if let Some(next) = (entry.callback)(started) {
+            if let Some(next) = run_timer_callback(name, &mut entry.callback, started) {
                 entry.waketime = next;
                 entry.seq = dispatcher.next_seq();
                 dispatcher.push(entry);
@@ -587,6 +651,8 @@ pub struct ManualReactor {
 
 struct ManualTimer {
     waketime: f64,
+    /// The name the callback was registered with, shown when it panics.
+    name: &'static str,
     callback: TimerCallback,
     /// Shared with the handle whose cancellation sets it.
     cancelled: Arc<AtomicBool>,
@@ -700,7 +766,7 @@ impl ManualReactor {
                     continue;
                 }
                 fired += 1;
-                if let Some(waketime) = (timer.callback)(now) {
+                if let Some(waketime) = run_timer_callback(timer.name, &mut timer.callback, now) {
                     timer.waketime = waketime;
                     self.timers
                         .lock()
@@ -725,7 +791,7 @@ impl Reactor for ManualReactor {
 
     fn register_timer_named(
         &self,
-        _name: &'static str,
+        name: &'static str,
         callback: TimerCallback,
         waketime: f64,
     ) -> TimerHandle {
@@ -735,6 +801,7 @@ impl Reactor for ManualReactor {
             .unwrap_or_else(|p| p.into_inner())
             .push(ManualTimer {
                 waketime,
+                name,
                 callback,
                 cancelled: Arc::clone(&cancelled),
             });

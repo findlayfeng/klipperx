@@ -210,9 +210,31 @@ impl McuChip {
             .expect("the pins registry outlives its chips")
     }
 
-    /// Make the connected device reachable by the resources built on this chip.
+    /// Make the connected device reachable by the resources built on this chip,
+    /// and give that **session** its `trsync_state` router.
+    ///
+    /// Every `Mcu` is one connection, and its event table starts empty — while
+    /// a resource's handlers cannot be bound at configuration time for each of
+    /// them (`ConfigBuilder::build` runs the config callbacks once per
+    /// configuration, and a section that is reset in place keeps its chips but
+    /// gets a new session: `object.rs`'s `reconnect`). Binding here is what
+    /// makes a report that arrives **before** anything is armed harmless: a
+    /// host that was killed during a homing move leaves the firmware's periodic
+    /// `trsync_state` feed running (only `trsync_trigger` or a new
+    /// `trsync_start` deletes that timer, `src/trsync.c:171-186`), so the next
+    /// session receives reports for an oid it has never armed. Routed to the
+    /// registry, they are dropped in silence like upstream drops a late report
+    /// (`klippy/mcu.py:228-240`); without a handler they are logged as
+    /// unhandled, every `report_ticks`.
     pub fn attach(&self, mcu: Arc<Mcu>) {
-        *self.lock() = Some(mcu);
+        *self.lock() = Some(Arc::clone(&mcu));
+        // A firmware without `trsync_state` cannot home; the report (if any)
+        // then falls through to the generic "Unhandled message" warning, which
+        // names it. Nothing to add here — the arming path is what fails loudly
+        // (`McuTrsync::start`).
+        if let Err(err) = self.trsync_registry.bind(&mcu) {
+            tracing::debug!("[{}] no trsync_state router: {err}", self.name);
+        }
     }
 
     /// The connected device, or `None` before connect.

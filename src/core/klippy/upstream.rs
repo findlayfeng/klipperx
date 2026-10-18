@@ -1878,28 +1878,62 @@ fn printer_config_files() -> Vec<PathBuf> {
 ///
 /// One case per macro, each on a machine of its own: a macro that leaves an
 /// error behind must not be excused by the case after it.
+///
+/// A plain `#[test]` that owns its runtime, for the reason `a_case_runtime_shuts_down`
+/// spells out: a `#[tokio::test]` runtime drops by waiting **forever** for a parked
+/// blocking device read, so a part that outlives `teardown` hangs the suite instead
+/// of failing it. Here the shutdown is bounded, and a leak is the failure.
 #[ignore = "temporary: the mainsail.cfg gaps are being closed"]
-#[tokio::test(flavor = "multi_thread")]
-async fn the_mainsail_client_macros_load_and_run() {
-    let text = format!("{PRINTER_SECTIONS}\n{MAINSAIL_CFG}");
-    let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
-    let mut failures = Vec::new();
-    for script in MAINSAIL_SCRIPTS {
-        let (config, _) = match crate::core::klippy::config::Config::from_text(&text) {
-            Ok(pair) => pair,
-            Err(error) => panic!("mainsail.cfg does not load: {error}"),
-        };
-        let cfg = tests::injected(&config, &[(None, dict.clone())]);
-        // `run_phases` bounds the script itself and tears the machine down
-        // whatever happens; wrapping it in a caller-side timeout here would
-        // drop that future mid-flight and leave a receive task parked on the
-        // device, which blocks the test runtime from shutting down.
-        match tests::run_phases(&cfg, "<mainsail.cfg>", script).await {
-            Err(error) => failures.push(format!("{script}: setup failed: {error}")),
-            Ok(Err(error)) => failures.push(format!("{script}: {error}")),
-            Ok(Ok(())) => {}
+#[test]
+fn the_mainsail_client_macros_load_and_run() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a case runtime");
+    let failures = runtime.block_on(async {
+        let mut text = format!("{PRINTER_SECTIONS}\n{MAINSAIL_CFG}");
+        if std::env::var("KLIPPERX_MAINSAIL_BARE").is_ok() {
+            text = PRINTER_SECTIONS.to_string();
         }
-    }
+        if std::env::var("KLIPPERX_MAINSAIL_NO_MACROS").is_ok() {
+            text = drop_macros(&text);
+        }
+        if let Ok(drop_name) = std::env::var("KLIPPERX_MAINSAIL_DROP") {
+            for name in drop_name.split(',') {
+                text = drop_section(&text, name);
+            }
+        }
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let mut failures = Vec::new();
+        for script in MAINSAIL_SCRIPTS {
+            let (config, _) = match crate::core::klippy::config::Config::from_text(&text) {
+                Ok(pair) => pair,
+                Err(error) => panic!("mainsail.cfg does not load: {error}"),
+            };
+            let cfg = tests::injected(&config, &[(None, dict.clone())]);
+            // `run_phases` bounds the script itself and tears the machine down
+            // whatever happens; wrapping it in a caller-side timeout here would
+            // drop that future mid-flight and leave a receive task parked on the
+            // device, which blocks the runtime from shutting down.
+            match tests::run_phases(&cfg, "<mainsail.cfg>", script).await {
+                Err(error) => failures.push(format!("{script}: setup failed: {error}")),
+                Ok(Err(error)) => failures.push(format!("{script}: {error}")),
+                Ok(Ok(())) => {}
+            }
+        }
+        failures
+    });
+    // The corpus' own bound (`tests::CASE_SHUTDOWN_TIMEOUT`, which is private to
+    // the corpus module); the same five seconds, for the same reason.
+    const SHUTDOWN_BOUND: u64 = 5;
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(std::time::Duration::from_secs(SHUTDOWN_BOUND));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(SHUTDOWN_BOUND),
+        "the mainsail cases' runtime did not shut down within {SHUTDOWN_BOUND}s \
+         ({elapsed:?}): a part was leaked"
+    );
     assert!(
         failures.is_empty(),
         "mainsail.cfg cases failed:\n{}",
@@ -1999,8 +2033,48 @@ const MAINSAIL_SCRIPTS: &[&str] = &[
     "_TOOLHEAD_PARK_PAUSE_CANCEL",
     "_CLIENT_RETRACT",
     "_CLIENT_EXTRUDE",
-    "_CLIENT_LINEAR_MOVE X=10 Y=10 F6000",
+    // One case per macro. `_CLIENT_LINEAR_MOVE` moves X/Y/E, so its machine has
+    // to be homed first — the macro is not a way around homing checks, and the
+    // case says so by homing the axes up front (`F=6000` is a **parameter**; a
+    // bare `F6000` is not a parameter at all and upstream's `shlex` reader
+    // refuses the line as malformed).
+    "SET_KINEMATIC_POSITION X=0 Y=0 Z=0\n_CLIENT_LINEAR_MOVE X=10 Y=10 F=6000",
     "PAUSE",
     "RESUME",
     "CANCEL_PRINT",
 ];
+
+/// Temporary bisect helper for the mainsail leak hunt.
+fn drop_section(text: &str, name: &str) -> String {
+    let header = format!("[{name}]");
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping = trimmed == header;
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Temporary bisect helper: drop every `[gcode_macro …]` section.
+fn drop_macros(text: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping = trimmed.starts_with("[gcode_macro");
+        }
+        if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}

@@ -24,6 +24,7 @@
 //! | output formatter | Python's `str` ([`format_output`]) | a tag renders `str(value)`, so a container prints its elements' `repr` (`{'call': 'PAUSE'}`, `['a', 1]`); the engine's own formatter prints them with Rust's `Debug` (`{call: PAUSE}`) |
 //! | filters | the engine's, with `int`, `float`, `min`, `max` replaced | the corpus spells its coercions `params.S\|default(1000.0)\|float` and folds lists with `\|min`/`\|max` |
 //! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which `gcode_macro` bodies call — the corpus spells `range`, this module's stepper-macro test binds `namespace` |
+//! | unknown method callback | Python's `str` and `list` methods ([`unknown_method`]) | the engine has no method table for a plain string or list, so `client.runout_sensor.split(" ")[1]` (`mainsail.cfg`'s `RESUME`, on every resume) would fail as `unknown method` — the callback answers it; see the deviation table's `append`/`extend` row |
 //!
 //! Compiling and evaluating are **two phases**: [`Template::parse`] compiles the
 //! body into the environment (`Environment::add_template_owned`),
@@ -91,6 +92,7 @@
 //! | printing a *silent* undefined (`{x if c}`, which has no `else`) | blank | an `undefined value` error: the engine's own formatter lets *that* one print nothing (it tells the two kinds of undefined apart), a custom formatter does not — `ValueKind::Undefined` is one kind — so the strict check [`format_output`] repeats covers both; a *default* undefined (`{nope}`) is the error it always was |
 //! | `"…%s…" % value` (a **string literal** directly left of `%`) | Python's printf formatting | rewritten at compile time into the engine's `\|format` filter, which is the same printf formatting with its arguments passed separately: `{"Restoring \"%s\"" % x}` → `{"Restoring \"%s\""\|format(x)}` ([`rewrite_printf_formatting`]). Both tag kinds carry expressions, so `{ … }` and `{% … %}` are both rewritten; a `{# … #}` comment is not. Narrow on purpose: the literal must be alone on the left and its `%` must end an operand position — any other `%` stays the remainder operator, and a formatting this rewrite cannot read fails the load the way it did before rather than mis-rendering |
 //! | `"%(key)s" % {'key': v}` (a mapping operand) | formatted from the mapping | unsupported: the operand right of `%` is a dict literal this rewrite does not read, so the tag keeps its Python spelling and fails the load (`%` is the remainder, which a string left operand cannot take); `\|format` reads a mapping only when the whole operand is one map value |
+//! | a method that mutates a **list** (`append`, `extend`, `pop`) | appends/extends/pops in place | `None`, and the list is unchanged: the engine's lists are **values**, so nothing can write back to the list a body holds. A body that collects into one (`{% set _d = prompt_txt.append(…) %}`, `mainsail.cfg`'s abort prompt) therefore reads an **empty** list afterwards — one `debug!` line per process records that the degradation happened. The read-only methods (`index`, `count`) are Python's own |
 //!
 //! Detail wording differs wherever the engine owns the wording. The frames
 //! (`Error loading template '<name>'\nline <n>: …`, `Error evaluating
@@ -116,6 +118,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use minijinja::syntax::SyntaxConfig;
@@ -125,6 +128,7 @@ use minijinja::{
     UndefinedBehavior::Strict,
 };
 use serde_json::Value;
+use tracing::debug;
 
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
@@ -862,8 +866,10 @@ fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
 
 /// The environment every body is compiled into: upstream's delimiters,
 /// undefined behavior and escaping, this port's trailing-newline rule, the four
-/// filters the corpus spells differently, and the two Jinja2 globals the
-/// corpus (`range`) and this module's stepper-macro test (`namespace`) call.
+/// filters the corpus spells differently, the two Jinja2 globals the corpus
+/// (`range`) and this module's stepper-macro test (`namespace`) call, and the
+/// unknown-method callback that answers `str`/`list` method calls
+/// ([`unknown_method`]).
 fn environment() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_syntax(
@@ -884,6 +890,7 @@ fn environment() -> Environment<'static> {
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
     env.set_formatter(format_output);
+    env.set_unknown_method_callback(unknown_method);
     env
 }
 
@@ -1143,6 +1150,475 @@ fn ordering_name(value: &MjValue) -> &'static str {
         ValueKind::Map => "dict",
         _ => "object",
     }
+}
+
+/// The Python type name a method's argument error uses (`replace() argument
+/// 'old' must be str, not int`). Numbers are told apart as `int`/`float`,
+/// which is `TypeError`'s wording — unlike [`ordering_name`], whose two-type
+/// form keeps the old subset's `min`/`max` messages.
+fn python_type(value: &MjValue) -> &'static str {
+    match value.kind() {
+        ValueKind::Number if value.as_i64().is_some() => "int",
+        ValueKind::Number => "float",
+        ValueKind::Bool => "bool",
+        ValueKind::String => "str",
+        ValueKind::None | ValueKind::Undefined => "NoneType",
+        ValueKind::Seq => "list",
+        ValueKind::Map => "dict",
+        _ => "object",
+    }
+}
+
+// ===========================================================================
+// Methods
+// ===========================================================================
+
+/// The answer for a method call on a value the engine has no method table for
+/// — every plain string and list, which is why a body's
+/// `client.runout_sensor.split(" ")[1]` (`mainsail.cfg`'s `RESUME`, on every
+/// resume) would otherwise fail as `unknown method`.
+///
+/// A `str` gets [`string_method`], a `list` gets [`list_method`]. Everything
+/// else — another type, another name — stays the `UnknownMethod` error it was,
+/// so a body still hears about a method nothing implements.
+///
+/// The one gap is **mutation**: the engine's lists are values, so
+/// `list.append`/`extend`/`pop` cannot write back to the list the body holds
+/// (see [`mixed_method`]); they answer `None` rather than fail, so the corpus'
+/// `{% set _d = prompt_txt.append(…) %}` keeps rendering.
+fn unknown_method(
+    _state: &State,
+    value: &MjValue,
+    method: &str,
+    args: &[MjValue],
+) -> Result<MjValue, MjError> {
+    match value.kind() {
+        ValueKind::String => string_method(value.as_str().unwrap_or_default(), method, args),
+        ValueKind::Seq => list_method(value, method, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// The method `method` on the string `text`, with Python's `str` semantics for
+/// each name this port implements; an unimplemented name is `UnknownMethod`.
+fn string_method(text: &str, method: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    match method {
+        "split" => method_split(text, args),
+        "strip" => strip(method, text, args, Side::Both),
+        "lstrip" => strip(method, text, args, Side::Left),
+        "rstrip" => strip(method, text, args, Side::Right),
+        "lower" => {
+            takes_no_arguments(method, args)?;
+            Ok(MjValue::from(text.to_lowercase()))
+        }
+        "upper" => {
+            takes_no_arguments(method, args)?;
+            Ok(MjValue::from(text.to_uppercase()))
+        }
+        "replace" => method_replace(text, args),
+        "startswith" => affix(method, text, args, Affix::Start),
+        "endswith" => affix(method, text, args, Affix::End),
+        "join" => method_join(text, args),
+        "find" => method_find(text, args),
+        "count" => method_count(text, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// The method `method` on the list `value`: the three that would mutate it are
+/// answered by [`mixed_method`], the read-only ones are Python's own, and every
+/// other name is `UnknownMethod`.
+fn list_method(value: &MjValue, method: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    match method {
+        "append" => {
+            arg_count(method, args, 1, 1)?;
+            Ok(mixed_method(method))
+        }
+        "extend" => {
+            arg_count(method, args, 1, 1)?;
+            // Python refuses a non-iterable argument instead of extending
+            // with it, so the degradation never swallows that mistake.
+            match args[0].kind() {
+                ValueKind::String | ValueKind::Seq | ValueKind::Iterable | ValueKind::Map => {
+                    Ok(mixed_method(method))
+                }
+                _ => Err(MjError::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "{method}() argument must be an iterable, not {}",
+                        python_type(&args[0])
+                    ),
+                )),
+            }
+        }
+        "pop" => {
+            arg_count(method, args, 0, 1)?;
+            Ok(mixed_method(method))
+        }
+        "index" => list_index(value, args),
+        "count" => list_count(value, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// A method whose effect is a **mutation** of its receiver: this port's lists
+/// are values, so there is no way to write back to the list a body holds.
+///
+/// `append` and `extend` return `None`, which is what Python returns, and the
+/// list keeps its contents — a body that collects into a list this way
+/// (`{% set _d = prompt_txt.append(…) %}`, `mainsail.cfg`'s abort prompt) gets
+/// an always-empty list. `pop` returns `None` too instead of the item it could
+/// not remove. One `debug!` line per process records that the degradation
+/// happened, so a render is never silent about it.
+fn mixed_method(method: &str) -> MjValue {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        debug!(
+            "template: list.{}() returns None and leaves the list unchanged — this port's lists \
+             are values, so a macro cannot collect into one",
+            method
+        );
+    }
+    MjValue::from(())
+}
+
+/// A method's argument count, checked the way Python's method errors spell it:
+/// `takes at most N arguments (M given)` / `takes at least N positional
+/// arguments (M given)`. Neither wording runs the method's body.
+fn arg_count(method: &str, args: &[MjValue], min: usize, max: usize) -> Result<(), MjError> {
+    if args.len() < min {
+        return Err(MjError::new(
+            ErrorKind::MissingArgument,
+            format!(
+                "{method}() takes at least {min} positional arguments ({} given)",
+                args.len()
+            ),
+        ));
+    }
+    if args.len() > max {
+        return Err(MjError::new(
+            ErrorKind::TooManyArguments,
+            format!(
+                "{method}() takes at most {max} arguments ({} given)",
+                args.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `str`'s own no-argument methods (`lower`, `upper`), worded as CPython words
+/// them: `str.lower() takes no arguments (1 given)`.
+fn takes_no_arguments(method: &str, args: &[MjValue]) -> Result<(), MjError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(MjError::new(
+        ErrorKind::TooManyArguments,
+        format!("str.{method}() takes no arguments ({} given)", args.len()),
+    ))
+}
+
+/// One argument as a string, or the `TypeError` Python raises for a value that
+/// is not one.
+fn as_text<'a>(method: &str, value: &'a MjValue, name: &str) -> Result<&'a str, MjError> {
+    value.as_str().ok_or_else(|| {
+        MjError::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "{method}() argument '{name}' must be str, not {}",
+                python_type(value)
+            ),
+        )
+    })
+}
+
+/// One argument as an integer, or the `TypeError` Python raises for a value
+/// that is not one.
+fn as_int(method: &str, value: &MjValue, name: &str) -> Result<i64, MjError> {
+    value.as_i64().ok_or_else(|| {
+        MjError::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "{method}() argument '{name}' must be int, not {}",
+                python_type(value)
+            ),
+        )
+    })
+}
+
+/// `str.split([sep[, maxsplit]])`.
+///
+/// Splitting on a separator keeps every empty piece (`' a  b '.split(' ')` is
+/// `['', 'a', '', 'b', '']`) and, with a `maxsplit`, keeps the tail verbatim;
+/// splitting on whitespace drops the leading run, treats any run of whitespace
+/// as one separator, and drops nothing else. An empty separator is Python's
+/// `ValueError`.
+fn method_split(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("split", args, 0, 2)?;
+    let maxsplit = match args.get(1) {
+        Some(arg) => Some(as_int("split", arg, "maxsplit")?),
+        None => None,
+    };
+    let pieces: Vec<MjValue> = match args.first() {
+        None => split_whitespace(text, maxsplit),
+        Some(sep) if sep.kind() == ValueKind::None => split_whitespace(text, maxsplit),
+        Some(sep) => {
+            let sep = as_text("split", sep, "sep")?;
+            if sep.is_empty() {
+                return Err(MjError::new(ErrorKind::InvalidOperation, "empty separator"));
+            }
+            let limit = match maxsplit {
+                Some(maxsplit) => usize::try_from(maxsplit)
+                    .map_or(usize::MAX, |maxsplit| maxsplit.saturating_add(1)),
+                None => usize::MAX,
+            };
+            text.splitn(limit, sep).map(MjValue::from).collect()
+        }
+    };
+    Ok(MjValue::from(pieces))
+}
+
+/// `str.split()` with no separator: the leading run of whitespace is dropped,
+/// a run separates two pieces, and with a `maxsplit` the tail after the last
+/// split is kept verbatim — `' a  b   c  '.split(None, 1)` is
+/// `['a', 'b   c  ']`, trailing whitespace and all.
+fn split_whitespace(text: &str, maxsplit: Option<i64>) -> Vec<MjValue> {
+    let mut rest = text.trim_start_matches(char::is_whitespace);
+    let mut left = maxsplit.map(|maxsplit| maxsplit.max(0) as usize);
+    let mut pieces = Vec::new();
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        if left == Some(0) {
+            pieces.push(MjValue::from(rest));
+            break;
+        }
+        match rest.find(char::is_whitespace) {
+            Some(index) => {
+                pieces.push(MjValue::from(&rest[..index]));
+                rest = rest[index..].trim_start_matches(char::is_whitespace);
+                left = left.map(|left| left - 1);
+            }
+            None => {
+                pieces.push(MjValue::from(rest));
+                break;
+            }
+        }
+    }
+    pieces
+}
+
+/// Which end [`strip`] trims.
+#[derive(Clone, Copy)]
+enum Side {
+    Both,
+    Left,
+    Right,
+}
+
+/// `str.strip([chars])` — and the one-sided `lstrip`/`rstrip`. No argument
+/// trims whitespace (Unicode `White_Space`, which is Python's set minus the
+/// `\x1c`–`\x1f` controls); an argument trims any of its characters.
+fn strip(method: &str, text: &str, args: &[MjValue], side: Side) -> Result<MjValue, MjError> {
+    arg_count(method, args, 0, 1)?;
+    let trimmed = match args.first() {
+        None => trim(text, side, char::is_whitespace),
+        Some(arg) => {
+            let chars = as_text(method, arg, "chars")?;
+            trim(text, side, |ch: char| chars.contains(ch))
+        }
+    };
+    Ok(MjValue::from(trimmed))
+}
+
+fn trim(text: &str, side: Side, stripped: impl Fn(char) -> bool) -> &str {
+    match side {
+        Side::Both => text.trim_matches(stripped),
+        Side::Left => text.trim_start_matches(stripped),
+        Side::Right => text.trim_end_matches(stripped),
+    }
+}
+
+/// `str.replace(old, new[, count])`. A negative `count` is unlimited, as in
+/// Python, and an empty `old` inserts `new` between every character (and at
+/// both ends), which is Python's own reading of it.
+fn method_replace(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("replace", args, 2, 3)?;
+    let old = as_text("replace", &args[0], "old")?;
+    let new = as_text("replace", &args[1], "new")?;
+    let replaced = match args.get(2) {
+        None => text.replace(old, new),
+        Some(arg) => match usize::try_from(as_int("replace", arg, "count")?) {
+            Ok(count) => text.replacen(old, new, count),
+            // A negative count is unlimited, as in Python.
+            Err(_) => text.replace(old, new),
+        },
+    };
+    Ok(MjValue::from(replaced))
+}
+
+/// Which end [`affix`] tests.
+#[derive(Clone, Copy)]
+enum Affix {
+    Start,
+    End,
+}
+
+/// `str.startswith(prefix[, start[, end]])` and `str.endswith`.
+///
+/// Python's first argument may be a tuple of prefixes; the engine has no
+/// tuple, so a **list** of them stands in for it. `start`/`end` slice the
+/// string the way Python's do ([`py_slice`]).
+fn affix(method: &str, text: &str, args: &[MjValue], affix: Affix) -> Result<MjValue, MjError> {
+    arg_count(method, args, 1, 3)?;
+    let (_, slice) = py_slice(method, text, args.get(1), args.get(2))?;
+    let candidates: Vec<MjValue> = match args[0].kind() {
+        ValueKind::Seq => args[0]
+            .try_iter()
+            .map_err(|_| uniterable(&args[0]))?
+            .collect(),
+        _ => vec![args[0].clone()],
+    };
+    for candidate in &candidates {
+        let candidate = as_text(method, candidate, "prefix")?;
+        let matched = match affix {
+            Affix::Start => slice.starts_with(candidate),
+            Affix::End => slice.ends_with(candidate),
+        };
+        if matched {
+            return Ok(MjValue::from(true));
+        }
+    }
+    Ok(MjValue::from(false))
+}
+
+/// `str.join(iterable)` — every item must be a string, as Python's own
+/// `TypeError` demands.
+fn method_join(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("join", args, 1, 1)?;
+    let items: Vec<MjValue> = match args[0].kind() {
+        ValueKind::String | ValueKind::Seq | ValueKind::Iterable | ValueKind::Map => args[0]
+            .try_iter()
+            .map_err(|_| uniterable(&args[0]))?
+            .collect(),
+        _ => {
+            return Err(MjError::new(
+                ErrorKind::InvalidOperation,
+                "can only join an iterable",
+            ))
+        }
+    };
+    let mut joined = String::new();
+    for (index, item) in items.iter().enumerate() {
+        let piece = item.as_str().ok_or_else(|| {
+            MjError::new(
+                ErrorKind::InvalidOperation,
+                format!(
+                    "sequence item {index}: expected str instance, {} found",
+                    python_type(item)
+                ),
+            )
+        })?;
+        if index > 0 {
+            joined.push_str(text);
+        }
+        joined.push_str(piece);
+    }
+    Ok(MjValue::from(joined))
+}
+
+/// `str.find(sub[, start[, end]])`: the **character** index of the first
+/// occurrence (Python counts code points, not bytes), `-1` when there is none.
+fn method_find(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("find", args, 1, 3)?;
+    let sub = as_text("find", &args[0], "sub")?;
+    let (begin, slice) = py_slice("find", text, args.get(1), args.get(2))?;
+    let found = slice.find(sub).map_or(-1, |byte| {
+        begin as i64 + slice[..byte].chars().count() as i64
+    });
+    Ok(MjValue::from(found))
+}
+
+/// `str.count(sub[, start[, end]])`: non-overlapping occurrences, as Python
+/// counts them (`'aaa'.count('aa')` is `1`); an empty `sub` counts the gaps
+/// between characters, `len + 1` of them.
+fn method_count(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("count", args, 1, 3)?;
+    let sub = as_text("count", &args[0], "sub")?;
+    let (_, slice) = py_slice("count", text, args.get(1), args.get(2))?;
+    Ok(MjValue::from(slice.matches(sub).count() as i64))
+}
+
+/// `list.index(value)` — the first equal item's index; Python's `ValueError`
+/// when there is none.
+fn list_index(value: &MjValue, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("index", args, 1, 1)?;
+    let found = value
+        .try_iter()
+        .map_err(|_| uniterable(value))?
+        .position(|item| item == args[0]);
+    match found {
+        Some(index) => Ok(MjValue::from(index as i64)),
+        None => Err(MjError::new(
+            ErrorKind::InvalidOperation,
+            format!("{} is not in list", python_repr(&args[0])),
+        )),
+    }
+}
+
+/// `list.count(value)` — how many items equal `value`.
+fn list_count(value: &MjValue, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("count", args, 1, 1)?;
+    let count = value
+        .try_iter()
+        .map_err(|_| uniterable(value))?
+        .filter(|item| *item == args[0])
+        .count();
+    Ok(MjValue::from(count as i64))
+}
+
+/// The Python slice of `text` the `start`/`end` arguments of
+/// `find`/`count`/`startswith`/`endswith` name: a negative index counts back
+/// from the end, both are clamped to the string's length, and `start >= end`
+/// is the empty string. Returns the slice with the **character** index it
+/// starts at, so a found offset can be reported the way Python reports it.
+fn py_slice<'a>(
+    method: &str,
+    text: &'a str,
+    start: Option<&MjValue>,
+    end: Option<&MjValue>,
+) -> Result<(usize, &'a str), MjError> {
+    let length = text.chars().count() as i64;
+    let bound = |arg: Option<&MjValue>, default: i64, name: &str| -> Result<i64, MjError> {
+        match arg {
+            None => Ok(default),
+            Some(value) => {
+                let index = as_int(method, value, name)?;
+                Ok(if index < 0 {
+                    (length + index).max(0)
+                } else {
+                    index.min(length)
+                })
+            }
+        }
+    };
+    let first = bound(start, 0, "start")?;
+    let last = bound(end, length, "end")?;
+    if first >= last {
+        return Ok((first as usize, ""));
+    }
+    let from = char_offset(text, first as usize);
+    let to = char_offset(text, last as usize);
+    Ok((first as usize, &text[from..to]))
+}
+
+/// The byte offset character `index` starts at (`text.len()` past the end).
+fn char_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 // ===========================================================================
@@ -2441,5 +2917,218 @@ STEPPER_RELEASE";
         );
         assert_eq!(backward.matches("G4 P5").count(), 8, "{backward}");
         assert_eq!(backward.matches("G4 P5\n").count(), 8, "{backward}");
+    }
+
+    /// `str.split`, the method the Mainsail corpus' `RESUME` depends on:
+    /// `client.runout_sensor.split(" ")[1]` runs on every resume
+    /// (`mainsail.cfg`). Each shape is what
+    /// `python3 -c "print(…split(…))"` prints.
+    #[test]
+    fn split_follows_python_for_whitespace_separators_and_maxsplit() {
+        // No argument: a run of whitespace separates, nothing empty survives.
+        assert_eq!(ok("{ 'a b  c'.split() }"), "['a', 'b', 'c']");
+        assert_eq!(ok("{ '  '.split() }"), "[]");
+        assert_eq!(ok("{ ''.split() }"), "[]");
+        // A separator: every empty piece is kept, consecutive separators too.
+        assert_eq!(ok("{ ' a  b '.split(' ') }"), "['', 'a', '', 'b', '']");
+        assert_eq!(ok("{ 'a,b'.split(',') }"), "['a', 'b']");
+        assert_eq!(ok("{ 'a'.split(',') }"), "['a']");
+        // `maxsplit` leaves the tail alone, and the whitespace form keeps its
+        // trailing blanks (`' a  b   c  '.split(None, 1)` in Python).
+        assert_eq!(ok("{ 'a b c'.split(' ', 1) }"), "['a', 'b c']");
+        assert_eq!(ok("{ 'a,b,,c'.split(',', 2) }"), "['a', 'b', ',c']");
+        assert_eq!(ok("{ ' a  b   c  '.split(none, 1) }"), "['a', 'b   c  ']");
+        assert_eq!(ok("{ ' a  b '.split(none, 0) }"), "['a  b ']");
+        // The corpus' own line.
+        assert_eq!(
+            ok("{ 'runout_sensor: TRIGGERED'.split(' ')[1] }"),
+            "TRIGGERED"
+        );
+
+        let error =
+            render("{ 'a b'.split('') }", &mut context(&[], "")).expect_err("empty separator");
+        assert!(error.to_string().contains("empty separator"), "{error}");
+    }
+
+    /// `str.strip`/`lstrip`/`rstrip`, `lower`/`upper` and `replace`.
+    #[test]
+    fn strip_case_and_replace_follow_python() {
+        assert_eq!(ok("[{ '  x  '.strip() }]"), "[x]");
+        assert_eq!(ok("[{ '  x  '.lstrip() }]"), "[x  ]");
+        assert_eq!(ok("[{ '  x  '.rstrip() }]"), "[  x]");
+        // An argument is a *set* of characters, not a substring.
+        assert_eq!(ok("{ 'xxaxx'.strip('x') }"), "a");
+        assert_eq!(ok("{ 'xyaxy'.strip('xy') }"), "a");
+        assert_eq!(ok("{ 'AbC'.lower() }/{ 'AbC'.upper() }"), "abc/ABC");
+
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+') }"), "a+b+c");
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', 1) }"), "a+b-c");
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', 0) }"), "a-b-c");
+        // A negative count is unlimited, as in Python.
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', -1) }"), "a+b+c");
+        // An empty `old` inserts between every character and at both ends.
+        assert_eq!(ok("{ 'abc'.replace('', '-') }"), "-a-b-c-");
+        assert_eq!(ok("{ 'abc'.replace('', '-', 2) }"), "-a-bc");
+    }
+
+    /// `str.startswith`/`endswith` with the optional `start`/`end` window.
+    #[test]
+    fn affixes_follow_python_including_the_slice_window() {
+        assert_eq!(ok("{ 'setup.cfg'.startswith('setup') }"), "True");
+        assert_eq!(ok("{ 'setup.cfg'.endswith('.cfg') }"), "True");
+        assert_eq!(ok("{ 'setup.cfg'.startswith('cfg') }"), "False");
+        assert_eq!(ok("{ 'abc'.startswith('b', 1) }"), "True");
+        assert_eq!(ok("{ 'abc'.endswith('b', 0, 2) }"), "True");
+        assert_eq!(ok("{ 'abc'.startswith('b', 0, 1) }"), "False");
+        // Negative indexes count from the end.
+        assert_eq!(ok("{ 'abc'.endswith('c', -1) }"), "True");
+        // A list stands in for Python's tuple of prefixes.
+        assert_eq!(ok("{ 'abc'.startswith(['x', 'a']) }"), "True");
+        assert_eq!(ok("{ 'abc'.endswith(['x', 'a']) }"), "False");
+    }
+
+    /// `str.find` and `str.count`: Python's **character** indexes, its window
+    /// arguments, and `find`'s `-1`.
+    #[test]
+    fn find_and_count_follow_python() {
+        assert_eq!(ok("{ 'abcabc'.find('bc') }"), "1");
+        assert_eq!(ok("{ 'abc'.find('z') }"), "-1");
+        assert_eq!(ok("{ 'abcabc'.find('bc', 2) }"), "4");
+        assert_eq!(ok("{ 'abc'.find('', 1) }"), "1");
+        // Code points, not bytes, as Python counts them.
+        assert_eq!(ok("{ 'héllo'.find('llo') }"), "2");
+
+        assert_eq!(ok("{ 'aaa'.count('aa') }"), "1");
+        assert_eq!(ok("{ 'abcabc'.count('bc', 2) }"), "1");
+        assert_eq!(ok("{ 'abc'.count('') }"), "4");
+        assert_eq!(ok("{ 'abc'.count('z') }"), "0");
+    }
+
+    /// `str.join`: the separator comes from the receiver, the items must be
+    /// strings, and a string argument iterates as its characters.
+    #[test]
+    fn join_follows_python() {
+        assert_eq!(ok("{ '-'.join(['a', 'b']) }"), "a-b");
+        assert_eq!(ok("{ ''.join(['a', 'b']) }"), "ab");
+        assert_eq!(ok("[{ '-'.join([]) }]"), "[]");
+        assert_eq!(ok("{ '-'.join('abc') }"), "a-b-c");
+
+        let error = render("{ '-'.join([1]) }", &mut context(&[], "")).expect_err("item");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence item 0: expected str instance, int found"),
+            "{error}"
+        );
+        let error = render("{ '-'.join(1) }", &mut context(&[], "")).expect_err("not iterable");
+        assert!(
+            error.to_string().contains("can only join an iterable"),
+            "{error}"
+        );
+    }
+
+    /// The list methods that read (`index`, `count`) are Python's own, and the
+    /// three that would mutate are answered with `None`: the engine's lists are
+    /// values, so nothing can write back to the list a body holds — the
+    /// deviation table's row. What a body sees: `None` back, the list as it was.
+    #[test]
+    fn list_reads_work_and_list_mutation_degrades_to_none() {
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.count(2) }"), "2");
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.count(3) }"), "0");
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.index(2) }"), "1");
+        let error =
+            render("{% set n = [1] %}{ n.index(3) }", &mut context(&[], "")).expect_err("absent");
+        assert!(error.to_string().contains("3 is not in list"), "{error}");
+
+        // `{% set _d = prompt_txt.append(…) %}` — `mainsail.cfg`'s abort
+        // prompt — renders, answers `None`, and collects nothing.
+        assert_eq!(
+            ok("{% set n = [1, 2] %}{% set _d = n.append(3) %}{ n }/{ _d }"),
+            "[1, 2]/None"
+        );
+        assert_eq!(
+            ok("{% set n = [1] %}{% set _d = n.extend([2, 3]) %}{ n }"),
+            "[1]"
+        );
+        assert_eq!(
+            ok("{% set n = [1, 2] %}{% set _d = n.pop() %}{ n }/{ _d }"),
+            "[1, 2]/None"
+        );
+
+        let error =
+            render("{% set n = [1] %}{ n.extend(1) }", &mut context(&[], "")).expect_err("int");
+        assert!(
+            error
+                .to_string()
+                .contains("extend() argument must be an iterable, not int"),
+            "{error}"
+        );
+    }
+
+    /// A method nothing implements — another name, another type — stays the
+    /// engine's `unknown method` error rather than a quiet `None`.
+    #[test]
+    fn unimplemented_methods_stay_unknown_method_errors() {
+        for source in [
+            "{ 'a'.nosuch() }",
+            "{ 'a'.sort() }",
+            "{ params.split('a') }",
+            "{% set n = [1] %}{ n.sort() }",
+            "{ (1).split() }",
+        ] {
+            let error = render(source, &mut context(&[], "")).expect_err(source);
+            assert!(
+                error.to_string().contains("has no method named"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    /// A wrong argument is Python's `TypeError` shape — an argument count or a
+    /// type — not a silently wrong answer.
+    #[test]
+    fn method_arguments_are_checked_like_pythons() {
+        let error = render("{ 'a b'.split(' ', 1, 2) }", &mut context(&[], "")).expect_err("3");
+        assert!(
+            error
+                .to_string()
+                .contains("split() takes at most 2 arguments (3 given)"),
+            "{error}"
+        );
+        let error = render("{ 'a b'.split(1) }", &mut context(&[], "")).expect_err("int sep");
+        assert!(
+            error
+                .to_string()
+                .contains("split() argument 'sep' must be str, not int"),
+            "{error}"
+        );
+        let error = render("{ 'a'.replace('a') }", &mut context(&[], "")).expect_err("1 arg");
+        assert!(
+            error
+                .to_string()
+                .contains("replace() takes at least 2 positional arguments (1 given)"),
+            "{error}"
+        );
+        let error = render("{ 'a'.lower(1) }", &mut context(&[], "")).expect_err("1 arg");
+        assert!(
+            error
+                .to_string()
+                .contains("str.lower() takes no arguments (1 given)"),
+            "{error}"
+        );
+        let error = render("{ ' a '.strip(1) }", &mut context(&[], "")).expect_err("int chars");
+        assert!(
+            error
+                .to_string()
+                .contains("strip() argument 'chars' must be str, not int"),
+            "{error}"
+        );
+        let error = render("{ 'a'.find('a', 'x') }", &mut context(&[], "")).expect_err("start");
+        assert!(
+            error
+                .to_string()
+                .contains("find() argument 'start' must be int, not str"),
+            "{error}"
+        );
     }
 }

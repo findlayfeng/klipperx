@@ -16,7 +16,7 @@
 //! * `Ready` — idle, with the timeout armed.
 //!
 //! The section is **optional**, as it is upstream: `toolhead.add_printer_objects`
-//! loads the module by name (`toolhead.py:603-611`) and `PrinterConfig.getsection`
+//! loads the module by name (`toolhead.py:604-614`) and `PrinterConfig.getsection`
 //! hands an absent section an empty config, so the defaults above are the whole
 //! configuration. `idle_timeout` is therefore in
 //! [`DEFAULT_MODULES`](crate::core::klippy::load), and a `printer.cfg` that never
@@ -115,7 +115,7 @@ use crate::core::klippy::reactor::TimerHandle;
 
 // Only the bare section exists upstream (`idle_timeout.py:117-118`), and
 // upstream builds it without one too — it is in the loader's `DEFAULT_MODULES`
-// (`toolhead.py:603-611`; see the module docs).
+// (`toolhead.py:604-614`; see the module docs).
 section!("idle_timeout", order = 30, load = load_config);
 
 /// Upstream's default idle script (`idle_timeout.py:8-13`); the leading newline
@@ -915,7 +915,7 @@ mod tests {
     }
 
     /// Upstream loads this module from `toolhead.add_printer_objects`
-    /// (`toolhead.py:603-611`), so a config without `[idle_timeout]` still has
+    /// (`toolhead.py:604-614`), so a config without `[idle_timeout]` still has
     /// the object, its default timeout and the command — what `mainsail.cfg`
     /// reads unconditionally (`printer.idle_timeout.state`,
     /// `printer.configfile.settings.idle_timeout.timeout`).

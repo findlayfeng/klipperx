@@ -166,7 +166,14 @@ mod tests {
 
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "gcode_arcs"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "gcode_arcs",
+                "gcode_macro",
+                "idle_timeout"
+            ]
         );
         let object = printer
             .lookup_object("gcode_arcs")

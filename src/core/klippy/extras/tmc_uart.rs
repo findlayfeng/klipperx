@@ -954,12 +954,14 @@ impl TmcTransport for TmcUart {
         write_register_verified(
             &self.name,
             reg_name,
+            val,
             &mut ifcnt,
             || {
                 self.bitbang
                     .reg_write(self.instance_id.as_deref(), self.addr, reg, val, print_time)
             },
             || Ok(self.do_get_register("IFCNT")?.data),
+            || Ok(self.do_get_register(reg_name)?.data),
         )
     }
 
@@ -1002,23 +1004,35 @@ fn read_register_with_retries(
 }
 
 /// [`UART_ATTEMPTS`] attempts at one write, each verified through `IFCNT`
-/// (`set_register`).
+/// (`set_register`) **or** a read-back of the register itself.
 ///
 /// `ifcnt` is the cached counter (upstream's `self.ifcnt`): it is read once,
 /// before the first write, and then kept at whatever the last attempt read
-/// back. An attempt is accepted only when the counter came back as
-/// `(baseline + 1) & 0xff`, which is how the chip says it saw exactly one more
-/// frame.
+/// back. An attempt is accepted when either
+///
+/// * the counter came back as `(baseline + 1) & 0xff` — the chip saw exactly
+///   one more frame (upstream's rule), or
+/// * the register reads back the value that was just written.
+///
+/// The second arm exists because a TMC2209 on a single-wire UART really does
+/// drop frames: on the bench a write changed `CHOPCONF` while `IFCNT` stayed
+/// put, and back-to-back writes advanced it by one instead of five
+/// (`command_tmcuart_send` drops a request that arrives while the line is
+/// busy, `src/tmcuart.c`). Upstream never notices because its blocking
+/// transport paces itself; here the register value is the authoritative
+/// evidence, which is also what the SPI transports verify with.
 ///
 /// # Errors
-/// A bus error from `write` or `read_ifcnt`, or the "Unable to write" report
-/// once every attempt has failed to advance the counter.
+/// A bus error from `write`, `read_ifcnt` or `read_back`, or the "Unable to
+/// write" report once every attempt has failed both checks.
 fn write_register_verified(
     name: &str,
     reg_name: &str,
+    val: u32,
     ifcnt: &mut Option<u32>,
     mut write: impl FnMut() -> Result<(), McuError>,
     mut read_ifcnt: impl FnMut() -> Result<u32, McuError>,
+    mut read_back: impl FnMut() -> Result<u32, McuError>,
 ) -> Result<(), McuError> {
     for attempt in 1..=UART_ATTEMPTS {
         let baseline = match *ifcnt {
@@ -1040,6 +1054,15 @@ fn write_register_verified(
              (expected {}, attempt {attempt}/{UART_ATTEMPTS})",
             (baseline + 1) & 0xff
         );
+        // The counter not moving does not prove the write was lost — check the
+        // register itself before spending another attempt (see the docs).
+        if read_back()? == val {
+            debug!(
+                "tmc uart '{name}': register {reg_name} holds {val:#x} although \
+                 IFCNT stayed at {after}"
+            );
+            return Ok(());
+        }
     }
     Err(McuError::Config(format!(
         "Unable to write tmc uart '{name}' register {reg_name}"
@@ -1212,6 +1235,7 @@ mod tests {
         write_register_verified(
             "stepper_x",
             "GCONF",
+            0x1234_5678,
             &mut ifcnt,
             || {
                 writes += 1;
@@ -1221,11 +1245,38 @@ mod tests {
                 Ok(())
             },
             || Ok(u32::from(counter.get())),
+            || Ok(0),
         )
         .unwrap();
 
         assert_eq!(writes, 3);
         assert_eq!(ifcnt, Some(11));
+    }
+
+    /// The bench's case: `CHOPCONF` took the new value while `IFCNT` stood
+    /// still — a single-wire TMC2209 drops frames, so the register itself is
+    /// what decides whether a write landed.
+    #[test]
+    fn a_write_is_accepted_when_the_register_reads_back_although_ifcnt_stood_still() {
+        let mut writes = 0;
+        let mut ifcnt = Some(4);
+
+        write_register_verified(
+            "stepper_x",
+            "CHOPCONF",
+            0x1403_0055,
+            &mut ifcnt,
+            || {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(4),
+            || Ok(0x1403_0055),
+        )
+        .unwrap();
+
+        assert_eq!(writes, 1, "one write, then read the register back");
+        assert_eq!(ifcnt, Some(4));
     }
 
     #[test]
@@ -1237,6 +1288,7 @@ mod tests {
         write_register_verified(
             "stepper_x",
             "GCONF",
+            0,
             &mut ifcnt,
             || {
                 counter.set(counter.get().wrapping_add(1));
@@ -1246,6 +1298,7 @@ mod tests {
                 reads += 1;
                 Ok(u32::from(counter.get()))
             },
+            || Ok(0),
         )
         .unwrap();
 
@@ -1262,6 +1315,7 @@ mod tests {
         let err = write_register_verified(
             "stepper_x",
             "GCONF",
+            0x42,
             &mut ifcnt,
             || {
                 writes += 1;
@@ -1271,6 +1325,7 @@ mod tests {
                 reads += 1;
                 Ok(7)
             },
+            || Ok(0),
         )
         .unwrap_err();
 

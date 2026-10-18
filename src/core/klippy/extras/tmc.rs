@@ -38,6 +38,17 @@
 //! drivers share, and the TMC2660's own, are provided by a separate `tmc_spi`
 //! module and short-circuit the same way: under file output a read answers 0
 //! and a write is dropped.
+//!
+//! # Deliberate deviation: the stallguard dump's read path
+//!
+//! Upstream's `TMCStallguardDump` picks its read path with one flag,
+//! `optimized_spi`, which it learns from the `spi_status` byte a SPI read
+//! returns — and uses the same flag for its poll cadence. A [`TmcRegister`]
+//! carries no bus status, so here the path is chosen by what the chip declares
+//! instead: a chip whose `DRV_STATUS` holds `sg_result` is read through
+//! `DRV_STATUS` (TMC2130/TMC5160/TMC2240), one with a separate `SG_RESULT`
+//! register through that (TMC2209). The cadence stays the UART one for every
+//! chip: nothing here can tell a SPI chain from a UART one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -1834,6 +1845,9 @@ pub struct TmcStallguardDump {
     printer: Weak<Printer>,
     fields: Arc<FieldHelper>,
     transport: Arc<dyn TmcTransport>,
+    /// `DRV_STATUS` declares `sg_result`, so the SG2 result is read from that
+    /// register (upstream's `sg2_supp`).
+    sg2_supp: bool,
     /// Where the chip keeps its separate stallguard result, if it has one.
     sg4_reg_name: Option<&'static str>,
     /// The samples taken since the last batch.
@@ -1876,6 +1890,7 @@ impl TmcStallguardDump {
             printer: Arc::downgrade(printer),
             fields,
             transport,
+            sg2_supp,
             sg4_reg_name,
             samples: Mutex::new(Vec::new()),
             query_timer: Mutex::new(None),
@@ -1924,10 +1939,11 @@ impl TmcStallguardDump {
     /// Start sampling: forget the last failure and arm the poll timer
     /// (`_start`).
     ///
-    /// Upstream also reads `DRV_STATUS` here to detect a SPI chain through the
-    /// reply's `spi_status` and switch to a 1 ms poll. A [`TmcRegister`] carries
-    /// no bus status, so a SPI chain is indistinguishable from a UART one and
-    /// every chip is polled at the UART period ([`QUERY_INTERVAL`]).
+    /// Upstream also reads `DRV_STATUS` here to learn `optimized_spi` from the
+    /// reply's `spi_status` (a 1 ms poll on a SPI chain, 5 ms on UART). A
+    /// [`TmcRegister`] carries no bus status, so every chip is polled at the
+    /// UART period ([`QUERY_INTERVAL`]) and the read path comes from the chip's
+    /// declared fields instead (see the module docs).
     fn start(self: &Arc<Self>) {
         *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
         let Some(printer) = self.printer.upgrade() else {
@@ -1996,9 +2012,10 @@ impl TmcStallguardDump {
     /// `sample`'s time starts as the event time and becomes the read's
     /// `receive_time` — already a print time — once a register was read.
     fn read_sample(&self, sample: &mut StallguardSample) -> Result<(), McuError> {
-        if self.sg4_reg_name == Some(SG4_RESULT_REG) {
-            // TMC2130/TMC5160/TMC2240 keep cs_actual and the SG2 result in
-            // DRV_STATUS; in stealthchop the useful result is the SG4 one.
+        if self.sg2_supp || self.sg4_reg_name == Some(SG4_RESULT_REG) {
+            // The chip reports its SG2 result in DRV_STATUS. `stealth` is looked
+            // up tolerantly: the TMC2130's DRV_STATUS has no such field, where
+            // upstream raises a `KeyError` — a defect we do not copy.
             let status = self.transport.get_register_raw("DRV_STATUS")?;
             sample.2 = self
                 .drv_status_field("cs_actual", status.data)
@@ -2006,7 +2023,9 @@ impl TmcStallguardDump {
             sample.1 = self.drv_status_field(SG2_FIELD, status.data).unwrap_or(-1);
             let stealth = self.drv_status_field("stealth", status.data).unwrap_or(0) != 0;
             sample.0 = status.receive_time;
-            if stealth {
+            // The TMC2240 keeps both results and switches to the SG4 one while
+            // stealthchop is on.
+            if stealth && self.sg4_reg_name == Some(SG4_RESULT_REG) {
                 let sg4 = self.transport.get_register_raw(SG4_RESULT_REG)?;
                 sample.1 = i64::from(sg4.data);
                 sample.0 = sg4.receive_time;
@@ -2110,10 +2129,12 @@ impl TmcDriver {
     ///
     /// `fields` must already carry the driver's default register values (the
     /// chip module sets them before calling this). This runs the microstep
-    /// helper, builds the error check and registers the command surface.
+    /// helper, builds the error check and the stallguard dump helper, and
+    /// registers the command surface.
     ///
     /// # Errors
-    /// A missing stepper section or a duplicate mux command.
+    /// A missing stepper section, a duplicate mux command, or a duplicate
+    /// `tmc/stallguard_dump` instance for this stepper.
     pub fn new(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -4046,6 +4067,19 @@ homing_speed: 50
         ])
     }
 
+    /// The TMC2130's stallguard tables: `DRV_STATUS` carries the SG2 result and
+    /// the current scale, and there is no SG4/`SG_RESULT` register (upstream
+    /// registers neither for this chip).
+    fn sg2_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([(
+            "DRV_STATUS".to_string(),
+            HashMap::from([
+                ("sg_result".to_string(), 0x3ffu32),
+                ("cs_actual".to_string(), 0x1fu32 << 16),
+            ]),
+        )])
+    }
+
     /// The TMC5160's stallguard tables: `DRV_STATUS` carries the SG2 result,
     /// the current scale and the stealthchop flag, and the SG4 result has its
     /// own register.
@@ -4110,6 +4144,37 @@ homing_speed: 50
         assert!(dump.is_none());
         let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
         assert!(registrations.is_empty());
+    }
+
+    /// A chip that reports its SG2 result in `DRV_STATUS` and has no SG4 or
+    /// `SG_RESULT` register (the TMC2130/TMC5160) streams that result. Upstream
+    /// reaches this path only through `optimized_spi`; here the chip's declared
+    /// fields choose it. `DRV_STATUS` of a TMC2130 has no `stealth` field, where
+    /// upstream raises a `KeyError`: the lookup is tolerant and the SG2 result
+    /// is streamed.
+    #[test]
+    fn test_a_chip_with_only_the_sg2_result_samples_drv_status() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg2_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        transport.set_read_time(1.5);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        reactor.run_due();
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[1.5, 42, 7]]})),
+            "the SG2 result and the current scale come from DRV_STATUS"
+        );
+        assert_eq!(transport.reads(), vec!["DRV_STATUS".to_string()]);
     }
 
     /// The TMC2209 branch: one `SG_RESULT` read per poll, whose raw value is the

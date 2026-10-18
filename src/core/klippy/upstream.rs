@@ -537,7 +537,7 @@ mod tests {
     /// `dictionaries` gives the data dictionary for each named MCU (`None` for
     /// the bare `[mcu]`); the caller resolves all of them for the case before
     /// this runs, so the first entry is always the fallback.
-    fn injected(config: &Config, dictionaries: &[(Option<String>, PathBuf)]) -> Config {
+    pub(super) fn injected(config: &Config, dictionaries: &[(Option<String>, PathBuf)]) -> Config {
         let transport_keys = [
             "serial",
             "baud",
@@ -598,13 +598,18 @@ mod tests {
     /// The printer is torn down before returning: the config's parts hold the
     /// device open, and a receive task parked on it would keep the test runtime
     /// from shutting down.
-    async fn run_phases(
+    pub(super) async fn run_phases(
         config: &Config,
         config_file: &str,
         script: &str,
     ) -> Result<Result<(), String>, String> {
         run_phases_with(config, config_file, script, true).await
     }
+
+    /// How long one case's script may run. A fake firmware answers at once, so
+    /// a wait here is a stuck exchange; the bound is what turns it into a
+    /// failure this harness can report and then tear down after.
+    pub(super) const SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
     /// [`run_phases`], with the case's shape chosen by the caller.
     ///
@@ -655,19 +660,32 @@ mod tests {
         }
         .await;
 
+        // The case's script runs under a bound of its own, *inside* the
+        // harness: `teardown` below has to run even when a script never
+        // finishes. A caller-side `tokio::time::timeout` would drop this
+        // future mid-flight instead, leaving the receive task parked on the
+        // device — and a parked task blocks the test runtime from shutting
+        // down, so the case hangs for good rather than failing.
         let gcode = if setup.is_ok() {
             match printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
-                Some(dispatcher) => match dispatcher.run_script(script).await {
-                    Ok(()) => {
-                        let state = printer.get_state_message();
-                        if state.category == PrinterState::Ready {
-                            Ok(())
-                        } else {
-                            Err(format!("left ready: {}", state.message))
+                Some(dispatcher) => {
+                    match tokio::time::timeout(SCRIPT_TIMEOUT, dispatcher.run_script(script)).await
+                    {
+                        Err(_) => Err(format!(
+                            "the script did not finish in {}s",
+                            SCRIPT_TIMEOUT.as_secs()
+                        )),
+                        Ok(Ok(())) => {
+                            let state = printer.get_state_message();
+                            if state.category == PrinterState::Ready {
+                                Ok(())
+                            } else {
+                                Err(format!("left ready: {}", state.message))
+                            }
                         }
+                        Ok(Err(e)) => Err(e.to_string()),
                     }
-                    Err(e) => Err(e.to_string()),
-                },
+                }
                 None => Err("the g-code dispatcher is not registered".to_string()),
             }
         } else {
@@ -1848,3 +1866,178 @@ fn printer_config_files() -> Vec<PathBuf> {
     files.dedup();
     files
 }
+
+/// The Mainsail client macro file — the one Mainsail ships to `[include]` from
+/// `printer.cfg` — loads, and every macro in it runs.
+///
+/// It is vendored verbatim (`extras/mainsail.cfg`): it is the largest real-world
+/// `[gcode_macro]` body this host has to take, and it leans on the parts a
+/// hand-written macro does not — dict-valued `variable_*`, `SET_GCODE_VARIABLE`
+/// with a **rendered** dict, four `rename_existing` swaps, nested `{% set %}`
+/// ternaries, and `RESPOND`'s prompt protocol.
+///
+/// One case per macro, each on a machine of its own: a macro that leaves an
+/// error behind must not be excused by the case after it.
+///
+/// A plain `#[test]` that owns its runtime, for the reason `a_case_runtime_shuts_down`
+/// spells out: a `#[tokio::test]` runtime drops by waiting **forever** for a parked
+/// blocking device read, so a part that outlives `teardown` hangs the suite instead
+/// of failing it. Here the shutdown is bounded, and a leak is the failure.
+///
+/// It is the only case in the corpus whose config holds `[virtual_sdcard]` and
+/// `[pause_resume]` together, and that pair had a cycle no part's `Drop` could
+/// reach: the dispatcher's command table held the `pause_resume` object
+/// **strongly** while the object held the SD card, which holds that same
+/// dispatcher (`extras/pause_resume.rs`, `register_commands`). The table
+/// therefore outlived `teardown` and kept every part it captured — each `Mcu`
+/// among them, whose `Drop` releases its receive task's blocking read — so the
+/// runtime had to give up after `SHUTDOWN_BOUND`. The commands are registered
+/// weakly now, and the bound is the assertion.
+#[test]
+fn the_mainsail_client_macros_load_and_run() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a case runtime");
+    let failures = runtime.block_on(async {
+        let text = format!("{PRINTER_SECTIONS}\n{MAINSAIL_CFG}");
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let mut failures = Vec::new();
+        for script in MAINSAIL_SCRIPTS {
+            let (config, _) = match crate::core::klippy::config::Config::from_text(&text) {
+                Ok(pair) => pair,
+                Err(error) => panic!("mainsail.cfg does not load: {error}"),
+            };
+            let cfg = tests::injected(&config, &[(None, dict.clone())]);
+            // `run_phases` bounds the script itself and tears the machine down
+            // whatever happens; wrapping it in a caller-side timeout here would
+            // drop that future mid-flight and leave a receive task parked on the
+            // device, which blocks the runtime from shutting down.
+            match tests::run_phases(&cfg, "<mainsail.cfg>", script).await {
+                Err(error) => failures.push(format!("{script}: setup failed: {error}")),
+                Ok(Err(error)) => failures.push(format!("{script}: {error}")),
+                Ok(Ok(())) => {}
+            }
+        }
+        failures
+    });
+    // The corpus' own bound (`tests::CASE_SHUTDOWN_TIMEOUT`, which is private to
+    // the corpus module); the same five seconds, for the same reason.
+    const SHUTDOWN_BOUND: u64 = 5;
+    let started = std::time::Instant::now();
+    runtime.shutdown_timeout(std::time::Duration::from_secs(SHUTDOWN_BOUND));
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(SHUTDOWN_BOUND),
+        "the mainsail cases' runtime did not shut down within {SHUTDOWN_BOUND}s \
+         ({elapsed:?}): a part was leaked"
+    );
+    assert!(
+        failures.is_empty(),
+        "mainsail.cfg cases failed:\n{}",
+        failures.join("\n")
+    );
+}
+
+/// The printer a Mainsail user's `printer.cfg` has to provide for the macro
+/// file to load: a cartesian machine with an extruder, a bed heater and a part
+/// cooling fan, on pins the `atmega2560` dictionary knows (the fixture board
+/// `macros.cfg` uses).
+const PRINTER_SECTIONS: &str = "\
+[stepper_x]
+step_pin: PF0
+dir_pin: PF1
+enable_pin: !PD7
+microsteps: 16
+rotation_distance: 40
+endstop_pin: ^PE5
+position_endstop: 0
+position_max: 200
+homing_speed: 50
+\
+[stepper_y]
+step_pin: PF6
+dir_pin: !PF7
+enable_pin: !PF2
+microsteps: 16
+rotation_distance: 40
+endstop_pin: ^PJ1
+position_endstop: 0
+position_max: 200
+homing_speed: 50
+\
+[stepper_z]
+step_pin: PL3
+dir_pin: PL1
+enable_pin: !PK0
+microsteps: 16
+rotation_distance: 8
+endstop_pin: ^PD3
+position_endstop: 0.5
+position_max: 200
+\
+[extruder]
+step_pin: PA4
+dir_pin: PA6
+enable_pin: !PA2
+microsteps: 16
+rotation_distance: 33.5
+nozzle_diameter: 0.500
+filament_diameter: 3.500
+heater_pin: PB4
+sensor_type: EPCOS 100K B57560G104F
+sensor_pin: PK5
+control: pid
+pid_Kp: 22.2
+pid_Ki: 1.08
+pid_Kd: 114
+min_temp: 0
+max_temp: 210
+\
+[heater_bed]
+heater_pin: PH5
+sensor_type: EPCOS 100K B57560G104F
+sensor_pin: PK6
+control: watermark
+min_temp: 0
+max_temp: 110
+\
+[fan]
+pin: PH6
+\
+[mcu]
+serial: /dev/ttyACM0
+\
+[printer]
+kinematics: cartesian
+max_velocity: 300
+max_accel: 3000
+max_z_velocity: 5
+max_z_accel: 100
+";
+
+/// The vendored client macro file, verbatim.
+const MAINSAIL_CFG: &str = include_str!("extras/mainsail.cfg");
+
+/// One case per macro the client file registers, plus the two client-facing
+/// paths that reach through it (`SET_PRINT_STATS_INFO`'s pause hooks).
+const MAINSAIL_SCRIPTS: &[&str] = &[
+    "SET_KINEMATIC_POSITION X=0 Y=0 Z=0",
+    "SET_PRINT_STATS_INFO TOTAL_LAYER=10 CURRENT_LAYER=5",
+    "SET_PAUSE_AT_LAYER LAYER=1",
+    "SET_PAUSE_NEXT_LAYER ENABLE=1",
+    "SET_PAUSE_NEXT_LAYER ENABLE=0",
+    "SET_PAUSE_AT_LAYER ENABLE=0 LAYER=0",
+    "_TOOLHEAD_PARK_PAUSE_CANCEL",
+    "_CLIENT_RETRACT",
+    "_CLIENT_EXTRUDE",
+    // One case per macro. `_CLIENT_LINEAR_MOVE` moves X/Y/E, so its machine has
+    // to be homed first — the macro is not a way around homing checks, and the
+    // case says so by homing the axes up front (`F=6000` is a **parameter**; a
+    // bare `F6000` is not a parameter at all and upstream's `shlex` reader
+    // refuses the line as malformed).
+    "SET_KINEMATIC_POSITION X=0 Y=0 Z=0\n_CLIENT_LINEAR_MOVE X=10 Y=10 F=6000",
+    "PAUSE",
+    "RESUME",
+    "CANCEL_PRINT",
+];

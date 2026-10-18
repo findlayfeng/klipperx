@@ -15,6 +15,15 @@
 //! * `Printing` — the toolhead's print time is moving;
 //! * `Ready` — idle, with the timeout armed.
 //!
+//! The section is **optional**, as it is upstream: `toolhead.add_printer_objects`
+//! loads the module by name (`toolhead.py:604-614`) and `PrinterConfig.getsection`
+//! hands an absent section an empty config, so the defaults above are the whole
+//! configuration. `idle_timeout` is therefore in
+//! [`DEFAULT_MODULES`](crate::core::klippy::load), and a `printer.cfg` that never
+//! mentions the section still has `printer.idle_timeout` and
+//! `settings.idle_timeout.timeout` — the two a client like `mainsail.cfg` reads
+//! unconditionally.
+//!
 //! `idle_timeout:ready` and `idle_timeout:printing` carry the print time the
 //! transition is dated with (`+ PIN_MIN_TIME`), and `idle_timeout:idle` the
 //! print time the idle gcode ran at. `SET_IDLE_TIMEOUT TIMEOUT=<seconds>`
@@ -104,7 +113,9 @@ use crate::core::klippy::mcu::McuObject;
 use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
 use crate::core::klippy::reactor::TimerHandle;
 
-// Only the bare section exists upstream (`idle_timeout.py:117-118`).
+// Only the bare section exists upstream (`idle_timeout.py:117-118`), and
+// upstream builds it without one too — it is in the loader's `DEFAULT_MODULES`
+// (`toolhead.py:604-614`; see the module docs).
 section!("idle_timeout", order = 30, load = load_config);
 
 /// Upstream's default idle script (`idle_timeout.py:8-13`); the leading newline
@@ -748,6 +759,7 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
     use crate::core::klippy::config::Config;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -810,6 +822,16 @@ mod tests {
         printer
             .lookup_object_as::<IdleTimeout>("idle_timeout")
             .expect("the section registered the object")
+    }
+
+    /// `printer.configfile.settings`, the map a client reads its configuration
+    /// from.
+    fn settings(printer: &Arc<Printer>) -> Value {
+        printer
+            .lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT)
+            .expect("configfile is registered")
+            .get_status(0.0)["settings"]
+            .clone()
     }
 
     /// The dispatcher, for running commands.
@@ -875,6 +897,12 @@ mod tests {
             .collect()
     }
 
+    /// The minimal machine the requirement names: `kinematics: none`, no
+    /// extruder, no `[virtual_sdcard]` / `[print_stats]`. `max_velocity` /
+    /// `max_accel` are the two options `[printer]` cannot default.
+    const MINIMAL_PRINTER: &str =
+        "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n";
+
     /// The section's status starts at upstream's initial values
     /// (`idle_timeout.py:24,32-40`).
     #[test]
@@ -884,6 +912,59 @@ mod tests {
             idle(&printer).get_status(0.0),
             json!({ "state": "Idle", "printing_time": 0.0, "idle_timeout": 600.0 })
         );
+    }
+
+    /// Upstream loads this module from `toolhead.add_printer_objects`
+    /// (`toolhead.py:604-614`), so a config without `[idle_timeout]` still has
+    /// the object, its default timeout and the command — what `mainsail.cfg`
+    /// reads unconditionally (`printer.idle_timeout.state`,
+    /// `printer.configfile.settings.idle_timeout.timeout`).
+    ///
+    /// The machine is the minimal one the requirement names: no extruder and no
+    /// `[virtual_sdcard]` / `[print_stats]` to lean on, `kinematics: none`.
+    #[test]
+    fn test_the_module_loads_without_a_config_section() {
+        let (printer, _reactor) = loaded(MINIMAL_PRINTER);
+
+        // The object exists and reports the defaults a client reads.
+        assert_eq!(
+            idle(&printer).get_status(0.0),
+            json!({ "state": "Idle", "printing_time": 0.0, "idle_timeout": 600.0 })
+        );
+        // A default that was used is recorded in `settings`, as upstream's is
+        // (`klippy/configfile.py:33-36`).
+        assert_eq!(settings(&printer)["idle_timeout"]["timeout"], json!(600.0));
+
+        // And the command the same client sends is registered.
+        gcode(&printer)
+            .run_script_sync("SET_IDLE_TIMEOUT TIMEOUT=30")
+            .expect("the command runs without a section");
+        assert_eq!(idle(&printer).get_status(0.0)["idle_timeout"], 30.0);
+
+        // The other read `mainsail.cfg` makes (`RESUME`, mainsail.cfg:134) is a
+        // template one: `printer.idle_timeout.state` has to resolve in the
+        // context a macro body gets, not fail with `undefined value`.
+        let mut context = Context::new();
+        context.insert(
+            "printer",
+            Rt::Printer(PrinterView::new(Arc::clone(&printer))),
+        );
+        let template = Template::parse(
+            "idle_state",
+            "{% if printer.idle_timeout.state|upper == 'IDLE' %}idle{% endif %}",
+        )
+        .expect("the template compiles");
+        assert_eq!(template.render(&mut context).expect("it renders"), "idle");
+    }
+
+    /// A config that names the section still runs with its own timeout, in
+    /// `status` and in `settings` alike.
+    #[test]
+    fn test_a_configured_section_keeps_its_timeout() {
+        let (printer, _reactor) =
+            loaded(&format!("{MINIMAL_PRINTER}[idle_timeout]\ntimeout: 1200\n"));
+        assert_eq!(idle(&printer).get_status(0.0)["idle_timeout"], 1200.0);
+        assert_eq!(settings(&printer)["idle_timeout"]["timeout"], json!(1200.0));
     }
 
     /// `timeout` is read through the loader's bound wording

@@ -949,9 +949,9 @@ pins: PA1, my_alias
 | `gcode` | 必填 | 宏体 |
 | `description` | `G-Code macro` | 命令 help 文本 |
 | `rename_existing` | — | 被改名的命令：装载期只做同型检查，**连接期把该命令的旧处理器位移到这个名下、本宏接管原名**（2026-10-06）；目标名须未被占用，已占用时报 `gcode command … already registered`（与上游 `gcode.py:142-144` 同款） |
-| `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
+| `variable_<名>` | — | 字面量，`get_status` 可见（只读）。**按 Python 字面量解析**（`{'restore': False, 'temp': 0}`、`False`、单/双引号串、list/tuple/dict、尾随逗号；JSON 写法 `true/false/null` 也收），与上游 `ast.literal_eval` 同口径 |
 
-宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。仍缺的在缝上：读 `printer.objects` 的反射式枚举（`PrinterView` 目前不能被 `enumerate`）。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
+宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写，`VALUE=` 同样按 Python 字面量解析）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。字符串语义也照 Python：`str` 有 `split`/`strip`/`replace`/`startswith`/`endswith`/`join`/`find`/`count`/`lower`/`upper`，`list` 有 `index`/`count`；**标签打印容器时按 Python `str()` 拼写**（`{'call': 'PAUSE'}`）；`"…%s…" % x` 这类 printf 格式化会改写成 `|format(...)`（只收左侧是字符串字面量的形态）。仍缺的在缝上：读 `printer.objects` 的反射式枚举（`PrinterView` 目前不能被 `enumerate`）。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、`|int`/`|float` 不可转换且无默认时报错、`~` 拼接容器不走 formatter、**列表不可变所以 `append`/`extend` 返回 `None` 且收集不到元素**、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 
@@ -1137,6 +1137,8 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=<display_template 名> [PARAM_*=…]` **已支持**：与 `[output_pin]` 共用同一个 `template_evaluator`（0.5 s 求值一次，结果直接 `Fan::set_speed`）；`SPEED=` 与 `TEMPLATE=` 必须给且只给一个。
 
 ### `[idle_timeout]` — 空闲超时（批 #21）
+
+**这个节可以不写**（2026-10-18）：上游在 `toolhead.py:604-614` 无条件加载它，本仓 `load.rs` 的 `DEFAULT_MODULES` 照做——没有该节时对象仍存在、`timeout` 取默认 600、`SET_IDLE_TIMEOUT` 仍可用，`printer.configfile.settings.idle_timeout.timeout` 也有值（客户端宏如 Mainsail 的 `RESUME` 会无条件读 `printer.idle_timeout.state`）。
 
 | 选项 | 默认 | 说明 |
 |------|------|------|

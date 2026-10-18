@@ -9,6 +9,7 @@
 //! | `TMCCommandHelper` + `TMCCurrentHelper` + `TMCErrorCheck` | [`TmcDriver`] |
 //! | `TMCVirtualPinHelper` | [`TmcVirtualPin`] (chip) + [`TmcVirtualEndstop`] |
 //! | `TMCMicrostepHelper` / `TMCStealthchopHelper` / `TMCVcoolthrsHelper` / `TMCtstepHelper` | the free functions below |
+//! | `TMCStallguardDump` | [`TmcStallguardDump`] |
 //!
 //! # One concrete driver type
 //!
@@ -45,6 +46,9 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::bulk_sensor::{
+    BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
+};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::heaters::{PrinterHeaters, HEATERS_OBJECT};
 use crate::core::klippy::extras::stepper::PrinterStepper;
@@ -1776,6 +1780,292 @@ pub fn wave_table_helper(config: &ConfigWrapper, fields: &FieldHelper) -> Result
 }
 
 // ===========================================================================
+// Record driver status (`tmc.TMCStallguardDump`)
+// ===========================================================================
+
+/// The mux endpoint the stallguard samples stream on
+/// (`add_mux_endpoint`'s path).
+pub const DUMP_ENDPOINT: &str = "tmc/stallguard_dump";
+
+/// The request key that selects a stepper's instance (`name`).
+pub const DUMP_KEY: &str = "name";
+
+/// The column header a connecting client receives.
+const DUMP_HEADER: [&str; 3] = ["time", "sg_result", "cs_actual"];
+
+/// The `DRV_STATUS` field carrying the stallguard result on the older chips;
+/// a chip that has it is upstream's `sg2_supp`.
+const SG2_FIELD: &str = "sg_result";
+
+/// The register TMC2209 keeps its stallguard result in.
+const SG_RESULT_REG: &str = "SG_RESULT";
+
+/// The separate stallguard-4 result register the TMC2240 also has.
+const SG4_RESULT_REG: &str = "SG4_RESULT";
+
+/// Seconds between polls of the driver's result registers (`_query_tmc`'s
+/// "UART queried as fast as possible" cadence).
+const QUERY_INTERVAL: f64 = 0.005;
+
+/// One sample: `(print time, sg_result, cs_actual)`.
+///
+/// `sg_result` and `cs_actual` start at `-1`, the sentinel a chip that does not
+/// report that value keeps (`_query_tmc`'s initialisers).
+type StallguardSample = (f64, i64, i64);
+
+/// Streams a driver's stallguard result to API clients, for tuning the SG
+/// threshold of sensorless homing (`tmc.TMCStallguardDump`).
+///
+/// Upstream builds this for every chip and lets the constructor decide whether
+/// there is anything to read. That decision is [`new`](Self::new)'s `None`:
+///
+/// - the TMC2660 has no `DRV_STATUS`, so it is unsupported for now (`It is
+///   possible to support TMC2660, just disable it for now`);
+/// - a chip with neither an `sg_result` field in `DRV_STATUS` nor a separate
+///   `SG_RESULT`/`SG4_RESULT` register (the TMC2208) has no stallguard result.
+///   Upstream's guard here (`if self.sg2_supp is None and self.sg4_reg_name is
+///   None`) can never fire — `sg2_supp` is a bool — so it registers a stream
+///   of `-1`s; here the endpoint is not registered at all.
+///
+/// The helper is a [`BatchBulkHelper`] client producer: its start callback arms
+/// a poll timer, the timer appends one sample per poll, and the batch callback
+/// hands the batch so far to the client every [`BATCH_INTERVAL`].
+pub struct TmcStallguardDump {
+    printer: Weak<Printer>,
+    /// The stepper name the samples belong to; the mux endpoint's value.
+    stepper_name: String,
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    /// Where the chip keeps its separate stallguard result, if it has one.
+    sg4_reg_name: Option<&'static str>,
+    /// The samples taken since the last batch.
+    samples: Mutex<Vec<StallguardSample>>,
+    /// The poll timer, while a client is connected.
+    query_timer: Mutex<Option<TimerHandle>>,
+    /// The read failure that stopped the polling, for the next batch.
+    error: Mutex<Option<String>>,
+}
+
+impl TmcStallguardDump {
+    /// Build the helper for `stepper_name`, or `None` when the chip has no
+    /// stallguard result to stream.
+    ///
+    /// # Errors
+    /// The mux endpoint's registration failure (a conflicting instance).
+    pub fn new(
+        printer: &Arc<Printer>,
+        stepper_name: &str,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Option<Arc<Self>>, ConfigError> {
+        let Some(drv_status) = fields.register_fields("DRV_STATUS") else {
+            return Ok(None);
+        };
+        let sg2_supp = drv_status.contains_key(SG2_FIELD);
+        // New drivers have a separate register for the SG4 result.
+        let sg4_reg_name = if transport.name_to_reg().contains_key(SG_RESULT_REG) {
+            Some(SG_RESULT_REG)
+        } else if transport.name_to_reg().contains_key(SG4_RESULT_REG) {
+            Some(SG4_RESULT_REG)
+        } else {
+            None
+        };
+        if !sg2_supp && sg4_reg_name.is_none() {
+            return Ok(None);
+        }
+
+        let state = Arc::new(Self {
+            printer: Arc::downgrade(printer),
+            stepper_name: stepper_name.to_string(),
+            fields,
+            transport,
+            sg4_reg_name,
+            samples: Mutex::new(Vec::new()),
+            query_timer: Mutex::new(None),
+            error: Mutex::new(None),
+        });
+
+        let weak = Arc::downgrade(&state);
+        let start_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.start();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.stop();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let batch_cb: BatchCb = Arc::new(move |_eventtime| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.dump()
+            })
+        });
+        let batch_bulk = BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, BATCH_INTERVAL);
+        // The registration owns the helper from here on: it holds the mux
+        // handler, and the handler reads this state through its `Weak`, so the
+        // driver only has to keep the state itself alive.
+        batch_bulk.add_mux_endpoint(
+            DUMP_ENDPOINT,
+            DUMP_KEY,
+            stepper_name,
+            json!({ "header": DUMP_HEADER }),
+        )?;
+        Ok(Some(state))
+    }
+
+    /// The stepper the samples belong to.
+    pub fn stepper_name(&self) -> &str {
+        &self.stepper_name
+    }
+
+    /// Start sampling: forget the last failure and arm the poll timer
+    /// (`_start`).
+    ///
+    /// Upstream also reads `DRV_STATUS` here to detect a SPI chain through the
+    /// reply's `spi_status` and switch to a 1 ms poll. A [`TmcRegister`] carries
+    /// no bus status, so a SPI chain is indistinguishable from a UART one and
+    /// every chip is polled at the UART period ([`QUERY_INTERVAL`]).
+    fn start(self: &Arc<Self>) {
+        *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let reactor = printer.reactor();
+        let weak = Arc::downgrade(self);
+        let handle = reactor.register_timer_named(
+            "tmc_stallguard_dump",
+            Box::new(move |eventtime| {
+                // A configuration reload detaches the endpoint without running
+                // the stop callback, so the state can be gone while the timer
+                // still ticks: retire instead of polling a driver that no
+                // longer exists.
+                let state = weak.upgrade()?;
+                state.query(eventtime)
+            }),
+            reactor.monotonic(),
+        );
+        *self.query_timer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    }
+
+    /// Stop sampling: cancel the poll timer and drop the buffered samples
+    /// (`_stop`).
+    fn stop(&self) {
+        let timer = self
+            .query_timer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let (Some(handle), Some(printer)) = (timer, self.printer.upgrade()) {
+            printer.reactor().unregister_timer(handle);
+        }
+        self.samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// One poll: read the chip's result registers and append a sample
+    /// (`_query_tmc`).
+    ///
+    /// A failed read is remembered for the next batch and retires the timer
+    /// (upstream returns `NEVER` after storing the error), so a driver that
+    /// fell off the bus reports the failure instead of streaming stale values.
+    fn query(&self, eventtime: f64) -> Option<f64> {
+        // The values a chip does not report stay at the sentinel.
+        let mut sample: StallguardSample = (eventtime, -1, -1);
+        match self.read_sample(&mut sample) {
+            Ok(()) => {
+                self.samples
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(sample);
+                Some(eventtime + QUERY_INTERVAL)
+            }
+            Err(err) => {
+                *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Fill `sample` from the chip (the body of `_query_tmc`'s `try`).
+    ///
+    /// `sample`'s time starts as the event time and becomes the read's
+    /// `receive_time` — already a print time — once a register was read.
+    fn read_sample(&self, sample: &mut StallguardSample) -> Result<(), McuError> {
+        if self.sg4_reg_name == Some(SG4_RESULT_REG) {
+            // TMC2130/TMC5160/TMC2240 keep cs_actual and the SG2 result in
+            // DRV_STATUS; in stealthchop the useful result is the SG4 one.
+            let status = self.transport.get_register_raw("DRV_STATUS")?;
+            sample.2 = self
+                .drv_status_field("cs_actual", status.data)
+                .unwrap_or(-1);
+            sample.1 = self.drv_status_field(SG2_FIELD, status.data).unwrap_or(-1);
+            let stealth = self.drv_status_field("stealth", status.data).unwrap_or(0) != 0;
+            sample.0 = status.receive_time;
+            if stealth {
+                let sg4 = self.transport.get_register_raw(SG4_RESULT_REG)?;
+                sample.1 = i64::from(sg4.data);
+                sample.0 = sg4.receive_time;
+            }
+        } else if self.sg4_reg_name == Some(SG_RESULT_REG) {
+            // TMC2209: the register holds the result itself, not a field.
+            let sg = self.transport.get_register_raw(SG_RESULT_REG)?;
+            sample.1 = i64::from(sg.data);
+            sample.0 = sg.receive_time;
+        }
+        Ok(())
+    }
+
+    /// A `DRV_STATUS` field of `reg_value`, or `None` when the chip does not
+    /// declare it.
+    ///
+    /// [`FieldHelper::get_field`] panics on an unknown field, so the field has
+    /// to be looked up first — upstream would raise instead.
+    fn drv_status_field(&self, field_name: &str, reg_value: u32) -> Option<i64> {
+        if !self
+            .fields
+            .register_fields("DRV_STATUS")?
+            .contains_key(field_name)
+        {
+            return None;
+        }
+        Some(
+            self.fields
+                .get_field(field_name, Some(reg_value), Some("DRV_STATUS")),
+        )
+    }
+
+    /// The batch callback: the samples taken since the last batch, or the
+    /// failure that stopped them (`_dump`).
+    ///
+    /// Unlike upstream, which always reports (even an empty `data` list), an
+    /// empty batch reports nothing: a poll every 5 ms would otherwise push a
+    /// message per batch carrying no sample at all.
+    fn dump(&self) -> Result<Option<Value>, String> {
+        if let Some(error) = self.error.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Err(error);
+        }
+        let samples = std::mem::take(&mut *self.samples.lock().unwrap_or_else(|p| p.into_inner()));
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({ "data": samples })))
+    }
+}
+
+// ===========================================================================
 // G-Code command helpers + the driver object
 // ===========================================================================
 
@@ -1816,6 +2106,11 @@ pub struct TmcDriver {
     virtual_prev_state: Mutex<Vec<(&'static str, i64)>>,
     /// Registers the virtual-endstop homing changed, awaiting a send.
     virtual_dirty: Mutex<Vec<(String, u32)>>,
+    /// The stallguard dump helper (`self.record_helper` upstream), when the
+    /// chip has a result to stream (`[`DUMP_ENDPOINT`]`). The driver only keeps
+    /// it alive: the API endpoint and its poll timer drive it.
+    #[allow(dead_code)]
+    stallguard_dump: Option<Arc<TmcStallguardDump>>,
 }
 
 impl TmcDriver {
@@ -1851,6 +2146,12 @@ impl TmcDriver {
             printer,
             config,
         ));
+        let stallguard_dump = TmcStallguardDump::new(
+            printer,
+            &stepper_name,
+            Arc::clone(&fields),
+            Arc::clone(&transport),
+        )?;
         let driver = Arc::new_cyclic(|self_ref| Self {
             printer: Arc::downgrade(printer),
             name,
@@ -1868,6 +2169,7 @@ impl TmcDriver {
             self_ref: self_ref.clone(),
             virtual_prev_state: Mutex::new(Vec::new()),
             virtual_dirty: Mutex::new(Vec::new()),
+            stallguard_dump,
         });
         driver.clone().register_commands(printer)?;
         Ok(driver)

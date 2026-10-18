@@ -29,6 +29,7 @@ pub mod delta_calibrate;
 pub mod display;
 pub mod display_status;
 pub mod ds18b20;
+pub mod duplicate_pin_override;
 pub mod endstop_phase;
 pub mod error_mcu;
 pub mod exclude_object;

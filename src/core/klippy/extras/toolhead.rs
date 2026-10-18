@@ -530,6 +530,29 @@ struct Connected {
     force_move_trapq: Option<usize>,
 }
 
+/// One kinematics stepper, as `GET_POSITION` reports it
+/// (`gcode_move.py:269-272`).
+pub struct StepperReport {
+    /// The section name upstream prints (`stepper_x`, `stepper_bed`…).
+    pub name: String,
+    /// The firmware step count (`MCU_stepper.get_mcu_position`).
+    pub mcu_position: i64,
+    /// The position its solver last commanded it to
+    /// (`MCU_stepper.get_commanded_position`).
+    pub commanded_position: f64,
+}
+
+/// Where the machine is, from the steppers up (`GET_POSITION`,
+/// `gcode_move.py:267-274`).
+pub struct PositionReport {
+    /// Every kinematics stepper, in upstream's `kin.get_steppers()` order.
+    pub steppers: Vec<StepperReport>,
+    /// The carriage position the kinematics inverts those steppers to
+    /// (`kin.calc_position`). An axis is `None` when it cannot be recovered —
+    /// an unhomed delta, a non-invertible solver.
+    pub kinematic: [Option<f64>; 3],
+}
+
 /// The step commands to send, paired with the stepper that produced them and
 /// the clock window the batch covers (`StepBatchClocks`).
 type StepBatches = Vec<(Arc<McuStepper>, Vec<StepCommand>, StepBatchClocks)>;
@@ -1958,6 +1981,89 @@ impl ToolHeadObject {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.commanded_pos())
+    }
+
+    /// The kinematics steppers' names, in upstream's `kin.get_steppers()`
+    /// order: each rail's motors in axis order, with polar's bare bed stepper
+    /// **before** the rails (`kinematics/polar.py:31-34`) and the rail-less
+    /// motors of winch and generic cartesian after them
+    /// (`kinematics/winch.py:29-30`,
+    /// `kinematics/generic_cartesian.py:233-234`).
+    ///
+    /// Not the order connect adds them in (`rails` → `generic_steppers` →
+    /// `bed` → `winch_steppers`): on polar the two differ, and upstream's is
+    /// what a `GET_POSITION` log is read against.
+    fn kinematics_stepper_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(bed) = &self.bed {
+            names.push(bed.name().to_string());
+        }
+        for rail in &self.rails {
+            names.extend(
+                rail.steppers()
+                    .iter()
+                    .map(|stepper| stepper.name().to_string()),
+            );
+        }
+        names.extend(
+            self.generic_steppers
+                .iter()
+                .map(|stepper| stepper.stepper().name().to_string()),
+        );
+        names.extend(
+            self.winch_steppers
+                .iter()
+                .map(|stepper| stepper.name().to_string()),
+        );
+        names
+    }
+
+    /// Every kinematics stepper's step count and commanded position, plus the
+    /// carriage position the kinematics inverts them to — the three quantities
+    /// `GET_POSITION` reports (`gcode_move.py:267-274`).
+    ///
+    /// The extruder steppers are not kinematics steppers — upstream reaches
+    /// them only through `set_trapq` (`kinematics/extruder.py`) — so they are
+    /// left out. Read under one lock, so the two stepper lines and the
+    /// inversion describe the same instant.
+    ///
+    /// `None` before connect: there is no motion state to report yet.
+    pub fn position_report(&self) -> Option<PositionReport> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let (steppers, positions) = {
+            let queuing = connected.toolhead.motion_queuing_mut();
+            let mut steppers = Vec::new();
+            let mut positions = HashMap::new();
+            for name in self.kinematics_stepper_names() {
+                let Some(stepper) = queuing
+                    .steppers()
+                    .iter()
+                    .find(|stepper| stepper.name() == name)
+                else {
+                    // A kinematics stepper the motion queue does not hold: its
+                    // rail did not reach connect, so there is nothing to report
+                    // for it.
+                    continue;
+                };
+                positions.insert(name.clone(), stepper.commanded_position());
+                steppers.push(StepperReport {
+                    name,
+                    mcu_position: stepper.mcu_position(),
+                    commanded_position: stepper.commanded_position(),
+                });
+            }
+            (steppers, positions)
+        };
+        let kinematic = connected
+            .toolhead
+            .kinematics()
+            .map(|kinematics| kinematics.calc_position(&positions))
+            .unwrap_or([None; 3]);
+        Some(PositionReport {
+            steppers,
+            kinematic,
+        })
     }
 
     /// The kinematic Z position at a past print time, from the stepper step

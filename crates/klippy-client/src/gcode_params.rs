@@ -100,6 +100,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("G90", &[]),
     ("G91", &[]),
     ("G92", &["X", "Y", "Z", "E"]),
+    ("GET_POSITION", &[]),
     ("GET_RETRACTION", &[]),
     ("IIC_READ", &["DEVICE", "WRITE", "READ_LEN"]),
     ("IIC_WRITE", &["DEVICE", "DATA"]),

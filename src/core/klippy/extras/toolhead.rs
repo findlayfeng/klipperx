@@ -2861,11 +2861,23 @@ impl Connected {
         // Move whatever the planner has queued into the trapq first, so the
         // step generation time below covers it.
         self.toolhead.wait_moves();
-        let step_gen_time = self.horizon(self.toolhead.print_time());
         // The previous generation horizon is this batch's start: a lower
         // bound on when its first step runs, and what its messages carry as
         // `req_clock` (`StepBatchClocks`).
-        let start_time = self.last_step_gen_time;
+        //
+        // It is taken against the planner's own horizon, not this pass's copy:
+        // **every** generation raises that one (`ToolHead::flush_step_generation`
+        // maxes it), and a homing drip — or a probe's explicit
+        // `flush_step_generation` — generates at the motion level, without
+        // passing through here. A pass bounded below what those already put on
+        // the wire rewinds the solvers onto it, and the re-walk then queues
+        // steps that land before `last_step_clock` — what `check_line` reports
+        // as "Invalid sequence" and what shut the printer down after a failed
+        // `G28`.
+        let start_time = self
+            .last_step_gen_time
+            .max(self.toolhead.last_step_gen_time());
+        let step_gen_time = self.horizon(self.toolhead.print_time(), start_time);
         let batches = self.toolhead.flush_step_generation(step_gen_time)?;
         self.toolhead.finalize_moves(
             step_gen_time,
@@ -2887,7 +2899,8 @@ impl Connected {
     /// (`extras/motion_queuing.py:193-234`), with `need_step_gen_time` /
     /// `need_flush_time` read as the planner's own reach (`content_end`,
     /// `wait_moves` having just drained it) and `kin_flush_delay` — not
-    /// modelled in this host — left at zero.
+    /// modelled in this host — left at zero. `last` is the horizon the pass
+    /// starts from, which it never lowers.
     ///
     /// Bounded by the estimate: `est + 0.4 s` at rest, `est + 0.7 s` while
     /// queued motion lies beyond the horizon (batched in 0.25 s windows from
@@ -2899,8 +2912,7 @@ impl Connected {
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from a stepper's compressor.
-    fn horizon(&self, content_end: f64) -> f64 {
-        let last = self.last_step_gen_time;
+    fn horizon(&self, content_end: f64, last: f64) -> f64 {
         let est = self.toolhead.estimated_print_time();
         let want = if last < content_end {
             // Actively stepping — the aggressive branch with its 0.25 s
@@ -3498,6 +3510,30 @@ fn no_trigger_error(stepper_name: &str) -> CommandError {
     ))
 }
 
+/// Settle the motion state where a homing move stopped, on the **miss** path,
+/// before the "No trigger" error is raised.
+///
+/// Upstream does this whether or not the endstop fired: `homing_move` reads
+/// `move_end_print_time = toolhead.get_last_move_time()` (which floors
+/// `print_time` at the horizon the drip generated to), flushes step generation,
+/// and calls `set_position(haltpos)` — with `haltpos == movepos` once the drip
+/// has run its full travel (`homing.py:110-160`); only then does it raise the
+/// deferred error. The port used to return straight from the miss, leaving the
+/// planner at the drip's **start** with the dripped segment still queued in the
+/// trapq: the next flush pass then bounded its generation behind steps the drip
+/// had already put on the wire, and `stepcompress` refused the re-walk
+/// ("Invalid sequence" — see
+/// `test_set_kinematic_position_and_g1_after_a_missed_home_still_generate_in_order`).
+///
+/// The axes are **not** marked homed (`&[]`): a miss says nothing about where
+/// the carriage is, and this host reports that instead of pretending `G28`
+/// succeeded.
+fn settle_halt_position(connected: &mut Connected, haltpos: Coord) {
+    connected.toolhead.get_last_move_time();
+    connected.toolhead.set_position(haltpos, &[]);
+    connected.toolhead.wipe_trapq();
+}
+
 /// Home every rail in one multi-endstop move, as delta does
 /// (`Homing._do_home_rails` + `HomingMove.homing_move` with every endstop
 /// armed; upstream's retract + second pass is the gap
@@ -3642,6 +3678,7 @@ async fn home_unified(
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     if let Some(error) = missed {
+        settle_halt_position(connected, target);
         return Err(error);
     }
     // The carriage is now at its home position, with the kinematics' homed
@@ -3736,6 +3773,7 @@ async fn home_axis(
     // whole 1.5× force distance.
     if trigger_time <= 0.0 {
         send(printer, &KlippyEvent::HomingHomingMoveEnd);
+        settle_halt_position(connected, home);
         let name = stepper_names
             .first()
             .expect("every rail has a primary stepper");
@@ -5593,10 +5631,39 @@ mod tests {
                 .motion_queuing_mut()
                 .steppers_mut()
                 .iter()
-                .map(|stepper| (stepper.name().to_string(), stepper.kinematics().last_flush_time))
+                .map(|stepper| {
+                    (
+                        stepper.name().to_string(),
+                        stepper.kinematics().last_flush_time,
+                    )
+                })
                 .collect::<Vec<_>>()
         };
         let drip_horizons = horizons(&mut connected);
+
+        // The failed home settles the halt position the way upstream does before
+        // it raises the deferred error (`settle_halt_position`): nothing of the
+        // drip stays queued, and the planner's time has caught up to what the
+        // solvers generated.
+        let x_horizon = drip_horizons
+            .iter()
+            .find(|(name, _)| name == "stepper_x")
+            .expect("stepper_x is registered")
+            .1;
+        assert!(
+            x_horizon > 0.0,
+            "the drip generated the homing move's steps"
+        );
+        assert!(
+            connected.toolhead.trapq().moves().is_empty(),
+            "the dripped segment must not stay queued for a later pass to re-walk"
+        );
+        assert!(
+            connected.toolhead.print_time() >= x_horizon,
+            "the planner's print time ({}) is still behind the horizon the drip \
+             generated to ({x_horizon})",
+            connected.toolhead.print_time()
+        );
 
         // The recovery the machine was driven through, twice over: as many
         // `SET_KINEMATIC_POSITION` + `G1` rounds as a session retries must all

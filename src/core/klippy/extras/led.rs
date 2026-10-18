@@ -196,7 +196,9 @@ struct DisplayTemplate {
 /// `objects/list`.
 #[derive(Debug, Default)]
 pub struct DisplayTemplates {
-    templates: Mutex<BTreeMap<String, DisplayTemplate>>,
+    /// Shared so a render can hold one template past the registry lock: the
+    /// body is compiled once at load and read by every render.
+    templates: Mutex<BTreeMap<String, Arc<DisplayTemplate>>>,
 }
 
 impl DisplayTemplates {
@@ -213,11 +215,11 @@ impl DisplayTemplates {
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(
                 name,
-                DisplayTemplate {
+                Arc::new(DisplayTemplate {
                     text,
                     params,
                     template,
-                },
+                }),
             );
     }
 
@@ -236,11 +238,13 @@ impl DisplayTemplates {
         context: &mut Context,
         params: &[(String, Value)],
     ) -> Option<Result<String, TemplateError>> {
-        let templates = self
-            .templates
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let template = templates.get(name)?;
+        let template = {
+            let templates = self
+                .templates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            Arc::clone(templates.get(name)?)
+        };
         for (option, value) in &template.params {
             context.insert(option.clone(), Rt::Json(value.clone()));
         }

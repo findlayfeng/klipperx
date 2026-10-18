@@ -62,6 +62,34 @@ pub const DEFAULT_BAUD: u32 = 250_000;
 /// `VTIME` is in tenths of a second, and only applies while `VMIN` is 0.
 const READ_TIMEOUT_TENTHS: u8 = 1;
 
+/// How long a connect-time open waits before it tries the port again.
+///
+/// Upstream's connect loop retries the open on a fixed pause: `os.open` fails,
+/// it logs `Unable to open port`, pauses five seconds and comes round again
+/// (`klippy/serialhdl.py:173-193`). The value is upstream's.
+pub const OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a connect-time open keeps retrying before it reports the failure.
+///
+/// Upstream gives the loop a wall-clock budget and raises `Unable to connect`
+/// once it is gone — `start_time + 90.` in the same loop
+/// (`klippy/serialhdl.py:171-178`). The value is upstream's.
+#[cfg(not(test))]
+pub const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(90);
+
+/// [`OPEN_RETRY_BUDGET`] in a test build.
+///
+/// A unit test that connects a port which is not there has to report in its own
+/// time, not the real budget's: 90 s per test would make the suite a trap. The
+/// retry loop's own tests pass the budget they mean, so nothing here depends on
+/// this value — only connect-time opens the tests do not mean to measure.
+#[cfg(test)]
+pub const OPEN_RETRY_BUDGET: Duration = Duration::from_millis(300);
+
+/// One sleep slice of a retry wait: a shutdown check runs between slices, so an
+/// exit request ends the wait well inside [`OPEN_RETRY_INTERVAL`].
+const OPEN_RETRY_SLICE: Duration = Duration::from_millis(50);
+
 /// A [`Device`] backed by a serial port.
 pub struct SerialDevice {
     port: File,
@@ -81,10 +109,46 @@ impl SerialDevice {
 
     /// Open `path` at `baud` and put the line into raw mode.
     ///
+    /// One attempt: a caller that has to wait for a port to come back uses
+    /// [`SerialDevice::open_retrying`].
+    ///
     /// # Errors
     /// Returns [`InterfaceError`] when the port cannot be opened or configured.
     pub fn open(path: impl AsRef<Path>, baud: u32) -> Result<Self, InterfaceError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_once(path.as_ref(), baud)
+    }
+
+    /// Open `path` at `baud`, retrying while the port is not there yet.
+    ///
+    /// A board that was just reset re-enumerates and a host that starts before
+    /// the kernel has created the tty has nothing to open, so the **open alone**
+    /// is retried every `interval` until `budget` is spent — the connect-time
+    /// behaviour of upstream's `connect_uart` (`klippy/serialhdl.py:181-204`).
+    /// The handshake and the configuration that follow are not retried here:
+    /// they are a protocol conversation with a device that answered an open, and
+    /// a retry there would turn a real protocol error into a slow one.
+    ///
+    /// `stop` is polled before every attempt and between sleep slices, so an
+    /// exit request ends the wait instead of holding the process for the whole
+    /// budget.
+    ///
+    /// # Errors
+    /// Returns the last attempt's error, with the attempt count appended, when
+    /// the budget runs out or `stop` asks for the wait to end.
+    pub fn open_retrying(
+        path: impl AsRef<Path>,
+        baud: u32,
+        budget: Duration,
+        interval: Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self, InterfaceError> {
+        let path = path.as_ref();
+        retry_open(budget, interval, || Self::open_once(path, baud), stop)
+    }
+
+    /// One attempt: open the port and put the line into raw mode.
+    fn open_once(path: &Path, baud: u32) -> Result<Self, InterfaceError> {
+        let path = path.to_path_buf();
         let port = OpenOptions::new()
             .read(true)
             .write(true)
@@ -152,6 +216,55 @@ impl SerialDevice {
     pub fn set_rts(&self, asserted: bool) -> Result<(), InterfaceError> {
         set_modem_line(&self.port, libc::TIOCM_RTS, asserted)
     }
+}
+
+/// Run `try_open` until it succeeds, waiting `interval` between attempts and
+/// giving up `budget` after the first one.
+///
+/// A failed exit keeps the last attempt's error — it is the one that names the
+/// port and the OS's reason — and appends the attempt count, so the log says
+/// how hard the open tried. `stop` is the exit request: it is polled after every
+/// failed attempt and between sleep slices, which is what keeps a shutdown from
+/// waiting out the budget.
+fn retry_open<T>(
+    budget: Duration,
+    interval: Duration,
+    mut try_open: impl FnMut() -> Result<T, InterfaceError>,
+    stop: &dyn Fn() -> bool,
+) -> Result<T, InterfaceError> {
+    let start = Instant::now();
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        let last = match try_open() {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        if stop() {
+            return Err(open_retry_error(last, attempts, "aborted"));
+        }
+        let waited = start.elapsed();
+        if waited >= budget {
+            return Err(open_retry_error(last, attempts, "gave up"));
+        }
+        // Wait the interval, or what is left of the budget, whichever is
+        // shorter — and sleep it in slices, so a shutdown is noticed inside a
+        // slice rather than after the interval.
+        let mut left = interval.min(budget - waited);
+        while !left.is_zero() {
+            let slice = left.min(OPEN_RETRY_SLICE);
+            std::thread::sleep(slice);
+            left -= slice;
+            if stop() {
+                return Err(open_retry_error(last, attempts, "aborted"));
+            }
+        }
+    }
+}
+
+/// The error a retry loop ends with: the last attempt's, plus how it ended.
+fn open_retry_error(last: InterfaceError, attempts: usize, reason: &str) -> InterfaceError {
+    InterfaceError::Other(format!("{last} ({reason} after {attempts} attempts)"))
 }
 
 impl fmt::Debug for SerialDevice {
@@ -398,14 +511,141 @@ pub(crate) fn last_error(call: &str) -> InterfaceError {
 mod tests {
     use super::*;
     use crate::core::klippy::interface::pty::Pty;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    /// Run `body` on a thread of its own, and fail if it has not returned in
+    /// five seconds.
+    ///
+    /// Every retry test sets a budget of its own; this is the bound that catches
+    /// a loop which ignores it and would otherwise sit in the test harness.
+    fn bounded<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the retry returns within its budget")
+    }
+
+    /// The attempt count a retry appends to the error it ends with.
+    fn attempts_in(text: &str) -> usize {
+        text.split("after ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|count| count.parse().ok())
+            .expect("the message counts the attempts")
+    }
 
     #[test]
     fn test_open_reports_a_missing_port() {
         let err = SerialDevice::open("/dev/not-a-serial-port", DEFAULT_BAUD).unwrap_err();
         assert!(matches!(err, InterfaceError::Other(_)), "{err:?}");
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[test]
+    fn test_a_port_that_never_opens_is_retried_until_the_budget_runs_out() {
+        // A real missing device, the way a start-up races the kernel's
+        // re-enumeration. The message still names the port — it is the last
+        // attempt's — and the count shows the open was tried again rather than
+        // accepted as final.
+        let err = bounded(|| {
+            SerialDevice::open_retrying(
+                "/dev/not-a-serial-port",
+                DEFAULT_BAUD,
+                Duration::from_millis(200),
+                Duration::from_millis(20),
+                &|| false,
+            )
+            .unwrap_err()
+        });
+        assert!(matches!(err, InterfaceError::Other(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("/dev/not-a-serial-port"), "{text}");
+        assert!(text.contains("gave up"), "{text}");
+        assert!(attempts_in(&text) > 1, "{text}");
+    }
+
+    #[test]
+    fn test_a_port_that_opens_on_a_later_attempt_still_opens() {
+        // The board comes back between two attempts: the retry hands back the
+        // success instead of the first failure.
+        let (opened, attempts) = bounded(|| {
+            let attempts = AtomicUsize::new(0);
+            let opened = retry_open(
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        Err(InterfaceError::Other(
+                            "failed to open serial port /dev/ttyUSB0: no such file".to_string(),
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                },
+                &|| false,
+            )
+            .expect("the second attempt opens the port");
+            (opened, attempts.load(Ordering::SeqCst))
+        });
+        assert_eq!(opened, 2, "the port that came back is the one returned");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn test_an_exit_request_ends_the_retry_without_waiting_out_the_budget() {
+        // The budget is a minute and the port never opens: without the stop
+        // check this test would sit here for it. The exit request lands after
+        // three polls, and the wait has to end within a slice of that.
+        let (err, elapsed) = bounded(|| {
+            let polls = AtomicUsize::new(0);
+            let start = Instant::now();
+            let err = retry_open::<()>(
+                Duration::from_secs(60),
+                Duration::from_millis(20),
+                || {
+                    Err(InterfaceError::Other(
+                        "failed to open serial port /dev/ttyUSB0: no such file".to_string(),
+                    ))
+                },
+                &|| polls.fetch_add(1, Ordering::SeqCst) >= 3,
+            )
+            .unwrap_err();
+            (err, start.elapsed())
+        });
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn test_a_port_that_opens_first_time_is_not_tried_again() {
+        // The successful case pays for no retry: the open is the whole attempt,
+        // and nothing polls the stop check — so nothing slept either.
+        let pty = Pty::new();
+        let path = pty.path.clone();
+        let (device, elapsed, polls) = bounded(move || {
+            let polls = AtomicUsize::new(0);
+            let start = Instant::now();
+            let device = SerialDevice::open_retrying(
+                &path,
+                DEFAULT_BAUD,
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                &|| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            )
+            .expect("the pty opens");
+            (device, start.elapsed(), polls.load(Ordering::SeqCst))
+        });
+        assert_eq!(device.baud(), DEFAULT_BAUD);
+        assert_eq!(polls, 0, "a first-try open polls nothing");
+        assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
     }
 
     #[test]

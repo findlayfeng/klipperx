@@ -1089,6 +1089,33 @@ mod tests {
     }
 
     #[test]
+    fn test_a_command_parameter_overrides_the_template_default() {
+        let (printer, chip) = printer();
+        add_display_template(
+            &printer,
+            "hot",
+            &[("param_myvar", "0.25"), ("text", "{param_myvar}")],
+        );
+        OutputPin::new(&wrap(&section("fan", "PA1", &[("pwm", "true")])), &printer).unwrap();
+        let eval = evaluator(&printer);
+
+        // The section's own `param_*` value is the default...
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=hot")
+            .unwrap();
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(pwm_updates(&chip, 0), [0.25]);
+
+        // ...and `PARAM_MYVAR=` is bound over it, as upstream's `params.update`
+        // does (`display/display.py:44-46`).
+        gcode(&printer)
+            .run_script_sync("SET_PIN PIN=fan TEMPLATE=hot PARAM_MYVAR=0.75")
+            .unwrap();
+        assert_eq!(eval.render_once(0.5), Some(1.0));
+        assert_eq!(pwm_updates(&chip, 0), [0.25, 0.75]);
+    }
+
+    #[test]
     fn test_an_empty_template_argument_unsubscribes() {
         let (printer, chip) = printer();
         add_display_template(&printer, "half", &[("text", "0.5")]);

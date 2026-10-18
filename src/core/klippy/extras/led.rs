@@ -34,9 +34,10 @@
 //!   no firmware resource for those drivers: the pins are validated and
 //!   reserved, the `[led]` PWMs are configured, and nothing else reaches the
 //!   firmware until a command needs it to.
-//! * **Template rendering.** `text` and `param_*` are parsed and validated with
-//!   upstream's error wording, but there is no Jinja engine (`gcode_macro` is
-//!   U-A7), so nothing renders a template yet.
+//! * **`SET_LED_TEMPLATE`.** Templates render for the commands that subscribe
+//!   them ([`template_evaluator`](super::template_evaluator) drives
+//!   [`DisplayTemplates::render`]); the LED command that would be their third
+//!   consumer upstream is not registered yet.
 //! * **`cycle_time`'s `maxval`** is upstream's `mcu.max_nominal_duration()`
 //!   (`led.py:114`); this host has no nominal-duration figure to bound it by,
 //!   so only `above=0` is enforced.
@@ -47,6 +48,7 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::template::{Context, Rt, Template, TemplateError};
 use crate::core::klippy::load::section;
 use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -172,11 +174,16 @@ impl PrinterObject for LEDHelper {
 /// (`display/display.py:25-42`).
 #[derive(Debug)]
 struct DisplayTemplate {
-    /// The template source (`text`), stored unrendered (no engine yet).
+    /// The template source (`text`) as the section wrote it, which is what
+    /// `get_status` reports.
     text: String,
     /// `param_*` options keyed by their full option name, parsed as a Python
     /// literal the way `ast.literal_eval` accepts them (`display.py:36`).
     params: BTreeMap<String, Value>,
+    /// The compiled body. Upstream compiles at load too
+    /// (`gcode_macro.load_template(config, 'text')`, `display.py:42`), so a
+    /// body that does not parse fails the section, not the first render.
+    template: Template,
 }
 
 /// The `display_template` printer object: every template by section name.
@@ -193,11 +200,53 @@ pub struct DisplayTemplates {
 
 impl DisplayTemplates {
     /// File one parsed section under its name (upstream `display.py:130-131`).
-    fn insert(&self, name: String, text: String, params: BTreeMap<String, Value>) {
+    fn insert(
+        &self,
+        name: String,
+        text: String,
+        params: BTreeMap<String, Value>,
+        template: Template,
+    ) {
         self.templates
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(name, DisplayTemplate { text, params });
+            .insert(
+                name,
+                DisplayTemplate {
+                    text,
+                    params,
+                    template,
+                },
+            );
+    }
+
+    /// Render the template filed under `name`, with its declared `param_*`
+    /// values and then `params` (one command's `PARAM_*` values) bound as
+    /// globals: upstream's `DisplayTemplate.render` (`display.py:43-53`).
+    ///
+    /// `None` when there is no such template. Upstream's other refusal — a
+    /// keyword the template does not declare, which it spots by comparing
+    /// counts (`display.py:44-47`) — is the subscriber's check instead, with
+    /// its own wording
+    /// ([`PrinterTemplateEvaluator::set_template`](super::template_evaluator::PrinterTemplateEvaluator::set_template)).
+    pub fn render(
+        &self,
+        name: &str,
+        context: &mut Context,
+        params: &[(String, Value)],
+    ) -> Option<Result<String, TemplateError>> {
+        let templates = self
+            .templates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let template = templates.get(name)?;
+        for (option, value) in &template.params {
+            context.insert(option.clone(), Rt::Json(value.clone()));
+        }
+        for (option, value) in params {
+            context.insert(option.clone(), Rt::Json(value.clone()));
+        }
+        Some(template.template.render(context))
     }
 
     /// A template's declared `param_*` option names, or `None` when there is no
@@ -255,7 +304,9 @@ impl PrinterObject for DisplayTemplates {
 /// # Errors
 /// Only if the object name is already taken, which a duplicate lazy creation
 /// would mean.
-fn lookup_display_templates(printer: &Arc<Printer>) -> Result<Arc<DisplayTemplates>, ConfigError> {
+pub(crate) fn lookup_display_templates(
+    printer: &Arc<Printer>,
+) -> Result<Arc<DisplayTemplates>, ConfigError> {
     if let Some(existing) = printer.lookup_object_as::<DisplayTemplates>(DISPLAY_TEMPLATES_OBJECT) {
         return Ok(existing);
     }
@@ -273,7 +324,7 @@ fn lookup_display_templates(printer: &Arc<Printer>) -> Result<Arc<DisplayTemplat
 /// tuples-in-JSON-spelling; anything else is upstream's "not a valid literal"
 /// error at the call site. `true`/`false`/`null` in lowercase are *rejected*:
 /// Python reads those as names, not literals (`display/display.py:36-40`).
-fn parse_literal(text: &str) -> Option<Value> {
+pub(crate) fn parse_literal(text: &str) -> Option<Value> {
     let trimmed = text.trim();
     match trimmed {
         "True" => return Some(json!(true)),
@@ -325,9 +376,13 @@ pub fn load_display_template(
         params.insert(option, value);
     }
     let text = config.get("text", None)?;
+    // Compiled here, the way `DisplayTemplate.__init__` calls
+    // `gcode_macro.load_template(config, 'text')` (`display.py:42`).
+    let template = Template::parse(&format!("{identifier}:text"), &text)
+        .map_err(|error| ConfigError::new(error.to_string()))?;
 
     let templates = lookup_display_templates(printer)?;
-    templates.insert(name, text, params);
+    templates.insert(name, text, params, template);
     Ok(templates as Arc<dyn PrinterObject>)
 }
 

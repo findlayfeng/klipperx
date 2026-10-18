@@ -162,8 +162,13 @@ const UART_READ_LEN: u8 = 10;
 /// How long one wire exchange may take before it is given up.
 ///
 /// Upstream waits forever (`tmc_uart.py:240`); a board with nothing on the UART
-/// would park the reactor here.
-const UART_TIMEOUT: Duration = Duration::from_secs(5);
+/// would park the reactor there. Half a second is already two orders of
+/// magnitude above a working exchange (~5 ms at 40 kbaud), and a **dropped**
+/// frame — the firmware drops a `tmcuart_send` that arrives while the line is
+/// busy — then costs a bounded wait before the retry loop sends it again,
+/// instead of stalling the flush for five seconds (measured on the bench: a
+/// five-second stall made the MCU miss a digital-out deadline and shut down).
+const UART_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How many times a read is retried before it is reported as failed
 /// (`tmc_uart.py:231`, `for retry in range(5)`).
@@ -278,24 +283,13 @@ fn write_command(oid: u8, addr: u8, reg: u8, val: u32) -> TmcuartSend {
     }
 }
 
-/// Slack added on top of a frame's clocking time before the bus is considered
-/// free again.
-const FRAME_DRAIN_MARGIN: Duration = Duration::from_millis(1);
-
-/// How long `bytes` bytes take on a `baud` UART: ten bits per byte (start, eight
-/// data, stop) plus [`FRAME_DRAIN_MARGIN`].
+/// The quiet gap left between two commands on one bit-banged UART.
 ///
-/// The firmware drops a `tmcuart_send` that arrives while the UART is busy
-/// (`src/tmcuart.c`, "host should retransmit"), and a write asks for no answer,
-/// so the host has no signal that the frame is out — it waits this long instead
-/// (see [`TmcUartBitbang::drain_time`]).
-fn frame_time(bytes: usize, baud: f64) -> Duration {
-    Duration::from_secs_f64(bytes as f64 * 10.0 / baud) + FRAME_DRAIN_MARGIN
-}
-
-// ===========================================================================
-// Analog mux (`MCU_analog_mux`)
-// ===========================================================================
+/// A single-wire TMC UART needs the line to settle before the next frame, and
+/// the firmware drops a request that arrives while it is still busy
+/// (`src/tmcuart.c`). Upstream gets this for free: every exchange goes through
+/// Python and chelper, so commands are milliseconds apart.
+const COMMAND_GAP: Duration = Duration::from_millis(2);
 
 /// The select pins that address one of several chips on a shared UART
 /// (`MCU_analog_mux`).
@@ -436,10 +430,6 @@ pub(crate) struct TmcUartBitbang {
     /// deadlock with the reactor itself. One [`TmcUart`] never recurses into
     /// its own read/write path, which is what would make this reentrant.
     bus: Mutex<()>,
-    /// The baud the firmware clocks this UART at, resolved in the config
-    /// callback (the MCU constant decides AVR's 9 kbaud). The write path uses
-    /// it to wait out a frame — see [`TmcUartBitbang::drain_time`].
-    baud: Arc<Mutex<f64>>,
 }
 
 impl TmcUartBitbang {
@@ -472,8 +462,6 @@ impl TmcUartBitbang {
         let callback_chip = chip_name.to_string();
         let callback_rx_pin = rx_params.pin.clone();
         let callback_tx_pin = tx_params.pin.clone();
-        let baud_cell = Arc::new(Mutex::new(TMC_BAUD_RATE));
-        let callback_baud = Arc::clone(&baud_cell);
         builder
             .register_config_callback(Box::new(move |builder, mcu| {
                 let baud = {
@@ -493,9 +481,6 @@ impl TmcUartBitbang {
                     }
                 };
                 let bit_time = mcu.seconds_to_clock(1. / baud)? as u32;
-                *callback_baud
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = baud;
                 let rx = pin_number(mcu, &callback_chip, &callback_rx_pin)?;
                 let tx = pin_number(mcu, &callback_chip, &callback_tx_pin)?;
                 builder.add_config_cmd(&ConfigTmcuart {
@@ -518,26 +503,7 @@ impl TmcUartBitbang {
             mcu_object: Arc::downgrade(&mcu_object),
             oid,
             bus: Mutex::new(()),
-            baud: baud_cell,
         }))
-    }
-
-    /// How long the firmware needs to clock `bytes` bytes out of this UART: the
-    /// frame at 10 bits per byte, plus a millisecond of margin.
-    ///
-    /// It is the write path's pacing. `command_tmcuart_send` **silently drops**
-    /// a request while the UART is busy (`src/tmcuart.c:107-109`, "host should
-    /// retransmit"), so a second command sent before the first has finished
-    /// clocking out is lost — that is why upstream's blocking transport never
-    /// needed this and a fire-and-forget write does. Measured on the bench: the
-    /// immediate `IFCNT` read-back of the very next write saw a stale value
-    /// while the write itself did land, and back-to-back writes went missing.
-    fn drain_time(&self, bytes: usize) -> Duration {
-        let baud = *self
-            .baud
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        frame_time(bytes, baud)
     }
 
     /// Hold the bus for one read/write sequence.
@@ -595,6 +561,8 @@ impl TmcUartBitbang {
             mux.activate(instance_id.unwrap_or(&[]))?;
         }
         let command = read_command(self.oid, addr, reg);
+        // Let the line settle before this frame goes out (see [`COMMAND_GAP`]).
+        std::thread::sleep(COMMAND_GAP);
         // `call_msg_oid` already carries `UART_TIMEOUT`; the `tokio` timeout is
         // the outer net the rest of the tree puts around a call that must not
         // park a command forever.
@@ -645,19 +613,31 @@ impl TmcUartBitbang {
             mux.activate(instance_id.unwrap_or(&[]))?;
         }
         let command = write_command(self.oid, addr, reg, val);
-        let bytes = command.write.len();
-        mcu.send_msg_clocked(
+        let clocks = SendClocks {
+            min_clock,
+            req_clock: None,
+        };
+        // The firmware answers **every** `tmcuart_send`, a write included (an
+        // empty `tmcuart_response`), once the frame has been clocked out
+        // (`src/tmcuart.c`: `tmcuart_finalize` sets `TU_REPORT`). Waiting for
+        // that answer is the write's completion signal — without it the host is
+        // guessing: reads issued before the frame was out were answered from
+        // the pre-write state, and a write whose answer nobody collected also
+        // poisoned the *next* query, which took that stale answer instead.
+        let call = mcu.call_msg_oid_clocked::<TmcuartSend, TmcuartResponse>(
             &command,
-            SendClocks {
-                min_clock,
-                req_clock: None,
-            },
-        )?;
-        // Wait the frame out before anyone may queue the next command on this
-        // UART: the firmware drops one that arrives while it is still clocking
-        // (see [`TmcUartBitbang::drain_time`]).
-        std::thread::sleep(self.drain_time(bytes));
-        Ok(())
+            self.oid,
+            clocks,
+            UART_TIMEOUT,
+        );
+        match block_in_command(async { tokio::time::timeout(UART_TIMEOUT, call).await }) {
+            Ok(Ok(_answer)) => Ok(()),
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(McuError::Call(McuCallError::Timeout(format!(
+                "no tmcuart_response for oid {} within {UART_TIMEOUT:?}",
+                self.oid
+            )))),
+        }
     }
 
     /// Register a driver on this peripheral (`register_instance`).
@@ -954,12 +934,14 @@ impl TmcTransport for TmcUart {
         write_register_verified(
             &self.name,
             reg_name,
+            val,
             &mut ifcnt,
             || {
                 self.bitbang
                     .reg_write(self.instance_id.as_deref(), self.addr, reg, val, print_time)
             },
             || Ok(self.do_get_register("IFCNT")?.data),
+            || Ok(self.do_get_register(reg_name)?.data),
         )
     }
 
@@ -1002,23 +984,35 @@ fn read_register_with_retries(
 }
 
 /// [`UART_ATTEMPTS`] attempts at one write, each verified through `IFCNT`
-/// (`set_register`).
+/// (`set_register`) **or** a read-back of the register itself.
 ///
 /// `ifcnt` is the cached counter (upstream's `self.ifcnt`): it is read once,
 /// before the first write, and then kept at whatever the last attempt read
-/// back. An attempt is accepted only when the counter came back as
-/// `(baseline + 1) & 0xff`, which is how the chip says it saw exactly one more
-/// frame.
+/// back. An attempt is accepted when either
+///
+/// * the counter came back as `(baseline + 1) & 0xff` — the chip saw exactly
+///   one more frame (upstream's rule), or
+/// * the register reads back the value that was just written.
+///
+/// The second arm exists because a TMC2209 on a single-wire UART really does
+/// drop frames: on the bench a write changed `CHOPCONF` while `IFCNT` stayed
+/// put, and back-to-back writes advanced it by one instead of five
+/// (`command_tmcuart_send` drops a request that arrives while the line is
+/// busy, `src/tmcuart.c`). Upstream never notices because its blocking
+/// transport paces itself; here the register value is the authoritative
+/// evidence, which is also what the SPI transports verify with.
 ///
 /// # Errors
-/// A bus error from `write` or `read_ifcnt`, or the "Unable to write" report
-/// once every attempt has failed to advance the counter.
+/// A bus error from `write`, `read_ifcnt` or `read_back`, or the "Unable to
+/// write" report once every attempt has failed both checks.
 fn write_register_verified(
     name: &str,
     reg_name: &str,
+    val: u32,
     ifcnt: &mut Option<u32>,
     mut write: impl FnMut() -> Result<(), McuError>,
     mut read_ifcnt: impl FnMut() -> Result<u32, McuError>,
+    mut read_back: impl FnMut() -> Result<u32, McuError>,
 ) -> Result<(), McuError> {
     for attempt in 1..=UART_ATTEMPTS {
         let baseline = match *ifcnt {
@@ -1040,6 +1034,20 @@ fn write_register_verified(
              (expected {}, attempt {attempt}/{UART_ATTEMPTS})",
             (baseline + 1) & 0xff
         );
+        // The counter not moving does not prove the write was lost — check the
+        // register itself before spending another attempt (see the docs).
+        let read_value = read_back()?;
+        debug!(
+            "tmc uart '{name}': register {reg_name} read back {read_value:#x} \
+             (wanted {val:#x}), IFCNT {after}"
+        );
+        if read_value == val {
+            debug!(
+                "tmc uart '{name}': register {reg_name} holds {val:#x} although \
+                 IFCNT stayed at {after}"
+            );
+            return Ok(());
+        }
     }
     Err(McuError::Config(format!(
         "Unable to write tmc uart '{name}' register {reg_name}"
@@ -1058,23 +1066,6 @@ mod tests {
         // The read request `[0xf5, addr, reg]` with its CRC appended, before the
         // serial-bit framing: the CRC of the three header bytes.
         assert_eq!(crc8(&[0xf5, 0x00, 0x00]), 0x0f);
-    }
-
-    /// A write frame is eight bytes, ten bits each: 2.0 ms at the nominal
-    /// 40 kbaud, 8.9 ms on AVR's 9 kbaud. The pacing that keeps the firmware
-    /// from dropping the next command is that plus the margin.
-    #[test]
-    fn a_write_frame_takes_its_ten_bits_per_byte_to_drain() {
-        assert_eq!(
-            frame_time(8, TMC_BAUD_RATE),
-            Duration::from_micros(2_000) + FRAME_DRAIN_MARGIN
-        );
-        assert_eq!(
-            frame_time(8, TMC_BAUD_RATE_AVR),
-            Duration::from_secs_f64(80.0 / TMC_BAUD_RATE_AVR) + FRAME_DRAIN_MARGIN
-        );
-        // The margin is what makes it a pacing rather than an estimate.
-        assert!(frame_time(8, TMC_BAUD_RATE) > Duration::from_micros(2_000));
     }
 
     #[test]
@@ -1212,6 +1203,7 @@ mod tests {
         write_register_verified(
             "stepper_x",
             "GCONF",
+            0x1234_5678,
             &mut ifcnt,
             || {
                 writes += 1;
@@ -1221,11 +1213,38 @@ mod tests {
                 Ok(())
             },
             || Ok(u32::from(counter.get())),
+            || Ok(0),
         )
         .unwrap();
 
         assert_eq!(writes, 3);
         assert_eq!(ifcnt, Some(11));
+    }
+
+    /// The bench's case: `CHOPCONF` took the new value while `IFCNT` stood
+    /// still — a single-wire TMC2209 drops frames, so the register itself is
+    /// what decides whether a write landed.
+    #[test]
+    fn a_write_is_accepted_when_the_register_reads_back_although_ifcnt_stood_still() {
+        let mut writes = 0;
+        let mut ifcnt = Some(4);
+
+        write_register_verified(
+            "stepper_x",
+            "CHOPCONF",
+            0x1403_0055,
+            &mut ifcnt,
+            || {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(4),
+            || Ok(0x1403_0055),
+        )
+        .unwrap();
+
+        assert_eq!(writes, 1, "one write, then read the register back");
+        assert_eq!(ifcnt, Some(4));
     }
 
     #[test]
@@ -1237,6 +1256,7 @@ mod tests {
         write_register_verified(
             "stepper_x",
             "GCONF",
+            0,
             &mut ifcnt,
             || {
                 counter.set(counter.get().wrapping_add(1));
@@ -1246,6 +1266,7 @@ mod tests {
                 reads += 1;
                 Ok(u32::from(counter.get()))
             },
+            || Ok(0),
         )
         .unwrap();
 
@@ -1262,6 +1283,7 @@ mod tests {
         let err = write_register_verified(
             "stepper_x",
             "GCONF",
+            0x42,
             &mut ifcnt,
             || {
                 writes += 1;
@@ -1271,6 +1293,7 @@ mod tests {
                 reads += 1;
                 Ok(7)
             },
+            || Ok(0),
         )
         .unwrap_err();
 

@@ -442,8 +442,36 @@ impl Mcu {
         timeout: Duration,
     ) -> Result<R, McuError> {
         let dictionary = self.require_dictionary()?;
-        self.call_typed::<C, R>(cmd, timeout, Some(dictionary), SendClocks::default())
+        self.call_typed::<C, R>(cmd, None, timeout, Some(dictionary), SendClocks::default())
             .await
+    }
+
+    /// [`Mcu::call_msg`] whose response must carry `oid` — upstream's
+    /// `serial.register_response(cb, name, oid)`.
+    ///
+    /// The TMC UART and SPI layers query several chips over one MCU; every
+    /// answer arrives under the same response name and the `oid` is what says
+    /// which chip it belongs to. A response carrying another `oid` does not
+    /// resolve this call (it is dropped), so concurrent queries on one
+    /// connection cannot take each other's data.
+    ///
+    /// # Errors
+    /// As [`Mcu::call_msg`].
+    pub async fn call_msg_oid<C: McuCommand, R: McuResponse>(
+        &self,
+        cmd: &C,
+        oid: u8,
+        timeout: Duration,
+    ) -> Result<R, McuError> {
+        let dictionary = self.require_dictionary()?;
+        self.call_typed::<C, R>(
+            cmd,
+            Some(oid),
+            timeout,
+            Some(dictionary),
+            SendClocks::default(),
+        )
+        .await
     }
 
     /// [`Mcu::call_msg`] with scheduling gates on the request ([`SendClocks`]).
@@ -462,7 +490,7 @@ impl Mcu {
         timeout: Duration,
     ) -> Result<R, McuError> {
         let dictionary = self.require_dictionary()?;
-        self.call_typed::<C, R>(cmd, timeout, Some(dictionary), clocks)
+        self.call_typed::<C, R>(cmd, None, timeout, Some(dictionary), clocks)
             .await
     }
 
@@ -478,7 +506,7 @@ impl Mcu {
         cmd: &C,
         timeout: Duration,
     ) -> Result<R, McuError> {
-        self.call_typed::<C, R>(cmd, timeout, None, SendClocks::default())
+        self.call_typed::<C, R>(cmd, None, timeout, None, SendClocks::default())
             .await
     }
 
@@ -486,10 +514,11 @@ impl Mcu {
     ///
     /// Both names are resolved before the command is sent, so a message the
     /// firmware does not implement fails immediately instead of waiting for
-    /// `timeout`.
+    /// `timeout`. `oid` is `Some` only for [`Mcu::call_msg_oid`].
     async fn call_typed<C: McuCommand, R: McuResponse>(
         &self,
         cmd: &C,
+        oid: Option<u8>,
         timeout: Duration,
         dictionary: Option<Arc<Dictionary>>,
         clocks: SendClocks,
@@ -498,7 +527,7 @@ impl Mcu {
         let msg = self.require_message(R::NAME)?;
 
         let values = self
-            .call_gated(C::NAME, &cmd.args(), R::NAME, timeout, clocks)
+            .call_gated_oid(C::NAME, &cmd.args(), oid, R::NAME, timeout, clocks)
             .await?;
 
         let params = match dictionary {
@@ -983,5 +1012,151 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, McuError::Decode(_)), "{err:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Mcu::call_msg_oid
+    // -----------------------------------------------------------------------
+
+    /// `tmc_uart_read oid=%c read_len=%u` / `tmc_uart_read_response oid=%c
+    /// data=%*s` — one command and one answer name for every chip on the bus.
+    fn tmc_dictionary() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {"tmc_uart_read oid=%c read_len=%u": 70},
+            "responses": {"tmc_uart_read_response oid=%c data=%*s": 71}
+        }))
+        .unwrap()
+    }
+
+    struct TmcUartRead {
+        oid: u8,
+        read_len: u32,
+    }
+
+    impl McuCommand for TmcUartRead {
+        const NAME: &'static str = "tmc_uart_read";
+        fn args(&self) -> Vec<ArgValue> {
+            vec![ArgValue::UInt8(self.oid), ArgValue::UInt32(self.read_len)]
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct TmcUartReadResponse {
+        oid: u8,
+        data: Vec<u8>,
+    }
+
+    impl McuResponse for TmcUartReadResponse {
+        const NAME: &'static str = "tmc_uart_read_response";
+        fn decode(params: &Params<'_>) -> Result<Self, McuError> {
+            Ok(Self {
+                oid: params.get_u8("oid")?,
+                data: params.get_bytes("data")?,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_msg_oid_roundtrip() {
+        let mappings = vec![MappingEntry {
+            input: frame(
+                0,
+                &[ArgValue::UInt8(70), ArgValue::UInt8(1), ArgValue::UInt32(4)],
+            ),
+            outputs: vec![frame(
+                0,
+                &[
+                    ArgValue::UInt8(71),
+                    ArgValue::UInt8(1),
+                    ArgValue::Bytes(b"one".to_vec()),
+                ],
+            )],
+        }];
+        let mcu = mcu_with(tmc_dictionary(), mappings);
+
+        let response = mcu
+            .call_msg_oid::<TmcUartRead, TmcUartReadResponse>(
+                &TmcUartRead {
+                    oid: 1,
+                    read_len: 4,
+                },
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response,
+            TmcUartReadResponse {
+                oid: 1,
+                data: b"one".to_vec()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_call_msg_oid_does_not_decode_another_oid_s_answer() {
+        // oid 2's data answers oid 1's query: wrong chip, so the typed call must
+        // not decode it — it waits out its own timeout instead.
+        let mappings = vec![MappingEntry {
+            input: frame(
+                0,
+                &[ArgValue::UInt8(70), ArgValue::UInt8(1), ArgValue::UInt32(4)],
+            ),
+            outputs: vec![frame(
+                0,
+                &[
+                    ArgValue::UInt8(71),
+                    ArgValue::UInt8(2),
+                    ArgValue::Bytes(b"two".to_vec()),
+                ],
+            )],
+        }];
+        let mcu = mcu_with(tmc_dictionary(), mappings);
+
+        let err = mcu
+            .call_msg_oid::<TmcUartRead, TmcUartReadResponse>(
+                &TmcUartRead {
+                    oid: 1,
+                    read_len: 4,
+                },
+                1,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            McuError::Call(McuCallError::Timeout(msg)) => {
+                assert!(
+                    msg.contains("no response for tmc_uart_read_response"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_msg_oid_times_out_when_mcu_stays_silent() {
+        let mcu = mcu_with(tmc_dictionary(), Vec::new());
+
+        let err = mcu
+            .call_msg_oid::<TmcUartRead, TmcUartReadResponse>(
+                &TmcUartRead {
+                    oid: 5,
+                    read_len: 1,
+                },
+                5,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, McuError::Call(McuCallError::Timeout(_))),
+            "{err:?}"
+        );
     }
 }

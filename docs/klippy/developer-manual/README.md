@@ -158,7 +158,7 @@ klipperx（bin，src/main.rs）
 | `resource/adc.rs` | `McuAdc` 与 `AdcRegistry`：`config_analog_in` + 周期 `query_analog_in`（新旧两种格式按字典格式串选择），按 oid 路由 `analog_in_state` 上报 |
 | `resource/stepper.rs` | MCU 侧的步进器（上游 `MCU_stepper`）：oid、`config_stepper`、运行期发步进批与 `stepper_get_position`；运动层只认它 |
 | `resource/endstop.rs` | `McuEndstop`（上游 `MCU_endstop`）：归零时的固件侧限位，持有 `endstop_home` 的触发窗口与查询 |
-| `resource/trsync.rs` | `McuTrsync`（上游 `MCU_trsync` / `TriggerDispatch`）：触发组——`trsync_start` 后多个步进器在触发时一起停，并把触发时刻的位置报回；`Completion` 存原始 reason：`wait()` 保持 1-4 的 typed 语义（未知码折叠 `CommsTimeout`），`wait_raw` 供 trigger_analog 的 5+ 原因贯通，`raw_is_failure`（≥4）判失败 |
+| `resource/trsync.rs` | `McuTrsync`（上游 `MCU_trsync` / `TriggerDispatch`）：触发组——`trsync_start` 后多个步进器在触发时一起停，并把触发时刻的位置报回；`Completion` 存原始 reason：`wait()` 保持 1-4 的 typed 语义（未知码折叠 `CommsTimeout`），`wait_raw` 供 trigger_analog 的 5+ 原因贯通，`raw_is_failure`（≥4）判失败。**`trsync_state` 路由器（2026-10-18）**：在会话 `attach`（identify 之后、配置握手之前）就装、整会话不解除，**无主 oid 静默丢弃**（对齐上游 `mcu.py:228-240`）；`on_restart` 列表里发 `trsync_start(oid,0,0,0)`，把上一轮（例如被杀的进程）留在该 oid 上的周期报告定时器断掉；同时删掉了挂在 chip 上的单向 `bound` 标志——它会在 `Mcu` 被重建时让绑定永久丢失。归零等待另加 **5 s 兜底**（上游 `TRSYNC_TIMEOUT` 语义）：超时先 `dispatch.stop()`（发 `trsync_trigger`）再以 `Timeout during homing` 结束，**不再占着 gcode 锁把整台机器锁死** |
 | `resource/trigger_analog.rs` | `McuTriggerAnalog`（上游 `MCU_trigger_analog`）：`set_raw_range` / `set_trigger` 去重后下发、`home` 挂 trsync 归零、`query_state` 回报 homing/时钟；错误码四类解码（`RAW_RANGE` / `OVERFLOW` / `MONITOR` / `SENSOR_SPECIFIC`，≥`SENSOR_SPECIFIC` 走传感器回调）；含 `MCU_SosFilter`：SOS 段/状态/offset_scale 去重缓存；已实现 `HomingEndstop`（M5b 第二实现通道，eddy 类探针共用 `probing_move`） |
 | `resource/spi.rs` | `McuSpi`（上游 `MCU_SPI`）：`config_spi`（连片选一起装）与传输 |
 | `resource/i2c.rs` | `McuI2c`（上游 `MCU_I2C`）：`config_i2c` 后配置为硬件或软件（bit-bang）总线，读写字节 |
@@ -492,6 +492,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 | `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |
 | `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`），以及 `coordinate_descent`（上游 `mathutil.py:16-49` 的近似最小二乘：步长 `1.0` 起、`>1e-5` 与万轮上限、改善 `*1.1`/不改善 `*0.9`）——H9 调平族 `z_tilt`/`bed_tilt` 平面拟合的依赖 |
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
+| `ui/` | 便利启动的两个服务：`klipperx mainsail`（静态服务；缺 `dist` 时首次 `npm ci && npm run build`，之后只检查 `dist/index.html` 比 `package-lock.json` 新）与 `klipperx moonraker`（自管 venv：`<venv>/klipperx-requirements.sha256` 记依赖表哈希，缺失或不一致才 `pip install`；源码解析 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ 子模块）。HTTP 静态服务用现有 tokio 手写（不引入 crate）。**这是快速起环境的便利通道，不是生产部署路径** |
 
 ## 二进制
 

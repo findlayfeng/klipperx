@@ -1055,7 +1055,9 @@ mod tests {
                 // registry up (`display/display.py:168-174`), before the
                 // display itself is registered.
                 "display_template",
-                "display"
+                "display",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
         let display = printer

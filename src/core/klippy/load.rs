@@ -13,7 +13,7 @@
 //! module (`klippy/klippy.py:90-99`).
 //!
 //! A few modules are built whether or not their section exists: upstream's
-//! `toolhead.add_printer_objects` loads them by name (`toolhead.py:603-611`).
+//! `toolhead.add_printer_objects` loads them by name (`toolhead.py:604-614`).
 //! [`DEFAULT_MODULES`] is that list, and [`Printer::load_sections`] loads each
 //! entry from an empty section when the config has none — upstream's
 //! `PrinterConfig.getsection` semantics for an absent section.
@@ -121,7 +121,7 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// Sections upstream builds even when the config does not have them.
 ///
 /// `toolhead.add_printer_objects` ends with a fixed list of modules it loads
-/// through `printer.load_object(config, module_name)` (`toolhead.py:603-611`),
+/// through `printer.load_object(config, module_name)` (`toolhead.py:604-614`),
 /// and `PrinterConfig.getsection` hands an absent section an empty config, so
 /// each module builds from its own option defaults. The generic walk below only
 /// sees sections that are present, so [`Printer::load_sections`] loads these
@@ -1085,8 +1085,9 @@ mod tests {
         // `gcode`, `configfile` and `pins` are unconditional; no section
         // contributed anything else. The tail is what `[printer]` loads by name
         // whether or not the config has the section (`DEFAULT_MODULES`,
-        // upstream's `toolhead.add_printer_objects`, `toolhead.py:603-611`) —
-        // `gcode_macro` is the template holder `idle_timeout` asks for.
+        // upstream's `toolhead.add_printer_objects`, `toolhead.py:604-614`) —
+        // `gcode_macro` is the template holder `idle_timeout` asks for
+        // (`idle_timeout.py:26`).
         assert_eq!(
             printer.objects(),
             ["gcode", "configfile", "pins", "gcode_macro", "idle_timeout"]

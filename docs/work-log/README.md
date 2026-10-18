@@ -4,12 +4,22 @@
 规范与执行清单以 `docs/klippy/` 与根目录的 `TODO.md` 为准。
 
 正文记的是写作当天的盘点与判断，**不随后续实现改写**；每篇末尾的「实施记录」（§6）是唯一
-随实现推进更新的回填节——余项与现状以它为准，仍留在本目录的记录都还有未收口的余项。
+随实现推进更新的回填节——余项与现状以它为准。
 
-下表按**创建时间**（首次入库时间）从早到晚排列。对应任务**已完结**的记录会从本目录
-清理掉，需要时从 git 历史找回（`git log --diff-filter=D -- docs/work-log/`）。
+## 现行状态：无在册记录
 
-| 创建时间 | 记录 |
-|---|---|
-| 2026-09-23 09:10 | [H2（风扇与通用输出）动工前调查](2026-09-23-h2-notes.md) — 上游 fan/heater_fan/controller_fan 等 21 个文件的依赖盘点、344 次「运行×缺口」测算、GCodeRequestQueue/heater 注册表/tachometer 三处差距与 H2-1…H2-7 拆分 |
-| 2026-09-23 10:03 | [G4/H10（gcode_move）动工前调查](2026-09-23-gcode-move-notes.md) — 上游 g-code 坐标系的状态/命令/事件模型、`G0`/`G1` 从 toolhead 搬家的差距、`Move out of range` 49 次的算账、G4-1/G4-2 拆分与六个拍板点 |
+对应任务**已完结**的记录已从本目录清理（最近一批：`2026-09-23-h2-notes.md`、
+`2026-09-23-gcode-move-notes.md`，2026-10-18 收口——其独有的规范信息先分流进
+[运行时](../klippy/developer-manual/klippy-runtime.md)、[G-Code 命令](../klippy/user-manual/gcode-commands.md)、
+[配置手册](../klippy/user-manual/config.md) 与 `TODO.md` 的 H2/G4/H10 各节，然后才删）。
+
+需要回溯时从 git 历史取：
+
+```bash
+git log --diff-filter=D -- docs/work-log/     # 被删的记录
+git log -- docs/work-log/                    # 本目录的完整历史
+```
+
+**新记录怎么放**：一次性分析写进来（按 `<日期>-<主题>.md` 命名），任务收口时按
+[`doc-sync`](../../.agents/skills/doc-sync/SKILL.md) 的删档条款先分流、再删——不要留下
+「已完成但还在册」的记录，也不要让手册与台账各存一份同样的细节。

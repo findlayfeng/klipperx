@@ -133,8 +133,7 @@ impl EnableTracking {
     }
 
     /// Register a callback for enable/disable transitions.
-    #[allow(dead_code)]
-    fn register_state_callback<F: Fn(bool) + Send + 'static>(&mut self, cb: F) {
+    pub(crate) fn register_state_callback<F: Fn(bool) + Send + 'static>(&mut self, cb: F) {
         self.callbacks.push(Box::new(cb));
     }
 
@@ -161,13 +160,12 @@ impl EnableTracking {
     }
 
     /// Whether the motor is currently enabled.
-    fn is_motor_enabled(&self) -> bool {
+    pub(crate) fn is_motor_enabled(&self) -> bool {
         self.is_enabled
     }
 
     /// Whether this is a dedicated (non-shared) enable pin.
-    #[allow(dead_code)]
-    fn has_dedicated_enable(&self) -> bool {
+    pub(crate) fn has_dedicated_enable(&self) -> bool {
         self.enable.lock().unwrap().is_dedicated
     }
 }

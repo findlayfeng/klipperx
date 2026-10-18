@@ -627,6 +627,19 @@ impl ToolHead {
         Ok(batches)
     }
 
+    /// The step-generation horizon this planner has reached
+    /// (`last_step_gen_time`).
+    ///
+    /// It is the floor a later pass must generate **from**, never below: the
+    /// solvers and the compressors have already scheduled their steps up to it.
+    /// Upstream reads the same value wherever it bounds a flush
+    /// (`motion_queuing.py:143-146`), so a caller that keeps its own copy of the
+    /// horizon — this host's connected-state flush pass does — has to take the
+    /// max of the two.
+    pub fn last_step_gen_time(&self) -> f64 {
+        self.last_step_gen_time
+    }
+
     /// Plan everything queued so far — upstream's `_flush_lookahead`, the
     /// first half of `ToolHead.wait_moves` (`klippy/toolhead.py:422-429`,
     /// `:300-309`): the toolhead is left in "NeedPrime", so the next planned

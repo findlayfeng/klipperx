@@ -543,9 +543,16 @@ impl TrsyncRegistry {
     /// Bind the shared `trsync_state` handler on `mcu`, replacing a handler an
     /// earlier session left behind (`Mcu::bind_event` keeps one per message).
     ///
+    /// Two callers, two reasons, one binding:
+    /// [`McuChip::attach`](super::pin::McuChip::attach) binds on every session
+    /// the chip gets, so a report that arrives before anything is armed (a
+    /// killed host's leftover periodic feed) is dropped in silence; and
+    /// [`McuTrsync::start`] binds again before arming, so a homing move on a
+    /// firmware that cannot report fails there instead of waiting forever.
+    ///
     /// # Errors
     /// Returns [`McuError`] if the message is not in the session's dictionary.
-    fn bind(self: &Arc<Self>, mcu: &Mcu) -> Result<(), McuError> {
+    pub(crate) fn bind(self: &Arc<Self>, mcu: &Mcu) -> Result<(), McuError> {
         // Weak, like the connection's own handlers (`McuObject`'s
         // `watch_connect_shutdown`): the table this closure sits in belongs to
         // the session, and a handler that kept its resource strongly would be
@@ -1203,6 +1210,15 @@ mod tests {
         let _session = SessionGuard(Arc::clone(&second_session));
         chip.attach(Arc::clone(&second_session));
 
+        // From the session's first moment, before anything is armed: a report
+        // that arrives now belongs to no dispatch (`oid` unknown until an arm,
+        // or the leftover feed a killed host left running) and must be dropped
+        // in silence, not as an unhandled message.
+        assert!(
+            second_session.has_event_handler::<TrsyncState>(),
+            "a replaced session must have the trsync_state router from attach on"
+        );
+
         let completion = dispatch.start(0.0).unwrap();
         // Let the arm flush as its own block, so the trigger below is answered
         // on its own (the wire answers a whole block at a time).
@@ -1227,6 +1243,30 @@ mod tests {
             names.iter().any(|name| name == "trsync_trigger"),
             "the firmware was never told to stop reporting: {names:?}"
         );
+    }
+
+    /// The dictionary a real `stm32f446` build publishes declares
+    /// `trsync_state`, so binding it cannot fail on the bench board.
+    ///
+    /// This is the “first suspect” checked off: `McuTrsync::new`'s config
+    /// callback runs after the dictionary is installed (`mcu/object.rs` builds
+    /// the configuration after `Mcu::connect`), so the old
+    /// `bound.swap(true)`-before-`bind_event` ordering never actually poisoned a
+    /// real board — the missing router was the **replaced session**
+    /// (`test_a_replaced_session_binds_the_report_handler_when_it_arms`), not a
+    /// failed bind.
+    #[tokio::test]
+    async fn test_a_real_board_dictionary_can_bind_the_trsync_state_handler() {
+        let json: serde_json::Value = serde_json::from_str(include_str!(
+            "../../upstream_generated/fixtures/stm32f446.dict"
+        ))
+        .unwrap();
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
+        mcu.install_dictionary(Dictionary::from_json(json).unwrap())
+            .unwrap();
+
+        assert!(mcu.has_message("trsync_state"));
+        mcu.bind_event::<TrsyncState, _>(|_| {}).unwrap();
     }
 
     /// The restart list disarms every group, upstream's `on_restart`

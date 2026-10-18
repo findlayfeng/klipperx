@@ -918,6 +918,15 @@ impl Printer {
         self.exit_requested.notify_all();
     }
 
+    /// Whether [`Printer::request_exit`] has already been called.
+    ///
+    /// A wait that belongs to the bring-up polls this instead of blocking: an
+    /// open that is waiting for a port to come back has to end when the process
+    /// is asked to (`mcu/object.rs`, `McuConfig::open_retrying`).
+    pub fn exit_requested(&self) -> bool {
+        self.lock().run_result.is_some()
+    }
+
     /// Idle until the printer is asked to exit, and return what it was asked
     /// with.
     ///
@@ -1334,6 +1343,16 @@ mod tests {
                 "klippy:disconnect",
             ]
         );
+    }
+
+    #[test]
+    fn test_exit_requested_reports_an_exit_that_was_asked_for() {
+        // A bring-up waits on this instead of blocking: a port that is not there
+        // yet must stop being waited for as soon as the process is asked to go.
+        let printer = new_printer();
+        assert!(!printer.exit_requested());
+        printer.request_exit("exit");
+        assert!(printer.exit_requested());
     }
 
     #[test]

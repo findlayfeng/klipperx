@@ -846,10 +846,16 @@ impl McuObject {
     /// A `uart:`/`can:` transport's device sits behind a bridge port: it is
     /// reached on the bridge's own link and named by a port-level
     /// `SET_PORT_NODEID`, never by [`Transport::open`] (`mcu/bridge_attach.rs`).
-    /// Every other transport opens exactly as before. `config` must already
-    /// carry the id `connect` covered onto it — a bridge port is addressed by id
-    /// like every other MCU.
-    fn open_interface(&self, config: &McuConfig) -> Result<Interface, KlippyError> {
+    /// Every other transport opens as before. `config` must already carry the id
+    /// `connect` covered onto it — a bridge port is addressed by id like every
+    /// other MCU.
+    ///
+    /// `retrying` says whether this open belongs to a connect that may wait for
+    /// the port: an exclusive tty is then retried until it appears
+    /// ([`McuConfig::open_retrying`]) and the printer's exit request ends the
+    /// wait. The reopen after a `reset` passes `false` — its own loop already
+    /// retries, and nesting the two would multiply the two budgets.
+    fn open_interface(&self, config: &McuConfig, retrying: bool) -> Result<Interface, KlippyError> {
         if matches!(config.transport, Transport::BridgePort { .. }) {
             let printer = self.printer.upgrade().ok_or_else(|| {
                 KlippyError::Internal(format!(
@@ -866,7 +872,22 @@ impl McuObject {
             let link = bridge_attach::resolve(&printer, config)?;
             return bridge_attach::open(&printer, &link, id);
         }
-        config.open().map_err(KlippyError::Connection)
+        if !retrying {
+            return config.open().map_err(KlippyError::Connection);
+        }
+        let stop = || self.exit_requested();
+        config.open_retrying(&stop).map_err(KlippyError::Connection)
+    }
+
+    /// Whether the printer has been asked to leave its run loop.
+    ///
+    /// A connect that is waiting for a port polls this: an exit request —
+    /// Ctrl-C, `FIRMWARE_RESTART` — must end the wait, not be answered after the
+    /// retry budget.
+    fn exit_requested(&self) -> bool {
+        self.printer
+            .upgrade()
+            .is_some_and(|printer| printer.exit_requested())
     }
 
     /// Open the port and identify the firmware, retrying while a rebooted board
@@ -881,7 +902,7 @@ impl McuObject {
         let mut last = String::new();
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
-            let interface = match self.open_interface(config) {
+            let interface = match self.open_interface(config, false) {
                 Ok(interface) => interface,
                 Err(err) => {
                     last = err.to_string();
@@ -1660,8 +1681,12 @@ impl PrinterObject for McuObject {
             // rebooting — `command` sent the reset on the live connection
             // (`before_firmware_restart`), and the physical methods just switched
             // it — so the port is retried until it comes back. A plain start
-            // opens it once and reports the error, so a missing device is not
-            // hidden behind a retry.
+            // waits for the port the same way: a host that comes up before the
+            // kernel has re-enumerated the tty, or a board that was power-cycled
+            // under it, must not leave the printer in `error` after one failed
+            // open (`McuConfig::open_retrying`). Handshake and configuration
+            // stay single-shot in both cases, so a protocol error is reported as
+            // one.
             let mcu = if self.is_firmware_restart() {
                 match self.open_and_connect(&config).await {
                     Ok(mcu) => mcu,
@@ -1674,7 +1699,7 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = match self.open_interface(&config) {
+                let interface = match self.open_interface(&config, true) {
                     Ok(interface) => interface,
                     Err(err) => return Err(self.recover_lost_child_port(&config, err).await),
                 };
@@ -2119,7 +2144,7 @@ mod tests {
     use crate::core::klippy::interface::devices::frame_mock::{
         FrameMock, FrameRecorder, MappingEntry,
     };
-    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+    use crate::core::klippy::interface::devices::serial::{self, DEFAULT_BAUD};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
@@ -2420,6 +2445,54 @@ mod tests {
 
         // The section's own parser names the port; the object does not have to.
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    /// A plain start waits for a port that is not there yet, and an exit request
+    /// ends that wait instead of leaving the process on the budget.
+    ///
+    /// Both halves are the fix: one failed open used to leave the printer in
+    /// `error` for a board that was still re-enumerating, and the wait must not
+    /// outlive a shutdown either.
+    #[tokio::test]
+    async fn test_a_missing_port_is_retried_and_an_exit_request_ends_the_wait() {
+        let start = std::time::Instant::now();
+        let waited = connect_to_a_missing_port(&printer()).await;
+        assert!(
+            waited.to_string().contains("/dev/not-a-serial-port"),
+            "{waited}"
+        );
+        assert!(waited.to_string().contains("gave up"), "{waited}");
+        assert!(
+            start.elapsed() >= serial::OPEN_RETRY_BUDGET,
+            "one attempt would have returned at once, took {:?}",
+            start.elapsed()
+        );
+
+        // Asked to leave before the open, the same connect ends with the retry's
+        // abort rather than sitting on the budget.
+        let printer = printer();
+        printer.request_exit("exit");
+        let start = std::time::Instant::now();
+        let aborted = connect_to_a_missing_port(&printer).await;
+        assert!(aborted.to_string().contains("aborted"), "{aborted}");
+        assert!(
+            start.elapsed() < serial::OPEN_RETRY_BUDGET,
+            "an exit request must not wait the budget, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Connect a `[mcu]` on a serial port no device is behind, and return the
+    /// error it reports.
+    async fn connect_to_a_missing_port(printer: &Arc<Printer>) -> KlippyError {
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            crate::core::klippy::config::ConfigValue::Single("/dev/not-a-serial-port".to_string()),
+        );
+        let object = McuObject::new(section, printer).unwrap();
+        object.set_id(4);
+        object.connect().await.unwrap_err()
     }
 
     /// The id gate itself: an object built outside the loader holds no id, and

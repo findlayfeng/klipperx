@@ -447,10 +447,35 @@ impl McuConfig {
     /// handshake inside [`serial::attach`] before it is handed back (see
     /// [`Transport::open`]).
     ///
+    /// The port is opened **once**: a caller connecting a printer uses
+    /// [`McuConfig::open_retrying`], which waits for a tty that is not there yet.
+    ///
     /// # Errors
     /// Returns the transport's own message (`serial: …`, `canbus: …`,
     /// `host_library: …`) when it cannot be opened.
     pub fn open(&self) -> Result<Interface, String> {
+        self.open_with(None)
+    }
+
+    /// Open the transport, retrying an **exclusive** serial port until it is
+    /// there.
+    ///
+    /// This is the connect-time open: a board that was just reset re-enumerates
+    /// and a host that starts early finds no tty, so the open alone is retried
+    /// for [`serial::OPEN_RETRY_BUDGET`] at [`serial::OPEN_RETRY_INTERVAL`]
+    /// (upstream's `connect_uart`, `klippy/serialhdl.py:181-204`). `stop` is
+    /// polled between attempts; it is how a shutdown ends the wait instead of
+    /// holding the process for the whole budget. Every other transport opens
+    /// exactly once, as [`McuConfig::open`] does.
+    ///
+    /// # Errors
+    /// As [`McuConfig::open`]: the last attempt's message once the retries run
+    /// out.
+    pub fn open_retrying(&self, stop: &dyn Fn() -> bool) -> Result<Interface, String> {
+        self.open_with(Some(stop))
+    }
+
+    fn open_with(&self, stop: Option<&dyn Fn() -> bool>) -> Result<Interface, String> {
         // Cheetah boards need RTS deasserted for the **whole** connection, not
         // just while resetting, or the board drops into its bootloader
         // (`klippy/mcu.py:703-705`). Every other method wants the line left as
@@ -463,6 +488,7 @@ impl McuConfig {
             self.shared_baud,
             self.host_mux,
             &self.host_port_paths,
+            stop,
         )
     }
 
@@ -1017,6 +1043,11 @@ impl Transport {
     /// because several MCUs would otherwise fight over the same modem line.
     /// The other transports ignore it.
     ///
+    /// `stop` is `Some` for a connect-time open, which retries an exclusive
+    /// tty until it appears ([`McuConfig::open_retrying`]); the check it holds
+    /// is polled between attempts so a shutdown ends the wait. `None` opens the
+    /// port once and reports the failure.
+    ///
     /// # Errors
     /// Returns a message prefixed with the transport that failed.
     pub fn open(
@@ -1026,6 +1057,7 @@ impl Transport {
         shared_baud: Option<u32>,
         host_mux: Option<HostMux>,
         host_port_paths: &[(u8, String)],
+        stop: Option<&dyn Fn() -> bool>,
     ) -> Result<Interface, String> {
         match self {
             Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
@@ -1051,7 +1083,17 @@ impl Transport {
                 baud,
                 uuid: _,
             } => {
-                let device = SerialDevice::open(path, *baud).map_err(|e| format!("serial: {e}"))?;
+                let device = match stop {
+                    Some(stop) => SerialDevice::open_retrying(
+                        path,
+                        *baud,
+                        serial::OPEN_RETRY_BUDGET,
+                        serial::OPEN_RETRY_INTERVAL,
+                        stop,
+                    ),
+                    None => SerialDevice::open(path, *baud),
+                }
+                .map_err(|e| format!("serial: {e}"))?;
                 if !rts {
                     device.set_rts(false).map_err(|e| format!("serial: {e}"))?;
                 }

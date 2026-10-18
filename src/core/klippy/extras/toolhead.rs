@@ -5786,7 +5786,7 @@ mod tests {
     /// payload once the lock is released ([`flush_sync_print_time`],
     /// [`run_flush_loop`]).
     #[test]
-    fn test_the_raised_print_time_is_parked_and_sent_with_the_lock_released() {
+    fn test_the_sync_print_time_is_parked_and_sent_with_the_lock_released() {
         let reactor = Arc::new(crate::core::klippy::reactor::ManualReactor::new());
         let pending = Arc::new(Mutex::new(None));
         let (state, _gcode, printer) = connected_with_printer(homed_toolhead());

@@ -1082,7 +1082,7 @@ mod tests {
     /// hook fires from the same branch: a floor that does not move the print
     /// time reports nothing.
     #[test]
-    fn test_the_sync_notify_fires_only_when_the_print_time_is_raised() {
+    fn test_the_sync_print_time_notify_fires_only_when_the_print_time_is_raised() {
         let est = Arc::new(Mutex::new(0.0));
         let mut toolhead = toolhead_with_estimate(&est);
         let raised = Arc::new(Mutex::new(Vec::new()));

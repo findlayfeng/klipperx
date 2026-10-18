@@ -214,6 +214,13 @@ impl PrinterExtruder {
             printer: Arc::downgrade(printer),
         };
         extruder.register_commands(printer)?;
+        // Register the extruder's own queue with `motion_report`, which streams
+        // it under this section's name. Upstream registers it in
+        // `klippy:connect` (`motion_report.py:173-179`); the mux table here is
+        // filled from the load path, so the instance is registered by name and
+        // the trapq id resolved per batch.
+        crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+            .register_extruder_trapq(&name)?;
         Ok(extruder)
     }
 
@@ -249,6 +256,12 @@ impl PrinterExtruder {
     /// Point this extruder at its trapq (the toolhead does this when attaching).
     pub fn set_trapq(&self, trapq: usize) {
         *self.trapq.lock().unwrap_or_else(|p| p.into_inner()) = Some(trapq);
+    }
+
+    /// This extruder's own trapq, once the toolhead has attached it
+    /// (`MCU_stepper.get_trapq`). `None` before connect.
+    pub fn trapq(&self) -> Option<usize> {
+        *Self::lock(&self.trapq)
     }
 
     /// Register the extruder's g-code commands

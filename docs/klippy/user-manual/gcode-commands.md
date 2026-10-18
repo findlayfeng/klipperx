@@ -330,6 +330,11 @@ G28 [X] [Y] [Z]
 点名的轴归零；**一个都不给就归零 XYZ 三轴**。归零由固件触发（endstop 命中即停步），
 是本主机里少数几个 `async` 处理器之一。
 
+**等触发有 5 s 兑底（上游 `TRSYNC_TIMEOUT` 语义）**：固件报告丢失（典型：上一轮被杀/重启固件
+后 `trsync_state` 落在没接的会话上）时，归零会在 5 s 内以 `Timeout during homing` 失败，
+并先发 `trsync_trigger` 收尾；**不会再占着 gcode 锁挂着**——以前这种情形会把整台机器
+变成「无法交互」：`G28` 永不返回，后面的 `M112`、连客户端的 `printer/info` 都排不进来。
+
 ### SET_VELOCITY_LIMIT — 运行期改速度上限
 
 ```

@@ -60,7 +60,21 @@ $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机�
 Mainsail/Fluidd 那层 HTTP/WebSocket（`server.*` / `machine.*` / `printer.objects.*`）全由
 Moonraker 自己提供，本仓不实现。2026-10-18 已对照 Moonraker 源码逐条核过握手链，无阻塞项。
 
-两条进程的命令行需对齐四个约定（否则能跑但某块 UI 会缺）：
+两条进程的命令行需对齐四个约定（否则能跑但某块 UI 会缺）。下面两种起法等价：
+
+**便捷起法（本仓自带，适合快速搭个环境）**：
+
+```console
+$ klipperx moonraker --dry-run      # 先看它会用哪份源码/venv 与最终命令行
+$ klipperx moonraker                # 首次：建 venv + pip install；之后只检查
+$ klipperx mainsail                 # 首次：npm ci && npm run build；之后只检查
+```
+
+- `klipperx moonraker`：venv 默认在 `~/.local/share/klipperx/moonraker-venv`（`--venv` 可改），依赖表哈希记在 `<venv>/klipperx-requirements.sha256`，**只有缺失或不一致才重装**；源码取 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ `third_party/moonraker`；顺手建好 `data_path` 的目录并在缺 `moonraker.conf` 时生成一份能跑的最小配置。
+- `klipperx mainsail`：静态托管，默认 `--port 8080 --bind 0.0.0.0`，站点根默认 `third_party/mainsail/dist`（`--dir` 可指向已构建好的目录）；缺 `dist` 时首次构建，`--rebuild` 强制重建、`--no-build` 禁止构建；如果 `dist/config.json` 不存在，会写一份指向本机 `:7125` 的实例配置。
+- 这两条是**便利通道**，不是生产部署：生产环境仍建议用 Moonraker 官方 `install-moonraker.sh`（自带 systemd unit、升级/回滚），Mainsail 用它的发布包或容器。
+
+**手起（自己控每一步）**：
 
 ```console
 # klipperx：socket 用 Moonraker 的默认值，日志与配置落在 Moonraker 的 data_path 下

@@ -458,6 +458,20 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] 已知偏差（2026-10-18 审出，客服端宏会踩）：无 `[extruder]` 时上游 `printer.toolhead.extruder` 是 `''`（`DummyExtruder.get_name()`），本仓恒为 `"extruder"`，于是 `_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_EXTRUDE` 那类 `!= ''` 守卫在本仓拦不住、直接去查未注册的 `printer['extruder']`。有挤出机时两者一致。
 - [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，`statistics` / `tuning_tower` / `garbage_collection` / `homing` 四个本仓仍无对应实现（`idle_timeout` 已于 2026-10-18 补上，见 `load.rs` 的 `DEFAULT_MODULES`）。
 
+- [x] **归零丢报告不再锁死（2026-10-18 真机）**：`trsync_state` 路由器提前到会话 `attach` 安装、无主 oid 静默、
+      `on_restart` 发 `trsync_start(oid,0,0,0)` 断掉被杀进程留下的周期报告；等触发加 5 s 兜底
+      （超时先 `dispatch.stop()` 再 `Terminal during homing` 式失败），失败路径释放 gcode 锁。
+- [x] **TMC 相位偏移（2026-10-18 真机）**：首因不是 UART 读失败，而是 `probing_move`/`flush_step_generation`
+      把 toolhead 的 `Connected` 整个 `take()` 出去，使能回调恰在其间取不到 `mcu_position`（53 µs 早退）；
+      改取 solver 位置后与上游一致。
+- [ ] **RESTART 对活固件做 takeover**（2026-10-18 真机）：`M112` → `RESTART` 会 identify+takeover 仍在运行的固件，
+      串口偶发 `Input/output error` 并重建 `Mcu`（曾连带 trsync 绑定丢失）。上游 `RESTART` 不重置固件、只重发配置——
+      本仓应在会话仍健康时复用它，把「重置」留给 `FIRMWARE_RESTART`。
+- [ ] `Timer too close`（真机只出现过一次）：前面 5 s 内有一次 `Reactor busy 0.195s`（TMC 单线读同步阻塞反应堆），
+      归到「使能路径不得阻塞反应堆」的验收里继续观察。
+- [ ] `klipperx mainsail` / `klipperx moonraker`（2026-10-18）：**便利启动**通道，不是生产部署；打包策略暂定
+      （Mainsail 只带 `dist/`，Moonraker 走子模块源码 + 自管 venv），将来若要发布再定。
+
 ### H4 打印流程与 SD 卡
 
 - [x] `virtual_sdcard.py`：主机侧文件打印、`M20`–`M27`/`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`、`work_handler` 回放、进度（**2026-10-02**；省略 `gcode.get_mutex().test()` 让出、`_handle_analyze_shutdown`/`_handle_debuginput_exit`/`stats`，`path` 不做 `expanduser`/`normpath`）。

@@ -5517,6 +5517,137 @@ mod tests {
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 
+    /// A failed `G28` must leave the motion state consistent: the recovery a
+    /// debug session reaches for — `SET_KINEMATIC_POSITION` and then a `G1` —
+    /// has to generate in order afterwards, however often it is retried.
+    ///
+    /// Measured on the machine (`TODO.md`'s known defect): after `G28` failed
+    /// with `No trigger on x after full movement`, that pair raised
+    /// `Internal error in stepcompress: … Invalid sequence` and shut the
+    /// printer down.
+    ///
+    /// What it pins. A homing move **drips** its steps out: when it ends the
+    /// solvers have generated to the drip's end (`last_flush_time` is the move
+    /// end, the compressor's `last_step_clock` sits at the same clock) while
+    /// the planner's `print_time` is still the drip's *start*. The failed path
+    /// used to leave it there — the dripped segment still queued in the trapq,
+    /// the print time behind it — and the background flush pass, which picks its
+    /// horizon up from the last *planned* move, then bounded its generation
+    /// behind what the drip had already generated and rewound the solvers onto
+    /// it. `stepcompress`' `check_line` is what calls that out ("Invalid
+    /// sequence"): a queued step that lands before `last_step_clock` is the
+    /// signature, and the re-walk then injects exactly those.
+    #[tokio::test(start_paused = true)]
+    async fn test_set_kinematic_position_and_g1_after_a_missed_home_still_generate_in_order() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        // The failed home: an armed endstop that never triggers, so the drip
+        // runs the whole 1.5× force distance (300 mm at 5 mm/s) out over the
+        // paused clock.
+        let endstop = TriggeringEndstop::new(false);
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
+        let homing = HomingHandle::new();
+        let result = home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await;
+        result.expect_err("the endstop never triggers, so the home fails");
+
+        // The horizon each stepper has generated to. A homing move is where
+        // this gets ahead of the planner, so no later pass may lower it — that
+        // lowering *is* the rewind `check_line` refuses.
+        let horizons = |connected: &mut Connected| {
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .steppers_mut()
+                .iter()
+                .map(|stepper| (stepper.name().to_string(), stepper.kinematics().last_flush_time))
+                .collect::<Vec<_>>()
+        };
+        let drip_horizons = horizons(&mut connected);
+
+        // The recovery the machine was driven through, twice over: as many
+        // `SET_KINEMATIC_POSITION` + `G1` rounds as a session retries must all
+        // generate in order.
+        for round in 0..2 {
+            // `SET_KINEMATIC_POSITION X=0 Y=0 Z=0`: `force_move.py:118-119`
+            // reads `get_last_move_time()` first, then forces the position.
+            connected.toolhead.get_last_move_time();
+            connected
+                .toolhead
+                .set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
+            // `G1 X10 Y10 F6000`.
+            connected
+                .toolhead
+                .move_to(Coord::new(10.0, 10.0, 0.0, 0.0), 100.0)
+                .expect("the move is inside the bed");
+            let gen_end = connected.toolhead.get_last_move_time();
+
+            // The background flush pass: the seam that shuts a real machine
+            // down (`run_flush_loop` → `Internal error in stepcompress`).
+            connected
+                .generate()
+                .unwrap_or_else(|err| panic!("round {round}: the flush pass failed: {err}"));
+            for (name, before) in &drip_horizons {
+                let after = horizons(&mut connected)
+                    .into_iter()
+                    .find(|(stepper, _)| stepper == name)
+                    .expect("every stepper is still registered")
+                    .1;
+                assert!(
+                    after >= *before,
+                    "round {round}: {name} was generated to {before} but the pass rewound \
+                     its horizon to {after}"
+                );
+            }
+
+            // …and the `G1` really steps: it is not silently dropped.
+            let batches = connected
+                .toolhead
+                .flush_step_generation(gen_end)
+                .unwrap_or_else(|err| panic!("round {round}: the move's steps failed: {err}"));
+            let x_steps = batches
+                .iter()
+                .find(|(name, _)| name == "stepper_x")
+                .map(|(_, commands)| commands.len())
+                .unwrap_or(0);
+            assert!(x_steps > 0, "round {round}: the G1 must produce X steps");
+        }
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
     /// Positive control for the miss check: a rail endstop that **does**
     /// trigger still homes exactly as before — the axis lands at its endstop,
     /// the command succeeds, and `homed_axes` is set.

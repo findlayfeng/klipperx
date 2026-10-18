@@ -940,6 +940,21 @@ mod tests {
             .run_script_sync("SET_IDLE_TIMEOUT TIMEOUT=30")
             .expect("the command runs without a section");
         assert_eq!(idle(&printer).get_status(0.0)["idle_timeout"], 30.0);
+
+        // The other read `mainsail.cfg` makes (`RESUME`, mainsail.cfg:134) is a
+        // template one: `printer.idle_timeout.state` has to resolve in the
+        // context a macro body gets, not fail with `undefined value`.
+        let mut context = Context::new();
+        context.insert(
+            "printer",
+            Rt::Printer(PrinterView::new(Arc::clone(&printer))),
+        );
+        let template = Template::parse(
+            "idle_state",
+            "{% if printer.idle_timeout.state|upper == 'IDLE' %}idle{% endif %}",
+        )
+        .expect("the template compiles");
+        assert_eq!(template.render(&mut context).expect("it renders"), "idle");
     }
 
     /// A config that names the section still runs with its own timeout, in

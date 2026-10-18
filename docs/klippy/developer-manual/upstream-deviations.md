@@ -82,6 +82,9 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 事件系统 | 运行时字符串事件、`*params` 可变参数、`try/except` 隔离、`assert_no_pause()` 强制 | 编译期枚举、变体字段、`catch_unwind`、不做运行时阻塞校验 | [事件系统 §6](event-system.md#6-与上游的差异) |
 | 模板引擎 | Jinja2 | minijinja 适配层（`%`/`//` 取余、Strict 缺键时机与部分 detail 措辞不同） | [模块表](README.md)、[配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 | 运动数学与步进压缩 | `chelper/` 的 C 代码 | Rust 重写；回零/探针位置按**指令位置**返回（上游用触发步数反算，见 TODO H9 的精度单元）、`home_start` 的 `rest_time` 硬编码 | [klippy-runtime](klippy-runtime.md)、[模块表](README.md) |
+| 电机使能的时机 | `set_motors_enable` 先 `toolhead.flush_step_generation()`，禁用前后各 dwell `DISABLE_STALL_TIME` | 自动使能链按首段运动的 `print_time` 排期 `queue_digital_out`（`add_active_callback` + flush 里的 `itersolve_check_active`，两者与上游同）；手动开关的日期取 `toolhead.get_last_move_time()`，**不 dwell**——排期事件与步进命令同在 MCU 时间轴上，先后由固件保证 | [模块表](README.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
+| MCU 失联的判定点 | `MCUConnHelper.check_timeout` 由 `calibrate_clock` 调（`mcu.py:1231`），判据是 `clocksync.is_active()`（未答查询 > 4） | 判据与文案相同，但挂在本仓的 **1 s `mcu_clock_poll`** 上（本仓没有独立的 clock calibration 轮）；每 MCU 只报一次，file-output 模式不判 | [模块表](README.md) |
+| 连接期串口打开重试 | `connect_uart` 里 5 s 间隔、90 s 预算（`serialhdl.py:181-204`） | 同值同语义，但：预算在**测试构建**下缩到 300 ms（单测不能等 90 s）；重试在**阻塞池**上跑（机器运行时只有 2 个 worker），退出请求在睡眠切片内被察觉；只包「打开端口」，握手与配置不重试 | [MCU 连接方式](../user-manual/mcu-connection.md) |
 | 时间敏感回调的锁 | 单线程 reactor，回调自然串行 | `GCodeRequestQueue` 的 sink 回调在**锁外**执行（gcode/flush 双线程） | [模块表](README.md) |
 | `start_reason` | 主循环每轮写回 `start_args` | 只在一处表示差异 | [klippy-runtime](klippy-runtime.md) |
 | `webhooks` 实现形态 | 一个文件同时是传输/派发机器与一个 printer object | 拆成 `klippy-api`（传输/派发）与 `core/klippy/api`（端点） | [klippy-runtime](klippy-runtime.md)、[运行时编排](runtime.md) |

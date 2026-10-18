@@ -54,6 +54,32 @@ $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机�
 注意：上游 Moonraker 的 `[octoprint_compat]` 只是给**切片软件**上传 gcode 用的 OctoPrint API
 子集，**不是** OctoPrint 接入 Klipper 的途径 —— OctoPrint 只走上面那条 pty。
 
+### 接 Moonraker / Mainsail（推荐路径）
+
+上游 Moonraker 可以**直接**把本机当 klippy 用（L1 面：`0x03` 分隔 JSON over unix socket）；
+Mainsail/Fluidd 那层 HTTP/WebSocket（`server.*` / `machine.*` / `printer.objects.*`）全由
+Moonraker 自己提供，本仓不实现。2026-10-18 已对照 Moonraker 源码逐条核过握手链，无阻塞项。
+
+两条进程的命令行需对齐四个约定（否则能跑但某块 UI 会缺）：
+
+```console
+# klipperx：socket 用 Moonraker 的默认值，日志与配置落在 Moonraker 的 data_path 下
+$ klipperx klippy -c ~/printer_data/config/printer.cfg \
+      -a /tmp/klippy_uds --logfile ~/printer_data/logs/klippy.log
+```
+
+| 约定 | 为什么 |
+|------|--------|
+| `-a /tmp/klippy_uds` | Moonraker 的 `klippy_uds_address` 默认就是它（`klippy_connection.py:72-74`）；换路径要改 Moonraker 的 `moonraker.conf` |
+| `-c <data_path>/config/printer.cfg` | 配置不在 `config/` 下时 Moonraker 加一条 `klipper_config` 警告（`file_manager.py:212-231`） |
+| `--logfile <data_path>/logs/klippy.log` | **不给就 `info.log_file = null`**，`/server/files/klippy.log` 会 404，Mainsail 的日志页空着（日志同时不落盘） |
+| `[virtual_sdcard] path: <data_path>/gcodes` | 与 Moonraker 的 `gcodes` 根不一致只加一条 `gcode_path` 警告，不阻功能；但两边不一致时上传的文件本机看不到 |
+
+`info` 里的 `klipper_path` / `python_path` 报的是两个**不存在**的路径，这是**故意的**、不要“修”：
+Moonraker 对这两个键无默认下标（`klippy_connection.py:352-354`），缺了会静默卡在 `startup` 且不重连；
+而报真的 venv 会让它的 Klipper 更新项直接报 `Invalid virtualenv` 起不来了（上游 `app_deploy.py:96-113`）。
+代价只是 Moonraker 的「更新」面板对 Klipper 一项退化为 no-op（已登记 `TODO.md` E2）。
+
 本仓不实现行协议输入，连带没有：`ok` 应答行、`gcode:debuginput_exit` 事件、`stats`/`gcodein`
 计数。逐条登记见开发手册的[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
 
@@ -391,8 +417,8 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 客户端会什么，取决于**主机实现了哪些端点**。完整清单与每个端点的参数、返回字段见
 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md)。
 
-> **当前状态**：端点是逐个落地的，下表里的操作**都已实现**；仍未实现的
-> （`bed_mesh/dump_mesh` 与尚未接入的 `*/dump_*`）调用时才会得到
+> **当前状态**：端点是逐个落地的，下表里的操作**都已实现**；只有未装载对应 extras 节时
+> （例如没有 `[bed_mesh]` 却调 `bed_mesh/dump_mesh`）才会得到
 > `webhooks: No registered callback for path '…'`——那不是客户端的问题。
 > 权威状态见 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md) 开头的
 > 实现状态与主机侧 `api/endpoints/mod.rs` 的状态表。

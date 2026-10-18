@@ -23,6 +23,7 @@
 $ klipperx api -a /tmp/klippy_uds list_endpoints
 {
   "endpoints": [
+    "bed_mesh/dump_mesh",
     "emergency_stop",
     "gcode/firmware_restart",
     "gcode/help",

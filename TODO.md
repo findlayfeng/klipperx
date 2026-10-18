@@ -319,6 +319,14 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       （`klippy_connection.py` 的 `_save_path_info`）。
 - [ ] **想做的**：这是一个 Klipper 实现细节，本主机没有解释器也没有 Klipper 源码树，
       报一个不存在（或任何）路径都是在编数据；理想是**取消**这个字段。
+- [x] **（2026-10-18 对 Moonraker 源码复核后的结论：现在是「不要做」）** 两个路径字段
+      （`klipper_path` **与** `python_path`）都不能删、也不能填真路径：`_save_path_info` 对两个键
+      都是**无默认下标**（`klippy_connection.py:352-354`），`KeyError` 不在 `:418-427` 的
+      `except ServerError` 内 → 初始化任务静默死、socket 连着但 `klippy_state` 永远 `startup`、
+      **不重连**；报真的 venv 则 `update_manager/app_deploy.py:96-113` 抛 `Invalid virtualenv`
+      直接起不来。现有「两个不存在的路径」是唯一正确取值，已加回归守卫钉住
+      （`info.rs` 的 `test_the_two_klipper_paths_are_present_and_do_not_exist`，并断言不得等于
+      `CARGO_MANIFEST_DIR`/`current_exe()`）。只有当上游把那两处下标改成 `.get()` 时才能动。
 - [ ] **阻塞在外部**：取消会让 Moonraker 的 `_save_path_info` 抛 `KeyError`（不在它的
       `except ServerError` 里），连接任务出错、它反复重连。上游把下标取值改成
       `.get()`（或用 `client_info` 判类型）之后才能自由。所以这条要等与 Moonraker 的
@@ -411,6 +419,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 与 F/G/B 各节。
 
 ### H1 加热与温度
+
+- [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）；顺带补了 `set_pwm` 保护的可达一半（`target_temp <= 0 ⇒ 输出 0`）。
+- [ ] **余项**：`set_pwm` 的第二重保护 `read_time > verify_mainthread_time ⇒ 输出 0` 仍未做（需要本机没有的「主线程截止时间」时钟，`heaters.rs` 的 `temperature_callback` 文档里留了方案）。
 
 - [x] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
       10 测）；`M105` gcode-id 表已接（2026-10-03，`14f5055`）：`register_sensor` 存 `gcode_id→sensor` 表（`BTreeMap` 排序），
@@ -619,6 +630,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - 依赖 C1（toolhead/kinematics）；`gcode_move` 已随 G4-1 落地（见 G4 节），不再是 H10 的前置。
 
 ### H11 主机运行时与调试
+
+- [x] **MCU 失联检测与连接期串口重试（2026-10-18）**：`mcu_clock_poll` 现在按上游判据（未答查询 > 4，`clocksync.py:156-157`）报 `Lost communication with MCU '<name>'` 并停机，每 MCU 一次、file-output 不判；独占串口的连接期打开按 5 s × 90 s 预算重试（只包打开，重试在阻塞池上跑，退出请求可打断）。
+- [ ] **日志**：`--logfile` 缺省不落盘、给了也不按大小轮转（上游 `bglogger` 是 2 MB × 5）；仓内不带 systemd unit 文件。
+- [ ] **定时器回调 panic 无兜底**：`reactor` 只有 gcode handler 与 API endpoint 有 `catch_unwind`，dispatcher 死掉后所有定时器静默。
 
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /

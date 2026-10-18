@@ -172,7 +172,7 @@
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `remote_method` | string | 是 | 远程方法名称 |
-| `response_template` | object | 是 | 推送消息的模板格式 |
+| `response_template` | object | 否 | 推送消息的模板格式；缺省 `{}`（与上游 `get_dict(..., {})` 一致），此时推送只有 `method` |
 
 > 服务端推送时，消息为 `{"params": {...}}` 与 `response_template` 合并（同 Subscription 机制）。若注册后连接已关闭，服务端会清理该注册；当某方法已无活动连接时，服务端内部调用会报 `No active connections for method '<method>'`。
 
@@ -586,20 +586,23 @@
 
 ### 18. 数据转储端点一览
 
-| 端点路径 | mux key | 典型 value | 说明 |
-|----------|---------|-----------|------|
-| `adxl345/dump_adxl345` | `sensor` | 配置节名，如 `adxl345` | ADXL345 加速度数据 |
-| `angle/dump_angle` | `sensor` | 配置节名，如 `my_angle` | 磁编码角度传感器数据 |
-| `bmi160/dump_bmi160` | `sensor` | 配置节名 | BMI160 加速度数据 |
-| `icm20948/dump_icm20948` | `sensor` | 配置节名 | ICM20948 加速度数据 |
-| `ldc1612/dump_ldc1612` | `sensor` | 配置节名 | LDC1612 涡流传感器数据 |
-| `lis2dw/dump_lis2dw` | `sensor` | 配置节名 | LIS2DW 加速度数据 |
-| `mpu9250/dump_mpu9250` | `sensor` | 配置节名 | MPU9250 加速度数据 |
-| `motion_report/dump_stepper` | `name` | 步进电机名 | 步进脉冲时间戳 |
-| `motion_report/dump_trapq` | `name` | trapq 名 | 梯形运动队列 |
-| `tmc/stallguard_dump` | `name` | 步进电机名 | TMC StallGuard 数据 |
-| `load_cell/dump_force` | `load_cell` | load cell 名 | 已实现（批 #14）：四列表头 `time, force (g), counts, tare_counts`，未校准列 `null` |
-| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 探针敲击事件 |
+下表的「状态」一列是本仓实际注册情况：**已实现**的 6 条随对应 extras 节装载而注册，
+其余是上游的目标形状、本仓尚未落地（调它只会得到 `webhooks: No registered callback for path '…'`）。
+
+| 端点路径 | mux key | 典型 value | 状态 | 说明 |
+|----------|---------|-----------|------|------|
+| `adxl345/dump_adxl345` | `sensor` | 配置节名，如 `adxl345` | 已实现 | ADXL345 加速度数据 |
+| `angle/dump_angle` | `sensor` | 配置节名，如 `my_angle` | 未实现 | 磁编码角度传感器数据 |
+| `bmi160/dump_bmi160` | `sensor` | 配置节名 | 未实现 | BMI160 加速度数据 |
+| `icm20948/dump_icm20948` | `sensor` | 配置节名 | 未实现 | ICM20948 加速度数据 |
+| `ldc1612/dump_ldc1612` | `sensor` | 配置节名 | 已实现 | LDC1612 涡流传感器数据 |
+| `lis2dw/dump_lis2dw` | `sensor` | 配置节名 | 未实现 | LIS2DW 加速度数据 |
+| `mpu9250/dump_mpu9250` | `sensor` | 配置节名 | 已实现 | MPU9250 加速度数据 |
+| `motion_report/dump_stepper` | `name` | 步进电机名 | 已实现 | 步进脉冲时间戳 |
+| `motion_report/dump_trapq` | `name` | trapq 名 | 已实现 | 梯形运动队列 |
+| `tmc/stallguard_dump` | `name` | 步进电机名 | 未实现 | TMC StallGuard 数据 |
+| `load_cell/dump_force` | `load_cell` | load cell 名 | 已实现 | 四列表头 `time, force (g), counts, tare_counts`，未校准列 `null` |
+| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 未实现 | 探针敲击事件 |
 
 **请求示例（订阅 ADXL345 数据）：**
 
@@ -667,12 +670,12 @@
 | `axis_maximum` | Coord | 运动学最大坐标（来自运动学） |
 | `cone_start_z` | float | 仅 delta 运动学额外提供 |
 
-> **与上游的已知差异（2026-10-04 复核）**：本机 `get_status` 实际只返回上表中的 `position` /
-> `print_time` / `extruder` / `max_velocity` / `max_accel` / `minimum_cruise_ratio` /
-> `square_corner_velocity` / `homed_axes`；`stalls` / `estimated_print_time` / `extra_axes_status` /
-> `axis_minimum` / `axis_maximum` / `cone_start_z` **未返回**（前两个与停滞计数有关，额外轴状态
-> 表与运动学端点仍是缺口）。`max_velocity` / `max_accel` / `minimum_cruise_ratio` /
-> `square_corner_velocity` 可由 `SET_VELOCITY_LIMIT`（或 `M204`）在运行期修改，改完两侧同时生效。
+> **与上游的已知差异（2026-10-18 复核）**：仍**未返回** `stalls`（本仓 planner 没有停滞计数，需新增状态）、
+> `extra_axes_status` 与 `cone_start_z`。`axis_minimum` / `axis_maximum`（运动学四轴 `Coord`）与
+> `estimated_print_time` 已于 2026-10-18 补上：前两者从 `kin.get_status()` 取（上游 `toolhead.py:502`
+> 同源），后者读 `connect` 注入的活估计（`toolhead.py:505-510`）。`max_velocity` / `max_accel` /
+> `minimum_cruise_ratio` / `square_corner_velocity` 可由 `SET_VELOCITY_LIMIT`（或 `M204`）在运行期
+> 修改，改完两侧同时生效。
 
 ### `save_variables`
 

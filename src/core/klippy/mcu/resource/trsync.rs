@@ -1396,15 +1396,6 @@ mod tests {
     /// keeps the session alive: `Mcu::Drop` never runs and its parked device
     /// read would hold up runtime shutdown (`endstop.rs`'s `SessionGuard` has
     /// the full note).
-    struct SessionGuard(Arc<Mcu>);
-
-    impl Drop for SessionGuard {
-        fn drop(&mut self) {
-            self.0.clear_events();
-            self.0.close();
-        }
-    }
-
     /// The `trsync_state` handler must be bound on the session that **arms**,
     /// not only on the one the configuration was built on.
     ///

@@ -39,18 +39,17 @@
 //!   past the horizon every later pass is bounded by, and the next pass would
 //!   rewind them onto moves already generated.
 //! * a stepper `force_move` knows but the toolhead's motion queue does not is
-//!   **refused**, with an error naming the fix ("a `[manual_stepper]` joins it
-//!   on its first `MANUAL_STEPPER STEPPER=<short name> MOVE=`"). This port
-//!   builds a `PrinterStepper` for the manual stepper and the IDEX second
-//!   carriage without putting it in the motion queue (a documented gap of those
-//!   modules), so there is no motor to drive; upstream, where every
-//!   `MCU_stepper` registers a syncemitter when it is built, would move it.
-//!   Refusing is the honest answer for a diagnostic command: `MSCNT` holding
-//!   still after a command that reported success is what made this defect look
-//!   like "force_move produces no `queue_step` at all". Taking the stepper over
-//!   here instead would fight `[manual_stepper]` for its one-shot
-//!   `PrinterStepper::take_stepper`, so unifying the ownership is left to those
-//!   modules.
+//!   carried on the timeline only, **with a warning**: nothing generates its
+//!   steps, so the motor does not move. This port builds a `PrinterStepper` for
+//!   the IDEX second carriage without putting it in the motion queue (a real
+//!   gap of `idex_modes`, registered in `TODO.md`), and a `[manual_stepper]`
+//!   joins only on its first `MOVE=`; upstream, where every `MCU_stepper`
+//!   registers a syncemitter when it is built (`klippy/stepper.py:50-56`),
+//!   moves either. The command still answers because upstream's corpus requires
+//!   that (`test/klippy/dual_carriage.test:49` runs `STEPPER_BUZZ
+//!   STEPPER=dual_carriage`) — an error here would make this port's own gap
+//!   punish legal upstream G-code. The warning is the part that keeps the gap
+//!   from looking like "force_move produces no `queue_step` at all" in silence.
 //!
 //! `SET_KINEMATIC_POSITION` is **not** registered here: upstream registers it
 //! from `force_move` (only with `enable_force_move`), but this port's toolhead
@@ -871,13 +870,13 @@ mod tests {
     }
 
     /// A `[manual_stepper]` is not in the toolhead's motion queue until its
-    /// first `MOVE=` installs it, so a force move on it has no motor to drive.
-    /// Both commands refuse it with an error that names the fix instead of
-    /// reporting success and stepping nothing — and the refusal leaves the
-    /// machine whole: a planned `G1` still runs, and the buzz on that same
-    /// stepper steps once `MANUAL_STEPPER … MOVE=` has installed it.
+    /// first `MOVE=` installs it, so a force move on it has no motor to drive:
+    /// both commands still answer (upstream's corpus requires that —
+    /// `dual_carriage.test:49`), but they generate no steps and the log says so.
+    /// One `MANUAL_STEPPER … MOVE=` installs the stepper, and the same buzz then
+    /// really steps it; a planned `G1` works throughout.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_a_manual_stepper_outside_the_motion_queue_is_refused_not_silently_stepped() {
+    async fn test_a_manual_stepper_outside_the_motion_queue_steps_nothing_until_its_first_move() {
         let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
         if !dict.is_file() {
             return;
@@ -900,21 +899,23 @@ mod tests {
                 .await
                 .map_err(|e| e.to_string())?;
 
+            // Before its first `MOVE=` the stepper is in no queue: the commands
+            // answer, and no `queue_step` comes out for it.
             for script in [
                 format!("STEPPER_BUZZ STEPPER=\"{stepper}\""),
                 format!("FORCE_MOVE STEPPER=\"{stepper}\" DISTANCE=1 VELOCITY=4"),
             ] {
-                let err = gcode.run_script(&script).await.unwrap_err().to_string();
-                if !err.contains("is not in the motion queue") || !err.contains("MANUAL_STEPPER") {
-                    return Err(format!("`{script}` said {err}"));
+                gcode
+                    .run_script(&script)
+                    .await
+                    .map_err(|e| format!("`{script}`: {e}"))?;
+                if step_batches(&toolhead, stepper) != 0 {
+                    return Err(format!("`{script}` stepped a stepper in no queue"));
                 }
             }
-            // The refusal is made before anything is generated or the timeline
-            // moved, so a refused command leaves no trace at all.
-            let after_refusal = toolhead.print_time();
 
-            // The fix the error names: one `MANUAL_STEPPER … MOVE=` installs the
-            // stepper, and the same buzz then really steps it.
+            // One `MANUAL_STEPPER … MOVE=` installs it, and the same buzz then
+            // really steps it.
             gcode
                 .run_script("MANUAL_STEPPER STEPPER=buzzer MOVE=1 SPEED=100 ACCEL=1000")
                 .await
@@ -928,15 +929,11 @@ mod tests {
                 return Err(format!("the buzz on {stepper} produced no queue_step"));
             }
 
-            // And no half-installed state was left behind: a planned move on a
-            // motor the queue does hold still runs.
-            if toolhead.print_time() <= after_refusal {
-                return Err("the refused commands moved the timeline".to_string());
-            }
+            // And the machine is whole: a planned move still runs.
             gcode
                 .run_script("G1 X10 F600")
                 .await
-                .map_err(|e| format!("G1 after the refusal: {e}"))?;
+                .map_err(|e| format!("G1 after the force moves: {e}"))?;
             Ok::<(), String>(())
         }
         .await;

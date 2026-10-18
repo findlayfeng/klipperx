@@ -2,20 +2,33 @@
 //!
 //! A synchronous call registers a [`PendingCall`] before the command is sent and
 //! waits on the returned [`oneshot`] channel. The receive loop resolves the
-//! registration when a message with the expected response name arrives. All
-//! registry locking is encapsulated here so the MCU orchestration code never
-//! touches the mutex directly.
+//! registration when a message with the expected response name arrives — and,
+//! for an `oid`-filtered call
+//! ([`Mcu::call_oid`](super::Mcu::call_oid)), only when that message carries the
+//! call's `oid`. All registry locking is encapsulated here so the MCU
+//! orchestration code never touches the mutex directly.
 
 use crate::core::klippy::msg::proto::ArgValue;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
+use tracing::debug;
 
 /// A single synchronous call waiting for a response from the MCU.
 struct PendingCall {
     /// Name of the response message to match against.
     response_name: String,
+    /// The `oid` this call's response must carry, when the answer is told
+    /// apart from other traffic of the same name (upstream
+    /// `serial.register_response(cb, name, oid)`).
+    oid: Option<u8>,
     /// Sender used to deliver the decoded parameters (or drop on timeout).
     response_tx: oneshot::Sender<Vec<ArgValue>>,
+}
+
+/// Whether `params` start with `oid` — the position the firmware declares it
+/// in, e.g. `tmc_uart_read_response oid=%c data=%*s`.
+fn carries_oid(params: &[ArgValue], oid: u8) -> bool {
+    matches!(params.first(), Some(ArgValue::UInt8(value)) if *value == oid)
 }
 
 /// Registry of in-flight synchronous calls.
@@ -33,39 +46,64 @@ impl PendingCalls {
         Self::default()
     }
 
-    /// Register a call that is waiting for `response_name`.
+    /// Register a call that is waiting for `response_name`, optionally told
+    /// apart from its siblings by `oid`.
     pub(crate) async fn register(
         &self,
         response_name: String,
+        oid: Option<u8>,
         response_tx: oneshot::Sender<Vec<ArgValue>>,
     ) {
         self.calls.lock().await.push(PendingCall {
             response_name,
+            oid,
             response_tx,
         });
     }
 
-    /// Deliver `params` to the oldest call waiting for `response_name`.
+    /// Deliver `params` to the call waiting for `response_name` it belongs to.
     ///
-    /// Returns `true` when a call was matched and consumed, in which case the
-    /// caller must **not** fall back to the regular callback dispatch. Returns
-    /// `false` when nobody is waiting, which is the common case.
+    /// Returns `true` when the message is spent, in which case the caller must
+    /// **not** fall back to the regular callback dispatch. Returns `false` when
+    /// nobody is waiting, which is the common case.
     ///
     /// The parameters are only cloned on a match, so the unmatched path — every
     /// asynchronous message — pays nothing.
     ///
     /// # Ordering
-    /// Matching is by response name only. Two concurrent calls waiting on the
-    /// same response name are therefore resolved first-come-first-served; callers
-    /// that need them told apart must discriminate on a tag parameter (e.g.
-    /// `oid`) themselves.
+    /// An `oid`-filtered call only accepts a message whose first parameter is
+    /// that `oid`; a plain call accepts anything, which keeps the
+    /// first-come-first-served rule it always had. Same-name calls are searched
+    /// in registration order, so a plain call waiting alongside filtered ones
+    /// takes the next message whatever its `oid`.
+    ///
+    /// A message whose `oid` no waiting call claims is **dropped**: upstream
+    /// dispatches `oid`-registered callbacks by exact `oid`
+    /// (`serial.register_response(cb, name, oid)`), so an answer nobody on this
+    /// connection asked for is not handed to the next caller in line — that
+    /// would be another peripheral's data.
     pub(crate) async fn resolve(&self, response_name: &str, params: &[ArgValue]) -> bool {
         let mut calls = self.calls.lock().await;
-        let Some(idx) = calls
-            .iter()
-            .position(|call| call.response_name == response_name)
-        else {
-            return false;
+        let mut waiting = false;
+        let mut matched = None;
+        for (idx, call) in calls.iter().enumerate() {
+            if call.response_name != response_name {
+                continue;
+            }
+            waiting = true;
+            if call.oid.is_none_or(|oid| carries_oid(params, oid)) {
+                matched = Some(idx);
+                break;
+            }
+        }
+        let Some(idx) = matched else {
+            if waiting {
+                debug!(
+                    "Discarding '{response_name}' with oid {:?}: no pending call carries it",
+                    params.first()
+                );
+            }
+            return waiting;
         };
         let call = calls.remove(idx);
         // A send failure means the receiver is gone already; that is not an error.
@@ -86,15 +124,17 @@ impl PendingCalls {
         calls.clear();
     }
 
-    /// Drop the oldest call registered for `response_name`, if any.
+    /// Drop the oldest call registered for `response_name` and `oid`, if any.
     ///
     /// Used to clean up after a send failure, a dropped receiver, or a timeout,
     /// so that a late response is not mis-delivered to a stale registration.
-    pub(crate) async fn cancel(&self, response_name: &str) {
+    /// The `oid` is part of the key: a call cancelled for `oid` 1 leaves the one
+    /// waiting for `oid` 2 alone.
+    pub(crate) async fn cancel(&self, response_name: &str, oid: Option<u8>) {
         let mut calls = self.calls.lock().await;
         if let Some(idx) = calls
             .iter()
-            .position(|call| call.response_name == response_name)
+            .position(|call| call.response_name == response_name && call.oid == oid)
         {
             calls.remove(idx);
         }
@@ -124,7 +164,7 @@ mod tests {
         let calls = PendingCalls::new();
         let (tx, rx) = oneshot::channel();
 
-        calls.register("clock".to_string(), tx).await;
+        calls.register("clock".to_string(), None, tx).await;
         assert!(calls.resolve("clock", &params()).await);
         assert_eq!(rx.await.unwrap(), params());
     }
@@ -134,7 +174,7 @@ mod tests {
         let calls = PendingCalls::new();
         let (tx, rx) = oneshot::channel();
 
-        calls.register("clock".to_string(), tx).await;
+        calls.register("clock".to_string(), None, tx).await;
         assert!(!calls.resolve("uptime", &params()).await);
         assert_eq!(calls.len().await, 1);
 
@@ -149,8 +189,8 @@ mod tests {
         let (tx1, rx1) = oneshot::channel();
         let (tx2, rx2) = oneshot::channel();
 
-        calls.register("clock".to_string(), tx1).await;
-        calls.register("clock".to_string(), tx2).await;
+        calls.register("clock".to_string(), None, tx1).await;
+        calls.register("clock".to_string(), None, tx2).await;
 
         assert!(calls.resolve("clock", &[ArgValue::UInt32(1)]).await);
         assert!(calls.resolve("clock", &[ArgValue::UInt32(2)]).await);
@@ -169,8 +209,8 @@ mod tests {
         let (config_tx, config_rx) = oneshot::channel();
         let (clock_tx, clock_rx) = oneshot::channel();
 
-        calls.register("config".to_string(), config_tx).await;
-        calls.register("clock".to_string(), clock_tx).await;
+        calls.register("config".to_string(), None, config_tx).await;
+        calls.register("clock".to_string(), None, clock_tx).await;
         calls.abort_all().await;
 
         assert_eq!(calls.len().await, 0);
@@ -189,8 +229,8 @@ mod tests {
         let calls = PendingCalls::new();
         let (tx, _rx) = oneshot::channel();
 
-        calls.register("clock".to_string(), tx).await;
-        calls.cancel("clock").await;
+        calls.register("clock".to_string(), None, tx).await;
+        calls.cancel("clock", None).await;
 
         assert_eq!(calls.len().await, 0);
         assert!(!calls.resolve("clock", &params()).await);
@@ -202,9 +242,9 @@ mod tests {
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
 
-        calls.register("clock".to_string(), tx1).await;
-        calls.register("clock".to_string(), tx2).await;
-        calls.cancel("clock").await;
+        calls.register("clock".to_string(), None, tx1).await;
+        calls.register("clock".to_string(), None, tx2).await;
+        calls.cancel("clock", None).await;
 
         assert_eq!(calls.len().await, 1);
     }
@@ -215,8 +255,152 @@ mod tests {
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
         drop(rx);
 
-        calls.register("clock".to_string(), tx).await;
+        calls.register("clock".to_string(), None, tx).await;
         assert!(calls.resolve("clock", &params()).await);
         assert_eq!(calls.len().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // `oid`-filtered calls
+    // -----------------------------------------------------------------------
+
+    /// What `tmc_uart_read_response oid=%c data=%*s` decodes to.
+    fn tmc_response(oid: u8) -> Vec<ArgValue> {
+        vec![ArgValue::UInt8(oid), ArgValue::Bytes(vec![oid; 2])]
+    }
+
+    #[tokio::test]
+    async fn test_two_oid_calls_each_take_their_own_response() {
+        let calls = PendingCalls::new();
+        let (tx1, rx1) = oneshot::channel();
+        let (tx2, rx2) = oneshot::channel();
+
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(1), tx1)
+            .await;
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(2), tx2)
+            .await;
+
+        // The answers arrive in the opposite order to the registrations: the
+        // `oid` decides, not who asked first.
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(2))
+                .await
+        );
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(1))
+                .await
+        );
+
+        assert_eq!(rx1.await.unwrap(), tmc_response(1));
+        assert_eq!(rx2.await.unwrap(), tmc_response(2));
+        assert_eq!(calls.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_an_answer_for_another_oid_reaches_no_pending_call() {
+        let calls = PendingCalls::new();
+        let (tx, mut rx) = oneshot::channel();
+
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(1), tx)
+            .await;
+
+        // oid 2's answer is nobody's on this connection. Handing it to the call
+        // waiting for oid 1 would be the wrong peripheral's data, so the
+        // registration stays put and the answer is dropped.
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(2))
+                .await
+        );
+        assert_eq!(calls.len().await, 1);
+        assert!(rx.try_recv().is_err(), "nothing was delivered");
+
+        // Its own answer still resolves it afterwards.
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(1))
+                .await
+        );
+        assert_eq!(rx.await.unwrap(), tmc_response(1));
+    }
+
+    #[tokio::test]
+    async fn test_an_unanswered_oid_call_still_times_out() {
+        let calls = PendingCalls::new();
+        let (tx, rx) = oneshot::channel();
+
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(1), tx)
+            .await;
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(2))
+                .await
+        );
+
+        // Only a mismatched answer ever arrived, so the call sits out its own
+        // deadline — the drop must not resolve it with the wrong data.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), rx)
+                .await
+                .is_err()
+        );
+        calls.cancel("tmc_uart_read_response", Some(1)).await;
+        assert_eq!(calls.len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_plain_call_takes_the_next_response_whatever_its_oid() {
+        // The old path: a registration without `oid` claims the next message of
+        // its name, tag parameter or not.
+        let calls = PendingCalls::new();
+        let (tx, rx) = oneshot::channel();
+
+        calls
+            .register("tmc_uart_read_response".to_string(), None, tx)
+            .await;
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(7))
+                .await
+        );
+
+        assert_eq!(rx.await.unwrap(), tmc_response(7));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_keeps_the_other_oid_registration() {
+        let calls = PendingCalls::new();
+        let (tx1, _rx1) = oneshot::channel();
+        let (tx2, _rx2) = oneshot::channel();
+
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(1), tx1)
+            .await;
+        calls
+            .register("tmc_uart_read_response".to_string(), Some(2), tx2)
+            .await;
+
+        calls.cancel("tmc_uart_read_response", Some(1)).await;
+
+        assert_eq!(calls.len().await, 1);
+        // oid 1's answer now has no claimant: it is dropped, and oid 2's call is
+        // left untouched by both the cancel and the drop.
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(1))
+                .await
+        );
+        assert_eq!(calls.len().await, 1);
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(2))
+                .await
+        );
     }
 }

@@ -2876,11 +2876,16 @@ impl TmcDriver {
         enable_line
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .register_state_callback(Box::new(move |is_enable: bool| {
-                if let Some(driver) = weak.upgrade() {
-                    driver.handle_stepper_enable(is_enable);
-                }
-            }));
+            .register_state_callback(Box::new(
+                // The print time is the queue's, not the driver's: `toff` goes
+                // over the bus on the reactor turn the callback defers to
+                // (`_handle_stepper_enable`'s `print_time` is unused too).
+                move |_print_time: Option<f64>, is_enable: bool| {
+                    if let Some(driver) = weak.upgrade() {
+                        driver.handle_stepper_enable(is_enable);
+                    }
+                },
+            ));
         *self
             .enable_line
             .lock()

@@ -129,13 +129,14 @@ enum Commands {
         command: AdminCommands,
     },
 
-    /// Serve the Mainsail web UI from this machine, building it on first run
+    /// Serve the Mainsail web UI that this binary carries
     ///
-    // The service half of the pair below: the site is static, so this is a file
-    // server plus the `npm ci && npm run build` that produces what it serves. Its
-    // arguments all have defaults — there is one site to build and one port to
-    // serve it on — so naming `mainsail` alone is an instruction, not a question,
-    // and it gets no `arg_required_else_help`.
+    // The service half of the pair below: the site is a packaged static site, so
+    // this is a file server for the copy embedded at build time, a `--dir` given
+    // on the command line, or a checkout's `dist/`. Its arguments all have
+    // defaults — there is one site to serve and one port for it — so naming
+    // `mainsail` alone is an instruction, not a question, and it gets no
+    // `arg_required_else_help`.
     Mainsail(klipperx::ui::mainsail::MainsailArgs),
 
     /// Run Moonraker against this host, keeping its Python environment here

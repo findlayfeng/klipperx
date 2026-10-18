@@ -86,7 +86,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`static_pwm_clock`、`replicape`、`duplicate_pin_override` 与 `SET_PIN TEMPLATE=`/`static_value`（见 H2 节） | F3、F4、F6、F7 |
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——三者主体**均已落地**（含单测）；`rename_existing` 连接期换名已落地（2026-10-06，`8113056`），余项＝`printer.objects` 的可枚举反射（Q5），见 H3 节 | G1b、Q5 |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
-| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；余项＝`stallguard_dump` 查询与 `tmc_spi` 的 `spi_set_bus` 共享，见 H5 节 | F6、F7、C1 |
+| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
@@ -456,14 +456,19 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H5 TMC 步进驱动
 
-**主体已落地（2026-10-06 复核）**：公共框架（`extras/tmc.rs` + `tmc_spi.rs` 的寄存器/字段表、
-`DUMP_TMC`/`SET_TMC_*`）与六型驱动都在工厂表里——`tmc2130`（批 #34）、`tmc2208`、`tmc2209`、
-`tmc2240`、`tmc2660`、`tmc5160`（各带 `section!`），`tmc_uart` 资源层在 `cmd/`、`extras/tmc_uart.rs`。
+**主体已落地（2026-10-06 复核，2026-10-18 补齐活线）**：公共框架（`extras/tmc.rs` + `tmc_spi.rs`
+的寄存器/字段表、`DUMP_TMC`/`SET_TMC_*`）与六型驱动都在工厂表里——`tmc2130`（批 #34）、
+`tmc2208`、`tmc2209`、`tmc2240`、`tmc2660`、`tmc5160`（各带 `section!`），`tmc_uart` 资源层在 `cmd/`、
+`extras/tmc_uart.rs`。
 
-- [ ] **`stallguard_dump` 查询**（`tmc/stallguard_dump` bulk 端点）：`tmc2130.rs` / `tmc2240.rs` 的模块 doc
-      自述未移植。**语料不覆盖**，按需再补。
-- [ ] **`tmc_spi` 的 `spi_set_bus` 共享**：本仓每节自建 `McuSpi`、片选只按 `"cs"` 角色共享，
-      串链会逐节发 `config_spi`/`spi_set_bus`（`tmc_spi.rs:34-38`），与上游 `share_type="tmc_spi_cs"` 不同。
+- [x] **`stallguard_dump` 查询**（`tmc/stallguard_dump` 端点，2026-10-18）：`TmcStallguardDump` +
+      `BatchBulkHelper`，六型按能力选读路径（`DRV_STATUS.sg_result` / `SG_RESULT` / `SG4_RESULT`）；
+      节拍统一 5 ms（上游用 `spi_status` 猜出的 `optimized_spi` 分 1 ms/5 ms）。
+- [x] **`tmc_spi` 的总线共享**（2026-10-18）：多设备链复用首个节的 `McuSpi` 与一把 `busy` 锁；
+      后续节仍会发一次被丢弃的 `config_spi`/`spi_set_bus`（为了走选项与片选校验），与上游共用同一个
+      pin 对象不同，但帧与互斥已共享。
+- [ ] **both-edge（`dedge`）**：`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，固件配置侧
+      没有 both-edge 步进模式，所以 TMC 不写 `dedge`。属优化项，不影响正确性。
 - 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。
 
 ### H6 传感器与块状数据

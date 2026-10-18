@@ -359,9 +359,16 @@ USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/de
   USB/CAN 抖动（软件侧已用 ±100 ppm/1 h 模拟；`SecondarySync` 周期重校准）。
 - **`rpi_usb` 物理复位**：per-port 断电重启、换电后 identify 不误判、拔插（`restart_method: rpi_usb`，
   代码与决策逻辑已就绪）。
-- **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD、tmcuart——
+- **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD——
   各接一个真实外设后验。（宿主模块已落地但尚未上真板的：`pulse_counter`、`neopixel`/`dotstar`、
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
+- **TMC 驱动的真板验收（2026-10-18 补齐活线后新列入）**：`[tmc2208/2209]` 的 UART 与
+  `[tmc2130/2240/2660/5160]` 的 SPI 读写现在都真上总线了，待上板验四件事：① `DUMP_TMC` 读到**非 0 且
+  字段合理**（`IOIN.version`、`GSTAT`、`DRV_STATUS`）；② `SET_TMC_CURRENT` 改电流后堵转力矩/温度跟变；
+  ③ `tmc2209_<stepper>:virtual_endstop` 能触发回零，且 `[endstop_phase]` 的相位偏移不再恒为 0；
+  ④ `tmc/stallguard_dump` 端点能采到随负载变化的 `sg_result`（2209 走 `SG_RESULT`，2130/5160 走
+  `DRV_STATUS.sg_result`）。**注意**：这两条传输层的 `block_in_command` 要求多线程 runtime，所以在
+  真板上跑时不能把命令塞进 current-thread runtime。
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
 - **katapult 刷写真机验证（直连）**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 直刷——

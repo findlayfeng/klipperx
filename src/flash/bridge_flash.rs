@@ -3604,6 +3604,165 @@ mod tests {
         responder.join().expect("the responder thread");
     }
 
+    // =======================================================================
+    // Where a bridge left in an earlier session's state is met
+    //
+    // The takeover itself is the MCU transport's (`mcu/mod.rs`, `place_frame` /
+    // `Sender::settle` / `renumber_to_firmware`): the session's first block goes
+    // out, and a board that answers it with a number past a fresh session's
+    // window is renumbered onto and the block re-sent. These tests pin down
+    // which **seam** that has to reach: a bridge whose admin channel answers is
+    // taken over by the identify the flash tool already runs, so the only way a
+    // stale board can lock a run out is the mux assignment handshake in front
+    // of it.
+    // =======================================================================
+
+    /// Read whole `(arbitration id, frame)` units off the pty master until
+    /// `done` accepts what has arrived — or `window` expires. A unit's length is
+    /// its length byte, for an admin unit and a command frame alike, and a
+    /// trailing partial unit is left out of the result.
+    fn read_units(
+        master: &mut std::fs::File,
+        window: Duration,
+        done: impl Fn(&[(u32, Vec<u8>)]) -> bool,
+    ) -> Vec<(u32, Vec<u8>)> {
+        let mut wire: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + window;
+        let mut buf = [0u8; 512];
+        loop {
+            let units = split_units(&wire);
+            if done(&units) {
+                return units;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return units;
+            }
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            if unsafe { libc::poll(&mut poll, 1, left.as_millis() as i32) } <= 0 {
+                continue;
+            }
+            match master.read(&mut buf) {
+                Ok(0) => continue,
+                Ok(read) => wire.extend_from_slice(&buf[..read]),
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    /// The whole units in `wire`, leaving a trailing partial one unparsed — the
+    /// host's own split of the stream, header by header.
+    fn split_units(mut wire: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let mut units = Vec::new();
+        loop {
+            match serial::decode_header(wire) {
+                serial::HeaderScan::Complete { arb, consumed } => {
+                    if wire.len() < consumed + 1 {
+                        break;
+                    }
+                    let length = wire[consumed] as usize;
+                    if wire.len() < consumed + length {
+                        break;
+                    }
+                    units.push((arb, wire[consumed..consumed + length].to_vec()));
+                    wire = &wire[consumed + length..];
+                }
+                serial::HeaderScan::NeedMore => break,
+                serial::HeaderScan::Invalid => panic!("a sent unit must start with a header"),
+            }
+        }
+        units
+    }
+
+    /// The empty frame a bridge sends as the ack or the nak of a block, on its
+    /// own reply id, stamped with `seq` — its counter, which is where an earlier
+    /// session left it.
+    fn bridge_ack(seq: u8) -> Vec<u8> {
+        use crate::core::klippy::frame::Frame;
+        let mut unit = serial::encode_header(
+            crate::core::klippy::assign::reply_arb_id(BRIDGE_MCU_ID)
+                .expect("the bridge id is addressable"),
+        );
+        unit.extend_from_slice(&Frame::new(seq, Vec::new()).raw_bytes());
+        unit
+    }
+
+    /// The seam the stale-session report has to reach: once the bridge's admin
+    /// channel answers (the mux handshake completes), the identify the flash
+    /// tool already runs **takes the earlier session over by itself** — the first
+    /// block goes out at 0, the bridge naks it with the number its earlier
+    /// session left, and the same block goes out again under that number.
+    ///
+    /// That is klippy's takeover, unrehearsed: nothing here had to be added for
+    /// it, which is what makes the unanswered **handshake** in front of it the
+    /// only place a stale bridge can still lock a run out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_stale_session_is_renumbered_onto_by_the_identify() {
+        use crate::core::klippy::frame::{Frame, MESSAGE_POS_SEQ};
+
+        const STALE_SEQ: u8 = 5;
+        let pty = Pty::new();
+        let mut master = pty.master.try_clone().expect("the pty master clones");
+        let uuid = [0x5a, 0x51, 0x52, 0x53, 0x54, 0x55];
+        let reply = serial::assignment_reply(BRIDGE_MCU_ID).expect("the bridge id is addressable");
+        let nak = bridge_ack(STALE_SEQ);
+
+        let responder = std::thread::spawn(move || {
+            // The assignment handshake: SET_NODEID, then the request, answered.
+            let units = read_units(&mut master, Duration::from_secs(10), |units| {
+                units.len() >= 2
+            });
+            assert_eq!(units.len(), 2, "SET_NODEID and the assignment request");
+            master.write_all(&reply).expect("the handshake is answered");
+
+            // The identify's first block: naks it with the earlier session's
+            // number instead of answering it.
+            let units = read_units(&mut master, Duration::from_secs(10), |units| {
+                units.len() >= 3
+            });
+            assert_eq!(units.len(), 3, "the identify's first block");
+            let first = units[2].1.clone();
+            master.write_all(&nak).expect("the nak goes out");
+
+            // The same block again, under the number the board reported.
+            let units = read_units(&mut master, Duration::from_secs(10), |units| {
+                units.len() >= 4
+            });
+            assert_eq!(units.len(), 4, "the renumbered block, re-sent");
+            let again = units[3].1.clone();
+            (first, again)
+        });
+
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, Some(uuid))
+            .expect("the bridge answered the assignment handshake");
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            link.identify(Duration::from_millis(1_500)),
+        )
+        .await
+        .expect("the identify is bounded")
+        .expect_err("nothing ever answers the identify, so it has to fail");
+
+        let (first, again) = responder.join().expect("the responder thread");
+        assert_eq!(
+            again[MESSAGE_POS_SEQ],
+            Frame::new(STALE_SEQ, Vec::new()).raw_bytes()[MESSAGE_POS_SEQ],
+            "the block goes out again under the number the board reported"
+        );
+        // The payload is the same request: the CRC is left out of the
+        // comparison because the sequence byte is part of what it covers.
+        let strip = |frame: &[u8]| frame[MESSAGE_POS_SEQ + 1..frame.len() - 3].to_vec();
+        assert_eq!(
+            strip(&again),
+            strip(&first),
+            "the same block, renumbered — not a new request"
+        );
+    }
+
     /// An answer that names **another** board is not this board's confirmation: the
     /// wait reads the whole window and reports the unit as sent.
     #[test]

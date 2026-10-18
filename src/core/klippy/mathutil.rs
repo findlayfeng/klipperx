@@ -29,6 +29,11 @@ pub const AXES: usize = 4;
 /// positions grow a slot per extra axis (`toolhead.py:378-385`,
 /// `add_extra_axis` appends to `commanded_pos`), so the room is eight: the
 /// four modelled axes plus four extra ones.
+///
+/// The capacity is `E` plus **four** extra-axis G-code letters: a fifth extra
+/// axis has no slot and its letter is not mapped into
+/// `gcode_move.axis_map` (upstream, with unbounded lists, has no such limit).
+/// Raising this constant means revisiting that cap's test as well.
 pub const MAX_AXES: usize = 8;
 
 /// A toolhead position: `x`, `y`, `z`, `e`, and any extra axes after them.

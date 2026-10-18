@@ -208,6 +208,15 @@ impl MoveState {
     fn update_extra_axes(&mut self, extra_axes: &[Option<String>]) {
         let mut axis_map = four_axis_map();
         for (index, gcode_id) in extra_axes.iter().enumerate() {
+            // Slot 0 is the extrude slot ([`E_AXIS`]) in this port —
+            // `ToolHead::add_extra_axis` puts the extruder there, and a lone
+            // `GCODE_AXIS` stepper would take it when no extruder is
+            // configured. Mapping its letter onto that slot would let `G1 A`
+            // write the E position, so an index-0 axis never gets a letter;
+            // upstream reserves the slot for the extruder and starts at 4.
+            if index == 0 {
+                continue;
+            }
             let Some(gcode_id) = gcode_id else { continue };
             // The filter is upstream's, in its order (`gcode_move.py:126-128`):
             // one uppercase letter, not one of the four axes, not `F` (feed)
@@ -223,7 +232,8 @@ impl MoveState {
                 continue;
             }
             // Past the container's capacity a letter would address a slot that
-            // cannot exist; upstream's list has no such bound.
+            // cannot exist; upstream's list has no such bound. With
+            // [`MAX_AXES`] eight, indices 1..=4 map (positions 4..=7).
             if E_AXIS + index >= MAX_AXES {
                 continue;
             }
@@ -373,6 +383,9 @@ impl GCodeMove {
         let position = target.position();
         let mut state = self.lock();
         let len = state.base_position.len();
+        // `toolhead.position()` carries the four modelled axes, so the
+        // extra-axis tail keeps the values of the last move until the toolhead
+        // reports the tail itself (upstream reads it out of `commanded_pos`).
         let tail = state.last_position.as_slice().get(AXES..).unwrap_or(&[]);
         let axes = position.axes().chain(tail.iter().copied());
         state.last_position = Coord::from_axes(axes);
@@ -1791,5 +1804,61 @@ mod tests {
 
         assert_eq!(axis_map(&object), json!({"X": 0, "Y": 1, "Z": 2, "E": 3}));
         assert_eq!(object.status()["position"], json!([0.0, 0.0, 0.0, 0.0]));
+    }
+
+    /// A lone `GCODE_AXIS` stepper (no extruder configured) sits in slot [`E_AXIS`]
+    /// in this port, so it must **not** get a letter: `G1 A` would land in the
+    /// E position.
+    #[test]
+    fn test_a_lone_manual_stepper_is_not_mapped_onto_the_e_slot() {
+        let (_printer, gcode, object, _target) = machine(Coord::default());
+        object.update_extra_axes_from(&[Some("A".to_string())]);
+
+        assert_eq!(
+            axis_map(&object),
+            json!({"X": 0, "Y": 1, "Z": 2, "E": 3}),
+            "slot 0 is the extruder slot; an axis there gets no letter"
+        );
+
+        gcode.run_script_sync("G1 E5").unwrap();
+        gcode.run_script_sync("G1 A10").unwrap();
+        assert_eq!(
+            object.status()["position"],
+            json!([0.0, 0.0, 0.0, 5.0]),
+            "A must not write the E slot"
+        );
+    }
+
+    /// The capacity cap, pinned: with `MAX_AXES` eight the four extra axes
+    /// after the extruder map (positions 4..=7) and a fifth does not. Raising
+    /// `MAX_AXES` has to revisit this assertion.
+    #[test]
+    fn test_a_fifth_extra_axis_is_not_mapped() {
+        let (_printer, _gcode, object, _target) = machine(Coord::default());
+
+        object.update_extra_axes_from(&[
+            Some("E".to_string()),
+            Some("A".to_string()),
+            Some("B".to_string()),
+            Some("C".to_string()),
+            Some("D".to_string()),
+            Some("G".to_string()),
+        ]);
+
+        let map = axis_map(&object);
+        assert_eq!(map["A"], json!(4));
+        assert_eq!(map["B"], json!(5));
+        assert_eq!(map["C"], json!(6));
+        assert_eq!(map["D"], json!(7));
+        assert!(
+            map.get("G").is_none(),
+            "the fifth extra axis has no slot: {map}"
+        );
+        assert_eq!(map.as_object().unwrap().len(), MAX_AXES);
+        assert_eq!(
+            object.status()["position"].as_array().unwrap().len(),
+            MAX_AXES,
+            "the position is capped at the container's capacity"
+        );
     }
 }

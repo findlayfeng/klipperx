@@ -73,7 +73,10 @@ $ klipperx mainsail                 # 首次：npm ci && npm run build；之后�
 - `klipperx moonraker`：venv 默认在 `~/.local/share/klipperx/moonraker-venv`（`--venv` 可改），依赖表哈希记在 `<venv>/klipperx-requirements.sha256`，**只有缺失或不一致才重装**；源码取 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ `third_party/moonraker`；顺手建好 `data_path` 的目录并在缺 `moonraker.conf` 时生成一份能跑的最小配置。
 - `klipperx mainsail`：静态托管，默认 `--port 8080 --bind 0.0.0.0`；站点按 `--dir` → **编进二进制的那份**（发布包自带）→
   `third_party/mainsail/dist`（开发检出里已构建的那份）取，**前端不在本机编译**，也不需要 node。
-  还没有 `config.json` 时会补一份指向本机 `:7125` 的实例配置。
+  `/config.json` 在**请求时**给出（不再往站点里写文件）：
+  ① `--config-json <PATH>` 指定用哪份（启动时只查一次「是 JSON 对象且含 `instances` 数组」，通过后原样返回、不改写）；
+  ② 没给就用站点自带那份做底稿、把 `instances` 换成「**请求的 Host** 主机名 + `--moonraker-port`（默认 7125）」；
+  `--moonraker-host` 可固定主机名（Moonraker 绑在别处/走反代时用）。响应带 `Cache-Control: no-store`。
 - 这两条是**便利通道**，不是生产部署：生产环境仍建议用 Moonraker 官方 `install-moonraker.sh`（自带 systemd unit、升级/回滚），Mainsail 用它的发布包或容器。
 
 **手起（自己控每一步）**：

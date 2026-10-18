@@ -131,7 +131,9 @@ use crate::core::klippy::motion::rotary_delta::{
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
-use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead, WaitMovesState};
+use crate::core::klippy::motion::toolhead::{
+    EstimatedPrintTime, SyncPrintTimeNotify, ToolHead, WaitMovesState,
+};
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -513,6 +515,14 @@ pub struct ToolHeadObject {
     /// Flush callbacks registered before connect, installed the same way
     /// (`register_flush_callback` at config load).
     pending_flush_callbacks: Mutex<Vec<Box<dyn Fn(f64) + Send + 'static>>>,
+    /// The `toolhead:sync_print_time` payload waiting to be sent —
+    /// `(curtime, est_print_time, print_time)` — filled by the planner's sync
+    /// hook under the state lock (see [`install_sync_print_time_hook`]) and
+    /// drained by [`run_flush_loop`] once that lock is released.
+    ///
+    /// An `Arc` because the hook is a `'static` closure that outlives the call
+    /// installing it.
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
     /// Set when the object is dropped, to stop the flush task.
     shutdown: Arc<AtomicBool>,
 }
@@ -936,6 +946,7 @@ impl ToolHeadObject {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         object.register_commands(printer)?;
@@ -1382,13 +1393,27 @@ impl PrinterObject for ToolHeadObject {
             // A reading taken here, at connect, would floor every later move at
             // a horizon the clock passed `idle` seconds ago (C5: the whole
             // motion expired and was dumped in one burst → `Timer too close`).
+            let est_reactor = Arc::clone(&reactor_for_est);
             toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(move || {
                 printer_for_est
                     .upgrade()
                     .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                    .and_then(|object| object.estimated_print_time(reactor_for_est.monotonic()))
+                    .and_then(|object| object.estimated_print_time(est_reactor.monotonic()))
                     .unwrap_or(0.0)
             }));
+
+            // The planner cannot send `toolhead:sync_print_time` itself: every
+            // path into `calc_print_time` holds the state lock this object
+            // shares, and a handler that reaches back into it (`idle_timeout`
+            // reads the print time) would deadlock on that same lock. So the
+            // hook parks the payload and the flush task sends it with the lock
+            // released — the ordering `set_position` uses for
+            // `toolhead:set_position`.
+            install_sync_print_time_hook(
+                &mut toolhead,
+                Arc::clone(&self.pending_sync_print_time),
+                Arc::clone(&reactor_for_est),
+            );
 
             // The extruders are the toolhead's `extra_axes`: each has its own
             // trapq, and the extruder queues the extrusion into it
@@ -1454,11 +1479,13 @@ impl PrinterObject for ToolHeadObject {
             }
 
             // The flush task owns nothing the object does not share; it stops
-            // when the object is dropped, by reading `shutdown`.
+            // when the object is dropped, by reading `shutdown`. It also sends
+            // the print time sync the planner parks (`pending_sync_print_time`).
             tokio::spawn(run_flush_loop(
                 Arc::clone(&self.state),
                 Arc::clone(&self.shutdown),
                 self.printer.clone(),
+                Arc::clone(&self.pending_sync_print_time),
             ));
             Ok(())
         })
@@ -2286,6 +2313,55 @@ impl ToolHeadObject {
     }
 }
 
+/// Install the planner's print-time sync hook (`ToolHeadObject::connect`): it
+/// dates the payload and parks it for [`run_flush_loop`].
+///
+/// The hook runs **under the toolhead's state lock** — every `calc_print_time`
+/// path holds it — so it must not send: `Printer::send_event` runs the handlers
+/// on that thread, and a handler that reads the planner would deadlock on the
+/// lock it is called under. A single slot is enough: only the latest raise
+/// matters to the handler, and a burst inside one 10 ms flush tick collapses
+/// into the last one.
+fn install_sync_print_time_hook(
+    toolhead: &mut ToolHead,
+    pending: Arc<Mutex<Option<(f64, f64, f64)>>>,
+    reactor: Arc<dyn Reactor>,
+) {
+    toolhead.set_sync_print_time_notify(SyncPrintTimeNotify::new(
+        move |est_print_time, print_time| {
+            // Upstream reads `curtime` when it enters `_calc_print_time`
+            // (`toolhead.py:261`); this is that instant.
+            *pending.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                Some((reactor.monotonic(), est_print_time, print_time));
+        },
+    ));
+}
+
+/// Send the `toolhead:sync_print_time` the planner parked, if any.
+///
+/// Called by [`run_flush_loop`] with the state lock **released**: the lock is
+/// only held while steps are generated, and this event's handler
+/// (`idle_timeout`'s `handle_sync_print_time`) reads the planner's print time —
+/// sending it under that lock would deadlock the sending thread. The slot is
+/// also emptied before the send, so a handler that raises the print time again
+/// faces no held lock.
+fn flush_sync_print_time(pending: &Mutex<Option<(f64, f64, f64)>>, printer: &Weak<Printer>) {
+    let sync = pending
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some((curtime, est_print_time, print_time)) = sync {
+        send(
+            printer,
+            &KlippyEvent::ToolheadSyncPrintTime {
+                curtime,
+                est_print_time,
+                print_time,
+            },
+        );
+    }
+}
+
 /// The flush task: generate the queued steps and await the transport.
 ///
 /// A command that must not return until the steps it queued are generated and
@@ -2296,6 +2372,7 @@ async fn run_flush_loop(
     state: Arc<Mutex<Option<Connected>>>,
     shutdown: Arc<AtomicBool>,
     printer: Weak<Printer>,
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
 ) {
     loop {
         sleep(FLUSH_INTERVAL).await;
@@ -2311,6 +2388,10 @@ async fn run_flush_loop(
                 None => Ok(Vec::new()),
             }
         };
+        // The lock is out of scope here, so the print-time sync the planner
+        // parked can be sent (it is parked under that lock instead — see
+        // [`install_sync_print_time_hook`]).
+        flush_sync_print_time(&pending_sync_print_time, &printer);
         let batches = match batches {
             Ok(batches) => batches,
             // `check_line` failed, which upstream treats as an internal error
@@ -4545,6 +4626,7 @@ mod tests {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         (printer, object)
@@ -5694,6 +5776,86 @@ mod tests {
         // `set_position` would otherwise silently discard them.
         let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
         assert!(!steppers[0].history(10, 0, u64::MAX).is_empty());
+    }
+
+    /// The print time a raise reports is **parked**, not sent: every
+    /// `calc_print_time` path runs under the toolhead's state lock, and the
+    /// event's handler reads the planner (`idle_timeout`), so sending there
+    /// would deadlock. `connect` installs this hook
+    /// ([`install_sync_print_time_hook`]) and the flush task sends the parked
+    /// payload once the lock is released ([`flush_sync_print_time`],
+    /// [`run_flush_loop`]).
+    #[test]
+    fn test_the_raised_print_time_is_parked_and_sent_with_the_lock_released() {
+        let reactor = Arc::new(crate::core::klippy::reactor::ManualReactor::new());
+        let pending = Arc::new(Mutex::new(None));
+        let (state, _gcode, printer) = connected_with_printer(homed_toolhead());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&sent);
+            printer.register_event_handler(
+                KlippyEvent::ToolheadSyncPrintTime {
+                    curtime: 0.0,
+                    est_print_time: 0.0,
+                    print_time: 0.0,
+                },
+                Box::new(move |event| {
+                    if let KlippyEvent::ToolheadSyncPrintTime {
+                        curtime,
+                        est_print_time,
+                        print_time,
+                    } = event
+                    {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                            *curtime,
+                            *est_print_time,
+                            *print_time,
+                        ));
+                    }
+                }),
+            );
+        }
+        // The clock the hook dates the event with (`toolhead.py:261`).
+        reactor.advance(2.0);
+
+        {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let connected = guard.as_mut().expect("the machine is connected");
+            connected
+                .toolhead
+                .set_estimated_print_time_source(EstimatedPrintTime::new(|| 5.0));
+            install_sync_print_time_hook(
+                &mut connected.toolhead,
+                Arc::clone(&pending),
+                Arc::clone(&reactor) as Arc<dyn Reactor>,
+            );
+            // Priming raises the print time to the estimate plus the buffer,
+            // which is the raise that sends the event upstream.
+            let print_time = connected.toolhead.get_last_move_time();
+            assert!((print_time - 5.25).abs() < 1e-9, "{print_time}");
+
+            // The raise happened under this lock, and only parked the payload.
+            assert!(
+                sent.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+                "the event must not be sent while the state lock is held"
+            );
+            assert_eq!(
+                *pending.lock().unwrap_or_else(|p| p.into_inner()),
+                Some((2.0, 5.0, 5.25))
+            );
+        }
+
+        // With the lock released, the flush task sends it: the payload is the
+        // one upstream sends, in its order (`toolhead.py:267-268`).
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(
+            *sent.lock().unwrap_or_else(|p| p.into_inner()),
+            [(2.0, 5.0, 5.25)]
+        );
+
+        // Nothing raised since: nothing left to send.
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(sent.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
     }
 
     /// `z_stepper_names` reads the Z rail in config order — primary first,

@@ -3120,6 +3120,10 @@ mod tests {
     use crate::core::klippy::api::webhooks;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
+    use crate::core::klippy::mathutil::Xyz;
+    use crate::core::klippy::motion::itersolve::Axis;
+    use crate::core::klippy::motion::queuing::MotionQueuing;
+    use crate::core::klippy::motion::stepper::Stepper;
     use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::{ManualReactor, Reactor};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -3894,6 +3898,59 @@ homing_speed: 50
             .as_f64()
             .expect("a tracked offset converts through the stepper");
         assert!((position - 0.1).abs() < 1e-12, "{position}");
+    }
+
+    /// The virtual enable is driven by the **auto-enable chain**, not only by
+    /// `SET_STEPPER_ENABLE`: a driver without a dedicated enable pin gets its
+    /// `toff` restored when real motion is queued for its stepper
+    /// (`_handle_stepper_enable` registered on the enable line).
+    #[test]
+    fn test_a_queued_move_restores_a_soft_enabled_drivers_toff() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, recording) = soft_enable_driver(&printer, &config);
+        // The value the section asked for; connect replaces it with 0, so the
+        // motor is off until the enable chain says otherwise.
+        driver.fields().set_field("toff", 3, None, None);
+        driver.handle_connect().unwrap();
+        assert_eq!(driver.fields().get_field("toff", None, None), 0);
+
+        // The queue the toolhead would own, armed with `stepper_enable`'s
+        // auto-enable callbacks — the set `ToolHeadObject::connect` installs.
+        let stepper_enable = printer
+            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            .expect("`[stepper_x]` registers with stepper_enable");
+        let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
+        queuing.add_stepper(Stepper::cartesian(
+            "stepper_x",
+            0,
+            1.0,
+            Axis::X,
+            1_000_000.0,
+        ));
+        queuing.set_active_callbacks(stepper_enable.active_callbacks());
+        // A 10 mm X move over 0.2 s (unit direction vector, as the trapq
+        // stores it).
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            0.1,
+            0.0,
+            0.1,
+            Xyz::default(),
+            Xyz::new(1.0, 0.0, 0.0),
+            0.0,
+            100.0,
+            1000.0,
+        );
+        assert!(!driver.echeck.is_running(), "nothing has moved yet");
+
+        queuing.generate(0.5).unwrap();
+
+        // The callback ran in place and deferred the driver's work to the
+        // reactor (`_handle_stepper_enable`): `toff` is back and the check runs.
+        assert_eq!(reactor.run_due(), 1);
+        assert!(driver.echeck.is_running());
+        assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(3));
     }
 
     /// With no dedicated enable pin the driver holds the motor state in `toff`:

@@ -704,6 +704,7 @@ git config core.hooksPath .githooks
 | `plan.rs` / `motion/toolhead.rs`（+4） | `Move` 携带第四个以外的额外轴（`axes_r` 长度、`extra_end`）；纯额外轴 move 不被零长丢弃；`ea_index==4` 的额外轴被 check 并入队；主 trapq 仍三轴 |
 | `idle_timeout.rs`（+3） | `toolhead:sync_print_time` 到达 → 转 `Printing` + 载荷 `print_time + PIN_MIN_TIME` + 按 `READY_TIMEOUT + est − print` 重挂；收到过事件后观察者不再二次触发；未收事件时旧路径仍工作 |
 | `motion/toolhead.rs`（sync 载荷，+3） | 仅 `calc_print_time` 抬高时才入待发槽（raise-only）、锁内只入槽而锁外发送（三元组顺序）、空槽不发 |
+| `manual_stepper.rs`（+13，S4a） | 首次需要时装进运动队列、**trapq ≠ 主 trapq**、`mcu_stepper`/`stepper_commanded_position` 可查；`MOVE=` 得到直接步进（有界，假固件 `atmega2560.dict`）；`SET_POSITION` 先 flush 再摆 solver；`GCODE_AXIS=A` 后 `G1 A…` 进该轴自己的 trapq（S3+S4 接合点）；全套 13 条 1.35 s |
 
 ### `interface`
 

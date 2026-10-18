@@ -1115,7 +1115,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `accel` | `0.0`（≥0） | 默认加速度 |
 | `position_min`/`position_max` | 无 | 可选软限位 |
 
-命令见 G-Code 参考的 `MANUAL_STEPPER`。gap（如实登记）：本仓只推进时间线与 `commanded_pos`，**不 append trapq、不产生 steps**；`G1 A<..>` 的 extra axis 词被 `gcode_move` 静默忽略；有 endstop 时的 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`。
+命令见 G-Code 参考的 `MANUAL_STEPPER`。现状：**`MOVE=` 与 `G1 A<..>` 都会真正出步**——这台电机有自己的 trapq（首次需要时 `take_stepper()` 装进运动队列），`process_move` 按上游 append（`start_axis/end_axis` + `axes_r[ea_index]`），`SET_POSITION` 先 flush 再把 solver 摆到 `commanded_pos`。gap（如实登记）：**自带回零仍缺**——有 `endstop_pin` 时 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`（本仓没有 `drip_update_time`，且 `drip_move` 只灌主 trapq、不带额外轴）。
 
 ### `[display]` — 液晶与编码器（st7920/hd44780/uc1701/ssd1306 已落地，批 #7+#13）
 

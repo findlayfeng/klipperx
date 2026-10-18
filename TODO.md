@@ -472,9 +472,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       pin 对象不同，但帧与互斥已共享。
 - [ ] **`FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 真机不出步**（2026-10-18 真板实测）：这三条
       路径在 F446 上**没有产生任何 `queue_step`**（驱动侧 `MSCNT` 不动），而 `[stepper_x]` + cartesian
-      的 `G1` 正常；`stress --task motion` 也正常（3780 步、读回一致）。待定位是 force_move 的
-      trapq/manual-move 未接 flush，还是 `kinematics: none` 下 toolhead 不接受。**影响**：`STEPPER_BUZZ`
-      这个"识别电机"的常用动作目前不可用。
+      的 `G1` 正常；`stress --task motion` 也正常（3780 步、读回一致）。
+      **2026-10-18 后半程已改掉其中一条的前提**：`[manual_stepper]` 现在有自己的 trapq 并真接进运动队列
+      （软件侧单测 13 条有界），所以三选一要**分开重新归因**——先重测 `MANUAL_STEPPER MOVE=`，
+      它若已出步则本条缩到 `FORCE_MOVE`/`STEPPER_BUZZ` 两条（那时待查的就是 force_move 的 trapq/flush 路径）。
+      **影响**：`STEPPER_BUZZ` 这个“识别电机”的常用动作目前不可用。
 - [ ] **`admin` 工具的 attach 没有会话 takeover**（2026-10-18 发现）：klippy 能接管陈旧会话
       （`Firmware is still in an earlier session (sequence N); taking it over`），而
       `flash/bridge_flash.rs` 的 attach 只重试 3 次就放弃。**重置已绕开它**（`reset` 不再先 identify，
@@ -602,19 +604,19 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1；`extras/gcode_arcs.rs` 只读 `resolution`，
       **未注册任何命令**），G2/G3 弧规划（`planArc`）与 G17/G18/G19 平面选择仍未接。
-- [x] `manual_stepper.py` **已落地**（section + 命令；余项：`manual_stepper` 自带回零未实现，
-      `extras/manual_stepper.rs:299` 明示拒绝）。
+- [x] `manual_stepper.py` **已落地**（section + 命令；**2026-10-18 补齐自有 trapq**：首次需要时装进运动队列、`MOVE=`/`G1 A…` 真出步、`SET_POSITION` 先 flush 再摆 solver）。
+      **余项**：自带回零（`STOP_ON_ENDSTOP` 仍明示拒绝——缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - [x] `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
       trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
 - [ ] `extruder_stepper.py`：**段已落地**（2026-09-24 批 #2），宿主 step 同步的 toolhead 缝仍缺
       （不跟随 extruder 运动）。
-- [ ] **extra-axes 外围**：`GET_POSITION`（要 `kin.get_steppers()` + `calc_position` + MCU 位置）、
-      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）。
+- [ ] **extra-axes 外围**：`GET_POSITION` ✅ 与动态 `axis_map` ✅ 已落地（2026-10-18；`G1 A…` 按字母寻址、进入规划器并有自己 trapq 的 `manual_stepper` 能真出步）。
+      余项：`MAX_AXES = 8` 的容量上限（E + 4 个字母轴，第 5 个不映射）；`G1_PARAMS` 静态表不为额外字母提供补全；`reset_last_position` 的尾巴沿用上一段（toolhead 只报 4 轴）。
       （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
       （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）
-- 依赖 C1（toolhead/kinematics）；`gcode_move` 同时是 **G4** 的前置。
+- 依赖 C1（toolhead/kinematics）；`gcode_move` 已随 G4-1 落地（见 G4 节），不再是 H10 的前置。
 
 ### H11 主机运行时与调试
 

@@ -87,11 +87,23 @@ Environment=RUST_LOG=debug
 ```text
 Versions: klipperx 0.1.0
 Config: /home/pi/printer.cfg
+===== Config file =====
+[printer]
+kinematics = none
+…
+=======================
 =============== Log rollover at Mon Sep 21 16:11:20 2026 ===============
 ```
 
 这是上游 `klippy` 的 `--logfile` + `bglogger` rollover 形状：把日志文件贴进 issue 时，
-它已经自带是哪个版本、哪份配置跑出来的。
+它已经自带是哪个版本、哪份配置（含 `SAVE_CONFIG` 写回的值）跑出来的。
+
+**轮转**（只在给了 `--logfile` 时）：与上游 `bglogger` 一致——`klippy.log` 只装当天的日志，
+**本地午夜之后的第一条日志**会把旧的改名成 `klippy.log.YYYY-MM-DD`，最多保留 **5** 份、
+更老的删掉；每个新文件开头都会重写上面那段 rollover 信息（所以轮转后的文件也看得出是哪个
+版本/配置）。注意两点：① 轮转发生在**下一条日志行**写下来的时候，不是午夜那一刻（与上游一样）；
+② 这是**按天**切、不是按大小，所以一个刷屏的调试会话在当天内仍可能把单个文件写得很大——
+需要限大小时自己在外部做 logrotate。
 
 ## `--tui` 模式下的日志
 

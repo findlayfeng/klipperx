@@ -690,6 +690,26 @@ git config core.hooksPath .githooks
 | `cmd/uart.rs` | **配置期端口命令的主机侧结构（M1-P7，无独立测试）**：`ConfigUart{oid,baud,slot}`/`ConfigBridgePort{oid,uart}`（`NAME` 与固件 `DECL_COMMAND` 逐字同形）与 `DEFAULT_UART_BAUD = 250_000`；由 `mcu/bridge_ports.rs::wire_bridge_port` 排进桥的 `ConfigBuilder`，行为由上面两条配置驱动测试与真实固件构建覆盖 |
 | `error_mcu.rs` | 已知固件消息拿到它的提示、MCU shutdown 被扩成原因+提示、`is_shutdown` 说“此前已停”、无关停机仍告诉用户敲什么；连接错误拿到 firmware_restart 提示；协议错误列出需要升级的 MCU（6 例，无配置节、由第一个 `[mcu]` 拉起） |
 
+### 2026-10-18 阶段一 P0/P1 新增（同样单列，避免与上表计数耦合）
+
+| 模块 | 覆盖 |
+|------|------|
+| `stepper_enable.rs` / `motion/queuing.rs` | 自动使能链：首段真运动按 `print_time` 使能一次且不重复、`M84` 后重新武装、只 flush 无运动不触发、TMC 虚拟使能（`toff` 回填）由同一条链驱动 |
+| `heaters.rs` | `TURN_OFF_HEATERS` 把三种 heater 的 target 归零且 `M105` 报 `0.0`；help 文案与 ready 表注册时机同上游；`setup_max_duration` 收到 `MAX_HEAT_TIME`；`target<=0` 时输出 0 |
+| `mcu/object.rs` | 未答时钟查询 > 4 ⇒ `Lost communication with MCU '<name>'` 且每 MCU 只报一次；正常应答不误报；file-output 不判；失联后 `M112`/`RESTART` 仍可用 |
+| `interface/devices/serial.rs` | 打开重试：预算耗尽报错（含路径与尝试次数）、首次失败次次成功、退出请求在切片内结束等待、一次成功不多发尝试；另 `mcu/object.rs` 一条「重试不阻塞运行时」（current-thread 运行时里 20 ms 节拍仍推进） |
+| `info.rs` / `printer.rs` / `print_stats.rs` | Moonraker 契约守卫：`klipper_path`/`python_path` 必须在且不是真路径、`state` 只能四态且 info 与 webhooks 一致、`print_stats` 首帧必带 `state` |
+| `extras/toolhead.rs` | `get_status` 报 `axis_minimum`/`axis_maximum`（四轴、等于配置）与 `estimated_print_time`；未连接仍 `{}` |
+| `extras/stepper.rs` / `mcu/resource/trsync.rs` | 三电机 Z 轨的端停 dispatch 报 `["stepper_z","stepper_z1","stepper_z2"]`；单电机轨不变；跨 MCU 仍拒绝；`add_stepper` 幂等 |
+| `logging.rs` / `klippy.rs` | 注入时钟跨午夜轮转一次、保留 5 份、新文件带 `rollover_info` 与 `Log rollover at …`、`--logfile` 缺省零副作用；配置块取装载结果（含 `SAVE_CONFIG` 值）并带围栏 |
+| `reactor.rs` / `motion/queuing.rs` | 定时器 panic 后 dispatcher 仍在且后续定时器触发、latency notifier 同形、flush 回调 panic 后整趟 flush 仍完成、日志有 `error!` |
+| `extras/toolhead.rs`（G28 恢复） | 失败 `G28`（端停不触发）后 `print_time` 追上 drip 地平线、trapq 不留 drip 段；随后两轮 `SET_KINEMATIC_POSITION`+`G1` 均按序生成且 X 真有步 |
+| `flash/bridge_flash.rs` | 陈旧会话由 identify 自行重号接管（不需要特殊命令）；握手无应答后开链路 + 欠握手 + 同 handle 补做；沉默板子仍报 `AttachUnanswered`；`SessionHeldByAnotherProcess` 只在 `took_over_session()` 时出现；正常设备零行为变化 |
+| `extras/force_move.rs` | `FORCE_MOVE` 真出 +800 步、`STEPPER_BUZZ` +800/−800、主 trapq 无位移段、未归零轴照走而 `G1` 仍报 `Must home axis first`；队列外名字 warn 不报错 |
+
+> 上游语料仍全绿（含 `dual_carriage` / `hybrid_corexy_dual_carriage` 两条——它们要求
+> `STEPPER_BUZZ STEPPER=dual_carriage` **成功**，所以队列外电机只能是 warning）。
+
 ### 2026-10-18 收尾新增（单列一节，避免与上表计数耦合）
 
 | 模块 | 覆盖 |

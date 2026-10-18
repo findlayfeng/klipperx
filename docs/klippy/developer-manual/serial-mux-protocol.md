@@ -246,6 +246,12 @@ CAN 侧的同族常量在 `canserial.rs`。
 - **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
   请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
   握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。
+- **握手被欠着的情形**（只出现在 `klipperx admin` 的桥 attach，2026-10-18）：重确认握手如果
+  一直无应答（板子卡在上一会话里），工具不再直接报错，而是用「不握手的打开」把链路开出来，
+  让 `identify` 先按 klippy 自己的接管逻辑（重号重发）清掉旧会话，**然后**在同一个 handle 上
+  补做那枚重确认握手 —— 即「先 establish、再 confirm」。顺序不能反过来：握手是给**已可达**的
+  设备确认 id 用的，没人在答的时候它永远无解；而 `SET_NODEID` 仍是 attach 在尝试阶段就发出去的。
+  `printer.cfg` 的连接路径没有这个回退（硬限制不变）。
 
 ### 固件端契约（设备半已实现，见 `src/mux.c`）
 

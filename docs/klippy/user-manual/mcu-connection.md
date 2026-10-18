@@ -54,7 +54,7 @@ serial: /dev/ttyUSB0
 
 - **baud**：共享路径上以**显式写出的** baud 为准；多颗写了不同的值就 `warn` 并**取最小值**，没写 baud 的节跟着这个值走（不一致不再是配置错）。
 - **id**：就是 `[mcu_ids]` 分给该 MCU 的号（**仅 CAN 节**可用 `canbus_nodeid` 显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
-- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
+- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。**`klipperx admin` 的桥 attach 是唯一例外**：握手无应答时它不放弃，而是先把链路开出来、由 `identify` 接管陈旧会话，再在同一个 handle 上补做这次握手（见下文“桥的上游链路”节的刷写工具注意项）；`printer.cfg` 的连接路径仍按上面的硬限制走。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
 - **发现**：还没分配 id 的设备用 `klipperx admin scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库、`--bridge <tty>` 扫桥下游各口；单次广播查询 + 截止窗口 + 按 uuid 去重，四种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
 
@@ -199,7 +199,13 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
 
 「不填就提示」，没有替你回填。）
 - 桥已在我们上一条命令里被赋过 node id 时，紧接着的**下一条命令**可能先报一次 `opening the bridge: Receive timeout`
-  ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）；仍失败就等几秒再试，或用 `--bridge-uuid`。
+  ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）。**重试耗尽也不再直接放弃**（2026-10-18）：
+  它改为“不握手先把链路开出来 → `identify` 用 klippy 自己的接管逻辑清掉陈旧会话（重号重发）→
+  在**同一个 handle** 上补做分配握手”。接管就是普通 MCU 连接的那套，不是刷写工具自创的
+  命令序列（`mcu/mod.rs`）。失败分三种文案：真没应答 ⇒ 仍是 `AttachUnanswered`；板子在应答另一个
+  连接（重号后计数仍在跳）⇒ 直接点名“另一个进程（通常是 klippy）正在驱动这块板，先停掉它再重试”；
+  其余是 identify 自己的错。所以“被 `kill -9` 过的桥需要断电重插”不再成立。
+  （若仍想少走这一趟：用 `--bridge-uuid` 点名，或等几秒再试。）
 - **`printer.cfg` 侧已接线并真机跑通**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，
   子设备用 `can:` 按名字引用；附着顺序是「路由（`SET_PORT_NODEID`）→ 设备命名（`0x3f0` 单帧，等 `0x3f1` 应答，
   超时也算已发出）」，之后 `identify` + 配置握手走 CAN 端口的中继会话（真机已通，可反复附着）。

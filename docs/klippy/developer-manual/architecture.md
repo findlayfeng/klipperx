@@ -138,6 +138,13 @@ let parser_for_task = parser.clone();   // 同一个 Arc<Mutex<MsgMap>>
 前者报 `Internal error on command:"X"`、后者报 `Internal Error on WebRequest: <method>`，两者都
 `invoke_shutdown`（上游 `gcode.py:230-234`、`webhooks.py:271-276`）。
 
+**回调和定时器的 panic 另有一套处理**（2026-10-18）：定时器回调、latency notifier、运动队列的
+flush/active 回调都在 `catch_unwind` 里跑；panic 记一条 `error!`（带回调名与 panic 文本）后**丢弃
+那个定时器**（panic 的回调没返回下次唤醒时间、状态不可信），其余定时器照常调度，`closed`/退出
+检查不受影响。理由：这一切都由**单个 dispatcher 任务**驱动，回调里一个 panic 会把 `mcu_clock_poll`、
+`idle_timeout`、订阅推送一并永久静默——机器看着在跑、实际什么都不再调度。上游没有这层隔离
+（Python 里异常同理会打死主循环），属本仓有意偏移，见[本项目与上游的偏移](upstream-deviations.md)。
+
 ## 已实现与未实现
 
 本页与上游不一致处（未实现项与实现形态差异）统一登记在[本项目与上游的偏移](upstream-deviations.md)。

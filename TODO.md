@@ -481,21 +481,33 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] **`tmc_spi` 的总线共享**（2026-10-18）：多设备链复用首个节的 `McuSpi` 与一把 `busy` 锁；
       后续节仍会发一次被丢弃的 `config_spi`/`spi_set_bus`（为了走选项与片选校验），与上游共用同一个
       pin 对象不同，但帧与互斥已共享。
-- [ ] **`FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 真机不出步**（2026-10-18 真板实测）：这三条
-      路径在 F446 上**没有产生任何 `queue_step`**（驱动侧 `MSCNT` 不动），而 `[stepper_x]` + cartesian
-      的 `G1` 正常；`stress --task motion` 也正常（3780 步、读回一致）。
-      **2026-10-18 后半程已改掉其中一条的前提**：`[manual_stepper]` 现在有自己的 trapq 并真接进运动队列
-      （软件侧单测 13 条有界），所以三选一要**分开重新归因**——先重测 `MANUAL_STEPPER MOVE=`，
-      它若已出步则本条缩到 `FORCE_MOVE`/`STEPPER_BUZZ` 两条（那时待查的就是 force_move 的 trapq/flush 路径）。
-      **影响**：`STEPPER_BUZZ` 这个“识别电机”的常用动作目前不可用。
-- [ ] **`admin` 工具的 attach 没有会话 takeover**（2026-10-18 发现）：klippy 能接管陈旧会话
-      （`Firmware is still in an earlier session (sequence N); taking it over`），而
-      `flash/bridge_flash.rs` 的 attach 只重试 3 次就放弃。**重置已绕开它**（`reset` 不再先 identify，
-      2026-10-18），但 `admin scan` / `admin flash --bridge` 仍会因此进不去一块被硬杀过的桥，
-      只能断电重插或先用 klippy 接管一次。
-- [ ] **失败态后的 `SET_KINEMATIC_POSITION` 会撞 stepcompress**（2026-10-18 真板实测）：`G28` 以
-      `No trigger on x after full movement` 失败后，再 `SET_KINEMATIC_POSITION` + `G1` ⇒
-      `Internal error in stepcompress: … Invalid sequence` 直接 shutdown；正常路径与零长度移动都不触发。
+- [x] **`FORCE_MOVE` / `STEPPER_BUZZ` 真机不出步 —— 已归因并修掉前提（2026-10-18）**：假固件上
+      host 侧**本来就没有缺口**（`FORCE_MOVE 10 mm@100 mm/s` 生成 +800 步、`STEPPER_BUZZ` +800/−800），
+      `manual_move` 的四件（换 solver / 挂专用 trapq / flush 到生成并发送 / 不碰规划器）都在。真机上
+      「命令成功但 `MSCNT` 不动」的三个成因分别是：**A** 电机根本没使能（EN 未开或 TMC `toff=0`，已由
+      自动使能链修掉）；**B** `[manual_stepper]` 未装队列（已由自有 trapq 修掉）；**C** 队列外电机
+      **静默空跑**（推进时间轴、返回 Ok、0 步、无日志）——C 已改成 `warn!`（不报错，见下一条）。
+      **仍需真机复验**：`MANUAL_STEPPER MOVE=` / `FORCE_MOVE` / `STEPPER_BUZZ` 三条各自的 `queue_step`。
+- [ ] **IDEX 第二滑车根本没有步进生成**（2026-10-18 发现，真缺口）：`idex_modes` 给 `[dual_carriage]`
+      建的 `PrinterStepper` 从不 `take_stepper()`、也从不进 `MotionQueuing`，它的 solver 没挂任何 trapq
+      ⇒ 不只是 `STEPPER_BUZZ` 不响，这一路**整条驱动链**都不出步。上游每个 `MCU_stepper` 建时即
+      `allocate_syncemitter`（`klippy/stepper.py:50-56`），所以 IDEX 机器在那里是正常的；本仓语料此前
+      是**假绿**（只要求 `STEPPER_BUZZ STEPPER=dual_carriage` 不报错）。修法参考
+      `manual_stepper::ensure_motion`（`take_stepper` → `add_extra_axis_stepper` → 装进队列入生成集），
+      但要照顾 kinematics 那一侧（carriage 在 IDEX 里是主 kinematics 的一部分，不是「自有 trapq」那种
+      独立轴），属跨 kinematics/queuing seam 的独立单元。到那时 `force_move` 的 `warn!` 可收掉。
+- [x] **`admin` 工具的 attach 没有会话 takeover —— 已修（2026-10-18）**：接管本来就是 klippy
+      identify 的能力（`mcu/mod.rs` 的重号重发），缺的是「握手无应答就再也走不到 identify」。现在
+      重试耗尽后改为「不握手开链路 → identify 接管陈旧会话 → 同一 handle 上补做分配握手」；沉默板子
+      仍报 `AttachUnanswered`，只有「板子在应答另一个连接」才报 `SessionHeldByAnotherProcess`
+      （点名「通常是 klippy 在驱动，先停掉它」）。
+- [x] **失败态后的 `SET_KINEMATIC_POSITION` 会撞 stepcompress —— 已修（2026-10-18）**：首因是**生成
+      地平线被回退**——drip 已把步生成到移动末端，而规划器 `print_time` 还停在 drip 起点；失败回零
+      没有上游 `homing_move` 的收尾三步（`get_last_move_time` → flush → `set_position(haltpos)`），
+      后台 flush pass 又用自己那份 `last_step_gen_time`（0.7）把 `itersolve.last_flush_time` 拽回去、
+      重走 drip 段，重走出来的步落在 compressor 的 `last_step_clock` 之前 ⇒ `check_line` 报
+      `Invalid sequence`。修法：地平线起点取 `max(两处)`，并在未触发分支补上游的收尾（`&[]` 不标
+      homed）。仍待真机复验一次。
 - [ ] **both-edge（`dedge`）**：`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，固件配置侧
       没有 both-edge 步进模式，所以 TMC 不写 `dedge`。属优化项，不影响正确性。
 - 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。
@@ -613,6 +625,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H10 运动相关 extras
 
+- [x] **同轨兄弟电机一起被该轨端停刹车（2026-10-18）**：`Rail::lookup` 把 `[stepper_z1]`/`[stepper_z2]`
+      等不带自己 `endstop_pin` 的兄弟注册进轨道端停的 `TriggerDispatch`（上游 `stepper.py:433-445`），
+      `McuTrsync::add_stepper` 改幂等（上游 `mcu.py:183-186`）。此前 Trident 的 `G28 Z` 只有
+      `stepper_z` 会立刻停，z1/z2 跑完约 50 ms 队列 ⇒ gantry 隐斜且 `set_position` 记账错误。
+
 - [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1；`extras/gcode_arcs.rs` 只读 `resolution`，
       **未注册任何命令**），G2/G3 弧规划（`planArc`）与 G17/G18/G19 平面选择仍未接。
 - [x] `manual_stepper.py` **已落地**（section + 命令；**2026-10-18 补齐自有 trapq**：首次需要时装进运动队列、`MOVE=`/`G1 A…` 真出步、`SET_POSITION` 先 flush 再摆 solver）。
@@ -631,9 +648,17 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H11 主机运行时与调试
 
+
 - [x] **MCU 失联检测与连接期串口重试（2026-10-18）**：`mcu_clock_poll` 现在按上游判据（未答查询 > 4，`clocksync.py:156-157`）报 `Lost communication with MCU '<name>'` 并停机，每 MCU 一次、file-output 不判；独占串口的连接期打开按 5 s × 90 s 预算重试（只包打开，重试在阻塞池上跑，退出请求可打断）。
-- [ ] **日志**：`--logfile` 缺省不落盘、给了也不按大小轮转（上游 `bglogger` 是 2 MB × 5）；仓内不带 systemd unit 文件。
-- [ ] **定时器回调 panic 无兜底**：`reactor` 只有 gcode handler 与 API endpoint 有 `catch_unwind`，dispatcher 死掉后所有定时器静默。
+- [x] **日志轮转与 rollover 配置块 —— 已修（2026-10-18）**：`--logfile` 现在照上游 `bglogger` 的
+      `TimedRotatingFileHandler(when='midnight', backupCount=5)` 轮转（本地午夜后第一条日志触发，
+      `klippy.log.YYYY-MM-DD`、保留 5 份），新文件开头写 `rollover_info`（`versions` + `config` 块，
+      形状照 `configfile.py:482-487`）。**修正旧断言**：上游**不是**「2 MB × 5」，全仓没有 `maxBytes`。
+- [ ] **余项**：`--logfile` 缺省仍不落盘（上游同样需要显式给）；仓内不带 systemd unit 文件；
+      按天切不按大小切，刷屏会话单日文件仍可能很大。
+- [x] **定时器回调 panic 无兜底 —— 已修（2026-10-18）**：定时器、latency notifier、运动队列的
+      flush/active 回调全部 `catch_unwind`；panic 记 `error!`（带回调名与 panic 文本）后丢弃那个定时器，
+      其余照常调度（详见 `docs/klippy/developer-manual/architecture.md`）。
 
 - [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /

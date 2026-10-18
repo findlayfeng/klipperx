@@ -142,3 +142,20 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 
 **下一步（第二批，未开始）**：P1-1（Z 兄弟电机进端停刹车）、P1-2/P1-3（日志落盘与轮转、定时器 panic 兜底）、
 P1-4（失败 `G28` 后的恢复）、P1-5 归因、P1-6（admin takeover）、上板实测（§4 五项）与 Moonraker 端到端冒烟。
+
+### 2026-10-18 第二批：P1 六条（已合入 `work`）
+
+| 项 | 状态 | 落点与要点 |
+|---|---|---|
+| P1-1 同轨兄弟电机一起刹车 | ✅ | `Rail::lookup` 把不带自己 `endstop_pin` 的兄弟注册进轨道端停 dispatch；`McuTrsync::add_stepper` 改幂等（轨道注册 + 虚拟端停 helper 会重复注册） |
+| P1-2 日志轮转 + rollover 配置块 | ✅ | **修正本笔记 §2 的错误修正**：上游**不是**「2 MB × 5」，是 `TimedRotatingFileHandler(when='midnight', backupCount=5)`；按午夜轮转、新文件写 `rollover_info`（`versions` + `config` 块） |
+| P1-3 回调 panic 兜底 | ✅ | 定时器 / latency notifier / flush / active 四类回调都 `catch_unwind`；panic 的定时器退场，其余照跑（偏移已登记） |
+| P1-4 失败 `G28` 后 shutdown | ✅ | 首因是**生成地平线回退**（drip 已生成到末端、规划器 `print_time` 停在起点）；修法：地平线取 `max(两处)` + 未触发分支补上游收尾三步 |
+| P1-6 admin attach 接管陈旧会话 | ✅ | identify 层的 takeover 本来就在，缺的是「握手无应答就走不到 identify」；现在预算耗尽后开链路 → identify 接管 → 同一 handle 补握手。沉默板子仍 `AttachUnanswered`，被别的进程驱动才报 `SessionHeldByAnotherProcess` |
+| P1-5 `FORCE_MOVE`/`STEPPER_BUZZ` 不出步 | ✅ 归因 + 收口 | host 侧本来就出步（+800 / ±800）；真机症状归因为 A 没使能（已修）+ B manual_stepper 未进队列（已修）+ C 队列外电机静默空跑（改 `warn!`）。**新发现真缺口**：IDEX 第二滑车压根不进运动队列，整条驱动链不出步（已登记 `TODO.md`，另立单元） |
+
+**方法上的两条教训（记下来避免重犯）**：
+1. 我在任务书里两次把「上游常量」写错（`bglogger` 的 2 MB、`force_move` 的 `KINEMATIC=`），都是凭印象而非回源码；
+   两次都由 worker 回源码纠正。此后同类断言一律先 `rg` 上游源码再用。
+2. 「让缺陷不静默」不等于「让命令报错」：上游语料要求 `STEPPER_BUZZ STEPPER=dual_carriage` **成功**，
+   把本仓缺陷做成命令错误会让合法 G-code 被惩罚 —— 正确落点是日志 + 台账。

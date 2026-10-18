@@ -131,6 +131,7 @@ use crate::core::klippy::motion::rotary_delta::{
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
 use crate::core::klippy::motion::stepcompress::{HistoryStep, StepCommand, StepCompressError};
+use crate::core::klippy::motion::stepper::Stepper;
 use crate::core::klippy::motion::toolhead::{
     EstimatedPrintTime, SyncPrintTimeNotify, ToolHead, WaitMovesState,
 };
@@ -2255,6 +2256,110 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Allocate a trapq for a stepper of the caller's own and put that stepper
+    /// in the motion queue reading it — upstream's
+    /// `motion_queuing.allocate_trapq()` plus `set_trapq`, which a
+    /// `[manual_stepper]` does in its own `__init__`
+    /// (`manual_stepper.py:31-34`) and this port does on the stepper's first
+    /// move (the trapq id only means something for a connection, so it cannot
+    /// be made at load).
+    ///
+    /// The stepper reads `trapq` and no other, and its generated steps reach
+    /// the firmware only through the `mcu_steppers` entry registered here —
+    /// `Connected::generate` looks a batch's stepper up by name to send it.
+    /// Returns the trapq id, which the caller keeps to append to.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    pub fn add_extra_axis_stepper(
+        &self,
+        mut stepper: Stepper,
+        mcu_stepper: Arc<McuStepper>,
+    ) -> Result<usize, CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let trapq = connected.toolhead.allocate_trapq();
+        // Added through the queue rather than `ToolHead::add_stepper`, which
+        // points every stepper it takes at the main trapq: this one drives its
+        // own.
+        stepper.set_trapq(trapq);
+        connected
+            .mcu_steppers
+            .insert(stepper.name().to_string(), mcu_stepper);
+        connected.toolhead.motion_queuing_mut().add_stepper(stepper);
+        Ok(trapq)
+    }
+
+    /// Append one trapezoid to the trapq `trapq` — upstream's
+    /// `lookup_trapq_append()`, for a caller that owns a trapq id but not the
+    /// queue (`[manual_stepper]`'s `_submit_move`, `manual_stepper.py:63-73`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_to_trapq(
+        &self,
+        trapq: usize,
+        print_time: f64,
+        accel_t: f64,
+        cruise_t: f64,
+        decel_t: f64,
+        start_pos: Xyz,
+        axes_r: Xyz,
+        start_v: f64,
+        cruise_v: f64,
+        accel: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        connected.toolhead.motion_queuing_mut().append(
+            trapq, print_time, accel_t, cruise_t, decel_t, start_pos, axes_r, start_v, cruise_v,
+            accel,
+        );
+        Ok(())
+    }
+
+    /// Put one motion stepper's solver at `position` on its own single-axis
+    /// coordinates (`MCU_stepper.set_position`), found by section name.
+    ///
+    /// A `[manual_stepper]` uses it after `SET_POSITION`: the trapq's positions
+    /// are that stepper's own coordinates, so the solver has to be moved with
+    /// the commanded position or the next appended move starts somewhere the
+    /// motor is not.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or the unknown-stepper error when
+    /// no motion stepper answers to `name`.
+    pub fn set_stepper_position(&self, name: &str, position: f64) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers_mut()
+            .iter_mut()
+            .find(|stepper| stepper.name() == name)
+            .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
+        stepper.set_position(Xyz::new(position, 0.0, 0.0));
+        Ok(())
+    }
+
+    /// The firmware stepper this connection registered for `name` — the one a
+    /// generated batch is sent through (`Connected::generate` matches a
+    /// stepper's name against this map). `None` before connect, or when no
+    /// stepper by that name was registered.
+    pub fn mcu_stepper(&self, name: &str) -> Option<Arc<McuStepper>> {
+        self.lock()
+            .as_ref()
+            .and_then(|connected| connected.mcu_steppers.get(name).cloned())
+    }
+
     /// One motion stepper's firmware step counter
     /// (`MCU_stepper.get_mcu_position`), found by section name.
     ///
@@ -2308,9 +2413,10 @@ impl ToolHeadObject {
     /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner.
     ///
     /// A `stepper_name` the toolhead's motion queue does not hold — a stepper
-    /// `force_move` knows but those modules have not wired (the manual stepper,
-    /// the IDEX second carriage) — carries the move on the timeline only; see
-    /// [`manual_move`] for why.
+    /// `force_move` knows but those modules have not wired (the IDEX second
+    /// carriage, or a `[manual_stepper]` that has not taken a first `MOVE=`
+    /// yet) — carries the move on the timeline only; see [`manual_move`] for
+    /// why.
     ///
     /// # Errors
     /// "Printer is not ready" before connect, or a step-generation/send
@@ -2604,11 +2710,11 @@ async fn manual_move(
     // keeping the old pair to restore afterwards.
     //
     // A stepper `force_move` knows but the toolhead's motion queue does not
-    // (the manual stepper and the IDEX second carriage build a `PrinterStepper`
-    // without being added to it — a documented gap of those modules) has no
-    // motor this port can drive. Upstream would move it; here the move is
-    // carried on the timeline only, so `STEPPER_BUZZ` / `FORCE_MOVE` on such a
-    // name still answer instead of erroring.
+    // (the IDEX second carriage builds a `PrinterStepper` without being added
+    // to it, and a `[manual_stepper]` joins on its first `MOVE=`) has no motor
+    // this port can drive. Upstream would move it; here the move is carried on
+    // the timeline only, so `STEPPER_BUZZ` / `FORCE_MOVE` on such a name still
+    // answer instead of erroring.
     let index = connected
         .toolhead
         .motion_queuing_mut()
@@ -6777,8 +6883,8 @@ mod tests {
 
     /// A name the motion queue does not hold carries the move on the timeline
     /// only, so `STEPPER_BUZZ` / `FORCE_MOVE` answer for a stepper those
-    /// modules have not wired (the manual stepper, the IDEX second carriage)
-    /// instead of erroring. The planner's position is still untouched.
+    /// modules have not wired (the IDEX second carriage) instead of erroring.
+    /// The planner's position is still untouched.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_manual_move_carries_an_unwired_stepper_on_the_timeline_only() {
         let mut connected = force_move_connected();

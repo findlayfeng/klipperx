@@ -1,19 +1,22 @@
-//! `klipperx mainsail` — serve the Mainsail web UI, building it on first run.
+//! `klipperx mainsail` — serve the Mainsail web UI.
 //!
-//! Mainsail is a Vite single-page application: the checkout under
-//! `third_party/mainsail` is its *source*, and what a browser can use is the
-//! `dist/` directory `npm ci && npm run build` produces from it. This subcommand
-//! is the missing middle: it builds that directory when it is missing or older
-//! than the checkout's `package-lock.json` (unless `--no-build`), serves it over
-//! HTTP, and writes the one file Mainsail cannot know — `dist/config.json`,
-//! which says which Moonraker to talk to.
+//! Mainsail is a Vite single-page application, and what a browser can use is the
+//! `dist/` a build of it produces. This subcommand does not build it: a release
+//! binary carries the site compiled in (`assets/mainsail/`, embedded by
+//! `build.rs`), and a run without one serves a site that is already on disk.
 //!
-//! Two places the site can come from, and the first that applies is used:
-//! `--dir <DIR>` for a site that is already built (served as it is), otherwise
-//! the checkout's `dist/`. The path actually served is printed at startup.
+//! Three places the site can come from, in the order `--help` lists them:
+//! `--dir <DIR>` (a site built anywhere), the embedded site (the packaged files
+//! this binary was built with), and `<repo>/third_party/mainsail/dist` (a
+//! checkout someone built by other means — read here, never built). The first
+//! that applies is served, and which one it was is printed at startup.
 //!
-//! The build runs through [`CommandRunner`] so the tests can drive the decision
-//! (build or not) without running `npm`.
+//! The one file Mainsail cannot know — `config.json`, saying which Moonraker to
+//! talk to — is written into a site served from disk when it has none. The
+//! embedded site's bytes are part of the binary, so a site without that file is
+//! reported instead, naming the file to add before the next build.
+//!
+//! Nothing here runs `npm`, and nothing here reaches the network.
 //!
 //! The HTTP side is deliberately plain: HTTP/1.1, one request per connection,
 //! `GET` and `HEAD`, no keep-alive. A path that names a file under the served
@@ -29,8 +32,11 @@ use clap::Args;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::ui::command::{self, CommandRunner, Invocation, SystemRunner};
 use crate::ui::repo_root;
+
+// The packaged site, table and all: `EMBEDDED_MAINSAIL`, `None` when the tree
+// this binary was built from carries no `assets/mainsail/`.
+include!(concat!(env!("OUT_DIR"), "/mainsail_assets.rs"));
 
 /// The port the site is served on by default.
 pub const DEFAULT_PORT: u16 = 8080;
@@ -42,21 +48,28 @@ pub const DEFAULT_BIND: &str = "0.0.0.0";
 /// The port Moonraker listens on, written into the site's `config.json`.
 pub const MOONRAKER_PORT: u16 = 7125;
 
+/// The directory a packaged site is put in before a build, relative to the
+/// repository root; `build.rs` embeds whatever is under it.
+pub const ASSETS_DIR: &str = "assets/mainsail";
+
 /// The largest request head accepted: a request line, some headers, and room to
 /// spare. Nothing Mainsail sends is near it.
 const MAX_REQUEST_BYTES: usize = 8 * 1024;
 
 /// Where the site comes from, spelled out in `--help`: an operator should be
-/// able to tell which directory a run will serve.
+/// able to tell which one a run will serve, and that none of them builds it.
 const SITE_SOURCE_HELP: &str = "\
 SITE SOURCE (the first that applies is used):
-  1. --dir <DIR>                    a site that is already built; never built
-  2. <repo>/third_party/mainsail/dist
-                                    built with `npm ci && npm run build` when it is
-                                    missing or older than package-lock.json
+  1. --dir <DIR>                    a site that is already built; served as it is
+  2. the site built into this binary
+                                    assets/mainsail/ from the build, printed as
+                                    `serving the embedded site (N files)`
+  3. <repo>/third_party/mainsail/dist
+                                    a build made elsewhere; served read-only
 
---no-build serves what exists and never runs npm; --rebuild always runs the
-build. The served path is printed when the service starts.";
+Nothing here runs npm. A release carries the site: put the contents of
+Mainsail's dist/ into assets/mainsail/ and build. Which source a run serves is
+printed when the service starts.";
 
 /// Serve the Mainsail site.
 #[derive(Args, Debug, Clone)]
@@ -70,182 +83,138 @@ pub struct MainsailArgs {
     #[arg(long, default_value = DEFAULT_BIND)]
     pub bind: String,
 
-    /// Serve a site that is already built, instead of the checkout's dist/
+    /// Serve a site that is already built, instead of the one this binary carries
     ///
-    /// The directory must contain `index.html`: `--dir` is served as found and
+    /// The directory must contain `index.html`: `--dir` is served as found, and
     /// nothing is built into it.
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
-
-    /// Serve the checkout's site as it is; never run npm
-    ///
-    /// With this, a site that is not built is an error naming the command that
-    /// would have built it.
-    #[arg(long, conflicts_with = "rebuild")]
-    pub no_build: bool,
-
-    /// Rebuild the checkout's site even if it looks current
-    ///
-    /// Runs `npm ci && npm run build` even when `dist/` is newer than the lock
-    /// file. It has no effect with `--dir`, which is never built.
-    #[arg(long)]
-    pub rebuild: bool,
 }
 
-/// Run `klipperx mainsail`: prepare the site, then serve it until Ctrl-C.
+/// Run `klipperx mainsail`: resolve the site, then serve it until Ctrl-C.
 pub fn run(args: MainsailArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    run_with(&args, &SystemRunner).map_err(Into::into)
+    let site = prepare_site(&args)?;
+    serve(&args, &site).map_err(Into::into)
 }
 
-/// [`run`] with the program runner given, for tests.
-fn run_with(args: &MainsailArgs, runner: &dyn CommandRunner) -> Result<i32, String> {
-    let site = prepare_site(args, runner)?;
-    serve(args, &site)
+/// The site being served.
+///
+/// Two shapes, one operation — read one file by its relative path — because the
+/// request handling is the same for both; only where the bytes come from
+/// differs. A directory site is read on every request, so editing a file shows
+/// up on the next reload; an embedded site is fixed at compile time.
+#[derive(Clone, Debug)]
+enum Site {
+    /// A site on disk: `--dir` as given, or a checkout's `dist/`.
+    Dir(PathBuf),
+    /// The site compiled into this binary, as `build.rs` found it.
+    Embedded(&'static [(&'static str, &'static [u8])]),
 }
 
-/// The Mainsail checkout: the Vite project `npm` runs in.
-fn checkout() -> PathBuf {
-    repo_root().join("third_party").join("mainsail")
+impl Site {
+    /// Whether `relative` names a file of this site.
+    fn contains(&self, relative: &str) -> bool {
+        match self {
+            Site::Dir(root) => root.join(relative).is_file(),
+            Site::Embedded(files) => embedded_file(files, relative).is_some(),
+        }
+    }
+
+    /// The bytes of `relative`, or a sentence saying why they cannot be read.
+    fn read(&self, relative: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Site::Dir(root) => std::fs::read(root.join(relative))
+                .map_err(|error| format!("cannot read {relative}: {error}")),
+            Site::Embedded(files) => embedded_file(files, relative)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| format!("{relative} is not in the embedded site")),
+        }
+    }
+
+    /// What to print as the site being served.
+    fn describe(&self) -> String {
+        match self {
+            Site::Dir(root) => root.display().to_string(),
+            Site::Embedded(files) => format!("the embedded site ({} files)", files.len()),
+        }
+    }
 }
 
-/// Resolve the site directory and make sure it is there to serve.
-fn prepare_site(args: &MainsailArgs, runner: &dyn CommandRunner) -> Result<PathBuf, String> {
+/// One file of an embedded site, by its relative path.
+fn embedded_file(
+    site: &'static [(&'static str, &'static [u8])],
+    relative: &str,
+) -> Option<&'static [u8]> {
+    site.iter()
+        .find(|(path, _)| *path == relative)
+        .map(|(_, body)| *body)
+}
+
+/// The `dist/` of a checkout under `third_party/`: a site someone built by hand.
+fn checkout_dist() -> PathBuf {
+    repo_root()
+        .join("third_party")
+        .join("mainsail")
+        .join("dist")
+}
+
+/// Resolve the site to serve and leave it with the one file Mainsail cannot
+/// know.
+fn prepare_site(args: &MainsailArgs) -> Result<Site, String> {
+    let site = resolve_site(args, EMBEDDED_MAINSAIL, &checkout_dist())?;
+    match &site {
+        Site::Dir(dir) => write_config_json(dir, &args.bind)?,
+        // The embedded bytes are the binary's own: there is nowhere to write a
+        // file that a browser would see, so say what to add and carry on.
+        Site::Embedded(files) if embedded_file(files, "config.json").is_none() => println!(
+            "mainsail: the embedded site has no config.json, so the page will ask for a \
+             server: put one in {ASSETS_DIR}/ and rebuild to have it open on Moonraker at \
+             {}:{MOONRAKER_PORT}",
+            browse_host(&args.bind)
+        ),
+        Site::Embedded(_) => {}
+    }
+    Ok(site)
+}
+
+/// The site to serve, chosen from the three sources `--help` lists.
+///
+/// `embedded` and `checkout` are parameters rather than lookups so a test can
+/// drive every branch without a packaged site and without a checkout.
+fn resolve_site(
+    args: &MainsailArgs,
+    embedded: Option<&'static [(&'static str, &'static [u8])]>,
+    checkout: &Path,
+) -> Result<Site, String> {
     if let Some(dir) = &args.dir {
         if !dir.join("index.html").is_file() {
             return Err(format!(
-                "--dir {} has no index.html, so it is not a built site. --dir is served \
-                 as it is and nothing is built into it: build the checkout with \
-                 `klipperx mainsail` (no --dir), or point --dir at the dist/ a build \
-                 made elsewhere.",
+                "--dir {} has no index.html, so it is not a built site. --dir is served as \
+                 it is and nothing is built into it: put the contents of Mainsail's dist/ \
+                 there, or drop --dir to serve the site this binary carries.",
                 dir.display()
             ));
         }
-        println!("mainsail: site: {} (--dir)", dir.display());
-        write_config_json(dir, &args.bind)?;
-        return Ok(dir.clone());
+        return Ok(Site::Dir(dir.clone()));
     }
 
-    let checkout = checkout();
-    let dist = checkout.join("dist");
-    ensure_built(args, &checkout, &dist, runner)?;
-    println!("mainsail: site: {} (the checkout's dist)", dist.display());
-    write_config_json(&dist, &args.bind)?;
-    Ok(dist)
-}
-
-/// What a look at the checkout's build found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SiteState {
-    /// `dist/index.html` exists and is newer than the lock file.
-    Ready,
-    /// Nothing is built: `dist/index.html` is not there.
-    Missing,
-    /// Built, but from an older dependency tree than the checkout now has.
-    Stale,
-}
-
-/// Whether the checkout's site needs building, from the two timestamps that
-/// decide it.
-///
-/// The built `index.html` is the marker of a build, the way a lock file is the
-/// marker of a dependency tree: `npm ci` installs exactly what
-/// `package-lock.json` pins, so a lock file newer than the built index means the
-/// site was built from dependencies that are no longer checked out.
-fn site_state(dist: &Path, checkout: &Path) -> SiteState {
-    let index = dist.join("index.html");
-    let Ok(index_time) = std::fs::metadata(&index).and_then(|meta| meta.modified()) else {
-        return SiteState::Missing;
-    };
-    match std::fs::metadata(checkout.join("package-lock.json")).and_then(|meta| meta.modified()) {
-        Ok(lock_time) if lock_time > index_time => SiteState::Stale,
-        _ => SiteState::Ready,
+    // An empty table is a build that embedded nothing, which is what `None`
+    // means for the checkout's tree as well. Which source won is printed by
+    // [`serve`], once the port it is served on is known.
+    if let Some(files) = embedded.filter(|files| !files.is_empty()) {
+        return Ok(Site::Embedded(files));
     }
-}
 
-/// Make sure the checkout's site is built, building it if allowed to.
-fn ensure_built(
-    args: &MainsailArgs,
-    checkout: &Path,
-    dist: &Path,
-    runner: &dyn CommandRunner,
-) -> Result<(), String> {
-    let state = site_state(dist, checkout);
-    if state == SiteState::Ready && !args.rebuild {
-        return Ok(());
+    if checkout.join("index.html").is_file() {
+        return Ok(Site::Dir(checkout.to_path_buf()));
     }
-    if args.no_build {
-        return Err(format!(
-            "{}; {}",
-            site_problem(state, dist, checkout),
-            build_hint(checkout)
-        ));
-    }
-    if args.rebuild {
-        println!("mainsail: building the checkout's site as asked (--rebuild)");
-    } else {
-        println!("mainsail: {}", site_problem(state, dist, checkout));
-    }
-    build_site(checkout, dist, runner)
-}
 
-/// The one sentence saying what is wrong with the checkout's build.
-fn site_problem(state: SiteState, dist: &Path, checkout: &Path) -> String {
-    match state {
-        SiteState::Missing => format!(
-            "no built site in {}: {} does not exist",
-            dist.display(),
-            dist.join("index.html").display()
-        ),
-        SiteState::Stale => format!(
-            "the build in {} is older than {}",
-            dist.display(),
-            checkout.join("package-lock.json").display()
-        ),
-        SiteState::Ready => format!("the build in {} is up to date", dist.display()),
-    }
-}
-
-/// What to type to build the site by hand.
-fn build_hint(checkout: &Path) -> String {
-    format!(
-        "build it with: cd {} && npm ci && npm run build",
+    Err(format!(
+        "no site to serve: this binary carries none, and {} has no index.html. Put the \
+         contents of Mainsail's dist/ into {ASSETS_DIR}/ and rebuild, or name a site that \
+         is already built with --dir.",
         checkout.display()
-    )
-}
-
-/// Run `npm ci && npm run build` in the checkout.
-fn build_site(checkout: &Path, dist: &Path, runner: &dyn CommandRunner) -> Result<(), String> {
-    let package = checkout.join("package.json");
-    if !package.is_file() {
-        return Err(format!(
-            "cannot build the site: {} does not exist. third_party/ holds submodule \
-             checkouts, and an empty one is not a checkout — initialize it in the main \
-             checkout (`git submodule update --init third_party/mainsail`) or point \
-             --dir at a build made elsewhere",
-            package.display()
-        ));
-    }
-    for invocation in [
-        Invocation::new("npm", ["ci"]).in_dir(checkout),
-        Invocation::new("npm", ["run", "build"]).in_dir(checkout),
-    ] {
-        let completed = runner
-            .run(&invocation)
-            .map_err(|error| command::start_error(&invocation, &error))?;
-        if !completed.success() {
-            return Err(command::failure_error(&invocation, &completed));
-        }
-    }
-    let index = dist.join("index.html");
-    if !index.is_file() {
-        return Err(format!(
-            "`npm run build` finished but {} does not exist: the site was built \
-             somewhere else — check vite.config.ts, or name the built directory with --dir",
-            index.display()
-        ));
-    }
-    println!("mainsail: built {}", dist.display());
-    Ok(())
+    ))
 }
 
 /// Write `config.json` into the served site if it is not there yet.
@@ -286,8 +255,8 @@ fn browse_host(bind: &str) -> &str {
     }
 }
 
-/// Serve `dist` on `bind:port` until Ctrl-C.
-fn serve(args: &MainsailArgs, dist: &Path) -> Result<i32, String> {
+/// Serve `site` on `bind:port` until Ctrl-C.
+fn serve(args: &MainsailArgs, site: &Site) -> Result<i32, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -302,10 +271,10 @@ fn serve(args: &MainsailArgs, dist: &Path) -> Result<i32, String> {
         // rather than the zero that was asked for.
         println!(
             "mainsail: serving {} on http://{}:{port}/ (Ctrl-C to stop)",
-            dist.display(),
+            site.describe(),
             browse_host(&args.bind)
         );
-        accept_loop(listener, Arc::new(dist.to_path_buf()), async {
+        accept_loop(listener, Arc::new(site.clone()), async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
@@ -333,7 +302,7 @@ async fn bind_listener(bind: &str, port: u16) -> Result<tokio::net::TcpListener,
 /// Accept connections until `stop` resolves, one task per connection.
 async fn accept_loop(
     listener: tokio::net::TcpListener,
-    root: Arc<PathBuf>,
+    site: Arc<Site>,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     tokio::pin!(stop);
@@ -341,11 +310,11 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _peer) = accepted.map_err(|error| format!("cannot accept a connection: {error}"))?;
-                let root = Arc::clone(&root);
+                let site = Arc::clone(&site);
                 // One task per connection: a slow page does not hold up the asset
-                // that follows it, and nothing is shared but the directory.
+                // that follows it, and nothing is shared but the site.
                 tokio::spawn(async move {
-                    serve_connection(stream, root).await;
+                    serve_connection(stream, site).await;
                 });
             }
             _ = &mut stop => {
@@ -357,7 +326,7 @@ async fn accept_loop(
 }
 
 /// Answer one request on one connection, then close it.
-async fn serve_connection(mut stream: TcpStream, root: Arc<PathBuf>) {
+async fn serve_connection(mut stream: TcpStream, site: Arc<Site>) {
     let head = match read_request(&mut stream).await {
         Ok(head) => head,
         Err(reply) => {
@@ -370,7 +339,7 @@ async fn serve_connection(mut stream: TcpStream, root: Arc<PathBuf>) {
         let _ = stream.write_all(&reply.into_bytes(false)).await;
         return;
     };
-    let reply = route(&root, method, target);
+    let reply = route(&site, method, target);
     let head_only = method.eq_ignore_ascii_case("HEAD");
     let _ = stream.write_all(&reply.into_bytes(head_only)).await;
     let _ = stream.shutdown().await;
@@ -459,8 +428,8 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Map one request onto a file under `root` and answer it.
-fn route(root: &Path, method: &str, target: &str) -> Reply {
+/// Map one request onto a file of `site` and answer it.
+fn route(site: &Site, method: &str, target: &str) -> Reply {
     if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
         return Reply::text(405, "this host serves GET and HEAD only\n");
     }
@@ -481,25 +450,28 @@ fn route(root: &Path, method: &str, target: &str) -> Reply {
         Ok(relative) => relative,
         Err(reason) => return Reply::text(403, &format!("{reason}\n")),
     };
-    let relative = served_file(root, relative);
+    let relative = served_file(site, relative);
 
     // Second gate, for what the lexical check cannot see: a symlink inside the
-    // served directory pointing out of it.
-    if let (Ok(root_real), Ok(file_real)) =
-        (root.canonicalize(), root.join(&relative).canonicalize())
-    {
-        if !file_real.starts_with(&root_real) {
-            return Reply::text(403, "the path leaves the served directory\n");
+    // served directory pointing out of it. An embedded site has no symlinks —
+    // its table is the whole of it.
+    if let Site::Dir(root) = site {
+        if let (Ok(dir_real), Ok(file_real)) =
+            (root.canonicalize(), root.join(&relative).canonicalize())
+        {
+            if !file_real.starts_with(&dir_real) {
+                return Reply::text(403, "the path leaves the served directory\n");
+            }
         }
     }
 
-    match std::fs::read(root.join(&relative)) {
+    match site.read(&relative) {
         Ok(body) => Reply {
             status: 200,
             content_type: content_type(Path::new(&relative)),
             body,
         },
-        Err(error) => Reply::text(500, &format!("cannot read {relative}: {error}\n")),
+        Err(reason) => Reply::text(500, &format!("{reason}\n")),
     }
 }
 
@@ -508,15 +480,15 @@ fn route(root: &Path, method: &str, target: &str) -> Reply {
 /// The empty path is the index; a path that names a directory is that
 /// directory's index; anything else unknown is the site index, because a
 /// single-page application decides what a URL means in the browser.
-fn served_file(root: &Path, relative: String) -> String {
+fn served_file(site: &Site, relative: String) -> String {
     if relative.is_empty() {
         return "index.html".to_string();
     }
-    if root.join(&relative).is_file() {
+    if site.contains(&relative) {
         return relative;
     }
     let nested = format!("{relative}/index.html");
-    if root.join(&nested).is_file() {
+    if site.contains(&nested) {
         return nested;
     }
     "index.html".to_string()
@@ -605,66 +577,17 @@ fn content_type(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::command::Completed;
     use clap::FromArgMatches;
-    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    /// A runner that records what would have run and answers with scripted
-    /// output, so a test can watch the build decision without running `npm`.
-    struct FakeRunner {
-        invocations: RefCell<Vec<Invocation>>,
-        status: i32,
-        stderr: String,
-        side_effect: Option<Box<dyn Fn(&Invocation)>>,
-    }
-
-    impl FakeRunner {
-        fn ok() -> FakeRunner {
-            FakeRunner {
-                invocations: RefCell::new(Vec::new()),
-                status: 0,
-                stderr: String::new(),
-                side_effect: None,
-            }
-        }
-
-        fn failing(stderr: &str) -> FakeRunner {
-            FakeRunner {
-                status: 1,
-                stderr: stderr.to_string(),
-                ..FakeRunner::ok()
-            }
-        }
-
-        fn with_side_effect(mut self, effect: impl Fn(&Invocation) + 'static) -> FakeRunner {
-            self.side_effect = Some(Box::new(effect));
-            self
-        }
-
-        fn calls(&self) -> Vec<String> {
-            self.invocations
-                .borrow()
-                .iter()
-                .map(Invocation::command_line)
-                .collect()
-        }
-    }
-
-    impl CommandRunner for FakeRunner {
-        fn run(&self, invocation: &Invocation) -> std::io::Result<Completed> {
-            self.invocations.borrow_mut().push(invocation.clone());
-            if let Some(effect) = &self.side_effect {
-                effect(invocation);
-            }
-            Ok(Completed {
-                status: self.status,
-                stdout: String::new(),
-                stderr: self.stderr.clone(),
-            })
-        }
-    }
+    /// A site as `build.rs` would embed it, for tests that have no packaged site
+    /// to build with: the JSON config file is deliberately absent, which is the
+    /// case the embedded site reports rather than writes.
+    const EMBEDDED_FOR_TEST: &[(&str, &[u8])] = &[
+        ("index.html", b"<html>embedded</html>"),
+        ("assets/app.js", b"console.log(2)\n"),
+    ];
 
     static SCRATCH: AtomicU32 = AtomicU32::new(0);
 
@@ -685,8 +608,6 @@ mod tests {
             port: DEFAULT_PORT,
             bind: DEFAULT_BIND.to_string(),
             dir: None,
-            no_build: false,
-            rebuild: false,
         }
     }
 
@@ -697,16 +618,6 @@ mod tests {
         let matches = command
             .try_get_matches_from(std::iter::once("mainsail").chain(arguments.iter().copied()))?;
         Ok(MainsailArgs::from_arg_matches(&matches).expect("the arguments parse"))
-    }
-
-    /// A checkout-shaped directory: a package plus its lock file.
-    fn checkout(directory: &Path) -> (PathBuf, PathBuf) {
-        let checkout = directory.join("mainsail");
-        std::fs::create_dir_all(&checkout).expect("the checkout");
-        std::fs::write(checkout.join("package.json"), "{}").expect("package.json");
-        std::fs::write(checkout.join("package-lock.json"), "{}").expect("package-lock.json");
-        let dist = checkout.join("dist");
-        (checkout, dist)
     }
 
     /// A built site: `dist/` with an index plus the files the tests ask about.
@@ -721,63 +632,122 @@ mod tests {
         dist
     }
 
-    /// A runner that behaves like `npm run build`: it produces `dist/index.html`.
-    fn building_runner(dist: &Path) -> FakeRunner {
-        let built_dist = dist.to_path_buf();
-        FakeRunner::ok().with_side_effect(move |invocation| {
-            if invocation.args == ["run", "build"] {
-                std::fs::create_dir_all(&built_dist).expect("dist");
-                std::fs::write(built_dist.join("index.html"), b"<html>built</html>")
-                    .expect("index.html");
-            }
-        })
-    }
-
     #[test]
     fn the_arguments_parse_with_their_documented_defaults() {
         let defaults = parse(&[]).expect("every argument has a default");
         assert_eq!(defaults.port, DEFAULT_PORT);
         assert_eq!(defaults.bind, DEFAULT_BIND);
         assert!(defaults.dir.is_none());
-        assert!(!defaults.no_build);
-        assert!(!defaults.rebuild);
 
-        let given = parse(&["--dir", "/tmp/site", "--no-build", "--port", "9000"]).expect("parsed");
+        let given = parse(&["--dir", "/tmp/site", "--port", "9000"]).expect("parsed");
         assert_eq!(given.dir, Some(PathBuf::from("/tmp/site")));
         assert_eq!(given.port, 9000);
-        assert!(given.no_build);
-
-        assert!(
-            parse(&["--no-build", "--rebuild"]).is_err(),
-            "--no-build and --rebuild ask for opposite things"
-        );
     }
 
     #[test]
-    fn a_given_directory_is_served_as_it_is() {
+    fn the_build_switches_are_gone_and_help_names_the_three_sources() {
+        // Nothing builds the site any more, so neither switch may come back.
+        assert!(parse(&["--no-build"]).is_err(), "--no-build is gone");
+        assert!(parse(&["--rebuild"]).is_err(), "--rebuild is gone");
+
+        let mut command =
+            <MainsailArgs as clap::Args>::augment_args(clap::Command::new("mainsail"));
+        let help = command.render_help().to_string();
+        assert!(help.contains("--dir"), "{help}");
+        assert!(help.contains("built into this binary"), "{help}");
+        assert!(help.contains("third_party/mainsail/dist"), "{help}");
+        assert!(!help.contains("no-build"), "{help}");
+        assert!(!help.contains("rebuild"), "{help}");
+        assert!(!help.contains("npm ci"), "{help}");
+    }
+
+    #[test]
+    fn a_given_directory_wins_over_the_other_sources() {
         let directory = scratch("given");
         let built = directory.join("built");
         std::fs::create_dir_all(&built).expect("a built site");
         std::fs::write(built.join("index.html"), b"<html>given</html>").expect("index.html");
 
+        // A checkout with a site of its own too, so only precedence can decide.
+        let checkout = directory.join("checkout-dist");
+        std::fs::create_dir_all(&checkout).expect("the checkout's dist");
+        std::fs::write(checkout.join("index.html"), b"<html>checkout</html>").expect("index.html");
+
         let mut args = args();
         args.dir = Some(built.clone());
-        let runner = FakeRunner::ok();
-        let site = prepare_site(&args, &runner).expect("--dir is served as it is");
-        assert_eq!(site, built);
-        assert!(
-            runner.calls().is_empty(),
-            "--dir is never built: {:?}",
-            runner.calls()
+        let site = resolve_site(&args, Some(EMBEDDED_FOR_TEST), &checkout).expect("--dir wins");
+        assert_eq!(site.describe(), built.display().to_string());
+        assert_eq!(
+            site.read("index.html").expect("the given index"),
+            b"<html>given</html>"
         );
+
         // The one file the site cannot ship is written into the served directory.
+        prepare_site(&args).expect("the site is served");
         assert!(built.join("config.json").is_file());
 
         // A directory with nothing built in it is a mistake, not a build request.
         args.dir = Some(directory.join("absent"));
-        let error = prepare_site(&args, &runner).expect_err("not a built site");
+        let error =
+            resolve_site(&args, Some(EMBEDDED_FOR_TEST), &checkout).expect_err("not a built site");
         assert!(error.contains("no index.html"), "{error}");
         assert!(error.contains("--dir"), "{error}");
+
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn the_embedded_site_is_used_when_no_directory_was_given() {
+        let directory = scratch("embedded");
+        let checkout = directory.join("dist");
+
+        let site = resolve_site(&args(), Some(EMBEDDED_FOR_TEST), &checkout)
+            .expect("the embedded site needs nothing on disk");
+        assert_eq!(
+            site.describe(),
+            format!("the embedded site ({} files)", EMBEDDED_FOR_TEST.len())
+        );
+        assert_eq!(
+            site.read("assets/app.js").expect("an embedded file"),
+            b"console.log(2)\n"
+        );
+        assert!(site.contains("index.html"));
+        assert!(site.read("nope.js").is_err());
+
+        // A build that embedded nothing falls through to the next source: here
+        // there is none, so the operator is told where to put a site.
+        let error =
+            resolve_site(&args(), Some(&[]), &checkout).expect_err("an empty table is not a site");
+        assert!(error.contains(ASSETS_DIR), "{error}");
+        assert!(error.contains("--dir"), "{error}");
+
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn a_built_checkout_is_the_last_source() {
+        let directory = scratch("checkout");
+        let dist = built_site(&directory);
+
+        let site = resolve_site(&args(), None, &dist).expect("the checkout's dist is served");
+        assert_eq!(site.describe(), dist.display().to_string());
+        assert_eq!(
+            site.read("index.html").expect("the checkout's index"),
+            b"<html>mainsail</html>"
+        );
+
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn no_source_at_all_says_what_to_do() {
+        let directory = scratch("nothing");
+        let absent = directory.join("dist");
+
+        let error = resolve_site(&args(), None, &absent).expect_err("no site to serve");
+        assert!(error.contains(ASSETS_DIR), "{error}");
+        assert!(error.contains("--dir"), "{error}");
+        assert!(error.contains(&absent.display().to_string()), "{error}");
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -787,26 +757,30 @@ mod tests {
         let directory = scratch("traversal");
         let dist = built_site(&directory);
 
-        // Plain, dot-segment, and percent-encoded spellings of "climb out".
-        for target in [
-            "/../secret",
-            "/assets/../../secret",
-            "/%2e%2e/secret",
-            "/assets/%2E%2E/%2e%2e/secret",
-            "/./../secret",
-        ] {
-            assert_eq!(
-                route(&dist, "GET", target).status,
-                403,
-                "{target} should be refused"
-            );
+        // Plain, dot-segment, and percent-encoded spellings of "climb out",
+        // against both shapes of site: the check is on the path, not on where
+        // the bytes come from.
+        for site in [Site::Dir(dist.clone()), Site::Embedded(EMBEDDED_FOR_TEST)] {
+            for target in [
+                "/../secret",
+                "/assets/../../secret",
+                "/%2e%2e/secret",
+                "/assets/%2E%2E/%2e%2e/secret",
+                "/./../secret",
+            ] {
+                assert_eq!(
+                    route(&site, "GET", target).status,
+                    403,
+                    "{target} should be refused"
+                );
+            }
+
+            // Not an origin-form path at all.
+            assert_eq!(route(&site, "GET", "http://elsewhere/secret").status, 400);
+
+            // A NUL byte cannot be part of a file name.
+            assert_eq!(route(&site, "GET", "/a%00b").status, 403);
         }
-
-        // Not an origin-form path at all.
-        assert_eq!(route(&dist, "GET", "http://elsewhere/secret").status, 400);
-
-        // A NUL byte cannot be part of a file name.
-        assert_eq!(route(&dist, "GET", "/a%00b").status, 403);
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -815,25 +789,45 @@ mod tests {
     fn root_and_unknown_paths_serve_the_index() {
         let directory = scratch("index");
         let dist = built_site(&directory);
+        let site = Site::Dir(dist);
 
-        let root = route(&dist, "GET", "/");
+        let root = route(&site, "GET", "/");
         assert_eq!(root.status, 200);
         assert_eq!(root.body, b"<html>mainsail</html>");
         assert_eq!(root.content_type, "text/html; charset=utf-8");
 
         // A client-side route is a page of the application, not a miss.
-        let route_like = route(&dist, "GET", "/printer/dashboard?x=1");
+        let route_like = route(&site, "GET", "/printer/dashboard?x=1");
         assert_eq!(route_like.status, 200);
         assert_eq!(route_like.body, b"<html>mainsail</html>");
 
         // `HEAD` answers with the same length and no body.
-        let head = route(&dist, "HEAD", "/");
+        let head = route(&site, "HEAD", "/");
         assert_eq!(head.status, 200);
         assert_eq!(head.body, b"<html>mainsail</html>");
         let bytes = head.into_bytes(true);
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("Content-Length: 21"), "{text}");
         assert!(text.ends_with("\r\n\r\n"), "HEAD has no body: {text}");
+
+        // The embedded site answers the same requests the same way.
+        let embedded = Site::Embedded(EMBEDDED_FOR_TEST);
+        let root = route(&embedded, "GET", "/");
+        assert_eq!(root.status, 200);
+        assert_eq!(root.body, b"<html>embedded</html>");
+        assert_eq!(
+            route(&embedded, "GET", "/assets/app.js").body,
+            b"console.log(2)\n"
+        );
+        assert_eq!(
+            route(&embedded, "GET", "/printer/dashboard").body,
+            b"<html>embedded</html>",
+            "SPA fallback works from the embedded table"
+        );
+        let head = route(&embedded, "HEAD", "/");
+        assert_eq!(head.body, b"<html>embedded</html>");
+        let bytes = String::from_utf8_lossy(&head.into_bytes(true)).into_owned();
+        assert!(bytes.contains("Content-Length: 21"), "{bytes}");
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -842,19 +836,24 @@ mod tests {
     fn files_are_served_with_their_type() {
         let directory = scratch("types");
         let dist = built_site(&directory);
+        let site = Site::Dir(dist);
 
-        let javascript = route(&dist, "GET", "/assets/app.js?v=2");
+        let javascript = route(&site, "GET", "/assets/app.js?v=2");
         assert_eq!(javascript.status, 200);
         assert_eq!(javascript.body, b"console.log(1)\n");
         assert_eq!(javascript.content_type, "text/javascript; charset=utf-8");
 
         assert_eq!(
-            route(&dist, "GET", "/assets/app.css").content_type,
+            route(&site, "GET", "/assets/app.css").content_type,
             "text/css; charset=utf-8"
         );
         assert_eq!(
-            route(&dist, "GET", "/config.json").content_type,
+            route(&site, "GET", "/config.json").content_type,
             "application/json"
+        );
+        assert_eq!(
+            route(&Site::Embedded(EMBEDDED_FOR_TEST), "GET", "/assets/app.js").content_type,
+            "text/javascript; charset=utf-8"
         );
         assert_eq!(content_type(Path::new("a.woff2")), "font/woff2");
         assert_eq!(content_type(Path::new("a.svg")), "image/svg+xml");
@@ -866,114 +865,32 @@ mod tests {
     }
 
     #[test]
+    fn a_symlink_out_of_the_served_directory_is_refused() {
+        let directory = scratch("symlink");
+        let dist = built_site(&directory);
+        std::os::unix::fs::symlink(directory.join("secret"), dist.join("escape")).expect("symlink");
+
+        // The lexical check passes — the name has no `..` — so this is the
+        // canonical-path gate answering.
+        let reply = route(&Site::Dir(dist), "GET", "/escape");
+        assert_eq!(reply.status, 403);
+        let text = String::from_utf8_lossy(&reply.body).into_owned();
+        assert!(text.contains("leaves the served directory"), "{text}");
+
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
     fn other_methods_are_refused() {
         let directory = scratch("methods");
         let dist = built_site(&directory);
-        assert_eq!(route(&dist, "POST", "/").status, 405);
-        assert_eq!(route(&dist, "DELETE", "/config.json").status, 405);
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn an_empty_directory_is_not_built_when_no_build_was_asked_for() {
-        let directory = scratch("nobuild");
-        let (checkout, dist) = checkout(&directory);
-        let runner = FakeRunner::ok();
-
-        let mut args = args();
-        args.no_build = true;
-        let error = ensure_built(&args, &checkout, &dist, &runner).expect_err("no build, no site");
-        assert!(error.contains("no built site"), "{error}");
-        assert!(error.contains("npm ci && npm run build"), "{error}");
-        assert!(
-            runner.calls().is_empty(),
-            "nothing may run: {:?}",
-            runner.calls()
+        let site = Site::Dir(dist);
+        assert_eq!(route(&site, "POST", "/").status, 405);
+        assert_eq!(route(&site, "DELETE", "/config.json").status, 405);
+        assert_eq!(
+            route(&Site::Embedded(EMBEDDED_FOR_TEST), "PUT", "/").status,
+            405
         );
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn a_missing_build_runs_npm_once_and_a_second_run_skips_it() {
-        let directory = scratch("build");
-        let (checkout, dist) = checkout(&directory);
-        let runner = building_runner(&dist);
-
-        assert_eq!(site_state(&dist, &checkout), SiteState::Missing);
-        ensure_built(&args(), &checkout, &dist, &runner).expect("the site is built");
-        assert_eq!(runner.calls(), ["npm ci", "npm run build"]);
-        assert_eq!(site_state(&dist, &checkout), SiteState::Ready);
-
-        // The second run finds the build and runs nothing at all.
-        let second = FakeRunner::ok();
-        ensure_built(&args(), &checkout, &dist, &second).expect("the build is reused");
-        assert!(
-            second.calls().is_empty(),
-            "nothing may run: {:?}",
-            second.calls()
-        );
-
-        // `--rebuild` runs npm even though the build is current.
-        let mut forced = args();
-        forced.rebuild = true;
-        let rebuild = FakeRunner::ok();
-        ensure_built(&forced, &checkout, &dist, &rebuild).expect("the build is forced");
-        assert_eq!(rebuild.calls(), ["npm ci", "npm run build"]);
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn a_lock_file_newer_than_the_build_makes_it_stale() {
-        let directory = scratch("stale");
-        let (checkout, dist) = checkout(&directory);
-        ensure_built(&args(), &checkout, &dist, &building_runner(&dist))
-            .expect("the site is built");
-        assert_eq!(site_state(&dist, &checkout), SiteState::Ready);
-
-        // Touch the lock file after the build: the dependency tree it pins is
-        // no longer the one the site was built from.
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(checkout.join("package-lock.json"), "{\"v\":2}").expect("a new lock file");
-        assert_eq!(site_state(&dist, &checkout), SiteState::Stale);
-
-        let rebuild = FakeRunner::ok();
-        ensure_built(&args(), &checkout, &dist, &rebuild).expect("a stale build is rebuilt");
-        assert_eq!(rebuild.calls(), ["npm ci", "npm run build"]);
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn a_failing_build_reports_what_npm_said() {
-        let directory = scratch("npmfails");
-        let (checkout, dist) = checkout(&directory);
-        let runner = FakeRunner::failing("npm error code EUSAGE\nnpm error missing script: build");
-
-        let error = ensure_built(&args(), &checkout, &dist, &runner).expect_err("npm failed");
-        assert!(error.contains("npm ci"), "{error}");
-        assert!(error.contains("missing script: build"), "{error}");
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn an_unchecked_out_submodule_says_so() {
-        let directory = scratch("nosources");
-        let checkout = directory.join("mainsail");
-        std::fs::create_dir_all(&checkout).expect("an empty checkout");
-        let dist = checkout.join("dist");
-        let runner = FakeRunner::ok();
-        let error = ensure_built(&args(), &checkout, &dist, &runner).expect_err("nothing to build");
-        assert!(error.contains("package.json"), "{error}");
-        assert!(error.contains("git submodule update --init"), "{error}");
-        assert!(
-            runner.calls().is_empty(),
-            "nothing may run: {:?}",
-            runner.calls()
-        );
-
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
 
@@ -1027,14 +944,20 @@ mod tests {
         (status, text)
     }
 
+    /// A current-thread runtime for one HTTP test.
+    fn http_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime")
+    }
+
     #[test]
     fn the_site_is_served_over_http() {
         let directory = scratch("http");
         let dist = built_site(&directory);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("a runtime");
+        let site = Site::Dir(dist.clone());
+        let runtime = http_runtime();
 
         let bounded = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(20), async {
@@ -1044,7 +967,7 @@ mod tests {
                 let address = listener.local_addr().expect("the bound address");
                 let server = tokio::spawn(accept_loop(
                     listener,
-                    Arc::new(dist.clone()),
+                    Arc::new(site),
                     std::future::pending::<()>(),
                 ));
 
@@ -1074,5 +997,47 @@ mod tests {
         bounded.expect("the HTTP test is bounded");
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn the_embedded_site_is_served_over_http() {
+        let runtime = http_runtime();
+
+        let bounded = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .expect("a random port");
+                let address = listener.local_addr().expect("the bound address");
+                let server = tokio::spawn(accept_loop(
+                    listener,
+                    Arc::new(Site::Embedded(EMBEDDED_FOR_TEST)),
+                    std::future::pending::<()>(),
+                ));
+
+                let (status, text) = get(address, "/").await;
+                assert_eq!(status, 200);
+                assert!(text.contains("<html>embedded</html>"), "{text}");
+
+                let (status, text) = get(address, "/assets/app.js").await;
+                assert_eq!(status, 200);
+                assert!(text.contains("console.log(2)"), "{text}");
+                assert!(text.contains("text/javascript"), "{text}");
+
+                let (status, text) = get(address, "/printer/dashboard").await;
+                assert_eq!(status, 200);
+                assert!(
+                    text.contains("<html>embedded</html>"),
+                    "SPA fallback: {text}"
+                );
+
+                let (status, _) = get(address, "/../secret").await;
+                assert_eq!(status, 403);
+
+                server.abort();
+            })
+            .await
+        });
+        bounded.expect("the HTTP test is bounded");
     }
 }

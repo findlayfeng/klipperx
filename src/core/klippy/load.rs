@@ -12,6 +12,12 @@
 //! `load_config_prefix` — the same two entry points upstream looks up on the
 //! module (`klippy/klippy.py:90-99`).
 //!
+//! A few modules are built whether or not their section exists: upstream's
+//! `toolhead.add_printer_objects` loads them by name (`toolhead.py:603-611`).
+//! [`DEFAULT_MODULES`] is that list, and [`Printer::load_sections`] loads each
+//! entry from an empty section when the config has none — upstream's
+//! `PrinterConfig.getsection` semantics for an absent section.
+//!
 //! The table is **generated** from the `section!` declarations in the modules
 //! that own sections (see `build.rs`): a module is one declaration next to the
 //! factory it names, so adding a section never edits a central list. Each
@@ -56,7 +62,7 @@ use std::sync::Arc;
 use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
 use crate::core::klippy::config::save_config;
 use crate::core::klippy::config::{
-    check_unused, AccessTracking, Config, ConfigError, ConfigWrapper,
+    check_unused, AccessTracking, Config, ConfigError, ConfigSection, ConfigWrapper,
 };
 use crate::core::klippy::gcode::{self, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
@@ -111,6 +117,22 @@ pub struct Factories {
 //
 // Generated from the `section!` declarations (see the module docs).
 include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
+
+/// Sections upstream builds even when the config does not have them.
+///
+/// `toolhead.add_printer_objects` ends with a fixed list of modules it loads
+/// through `printer.load_object(config, module_name)` (`toolhead.py:603-611`),
+/// and `PrinterConfig.getsection` hands an absent section an empty config, so
+/// each module builds from its own option defaults. The generic walk below only
+/// sees sections that are present, so [`Printer::load_sections`] loads these
+/// after it — the point upstream loads them at (the end of `[printer]`).
+///
+/// This is the mechanism, not an allowance for one module: an id here is loaded
+/// whether or not its section exists, unconditionally, the way upstream's list
+/// is. The rest of upstream's list — `gcode_move`, `homing`, `statistics`,
+/// `manual_probe`, `tuning_tower`, `garbage_collection` — is not ported yet, so
+/// those modules are still absent from a config that does not name them.
+const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
 
 /// Every section id this host knows, in load order.
 ///
@@ -293,6 +315,27 @@ impl Printer {
                     self.register(load, entry, section, config, access, &mut claimed)?;
                 }
             }
+        }
+
+        // The modules upstream builds unconditionally (`DEFAULT_MODULES`). A
+        // section that is present was built by the walk above, in its phase and
+        // from its own options; one that is absent is built from an empty
+        // section, which is what upstream's `getsection` hands it — every option
+        // these modules read has a default.
+        for id in DEFAULT_MODULES {
+            let Some((_, entry)) = factories.iter().find(|(known, _)| *known == *id) else {
+                // The table is the schema: a module this host does not know
+                // cannot be loaded from a name alone.
+                continue;
+            };
+            let Some(load) = entry.load_config else {
+                continue;
+            };
+            if config.get_section(id).is_some() {
+                continue;
+            }
+            let absent = ConfigSection::new(id, None);
+            self.register(load, entry, &absent, config, access, &mut claimed)?;
         }
 
         Ok(claimed)
@@ -733,7 +776,9 @@ mod tests {
                 "mcu_ids",
                 "error_mcu",
                 "serial_ports",
-                "mcu"
+                "mcu",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -760,7 +805,9 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "mcu zboard",
-                "board_pins"
+                "board_pins",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -781,7 +828,9 @@ mod tests {
                 "mcu_ids",
                 "error_mcu",
                 "serial_ports",
-                "mcu"
+                "mcu",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
         // The main MCU's id, pinned across the restart below: the allocator is
@@ -807,7 +856,9 @@ mod tests {
                 "mcu_ids",
                 "error_mcu",
                 "serial_ports",
-                "mcu"
+                "mcu",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
         // The reborn allocator hands the same main MCU its id again, so nothing
@@ -875,7 +926,9 @@ mod tests {
                 // makes `PROBE_CALIBRATE` work without a `[manual_probe]`
                 // section.
                 "manual_probe",
-                "toolhead"
+                "toolhead",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
         // The steppers are registered but not client-visible; the toolhead is.
@@ -980,7 +1033,9 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "mcu zboard",
-                "mcu toolhead"
+                "mcu toolhead",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -1028,8 +1083,46 @@ mod tests {
 
         result.unwrap();
         // `gcode`, `configfile` and `pins` are unconditional; no section
-        // contributed anything else.
-        assert_eq!(printer.objects(), ["gcode", "configfile", "pins"]);
+        // contributed anything else. The tail is what `[printer]` loads by name
+        // whether or not the config has the section (`DEFAULT_MODULES`,
+        // upstream's `toolhead.add_printer_objects`, `toolhead.py:603-611`) —
+        // `gcode_macro` is the template holder `idle_timeout` asks for.
+        assert_eq!(
+            printer.objects(),
+            ["gcode", "configfile", "pins", "gcode_macro", "idle_timeout"]
+        );
+    }
+
+    /// A module in [`DEFAULT_MODULES`] is built whether or not the config has
+    /// its section, and a section that *is* present is still the one thing that
+    /// builds it — once, from its own options.
+    #[test]
+    fn test_a_default_module_loads_without_its_section() {
+        let (printer, result) =
+            load("[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n");
+
+        result.unwrap();
+        assert_eq!(
+            printer
+                .lookup_object("idle_timeout")
+                .expect("the default module was built from an empty section")
+                .get_status(0.0)["idle_timeout"],
+            json!(600.0)
+        );
+
+        let (printer, result) = load(
+            "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n\
+             [idle_timeout]\ntimeout: 1200\n",
+        );
+
+        result.unwrap();
+        assert_eq!(
+            printer
+                .lookup_object("idle_timeout")
+                .expect("the section built it")
+                .get_status(0.0)["idle_timeout"],
+            json!(1200.0)
+        );
     }
 
     #[test]
@@ -1050,7 +1143,9 @@ mod tests {
                 "mcu_ids",
                 "error_mcu",
                 "serial_ports",
-                "mcu"
+                "mcu",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -1081,7 +1176,9 @@ mod tests {
                 "mcu",
                 "display_template",
                 "template_evaluator",
-                "output_pin fan"
+                "output_pin fan",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -1108,7 +1205,9 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "board_pins",
-                "board_pins second"
+                "board_pins second",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -1134,7 +1233,9 @@ mod tests {
                 "error_mcu",
                 "serial_ports",
                 "mcu",
-                "i2c_device accel"
+                "i2c_device accel",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }
@@ -1160,7 +1261,9 @@ mod tests {
                 "error_mcu",
                 "serial_ports",
                 "mcu",
-                "spi_device flash"
+                "spi_device flash",
+                "gcode_macro",
+                "idle_timeout"
             ]
         );
     }

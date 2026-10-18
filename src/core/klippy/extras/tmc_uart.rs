@@ -278,6 +278,21 @@ fn write_command(oid: u8, addr: u8, reg: u8, val: u32) -> TmcuartSend {
     }
 }
 
+/// Slack added on top of a frame's clocking time before the bus is considered
+/// free again.
+const FRAME_DRAIN_MARGIN: Duration = Duration::from_millis(1);
+
+/// How long `bytes` bytes take on a `baud` UART: ten bits per byte (start, eight
+/// data, stop) plus [`FRAME_DRAIN_MARGIN`].
+///
+/// The firmware drops a `tmcuart_send` that arrives while the UART is busy
+/// (`src/tmcuart.c`, "host should retransmit"), and a write asks for no answer,
+/// so the host has no signal that the frame is out — it waits this long instead
+/// (see [`TmcUartBitbang::drain_time`]).
+fn frame_time(bytes: usize, baud: f64) -> Duration {
+    Duration::from_secs_f64(bytes as f64 * 10.0 / baud) + FRAME_DRAIN_MARGIN
+}
+
 // ===========================================================================
 // Analog mux (`MCU_analog_mux`)
 // ===========================================================================
@@ -421,6 +436,10 @@ pub(crate) struct TmcUartBitbang {
     /// deadlock with the reactor itself. One [`TmcUart`] never recurses into
     /// its own read/write path, which is what would make this reentrant.
     bus: Mutex<()>,
+    /// The baud the firmware clocks this UART at, resolved in the config
+    /// callback (the MCU constant decides AVR's 9 kbaud). The write path uses
+    /// it to wait out a frame — see [`TmcUartBitbang::drain_time`].
+    baud: Arc<Mutex<f64>>,
 }
 
 impl TmcUartBitbang {
@@ -453,6 +472,8 @@ impl TmcUartBitbang {
         let callback_chip = chip_name.to_string();
         let callback_rx_pin = rx_params.pin.clone();
         let callback_tx_pin = tx_params.pin.clone();
+        let baud_cell = Arc::new(Mutex::new(TMC_BAUD_RATE));
+        let callback_baud = Arc::clone(&baud_cell);
         builder
             .register_config_callback(Box::new(move |builder, mcu| {
                 let baud = {
@@ -472,6 +493,9 @@ impl TmcUartBitbang {
                     }
                 };
                 let bit_time = mcu.seconds_to_clock(1. / baud)? as u32;
+                *callback_baud
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = baud;
                 let rx = pin_number(mcu, &callback_chip, &callback_rx_pin)?;
                 let tx = pin_number(mcu, &callback_chip, &callback_tx_pin)?;
                 builder.add_config_cmd(&ConfigTmcuart {
@@ -494,7 +518,26 @@ impl TmcUartBitbang {
             mcu_object: Arc::downgrade(&mcu_object),
             oid,
             bus: Mutex::new(()),
+            baud: baud_cell,
         }))
+    }
+
+    /// How long the firmware needs to clock `bytes` bytes out of this UART: the
+    /// frame at 10 bits per byte, plus a millisecond of margin.
+    ///
+    /// It is the write path's pacing. `command_tmcuart_send` **silently drops**
+    /// a request while the UART is busy (`src/tmcuart.c:107-109`, "host should
+    /// retransmit"), so a second command sent before the first has finished
+    /// clocking out is lost — that is why upstream's blocking transport never
+    /// needed this and a fire-and-forget write does. Measured on the bench: the
+    /// immediate `IFCNT` read-back of the very next write saw a stale value
+    /// while the write itself did land, and back-to-back writes went missing.
+    fn drain_time(&self, bytes: usize) -> Duration {
+        let baud = *self
+            .baud
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        frame_time(bytes, baud)
     }
 
     /// Hold the bus for one read/write sequence.
@@ -601,13 +644,20 @@ impl TmcUartBitbang {
         if let Some(mux) = &self.mux {
             mux.activate(instance_id.unwrap_or(&[]))?;
         }
+        let command = write_command(self.oid, addr, reg, val);
+        let bytes = command.write.len();
         mcu.send_msg_clocked(
-            &write_command(self.oid, addr, reg, val),
+            &command,
             SendClocks {
                 min_clock,
                 req_clock: None,
             },
-        )
+        )?;
+        // Wait the frame out before anyone may queue the next command on this
+        // UART: the firmware drops one that arrives while it is still clocking
+        // (see [`TmcUartBitbang::drain_time`]).
+        std::thread::sleep(self.drain_time(bytes));
+        Ok(())
     }
 
     /// Register a driver on this peripheral (`register_instance`).
@@ -1008,6 +1058,23 @@ mod tests {
         // The read request `[0xf5, addr, reg]` with its CRC appended, before the
         // serial-bit framing: the CRC of the three header bytes.
         assert_eq!(crc8(&[0xf5, 0x00, 0x00]), 0x0f);
+    }
+
+    /// A write frame is eight bytes, ten bits each: 2.0 ms at the nominal
+    /// 40 kbaud, 8.9 ms on AVR's 9 kbaud. The pacing that keeps the firmware
+    /// from dropping the next command is that plus the margin.
+    #[test]
+    fn a_write_frame_takes_its_ten_bits_per_byte_to_drain() {
+        assert_eq!(
+            frame_time(8, TMC_BAUD_RATE),
+            Duration::from_micros(2_000) + FRAME_DRAIN_MARGIN
+        );
+        assert_eq!(
+            frame_time(8, TMC_BAUD_RATE_AVR),
+            Duration::from_secs_f64(80.0 / TMC_BAUD_RATE_AVR) + FRAME_DRAIN_MARGIN
+        );
+        // The margin is what makes it a pacing rather than an estimate.
+        assert!(frame_time(8, TMC_BAUD_RATE) > Duration::from_micros(2_000));
     }
 
     #[test]

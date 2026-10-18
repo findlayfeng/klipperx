@@ -392,6 +392,41 @@ EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂
 **仍未验**：无感回零的**真触发**（这台电机是空悬的，不会堵转，需要负载或手捏轴）与
 `tmc/stallguard_dump` 的随负载采样；SPI 族（2130/2240/2660/5160）的真板读写本轮没上板。
 
+### 真机结果（2026-10-18，桥的自恢复：admin 重置不再需要 identify）
+
+背景：`restart_method: command` 是"连上之后发固件 `reset`"，所以它**只能在 identify 之后**生效——板子卡在
+陈旧会话、认不出来时正好用不上。真机验过两条 admin 路径，它们都不需要 klipper 会话：
+
+```bash
+# 1) 工具路径（不读 printer.cfg）：重置桥自己 / 送它进 katapult
+klipperx admin reset --bridge /dev/serial/by-id/usb-Klipper_stm32f446xx_… --bridge-uuid 56ec3127224a
+klipperx admin reset --bridge … --bootloader
+
+# 2) 配置路径：桥自己的 [mcu] 写 restart_method: admin，之后 FIRMWARE_RESTART 就走同一条 admin 帧
+```
+
+实测（F446，`admin reset --bridge …`，0.99 s）：
+
+```
+shared serial … open at 250000 baud
+Creating MCU: bridge                                  ← 只开 mux 链路，没有 identify
+shared serial … open at 250000 baud                   ← 重启之后的回归确认
+MCU 'bridge' identified: 150 messages registered
+reset: bridge (restarted and identified again)
+```
+
+实测（同一块板，`restart_method: admin` + `FIRMWARE_RESTART`）：
+
+```
+05:55:12 bridge … restarted over its admin channel (index 0xff)
+05:55:13 MCU 'mcu' identified: 150 messages registered
+05:55:13 MCU 'downstream' identified: 139 messages registered     → state: ready
+```
+
+两者发的都是 `RESTART_DEVICE [0x05][0xFF]`：`0xFF` 超出任何桥的端口数（`BRIDGE_MAX_PORTS = 8`），
+固件的 `bridge.c` 因此不把它当"某个端口的下游设备"，而是落给 `mux_admin_unit` → `mcu_restart()`。
+`--bootloader` 同位置发 `[0x02][0xFF]` → `bootloader_request()`（未在本轮跑，避免把桥刷成 katapult 后还要重刷）。
+
 ## 范围外的真板项（不属最小打印任务，未排期）
 
 - **双板时序/漂移**：第二块板（`[mcu zboard]`）跨 MCU 停轴、小时级运行的实际晶振漂移与

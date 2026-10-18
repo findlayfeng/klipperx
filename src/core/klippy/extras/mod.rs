@@ -64,6 +64,7 @@ pub mod manual_probe;
 pub mod manual_stepper;
 pub mod mcp4018;
 pub mod mcp4451;
+pub mod motion_report;
 pub mod mpu9250;
 pub mod multi_pin;
 pub mod output_pin;

@@ -847,6 +847,13 @@ mod tests {
                 // when the config named no `[force_move]` section, so it lands
                 // just before the stepper that asked for it.
                 "force_move",
+                // The same build registers the stepper's `motion_report`
+                // instance (`stepper.py:282-285`'s third helper module), which
+                // creates that object too — and its mux registration installs
+                // `webhooks` (the table the endpoint is buffered in) right
+                // behind it.
+                "motion_report",
+                "webhooks",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",

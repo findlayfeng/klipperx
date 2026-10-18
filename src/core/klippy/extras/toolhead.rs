@@ -130,8 +130,9 @@ use crate::core::klippy::motion::rotary_delta::{
     rotary_delta_active_flags, rotary_delta_position_fn, RotaryDeltaConfig, RotaryDeltaKinematics,
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
-use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
+use crate::core::klippy::motion::stepcompress::{HistoryStep, StepCommand, StepCompressError};
 use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead, WaitMovesState};
+use crate::core::klippy::motion::trapq::MoveSegment;
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -1775,6 +1776,30 @@ impl Drop for ToolHeadObject {
     }
 }
 
+/// One motion stepper's step history, as `motion_report/dump_stepper` reads it.
+///
+/// The compressor records firmware clocks; the report needs print seconds, so
+/// the mapping the compressor was given travels with the rows.
+pub struct StepperStepHistory {
+    /// The runs overlapping the read window, newest first
+    /// (`StepCompressor::extract_old`).
+    pub steps: Vec<HistoryStep>,
+    /// Millimetres per step (`MCU_stepper.step_dist`).
+    pub step_dist: f64,
+    /// Clock ticks per print second, and the print time clock 0 corresponds to
+    /// (`StepCompressor::mcu_freq` / `time_offset`).
+    pub mcu_freq: f64,
+    pub time_offset: f64,
+}
+
+impl StepperStepHistory {
+    /// The print time of one of the rows' clocks (upstream's
+    /// `MCU.clock_to_print_time`, the inverse of `print_time_to_clock`).
+    pub fn clock_to_print_time(&self, clock: u64) -> f64 {
+        clock as f64 / self.mcu_freq + self.time_offset
+    }
+}
+
 impl ToolHeadObject {
     fn lock(&self) -> MutexGuard<'_, Option<Connected>> {
         self.state
@@ -1992,6 +2017,61 @@ impl ToolHeadObject {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.main_trapq())
+    }
+
+    /// The segments of trapq `trapq` that overlap `start_time..end_time`,
+    /// newest first (`trapq_extract_old`, the read side of
+    /// `motion_report/dump_trapq`).
+    ///
+    /// `trapq` is a [`MotionQueuing`](crate::core::klippy::motion::MotionQueuing)
+    /// id from this machine — [`ToolHeadObject::main_trapq`] or
+    /// [`crate::core::klippy::extras::extruder::PrinterExtruder::trapq`].
+    /// `None` before connect (the motion state the ids index does not exist
+    /// yet).
+    pub fn trapq_extract(
+        &self,
+        trapq: usize,
+        max: usize,
+        start_time: f64,
+        end_time: f64,
+    ) -> Option<Vec<MoveSegment>> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        Some(
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .trapq(trapq)
+                .extract_old(max, start_time, end_time),
+        )
+    }
+
+    /// One motion stepper's recent step runs plus the clock mapping that turns
+    /// its records' clocks into print times — what
+    /// `motion_report/dump_stepper` streams (`MCU_stepper.dump_steps`).
+    ///
+    /// `None` before connect, or when no motion stepper answers to `name`.
+    pub fn stepper_step_history(
+        &self,
+        name: &str,
+        max: usize,
+        start_clock: u64,
+        end_clock: u64,
+    ) -> Option<StepperStepHistory> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)?;
+        Some(StepperStepHistory {
+            steps: stepper.history(max, start_clock, end_clock),
+            step_dist: stepper.step_dist(),
+            mcu_freq: stepper.mcu_freq(),
+            time_offset: stepper.time_offset(),
+        })
     }
 
     /// Point a motion stepper at a trapq by name, or take it off one with
@@ -3901,6 +3981,12 @@ pub(crate) fn load_config(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = ToolHeadObject::new(config, printer)?;
+    // `motion_report` streams the toolhead's own queue under the name
+    // `toolhead` (`motion_report.py:169-172`). Upstream registers it in
+    // `klippy:connect`; the mux table here is filled from the load path, so the
+    // instance is registered by name and the trapq id resolved per batch.
+    crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+        .register_toolhead_trapq()?;
     // Upstream's `add_printer_objects` loads the default modules right after
     // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
     // them: it is what turns g-code coordinates into the toolhead's.

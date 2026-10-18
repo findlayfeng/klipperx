@@ -42,8 +42,10 @@ pub struct McuConfig {
     ///
     /// Resolved to the effective method: `command` for a non-serial MCU, the
     /// config's own value (default `arduino`) for a serial one, and `admin` for
-    /// a named bridge-port device ([`McuRestartMethod`]). The reset itself is
-    /// `mcu/restart.rs`'s, dispatched on this.
+    /// a serial one or a named bridge-port device ([`McuRestartMethod`]) — on a
+    /// serial section `admin` is the bridge restarting **itself** over its mux
+    /// admin channel (`mcu/restart.rs`). The reset itself is `mcu/restart.rs`'s,
+    /// dispatched on this.
     pub restart_method: McuRestartMethod,
     /// Which port-level reset this device gets, when it hangs behind a bridge
     /// port.
@@ -482,6 +484,15 @@ impl McuConfig {
     /// A device behind a bridge port is the third case, resolved by
     /// [`McuConfig::parse_bridge_restart`].
     ///
+    /// `admin` is the one value both shapes with an admin channel use, and which
+    /// channel it is depends on the transport: a **serial** MCU is the bridge
+    /// itself, so the host restarts it over its mux admin channel before the
+    /// port opens (`mcu/restart.rs`), while a **bridge port** child that writes
+    /// a `uuid:` is restarted by the bridge forwarding the command. A **shared**
+    /// serial port keeps `admin` too: the frame travels the admin id, not the
+    /// line's modem lines, so it interrupts no other MCU the way a DTR toggle
+    /// would — the reason the line-wide methods are downgraded does not apply.
+    ///
     /// # Returns
     /// The MCU's own method, and the port-level reset a bridge-port device uses
     /// — `None` unless this section is one ([`BridgeRestart`]).
@@ -510,7 +521,7 @@ impl McuConfig {
                 .as_deref()
                 .is_some_and(|text| McuRestartMethod::parse(text) == Some(McuRestartMethod::Admin))
             {
-                return Err(Self::admin_needs_a_named_bridge_port(section));
+                return Err(Self::admin_without_an_admin_channel(section));
             }
             return Ok((McuRestartMethod::Command, None));
         }
@@ -520,8 +531,12 @@ impl McuConfig {
             None => McuRestartMethod::Arduino,
             Some(text) => Self::parse_method(section, text)?,
         };
+        // The bridge's own restart is an admin unit, not a modem-line sequence:
+        // it reaches the mux's admin id, so a shared port keeps it (the
+        // line-wide methods below are pinned to `command` for the opposite
+        // reason).
         if written == McuRestartMethod::Admin {
-            return Err(Self::admin_needs_a_named_bridge_port(section));
+            return Ok((written, None));
         }
         if !shared {
             return Ok((written, None));
@@ -566,7 +581,7 @@ impl McuConfig {
         let method = match &text {
             Some(text) if McuRestartMethod::parse(text) == Some(McuRestartMethod::Admin) => {
                 if !named {
-                    return Err(Self::admin_needs_a_named_bridge_port(section));
+                    return Err(Self::admin_without_an_admin_channel(section));
                 }
                 McuRestartMethod::Admin
             }
@@ -632,19 +647,21 @@ impl McuConfig {
         })
     }
 
-    /// The error for `restart_method: admin` on a section that is not a **named**
-    /// bridge-port device.
+    /// The error for `restart_method: admin` on a section with **no** admin
+    /// channel to use.
     ///
-    /// `admin` is the one method that acts on the device's own admin channel,
-    /// and only a child behind a bridge port that writes a `uuid:` has one. A
-    /// serial section resets on its own line, and a legacy bridge-port device
-    /// has nothing to forward the command to — for both, the bridge's port is
-    /// the only reset available, so the error names the rule rather than
-    /// silently downgrading a *written* choice that can never work.
-    fn admin_needs_a_named_bridge_port(section: &ConfigWrapper) -> ConfigError {
+    /// `admin` acts on the mux admin channel, and only two shapes have one: a
+    /// serial MCU, which is the bridge restarting itself, and a child behind a
+    /// bridge port that writes a `uuid:`, whose restart the bridge forwards to
+    /// its port. Every other section — a CAN MCU, a host library, a legacy
+    /// (uuid-less) bridge-port device — has neither, so the error names the two
+    /// shapes rather than silently downgrading a *written* choice that can never
+    /// work.
+    fn admin_without_an_admin_channel(section: &ConfigWrapper) -> ConfigError {
         ConfigError::new(format!(
-            "MCU '{}': restart_method 'admin' needs a bridge port with a 'uuid:' — a device with \
-             no admin channel can only be reset by its bridge's port",
+            "MCU '{}': restart_method 'admin' needs an admin channel — a 'serial:' link, where \
+             the bridge restarts itself, or a bridge port with a 'uuid:', where the bridge \
+             forwards the command to the device",
             section.identifier()
         ))
     }
@@ -2729,31 +2746,43 @@ mod tests {
 
         let text = err.to_string();
         assert!(
-            text.contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
+            text.contains("restart_method 'admin' needs an admin channel"),
             "{text}"
         );
-        assert!(
-            text.contains("a device with no admin channel can only be reset by its bridge's port"),
-            "{text}"
-        );
+        assert!(text.contains("or a bridge port with a 'uuid:'"), "{text}");
     }
 
-    /// `admin` on a serial MCU is refused the same way: the method resets a
-    /// device over a bridge's admin channel, and a serial line is not one.
+    /// `admin` on a serial MCU is the bridge restarting **itself**: its mux admin
+    /// channel is reached on this very link, so the value is kept rather than
+    /// refused — and no port-level reset is asked for, since the device in
+    /// question is not behind a port.
     #[test]
-    fn admin_on_a_serial_mcu_is_refused() {
-        let err =
-            parse_section("[mcu]\nserial: /dev/a\nrestart_method: admin\n", "mcu").unwrap_err();
+    fn admin_on_a_serial_mcu_is_the_bridge_restarting_itself() {
+        let config = parse_section("[mcu]\nserial: /dev/a\nrestart_method: admin\n", "mcu")
+            .expect("a serial MCU with admin parses");
 
-        assert!(
-            err.to_string()
-                .contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
-            "{err}"
-        );
+        assert_eq!(config.restart_method, McuRestartMethod::Admin);
+        assert_eq!(config.bridge_restart, None);
+    }
+
+    /// A **shared** serial path keeps `admin`: the frame goes to the mux's admin
+    /// id, not to the line's modem lines, so no other MCU on the port is
+    /// interrupted the way a DTR toggle would interrupt it.
+    #[test]
+    fn admin_on_a_shared_serial_path_is_kept() {
+        let config = parse_section(
+            "[mcu bridge]\nserial: /dev/a\nrestart_method: admin\n[mcu board]\nserial: /dev/a\n",
+            "mcu bridge",
+        )
+        .expect("a shared serial path with admin parses");
+
+        assert_eq!(config.restart_method, McuRestartMethod::Admin);
+        assert_eq!(config.bridge_restart, None);
     }
 
     /// `admin` on a non-bridge transport is refused even when the section does
-    /// write a `uuid:` — a CAN link has no bridge port to forward on.
+    /// write a `uuid:` — a CAN link has no admin channel and no bridge port to
+    /// forward on.
     #[test]
     fn admin_on_a_can_mcu_is_refused() {
         let err =
@@ -2761,7 +2790,7 @@ mod tests {
 
         assert!(
             err.to_string()
-                .contains("restart_method 'admin' needs a bridge port with a 'uuid:'"),
+                .contains("restart_method 'admin' needs an admin channel"),
             "{err}"
         );
     }

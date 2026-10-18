@@ -12,9 +12,10 @@
 //! that applies is served, and which one it was is printed at startup.
 //!
 //! The one file Mainsail cannot know — `config.json`, saying which Moonraker to
-//! talk to — is written into a site served from disk when it has none. The
-//! embedded site's bytes are part of the binary, so a site without that file is
-//! reported instead, naming the file to add before the next build.
+//! talk to — is answered per request instead of taken from the site: a browser
+//! that opened the page at `http://10.0.48.2:8080/` is pointed at the Moonraker
+//! on that address, so one served site works from every machine that reaches it.
+//! `--config-json` answers with an operator's own file instead, unchanged.
 //!
 //! Nothing here runs `npm`, and nothing here reaches the network.
 //!
@@ -45,7 +46,7 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// from another machine on the same network.
 pub const DEFAULT_BIND: &str = "0.0.0.0";
 
-/// The port Moonraker listens on, written into the site's `config.json`.
+/// The port Moonraker listens on, given in the answered `config.json`.
 pub const MOONRAKER_PORT: u16 = 7125;
 
 /// The directory a packaged site is put in before a build, relative to the
@@ -89,12 +90,27 @@ pub struct MainsailArgs {
     /// nothing is built into it.
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+
+    /// Serve this `config.json` as it is, instead of answering one from the site
+    ///
+    /// Read on every request and never rewritten; it must be readable at start.
+    #[arg(long, value_name = "PATH")]
+    pub config_json: Option<PathBuf>,
+
+    /// Hostname the answered `config.json` gives for Moonraker, instead of the
+    /// host the browser asked on
+    #[arg(long, value_name = "HOST")]
+    pub moonraker_host: Option<String>,
+
+    /// Port the answered `config.json` gives for Moonraker
+    #[arg(long, default_value_t = MOONRAKER_PORT)]
+    pub moonraker_port: u16,
 }
 
 /// Run `klipperx mainsail`: resolve the site, then serve it until Ctrl-C.
 pub fn run(args: MainsailArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let site = prepare_site(&args)?;
-    serve(&args, &site).map_err(Into::into)
+    serve(&args, site).map_err(Into::into)
 }
 
 /// The site being served.
@@ -158,23 +174,27 @@ fn checkout_dist() -> PathBuf {
         .join("dist")
 }
 
-/// Resolve the site to serve and leave it with the one file Mainsail cannot
-/// know.
+/// Resolve the site to serve, refusing a `--config-json` that cannot be served:
+/// it is the answer to every `/config.json` request, so a bad one would leave a
+/// page that cannot find its printer.
 fn prepare_site(args: &MainsailArgs) -> Result<Site, String> {
-    let site = resolve_site(args, EMBEDDED_MAINSAIL, &checkout_dist())?;
-    match &site {
-        Site::Dir(dir) => write_config_json(dir, &args.bind)?,
-        // The embedded bytes are the binary's own: there is nowhere to write a
-        // file that a browser would see, so say what to add and carry on.
-        Site::Embedded(files) if embedded_file(files, "config.json").is_none() => println!(
-            "mainsail: the embedded site has no config.json, so the page will ask for a \
-             server: put one in {ASSETS_DIR}/ and rebuild to have it open on Moonraker at \
-             {}:{MOONRAKER_PORT}",
-            browse_host(&args.bind)
-        ),
-        Site::Embedded(_) => {}
+    if let Some(path) = &args.config_json {
+        let body = std::fs::read(path)
+            .map_err(|error| format!("cannot read --config-json {}: {error}", path.display()))?;
+        let config = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
+            .map_err(|error| format!("cannot parse --config-json {}: {error}", path.display()))?;
+        if !config
+            .get("instances")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(format!(
+                "--config-json {} has no instances array: Mainsail's config.json needs at \
+                 least one.",
+                path.display()
+            ));
+        }
     }
-    Ok(site)
+    resolve_site(args, EMBEDDED_MAINSAIL, &checkout_dist())
 }
 
 /// The site to serve, chosen from the three sources `--help` lists.
@@ -217,33 +237,6 @@ fn resolve_site(
     ))
 }
 
-/// Write `config.json` into the served site if it is not there yet.
-///
-/// The file is the site's whole idea of where its server is, and Mainsail ships
-/// none: without it the page opens on its "add a printer" screen. Written only
-/// when missing, so an operator who pointed theirs elsewhere keeps it.
-fn write_config_json(dist: &Path, bind: &str) -> Result<(), String> {
-    let path = dist.join("config.json");
-    if path.exists() {
-        return Ok(());
-    }
-    let config = serde_json::json!({
-        "defaultLocale": "zh-CN",
-        "instances": [{"hostname": browse_host(bind), "port": MOONRAKER_PORT}],
-    });
-    let mut text = serde_json::to_string_pretty(&config)
-        .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
-    text.push('\n');
-    std::fs::write(&path, text)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    println!(
-        "mainsail: wrote {} (Moonraker at {}:{MOONRAKER_PORT})",
-        path.display(),
-        browse_host(bind)
-    );
-    Ok(())
-}
-
 /// The address a browser on this machine should use for a service bound to
 /// `bind`: a wildcard address is not one a browser can open, so it becomes the
 /// loopback address of its family.
@@ -255,8 +248,27 @@ fn browse_host(bind: &str) -> &str {
     }
 }
 
+/// Everything a request is answered from: the site, and where `config.json`
+/// sends the browser.
+#[derive(Debug)]
+struct Ctx {
+    site: Site,
+    /// `--config-json`: an operator's file, served instead of an answer.
+    config_override: Option<PathBuf>,
+    bind: String,
+    moonraker_host: Option<String>,
+    moonraker_port: u16,
+}
+
 /// Serve `site` on `bind:port` until Ctrl-C.
-fn serve(args: &MainsailArgs, site: &Site) -> Result<i32, String> {
+fn serve(args: &MainsailArgs, site: Site) -> Result<i32, String> {
+    let context = Arc::new(Ctx {
+        site,
+        config_override: args.config_json.clone(),
+        bind: args.bind.clone(),
+        moonraker_host: args.moonraker_host.clone(),
+        moonraker_port: args.moonraker_port,
+    });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -271,10 +283,10 @@ fn serve(args: &MainsailArgs, site: &Site) -> Result<i32, String> {
         // rather than the zero that was asked for.
         println!(
             "mainsail: serving {} on http://{}:{port}/ (Ctrl-C to stop)",
-            site.describe(),
+            context.site.describe(),
             browse_host(&args.bind)
         );
-        accept_loop(listener, Arc::new(site.clone()), async {
+        accept_loop(listener, context, async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
@@ -302,7 +314,7 @@ async fn bind_listener(bind: &str, port: u16) -> Result<tokio::net::TcpListener,
 /// Accept connections until `stop` resolves, one task per connection.
 async fn accept_loop(
     listener: tokio::net::TcpListener,
-    site: Arc<Site>,
+    context: Arc<Ctx>,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     tokio::pin!(stop);
@@ -310,11 +322,11 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _peer) = accepted.map_err(|error| format!("cannot accept a connection: {error}"))?;
-                let site = Arc::clone(&site);
+                let context = Arc::clone(&context);
                 // One task per connection: a slow page does not hold up the asset
-                // that follows it, and nothing is shared but the site.
+                // that follows it, and nothing is shared but the context.
                 tokio::spawn(async move {
-                    serve_connection(stream, site).await;
+                    serve_connection(stream, context).await;
                 });
             }
             _ = &mut stop => {
@@ -326,7 +338,7 @@ async fn accept_loop(
 }
 
 /// Answer one request on one connection, then close it.
-async fn serve_connection(mut stream: TcpStream, site: Arc<Site>) {
+async fn serve_connection(mut stream: TcpStream, context: Arc<Ctx>) {
     let head = match read_request(&mut stream).await {
         Ok(head) => head,
         Err(reply) => {
@@ -339,10 +351,77 @@ async fn serve_connection(mut stream: TcpStream, site: Arc<Site>) {
         let _ = stream.write_all(&reply.into_bytes(false)).await;
         return;
     };
-    let reply = route(&site, method, target);
+    // `config.json` is not one file of the site: it depends on who asked.
+    let path = target.split(['?', '#']).next().unwrap_or_default();
+    let reply = if path == "/config.json" {
+        config_json_reply(&context, method, &head)
+    } else {
+        route(&context.site, method, target)
+    };
     let head_only = method.eq_ignore_ascii_case("HEAD");
     let _ = stream.write_all(&reply.into_bytes(head_only)).await;
     let _ = stream.shutdown().await;
+}
+
+/// The `config.json` answer for one request: `--config-json` as it is, or the
+/// site's own file read per request with `instances` pointing at this browser.
+fn config_json_reply(context: &Ctx, method: &str, head: &str) -> Reply {
+    if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
+        return Reply::text(405, "this host serves GET and HEAD only\n");
+    }
+    if let Some(path) = &context.config_override {
+        // Never rewritten: the operator's file is the whole answer.
+        return match std::fs::read(path) {
+            Ok(body) => Reply {
+                status: 200,
+                content_type: "application/json",
+                body,
+                no_store: true,
+            },
+            Err(error) => Reply::text(500, &format!("cannot read {}: {error}\n", path.display())),
+        };
+    }
+    // The site's file is the template; one that is missing or is not a JSON
+    // object still answers from the address alone rather than refusing the page.
+    let mut config = serde_json::Map::new();
+    if let Ok(body) = context.site.read("config.json") {
+        if let Ok(serde_json::Value::Object(given)) = serde_json::from_slice(&body) {
+            config = given;
+        }
+    }
+    let hostname = context
+        .moonraker_host
+        .clone()
+        .or_else(|| host_name(head).map(str::to_string))
+        .unwrap_or_else(|| browse_host(&context.bind).to_string());
+    config.insert("instancesDB".to_string(), serde_json::json!("json"));
+    config.insert(
+        "instances".to_string(),
+        serde_json::json!([{"hostname": hostname, "port": context.moonraker_port}]),
+    );
+    let mut text = serde_json::to_string_pretty(&config).expect("a JSON map encodes");
+    text.push('\n');
+    Reply {
+        status: 200,
+        content_type: "application/json",
+        body: text.into_bytes(),
+        no_store: true,
+    }
+}
+
+/// The hostname a request head's `Host` header names, without its port.
+fn host_name(head: &str) -> Option<&str> {
+    let authority = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("host").then(|| value.trim())
+    })?;
+    // `host:port`, unless it is a bare IPv6 literal, which has colons of its own.
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && port.bytes().all(|b| b.is_ascii_digit()) => {
+            Some(host)
+        }
+        _ => Some(authority),
+    }
 }
 
 /// Read up to the empty line that ends the request head.
@@ -384,6 +463,9 @@ struct Reply {
     status: u16,
     content_type: &'static str,
     body: Vec<u8>,
+    /// Set for an answer that must not be reused: `config.json` names a host,
+    /// and the next browser to ask may be on another one.
+    no_store: bool,
 }
 
 impl Reply {
@@ -393,15 +475,21 @@ impl Reply {
             status,
             content_type: "text/plain; charset=utf-8",
             body: message.as_bytes().to_vec(),
+            no_store: false,
         }
     }
 
     /// The response as bytes, header block included; `head_only` omits the body
     /// but keeps its length, which is what a `HEAD` must do.
     fn into_bytes(&self, head_only: bool) -> Vec<u8> {
+        let cache = if self.no_store {
+            "no-store"
+        } else {
+            "no-cache"
+        };
         let head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-             Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+             Cache-Control: {cache}\r\nConnection: close\r\n\r\n",
             self.status,
             reason(self.status),
             self.content_type,
@@ -470,6 +558,7 @@ fn route(site: &Site, method: &str, target: &str) -> Reply {
             status: 200,
             content_type: content_type(Path::new(&relative)),
             body,
+            no_store: false,
         },
         Err(reason) => Reply::text(500, &format!("{reason}\n")),
     }
@@ -608,7 +697,26 @@ mod tests {
             port: DEFAULT_PORT,
             bind: DEFAULT_BIND.to_string(),
             dir: None,
+            config_json: None,
+            moonraker_host: None,
+            moonraker_port: MOONRAKER_PORT,
         }
+    }
+
+    /// The context a `Site` alone is served with, for the HTTP tests.
+    fn context(site: Site) -> Ctx {
+        Ctx {
+            site,
+            config_override: None,
+            bind: DEFAULT_BIND.to_string(),
+            moonraker_host: None,
+            moonraker_port: MOONRAKER_PORT,
+        }
+    }
+
+    /// A request head asking for `config.json` from `host`.
+    fn head_from(host: &str) -> String {
+        format!("GET /config.json HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
     }
 
     /// Parse arguments the way the subcommand does, for the default/`--help`
@@ -682,9 +790,10 @@ mod tests {
             b"<html>given</html>"
         );
 
-        // The one file the site cannot ship is written into the served directory.
+        // Nothing is written into the served directory: `config.json` is
+        // answered per request, so a site is served as it was found.
         prepare_site(&args).expect("the site is served");
-        assert!(built.join("config.json").is_file());
+        assert!(!built.join("config.json").exists());
 
         // A directory with nothing built in it is a mistake, not a build request.
         args.dir = Some(directory.join("absent"));
@@ -895,24 +1004,110 @@ mod tests {
     }
 
     #[test]
-    fn the_site_config_points_at_this_machines_moonraker() {
-        let directory = scratch("configjson");
-        let dist = directory.join("dist");
-        std::fs::create_dir_all(&dist).expect("dist");
+    fn the_config_json_answers_the_host_that_asked() {
+        let directory = scratch("answer");
+        let dist = built_site(&directory);
+        let base = dist.join("config.json");
+        std::fs::write(&base, r#"{"defaultTheme": "dark", "instances": []}"#)
+            .expect("the base config.json");
+        let answer = |context: &Ctx, host: &str| {
+            let reply = config_json_reply(context, "GET", &head_from(host));
+            assert_eq!(reply.status, 200, "{host}");
+            assert_eq!(reply.content_type, "application/json");
+            let head = String::from_utf8_lossy(&reply.into_bytes(true)).into_owned();
+            assert!(head.contains("Cache-Control: no-store"), "{host}: {head}");
+            serde_json::from_slice::<serde_json::Value>(&reply.body).expect("JSON")
+        };
 
-        write_config_json(&dist, "0.0.0.0").expect("config.json");
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dist.join("config.json")).expect("config.json"))
-                .expect("JSON");
-        assert_eq!(written["defaultLocale"], "zh-CN");
-        assert_eq!(written["instances"][0]["hostname"], "127.0.0.1");
-        assert_eq!(written["instances"][0]["port"], MOONRAKER_PORT);
+        // One site, two browsers, two answers: `instances` is the address each
+        // one reached this server on, and the base's other keys survive.
+        let context = context(Site::Dir(dist.clone()));
+        for (host, expected) in [
+            ("10.0.48.2:8080", "10.0.48.2"),
+            ("printer.local", "printer.local"),
+        ] {
+            let config = answer(&context, host);
+            assert_eq!(config["instances"][0]["hostname"], expected);
+            assert_eq!(config["instances"][0]["port"], MOONRAKER_PORT);
+            assert_eq!(config["instancesDB"], "json");
+            assert_eq!(config["defaultTheme"], "dark", "the base is kept");
+        }
 
-        // An operator's own file is never overwritten.
-        std::fs::write(dist.join("config.json"), "{\"mine\":true}").expect("own file");
-        write_config_json(&dist, "0.0.0.0").expect("config.json");
-        let kept = std::fs::read_to_string(dist.join("config.json")).expect("config.json");
-        assert_eq!(kept, "{\"mine\":true}");
+        // The base is read per request, not kept from the start.
+        std::fs::write(&base, r#"{"defaultTheme": "light"}"#).expect("the edited base");
+        assert_eq!(answer(&context, "printer.local")["defaultTheme"], "light");
+
+        // `--moonraker-host` and `--moonraker-port` win over the asking host.
+        let flagged = Ctx {
+            moonraker_host: Some("moonraker.lan".to_string()),
+            moonraker_port: 6000,
+            ..context
+        };
+        let pointed = config_json_reply(&flagged, "GET", &head_from("10.0.48.2:8080"));
+        let pointed: serde_json::Value = serde_json::from_slice(&pointed.body).expect("JSON");
+        assert_eq!(pointed["instances"][0]["hostname"], "moonraker.lan");
+        assert_eq!(pointed["instances"][0]["port"], 6000);
+
+        std::fs::remove_dir_all(&directory).expect("cleanup");
+    }
+
+    #[test]
+    fn a_given_config_json_is_served_as_it_is() {
+        let directory = scratch("override");
+        let own = directory.join("mine.json");
+        let text = r#"{"instancesDB": "browser", "instances": [{"hostname": "beside.example", "port": 9000}]}"#;
+        std::fs::write(&own, text).expect("the operator's file");
+
+        // Checked once at startup: readable, a JSON object, an `instances` array.
+        let mut args = args();
+        args.dir = Some(built_site(&directory));
+        args.config_json = Some(own.clone());
+        prepare_site(&args).expect("a serveable --config-json");
+        for (bad, expected) in [
+            (None, "cannot read"),
+            (Some(r#"{"instancesDB": "json"}"#), "instances array"),
+            (Some("[1]"), "cannot parse"),
+        ] {
+            match bad {
+                Some(body) => std::fs::write(&own, body).expect("a bad file"),
+                None => std::fs::remove_file(&own).expect("no file"),
+            }
+            let error = prepare_site(&args).expect_err("a bad --config-json stops the run");
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("--config-json"), "{error}");
+        }
+        std::fs::write(&own, text).expect("the operator's file");
+
+        let context = Ctx {
+            config_override: Some(own.clone()),
+            ..context(Site::Dir(args.dir.clone().expect("--dir")))
+        };
+        let reply = config_json_reply(&context, "GET", &head_from("10.0.48.2:8080"));
+        assert_eq!(reply.status, 200);
+        assert!(reply.no_store, "config.json names a host");
+        assert_eq!(
+            String::from_utf8(reply.body).expect("text"),
+            text,
+            "the operator's file, `instances` included"
+        );
+        // Nothing wrote to the file itself.
+        assert_eq!(std::fs::read_to_string(&own).expect("the file"), text);
+        assert_eq!(
+            config_json_reply(&context, "POST", &head_from("h:1")).status,
+            405
+        );
+
+        // The flags, from the argument parser itself.
+        assert_eq!(parse(&[]).expect("defaults").moonraker_port, MOONRAKER_PORT);
+        let given = parse(&[
+            "--moonraker-host",
+            "moonraker.lan",
+            "--moonraker-port",
+            "6000",
+        ])
+        .expect("parsed");
+        assert_eq!(given.moonraker_host.as_deref(), Some("moonraker.lan"));
+        assert_eq!(given.moonraker_port, 6000);
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -967,7 +1162,7 @@ mod tests {
                 let address = listener.local_addr().expect("the bound address");
                 let server = tokio::spawn(accept_loop(
                     listener,
-                    Arc::new(site),
+                    Arc::new(context(site)),
                     std::future::pending::<()>(),
                 ));
 
@@ -1011,7 +1206,7 @@ mod tests {
                 let address = listener.local_addr().expect("the bound address");
                 let server = tokio::spawn(accept_loop(
                     listener,
-                    Arc::new(Site::Embedded(EMBEDDED_FOR_TEST)),
+                    Arc::new(context(Site::Embedded(EMBEDDED_FOR_TEST))),
                     std::future::pending::<()>(),
                 ));
 

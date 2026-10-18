@@ -9,10 +9,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use tracing::error;
+
 use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::{Trapq, NEVER_TIME};
 use crate::core::klippy::mathutil::Xyz;
+use crate::core::klippy::reactor::panic_message;
 
 /// One callback fired when its stepper first has real motion queued.
 ///
@@ -245,7 +248,7 @@ impl MotionQueuing {
         // motion's print time, before this pass generates its steps.
         let waiting = active_callbacks.waiting();
         if !waiting.is_empty() {
-            let mut fired: Vec<(Vec<ActiveCallback>, f64)> = Vec::new();
+            let mut fired: Vec<(String, Vec<ActiveCallback>, f64)> = Vec::new();
             for name in waiting {
                 let Some(stepper) = steppers.iter().find(|stepper| stepper.name() == name) else {
                     continue;
@@ -258,22 +261,26 @@ impl MotionQueuing {
                     .kinematics()
                     .check_active(&trapqs[trapq_id], flush_time)
                 {
-                    fired.push((active_callbacks.take(&name), print_time));
+                    fired.push((name.clone(), active_callbacks.take(&name), print_time));
                 }
             }
             // Outside the queue borrows: a callback drives an enable pin and may
             // defer work, but must not need the queue.
-            for (callbacks, print_time) in fired {
+            for (stepper, callbacks, print_time) in fired {
                 for callback in callbacks {
-                    callback(print_time);
+                    run_callback(
+                        &format!("active callback on {stepper}"),
+                        &*callback,
+                        print_time,
+                    );
                 }
             }
         }
         // Flush callbacks run before generating, and they run even when
         // there is no stepper to generate for: a macro-driven dwell timeline
         // queues no steps, but its flush time still advances.
-        for callback in flush_callbacks.iter() {
-            callback(flush_time);
+        for (index, callback) in flush_callbacks.iter().enumerate() {
+            run_callback(&format!("flush callback #{index}"), &**callback, flush_time);
         }
         let mut out = Vec::new();
         for stepper in steppers.iter_mut() {
@@ -322,6 +329,28 @@ impl MotionQueuing {
             return stepper.generate(&trapqs[trapq_id], flush_time);
         }
         Ok(Vec::new())
+    }
+}
+
+/// Run one callback the flush pass registered, catching a panic in it.
+///
+/// The pass is driven from the toolhead's flush timer, so it runs on the
+/// reactor's single dispatcher: a panic left to escape would end that round's
+/// dispatch and, before [`crate::core::klippy::reactor`] isolated timer
+/// callbacks, the dispatcher itself. The panic is logged with where the callback
+/// came from (`source`), and the rest of the pass still runs — the flush time
+/// has advanced either way, so dropping the remaining callbacks would leave the
+/// queue behind the MCU's clock.
+fn run_callback(source: &str, callback: &(dyn Fn(f64) + Send), eventtime: f64) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        callback(eventtime);
+    }));
+    if let Err(payload) = result {
+        error!(
+            callback = source,
+            "callback panicked: {}",
+            panic_message(&*payload)
+        );
     }
 }
 

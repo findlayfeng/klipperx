@@ -18,12 +18,12 @@
 //!
 //! # Gaps
 //!
-//! Not every Traminic driver exists here yet (`tmc2130` landed in 批 #34;
-//! `tmc5160`/`tmc2660`/`tmc2240` pending), so for those `PhaseCalc.lookup_tmc`
-//! finds no `<driver> <stepper>` object and
-//! the MCU phase offset stays zero (`PhaseCalc.calc_phase`); `phases` comes from
-//! the section's own `microsteps` instead. This does not stop the bare section
-//! working, and upstream runs without a Traminic driver the same way.
+//! `PhaseCalc.lookup_tmc` resolves a `<driver> <stepper>` object and asks it
+//! for `get_phase_offset()`, but nothing in this host *sets* that offset: it
+//! comes from upstream's position-sync handler on the driver's `enable`, and
+//! `TmcDriver` runs none, so it reports `None` and `PhaseCalc.calc_phase` keeps
+//! the phase it last recorded. `phases` still comes from the section's own
+//! `microsteps`; a stepper with no prefix section takes both from the driver.
 //!
 //! Upstream widens `endstop_phase_accuracy` to `phases` under `debugoutput`
 //! (its test mode); this host has no such start argument, so the computed
@@ -39,6 +39,7 @@ use crate::core::klippy::config::object::CONFIGFILE_OBJECT;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::stepper::PrinterStepper;
+use crate::core::klippy::extras::tmc::TmcDriver;
 use crate::core::klippy::gcode::{
     CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -64,6 +65,25 @@ const TRINAMIC_DRIVERS: [&str; 6] = [
     "tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660", "tmc5160",
 ];
 
+/// What a [`PhaseCalc`] asks a Traminic driver: where in the microstep cycle
+/// its stepper sits, and how many phases that cycle divides into
+/// (`TmcDriver::get_phase_offset`, upstream's `get_phase_offset`).
+///
+/// A trait rather than a [`TmcDriver`] handle so the phase math can be pinned
+/// without assembling a driver — one needs a live transport, and in this host
+/// it never reports an offset anyway.
+trait PhaseOffsetSource: Send + Sync {
+    /// `(mcu_phase_offset, phases)`; the offset is `None` until the driver has
+    /// measured it.
+    fn get_phase_offset(&self) -> (Option<i64>, i64);
+}
+
+impl PhaseOffsetSource for TmcDriver {
+    fn get_phase_offset(&self) -> (Option<i64>, i64) {
+        TmcDriver::get_phase_offset(self)
+    }
+}
+
 /// One stepper's trigger-phase tracking (upstream `PhaseCalc`).
 struct PhaseCalc {
     /// The stepper's name.
@@ -84,6 +104,8 @@ struct PhaseCalc {
     /// Whether the tracker only counts phases and never adjusts an axis
     /// (`stats_only`) — a stepper with no `[endstop_phase <stepper>]` section.
     stats_only: bool,
+    /// The stepper's Traminic driver (`tmc_module`), once one is registered.
+    tmc: Option<Arc<dyn PhaseOffsetSource>>,
 }
 
 impl PhaseCalc {
@@ -97,35 +119,57 @@ impl PhaseCalc {
             last_mcu_position: None,
             is_primary: false,
             stats_only: false,
+            tmc: None,
         }
     }
 
-    /// Resolve the stepper's Traminic driver (`PhaseCalc.lookup_tmc`).
+    /// Resolve the stepper's Traminic driver (`PhaseCalc.lookup_tmc`), keeping
+    /// the first one registered under its upstream name.
     ///
-    /// None of [`TRINAMIC_DRIVERS`] is implemented here, so this only records
-    /// that `phases` has to come from config; the search stays so a driver that
-    /// lands later only has to register under its upstream name.
-    fn lookup_tmc(&self, printer: &Printer) {
+    /// A tracker built without phases — a stepper with no prefix section —
+    /// takes them from the driver (`phases` from `get_phase_offset`), which is
+    /// also what gives it a phase history to count into.
+    fn lookup_tmc(&mut self, printer: &Printer) {
         for driver in TRINAMIC_DRIVERS {
             let driver_name = format!("{driver} {}", self.name);
-            if printer.lookup_object(&driver_name).is_some() {
-                // A driver here would answer `get_phase_offset()`; until one
-                // exists the phase offset stays zero.
-                break;
+            let Some(tmc) = printer.lookup_object_as::<TmcDriver>(&driver_name) else {
+                continue;
+            };
+            if self.phases.is_none() {
+                let (_, driver_phases) = tmc.get_phase_offset();
+                self.phases = usize::try_from(driver_phases).ok();
             }
+            self.tmc = Some(tmc);
+            break;
+        }
+        // Upstream builds the history here, once the phase count is settled.
+        if self.phase_history.is_none() {
+            self.phase_history = self.phases.map(|phases| vec![0; phases]);
         }
     }
 
     /// Record the phase a trigger position falls on
     /// (`PhaseCalc.calc_phase`).
     ///
-    /// The MCU phase offset is zero — no Traminic driver in this host supplies
-    /// one — so the phase is the trigger position modulo `phases`.
+    /// The driver's phase offset shifts the trigger position first, because the
+    /// rotor's phase there also depends on where the driver put the microstep
+    /// cycle. Without a driver the offset is zero; a driver that has not
+    /// measured its offset yet leaves the phase unknown, so the last recorded
+    /// one stands — `0` for a tracker that never recorded one (upstream
+    /// `return self.last_phase`).
     fn calc_phase(&mut self, trig_mcu_pos: f64) -> usize {
         let phases = self
             .phases
             .expect("calc_phase is only called with phases known");
-        let phase = (trig_mcu_pos % phases as f64) as usize;
+        let phase = match &self.tmc {
+            Some(tmc) => match tmc.get_phase_offset() {
+                (Some(offset), driver_phases) => {
+                    self.convert_phase(trig_mcu_pos + offset as f64, driver_phases as f64)
+                }
+                (None, _) => return self.last_phase.unwrap_or(0),
+            },
+            None => (trig_mcu_pos % phases as f64) as usize,
+        };
         if let Some(history) = self.phase_history.as_mut() {
             history[phase] += 1;
         }
@@ -137,11 +181,17 @@ impl PhaseCalc {
     /// Convert a driver's phase count to this tracker's
     /// (`PhaseCalc.convert_phase`): `round(driver_phase / driver_phases ×
     /// phases)`, taken modulo `phases`.
+    ///
+    /// Upstream's `int(x + .5)` rounds a non-negative argument the same way
+    /// `round` does; the phase offset makes a negative one reachable, and there
+    /// the sum must not bias toward zero, nor may the result go negative
+    /// (upstream's `%` stays non-negative).
     fn convert_phase(&self, driver_phase: f64, driver_phases: f64) -> usize {
         let phases = self
             .phases
             .expect("convert_phase is only called with phases known");
-        ((driver_phase / driver_phases * phases as f64 + 0.5) as usize) % phases
+        let scaled = (driver_phase / driver_phases * phases as f64).round() as i64;
+        scaled.rem_euclid(phases as i64) as usize
     }
 }
 
@@ -698,6 +748,22 @@ pub fn load_config_prefix(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = Arc::new(EndstopPhase::new(config, printer)?);
+    // The driver is looked up once every section is registered, at connect
+    // (`endstop_phase.py:63-65`): `[tmc2209 stepper_x]` may load after this
+    // section.
+    printer.register_event_handler(
+        KlippyEvent::KlippyConnect,
+        Box::new({
+            let phase_calc = Arc::clone(&object.phase_calc);
+            let printer = Arc::clone(printer);
+            move |_| {
+                phase_calc
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .lookup_tmc(&printer);
+            }
+        }),
+    );
     // The prefix node registers its handler before the bare section is created,
     // so it runs first and the bare section sees the phase it recorded
     // (`endstop_phase.py:63-67`).
@@ -773,6 +839,7 @@ mod tests {
             last_mcu_position: None,
             is_primary,
             stats_only: true,
+            tmc: None,
         }))
     }
 
@@ -999,6 +1066,120 @@ mod tests {
         );
     }
 
+    /// A stand-in Traminic driver, so the phase math can be pinned without
+    /// assembling one (a real `TmcDriver` needs a live transport).
+    struct FakeDriver {
+        offset: Option<i64>,
+        phases: i64,
+    }
+
+    impl PhaseOffsetSource for FakeDriver {
+        fn get_phase_offset(&self) -> (Option<i64>, i64) {
+            (self.offset, self.phases)
+        }
+    }
+
+    /// A `phase_calc` with `counts` as its history and `driver` behind it.
+    fn calc_with_driver(counts: &[u64], driver: FakeDriver) -> PhaseCalc {
+        let mut phase_calc = PhaseCalc::new("stepper_x", Some(counts.len()));
+        phase_calc.stats_only = true;
+        phase_calc.phase_history = Some(counts.to_vec());
+        phase_calc.tmc = Some(Arc::new(driver));
+        phase_calc
+    }
+
+    /// Without a driver the phase is the trigger position modulo `phases`
+    /// (`PhaseCalc.calc_phase` with no `tmc_module`), and the sample is
+    /// counted.
+    #[test]
+    fn test_calc_phase_without_a_driver_is_the_position_modulo_phases() {
+        let mut phase_calc = PhaseCalc::new("stepper_x", Some(8));
+
+        assert_eq!(phase_calc.calc_phase(10.0), 2);
+        assert_eq!(phase_calc.calc_phase(13.0), 5);
+        assert_eq!(phase_calc.phase_history.as_ref().unwrap()[2], 1);
+        assert_eq!(phase_calc.phase_history.as_ref().unwrap()[5], 1);
+    }
+
+    /// A driver offset shifts the trigger position before the modulo, wrapping
+    /// into range when the sum is negative (`PhaseCalc.calc_phase`).
+    #[test]
+    fn test_calc_phase_shifts_by_the_driver_offset() {
+        // (10 + 3) % 8 = 5.
+        let mut ahead = calc_with_driver(
+            &[0; 8],
+            FakeDriver {
+                offset: Some(3),
+                phases: 8,
+            },
+        );
+        assert_eq!(ahead.calc_phase(10.0), 5);
+        assert_eq!(ahead.phase_history.as_ref().unwrap()[5], 1);
+
+        // (1 - 4) mod 8 = 5, not the 6 a rounding-toward-zero would give.
+        let mut behind = calc_with_driver(
+            &[0; 8],
+            FakeDriver {
+                offset: Some(-4),
+                phases: 8,
+            },
+        );
+        assert_eq!(behind.calc_phase(1.0), 5);
+    }
+
+    /// A driver that has not measured its offset yet leaves the phase unknown:
+    /// the last one stands and nothing is counted (`endstop_phase.py`
+    /// `return self.last_phase`).
+    #[test]
+    fn test_calc_phase_keeps_the_last_phase_when_the_offset_is_unknown() {
+        let mut phase_calc = calc_with_driver(
+            &[0; 8],
+            FakeDriver {
+                offset: None,
+                phases: 8,
+            },
+        );
+        phase_calc.last_phase = Some(6);
+        phase_calc.last_mcu_position = Some(2.0);
+
+        assert_eq!(phase_calc.calc_phase(10.0), 6);
+        assert_eq!(phase_calc.phase_history.as_ref().unwrap(), &vec![0; 8]);
+        assert_eq!(phase_calc.last_mcu_position, Some(2.0));
+    }
+
+    /// A driver with a finer phase count is scaled onto this tracker's
+    /// (`PhaseCalc.convert_phase`): 12 of the driver's 16 phases is 6 of 8.
+    #[test]
+    fn test_calc_phase_scales_a_finer_driver_phase_count() {
+        let mut phase_calc = calc_with_driver(
+            &[0; 8],
+            FakeDriver {
+                offset: Some(2),
+                phases: 16,
+            },
+        );
+
+        // (10 + 2) of 16 → 6 of 8.
+        assert_eq!(phase_calc.calc_phase(10.0), 6);
+        assert_eq!(phase_calc.phase_history.as_ref().unwrap()[6], 1);
+    }
+
+    /// With no `<driver> <stepper>` object registered `lookup_tmc` finds
+    /// nothing and keeps the section's phases and the history it counts into
+    /// (`PhaseCalc.lookup_tmc`).
+    #[test]
+    fn test_lookup_tmc_leaves_a_driverless_tracker_alone() {
+        let (printer, _gcode, _lines) = machine();
+        let mut phase_calc = PhaseCalc::new("stepper_x", Some(8));
+        phase_calc.phase_history.as_mut().unwrap()[1] = 3;
+
+        phase_calc.lookup_tmc(&printer);
+
+        assert!(phase_calc.tmc.is_none());
+        assert_eq!(phase_calc.phases, Some(8));
+        assert_eq!(phase_calc.phase_history.as_ref().unwrap()[1], 3);
+    }
+
     // =======================================================================
     // `[endstop_phase <stepper>]`
     // =======================================================================
@@ -1115,6 +1296,23 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// The prefix section resolves its driver at connect, so a `[tmc2209
+    /// stepper_x]` that loads after it is still found (`endstop_phase.py:63-65`).
+    #[test]
+    fn test_the_prefix_section_looks_up_its_driver_at_connect() {
+        let (printer, result) = load(&config_with_x(""));
+        result.unwrap();
+
+        printer.send_event(&KlippyEvent::KlippyConnect);
+
+        let phase_calc = Arc::clone(&prefix_object(&printer).phase_calc);
+        let phase_calc = phase_calc
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        assert!(phase_calc.tmc.is_none(), "this config has no driver");
+        assert_eq!(phase_calc.phases, Some(32));
     }
 
     /// A directly built section with `phases` and a `step_dist` for the

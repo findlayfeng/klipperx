@@ -1490,9 +1490,21 @@ fn uuid_hex(uuid: [u8; 6]) -> String {
     uuid.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// `admin reset`: open the bridge, identify it, and reset what the plan names —
-/// the bridge itself, or a declared port's device — or, when the plan names a
-/// **CAN bus** instead, send that board its bootloader request.
+/// `admin reset`: open the bridge and send what the plan names — the bridge
+/// itself, or a declared port's device — or, when the plan names a **CAN bus**
+/// instead, send that board its bootloader request.
+///
+/// The bridge's klipper session is **not identified first, and that is the
+/// point**: every reset here is one mux admin unit on the link's shared handle
+/// ([`BridgeLink::reset`] sends `[RESTART_DEVICE][0xFF]`,
+/// [`reset_to_bootloader`](BridgeLink::reset_to_bootloader)
+/// `[REQUEST_BOOTLOADER][0xFF]`, and [`reset_port`](BridgeLink::reset_port) the
+/// port-level family), written straight to the admin channel. The dictionary
+/// identify delivers only names the **declaration** commands, so no reset needs
+/// it — while a bridge left in a previous session's state, which is exactly what
+/// a reset is for, may answer nothing to identify at all. The identify still
+/// runs where it belongs: after the bridge restarts itself, inside
+/// [`BridgeLink::reset`], as the confirmation that it came back.
 ///
 /// The bridge's result line is the confirmation: its self-reset confirms itself
 /// by answering again ([`BridgeLink::reset`]'s bounded reopen + identify), while
@@ -1521,9 +1533,6 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     runtime.block_on(async {
         let mut link = open_link(&source, baud)?;
-        tokio::time::timeout(IDENTIFY_TIMEOUT, link.identify(IDENTIFY_TIMEOUT))
-            .await
-            .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
         match target {
             ResetTarget::Bridge => {
                 link.reset().await?;

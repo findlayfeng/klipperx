@@ -21,6 +21,7 @@
 //! | undefined behavior | `UndefinedBehavior::Strict` | a missing status key must not render a blank `PARK_` line — the rule the hand-written subset had |
 //! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
 //! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
+//! | output formatter | Python's `str` ([`format_output`]) | a tag renders `str(value)`, so a container prints its elements' `repr` (`{'call': 'PAUSE'}`, `['a', 1]`); the engine's own formatter prints them with Rust's `Debug` (`{call: PAUSE}`) |
 //! | filters | the engine's, with `int`, `float`, `min`, `max` replaced | the corpus spells its coercions `params.S\|default(1000.0)\|float` and folds lists with `\|min`/`\|max` |
 //! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which `gcode_macro` bodies call — the corpus spells `range`, this module's stepper-macro test binds `namespace` |
 //!
@@ -86,6 +87,8 @@
 //! | a missing status object (`printer.nope`) | `Undefined` | same: undefined, which Strict then fails on if it is used |
 //! | trailing newline | one newline dropped | kept (`set_keep_trailing_newline(true)`), because `idle_timeout`'s default script and the corpus' bodies are written to keep theirs |
 //! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
+//! | a container joined with `~` | `str()` of it, elements `repr`-quoted: `'x' ~ {'call': 'PAUSE'}` is `x{'call': 'PAUSE'}` | the engine's `Display`, elements unquoted: `'x' ~ {'call': 'PAUSE'}` is `x{call: PAUSE}` — `~` joins through `Display` before the formatter sees a string, so only a whole tag (`{ … }`) gets Python's spelling |
+//! | printing a *silent* undefined (`{x if c}`, which has no `else`) | blank | an `undefined value` error: the engine's own formatter lets *that* one print nothing (it tells the two kinds of undefined apart), a custom formatter does not — `ValueKind::Undefined` is one kind — so the strict check [`format_output`] repeats covers both; a *default* undefined (`{nope}`) is the error it always was |
 //!
 //! Detail wording differs wherever the engine owns the wording. The frames
 //! (`Error loading template '<name>'\nline <n>: …`, `Error evaluating
@@ -114,7 +117,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value as MjValue, ValueKind};
-use minijinja::{AutoEscape, Environment, Error as MjError, ErrorKind, UndefinedBehavior::Strict};
+use minijinja::{
+    escape_formatter, AutoEscape, Environment, Error as MjError, ErrorKind, Output, State,
+    UndefinedBehavior::Strict,
+};
 use serde_json::Value;
 
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
@@ -494,7 +500,90 @@ fn environment() -> Environment<'static> {
     env.add_filter("max", filter_max);
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
+    env.set_formatter(format_output);
     env
+}
+
+// ===========================================================================
+// Output
+// ===========================================================================
+
+/// What a `{ … }` tag writes: Python's `str`, which is what a Jinja2 tag
+/// renders (`gcode_macro.py:83`).
+///
+/// The engine prints a container by walking it with Rust's `Debug`
+/// (`Object::render`), which leaves the elements unquoted — `{call: PAUSE}`.
+/// Jinja2 prints a container with its elements' `repr`, so upstream's
+/// `{params}` reads `{'call': 'PAUSE'}`, and a macro body that writes a
+/// container into a g-code value (`mainsail.cfg:182`'s
+/// `SET_GCODE_VARIABLE … VALUE="{…}"`) writes that text. Everything that is
+/// not a container is already Python's spelling in the engine's own `Display`
+/// (`True`, `None`, `3.0`), so it keeps the default formatter.
+///
+/// A custom formatter is also what the engine drops its strict-undefined check
+/// for on printing (`Instruction::Emit` only applies it when
+/// `is_default_formatter`), so the check moves here: printing an undefined
+/// stays the `undefined value` error a body has always got.
+fn format_output(
+    out: &mut Output<'_>,
+    state: &State<'_, '_>,
+    value: &MjValue,
+) -> Result<(), MjError> {
+    if value.is_undefined() {
+        return Err(MjError::from(ErrorKind::UndefinedError));
+    }
+    match value.kind() {
+        ValueKind::Map | ValueKind::Seq => {
+            out.write_str(&python_repr(value)).map_err(MjError::from)
+        }
+        _ => escape_formatter(out, state, value),
+    }
+}
+
+/// One value the way Python's `repr` spells it — what a container's elements
+/// are printed with. A number, a boolean or `None` keeps the engine's spelling
+/// (already Python's, `Display`'s `3.0` / `True` / `None`); a container recurses
+/// so nesting reads like Python's too.
+fn python_repr(value: &MjValue) -> String {
+    match value.kind() {
+        ValueKind::String => python_repr_string(value.as_str().unwrap_or_default()),
+        ValueKind::Seq => match value.try_iter() {
+            Ok(items) => format!(
+                "[{}]",
+                items
+                    .map(|item| python_repr(&item))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(_) => value.to_string(),
+        },
+        ValueKind::Map => match value.as_object().and_then(|object| object.try_iter_pairs()) {
+            Some(entries) => format!(
+                "{{{}}}",
+                entries
+                    .map(|(key, item)| format!("{}: {}", python_repr(&key), python_repr(&item)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => value.to_string(),
+        },
+        _ => value.to_string(),
+    }
+}
+
+/// A string as Python's `repr` quotes it inside a container: single quotes,
+/// with a backslash and the quote itself escaped.
+fn python_repr_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 // ===========================================================================
@@ -743,6 +832,112 @@ mod tests {
         assert_eq!(ok("{-3.5}"), "3.5");
         assert_eq!(ok("{ -3.5}"), "-3.5");
         assert_eq!(ok("{ 0 - 3.5 }"), "-3.5");
+    }
+
+    /// A container prints the way Python's `str` prints it: its elements' own
+    /// `repr` — strings quoted, `True`/`None`, floats with `.0`, nesting
+    /// recursed — so `mainsail.cfg:184`'s
+    /// `VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"` writes a text a Python
+    /// reader can evaluate back instead of the engine's `Debug` output.
+    #[test]
+    fn containers_render_python_repr() {
+        let dict = |value: Value| {
+            let mut context = context(&[], "");
+            context.insert("v", Rt::Json(value));
+            context
+        };
+
+        // Keys come out in the engine's map order (its map is ordered), which
+        // is alphabetical, not Jinja2's literal order.
+        assert_eq!(
+            render(
+                "{v}",
+                &mut dict(json!({"layer": 1, "call": "PAUSE", "enable": true}))
+            )
+            .expect("renders"),
+            "{'call': 'PAUSE', 'enable': True, 'layer': 1}"
+        );
+        assert_eq!(
+            render(
+                "{v}",
+                &mut dict(json!({"outer": {"inner": [1, 2.0, Value::Null]}}))
+            )
+            .expect("renders"),
+            "{'outer': {'inner': [1, 2.0, None]}}"
+        );
+        assert_eq!(
+            render("{v}", &mut dict(json!(["a", 1, 2.0]))).expect("renders"),
+            "['a', 1, 2.0]"
+        );
+        assert_eq!(render("{v}", &mut dict(json!({}))).expect("renders"), "{}");
+        assert_eq!(render("{v}", &mut dict(json!([]))).expect("renders"), "[]");
+        // A backslash and the quote itself are escaped, as `repr` escapes them.
+        assert_eq!(
+            render("{v}", &mut dict(json!({"it's": "a \\ b"}))).expect("renders"),
+            r"{'it\'s': 'a \\ b'}"
+        );
+        // The scalar spellings inside a container are the same Python ones the
+        // engine already prints: `True`, `None`, `2.0`.
+        assert_eq!(
+            render("{v}", &mut dict(json!([true, false, null, 2.0]))).expect("renders"),
+            "[True, False, None, 2.0]"
+        );
+        // A dict *literal* in a body, which is how the corpus spells it.
+        assert_eq!(
+            ok("{ {'enable': True, 'call': 'PAUSE'} }"),
+            "{'call': 'PAUSE', 'enable': True}"
+        );
+        // A **whole tag** is `str`: a top-level string stays unquoted, and so
+        // does a container's key read out of it.
+        assert_eq!(
+            render("{v}", &mut dict(json!("PAUSE"))).expect("renders"),
+            "PAUSE"
+        );
+        assert_eq!(
+            render("{v.call}", &mut dict(json!({"call": "PAUSE"}))).expect("renders"),
+            "PAUSE"
+        );
+    }
+
+    /// The two kinds of `Undefined` the engine distinguishes are one kind to a
+    /// formatter, so the strict check covers both: printing a *silent* one
+    /// (`{1 if False}`, blank in Jinja2) fails the render instead of printing
+    /// nothing — the trade the deviations table records. An undefined that
+    /// `is defined` probes or `\|default` swallows never reaches the formatter,
+    /// so those stay quiet.
+    #[test]
+    fn a_printed_undefined_is_a_render_error() {
+        let error = render("{1 if False}", &mut context(&[], "")).expect_err("silent undefined");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+        assert_eq!(ok("{nope|default('none')}"), "none");
+    }
+
+    /// `mainsail.cfg:176-182`'s `SET_PAUSE_NEXT_LAYER`, body for body: the
+    /// value it hands `SET_GCODE_VARIABLE` is a dict, and upstream writes it
+    /// with a tag (`VALUE="{{ … }}"`) — so its text must be Python's spelling
+    /// (`klippy`'s `ast.literal_eval` reads it back).
+    #[test]
+    fn pause_next_layer_writes_its_value_as_python_repr() {
+        let printer = printer_with(
+            "gcode_macro SET_PRINT_STATS_INFO",
+            json!({"pause_next_layer": {"enable": false, "call": "PAUSE"}}),
+        );
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("params", Rt::Json(json!({"ENABLE": "1"})));
+        let body = "{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO']\
+                    .pause_next_layer %}\n\
+                    {% set ENABLE = params.ENABLE|default(1)|int != 0 %}\n\
+                    {% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}\n\
+                    SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer \
+                    VALUE=\"{{ 'enable': ENABLE, 'call': MACRO }}\"\n";
+        assert_eq!(
+            render(body, &mut context).expect("the macro loads"),
+            // The three `{% set %}` lines leave their newlines; the value itself
+            // is Python's spelling of the dict.
+            "\n\n\nSET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer \
+             VALUE=\"{'call': 'PAUSE', 'enable': True}\"\n"
+        );
     }
 
     /// `if` / `elif` / `else` and `for` over `range(… | int)`, the shapes

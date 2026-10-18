@@ -702,10 +702,10 @@
 | `speed` | float | 当前速度（mm/min） |
 | `speed_factor` | float | 速度系数（默认 1.0） |
 | `extrude_factor` | float | 挤出系数（默认 1.0） |
-| `position` | Coord | 上次设置的位置 `[x, y, z, e]` |
-| `gcode_position` | Coord | 含着所有偏移后的当前 G-Code 坐标 |
-| `homing_origin` | Coord | 归位原点偏移（`SET_GCODE_OFFSET` 的结果） |
-| `axis_map` | array | 轴映射，元素为 `[轴字母, 轴索引]` |
+| `position` | array | 上次设置的位置（初始 `[x, y, z, e]`；注册了额外轴时后面追加其数值） |
+| `gcode_position` | array | 含着所有偏移后的当前 G-Code 坐标（长度同上） |
+| `homing_origin` | array | 归位原点偏移（`SET_GCODE_OFFSET` 的结果，恒 4 元） |
+| `axis_map` | object | 轴映射：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`；`toolhead:update_extra_axes` 到达后追加如 `"A":4`（**不是**数组） |
 
 ### `configfile`
 

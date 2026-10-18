@@ -195,7 +195,9 @@
   `SET_PORT_NODEID`/`RESET_PORT`。判定：同 M1-1/M1-2 的 identify + `get_clock`，且**单元不被截断**。
   **缺件（2026-10-17 复核，已缩小）**：固件的 CAN **下游端口**后端（`BRIDGE_PORT_CAN`）与它的
   单帧 admin 代理**已经落地并真机验过**（见下方「经桥刷 CAN 下游」，F446 桥 + F103 下游，含可反复刷）；
-  仍未接线的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 **CAN 上游 attach**
+  仍未接线的只剩 **CAN 上游 attach**（桥自己经 CAN 被宿主连）；`printer.cfg` 的 `[can_device]` 端口节
+  已接线并真机跑通（主机在配置期发 `config_can` + `config_bridge_port`，见
+  [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的 CAN 一节）。
   （桥自己经 CAN 被宿主连）。
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
@@ -233,8 +235,9 @@
 **上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
 B) `REQUEST_BOOTLOADER (0x02)` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）
 ——不带就是设计内 no-op，它属**刷写工具**；「重启固件」用 `RESTART_DEVICE (0x05)`（`restart_method: admin`）；
-C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」还需 MCU 侧 **UART 端口后端**
-（`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
+C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」当时还缺 MCU 侧的 **UART 端口后端**
+（`CONFIG_SERIAL_UART` 那时只有 host 库实现）——**现已落地**（stm32 `src/stm32/bridge_serial.c`，多选 USART1/2/3 + UART4/5，
+见 [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的多端口一节），这句留作上板当天的记录。
 
 **刷写这台板的正确姿势（本轮踩过，写下来）**：`./venv/bin/pyocd load -O connect_mode=halt
 -O frequency=1000000 -e chip --target stm32f103ze out/firmware/klipper/klipper.elf`

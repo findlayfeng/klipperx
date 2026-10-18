@@ -2,15 +2,15 @@
 //! talks to, run as local services.
 //!
 //! The two subcommands are a convenience pair, not a second way to develop
-//! either project: each takes something that is not a Rust build (a Vite site; a
-//! Python application), gets it runnable where it is — `npm ci && npm run build`
-//! for the site, a virtualenv with `pip install -r` for Moonraker — and serves or
-//! execs it, saying which path it used. Later runs re-check that preparation
-//! instead of repeating it.
+//! either project: Moonraker is a Python application, so [`moonraker`] gets it
+//! runnable where it is (a virtualenv with `pip install -r`) and execs it;
+//! Mainsail is a packaged single-page site, so [`mainsail`] serves the copy a
+//! build embedded or one that is already built on disk, and builds nothing.
+//! Either way the path actually used is printed.
 //!
-//! Neither half talks to the network on its own account: every external program
-//! (`npm`, `python3 -m venv`, `pip`) goes through [`command::CommandRunner`], so
-//! the tests drive the preparation logic with a recorded fake instead of
+//! Nothing here reaches the network on its own account. Moonraker's external
+//! programs (`python3 -m venv`, `pip`) go through [`command::CommandRunner`], so
+//! the tests drive that preparation logic with a recorded fake instead of
 //! installing anything.
 
 pub mod command;

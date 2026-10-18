@@ -47,7 +47,8 @@ pub(crate) use resource::pin_number;
 pub use resource::{
     Completion, I2cMode, McuAdc, McuChip, McuDigitalOut, McuEndstop, McuI2c, McuPwm, McuSpi,
     McuStepper, McuTriggerAnalog, McuTrsync, SosFilter, SosFilterDesign, SpiMode, TriggerDispatch,
-    TrsyncRegistry, DEFAULT_SPEED, MONITOR_MAX, TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
+    TrsyncRegistry, DEFAULT_SPEED, HOME_WAIT_TIMEOUT, MONITOR_MAX, TRSYNC_SINGLE_MCU_TIMEOUT,
+    TRSYNC_TIMEOUT,
 };
 pub use restart_method::McuRestartMethod;
 

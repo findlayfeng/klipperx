@@ -287,7 +287,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         "SET_KINEMATIC_POSITION",
         &["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"],
     ),
-    ("SET_PIN", &["PIN", "VALUE", "CYCLE_TIME"]),
+    ("SET_PIN", &["PIN", "VALUE", "TEMPLATE", "CYCLE_TIME"]),
     (
         "SET_PRESSURE_ADVANCE",
         &["EXTRUDER", "ADVANCE", "SMOOTH_TIME"],

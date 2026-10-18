@@ -4845,7 +4845,10 @@ mod tests {
         assert!(app.completion_key(KeyCode::Tab));
 
         let completion = app.completion.as_ref().expect("the layer opens");
-        assert_eq!(completion.candidates, ["PIN", "VALUE", "CYCLE_TIME"]);
+        assert_eq!(
+            completion.candidates,
+            ["PIN", "VALUE", "TEMPLATE", "CYCLE_TIME"]
+        );
         assert_eq!(completion.word, Word { start: 16, end: 16 });
         assert_eq!(completion.selected, None, "nothing is picked yet");
         assert_eq!(app.input.text(), "SET_PIN PIN=fan ", "the line is entire");

@@ -12,9 +12,12 @@
 //! that applies is served, and which one it was is printed at startup.
 //!
 //! The one file Mainsail cannot know — `config.json`, saying which Moonraker to
-//! talk to — is written into a site served from disk when it has none. The
-//! embedded site's bytes are part of the binary, so a site without that file is
-//! reported instead, naming the file to add before the next build.
+//! talk to — is generated for every request rather than served from the site:
+//! its `instances` names the address the browser used to reach this server
+//! (`--moonraker-host` overrides that, for a Moonraker reached by another name),
+//! and every other key is whatever the site's own `config.json` had. One binary
+//! therefore serves any machine, and a `config.json` left in a site on disk
+//! cannot point the page somewhere else.
 //!
 //! Nothing here runs `npm`, and nothing here reaches the network.
 //!
@@ -45,7 +48,7 @@ pub const DEFAULT_PORT: u16 = 8080;
 /// from another machine on the same network.
 pub const DEFAULT_BIND: &str = "0.0.0.0";
 
-/// The port Moonraker listens on, written into the site's `config.json`.
+/// The port Moonraker listens on, the default for `--moonraker-port`.
 pub const MOONRAKER_PORT: u16 = 7125;
 
 /// The directory a packaged site is put in before a build, relative to the
@@ -69,7 +72,11 @@ SITE SOURCE (the first that applies is used):
 
 Nothing here runs npm. A release carries the site: put the contents of
 Mainsail's dist/ into assets/mainsail/ and build. Which source a run serves is
-printed when the service starts.";
+printed when the service starts.
+
+One file is never served as it is: config.json is generated per request, so the
+page opens on the Moonraker at the address the browser used (--moonraker-host
+and --moonraker-port change where that is).";
 
 /// Serve the Mainsail site.
 #[derive(Args, Debug, Clone)]
@@ -89,11 +96,24 @@ pub struct MainsailArgs {
     /// nothing is built into it.
     #[arg(long, value_name = "DIR")]
     pub dir: Option<PathBuf>,
+
+    /// Port Moonraker listens on, named in the site's config.json
+    #[arg(long, value_name = "PORT", default_value_t = MOONRAKER_PORT)]
+    pub moonraker_port: u16,
+
+    /// Host Moonraker is reached at, when it is not the host the page came from
+    ///
+    /// config.json otherwise names the address the browser used, which is right
+    /// whenever Moonraker runs on the machine serving the site. Give this when
+    /// it does not: a reverse proxy in front of Moonraker, or a Moonraker bound
+    /// to another machine.
+    #[arg(long, value_name = "HOST")]
+    pub moonraker_host: Option<String>,
 }
 
 /// Run `klipperx mainsail`: resolve the site, then serve it until Ctrl-C.
 pub fn run(args: MainsailArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    let site = prepare_site(&args)?;
+    let site = resolve_site(&args, EMBEDDED_MAINSAIL, &checkout_dist())?;
     serve(&args, &site).map_err(Into::into)
 }
 
@@ -158,25 +178,6 @@ fn checkout_dist() -> PathBuf {
         .join("dist")
 }
 
-/// Resolve the site to serve and leave it with the one file Mainsail cannot
-/// know.
-fn prepare_site(args: &MainsailArgs) -> Result<Site, String> {
-    let site = resolve_site(args, EMBEDDED_MAINSAIL, &checkout_dist())?;
-    match &site {
-        Site::Dir(dir) => write_config_json(dir, &args.bind)?,
-        // The embedded bytes are the binary's own: there is nowhere to write a
-        // file that a browser would see, so say what to add and carry on.
-        Site::Embedded(files) if embedded_file(files, "config.json").is_none() => println!(
-            "mainsail: the embedded site has no config.json, so the page will ask for a \
-             server: put one in {ASSETS_DIR}/ and rebuild to have it open on Moonraker at \
-             {}:{MOONRAKER_PORT}",
-            browse_host(&args.bind)
-        ),
-        Site::Embedded(_) => {}
-    }
-    Ok(site)
-}
-
 /// The site to serve, chosen from the three sources `--help` lists.
 ///
 /// `embedded` and `checkout` are parameters rather than lookups so a test can
@@ -217,31 +218,122 @@ fn resolve_site(
     ))
 }
 
-/// Write `config.json` into the served site if it is not there yet.
-///
-/// The file is the site's whole idea of where its server is, and Mainsail ships
-/// none: without it the page opens on its "add a printer" screen. Written only
-/// when missing, so an operator who pointed theirs elsewhere keeps it.
-fn write_config_json(dist: &Path, bind: &str) -> Result<(), String> {
-    let path = dist.join("config.json");
-    if path.exists() {
-        return Ok(());
+/// Where the page is told its Moonraker is, from `--moonraker-host` and
+/// `--moonraker-port`.
+#[derive(Clone, Debug)]
+struct Moonraker {
+    /// The name to use instead of the address the browser used; `None` means
+    /// the browser's own address is the answer.
+    host: Option<String>,
+    /// The port Moonraker listens on.
+    port: u16,
+    /// The `--bind` address, named only when a request carries no `Host`.
+    bind: String,
+}
+
+impl Moonraker {
+    /// The hostname `config.json` names for this request: what the operator
+    /// set, else the address the browser used, else this machine's own.
+    fn hostname(&self, request_host: Option<&str>) -> String {
+        if let Some(host) = &self.host {
+            return host.clone();
+        }
+        let used = request_host.map(host_without_port).unwrap_or_default();
+        if used.is_empty() {
+            return browse_host(&self.bind).to_string();
+        }
+        used.to_string()
     }
-    let config = serde_json::json!({
-        "defaultLocale": "zh-CN",
-        "instances": [{"hostname": browse_host(bind), "port": MOONRAKER_PORT}],
-    });
-    let mut text = serde_json::to_string_pretty(&config)
-        .map_err(|error| format!("cannot encode {}: {error}", path.display()))?;
-    text.push('\n');
-    std::fs::write(&path, text)
-        .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
-    println!(
-        "mainsail: wrote {} (Moonraker at {}:{MOONRAKER_PORT})",
-        path.display(),
-        browse_host(bind)
+}
+
+/// What one connection is answered with: the site's files, and the Moonraker
+/// its `config.json` is generated for.
+#[derive(Clone, Debug)]
+struct Served {
+    site: Site,
+    moonraker: Moonraker,
+}
+
+/// The host a `Host` header names, with any port removed.
+///
+/// A browser reached this server at some address; that address, not the one the
+/// server was bound to, is the one the page must use for Moonraker. The port is
+/// dropped because it is the site's, and Moonraker has its own.
+fn host_without_port(host: &str) -> &str {
+    let host = host.trim();
+    if host.starts_with('[') {
+        // An IPv6 literal: `[::1]` or `[::1]:8080`; the brackets stay, because
+        // they are part of how the address is spelled in a URL.
+        return match host.find(']') {
+            Some(end) => &host[..=end],
+            None => host,
+        };
+    }
+    match host.rsplit_once(':') {
+        Some((name, port))
+            if !name.contains(':') && port.chars().all(|digit| digit.is_ascii_digit()) =>
+        {
+            name
+        }
+        _ => host,
+    }
+}
+
+/// One header's value from a request head, by name (case-insensitive).
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if !key.trim().eq_ignore_ascii_case(name) {
+            return None;
+        }
+        Some(value.trim()).filter(|value| !value.is_empty())
+    })
+}
+
+/// `config.json` for one request.
+///
+/// The site's own `config.json` — the packaged one, or a site on disk's — is the
+/// base, so the locale, theme and mode it sets survive; what no build can know
+/// is which Moonraker this browser should talk to, so `instances` is this
+/// request's answer and `instancesDB` says to read the list from this file.
+fn generated_config(served: &Served, request_host: Option<&str>) -> Reply {
+    let mut config = config_base(&served.site);
+    config.insert(
+        "instances".to_string(),
+        serde_json::json!([{
+            "hostname": served.moonraker.hostname(request_host),
+            "port": served.moonraker.port,
+        }]),
     );
-    Ok(())
+    config.insert("instancesDB".to_string(), "json".into());
+    let body = match serde_json::to_vec_pretty(&config) {
+        Ok(body) => body,
+        Err(error) => return Reply::text(500, &format!("cannot encode config.json: {error}\n")),
+    };
+    Reply {
+        status: 200,
+        content_type: "application/json",
+        cache_control: "no-store",
+        body,
+    }
+}
+
+/// The keys `config.json` starts from: the site's own file when it has a
+/// readable one, otherwise only what this server can supply itself.
+fn config_base(site: &Site) -> serde_json::Map<String, serde_json::Value> {
+    let shipped = site
+        .read("config.json")
+        .ok()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+        .and_then(|value| match value {
+            serde_json::Value::Object(keys) => Some(keys),
+            _ => None,
+        });
+    shipped.unwrap_or_else(|| {
+        let mut base = serde_json::Map::new();
+        base.insert("defaultLocale".to_string(), "zh-CN".into());
+        base
+    })
 }
 
 /// The address a browser on this machine should use for a service bound to
@@ -257,6 +349,14 @@ fn browse_host(bind: &str) -> &str {
 
 /// Serve `site` on `bind:port` until Ctrl-C.
 fn serve(args: &MainsailArgs, site: &Site) -> Result<i32, String> {
+    let served = Served {
+        site: site.clone(),
+        moonraker: Moonraker {
+            host: args.moonraker_host.clone(),
+            port: args.moonraker_port,
+            bind: args.bind.clone(),
+        },
+    };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -271,10 +371,10 @@ fn serve(args: &MainsailArgs, site: &Site) -> Result<i32, String> {
         // rather than the zero that was asked for.
         println!(
             "mainsail: serving {} on http://{}:{port}/ (Ctrl-C to stop)",
-            site.describe(),
+            served.site.describe(),
             browse_host(&args.bind)
         );
-        accept_loop(listener, Arc::new(site.clone()), async {
+        accept_loop(listener, Arc::new(served), async {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await
@@ -302,7 +402,7 @@ async fn bind_listener(bind: &str, port: u16) -> Result<tokio::net::TcpListener,
 /// Accept connections until `stop` resolves, one task per connection.
 async fn accept_loop(
     listener: tokio::net::TcpListener,
-    site: Arc<Site>,
+    served: Arc<Served>,
     stop: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), String> {
     tokio::pin!(stop);
@@ -310,11 +410,11 @@ async fn accept_loop(
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _peer) = accepted.map_err(|error| format!("cannot accept a connection: {error}"))?;
-                let site = Arc::clone(&site);
+                let served = Arc::clone(&served);
                 // One task per connection: a slow page does not hold up the asset
                 // that follows it, and nothing is shared but the site.
                 tokio::spawn(async move {
-                    serve_connection(stream, site).await;
+                    serve_connection(stream, served).await;
                 });
             }
             _ = &mut stop => {
@@ -326,7 +426,7 @@ async fn accept_loop(
 }
 
 /// Answer one request on one connection, then close it.
-async fn serve_connection(mut stream: TcpStream, site: Arc<Site>) {
+async fn serve_connection(mut stream: TcpStream, served: Arc<Served>) {
     let head = match read_request(&mut stream).await {
         Ok(head) => head,
         Err(reply) => {
@@ -339,7 +439,10 @@ async fn serve_connection(mut stream: TcpStream, site: Arc<Site>) {
         let _ = stream.write_all(&reply.into_bytes(false)).await;
         return;
     };
-    let reply = route(&site, method, target);
+    // The `Host` the browser used is the address the page will reach Moonraker
+    // at, so it is read from the request rather than from `--bind`.
+    let request_host = header(&head, "host");
+    let reply = route(&served, method, target, request_host);
     let head_only = method.eq_ignore_ascii_case("HEAD");
     let _ = stream.write_all(&reply.into_bytes(head_only)).await;
     let _ = stream.shutdown().await;
@@ -378,11 +481,15 @@ fn request_line(head: &str) -> Option<(&str, &str)> {
     Some((method, target))
 }
 
-/// One response: status, content type and body.
+/// One response: status, content type, cache policy and body.
 #[derive(Debug, PartialEq, Eq)]
 struct Reply {
     status: u16,
     content_type: &'static str,
+    /// `no-store` for the generated `config.json`: a cached copy names the
+    /// Moonraker of whichever address asked first, which is the bug this server
+    /// exists to avoid.
+    cache_control: &'static str,
     body: Vec<u8>,
 }
 
@@ -392,6 +499,7 @@ impl Reply {
         Reply {
             status,
             content_type: "text/plain; charset=utf-8",
+            cache_control: "no-cache",
             body: message.as_bytes().to_vec(),
         }
     }
@@ -401,11 +509,12 @@ impl Reply {
     fn into_bytes(&self, head_only: bool) -> Vec<u8> {
         let head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-             Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
+             Cache-Control: {}\r\nConnection: close\r\n\r\n",
             self.status,
             reason(self.status),
             self.content_type,
-            self.body.len()
+            self.body.len(),
+            self.cache_control
         );
         let mut bytes = head.into_bytes();
         if !head_only {
@@ -428,8 +537,11 @@ fn reason(status: u16) -> &'static str {
     }
 }
 
-/// Map one request onto a file of `site` and answer it.
-fn route(site: &Site, method: &str, target: &str) -> Reply {
+/// Map one request onto an answer from `served` and return it.
+///
+/// `request_host` is the request's `Host` header, the address the browser used.
+fn route(served: &Served, method: &str, target: &str, request_host: Option<&str>) -> Reply {
+    let site = &served.site;
     if !(method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD")) {
         return Reply::text(405, "this host serves GET and HEAD only\n");
     }
@@ -450,6 +562,15 @@ fn route(site: &Site, method: &str, target: &str) -> Reply {
         Ok(relative) => relative,
         Err(reason) => return Reply::text(403, &format!("{reason}\n")),
     };
+
+    // One file is not the site's: `config.json` says which Moonraker to talk to,
+    // and only the request knows that. Generated here, before the lookup, so a
+    // site that ships one (or a directory whose file was edited) is not served
+    // from it.
+    if relative == "config.json" {
+        return generated_config(served, request_host);
+    }
+
     let relative = served_file(site, relative);
 
     // Second gate, for what the lexical check cannot see: a symlink inside the
@@ -469,6 +590,7 @@ fn route(site: &Site, method: &str, target: &str) -> Reply {
         Ok(body) => Reply {
             status: 200,
             content_type: content_type(Path::new(&relative)),
+            cache_control: "no-cache",
             body,
         },
         Err(reason) => Reply::text(500, &format!("{reason}\n")),
@@ -582,11 +704,23 @@ mod tests {
     use std::time::Duration;
 
     /// A site as `build.rs` would embed it, for tests that have no packaged site
-    /// to build with: the JSON config file is deliberately absent, which is the
-    /// case the embedded site reports rather than writes.
+    /// to build with. It ships no `config.json`, so the generated one has no
+    /// keys to keep.
     const EMBEDDED_FOR_TEST: &[(&str, &[u8])] = &[
         ("index.html", b"<html>embedded</html>"),
         ("assets/app.js", b"console.log(2)\n"),
+    ];
+
+    /// A site that ships a `config.json`, as a packaged Mainsail does: the keys
+    /// in it are what the generated file has to keep.
+    const EMBEDDED_WITH_CONFIG_FOR_TEST: &[(&str, &[u8])] = &[
+        ("index.html", b"<html>embedded</html>"),
+        (
+            "config.json",
+            b"{\"defaultLocale\":\"en\",\"defaultMode\":\"dark\",\
+              \"defaultTheme\":\"mainsail\",\"hostname\":null,\"port\":null,\
+              \"instancesDB\":\"moonraker\",\"instances\":[]}",
+        ),
     ];
 
     static SCRATCH: AtomicU32 = AtomicU32::new(0);
@@ -608,7 +742,28 @@ mod tests {
             port: DEFAULT_PORT,
             bind: DEFAULT_BIND.to_string(),
             dir: None,
+            moonraker_port: MOONRAKER_PORT,
+            moonraker_host: None,
         }
+    }
+
+    /// A site served with the Moonraker a browser on this machine would reach,
+    /// which is what `serve` assembles from the arguments.
+    fn served(site: Site) -> Served {
+        Served {
+            site,
+            moonraker: Moonraker {
+                host: None,
+                port: MOONRAKER_PORT,
+                bind: DEFAULT_BIND.to_string(),
+            },
+        }
+    }
+
+    /// The `config.json` of a reply, parsed.
+    fn config_json(reply: &Reply) -> serde_json::Value {
+        assert_eq!(reply.status, 200, "{reply:?}");
+        serde_json::from_slice(&reply.body).expect("config.json is JSON")
     }
 
     /// Parse arguments the way the subcommand does, for the default/`--help`
@@ -621,13 +776,20 @@ mod tests {
     }
 
     /// A built site: `dist/` with an index plus the files the tests ask about.
+    /// The `config.json` is the packaged one's shape, so tests can assert that a
+    /// generated file keeps its keys.
     fn built_site(directory: &Path) -> PathBuf {
         let dist = directory.join("dist");
         std::fs::create_dir_all(dist.join("assets")).expect("the built site");
         std::fs::write(dist.join("index.html"), b"<html>mainsail</html>").expect("index.html");
         std::fs::write(dist.join("assets/app.js"), b"console.log(1)\n").expect("app.js");
         std::fs::write(dist.join("assets/app.css"), b"body{}\n").expect("app.css");
-        std::fs::write(dist.join("config.json"), b"{}\n").expect("config.json");
+        std::fs::write(
+            dist.join("config.json"),
+            b"{\"defaultLocale\":\"en\",\"defaultTheme\":\"mainsail\",\
+              \"instancesDB\":\"moonraker\",\"instances\":[]}\n",
+        )
+        .expect("config.json");
         std::fs::write(directory.join("secret"), b"do not serve this\n").expect("the secret");
         dist
     }
@@ -638,10 +800,24 @@ mod tests {
         assert_eq!(defaults.port, DEFAULT_PORT);
         assert_eq!(defaults.bind, DEFAULT_BIND);
         assert!(defaults.dir.is_none());
+        assert_eq!(defaults.moonraker_port, 7125);
+        assert!(defaults.moonraker_host.is_none());
 
-        let given = parse(&["--dir", "/tmp/site", "--port", "9000"]).expect("parsed");
+        let given = parse(&[
+            "--dir",
+            "/tmp/site",
+            "--port",
+            "9000",
+            "--moonraker-port",
+            "7126",
+            "--moonraker-host",
+            "moonraker.local",
+        ])
+        .expect("parsed");
         assert_eq!(given.dir, Some(PathBuf::from("/tmp/site")));
         assert_eq!(given.port, 9000);
+        assert_eq!(given.moonraker_port, 7126);
+        assert_eq!(given.moonraker_host.as_deref(), Some("moonraker.local"));
     }
 
     #[test]
@@ -656,6 +832,9 @@ mod tests {
         assert!(help.contains("--dir"), "{help}");
         assert!(help.contains("built into this binary"), "{help}");
         assert!(help.contains("third_party/mainsail/dist"), "{help}");
+        assert!(help.contains("--moonraker-port"), "{help}");
+        assert!(help.contains("--moonraker-host"), "{help}");
+        assert!(help.contains("generated per request"), "{help}");
         assert!(!help.contains("no-build"), "{help}");
         assert!(!help.contains("rebuild"), "{help}");
         assert!(!help.contains("npm ci"), "{help}");
@@ -682,9 +861,9 @@ mod tests {
             b"<html>given</html>"
         );
 
-        // The one file the site cannot ship is written into the served directory.
-        prepare_site(&args).expect("the site is served");
-        assert!(built.join("config.json").is_file());
+        // One file is never the site's: `config.json` is generated per request,
+        // so nothing is written into the served directory.
+        assert!(!built.join("config.json").is_file());
 
         // A directory with nothing built in it is a mistake, not a build request.
         args.dir = Some(directory.join("absent"));
@@ -760,7 +939,10 @@ mod tests {
         // Plain, dot-segment, and percent-encoded spellings of "climb out",
         // against both shapes of site: the check is on the path, not on where
         // the bytes come from.
-        for site in [Site::Dir(dist.clone()), Site::Embedded(EMBEDDED_FOR_TEST)] {
+        for site in [
+            served(Site::Dir(dist.clone())),
+            served(Site::Embedded(EMBEDDED_FOR_TEST)),
+        ] {
             for target in [
                 "/../secret",
                 "/assets/../../secret",
@@ -769,17 +951,20 @@ mod tests {
                 "/./../secret",
             ] {
                 assert_eq!(
-                    route(&site, "GET", target).status,
+                    route(&site, "GET", target, None).status,
                     403,
                     "{target} should be refused"
                 );
             }
 
             // Not an origin-form path at all.
-            assert_eq!(route(&site, "GET", "http://elsewhere/secret").status, 400);
+            assert_eq!(
+                route(&site, "GET", "http://elsewhere/secret", None).status,
+                400
+            );
 
             // A NUL byte cannot be part of a file name.
-            assert_eq!(route(&site, "GET", "/a%00b").status, 403);
+            assert_eq!(route(&site, "GET", "/a%00b", None).status, 403);
         }
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
@@ -789,20 +974,20 @@ mod tests {
     fn root_and_unknown_paths_serve_the_index() {
         let directory = scratch("index");
         let dist = built_site(&directory);
-        let site = Site::Dir(dist);
+        let site = served(Site::Dir(dist));
 
-        let root = route(&site, "GET", "/");
+        let root = route(&site, "GET", "/", None);
         assert_eq!(root.status, 200);
         assert_eq!(root.body, b"<html>mainsail</html>");
         assert_eq!(root.content_type, "text/html; charset=utf-8");
 
         // A client-side route is a page of the application, not a miss.
-        let route_like = route(&site, "GET", "/printer/dashboard?x=1");
+        let route_like = route(&site, "GET", "/printer/dashboard?x=1", None);
         assert_eq!(route_like.status, 200);
         assert_eq!(route_like.body, b"<html>mainsail</html>");
 
         // `HEAD` answers with the same length and no body.
-        let head = route(&site, "HEAD", "/");
+        let head = route(&site, "HEAD", "/", None);
         assert_eq!(head.status, 200);
         assert_eq!(head.body, b"<html>mainsail</html>");
         let bytes = head.into_bytes(true);
@@ -811,20 +996,20 @@ mod tests {
         assert!(text.ends_with("\r\n\r\n"), "HEAD has no body: {text}");
 
         // The embedded site answers the same requests the same way.
-        let embedded = Site::Embedded(EMBEDDED_FOR_TEST);
-        let root = route(&embedded, "GET", "/");
+        let embedded = served(Site::Embedded(EMBEDDED_FOR_TEST));
+        let root = route(&embedded, "GET", "/", None);
         assert_eq!(root.status, 200);
         assert_eq!(root.body, b"<html>embedded</html>");
         assert_eq!(
-            route(&embedded, "GET", "/assets/app.js").body,
+            route(&embedded, "GET", "/assets/app.js", None).body,
             b"console.log(2)\n"
         );
         assert_eq!(
-            route(&embedded, "GET", "/printer/dashboard").body,
+            route(&embedded, "GET", "/printer/dashboard", None).body,
             b"<html>embedded</html>",
             "SPA fallback works from the embedded table"
         );
-        let head = route(&embedded, "HEAD", "/");
+        let head = route(&embedded, "HEAD", "/", None);
         assert_eq!(head.body, b"<html>embedded</html>");
         let bytes = String::from_utf8_lossy(&head.into_bytes(true)).into_owned();
         assert!(bytes.contains("Content-Length: 21"), "{bytes}");
@@ -836,23 +1021,29 @@ mod tests {
     fn files_are_served_with_their_type() {
         let directory = scratch("types");
         let dist = built_site(&directory);
-        let site = Site::Dir(dist);
+        let site = served(Site::Dir(dist));
 
-        let javascript = route(&site, "GET", "/assets/app.js?v=2");
+        let javascript = route(&site, "GET", "/assets/app.js?v=2", None);
         assert_eq!(javascript.status, 200);
         assert_eq!(javascript.body, b"console.log(1)\n");
         assert_eq!(javascript.content_type, "text/javascript; charset=utf-8");
 
         assert_eq!(
-            route(&site, "GET", "/assets/app.css").content_type,
+            route(&site, "GET", "/assets/app.css", None).content_type,
             "text/css; charset=utf-8"
         );
         assert_eq!(
-            route(&site, "GET", "/config.json").content_type,
+            route(&site, "GET", "/config.json", None).content_type,
             "application/json"
         );
         assert_eq!(
-            route(&Site::Embedded(EMBEDDED_FOR_TEST), "GET", "/assets/app.js").content_type,
+            route(
+                &served(Site::Embedded(EMBEDDED_FOR_TEST)),
+                "GET",
+                "/assets/app.js",
+                None
+            )
+            .content_type,
             "text/javascript; charset=utf-8"
         );
         assert_eq!(content_type(Path::new("a.woff2")), "font/woff2");
@@ -872,7 +1063,7 @@ mod tests {
 
         // The lexical check passes — the name has no `..` — so this is the
         // canonical-path gate answering.
-        let reply = route(&Site::Dir(dist), "GET", "/escape");
+        let reply = route(&served(Site::Dir(dist)), "GET", "/escape", None);
         assert_eq!(reply.status, 403);
         let text = String::from_utf8_lossy(&reply.body).into_owned();
         assert!(text.contains("leaves the served directory"), "{text}");
@@ -884,35 +1075,120 @@ mod tests {
     fn other_methods_are_refused() {
         let directory = scratch("methods");
         let dist = built_site(&directory);
-        let site = Site::Dir(dist);
-        assert_eq!(route(&site, "POST", "/").status, 405);
-        assert_eq!(route(&site, "DELETE", "/config.json").status, 405);
+        let site = served(Site::Dir(dist));
+        assert_eq!(route(&site, "POST", "/", None).status, 405);
+        assert_eq!(route(&site, "DELETE", "/config.json", None).status, 405);
         assert_eq!(
-            route(&Site::Embedded(EMBEDDED_FOR_TEST), "PUT", "/").status,
+            route(&served(Site::Embedded(EMBEDDED_FOR_TEST)), "PUT", "/", None).status,
             405
         );
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
 
     #[test]
-    fn the_site_config_points_at_this_machines_moonraker() {
-        let directory = scratch("configjson");
+    fn the_config_follows_the_host_the_browser_used() {
+        let site = served(Site::Embedded(EMBEDDED_WITH_CONFIG_FOR_TEST));
+
+        // Two browsers reach the same server by two addresses, and each is told
+        // to open Moonraker at the address it used.
+        let first = config_json(&route(&site, "GET", "/config.json", Some("10.0.48.2:8080")));
+        assert_eq!(first["instances"][0]["hostname"], "10.0.48.2");
+        assert_eq!(first["instances"][0]["port"], 7125);
+        let second = config_json(&route(&site, "GET", "/config.json", Some("printer.local")));
+        assert_eq!(second["instances"][0]["hostname"], "printer.local");
+
+        // A query string is not part of the name of the file.
+        assert_eq!(
+            config_json(&route(
+                &site,
+                "GET",
+                "/config.json?v=1",
+                Some("printer.local")
+            )),
+            second
+        );
+
+        // The packaged file is the base: its other keys survive, and only the
+        // two it cannot know are replaced.
+        assert_eq!(second["defaultLocale"], "en");
+        assert_eq!(second["defaultMode"], "dark");
+        assert_eq!(second["defaultTheme"], "mainsail");
+        assert!(second["hostname"].is_null());
+        assert_eq!(second["instancesDB"], "json");
+        assert_eq!(second["instances"].as_array().expect("a list").len(), 1);
+
+        // Generated per request, so it must not be cached: a cached copy would
+        // name the address some other browser used.
+        let reply = route(&site, "GET", "/config.json", Some("printer.local"));
+        assert_eq!(reply.content_type, "application/json");
+        assert_eq!(reply.cache_control, "no-store");
+        let head = String::from_utf8_lossy(&reply.into_bytes(true)).into_owned();
+        assert!(head.contains("Cache-Control: no-store"), "{head}");
+        assert!(!head.contains("no-cache"), "{head}");
+
+        // `HEAD` answers with the length of the body it would have sent.
+        let head = route(&site, "HEAD", "/config.json", Some("printer.local"));
+        assert_eq!(head.body, reply.body);
+        assert_eq!(head.content_type, "application/json");
+    }
+
+    #[test]
+    fn the_config_falls_back_to_the_bind_and_needs_no_base() {
+        // A site that ships no config.json still gets one, with a locale this
+        // operator can read; only the two keys the server knows are in it.
+        let bare = served(Site::Embedded(EMBEDDED_FOR_TEST));
+        let config = config_json(&route(&bare, "GET", "/config.json", Some("printer.local")));
+        assert_eq!(config["defaultLocale"], "zh-CN");
+        assert_eq!(config["instancesDB"], "json");
+        assert_eq!(config["instances"][0]["hostname"], "printer.local");
+
+        // No `Host` header at all: the address the server is bound to answers,
+        // and a wildcard bind is not an address a browser can open.
+        let wildcard = config_json(&route(&bare, "GET", "/config.json", None));
+        assert_eq!(wildcard["instances"][0]["hostname"], "127.0.0.1");
+        let mut bound = bare.clone();
+        bound.moonraker.bind = "192.168.1.5".to_string();
+        let named = config_json(&route(&bound, "GET", "/config.json", None));
+        assert_eq!(named["instances"][0]["hostname"], "192.168.1.5");
+
+        // `--moonraker-host` and `--moonraker-port` win over both, for a
+        // Moonraker reached by another name.
+        let mut overridden = bare.clone();
+        overridden.moonraker.host = Some("moonraker.local".to_string());
+        overridden.moonraker.port = 7126;
+        let config = config_json(&route(
+            &overridden,
+            "GET",
+            "/config.json",
+            Some("printer.local:8080"),
+        ));
+        assert_eq!(config["instances"][0]["hostname"], "moonraker.local");
+        assert_eq!(config["instances"][0]["port"], 7126);
+    }
+
+    #[test]
+    fn a_stale_config_on_disk_is_neither_served_nor_edited() {
+        let directory = scratch("stale");
         let dist = directory.join("dist");
         std::fs::create_dir_all(&dist).expect("dist");
+        std::fs::write(dist.join("index.html"), b"<html>mainsail</html>").expect("index.html");
+        let stale = "{\"instances\":[{\"hostname\":\"elsewhere\",\"port\":7125}]}";
+        std::fs::write(dist.join("config.json"), stale).expect("config.json");
 
-        write_config_json(&dist, "0.0.0.0").expect("config.json");
-        let written: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dist.join("config.json")).expect("config.json"))
-                .expect("JSON");
-        assert_eq!(written["defaultLocale"], "zh-CN");
-        assert_eq!(written["instances"][0]["hostname"], "127.0.0.1");
-        assert_eq!(written["instances"][0]["port"], MOONRAKER_PORT);
+        // A build made on another machine answers with this request's address…
+        let config = config_json(&route(
+            &served(Site::Dir(dist.clone())),
+            "GET",
+            "/config.json",
+            Some("printer.local"),
+        ));
+        assert_eq!(config["instances"][0]["hostname"], "printer.local");
 
-        // An operator's own file is never overwritten.
-        std::fs::write(dist.join("config.json"), "{\"mine\":true}").expect("own file");
-        write_config_json(&dist, "0.0.0.0").expect("config.json");
-        let kept = std::fs::read_to_string(dist.join("config.json")).expect("config.json");
-        assert_eq!(kept, "{\"mine\":true}");
+        // …and the file on disk is left as it was: serving a site does not edit it.
+        assert_eq!(
+            std::fs::read_to_string(dist.join("config.json")).expect("config.json"),
+            stale
+        );
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -924,11 +1200,26 @@ mod tests {
         assert_eq!(browse_host("192.168.1.5"), "192.168.1.5");
     }
 
-    /// A `GET` over a real socket, answered by the real server.
-    async fn get(address: std::net::SocketAddr, target: &str) -> (u16, String) {
+    #[test]
+    fn a_host_header_loses_its_port() {
+        assert_eq!(host_without_port("10.0.48.2:8080"), "10.0.48.2");
+        assert_eq!(host_without_port("printer.local"), "printer.local");
+        assert_eq!(host_without_port(" printer.local "), "printer.local");
+        assert_eq!(host_without_port("[::1]:8080"), "[::1]");
+        assert_eq!(host_without_port("[::1]"), "[::1]");
+        // Not a port, so the colon stays: a name this server did not expect is
+        // passed on rather than cut in half.
+        assert_eq!(
+            host_without_port("printer.local:http"),
+            "printer.local:http"
+        );
+    }
+
+    /// A `GET` over a real socket, answered by the real server, with a chosen
+    /// `Host` header.
+    async fn get_as(address: std::net::SocketAddr, target: &str, host: &str) -> (u16, String) {
         let mut stream = TcpStream::connect(address).await.expect("a connection");
-        let request =
-            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let request = format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .await
@@ -944,6 +1235,18 @@ mod tests {
         (status, text)
     }
 
+    /// A `GET` over a real socket, answered by the real server.
+    async fn get(address: std::net::SocketAddr, target: &str) -> (u16, String) {
+        get_as(address, target, "localhost").await
+    }
+
+    /// The body of a response, past the header block.
+    fn body_of(text: &str) -> &str {
+        text.split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("a body follows the headers")
+    }
+
     /// A current-thread runtime for one HTTP test.
     fn http_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -956,7 +1259,7 @@ mod tests {
     fn the_site_is_served_over_http() {
         let directory = scratch("http");
         let dist = built_site(&directory);
-        let site = Site::Dir(dist.clone());
+        let site = served(Site::Dir(dist.clone()));
         let runtime = http_runtime();
 
         let bounded = runtime.block_on(async {
@@ -1011,7 +1314,7 @@ mod tests {
                 let address = listener.local_addr().expect("the bound address");
                 let server = tokio::spawn(accept_loop(
                     listener,
-                    Arc::new(Site::Embedded(EMBEDDED_FOR_TEST)),
+                    Arc::new(served(Site::Embedded(EMBEDDED_FOR_TEST))),
                     std::future::pending::<()>(),
                 ));
 
@@ -1033,6 +1336,51 @@ mod tests {
 
                 let (status, _) = get(address, "/../secret").await;
                 assert_eq!(status, 403);
+
+                server.abort();
+            })
+            .await
+        });
+        bounded.expect("the HTTP test is bounded");
+    }
+
+    #[test]
+    fn the_http_config_names_the_address_each_request_used() {
+        let runtime = http_runtime();
+
+        let bounded = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .expect("a random port");
+                let address = listener.local_addr().expect("the bound address");
+                let server = tokio::spawn(accept_loop(
+                    listener,
+                    Arc::new(served(Site::Embedded(EMBEDDED_WITH_CONFIG_FOR_TEST))),
+                    std::future::pending::<()>(),
+                ));
+
+                // The same server, reached by two addresses: each answer names
+                // the address its own request carried, and tells the browser not
+                // to keep it.
+                for host in ["10.0.48.2:8080", "printer.local"] {
+                    let (status, text) = get_as(address, "/config.json", host).await;
+                    assert_eq!(status, 200, "{text}");
+                    assert!(text.contains("Cache-Control: no-store"), "{text}");
+                    assert!(text.contains("Content-Type: application/json"), "{text}");
+                    let config: serde_json::Value =
+                        serde_json::from_str(body_of(&text)).expect("config.json is JSON");
+                    let name = host.split(':').next().expect("a name");
+                    assert_eq!(config["instances"][0]["hostname"], name);
+                    assert_eq!(config["instances"][0]["port"], 7125);
+                    assert_eq!(config["instancesDB"], "json");
+                    assert_eq!(config["defaultTheme"], "mainsail");
+                }
+
+                // The rest of the site is served as before, port and all.
+                let (status, text) = get(address, "/").await;
+                assert_eq!(status, 200, "{text}");
+                assert!(text.contains("<html>embedded</html>"), "{text}");
 
                 server.abort();
             })

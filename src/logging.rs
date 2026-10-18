@@ -896,7 +896,7 @@ mod tests {
         set_rollover_info("versions", Some("Versions: klipperx test"));
         set_rollover_info(
             "config",
-            Some("===== Config file =====\n[printer]\nkinematics: none\n======================="),
+            Some("===== Config file =====\n[printer]\nkinematics = none\n======================="),
         );
 
         let dir = TempDir::new("header");
@@ -913,7 +913,7 @@ mod tests {
             current.starts_with(concat!(
                 "===== Config file =====\n",
                 "[printer]\n",
-                "kinematics: none\n",
+                "kinematics = none\n",
                 "=======================\n",
                 "Versions: klipperx test\n",
                 "=============== Log rollover at ",

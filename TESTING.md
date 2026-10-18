@@ -261,6 +261,36 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
   没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
 
+### 真机结果（2026-10-16，mux 设备半直连：隧道 / 送引导 / 重启）
+
+目的：**不摆桥**、只把板子当一个 mux 设备半，先验「设备对新指令的应答对不对」。固件 = klipper
+子模组 `test/configs/stm32f103-usb-mux.config` 加 `CONFIG_STM32_FLASH_START_2000=y`（应用偏移
+`0x8002000`，与 katapult 对齐），**构建外移**（`KCONFIG_CONFIG`/`OUT` 指自建目录
+`target/hw-phase1`，不碰子模组的 `.config`/`out/`）；用 `klipperx admin flash --device <by-id>` 直连
+USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/devices/serial.rs` 的两条
+`#[ignore]` 探针，tty 由 `KLIPPERX_HW_MUX_TTY=<by-id>` 给（uuid 默认本板 `e512c60ac0e6`，可
+`KLIPPERX_HW_MUX_UUID` 覆盖）。
+
+| # | 验项 | 结果 |
+|---|------|------|
+| 1 | 发现（未指派）：应答落在 admin 应答 id `0x3f1`、`application=None`、`NEED_NODEID` | ✓ |
+| 2 | 指派被采纳：再扫**静默**（号只由主机持有） | ✓ |
+| 3 | `SET_PORT_NODEID (0x03)`：设备不执行（桥自身命令），无任何应答 | ✓ |
+| 4 | 隧道单元（`01 88 …`）：整段丢弃且流恢复 | ✓ |
+| 5 | `RESTART_DEVICE (0x05)`：真重启、号丢失、再扫仍应答同一 uuid | ✓ |
+| 6 | `REQUEST_BOOTLOADER (0x02)`：板子重枚举为 `usb-katapult_stm32f103xe_devloop1-if00` | ✓ |
+
+实测耗时：第 1 条 8.91 s、第 2 条 2.41 s。**阶段结束时板子停在 katapult**（第 6 条是最后一步）。
+
+两条踩出来的口径（已写进探针注释）：
+
+- **板子会自发 1 Hz `stats` 帧**（固件字典记作 id `-12`，编码首字节 `0x74`），且上一轮残留的应答头
+  会先到；所以探针开端口时必须 `tcflush` 清输入缓冲，并且**盲读第一个单元会把两者粘连误判**——
+  解析器必须按 arb 分派、必要时 `drop_to_sync`。
+- **隧道单元之后至多吞一帧**：设备解析器遇到内层 katapult 帧（首字节 `0x01` 不是合法长度）就进入
+  「等下一个 SYNC」态，紧随其后那一帧被整体吃掉、再下一帧恢复——与主机侧「丢到下一个 `0x7e`、至多
+  损失一个单元」同性质，刷写会话的重传（`tries=5`）盖得过它。
+
 ### 真机结果（2026-10-17，主机直连 CAN：上游 USB-CAN 桥）
 
 做法：把 F446 桥板刷成**上游 klipper 的 `USBCANBUS`**（`src/generic/usb_canbus.c`，USB id

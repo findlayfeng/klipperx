@@ -6037,8 +6037,8 @@ mod katapult_dual_encap_tests {
 // ===========================================================================
 //
 // Drives a board that runs the firmware's serial-mux device half over its own
-// tty, **with no bridge in the path** (the staging in
-// `docs/work-log/2026-10-16-katapult-flash-task.md`, "真机测试分阶段口径"): every
+// tty, **with no bridge in the path** (the staging is the developer manual's
+// hardware-test table plus `TESTING.md`'s "mux 设备半直连" record): every
 // step sends one unit and reads what comes back, so each answer of the device
 // half is pinned against real bytes instead of a pty fixture.
 //
@@ -6141,8 +6141,10 @@ mod hw_mux_device_tests {
     /// Drop bytes up to and including the next frame sync — the device layer's
     /// resynchronisation policy ([`drop_to_sync`]), which a probe needs for the
     /// same reason the reader does: a board also sends its own traffic (the
-    /// firmware's once-a-second `stats` frame), and those bytes sit in front of
-    /// the unit a probe is waiting for.
+    /// firmware's once-a-second `stats` frame, message id `-12` in the
+    /// dictionary, whose encoding starts with `0x74`), and a previous run's
+    /// late answers may still be ahead of it — a blind read of "the first unit"
+    /// glues those two together and misreads both.
     fn skip_to_sync(pending: &mut Vec<u8>) {
         match pending.iter().position(|b| *b == MESSAGE_SYNC) {
             Some(idx) => {

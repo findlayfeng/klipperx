@@ -16,8 +16,9 @@
 //! built *from* that handle for the two things only it needs it for: the Mcu's
 //! connection and the port-level admin commands.
 //!
-//! The run is the sequence `docs/work-log/2026-10-16-katapult-flash-task.md`
-//! spells out, in the order the bridge firmware requires:
+//! The run is the sequence the developer manual's
+//! `docs/klippy/developer-manual/serial-mux-protocol.md` spells out under
+//! `admin flash`, in the order the bridge firmware requires:
 //!
 //! 1. **open + identify** ([`BridgeLink::open_host_library`] /
 //!    [`BridgeLink::open_serial`], then [`BridgeLink::identify`]) — the

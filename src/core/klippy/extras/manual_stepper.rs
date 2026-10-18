@@ -922,6 +922,22 @@ mod tests {
             .expect("the toolhead is connected")
     }
 
+    /// The print time a move appended **now** starts at: the end of the newest
+    /// segment already in `trapq` (`0.0` when it is empty).
+    ///
+    /// A manual stepper queues on its own trapq, so neither `print_time()` nor
+    /// the planner horizon bounds it — they track the *main* trapq and stand
+    /// still while the manual one grows. The trapq's own end is the boundary
+    /// `extract_old` stops at (`start_time >= segment.end_time()`), so slicing
+    /// from it picks up exactly the segments appended afterwards, however much
+    /// the background generator has run.
+    fn trapq_end(toolhead: &ToolHeadObject, trapq: usize) -> f64 {
+        segments_since(toolhead, trapq, 0.0)
+            .first()
+            .map(|segment| segment.end_time())
+            .unwrap_or(0.0)
+    }
+
     /// The trapq the stepper's moves are queued in, or an error naming the
     /// command that was supposed to install it.
     fn trapq_of(stepper: &Arc<ManualStepper>) -> Result<usize, String> {
@@ -1016,7 +1032,9 @@ mod tests {
                 "MANUAL_STEPPER STEPPER=basic_stepper SET_POSITION=0",
             )
             .await?;
-            let before = toolhead.print_time();
+            // The boundary is the trapq's own end (see [`trapq_end`]): the
+            // manual trapq is not the planner's timeline.
+            let before = trapq_end(&toolhead, trapq);
             run(&gcode, "MANUAL_STEPPER STEPPER=basic_stepper MOVE=5").await?;
             let default = segments_since(&toolhead, trapq, before);
             let ramp = default.last().ok_or("the trapq is empty")?;
@@ -1195,7 +1213,7 @@ mod tests {
 
             // The next move is queued from the re-anchored position, so there is
             // no jump for the solver to walk back through.
-            let before = toolhead.print_time();
+            let before = trapq_end(&toolhead, trapq);
             run(
                 &gcode,
                 "MANUAL_STEPPER STEPPER=basic_stepper MOVE=5 SPEED=100 ACCEL=1000",
@@ -1238,7 +1256,7 @@ mod tests {
 
             // 1 mm at F600 (10 mm/s): short enough that the generation horizon
             // covers the whole move on the next flush.
-            let before = toolhead.print_time();
+            let before = trapq_end(&toolhead, trapq);
             run(&gcode, "G1 A1 F600").await?;
             tokio::time::timeout(Duration::from_secs(10), toolhead.flush_step_generation())
                 .await

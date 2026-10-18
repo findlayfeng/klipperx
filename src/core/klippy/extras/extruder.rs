@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::extruder_stepper::{
     cmd_set_extruder_rotation_distance, cmd_sync_extruder_motion,
 };
@@ -213,6 +214,13 @@ impl PrinterExtruder {
             printer: Arc::downgrade(printer),
         };
         extruder.register_commands(printer)?;
+        // Register the extruder's own queue with `motion_report`, which streams
+        // it under this section's name. Upstream registers it in
+        // `klippy:connect` (`motion_report.py:173-179`); the mux table here is
+        // filled from the load path, so the instance is registered by name and
+        // the trapq id resolved per batch.
+        crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+            .register_extruder_trapq(&name)?;
         Ok(extruder)
     }
 
@@ -248,6 +256,12 @@ impl PrinterExtruder {
     /// Point this extruder at its trapq (the toolhead does this when attaching).
     pub fn set_trapq(&self, trapq: usize) {
         *self.trapq.lock().unwrap_or_else(|p| p.into_inner()) = Some(trapq);
+    }
+
+    /// This extruder's own trapq, once the toolhead has attached it
+    /// (`MCU_stepper.get_trapq`). `None` before connect.
+    pub fn trapq(&self) -> Option<usize> {
+        *Self::lock(&self.trapq)
     }
 
     /// Register the extruder's g-code commands
@@ -318,7 +332,12 @@ impl PrinterExtruder {
                 .map_err(ConfigError::new)?;
         }
 
-        // ACTIVATE_EXTRUDER: record the active extruder on the toolhead.
+        // ACTIVATE_EXTRUDER: record the active extruder on the toolhead, then
+        // announce the switch (`kinematics/extruder.py:281-289`). The event
+        // carries no payload upstream and is what re-anchors the consumers:
+        // `gcode_move` resets the E position and the extrude factor, and
+        // `print_stats` re-bases its filament usage. A missing toolhead means
+        // nothing was switched, so nothing is announced.
         {
             let name = self.name.clone();
             let printer = Arc::downgrade(printer);
@@ -328,6 +347,7 @@ impl PrinterExtruder {
                 };
                 if let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>("toolhead") {
                     toolhead.set_active_extruder(&name);
+                    printer.send_event(&KlippyEvent::ExtruderActivateExtruder);
                 }
                 gcmd.respond_info(&format!("Activating extruder {name}"));
                 let _ = gcmd;
@@ -496,7 +516,7 @@ impl ExtraAxis for PrinterExtruder {
         }
         let axis_r = ctx.axes_r()[ea_index];
         let axis_d = ctx.axes_d()[ea_index];
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         if (axes_d[0] == 0.0 && axes_d[1] == 0.0) || axis_r < 0.0 {
             // Extrude-only or retraction: limit the speed and acceleration.
             if axis_d.abs() > self.max_e_dist {
@@ -555,13 +575,13 @@ impl ExtraAxis for PrinterExtruder {
             move_.accel_t,
             move_.cruise_t,
             move_.decel_t,
-            crate::core::klippy::mathutil::Xyz::new(move_.start_pos.axis(ea_index), 0.0, 0.0),
+            crate::core::klippy::mathutil::Xyz::new(move_.start_axis(ea_index), 0.0, 0.0),
             crate::core::klippy::mathutil::Xyz::new(1.0, can_pressure_advance as u8 as f64, 0.0),
             move_.start_v * axis_r,
             move_.cruise_v * axis_r,
             move_.accel * axis_r,
         );
-        *Self::lock(&self.last_position) = move_.end_pos.axis(ea_index);
+        *Self::lock(&self.last_position) = move_.end_axis(ea_index);
     }
 
     fn find_past_position(&self, _print_time: f64) -> f64 {
@@ -647,11 +667,11 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
-    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::mathutil::{Coord, E_AXIS};
     use crate::core::klippy::motion::plan::MoveLimits;
     use crate::core::klippy::motion::Move;
     use crate::core::klippy::reactor::ManualReactor;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A cartesian printer config with one extruder.
     fn extruder_config(extra: &str) -> String {
@@ -733,18 +753,90 @@ mod tests {
         assert!(printer.lookup_object("extruder_stepper extruder").is_some());
     }
 
-    #[test]
-    fn test_numbered_extruder_sections_are_read_through_the_primary() {
-        let printer = load_ok(&extruder_config(
+    /// `extruder_config` plus a second `[extruder1]` section, so an
+    /// `ACTIVATE_EXTRUDER` switch has somewhere to move.
+    fn two_extruder_config() -> String {
+        extruder_config(
             "[extruder1]\nstep_pin: PB1\ndir_pin: PB2\nrotation_distance: 33.5\nmicrosteps: 16\n\
              nozzle_diameter: 0.4\nfilament_diameter: 1.75\nheater_pin: PB3\n\
              sensor_type: EPCOS 100K B57560G104F\nsensor_pin: PB5\ncontrol: pid\npid_Kp: 1\npid_Ki: 0.1\npid_Kd: 10\n\
              min_temp: 0\nmax_temp: 250\n",
-        ));
+        )
+    }
+
+    #[test]
+    fn test_numbered_extruder_sections_are_read_through_the_primary() {
+        let printer = load_ok(&two_extruder_config());
         let extruder1 = printer
             .lookup_object_as::<PrinterExtruder>("extruder1")
             .expect("extruder1 is registered");
         assert_eq!(extruder1.name(), "extruder1");
+    }
+
+    /// `ACTIVATE_EXTRUDER` records the new active extruder on the toolhead and
+    /// then announces it (`kinematics/extruder.py:281-289`) — the event carries
+    /// no payload upstream, and it is what re-anchors the E positions of
+    /// `gcode_move` and `print_stats`.
+    #[test]
+    fn test_activate_extruder_switches_and_announces_the_switch() {
+        let printer = load_ok(&two_extruder_config());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let announced = Arc::new(AtomicUsize::new(0));
+        printer.register_event_handler(
+            KlippyEvent::ExtruderActivateExtruder,
+            Box::new({
+                let announced = Arc::clone(&announced);
+                move |_| {
+                    announced.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        gcode
+            .run_script_sync("ACTIVATE_EXTRUDER EXTRUDER=extruder1")
+            .unwrap();
+
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert_eq!(toolhead.active_extruder(), "extruder1");
+        assert_eq!(announced.load(Ordering::SeqCst), 1);
+    }
+
+    /// An `EXTRUDER=` that names no configured extruder is rejected by the mux
+    /// before any extruder's handler runs (upstream `_cmd_mux`), so nothing is
+    /// switched and nothing is announced.
+    #[test]
+    fn test_activate_extruder_announces_nothing_for_an_unknown_name() {
+        let printer = load_ok(&two_extruder_config());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let announced = Arc::new(AtomicUsize::new(0));
+        printer.register_event_handler(
+            KlippyEvent::ExtruderActivateExtruder,
+            Box::new({
+                let announced = Arc::clone(&announced);
+                move |_| {
+                    announced.fetch_add(1, Ordering::SeqCst);
+                }
+            }),
+        );
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        let err = gcode
+            .run_script_sync("ACTIVATE_EXTRUDER EXTRUDER=nope")
+            .unwrap_err();
+
+        assert!(err.to_string().contains("nope"), "{err}");
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        assert_eq!(toolhead.active_extruder(), "extruder");
+        assert_eq!(announced.load(Ordering::SeqCst), 0);
     }
 
     #[test]

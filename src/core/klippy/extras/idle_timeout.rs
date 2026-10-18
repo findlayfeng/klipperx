@@ -30,20 +30,30 @@
 //!   timer a print start re-arms). `IdleTimeout::arm` is the stand-in — it
 //!   cancels the handle and registers a fresh timer — and the timer is never
 //!   retired: `Machine::armed` is what upstream's retired timer means, and the
-//!   registered timer is how this port watches for the print to start again.
-//! * **No `toolhead:sync_print_time` sender.** Upstream is told the moment the
-//!   toolhead re-syncs its print time and re-arms from that event; this host
-//!   declares the event but nothing sends it. The timeout therefore *observes*
-//!   the print time: a tick that sees it advance is a print start (see
-//!   `IdleTimeout::observe_print_time`). Because that observation only
-//!   happens on a wake-up, a `Ready` machine is woken every `READY_TIMEOUT`
-//!   rather than only at the timeout — the granularity upstream's own re-arm
-//!   uses — so a print is noticed within half a second instead of at the
-//!   timeout. The `idle_timeout:printing` payload is the toolhead's print time
-//!   plus `PIN_MIN_TIME`, which is what upstream's own handler sends once the
-//!   argument order of its `(curtime, print_time, est_print_time)` signature
-//!   against `toolhead.py:267-268`'s `(curtime, est_print_time, print_time)` is
-//!   taken into account.
+//!   registered timer is how this port keeps polling a machine nothing else
+//!   wakes (see the next bullet).
+//! * **The print-start source has a fallback.** `toolhead:sync_print_time` is
+//!   the moment the toolhead raises its print time for new motion
+//!   (`toolhead.py:264-268`), and `IdleTimeout::handle_sync_print_time` is what
+//!   upstream's `handle_sync_print_time` (`idle_timeout.py:98-107`) does with
+//!   it: `Printing`, an `idle_timeout:printing` event, and a re-armed timeout
+//!   for when the buffer should have drained. Because that handler only runs
+//!   once something sends the event, the tick still *observes* the print time
+//!   as a fallback (`IdleTimeout::observe_print_time`): a print time that moved
+//!   since the last tick is a print start — but only until the first event
+//!   arrives (`Machine::seen_sync`), whereupon the observer retires so a print
+//!   start is never counted twice. The fallback's cost is that a `Ready`
+//!   machine is woken every `READY_TIMEOUT` rather than only at the timeout
+//!   (upstream's own re-arm granularity); a machine that sends the event still
+//!   wakes at that rate, because the timer stays registered here (previous
+//!   bullet).
+//!
+//! The `idle_timeout:printing` payload is the toolhead's print time plus
+//! `PIN_MIN_TIME`, which is what upstream's handler sends once the argument
+//! order of its `(curtime, print_time, est_print_time)` signature against
+//! `toolhead.py:267-268`'s `(curtime, est_print_time, print_time)` is taken into
+//! account — the handler is ported with that same order (see
+//! `IdleTimeout::handle_sync_print_time`).
 //!
 //! Three smaller pieces of upstream's checks are dropped rather than
 //! approximated:
@@ -150,8 +160,14 @@ struct Machine {
     /// `toolhead:sync_print_time`; this port's timer stays registered, so this
     /// flag is what "retired" means (module docs).
     armed: bool,
-    /// The print time the last tick saw: our stand-in for `toolhead:sync_print_time`
-    /// (see `IdleTimeout::observe_print_time`).
+    /// Whether a `toolhead:sync_print_time` has arrived: from then on the event
+    /// is the print-start source, and the tick's print-time observation — the
+    /// fallback for a machine nothing sends it from — retires
+    /// (`IdleTimeout::observe_print_time`).
+    seen_sync: bool,
+    /// The print time the last tick saw, read only while [`Self::seen_sync`] is
+    /// unset: the fallback's stand-in for `toolhead:sync_print_time` (see
+    /// `IdleTimeout::observe_print_time`).
     last_print_time: f64,
     /// When the current `Printing` state began (`printing_time` counts from
     /// here, `idle_timeout.py:34-40`).
@@ -165,6 +181,7 @@ impl Default for Machine {
             // (`idle_timeout.py:24-25`).
             state: State::Idle,
             armed: true,
+            seen_sync: false,
             last_print_time: 0.0,
             last_print_start_systime: 0.0,
         }
@@ -324,9 +341,9 @@ impl IdleTimeout {
             return;
         };
         // The print time the machine is at when the timeout arms: motion past
-        // this point is what the tick reads as a print (the stand-in for
-        // `toolhead:sync_print_time`). Taking it here keeps a print time that
-        // is already non-zero at boot from looking like one.
+        // this point is what the fallback observation reads as a print (see
+        // `IdleTimeout::observe_print_time`). Taking it here keeps a print time
+        // that is already non-zero at boot from looking like one.
         self.lock_machine().last_print_time = toolhead.print_time();
         *self.toolhead.lock().unwrap_or_else(|p| p.into_inner()) = Some(toolhead);
         // Upstream registers its timer at `reactor.NOW` (`idle_timeout.py:43`).
@@ -362,7 +379,8 @@ impl IdleTimeout {
 
     /// One timer callback: upstream's `timeout_handler`
     /// (`idle_timeout.py:75-97`) plus the print-time observation that stands in
-    /// for `handle_sync_print_time` (`:98-107`).
+    /// for `handle_sync_print_time` while nothing sends
+    /// `toolhead:sync_print_time` (`:98-107`).
     ///
     /// The returned wake time is the next time this runs; `None` retires the
     /// timer, which is what upstream does on shutdown (it also retires it after
@@ -392,9 +410,10 @@ impl IdleTimeout {
             (machine.state, machine.armed, started)
         };
         if print_started {
-            // Upstream sends this from `handle_sync_print_time`; the payload is
-            // what its handler's `est_print_time + PIN_MIN_TIME` comes to
-            // (module docs).
+            // Upstream sends this from `handle_sync_print_time`; this is the
+            // fallback path, for a machine whose toolhead does not send the
+            // event (module docs). The payload is what its handler's
+            // `est_print_time + PIN_MIN_TIME` comes to.
             printer.send_event(&KlippyEvent::IdleTimeoutPrinting {
                 print_time: print_time + PIN_MIN_TIME,
             });
@@ -444,15 +463,67 @@ impl IdleTimeout {
         ))
     }
 
-    /// The `toolhead:sync_print_time` stand-in: a print time that moved since
-    /// the last tick means the toolhead is printing.
+    /// Upstream's `handle_sync_print_time` (`idle_timeout.py:98-107`): the
+    /// toolhead raised its print time, so a print is starting — go `Printing`,
+    /// send `idle_timeout:printing`, and re-arm the timeout for when the
+    /// buffer should have drained.
+    ///
+    /// **The two print times are named in upstream's order, which is not the
+    /// order they are sent in.** `toolhead.py:267-268` sends
+    /// `(curtime, est_print_time, print_time)`; the handler signature is
+    /// `(curtime, print_time, est_print_time)` (`idle_timeout.py:98`), so the
+    /// `print_time` received here is upstream's **estimate** and
+    /// `est_print_time` is the raised print time. That quirk is upstream's own
+    /// and is kept: the body below binds the parameters as upstream does, so
+    /// the timeout is armed at `READY_TIMEOUT + est - print` and the `printing`
+    /// payload is the print time plus `PIN_MIN_TIME` (module docs).
+    ///
+    /// The handler reads the payload and this module's state only. It must not
+    /// call back into the toolhead: the sender has just released the toolhead's
+    /// state lock, and a read here would be a second lock on that path.
+    fn handle_sync_print_time(&self, curtime: f64, print_time: f64, est_print_time: f64) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        {
+            let mut machine = self.lock_machine();
+            // From now on the event is the print-start source and the tick's
+            // print-time observation is the fallback
+            // (`IdleTimeout::observe_print_time`).
+            machine.seen_sync = true;
+            if machine.state == State::Printing {
+                // Upstream returns here: `Printing` means this print's buffer
+                // is still draining and the timer is already armed for it.
+                return;
+            }
+            machine.state = State::Printing;
+            machine.armed = true;
+            machine.last_print_start_systime = curtime;
+        }
+        // Upstream's `update_timer(timer, curtime + check_time)`
+        // (`idle_timeout.py:104-105`): `arm` replaces the registered timer, so
+        // the tick's own renewal cannot run alongside this one.
+        self.arm(curtime + READY_TIMEOUT + print_time - est_print_time);
+        printer.send_event(&KlippyEvent::IdleTimeoutPrinting {
+            print_time: est_print_time + PIN_MIN_TIME,
+        });
+    }
+
+    /// The fallback print-start source: a print time that moved since the last
+    /// tick means the toolhead is printing.
     ///
     /// Upstream learns this from the event `ToolHead._calc_print_time` sends
-    /// when it raises the print time for new motion (`toolhead.py:264-268`),
-    /// and answers it by going `Printing` and re-arming the timeout
-    /// (`idle_timeout.py:98-107`). Returns whether the state just became
-    /// `Printing`.
+    /// when it raises the print time for new motion (`toolhead.py:264-268`) and
+    /// answers it in [`IdleTimeout::handle_sync_print_time`]. That event is the
+    /// source once one has been handled (`Machine::seen_sync`); this observation
+    /// remains for the configuration where nothing sends it, and it must not
+    /// report a start a second time — `last_print_start_systime` would be
+    /// overwritten and `printing_time` would jump. Returns whether the state
+    /// just became `Printing`.
     fn observe_print_time(machine: &mut Machine, print_time: f64, eventtime: f64) -> bool {
+        if machine.seen_sync {
+            return false;
+        }
         if print_time <= machine.last_print_time {
             return false;
         }
@@ -622,6 +693,39 @@ fn on_ready(printer: &Arc<Printer>, idle: &Arc<IdleTimeout>) {
     );
 }
 
+/// Wire the built object into `toolhead:sync_print_time`, its print-start
+/// source (`idle_timeout.py:44-45`).
+///
+/// The payload is forwarded positionally, as Python binds it: the handler's
+/// second parameter is the event's `est_print_time` and its third is the
+/// event's `print_time`, because its signature names them the other way round
+/// (`idle_timeout.py:98` against `toolhead.py:267-268`; see
+/// `IdleTimeout::handle_sync_print_time`). The registration's payload values are
+/// placeholders: handlers are keyed by event name.
+fn on_sync_print_time(printer: &Arc<Printer>, idle: &Arc<IdleTimeout>) {
+    let weak = Arc::downgrade(idle);
+    printer.register_event_handler(
+        KlippyEvent::ToolheadSyncPrintTime {
+            curtime: 0.0,
+            est_print_time: 0.0,
+            print_time: 0.0,
+        },
+        Box::new(move |event| {
+            let KlippyEvent::ToolheadSyncPrintTime {
+                curtime,
+                est_print_time,
+                print_time,
+            } = event
+            else {
+                return;
+            };
+            if let Some(this) = weak.upgrade() {
+                this.handle_sync_print_time(*curtime, *est_print_time, *print_time);
+            }
+        }),
+    );
+}
+
 /// Upstream's `load_config` for `[idle_timeout]` (`idle_timeout.py:117-118`).
 ///
 /// # Errors
@@ -633,6 +737,7 @@ pub fn load_config(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let idle = IdleTimeout::new(config, printer)?;
     on_ready(printer, &idle);
+    on_sync_print_time(printer, &idle);
     Ok(idle)
 }
 
@@ -757,6 +862,17 @@ mod tests {
 
     fn sent_events(sent: &Arc<Mutex<Vec<KlippyEvent>>>) -> Vec<KlippyEvent> {
         sent.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The `idle_timeout:printing` payloads, in the order they were sent.
+    fn printing_times(sent: &Arc<Mutex<Vec<KlippyEvent>>>) -> Vec<f64> {
+        sent_events(sent)
+            .into_iter()
+            .filter_map(|event| match event {
+                KlippyEvent::IdleTimeoutPrinting { print_time } => Some(print_time),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The section's status starts at upstream's initial values
@@ -982,6 +1098,121 @@ mod tests {
         // machine goes back to `Ready` half a second later.
         reactor.advance(2.6);
         assert_eq!(object.get_status(0.0)["state"], "Ready");
+    }
+
+    /// The event names the print start once: after a `toolhead:sync_print_time`
+    /// has been handled, a print time that moves further must not send
+    /// `idle_timeout:printing` a second time, nor re-date the print start
+    /// (`Machine::seen_sync` retires the fallback observation).
+    #[test]
+    fn test_a_seen_sync_event_retires_the_print_time_observer() {
+        let (printer, reactor) = loaded("[idle_timeout]\ntimeout: 10\n");
+        let sent = captured_events(&printer);
+        let object = idle(&printer);
+        let toolhead = Arc::new(FakeToolhead::new(0.0, 0.0));
+        reactor.advance(1.0);
+        object.start(Arc::clone(&toolhead) as Arc<dyn Toolhead>);
+
+        // A print starts: the toolhead raised its print time to 3.25 while the
+        // estimate was 3.0 (`toolhead.py:264-268`), reported at 1.0.
+        toolhead.move_to(3.25, 3.0);
+        printer.send_event(&KlippyEvent::ToolheadSyncPrintTime {
+            curtime: 1.0,
+            est_print_time: 3.0,
+            print_time: 3.25,
+        });
+        // Upstream's payload is the raised print time plus `PIN_MIN_TIME`
+        // (the `est_print_time` of its handler's signature).
+        assert_eq!(printing_times(&sent), [3.35]);
+        let status = object.get_status(1.0);
+        assert_eq!(status["state"], "Printing");
+        assert_eq!(status["printing_time"], 0.0);
+
+        // The planner moves on: the tick sees the print time advance, but it is
+        // no longer the source and must not report a second start.
+        toolhead.move_to(4.0, 5.0);
+        reactor.advance(0.5);
+        assert_eq!(printing_times(&sent), [3.35]);
+        assert_eq!(object.get_status(1.5)["state"], "Printing");
+        // `printing_time` counts from the event's `curtime`, not from the tick.
+        assert_eq!(object.get_status(1.5)["printing_time"], 0.5);
+    }
+
+    /// The handler keeps upstream's argument order, so the timeout it arms is
+    /// `curtime + READY_TIMEOUT + est - print` (`idle_timeout.py:104-105` with
+    /// the swapped names): 0.25 s after the event here, not the 0.75 s the
+    /// names read as.
+    #[test]
+    fn test_the_sync_handler_arms_the_timeout_with_upstreams_argument_order() {
+        let (printer, reactor) = loaded("[idle_timeout]\ntimeout: 10\n");
+        let object = idle(&printer);
+        // The MCU is ahead of the planner, so the first wake drains the buffer
+        // and settles the machine in `Ready`.
+        reactor.advance(1.0);
+        object.start(Arc::new(FakeToolhead::new(3.25, 0.0)));
+        printer.send_event(&KlippyEvent::ToolheadSyncPrintTime {
+            curtime: 1.0,
+            est_print_time: 3.0,
+            print_time: 3.25,
+        });
+        assert_eq!(object.get_status(1.0)["state"], "Printing");
+
+        reactor.advance(0.2);
+        assert_eq!(
+            object.get_status(1.2)["state"],
+            "Printing",
+            "the re-armed timeout is not due before 1.25"
+        );
+        reactor.advance(0.1);
+        assert_eq!(
+            object.get_status(1.3)["state"],
+            "Ready",
+            "the re-armed timeout fired at 1.25 and drained the buffer"
+        );
+    }
+
+    /// A print start puts the machine in `Printing`, the buffer draining puts it
+    /// back in `Ready`, and the next start puts it in `Printing` again — the
+    /// timer the event arms runs those transitions, and the tick's own renewal
+    /// does not fight it.
+    #[test]
+    fn test_the_sync_event_round_trips_through_printing_and_ready() {
+        let (printer, reactor) = loaded("[idle_timeout]\ntimeout: 10\n");
+        let sent = captured_events(&printer);
+        let object = idle(&printer);
+        // The planner stands at 3.25; the MCU reaches it at 5.0 and its estimate
+        // runs on from there, so the buffer drains between 5.0 and 5.5.
+        let toolhead = Arc::new(FakeToolhead::new(3.25, 5.0));
+        reactor.advance(1.0);
+        object.start(Arc::clone(&toolhead) as Arc<dyn Toolhead>);
+
+        printer.send_event(&KlippyEvent::ToolheadSyncPrintTime {
+            curtime: 1.0,
+            est_print_time: 3.0,
+            print_time: 3.25,
+        });
+        assert_eq!(object.get_status(1.0)["state"], "Printing");
+
+        // The event's timer keeps the machine `Printing` while the buffer is
+        // still ahead of the MCU.
+        reactor.advance(4.0);
+        assert_eq!(object.get_status(5.0)["state"], "Printing");
+        reactor.advance(1.0);
+        assert_eq!(object.get_status(6.0)["state"], "Ready");
+
+        // A second start, on a machine in `Ready`: `Printing` again, with its
+        // own payload and its own re-armed timeout.
+        printer.send_event(&KlippyEvent::ToolheadSyncPrintTime {
+            curtime: 6.0,
+            est_print_time: 6.0,
+            print_time: 6.25,
+        });
+        assert_eq!(object.get_status(6.0)["state"], "Printing");
+        assert_eq!(printing_times(&sent), [3.35, 6.35]);
+        // The second start's timeout runs the machine back to `Ready` once its
+        // buffer is behind the estimate.
+        reactor.advance(1.0);
+        assert_eq!(object.get_status(7.0)["state"], "Ready");
     }
 
     /// `SET_IDLE_TIMEOUT` in `Ready` moves the timeout the machine already has

@@ -130,8 +130,11 @@ use crate::core::klippy::motion::rotary_delta::{
     rotary_delta_active_flags, rotary_delta_position_fn, RotaryDeltaConfig, RotaryDeltaKinematics,
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
-use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
-use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead, WaitMovesState};
+use crate::core::klippy::motion::stepcompress::{HistoryStep, StepCommand, StepCompressError};
+use crate::core::klippy::motion::toolhead::{
+    EstimatedPrintTime, SyncPrintTimeNotify, ToolHead, WaitMovesState,
+};
+use crate::core::klippy::motion::trapq::MoveSegment;
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -513,6 +516,14 @@ pub struct ToolHeadObject {
     /// Flush callbacks registered before connect, installed the same way
     /// (`register_flush_callback` at config load).
     pending_flush_callbacks: Mutex<Vec<Box<dyn Fn(f64) + Send + 'static>>>,
+    /// The `toolhead:sync_print_time` payload waiting to be sent —
+    /// `(curtime, est_print_time, print_time)` — filled by the planner's sync
+    /// hook under the state lock (see [`install_sync_print_time_hook`]) and
+    /// drained by [`run_flush_loop`] once that lock is released.
+    ///
+    /// An `Arc` because the hook is a `'static` closure that outlives the call
+    /// installing it.
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
     /// Set when the object is dropped, to stop the flush task.
     shutdown: Arc<AtomicBool>,
 }
@@ -528,6 +539,29 @@ struct Connected {
     /// `self.trapq`, `force_move.py:33`). Kept beside the toolhead because the
     /// id only means anything for this connection's [`MotionQueuing`].
     force_move_trapq: Option<usize>,
+}
+
+/// One kinematics stepper, as `GET_POSITION` reports it
+/// (`gcode_move.py:269-272`).
+pub struct StepperReport {
+    /// The section name upstream prints (`stepper_x`, `stepper_bed`…).
+    pub name: String,
+    /// The firmware step count (`MCU_stepper.get_mcu_position`).
+    pub mcu_position: i64,
+    /// The position its solver last commanded it to
+    /// (`MCU_stepper.get_commanded_position`).
+    pub commanded_position: f64,
+}
+
+/// Where the machine is, from the steppers up (`GET_POSITION`,
+/// `gcode_move.py:267-274`).
+pub struct PositionReport {
+    /// Every kinematics stepper, in upstream's `kin.get_steppers()` order.
+    pub steppers: Vec<StepperReport>,
+    /// The carriage position the kinematics inverts those steppers to
+    /// (`kin.calc_position`). An axis is `None` when it cannot be recovered —
+    /// an unhomed delta, a non-invertible solver.
+    pub kinematic: [Option<f64>; 3],
 }
 
 /// The step commands to send, paired with the stepper that produced them and
@@ -913,6 +947,7 @@ impl ToolHeadObject {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         object.register_commands(printer)?;
@@ -1159,7 +1194,7 @@ impl PrinterObject for ToolHeadObject {
         // built from, and the runtime setters keep the two in step.
         let limits = self.limits_guard();
         json!({
-            "position": position.as_array(),
+            "position": position.as_slice(),
             "homed_axes": homed_axes,
             "print_time": connected.toolhead.print_time(),
             // The active extruder's name, as upstream reports it
@@ -1359,13 +1394,27 @@ impl PrinterObject for ToolHeadObject {
             // A reading taken here, at connect, would floor every later move at
             // a horizon the clock passed `idle` seconds ago (C5: the whole
             // motion expired and was dumped in one burst → `Timer too close`).
+            let est_reactor = Arc::clone(&reactor_for_est);
             toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(move || {
                 printer_for_est
                     .upgrade()
                     .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                    .and_then(|object| object.estimated_print_time(reactor_for_est.monotonic()))
+                    .and_then(|object| object.estimated_print_time(est_reactor.monotonic()))
                     .unwrap_or(0.0)
             }));
+
+            // The planner cannot send `toolhead:sync_print_time` itself: every
+            // path into `calc_print_time` holds the state lock this object
+            // shares, and a handler that reaches back into it (`idle_timeout`
+            // reads the print time) would deadlock on that same lock. So the
+            // hook parks the payload and the flush task sends it with the lock
+            // released — the ordering `set_position` uses for
+            // `toolhead:set_position`.
+            install_sync_print_time_hook(
+                &mut toolhead,
+                Arc::clone(&self.pending_sync_print_time),
+                Arc::clone(&reactor_for_est),
+            );
 
             // The extruders are the toolhead's `extra_axes`: each has its own
             // trapq, and the extruder queues the extrusion into it
@@ -1431,11 +1480,13 @@ impl PrinterObject for ToolHeadObject {
             }
 
             // The flush task owns nothing the object does not share; it stops
-            // when the object is dropped, by reading `shutdown`.
+            // when the object is dropped, by reading `shutdown`. It also sends
+            // the print time sync the planner parks (`pending_sync_print_time`).
             tokio::spawn(run_flush_loop(
                 Arc::clone(&self.state),
                 Arc::clone(&self.shutdown),
                 self.printer.clone(),
+                Arc::clone(&self.pending_sync_print_time),
             ));
             Ok(())
         })
@@ -1775,6 +1826,30 @@ impl Drop for ToolHeadObject {
     }
 }
 
+/// One motion stepper's step history, as `motion_report/dump_stepper` reads it.
+///
+/// The compressor records firmware clocks; the report needs print seconds, so
+/// the mapping the compressor was given travels with the rows.
+pub struct StepperStepHistory {
+    /// The runs overlapping the read window, newest first
+    /// (`StepCompressor::extract_old`).
+    pub steps: Vec<HistoryStep>,
+    /// Millimetres per step (`MCU_stepper.step_dist`).
+    pub step_dist: f64,
+    /// Clock ticks per print second, and the print time clock 0 corresponds to
+    /// (`StepCompressor::mcu_freq` / `time_offset`).
+    pub mcu_freq: f64,
+    pub time_offset: f64,
+}
+
+impl StepperStepHistory {
+    /// The print time of one of the rows' clocks (upstream's
+    /// `MCU.clock_to_print_time`, the inverse of `print_time_to_clock`).
+    pub fn clock_to_print_time(&self, clock: u64) -> f64 {
+        clock as f64 / self.mcu_freq + self.time_offset
+    }
+}
+
 impl ToolHeadObject {
     fn lock(&self) -> MutexGuard<'_, Option<Connected>> {
         self.state
@@ -1950,6 +2025,27 @@ impl ToolHeadObject {
         connected.toolhead.move_to(position, speed)
     }
 
+    /// Queue a move that also drives the extra axes.
+    ///
+    /// `extras` are the new positions of the non-kinematic axes on position
+    /// index `E_AXIS + 1` and up — a `GCODE_AXIS` manual stepper's slot, or a
+    /// second extruder's. An axis the caller leaves out keeps where it is.
+    ///
+    /// # Errors
+    /// As [`Self::move_to`].
+    pub fn move_to_extended(
+        &self,
+        position: Coord,
+        extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let Some(connected) = guard.as_mut() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected.toolhead.move_to_extended(position, extras, speed)
+    }
+
     /// The commanded position (upstream's `toolhead.get_position`).
     ///
     /// `None` before connect: there is no planner to ask yet, and
@@ -1958,6 +2054,89 @@ impl ToolHeadObject {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.commanded_pos())
+    }
+
+    /// The kinematics steppers' names, in upstream's `kin.get_steppers()`
+    /// order: each rail's motors in axis order, with polar's bare bed stepper
+    /// **before** the rails (`kinematics/polar.py:31-34`) and the rail-less
+    /// motors of winch and generic cartesian after them
+    /// (`kinematics/winch.py:29-30`,
+    /// `kinematics/generic_cartesian.py:233-234`).
+    ///
+    /// Not the order connect adds them in (`rails` → `generic_steppers` →
+    /// `bed` → `winch_steppers`): on polar the two differ, and upstream's is
+    /// what a `GET_POSITION` log is read against.
+    fn kinematics_stepper_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(bed) = &self.bed {
+            names.push(bed.name().to_string());
+        }
+        for rail in &self.rails {
+            names.extend(
+                rail.steppers()
+                    .iter()
+                    .map(|stepper| stepper.name().to_string()),
+            );
+        }
+        names.extend(
+            self.generic_steppers
+                .iter()
+                .map(|stepper| stepper.stepper().name().to_string()),
+        );
+        names.extend(
+            self.winch_steppers
+                .iter()
+                .map(|stepper| stepper.name().to_string()),
+        );
+        names
+    }
+
+    /// Every kinematics stepper's step count and commanded position, plus the
+    /// carriage position the kinematics inverts them to — the three quantities
+    /// `GET_POSITION` reports (`gcode_move.py:267-274`).
+    ///
+    /// The extruder steppers are not kinematics steppers — upstream reaches
+    /// them only through `set_trapq` (`kinematics/extruder.py`) — so they are
+    /// left out. Read under one lock, so the two stepper lines and the
+    /// inversion describe the same instant.
+    ///
+    /// `None` before connect: there is no motion state to report yet.
+    pub fn position_report(&self) -> Option<PositionReport> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let (steppers, positions) = {
+            let queuing = connected.toolhead.motion_queuing_mut();
+            let mut steppers = Vec::new();
+            let mut positions = HashMap::new();
+            for name in self.kinematics_stepper_names() {
+                let Some(stepper) = queuing
+                    .steppers()
+                    .iter()
+                    .find(|stepper| stepper.name() == name)
+                else {
+                    // A kinematics stepper the motion queue does not hold: its
+                    // rail did not reach connect, so there is nothing to report
+                    // for it.
+                    continue;
+                };
+                positions.insert(name.clone(), stepper.commanded_position());
+                steppers.push(StepperReport {
+                    name,
+                    mcu_position: stepper.mcu_position(),
+                    commanded_position: stepper.commanded_position(),
+                });
+            }
+            (steppers, positions)
+        };
+        let kinematic = connected
+            .toolhead
+            .kinematics()
+            .map(|kinematics| kinematics.calc_position(&positions))
+            .unwrap_or([None; 3]);
+        Some(PositionReport {
+            steppers,
+            kinematic,
+        })
     }
 
     /// The kinematic Z position at a past print time, from the stepper step
@@ -1992,6 +2171,61 @@ impl ToolHeadObject {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.main_trapq())
+    }
+
+    /// The segments of trapq `trapq` that overlap `start_time..end_time`,
+    /// newest first (`trapq_extract_old`, the read side of
+    /// `motion_report/dump_trapq`).
+    ///
+    /// `trapq` is a [`MotionQueuing`](crate::core::klippy::motion::MotionQueuing)
+    /// id from this machine — [`ToolHeadObject::main_trapq`] or
+    /// [`crate::core::klippy::extras::extruder::PrinterExtruder::trapq`].
+    /// `None` before connect (the motion state the ids index does not exist
+    /// yet).
+    pub fn trapq_extract(
+        &self,
+        trapq: usize,
+        max: usize,
+        start_time: f64,
+        end_time: f64,
+    ) -> Option<Vec<MoveSegment>> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        Some(
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .trapq(trapq)
+                .extract_old(max, start_time, end_time),
+        )
+    }
+
+    /// One motion stepper's recent step runs plus the clock mapping that turns
+    /// its records' clocks into print times — what
+    /// `motion_report/dump_stepper` streams (`MCU_stepper.dump_steps`).
+    ///
+    /// `None` before connect, or when no motion stepper answers to `name`.
+    pub fn stepper_step_history(
+        &self,
+        name: &str,
+        max: usize,
+        start_clock: u64,
+        end_clock: u64,
+    ) -> Option<StepperStepHistory> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)?;
+        Some(StepperStepHistory {
+            steps: stepper.history(max, start_clock, end_clock),
+            step_dist: stepper.step_dist(),
+            mcu_freq: stepper.mcu_freq(),
+            time_offset: stepper.time_offset(),
+        })
     }
 
     /// Point a motion stepper at a trapq by name, or take it off one with
@@ -2180,6 +2414,55 @@ impl ToolHeadObject {
     }
 }
 
+/// Install the planner's print-time sync hook (`ToolHeadObject::connect`): it
+/// dates the payload and parks it for [`run_flush_loop`].
+///
+/// The hook runs **under the toolhead's state lock** — every `calc_print_time`
+/// path holds it — so it must not send: `Printer::send_event` runs the handlers
+/// on that thread, and a handler that reads the planner would deadlock on the
+/// lock it is called under. A single slot is enough: only the latest raise
+/// matters to the handler, and a burst inside one 10 ms flush tick collapses
+/// into the last one.
+fn install_sync_print_time_hook(
+    toolhead: &mut ToolHead,
+    pending: Arc<Mutex<Option<(f64, f64, f64)>>>,
+    reactor: Arc<dyn Reactor>,
+) {
+    toolhead.set_sync_print_time_notify(SyncPrintTimeNotify::new(
+        move |est_print_time, print_time| {
+            // Upstream reads `curtime` when it enters `_calc_print_time`
+            // (`toolhead.py:261`); this is that instant.
+            *pending.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                Some((reactor.monotonic(), est_print_time, print_time));
+        },
+    ));
+}
+
+/// Send the `toolhead:sync_print_time` the planner parked, if any.
+///
+/// Called by [`run_flush_loop`] with the state lock **released**: the lock is
+/// only held while steps are generated, and this event's handler
+/// (`idle_timeout`'s `handle_sync_print_time`) reads the planner's print time —
+/// sending it under that lock would deadlock the sending thread. The slot is
+/// also emptied before the send, so a handler that raises the print time again
+/// faces no held lock.
+fn flush_sync_print_time(pending: &Mutex<Option<(f64, f64, f64)>>, printer: &Weak<Printer>) {
+    let sync = pending
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some((curtime, est_print_time, print_time)) = sync {
+        send(
+            printer,
+            &KlippyEvent::ToolheadSyncPrintTime {
+                curtime,
+                est_print_time,
+                print_time,
+            },
+        );
+    }
+}
+
 /// The flush task: generate the queued steps and await the transport.
 ///
 /// A command that must not return until the steps it queued are generated and
@@ -2190,6 +2473,7 @@ async fn run_flush_loop(
     state: Arc<Mutex<Option<Connected>>>,
     shutdown: Arc<AtomicBool>,
     printer: Weak<Printer>,
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
 ) {
     loop {
         sleep(FLUSH_INTERVAL).await;
@@ -2205,6 +2489,10 @@ async fn run_flush_loop(
                 None => Ok(Vec::new()),
             }
         };
+        // The lock is out of scope here, so the print-time sync the planner
+        // parked can be sent (it is parked under that lock instead — see
+        // [`install_sync_print_time_hook`]).
+        flush_sync_print_time(&pending_sync_print_time, &printer);
         let batches = match batches {
             Ok(batches) => batches,
             // `check_line` failed, which upstream treats as an internal error
@@ -3901,6 +4189,12 @@ pub(crate) fn load_config(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = ToolHeadObject::new(config, printer)?;
+    // `motion_report` streams the toolhead's own queue under the name
+    // `toolhead` (`motion_report.py:169-172`). Upstream registers it in
+    // `klippy:connect`; the mux table here is filled from the load path, so the
+    // instance is registered by name and the trapq id resolved per batch.
+    crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+        .register_toolhead_trapq()?;
     // Upstream's `add_printer_objects` loads the default modules right after
     // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
     // them: it is what turns g-code coordinates into the toolhead's.
@@ -4036,6 +4330,13 @@ mod tests {
         // The sibling is registered (so its connect runs) and its options were
         // read, which is what makes the factory-less section valid.
         assert!(printer.lookup_object("stepper_z1").is_some());
+        // `GET_POSITION` names the steppers in `kin.get_steppers()` order: each
+        // rail's motors in axis order, the sibling inside its rail
+        // (`kinematics/cartesian.py:46-47`).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_x", "stepper_y", "stepper_z", "stepper_z1"]
+        );
     }
 
     #[test]
@@ -4110,6 +4411,13 @@ mod tests {
         assert_eq!(object.max_angular_velocity, 5.0);
         // The Z rail is found by name, not by cartesian index.
         assert_eq!(object.z_stepper_names(), ["stepper_z"]);
+        // `kin.get_steppers()` puts the bare bed stepper **before** the rails
+        // (`kinematics/polar.py:33-34`), which is not the order connect adds
+        // them in (rails, then bed).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_bed", "stepper_arm", "stepper_z"]
+        );
     }
 
     #[test]
@@ -4425,6 +4733,7 @@ mod tests {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         (printer, object)
@@ -5574,6 +5883,86 @@ mod tests {
         // `set_position` would otherwise silently discard them.
         let steppers = connected_ref.toolhead.motion_queuing_mut().steppers_mut();
         assert!(!steppers[0].history(10, 0, u64::MAX).is_empty());
+    }
+
+    /// The print time a raise reports is **parked**, not sent: every
+    /// `calc_print_time` path runs under the toolhead's state lock, and the
+    /// event's handler reads the planner (`idle_timeout`), so sending there
+    /// would deadlock. `connect` installs this hook
+    /// ([`install_sync_print_time_hook`]) and the flush task sends the parked
+    /// payload once the lock is released ([`flush_sync_print_time`],
+    /// [`run_flush_loop`]).
+    #[test]
+    fn test_the_sync_print_time_is_parked_and_sent_with_the_lock_released() {
+        let reactor = Arc::new(crate::core::klippy::reactor::ManualReactor::new());
+        let pending = Arc::new(Mutex::new(None));
+        let (state, _gcode, printer) = connected_with_printer(homed_toolhead());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&sent);
+            printer.register_event_handler(
+                KlippyEvent::ToolheadSyncPrintTime {
+                    curtime: 0.0,
+                    est_print_time: 0.0,
+                    print_time: 0.0,
+                },
+                Box::new(move |event| {
+                    if let KlippyEvent::ToolheadSyncPrintTime {
+                        curtime,
+                        est_print_time,
+                        print_time,
+                    } = event
+                    {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                            *curtime,
+                            *est_print_time,
+                            *print_time,
+                        ));
+                    }
+                }),
+            );
+        }
+        // The clock the hook dates the event with (`toolhead.py:261`).
+        reactor.advance(2.0);
+
+        {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let connected = guard.as_mut().expect("the machine is connected");
+            connected
+                .toolhead
+                .set_estimated_print_time_source(EstimatedPrintTime::new(|| 5.0));
+            install_sync_print_time_hook(
+                &mut connected.toolhead,
+                Arc::clone(&pending),
+                Arc::clone(&reactor) as Arc<dyn Reactor>,
+            );
+            // Priming raises the print time to the estimate plus the buffer,
+            // which is the raise that sends the event upstream.
+            let print_time = connected.toolhead.get_last_move_time();
+            assert!((print_time - 5.25).abs() < 1e-9, "{print_time}");
+
+            // The raise happened under this lock, and only parked the payload.
+            assert!(
+                sent.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+                "the event must not be sent while the state lock is held"
+            );
+            assert_eq!(
+                *pending.lock().unwrap_or_else(|p| p.into_inner()),
+                Some((2.0, 5.0, 5.25))
+            );
+        }
+
+        // With the lock released, the flush task sends it: the payload is the
+        // one upstream sends, in its order (`toolhead.py:267-268`).
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(
+            *sent.lock().unwrap_or_else(|p| p.into_inner()),
+            [(2.0, 5.0, 5.25)]
+        );
+
+        // Nothing raised since: nothing left to send.
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(sent.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
     }
 
     /// `z_stepper_names` reads the Z rail in config order — primary first,

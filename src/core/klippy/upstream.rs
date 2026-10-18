@@ -1883,7 +1883,16 @@ fn printer_config_files() -> Vec<PathBuf> {
 /// spells out: a `#[tokio::test]` runtime drops by waiting **forever** for a parked
 /// blocking device read, so a part that outlives `teardown` hangs the suite instead
 /// of failing it. Here the shutdown is bounded, and a leak is the failure.
-#[ignore = "temporary: the mainsail.cfg gaps are being closed"]
+///
+/// It is the only case in the corpus whose config holds `[virtual_sdcard]` and
+/// `[pause_resume]` together, and that pair had a cycle no part's `Drop` could
+/// reach: the dispatcher's command table held the `pause_resume` object
+/// **strongly** while the object held the SD card, which holds that same
+/// dispatcher (`extras/pause_resume.rs`, `register_commands`). The table
+/// therefore outlived `teardown` and kept every part it captured — each `Mcu`
+/// among them, whose `Drop` releases its receive task's blocking read — so the
+/// runtime had to give up after `SHUTDOWN_BOUND`. The commands are registered
+/// weakly now, and the bound is the assertion.
 #[test]
 fn the_mainsail_client_macros_load_and_run() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1891,18 +1900,7 @@ fn the_mainsail_client_macros_load_and_run() {
         .build()
         .expect("a case runtime");
     let failures = runtime.block_on(async {
-        let mut text = format!("{PRINTER_SECTIONS}\n{MAINSAIL_CFG}");
-        if std::env::var("KLIPPERX_MAINSAIL_BARE").is_ok() {
-            text = PRINTER_SECTIONS.to_string();
-        }
-        if std::env::var("KLIPPERX_MAINSAIL_NO_MACROS").is_ok() {
-            text = drop_macros(&text);
-        }
-        if let Ok(drop_name) = std::env::var("KLIPPERX_MAINSAIL_DROP") {
-            for name in drop_name.split(',') {
-                text = drop_section(&text, name);
-            }
-        }
+        let text = format!("{PRINTER_SECTIONS}\n{MAINSAIL_CFG}");
         let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
         let mut failures = Vec::new();
         for script in MAINSAIL_SCRIPTS {
@@ -2043,38 +2041,3 @@ const MAINSAIL_SCRIPTS: &[&str] = &[
     "RESUME",
     "CANCEL_PRINT",
 ];
-
-/// Temporary bisect helper for the mainsail leak hunt.
-fn drop_section(text: &str, name: &str) -> String {
-    let header = format!("[{name}]");
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping = trimmed == header;
-        }
-        if !skipping {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}
-
-/// Temporary bisect helper: drop every `[gcode_macro …]` section.
-fn drop_macros(text: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            skipping = trimmed.starts_with("[gcode_macro");
-        }
-        if !skipping {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
-}

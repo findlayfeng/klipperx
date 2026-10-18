@@ -49,11 +49,13 @@
 //! A `GCODE_AXIS` manual stepper (or a second extruder) adds an axis past `E`:
 //! `toolhead:update_extra_axes` rebuilds [`MoveState::axis_map`], so the
 //! letter registers address the extra position slots exactly as `X`/`Y`/`Z`/`E`
-//! address the first four (`gcode_move.py:118-131`). Only the **coordinate**
-//! side is modelled here: `G1 A10` reads and records the extra axis, but the
-//! planner has no position slot and no trapq for it yet, so the move that
-//! leaves this module still carries four axes (the `manual_stepper` module
-//! docs register the missing step generation).
+//! address the first four (`gcode_move.py:118-131`). `G1 A10` writes the extra
+//! slot and hands the tail to [`MoveTarget::move_to_extended`], so it reaches
+//! the planner as `Move::extra_start`/`extra_end` and the extra axis' own
+//! `check_move`/`process_move` see their distance. Whether that becomes steps
+//! is the axis' business: the extruder already queues its own trapq, a
+//! `GCODE_AXIS` manual stepper does not yet (its module docs register that
+//! gap).
 //!
 //! # What is not here
 //!
@@ -94,6 +96,21 @@ pub trait MoveTarget: Send + Sync {
     /// Queue a move to `position` at `speed` mm/s.
     fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError>;
 
+    /// Queue a move that also drives the extra axes.
+    ///
+    /// `extras` is the tail of `last_position` — the positions of the extra
+    /// axes, index 0 being the first one past `E`. A transform that does not
+    /// model extra axes (`bed_tilt`, `exclude_object`, a test double) keeps the
+    /// four-axis move by default.
+    fn move_to_extended(
+        &self,
+        position: Coord,
+        _extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        self.move_to(position, speed)
+    }
+
     /// The toolhead's current position.
     fn position(&self) -> Coord;
 }
@@ -104,6 +121,15 @@ struct ToolheadTarget(Arc<ToolHeadObject>);
 impl MoveTarget for ToolheadTarget {
     fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
         self.0.move_to(position, speed)
+    }
+
+    fn move_to_extended(
+        &self,
+        position: Coord,
+        extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        self.0.move_to_extended(position, extras, speed)
     }
 
     fn position(&self) -> Coord {
@@ -718,10 +744,23 @@ fn cmd_g1(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         }
         (*last_position, *speed)
     };
-    // The extra-axis tail has no planner slot yet, so the move carries the four
-    // modelled axes (see the module docs).
+    move_with_transform(&target, position, speed)
+}
+
+/// Upstream's `move_with_transform`: queue a toolhead move to `position`.
+///
+/// A [`Coord`] holds the four modelled axes and carries the extra axes behind
+/// them, so the tail rides beside the move (`Move::extra_start`/`extra_end`) —
+/// the planner and every [`ExtraAxis`](crate::core::klippy::motion::extra::ExtraAxis)
+/// then see the extra axis' distance.
+fn move_with_transform(
+    target: &Arc<dyn MoveTarget>,
+    position: Coord,
+    speed: f64,
+) -> Result<(), CommandError> {
+    let extras = position.as_slice().get(AXES..).unwrap_or(&[]);
     let toolhead = Coord::new(position.x(), position.y(), position.z(), position.e());
-    target.move_to(toolhead, speed)
+    target.move_to_extended(toolhead, extras, speed)
 }
 
 /// `G20`: inches. The port speaks millimeters only, as upstream refuses it.
@@ -860,7 +899,7 @@ fn cmd_set_gcode_offset(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), C
         }
         (target, state.last_position, speed)
     };
-    target.move_to(position, speed)
+    move_with_transform(&target, position, speed)
 }
 
 /// `SAVE_GCODE_STATE` (`gcode_move.py:232-245`): park the whole state under
@@ -934,7 +973,7 @@ fn cmd_restore_gcode_state(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<()
         state.last_position
     };
     if move_back {
-        target(object)?.move_to(position, speed)?;
+        move_with_transform(&target(object)?, position, speed)?;
     }
     Ok(())
 }
@@ -1064,6 +1103,7 @@ mod tests {
     struct FakeTarget {
         position: Mutex<Coord>,
         moves: Mutex<Vec<(Coord, f64)>>,
+        extras: Mutex<Vec<Vec<f64>>>,
     }
 
     impl FakeTarget {
@@ -1071,11 +1111,20 @@ mod tests {
             Self {
                 position: Mutex::new(position),
                 moves: Mutex::new(Vec::new()),
+                extras: Mutex::new(Vec::new()),
             }
         }
 
         fn moves(&self) -> Vec<(Coord, f64)> {
             self.moves
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        }
+
+        /// The extra-axis tails the moves carried, one per move.
+        fn extras(&self) -> Vec<Vec<f64>> {
+            self.extras
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .clone()
@@ -1100,6 +1149,19 @@ mod tests {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .push((position, speed));
             Ok(())
+        }
+
+        fn move_to_extended(
+            &self,
+            position: Coord,
+            extras: &[f64],
+            speed: f64,
+        ) -> Result<(), CommandError> {
+            self.extras
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .push(extras.to_vec());
+            self.move_to(position, speed)
         }
 
         fn position(&self) -> Coord {
@@ -1643,6 +1705,26 @@ mod tests {
             object.status()["position"],
             json!([10.0, 0.0, 0.0, 0.0, 7.0])
         );
+    }
+
+    #[test]
+    fn test_g1_hands_the_extra_axis_tail_to_the_planner() {
+        let (_printer, gcode, object, target) = machine(Coord::default());
+        object.update_extra_axes_from(&extra_axes());
+
+        gcode.run_script_sync("G1 X10 A10").unwrap();
+
+        // The four axes stay the toolhead coordinate; the extra axis' position
+        // travels beside it as the move's tail (`Move::extra_end`).
+        assert_eq!(target.extras(), [vec![10.0]]);
+        assert_eq!(
+            target.moves(),
+            [(Coord::new(10.0, 0.0, 0.0, 0.0), DEFAULT_SPEED)]
+        );
+
+        // A move that does not name the extra axis keeps where it is.
+        gcode.run_script_sync("G1 X20").unwrap();
+        assert_eq!(target.extras(), [vec![10.0], vec![10.0]]);
     }
 
     #[test]

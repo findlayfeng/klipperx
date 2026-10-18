@@ -516,7 +516,7 @@ impl ExtraAxis for PrinterExtruder {
         }
         let axis_r = ctx.axes_r()[ea_index];
         let axis_d = ctx.axes_d()[ea_index];
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         if (axes_d[0] == 0.0 && axes_d[1] == 0.0) || axis_r < 0.0 {
             // Extrude-only or retraction: limit the speed and acceleration.
             if axis_d.abs() > self.max_e_dist {
@@ -575,13 +575,13 @@ impl ExtraAxis for PrinterExtruder {
             move_.accel_t,
             move_.cruise_t,
             move_.decel_t,
-            crate::core::klippy::mathutil::Xyz::new(move_.start_pos.axis(ea_index), 0.0, 0.0),
+            crate::core::klippy::mathutil::Xyz::new(move_.start_axis(ea_index), 0.0, 0.0),
             crate::core::klippy::mathutil::Xyz::new(1.0, can_pressure_advance as u8 as f64, 0.0),
             move_.start_v * axis_r,
             move_.cruise_v * axis_r,
             move_.accel * axis_r,
         );
-        *Self::lock(&self.last_position) = move_.end_pos.axis(ea_index);
+        *Self::lock(&self.last_position) = move_.end_axis(ea_index);
     }
 
     fn find_past_position(&self, _print_time: f64) -> f64 {

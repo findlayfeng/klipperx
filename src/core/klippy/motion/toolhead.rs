@@ -197,8 +197,17 @@ pub struct ToolHead {
     /// The trapq the kinematic move is appended to; each extra axis has its
     /// own (`MotionQueuing::allocate_trapq`).
     main_trapq: usize,
-    /// The non-kinematic axes (extruders), on position index 3 and up.
+    /// The non-kinematic axes (extruders), on position index `E_AXIS` and up.
     extra_axes: Vec<Arc<dyn ExtraAxis>>,
+    /// Where the extra axes **past [`E_AXIS`]** are, index 0 == the first one
+    /// after the four modelled axes.
+    ///
+    /// Upstream keeps these in the tail of `commanded_pos`, which grows a slot
+    /// per `add_extra_axis` (`toolhead.py:378-385`) and is what a `Move` reads
+    /// its start and end from (`:20-24`). This port's [`Coord`] is four axes,
+    /// so the tail lives here and travels into `Move::extra_start`/
+    /// `extra_end`.
+    extra_pos: Vec<f64>,
 }
 
 impl ToolHead {
@@ -223,6 +232,7 @@ impl ToolHead {
             kinematics: None,
             main_trapq,
             extra_axes: Vec::new(),
+            extra_pos: Vec::new(),
         }
     }
 
@@ -236,8 +246,20 @@ impl ToolHead {
     ///
     /// The caller owns the axis' trapq and has already pointed its stepper at
     /// it (`PrinterExtruder.stepper.set_trapq`).
+    ///
+    /// Upstream flushes the look-ahead first (`toolhead.py:442`: a queued move
+    /// has as many axis slots as the toolhead had then) and appends the axis'
+    /// position to `commanded_pos`. Here the position of the **first** extra
+    /// axis is the `e` of the toolhead's [`Coord`] (it is the extruder slot,
+    /// position [`E_AXIS`]); every later one gets a tail slot in
+    /// [`Self::extra_pos`], seeded the way upstream's `axis_pos` argument does.
     pub fn add_extra_axis(&mut self, axis: Arc<dyn ExtraAxis>) {
+        self.process_lookahead();
+        let position = axis.find_past_position(self.print_time);
         self.extra_axes.push(axis);
+        if self.extra_axes.len() > 1 {
+            self.extra_pos.push(position);
+        }
     }
 
     /// The non-kinematic axes.
@@ -249,14 +271,22 @@ impl ToolHead {
     ///
     /// A `GCODE_AXIS=` request takes the manual stepper back off the axis list;
     /// upstream compares by object identity (`ea not in self.extra_axes`), so
-    /// this matches on the shared allocation.
+    /// this matches on the shared allocation. Like [`Self::add_extra_axis`], it
+    /// flushes the look-ahead first and drops the axis' position slot
+    /// (`toolhead.py:446-452`).
+    /// [`Self::extra_pos`] holds one position per axis **past** [`E_AXIS`], so
+    /// the first extra axis (the extruder) has none.
     pub fn remove_extra_axis(&mut self, axis: &Arc<dyn ExtraAxis>) {
+        self.process_lookahead();
         if let Some(index) = self
             .extra_axes
             .iter()
             .position(|candidate| Arc::ptr_eq(candidate, axis))
         {
             self.extra_axes.remove(index);
+            if index > 0 {
+                self.extra_pos.remove(index - 1);
+            }
         }
     }
 
@@ -404,7 +434,38 @@ impl ToolHead {
     /// A zero-length move is ignored; the kinematics' own `check_move`
     /// (bounds, per-axis speed limits) is FW5e.
     pub fn move_to(&mut self, newpos: Coord, speed: f64) -> Result<(), CommandError> {
-        let mut move_ = Move::new(self.commanded_pos, newpos, speed, &self.limits);
+        self.move_to_extended(newpos, &[], speed)
+    }
+
+    /// Queue a move that also names the extra axes.
+    ///
+    /// `extras` are the new positions of the non-kinematic axes on position
+    /// index `E_AXIS + 1` and up; an axis the caller leaves out keeps where it
+    /// is (upstream's `G1` writes only the letters it is given into a position
+    /// list that carries every axis).
+    ///
+    /// # Errors
+    /// As [`Self::move_to`].
+    pub fn move_to_extended(
+        &mut self,
+        newpos: Coord,
+        extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        let extra_start = self.extra_pos.clone();
+        let extra_end: Vec<f64> = extra_start
+            .iter()
+            .enumerate()
+            .map(|(index, start)| extras.get(index).copied().unwrap_or(*start))
+            .collect();
+        let mut move_ = Move::new_extended(
+            self.commanded_pos,
+            &extra_start,
+            newpos,
+            &extra_end,
+            speed,
+            &self.limits,
+        );
         if move_.move_d == 0.0 {
             return Ok(());
         }
@@ -416,19 +477,13 @@ impl ToolHead {
         }
         for (index, axis) in self.extra_axes.iter().enumerate() {
             let ea_index = index + E_AXIS;
-            // A second and later extra axis would need a position slot past
-            // the move's four; those slots are not modelled yet (the guarded
-            // downgrade for multi-extruder configs), so skip rather than
-            // index out of bounds.
-            if ea_index >= move_.axes_d.len() {
-                continue;
-            }
             if move_.axes_d[ea_index] != 0.0 {
                 let mut ctx = MoveContext::new(&mut move_);
                 axis.check_move(&mut ctx, ea_index)?;
             }
         }
         self.commanded_pos = move_.end_pos;
+        self.extra_pos = move_.extra_end.clone();
         // Every non-zero move adds exactly one queue entry (`add_move` pushes
         // unconditionally; the zero-length move left above), so the depth
         // counter mirrors the queue's length.
@@ -529,13 +584,10 @@ impl ToolHead {
                 );
             }
             // The extra axes queue their own trapezoid, on their own trapq
-            // (`klippy/toolhead.py:290-292`).
+            // (`klippy/toolhead.py:290-292`). Every registered axis has a slot
+            // in the move (`Move::new_extended`).
             for (index, axis) in self.extra_axes.iter().enumerate() {
                 let ea_index = index + E_AXIS;
-                // Slots past the move's four are skipped, as in `move_to`.
-                if ea_index >= move_.axes_d.len() {
-                    continue;
-                }
                 if move_.axes_d[ea_index] != 0.0 {
                     axis.process_move(&mut self.motion_queuing, next_move_time, &move_, ea_index);
                 }
@@ -655,6 +707,11 @@ impl ToolHead {
     /// endstop — the next queued move would inherit it as its start time.
     ///
     /// Returns the move's start and end print times.
+    ///
+    /// A drip carries the four modelled axes only: its move starts from
+    /// `commanded_pos` and the extra axes are neither planned nor queued here
+    /// (upstream's `_drip_load_trapq` reaches the main trapq too, and a manual
+    /// stepper has no drip path in this port yet).
     ///
     /// # Errors
     /// The kinematics' `check_move` refusal.
@@ -779,6 +836,7 @@ fn append_move(trapq: &mut Trapq, print_time: f64, move_: &Move) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::mathutil::AXES;
     use crate::core::klippy::motion::itersolve::Axis;
     use crate::core::klippy::motion::stepcompress::StepCommand;
     use crate::core::klippy::motion::stepper::Stepper;
@@ -866,16 +924,13 @@ mod tests {
             move_: &Move,
             ea_index: usize,
         ) {
-            self.queued
-                .lock()
-                .unwrap()
-                .push(move_.end_pos.axis(ea_index));
+            self.queued.lock().unwrap().push(move_.end_axis(ea_index));
             queuing.trapq_mut(self.trapq).append(
                 print_time,
                 move_.accel_t,
                 move_.cruise_t,
                 move_.decel_t,
-                Xyz::new(move_.start_pos.axis(ea_index), 0.0, 0.0),
+                Xyz::new(move_.start_axis(ea_index), 0.0, 0.0),
                 Xyz::new(1.0, 0.0, 0.0),
                 move_.start_v,
                 move_.cruise_v,
@@ -916,6 +971,70 @@ mod tests {
             .is_empty());
         // The X stepper did not move, and the fake axis is not a `Stepper`.
         assert!(batches.is_empty());
+    }
+
+    #[test]
+    fn test_an_extra_axis_at_index_four_is_checked_and_queued() {
+        let mut toolhead = toolhead();
+        // The extruder's slot, then the A axis'.
+        let extruder = toolhead.allocate_trapq();
+        toolhead.add_extra_axis(Arc::new(FakeExtraAxis::new(extruder)) as Arc<dyn ExtraAxis>);
+        let trapq = toolhead.allocate_trapq();
+        let axis = Arc::new(FakeExtraAxis::new(trapq));
+        toolhead.add_extra_axis(Arc::clone(&axis) as Arc<dyn ExtraAxis>);
+
+        // A pure extra-axis move: the kinematic steppers stay still.
+        toolhead
+            .move_to_extended(Coord::new(0.0, 0.0, 0.0, 0.0), &[10.0], 10.0)
+            .unwrap();
+        {
+            let move_ = toolhead.lookahead.last().unwrap();
+            // The move reaches past the four modelled axes and the extra axis'
+            // distance is in it (`G1 A10`'s `axes_r[4]`).
+            assert_eq!(move_.axes_r.len(), AXES + 1);
+            assert_eq!(move_.axes_r[AXES], 1.0);
+            assert_eq!(move_.extra_end, [10.0]);
+            assert_eq!(move_.end_axis(AXES), 10.0);
+        }
+        assert_eq!(*axis.checked.lock().unwrap(), [AXES]);
+
+        let batches = toolhead.flush_step_generation(1.0).unwrap();
+
+        assert_eq!(*axis.queued.lock().unwrap(), [10.0]);
+        assert!(!toolhead
+            .motion_queuing_mut()
+            .trapq(trapq)
+            .moves()
+            .is_empty());
+        assert!(batches.is_empty(), "the extra axis is not a `Stepper`");
+    }
+
+    /// The main trapq stays three axes: the extra slots live beside it, one
+    /// trapq per extra axis (`toolhead.py:284-292`).
+    #[test]
+    fn test_the_main_trapq_stays_three_axes_with_an_extra_axis_present() {
+        let mut toolhead = toolhead();
+        let trapq = toolhead.allocate_trapq();
+        toolhead.add_extra_axis(Arc::new(FakeExtraAxis::new(trapq)) as Arc<dyn ExtraAxis>);
+
+        toolhead
+            .move_to_extended(Coord::new(10.0, 0.0, 0.0, 1.0), &[1.0], 100.0)
+            .unwrap();
+        toolhead.flush_step_generation(1.0).unwrap();
+
+        // The extra axis' ratio must not leak into the main trapq's three
+        // slots: every segment is a plain X move, filler included.
+        let ratios: Vec<Xyz> = toolhead.trapq().moves().iter().map(|s| s.axes_r).collect();
+        assert!(
+            ratios.contains(&Xyz::new(1.0, 0.0, 0.0)),
+            "the kinematic direction: {ratios:?}"
+        );
+        assert!(
+            ratios
+                .iter()
+                .all(|ratio| ratio.y() == 0.0 && ratio.z() == 0.0),
+            "{ratios:?}"
+        );
     }
 
     #[test]

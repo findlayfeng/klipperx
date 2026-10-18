@@ -59,14 +59,11 @@
 //!   `STEPPER_BUZZ STEPPER=dual_carriage` is not registered (both are silent
 //!   unknown-command answers, so the corpus does not care).
 //! * **A config with two extruders ([`dual_carriage.cfg`](crate and its T0/T1
-//!   macros) runs with the second extruder **out of the motion path**: this
-//!   port's `Move.axes_d` has four slots (X/Y/Z/E), so an extra axis past the
-//!   first is skipped by guarded no-ops in the planner instead of receiving
-//!   its own slot — a defensive downgrade of the pre-existing multi-extruder
-//!   port gap (it used to panic on the first `G1`). Full dynamic multi-extruder
-//!   positions (`Coord`/`axes_d` growing per axis, as upstream's
-//!   `gcode_move.py:118-131` does) is a separate unit and a prerequisite of
-//!   upstream's `extruders.test`.
+//!   macros) puts **both** extruders in the motion path**: a `Move` carries one
+//!   position slot per extra axis (`Move::extra_start`/`extra_end`, with
+//!   `axes_d`/`axes_r` as long as the toolhead's axis list), so each extruder
+//!   checks and queues its own trapezoid, and `gcode_move`'s `axis_map` offers
+//!   a `G1` letter for each registered axis.
 //! * **The generic-cartesian module tracks one active carriage**, the last
 //!   `SET_DUAL_CARRIAGE` picked, while upstream keeps a mode per rail
 //!   (`idex_modes.py:37-45,133-139`): selecting the dual carriage of a
@@ -1082,11 +1079,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // The multi-extruder guard (module docs): the corpus config carries two
-    // extruders, and a move has four slots — the second extra axis must be
-    // skipped, not indexed. The recording axis reads `axes_d[ea_index]` like
-    // the real extruder does, so an unguarded planner panics here exactly as
-    // `dual_carriage.test` did on its first `G1`.
+    // The extra-axis slots: a move is as long as the toolhead's axis list, so
+    // a second extra axis has a position slot of its own instead of being
+    // skipped. The recording axis reads `axes_d[ea_index]` the way the real
+    // extruder reads it, so an out-of-slot index panics here exactly as it
+    // would in the extruder.
     // -----------------------------------------------------------------------
 
     #[derive(Debug)]
@@ -1150,12 +1147,12 @@ mod tests {
         }
     }
 
-    /// The guard's two sides, pinned: with two extra axes the planner skips
-    /// the out-of-slot second one in **all three** paths (per-move check,
-    /// junction fold-in, trapq queueing) without panicking, while the first
-    /// extra axis keeps its slot-3 behaviour unchanged.
+    /// Both slots, pinned: every extra axis has a position slot now that a
+    /// move is as long as the toolhead's axis list, so each one runs its own
+    /// hooks — the per-move check and the trapq queueing where its distance is
+    /// non-zero, and the junction fold-in on every pair of moves.
     #[test]
-    fn a_second_extra_axis_is_skipped_and_the_first_keeps_its_slot() {
+    fn a_second_extra_axis_gets_its_own_slot() {
         let mut toolhead = ToolHead::new(MoveLimits {
             max_velocity: 300.0,
             max_accel: 3000.0,
@@ -1167,24 +1164,24 @@ mod tests {
         toolhead.add_extra_axis(Arc::clone(&first) as Arc<dyn ExtraAxis>);
         toolhead.add_extra_axis(Arc::clone(&second) as Arc<dyn ExtraAxis>);
 
-        // Two extrude-only moves: the check path runs for both moves, the
-        // junction path pairs the second move with the first.
+        // Two extrude-only moves, each naming both extra axes: the check path
+        // runs for both moves, the junction path pairs the second with the
+        // first, and queueing sees both.
         toolhead
-            .move_to(Coord::new(0.0, 0.0, 0.0, 5.0), 10.0)
+            .move_to_extended(Coord::new(0.0, 0.0, 0.0, 5.0), &[1.0, 2.0], 10.0)
             .unwrap();
         toolhead
-            .move_to(Coord::new(0.0, 0.0, 0.0, 6.0), 10.0)
+            .move_to_extended(Coord::new(0.0, 0.0, 0.0, 6.0), &[1.5, 2.5], 10.0)
             .unwrap();
         toolhead.flush_step_generation(1.0).unwrap();
 
-        // Slot 3 (the first extra axis) is checked once per move, queued once
-        // per move, and folds one junction limit in — as before the guard.
+        // Slot 3 (the first extra axis) and slot 4 (the second) each run their
+        // hooks once per move.
         assert_eq!(*first.checked.lock().unwrap(), [3, 3]);
         assert_eq!(*first.junctions.lock().unwrap(), [3]);
         assert_eq!(*first.queued.lock().unwrap(), [3, 3]);
-        // Slot 4 does not exist: the second extra axis never runs a hook.
-        assert!(second.checked.lock().unwrap().is_empty());
-        assert!(second.junctions.lock().unwrap().is_empty());
-        assert!(second.queued.lock().unwrap().is_empty());
+        assert_eq!(*second.checked.lock().unwrap(), [4, 4]);
+        assert_eq!(*second.junctions.lock().unwrap(), [4]);
+        assert_eq!(*second.queued.lock().unwrap(), [4, 4]);
     }
 }

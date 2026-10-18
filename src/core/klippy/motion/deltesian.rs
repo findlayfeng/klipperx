@@ -340,7 +340,10 @@ impl Kinematics for DeltesianKinematics {
         let mut limits = self.limits;
         let spos = *ctx.start_pos();
         let epos = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        // A copy: the slice borrow would still be alive when `limit_speed`
+        // needs `ctx` mutable below. Only the four modelled axes are read.
+        let mut axes_d = [0.0; AXES];
+        axes_d.copy_from_slice(&ctx.axes_d()[..AXES]);
         // Recognize the arm home's final position (`deltesian.py:151-153`).
         let mut homing_move = false;
         if epos.x() == 0.0 && epos.z() == self.home_z && axes_d[Y_AXIS] == 0.0 {

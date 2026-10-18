@@ -77,6 +77,7 @@ pub mod probe_eddy_current;
 pub mod pulse_counter;
 pub mod pwm_cycle_time;
 pub mod pwm_tool;
+pub(crate) mod py_literal;
 pub mod quad_gantry_level;
 pub mod query_endstops;
 pub mod resonance_tester;

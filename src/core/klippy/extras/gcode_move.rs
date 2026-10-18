@@ -46,10 +46,6 @@
 //!
 //! # What is not here
 //!
-//! * `GET_POSITION` needs the kinematics' stepper positions and
-//!   `calc_position` (G4-2); it stays an unknown command until then, which
-//!   costs a run nothing — klipper answers unknown commands rather than
-//!   failing them.
 //! * `axis_map` grows for extra axes upstream (`_update_extra_axes`); a
 //!   [`Coord`] is four axes here, so the mapping stops at `E` (G4-2).
 //! * `set_move_transform` is written and both `bed_tilt` (`bed_tilt.rs:376`) and
@@ -63,7 +59,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::event::KlippyEvent;
-use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::toolhead::{PositionReport, ToolHeadObject};
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -319,6 +315,13 @@ impl GCodeMove {
             ("G90", cmd_g90, None, &[], false),
             ("G91", cmd_g91, None, &[], false),
             ("G92", cmd_g92, None, G92_PARAMS, false),
+            (
+                "GET_POSITION",
+                cmd_get_position,
+                Some("Return information on the current location of the toolhead"),
+                &[],
+                true,
+            ),
             ("M82", cmd_m82, None, &[], false),
             ("M83", cmd_m83, None, &[], false),
             ("M114", cmd_m114, None, &[], true),
@@ -781,6 +784,100 @@ fn cmd_m114(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), CommandError>
     Ok(())
 }
 
+/// `GET_POSITION` (`gcode_move.py:261-291`): where the machine thinks it is,
+/// from the MCU step counts down to the g-code offset.
+///
+/// It answers the three questions a motion problem splits into — are the
+/// steps right, does the kinematics invert them right, are the offsets right —
+/// in one reply. Unlike `M114` it reads the **toolhead**, not the move
+/// transform, so a `bed_mesh` compensation shows up in `M114` but not in the
+/// `toolhead:` line here.
+fn cmd_get_position(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+    let toolhead = object
+        .printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT));
+    let Some(toolhead) = toolhead else {
+        return Err(CommandError::new("Printer not ready"));
+    };
+    // A toolhead that exists but has not connected has nothing to report
+    // either (`gcode_move.py:265-266` is the same refusal).
+    let Some(report) = toolhead.position_report() else {
+        return Err(CommandError::new("Printer not ready"));
+    };
+    let position = toolhead.position().unwrap_or_default();
+    let lines = position_lines(&report, position, &object.lock());
+    gcmd.respond_info(&lines);
+    Ok(())
+}
+
+/// The seven lines `GET_POSITION` answers with (`gcode_move.py:283-291`),
+/// verbatim: the two stepper lines in `kin.get_steppers()` order,
+/// `kinematic:` and `gcode homing:` for X/Y/Z only, everything six decimals
+/// except the MCU step counts, which are integers.
+fn position_lines(report: &PositionReport, toolhead_position: Coord, state: &MoveState) -> String {
+    let mcu_pos = report
+        .steppers
+        .iter()
+        .map(|stepper| format!("{}:{}", stepper.name, stepper.mcu_position))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stepper_pos = report
+        .steppers
+        .iter()
+        .map(|stepper| format!("{}:{:.6}", stepper.name, stepper.commanded_position))
+        .collect::<Vec<_>>()
+        .join(" ");
+    // An axis the inverse solver cannot recover falls back to the commanded
+    // position, which is what `calc_toolhead_pos` does for the same case
+    // (`homing.py:74-75`: `cp if cp is not None else tp`). Upstream's
+    // `GET_POSITION` has no answer there — it formats the `None` and raises.
+    let kin_pos = report
+        .kinematic
+        .into_iter()
+        .enumerate()
+        .map(|(axis, value)| {
+            format!(
+                "{}:{:.6}",
+                ["X", "Y", "Z"][axis],
+                value.unwrap_or(toolhead_position.axis(axis))
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    // `homing_position` is four slots here (`gcode_move.py:32`'s has three);
+    // upstream prints the three axes it hands the kinematics.
+    let homing_pos = ["X", "Y", "Z"]
+        .into_iter()
+        .zip(state.homing_position)
+        .map(|(axis, value)| format!("{axis}:{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "mcu: {mcu_pos}\n\
+         stepper: {stepper_pos}\n\
+         kinematic: {kin_pos}\n\
+         toolhead: {}\n\
+         gcode: {}\n\
+         gcode base: {}\n\
+         gcode homing: {homing_pos}",
+        xyze_line(toolhead_position.as_array()),
+        xyze_line(state.last_position.as_array()),
+        xyze_line(&state.base_position),
+    )
+}
+
+/// `X:` … `E:` with six decimals — the shape of `GET_POSITION`'s four-axis
+/// lines (`zip("XYZE", position)`, `gcode_move.py:275-280`).
+fn xyze_line(position: &[f64; AXES]) -> String {
+    ["X", "Y", "Z", "E"]
+        .into_iter()
+        .zip(position)
+        .map(|(axis, value)| format!("{axis}:{value:.6}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -788,6 +885,7 @@ fn cmd_m114(object: &GCodeMove, gcmd: &GcodeCommand) -> Result<(), CommandError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::extras::toolhead::StepperReport;
     use crate::core::klippy::mathutil::Z_AXIS;
     use crate::core::klippy::reactor::ManualReactor;
 
@@ -1079,6 +1177,118 @@ mod tests {
         assert!(err.to_string().contains("Unknown g-code state"), "{err}");
     }
 
+    /// The report a cartesian machine standing at X12.5 Y-25 gives — the
+    /// shape upstream's own example has (`gcode_move.py:269-282`).
+    fn cartesian_report() -> PositionReport {
+        PositionReport {
+            steppers: vec![
+                StepperReport {
+                    name: "stepper_x".to_string(),
+                    mcu_position: 100,
+                    commanded_position: 12.5,
+                },
+                StepperReport {
+                    name: "stepper_y".to_string(),
+                    mcu_position: -200,
+                    commanded_position: -25.0,
+                },
+                StepperReport {
+                    name: "stepper_z".to_string(),
+                    mcu_position: 0,
+                    commanded_position: 0.0,
+                },
+            ],
+            kinematic: [Some(12.5), Some(-25.0), Some(0.0)],
+        }
+    }
+
+    /// The whole reply: seven lines, the stepper lines in the order the report
+    /// gives them, `mcu:` in integers and everything else six decimals,
+    /// `kinematic:`/`gcode homing:` for three axes only.
+    #[test]
+    fn test_get_position_prints_the_seven_lines() {
+        let position = Coord::new(12.5, -25.0, 0.0, 0.0);
+        let state = MoveState {
+            last_position: position,
+            ..Default::default()
+        };
+
+        let lines = position_lines(&cartesian_report(), position, &state);
+
+        assert_eq!(
+            lines,
+            "mcu: stepper_x:100 stepper_y:-200 stepper_z:0\n\
+             stepper: stepper_x:12.500000 stepper_y:-25.000000 stepper_z:0.000000\n\
+             kinematic: X:12.500000 Y:-25.000000 Z:0.000000\n\
+             toolhead: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000\n\
+             gcode: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000\n\
+             gcode base: X:0.000000 Y:0.000000 Z:0.000000 E:0.000000\n\
+             gcode homing: X:0.000000 Y:0.000000 Z:0.000000"
+        );
+    }
+
+    /// `M114` answers `last - base` (and E divided by the factor), but
+    /// `GET_POSITION` prints the two arrays as they are — that is the one
+    /// difference a reader of both rows has to know (`gcode_move.py:277-280`).
+    #[test]
+    fn test_get_position_reports_gcode_and_base_as_they_are() {
+        let state = MoveState {
+            last_position: Coord::new(10.0, 20.0, 30.0, 40.0),
+            base_position: [1.0, 2.0, 3.0, 4.0],
+            homing_position: [0.5, 0.5, 0.5, 0.5],
+            extrude_factor: 2.0,
+            ..Default::default()
+        };
+
+        let lines = position_lines(&cartesian_report(), Coord::default(), &state);
+        let reported: Vec<&str> = lines
+            .lines()
+            .filter(|line| line.starts_with("gcode"))
+            .collect();
+
+        assert_eq!(
+            reported,
+            [
+                "gcode: X:10.000000 Y:20.000000 Z:30.000000 E:40.000000",
+                "gcode base: X:1.000000 Y:2.000000 Z:3.000000 E:4.000000",
+                "gcode homing: X:0.500000 Y:0.500000 Z:0.500000",
+            ]
+        );
+    }
+
+    /// An axis the inverse solver cannot recover is printed from the commanded
+    /// position, **per axis** — `calc_toolhead_pos` does the same
+    /// (`homing.py:74-75`: `cp if cp is not None else tp`), and upstream's
+    /// `GET_POSITION` has no answer at all there (it formats the `None` and
+    /// raises).
+    #[test]
+    fn test_get_position_falls_back_to_the_commanded_position() {
+        let mut report = cartesian_report();
+        // Only Y is unrecoverable, and the two that are keep their solved
+        // values — neither the commanded ones nor a stand-in zero.
+        report.kinematic = [Some(11.0), None, Some(1.0)];
+        let position = Coord::new(12.5, -25.0, 3.0, 0.0);
+        let state = MoveState::default();
+
+        let lines = position_lines(&report, position, &state);
+
+        assert_eq!(
+            lines.lines().nth(2),
+            Some("kinematic: X:11.000000 Y:-25.000000 Z:1.000000")
+        );
+    }
+
+    /// Without a `toolhead` object the command refuses with upstream's exact
+    /// wording (`gcode_move.py:265-266`) — `M114` answers in the same state.
+    #[test]
+    fn test_get_position_needs_a_toolhead() {
+        let (_printer, gcode, _object, _target) = machine(Coord::default());
+
+        let err = gcode.run_script_sync("GET_POSITION").unwrap_err();
+
+        assert_eq!(err.to_string(), "Printer not ready");
+    }
+
     #[test]
     fn test_m114_reports_the_g_code_position() {
         let (_printer, gcode, _object, _target) = machine(Coord::new(0.0, 1.5, 0.0, 0.0));
@@ -1178,5 +1388,8 @@ mod tests {
         );
         // No named word at all: the object a client saw before.
         assert!(commands["G20"].get("parameters").is_none());
+        // `GET_POSITION` reads no word either, and is in the table at all (it
+        // answers before ready, like `M114`).
+        assert!(commands["GET_POSITION"].get("parameters").is_none());
     }
 }

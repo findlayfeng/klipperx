@@ -1054,7 +1054,10 @@ mod tests {
         );
 
         result.unwrap();
-        // Main sections first, then the prefix section.
+        // Main sections first, then the prefix section. `[output_pin]` also asks
+        // for the shared `display_template` registry and the
+        // `template_evaluator` `TEMPLATE=` subscribes through, as upstream's
+        // constructor does (`output_pin.py:228`).
         assert_eq!(
             printer.objects(),
             [
@@ -1065,6 +1068,8 @@ mod tests {
                 "error_mcu",
                 "serial_ports",
                 "mcu",
+                "display_template",
+                "template_evaluator",
                 "output_pin fan"
             ]
         );

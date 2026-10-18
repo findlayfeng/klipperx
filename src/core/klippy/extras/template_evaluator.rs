@@ -24,11 +24,12 @@
 //!
 //! [`PrinterTemplateEvaluator::set_template`] is upstream's `set_template`
 //! (`output_pin.py:164-184`): it reads `TEMPLATE=` plus every `PARAM_*` from
-//! the command and either subscribes the callback under that name or — when
-//! `TEMPLATE=` is empty — unsubscribes it. Upstream keys the table by the
-//! callback object itself (a bound method); a Rust closure has no identity of
-//! its own, so the key is the `Arc`'s address, which is stable for as long as
-//! the consumer keeps its one `Arc` (a pin's schedule, a fan).
+//! the command and either subscribes the callback under a key or — when
+//! `TEMPLATE=` is empty — unsubscribes that key. Upstream keys the table by the
+//! consumer's bound method `_template_update` (`:128`), which is one object per
+//! pin or fan; a Rust closure has no identity of its own, so the consumer names
+//! itself instead (`"output_pin fan"`, `"fan_generic side_fan"`). One
+//! subscription per consumer follows in both spellings.
 //!
 //! The three refusals are upstream's wording: an unknown template name, a
 //! `PARAM_*` the template does not declare, and a `PARAM_*` value that is not
@@ -99,8 +100,8 @@ struct EvaluatorCore {
     /// The `[display_template]` registry (`led.rs`'s, upstream's
     /// `lookup_display_templates`).
     templates: Arc<DisplayTemplates>,
-    /// The active subscriptions, keyed by callback address.
-    active: Mutex<BTreeMap<usize, Active>>,
+    /// The active subscriptions, keyed by consumer name.
+    active: Mutex<BTreeMap<String, Active>>,
     /// The render timer, present exactly while something is subscribed.
     timer: Mutex<Option<TimerHandle>>,
 }
@@ -150,7 +151,12 @@ pub fn lookup_template_eval(
 impl PrinterTemplateEvaluator {
     /// Upstream's `set_template` (`output_pin.py:164-184`): subscribe
     /// `callback` to the command's `TEMPLATE=` (with its `PARAM_*` values), or
-    /// unsubscribe it when that word is empty.
+    /// unsubscribe `key` when that word is empty.
+    ///
+    /// `key` is the consumer's stable identity. Upstream's table is keyed by
+    /// the consumer's bound `_template_update`, one object per pin or fan; this
+    /// is that object's name (`"output_pin fan"`), so a second subscription on
+    /// the same consumer replaces the first.
     ///
     /// An empty `TEMPLATE=` is not a missing one: upstream reads the word and
     /// branches on its truthiness, so `SET_PIN PIN=x TEMPLATE=` cancels the
@@ -163,18 +169,18 @@ impl PrinterTemplateEvaluator {
     /// and its callers never trigger.
     pub fn set_template(
         &self,
+        key: &str,
         gcmd: &GcodeCommand,
         callback: TemplateUpdate,
     ) -> Result<(), CommandError> {
         let Some(tpl_name) = gcmd.get_command_parameters().get("TEMPLATE").cloned() else {
             return Err(CommandError::new("missing TEMPLATE"));
         };
-        let key = callback_key(&callback);
 
         if tpl_name.is_empty() {
             let emptied = {
                 let mut active = self.core.lock_active();
-                active.remove(&key).is_some() && active.is_empty()
+                active.remove(key).is_some() && active.is_empty()
             };
             if emptied {
                 self.stop_timer();
@@ -206,7 +212,7 @@ impl PrinterTemplateEvaluator {
         }
 
         self.core.lock_active().insert(
-            key,
+            key.to_string(),
             Active {
                 template: tpl_name,
                 lparams,
@@ -221,9 +227,9 @@ impl PrinterTemplateEvaluator {
     /// is dated the way the reactor would date it, and the answer is the next
     /// wake time, or `None` when nothing is subscribed.
     ///
-    /// This is upstream's `_render` (`output_pin.py:131-163`). The timer calls
-    /// it; a unit test calls this entry point instead, so it never needs a live
-    /// reactor nor a sleep.
+    /// This is upstream's `_render` (`output_pin.py:131-163`), reachable here
+    /// without a reactor so a unit test can step a period by hand instead of
+    /// waiting for one.
     #[cfg(test)]
     pub(crate) fn render_once(&self, eventtime: f64) -> Option<f64> {
         self.core.render_once(eventtime)
@@ -265,24 +271,14 @@ impl PrinterTemplateEvaluator {
     }
 }
 
-/// The identity a subscription is keyed by.
-///
-/// Upstream keys the table by the bound method (`output_pin.py:128`), which is
-/// one stable object per consumer; here each consumer builds exactly one
-/// [`TemplateUpdate`] and keeps it, so the allocation's address plays that
-/// part. Two different `Arc`s are two subscriptions even when they behave
-/// alike, as two `PinSchedule`s would be upstream.
-fn callback_key(callback: &TemplateUpdate) -> usize {
-    Arc::as_ptr(callback) as *const () as usize
-}
-
 impl EvaluatorCore {
     /// Upstream's `_render` (`output_pin.py:131-163`): render every
     /// subscription and hand it the text; `None` once nothing is subscribed.
     fn render_once(&self, eventtime: f64) -> Option<f64> {
-        // Taken out from under the lock: a callback may subscribe or
-        // unsubscribe another template (an `action_*` in a template could
-        // reach a command), and that must not wait on this walk.
+        // Taken out from under the lock so a subscription's callback runs with
+        // the table free: a callback drives a pin or a fan, which takes that
+        // consumer's own locks, and holding the table across it would put an
+        // unrelated lock inside this one.
         let snapshot: Vec<ActiveView> = {
             let active = self.lock_active();
             active
@@ -351,7 +347,7 @@ impl EvaluatorCore {
 
     /// The subscriptions; a poisoned lock is recovered from so one panicking
     /// callback cannot wedge the evaluator (repo pattern, `adc_scaled.rs`).
-    fn lock_active(&self) -> MutexGuard<'_, BTreeMap<usize, Active>> {
+    fn lock_active(&self) -> MutexGuard<'_, BTreeMap<String, Active>> {
         self.active
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

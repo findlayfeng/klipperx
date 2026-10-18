@@ -156,6 +156,7 @@ fn cmd_set_fan_speed(
         let fan = Arc::clone(fan);
         let fan_name = fan_name.to_string();
         return template_eval.set_template(
+            &format!("fan_generic {fan_name}"),
             gcmd,
             Arc::new(move |text| set_rendered_speed(&fan, &fan_name, text)),
         );
@@ -386,19 +387,69 @@ mod tests {
         }
     }
 
+    /// A `[display_template <name>]` section filed into the shared registry.
+    fn add_display_template(printer: &Arc<Printer>, name: &str, text: &str) {
+        let mut section = ConfigSection::new("display_template", Some(name));
+        section
+            .parameters
+            .insert("text".to_string(), ConfigValue::Single(text.to_string()));
+        crate::core::klippy::extras::led::load_display_template(&wrap(&section), printer)
+            .expect("the template loads");
+    }
+
+    /// The shared evaluator a `TEMPLATE=` subscription lands in.
+    fn evaluator(printer: &Arc<Printer>) -> Arc<PrinterTemplateEvaluator> {
+        crate::core::klippy::extras::template_evaluator::lookup_template_eval(printer)
+            .expect("the evaluator is created on first use")
+    }
+
     #[test]
-    fn test_template_is_rejected_as_not_implemented() {
+    fn test_set_fan_speed_template_re_renders_the_speed() {
+        let (printer, chip) = printer();
+        add_display_template(&printer, "slow", "0.25");
+        add_display_template(&printer, "fast", "0.5");
+        let fan = load(
+            &printer,
+            &section("side_fan", "PH0", &[("kick_start_time", "0")]),
+        )
+        .unwrap();
+        let eval = evaluator(&printer);
+
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=slow")
+            .unwrap();
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25]);
+        assert_eq!(speed(&fan), 0.25);
+
+        // A second subscription replaces the first (one per fan), and the next
+        // render period drives the new value.
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=fast")
+            .unwrap();
+        assert_eq!(eval.render_once(0.5), Some(1.0));
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25, 0.5]);
+        assert_eq!(speed(&fan), 0.5);
+
+        // `TEMPLATE=` cancels it: with nothing subscribed the timer retires and
+        // the fan stays where it was.
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=")
+            .unwrap();
+        assert_eq!(eval.render_once(1.0), None);
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25, 0.5]);
+    }
+
+    #[test]
+    fn test_set_fan_speed_template_must_name_a_display_template() {
         let (printer, chip) = printer();
         load(&printer, &section("side_fan", "PH0", &[])).unwrap();
 
         let err = gcode(&printer)
-            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=hot")
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=nosuch")
             .unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "SET_FAN_SPEED TEMPLATE is not supported: the template evaluator is not implemented"
-        );
+        assert_eq!(err.to_string(), "Unknown display_template 'nosuch'");
         assert!(updates(&pwm(&chip, 0)).is_empty(), "nothing was driven");
     }
 

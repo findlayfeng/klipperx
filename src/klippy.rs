@@ -8,6 +8,7 @@ use crate::core::klippy::api::{
     self, AddressError, Api, ApiTarget, RegistrationError, Server, StartArgs, WebhooksStatus,
     WEBHOOKS_OBJECT,
 };
+use crate::core::klippy::config::build_config_string;
 use crate::core::klippy::config::Config;
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
@@ -89,6 +90,29 @@ fn versions_block(config_file: &str) -> String {
         "Versions: klipperx {}\nConfig: {config_file}",
         env!("CARGO_PKG_VERSION")
     )
+}
+
+/// The `config` rollover block: the config this run loaded.
+///
+/// Upstream's `PrinterConfig.log_config` (`klippy/configfile.py:482-487`,
+/// called from `klippy/klippy.py:117-118`): the sections as the loader read them
+/// — includes spliced in, `SAVE_CONFIG` values applied — fenced so a log reader
+/// can tell them from the records around them. The file's path is already in the
+/// `versions` block, so it is not repeated here.
+fn config_rollover_block(config: &Config) -> String {
+    format!(
+        "===== Config file =====\n{}\n=======================",
+        build_config_string(config).trim_end()
+    )
+}
+
+/// Put the loaded config into the log's rollover information.
+///
+/// Every log file this host rotates to from now on begins with it, which is how a
+/// log taken after a restart still says which config was in force (upstream's
+/// `log_config`, called on every `_read_config`).
+fn log_config(config: &Config) {
+    logging::set_rollover_info("config", Some(&config_rollover_block(config)));
 }
 
 /// The process exit code a finished run asks for.
@@ -177,6 +201,10 @@ async fn klippy_process(printer: Arc<Printer>, config_file: String) -> String {
         // so a file edited while the printer was running is what comes up.
         match Config::from_file(&config_file) {
             Ok((config, _sources)) => {
+                // The reload replaced the config, so the rollover block is the
+                // one just read: upstream calls `log_config` on every
+                // `_read_config` (`klippy/klippy.py:117-118`).
+                log_config(&config);
                 if let Err(err) = printer.load_config(&config) {
                     // A config the reload rejects is an `error`, not a shutdown:
                     // upstream's `_connect` sets the state and lets a `RESTART`
@@ -255,6 +283,7 @@ pub fn run(
     // every restart (see `klippy_process`), so it is handed the path rather than
     // this value.
     let (config, sources) = Config::from_file(&config_file)?;
+    log_config(&config);
     debug!("Config sources: {:?}", sources);
     info!(
         "Successfully parsed config with {} sections",
@@ -803,6 +832,46 @@ mod tests {
             state.message.contains("Parameter outside of section"),
             "the state message is the parse failure: {}",
             state.message
+        );
+    }
+
+    /// The block a rollover writes out is the config the loader read, not the
+    /// file's text: `SAVE_CONFIG` values applied, fenced the way upstream's
+    /// `log_config` fences it (`configfile.py:482-487`).
+    #[test]
+    fn test_the_rollover_block_holds_the_loaded_config() {
+        let path = write_temp_config(
+            "log-config",
+            concat!(
+                "[printer]\n",
+                "kinematics: none\n",
+                "\n",
+                "[stepper_x]\n",
+                "step_pin: PE2\n",
+                "\n#*# <---------------------- SAVE_CONFIG ---------------------->\n",
+                "#*# DO NOT EDIT THIS BLOCK OR BELOW. The contents are auto-generated.\n",
+                "#*#\n",
+                "#*# [stepper_x]\n",
+                "#*# position_endstop = 5\n",
+            ),
+        );
+        let (config, _sources) = Config::from_file(&path).expect("the config parses");
+        let block = config_rollover_block(&config);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            block.starts_with("===== Config file =====\n[printer]\nkinematics = none\n"),
+            "{block}"
+        );
+        // A value `SAVE_CONFIG` wrote is part of the config the loader loaded,
+        // so a log taken after a calibration says so.
+        assert!(
+            block.contains("[stepper_x]\nposition_endstop = 5\nstep_pin = PE2\n"),
+            "{block}"
+        );
+        assert!(
+            block.ends_with("======================="),
+            "the block is fenced: {block}"
         );
     }
 

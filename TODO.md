@@ -449,18 +449,20 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] `gcode_macro.py`：段与宏注册**已落地**（2026-09-24 集成批 #1，语料绿）；**`rename_existing` 连接期换名已落地**
       （2026-10-06，`8113056`：装载期只做同型检查、连接期经 `PrinterObject::connect` 把 alias 的旧处理器位移到
       `rename_existing` 名下、宏再接管 alias；缺命令报上游文案，换名目标已被占用时按 `register_command` 报错
-      ——上游 `gcode.py:142-144` 同款，**不**先 unregister 静默顶掉）。剩余 = 读 `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已归档**（2026-09-24 批 #4 起的「受控子集引擎」阶段：`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零，`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17、列表字面量与 `|min`/`|max` 批 #24 相继落地）。**2026-09-29 引擎换为 minijinja 2.24 适配层**（`custom_syntax` 单花括号定界符、Strict undefined、装载期编译与求值分两段）：原子集外的 `namespace()`、关键字实参、`{% block %}`、`|float(默认)` 由此接上（语料 160 绿）。仍缺：`%` 字符串格式化（minijinja 的 `%` 是数值取模）、模板内方法调用（`Coord`/`PrinterView` 未实现 `call_method`；「方法调用白名单」待办消解——不装 `unknown_method_callback` 即天然拒绝）；三元 `x if c else y` 由 minijinja 原生支持但本仓未单列测试。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分 detail 措辞）见 `template.rs` 模块文档。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`。
+      ——上游 `gcode.py:142-144` 同款，**不**先 unregister 静默顶掉）。剩余 = 读 `printer.objects` 的反射式能力（**Q5**）。**U-A7b 已归档**（2026-09-24 批 #4 起的「受控子集引擎」阶段：`exclude_object.test`+`dual_carriage.test` 双翻转、guard 归零，`{% set %}` 批 #9、过滤器参数与 `default`/`float` 批 #17、列表字面量与 `|min`/`|max` 批 #24 相继落地）。**2026-09-29 引擎换为 minijinja 2.24 适配层**（`custom_syntax` 单花括号定界符、Strict undefined、装载期编译与求值分两段）：原子集外的 `namespace()`、关键字实参、`{% block %}`、`|float(默认)` 由此接上（语料 160 绿）。仍缺：读 `printer.objects` 的反射式枚举（**Q5**）；三元 `x if c else y` 由 minijinja 原生支持但本仓未单列测试。**2026-10-18 三轮补齐**（以 Mainsail 客户端宏文件为语料）：① `%` 字符串格式化——编译期把「左侧是字符串字面量」的 `"…%s…" % x` 重写成 `|format(...)`（`{ … }` 与 `{% … %}` 都盖，`{% if n % 2 == 0 %}` 这类数值取模不动，`%(key)s` 映射形态仍不支持）；② 模板内方法调用——装了 unknown-method callback，`str` 的 `split`/`strip`/`replace`/`startswith`/`endswith`/`join`/`find`/`count`/`lower`/`upper` 与 `list` 的 `index`/`count` 是真实现，**`append`/`extend`/`pop` 因值语义只能降级**（返回 `None`、列表不变，收集写法拿到空列表）；③ 标签输出容器的 formatter（按 Python `str()` 拼写）。与 Jinja2 的已知差异（`%`/`//` 欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、`~` 拼接容器不走 formatter、列表不可变、部分 detail 措辞）见 `template.rs` 模块文档。iqex/itex 的模板阻塞已消，首因前移到 `dual_carriage` 的 `primary_carriage`。
 - [x] `delayed_gcode.py`（`[delayed_gcode]`）**已落地**（2026-10-06 复核：`extras/delayed_gcode.rs` 已装进
       工厂表 `load.rs`，`initial_duration` / `UPDATE_DELAYED_GCODE` / `klippy:ready` 注册齐全，8 条单测）。
       上游 `test/klippy/` 无对应 `.test`，语料不覆盖。
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
+- [ ] 已知偏差（2026-10-18 审出，客服端宏会踩）：无 `[extruder]` 时上游 `printer.toolhead.extruder` 是 `''`（`DummyExtruder.get_name()`），本仓恒为 `"extruder"`，于是 `_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_EXTRUDE` 那类 `!= ''` 守卫在本仓拦不住、直接去查未注册的 `printer['extruder']`。有挤出机时两者一致。
+- [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，`statistics` / `tuning_tower` / `garbage_collection` / `homing` 四个本仓仍无对应实现（`idle_timeout` 已于 2026-10-18 补上，见 `load.rs` 的 `DEFAULT_MODULES`）。
 
 ### H4 打印流程与 SD 卡
 
 - [x] `virtual_sdcard.py`：主机侧文件打印、`M20`–`M27`/`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`、`work_handler` 回放、进度（**2026-10-02**；省略 `gcode.get_mutex().test()` 让出、`_handle_analyze_shutdown`/`_handle_debuginput_exit`/`stats`，`path` 不做 `expanduser`/`normpath`）。
 - [x] `print_stats.py`（**2026-10-02**；省略 `_handle_activate_extruder`，事件未 fire）、`display_status.py`（`M73`/`M117`）。
-- [x] `pause_resume.py` 的节、四条命令与 `pause_resume/*` 三个端点（批 #15 + 2026-10-03）。
+- [x] `pause_resume.py` 的节、四条命令与 `pause_resume/*` 三个端点（批 #15 + 2026-10-03）；命令表改握 `Weak`（2026-10-18）：它与 `[virtual_sdcard]` 同场时曾成环 `dispatcher → 命令表 → pause_resume → sd 卡 → dispatcher`，跨 `teardown` 钉住整张表（连带各 `Mcu`）——单测 `teardown_releases_the_sd_card_and_pause_resume` 钉死。
 - [x] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
 - [ ] `sdcard_loop.py`：**栈语义已落地**（`extras/sdcard_loop.rs` 的 `loop_begin`/`loop_end`/`loop_desist` 与单测），
       **命令未注册**（`load_config` 只建对象）、与 `virtual_sdcard` 回放循环的

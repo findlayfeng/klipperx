@@ -213,6 +213,13 @@ pub struct McuObject {
     /// ([`McuObject::connect_failure`]). `Arc` because the recording handlers are
     /// `'static`.
     connect_shutdown: Arc<Mutex<Option<String>>>,
+    /// Whether this MCU has already been reported as lost.
+    ///
+    /// Upstream's `_is_timeout` (`klippy/mcu.py:801`): one report per MCU. The
+    /// clock poll keeps running after the machine is shutdown, so without this
+    /// every later round would find the same unanswered queries and ask for the
+    /// same stop again.
+    clock_timed_out: AtomicBool,
     /// The latest scheduler load from the firmware's `stats` reports, for
     /// `get_status`'s `last_stats` (`klippy/mcu.py:974-975`).
     ///
@@ -288,6 +295,7 @@ impl McuObject {
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
+            clock_timed_out: AtomicBool::new(false),
             last_stats: Arc::new(Mutex::new(None)),
             secondary_sync: Mutex::new(None),
             bridge_ports: AtomicU16::new(0),
@@ -666,9 +674,11 @@ impl McuObject {
     /// MCU, none fed twice.
     ///
     /// A failed round trip is logged at debug level and the next interval runs
-    /// as usual: this timer feeds an estimate, it does not watch for a dead MCU.
-    /// Cancellation is the precedent's — [`McuObject::release_cycles`] on
-    /// teardown (`Drop`), so nothing polls after the machine comes down.
+    /// as usual — the failure itself is not the verdict on the link. What is
+    /// watched is the count of queries still waiting for an answer
+    /// ([`McuObject::check_clock_timeout`]). Cancellation is the precedent's —
+    /// [`McuObject::release_cycles`] on teardown (`Drop`), so nothing polls
+    /// after the machine comes down.
     ///
     /// One timer per object: [`McuObject::install_clock`] runs again when a
     /// reconnect replaces the session, and a second timer beside the first
@@ -716,8 +726,13 @@ impl McuObject {
     /// must not block the dispatcher. [`McuClock::get_clock`] folds the answer
     /// into its regression and, through it, into `Mcu::record_clock_sample`; a
     /// query that fails (a firmware without the message, a timeout) logs at
-    /// debug level, feeds nothing and changes nothing — the timer keeps its
-    /// schedule and the next round tries again.
+    /// debug level, feeds nothing — the timer keeps its schedule and the next
+    /// round tries again.
+    ///
+    /// What the failure does change is the estimator's outstanding-query count
+    /// (`ClockEstimator::is_active` is what reads it): that count is what
+    /// [`McuObject::check_clock_timeout`] judges the link by, and it is the
+    /// only state a dead board leaves behind.
     ///
     /// A **closed** session is not even asked: between a reconnect's
     /// [`Mcu::close`] and the new session's clock landing on the chip, the slot
@@ -734,8 +749,13 @@ impl McuObject {
             debug!("MCU '{name}': clock poll skipped: the session is closed");
             return;
         }
+        self.check_clock_timeout(&clock, &name);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
+                // Outstanding until an answer folds in (`ClockEstimator::update`
+                // clears the count), which is exactly what a dead board never
+                // does.
+                clock.estimator().note_query_sent();
                 handle.spawn(async move {
                     if let Err(err) = clock.get_clock().await {
                         debug!("MCU '{name}': clock poll failed: {err}");
@@ -744,6 +764,41 @@ impl McuObject {
             }
             Err(_) => debug!("MCU '{name}': the clock poll needs an async runtime"),
         }
+    }
+
+    /// Report this MCU as lost once too many clock queries have gone
+    /// unanswered (`MCUConnHelper.check_timeout`, `klippy/mcu.py:895-905`).
+    ///
+    /// The judge is upstream's own: `ClockEstimator::is_active` tolerates up
+    /// to four outstanding queries and no more (`klippy/clocksync.py:156-157`),
+    /// so a board that stops answering is declared lost on the sixth round —
+    /// five unanswered intervals, at [`CLOCK_POLL_INTERVAL`]'s one second
+    /// each. The message is upstream's word for word, because clients and the
+    /// `error_mcu` hint table match on that text.
+    ///
+    /// A **file-output** run never gets here: it writes the protocol to a file
+    /// instead of a port (`Printer::is_fileoutput`), so nothing answers by
+    /// design and the count would be meaningless. Reported once
+    /// ([`McuObject::clock_timed_out`]) and not again: the timer keeps firing
+    /// after the machine is shutdown.
+    fn check_clock_timeout(&self, clock: &McuClock, name: &str) {
+        if clock.estimator().is_active() || self.clock_timed_out.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if printer.is_fileoutput() {
+            debug!(
+                "MCU '{name}': no answer to the clock poll; not reported from a file-output run"
+            );
+            return;
+        }
+        self.clock_timed_out.store(true, Ordering::SeqCst);
+        report_shutdown(
+            &self.printer,
+            &format!("Lost communication with MCU '{name}'"),
+        );
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.
@@ -2750,6 +2805,15 @@ mod tests {
                 recorder,
             }
         }
+
+        /// Make this run a file-output one: the host's start arguments name a
+        /// `--debugoutput` file, which is what [`Printer::is_fileoutput`]
+        /// reads.
+        fn as_fileoutput(&self) {
+            let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+            args.debug_output = Some("_test_output".to_string());
+            self.printer.set_start_args(Arc::new(args));
+        }
     }
 
     #[tokio::test]
@@ -2797,8 +2861,10 @@ mod tests {
         // A query that cannot go through (here `get_clock` is not even in the
         // firmware's dictionary, so it fails before anything is sent) must not
         // disturb anything: no sample, no panic, no state change — and the
-        // next interval runs as usual. Watching for a dead MCU is a different
-        // feature and deliberately not part of this timer.
+        // next interval runs as usual. A failed round is not yet a verdict on
+        // the link either: declaring it lost takes more unanswered queries
+        // than one round leaves outstanding
+        // (`McuObject::check_clock_timeout`).
         let rig = PollRig::new(json!({"config": {"CLOCK_FREQ": 20000000}}), vec![]);
         let seed = rig.object.clock().unwrap().estimator().last_clock();
         rig.object.register_clock_poll(rig.manual.as_ref());
@@ -2833,6 +2899,191 @@ mod tests {
             "the cancelled timer never fires"
         );
         assert!(rig.recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness: a board that stops answering its clock queries
+    // -----------------------------------------------------------------------
+
+    /// `count` scripted `get_clock` blocks that reach the wire and are **never
+    /// answered** — a board that is still connected but no longer talking.
+    ///
+    /// The block sequence numbers are the ones the interface stamps on
+    /// consecutive sends, so a silent round cannot be mistaken for a mismatched
+    /// script entry. Two spare entries are appended: consuming the last entry
+    /// closes the mock's receive channel, which would end the session instead
+    /// of leaving it silent.
+    fn silent_clock_exchanges(count: usize) -> Vec<MappingEntry> {
+        (0..count + 2)
+            .map(|i| MappingEntry {
+                input: Frame::new((i & 0xf) as u8, vec![5]), // `get_clock`
+                outputs: vec![],
+            })
+            .collect()
+    }
+
+    /// `count` scripted `get_clock` exchanges that are all answered, in the
+    /// order the interface sends them.
+    fn answered_clock_exchanges(count: usize, clock: u32) -> Vec<MappingEntry> {
+        (0..count + 2)
+            .map(|i| {
+                let seq = (i & 0xf) as u8;
+                let mut response = Payload::new();
+                response.push_u8(18).unwrap(); // response id, `clock clock=%u`
+                response.push_u32(clock).unwrap();
+                MappingEntry {
+                    input: Frame::new(seq, vec![5]),
+                    outputs: vec![Frame::new(seq, response.into_raw())],
+                }
+            })
+            .collect()
+    }
+
+    /// Fire `rounds` clock-poll intervals. The rig's section names no `test:`,
+    /// so its interval is the production one second.
+    fn fire_clock_polls(rig: &PollRig, rounds: usize) {
+        for _ in 0..rounds {
+            assert_eq!(rig.manual.advance(1.0), 1, "one poll per interval");
+        }
+    }
+
+    /// Wait (bounded) for the outstanding clock query to be answered, so the
+    /// next round is judged on a clean count.
+    async fn wait_for_pending_clear(clock: &McuClock) {
+        for _ in 0..200 {
+            if clock.estimator().queries_pending() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the clock query was never answered ({})",
+            clock.estimator().queries_pending()
+        );
+    }
+
+    /// A board whose clock queries stop being answered is reported lost with
+    /// upstream's wording (`MCUConnHelper.check_timeout`, `klippy/mcu.py:895-905`).
+    #[tokio::test]
+    async fn test_an_mcu_that_stops_answering_the_clock_is_reported_lost() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            // The poll counts its own query as outstanding; only an answer
+            // clears the count (`ClockEstimator::update`).
+            fire_clock_polls(&rig, 1);
+            assert_eq!(clock.estimator().queries_pending(), 1);
+
+            // Up to four outstanding queries are still within upstream's
+            // `is_active` bound.
+            fire_clock_polls(&rig, 4);
+            assert_eq!(clock.estimator().queries_pending(), 5);
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown,
+                "four unanswered queries are still tolerated"
+            );
+
+            // The fifth unanswered round makes it a dead link, and the state
+            // message is upstream's word for word.
+            fire_clock_polls(&rig, 1);
+            let state = rig.printer.get_state_message();
+            assert_eq!(state.category, PrinterState::Shutdown);
+            assert_eq!(state.message, "Lost communication with MCU 'mcu'");
+        })
+        .await
+        .expect("the liveness check is bounded");
+    }
+
+    /// The normal path is untouched: answered queries never add up to a lost
+    /// link, however many intervals pass.
+    #[tokio::test]
+    async fn test_a_clock_that_keeps_answering_is_never_reported_lost() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let rig = PollRig::new(
+                polling_dictionary(),
+                answered_clock_exchanges(12, 21_000_500),
+            );
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            for _ in 0..12 {
+                fire_clock_polls(&rig, 1);
+                wait_for_pending_clear(&clock).await;
+            }
+
+            assert!(clock.estimator().is_active());
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown,
+                "an answering board is never declared lost"
+            );
+        })
+        .await
+        .expect("the answered path is bounded");
+    }
+
+    /// A file-output run never reports the MCU lost: the protocol is written to
+    /// a file instead of a port, so nothing answers by design and the count of
+    /// outstanding queries says nothing about a board (`MCU.is_fileoutput`,
+    /// the mode every corpus case runs in).
+    #[tokio::test]
+    async fn test_a_fileoutput_run_never_reports_the_mcu_lost() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            rig.as_fileoutput();
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            // Far past the five unanswered rounds the real mode stops at.
+            fire_clock_polls(&rig, 8);
+
+            assert_eq!(clock.estimator().queries_pending(), 8);
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown
+            );
+        })
+        .await
+        .expect("the file-output path is bounded");
+    }
+
+    /// A lost MCU leaves the machine haltable and restartable: `M112` (which
+    /// does exactly the `invoke_shutdown` below) still lands, the first
+    /// message standing, and `RESTART`'s pair still brings the printer back to
+    /// `startup` so the config can be loaded again.
+    #[tokio::test]
+    async fn test_a_lost_mcu_leaves_m112_and_restart_usable() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            rig.object.register_clock_poll(rig.manual.as_ref());
+            fire_clock_polls(&rig, 6);
+            assert_eq!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown
+            );
+
+            // `M112`'s handler body (`gcode.rs`, `register_command("M112", ..)`).
+            rig.printer.invoke_shutdown("Shutdown due to M112 command");
+            assert_eq!(
+                rig.printer.get_state_message().message,
+                "Lost communication with MCU 'mcu'",
+                "the first message stands"
+            );
+
+            // `RESTART`: the printer leaves its run loop and the next bring-up
+            // starts from `startup`.
+            rig.printer.request_exit("restart");
+            rig.printer.reset_for_restart("restart");
+            assert_eq!(
+                rig.printer.get_state_message().category,
+                PrinterState::Startup
+            );
+        })
+        .await
+        .expect("the halt and restart path is bounded");
     }
 
     // -----------------------------------------------------------------------

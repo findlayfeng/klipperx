@@ -99,6 +99,7 @@ use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
+use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -1456,6 +1457,22 @@ impl PrinterObject for ToolHeadObject {
                 }
             }
 
+            // The auto-enable chain (`MCU_stepper.add_active_callback`):
+            // `stepper_enable` armed a callback per stepper at config load, and
+            // its own registry is what the queue must check before every step
+            // generation. The queue cannot reach that object (`[printer]` loads
+            // last) and the object could not reach this queue (it does not exist
+            // yet), so the queue takes the set here.
+            if let Some(printer) = self.printer.upgrade() {
+                if let Some(stepper_enable) =
+                    printer.lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+                {
+                    toolhead
+                        .motion_queuing_mut()
+                        .set_active_callbacks(stepper_enable.active_callbacks());
+                }
+            }
+
             // Callbacks registered at config load, when there was no
             // planner to hang them on (`register_lookahead_callback` /
             // `register_flush_callback`): install them now, under the state
@@ -1904,6 +1921,16 @@ impl ToolHeadObject {
             .as_mut()
             .map(|connected| connected.toolhead.get_last_move_time())
             .unwrap_or(0.0)
+    }
+
+    /// [`Self::get_last_move_time`] for a caller that **dates** a change by it
+    /// (`stepper_enable`'s enable-line writes): `None` while there is no planner,
+    /// instead of the `0.0` that would schedule the change at the MCU's boot
+    /// clock.
+    pub fn last_move_time(&self) -> Option<f64> {
+        self.lock()
+            .as_mut()
+            .map(|connected| connected.toolhead.get_last_move_time())
     }
 
     /// Advance the planner's timeline by `delay` seconds (`toolhead.dwell`).

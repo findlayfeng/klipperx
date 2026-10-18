@@ -28,28 +28,39 @@
 //! lowercase request is accepted as its uppercase form; `F`, multi-character
 //! values, and non-letters are refused with `Not a valid GCODE_AXIS`.
 //!
-//! # Timelines: this port's gap
+//! # Timelines
 //!
 //! Upstream gives every manual stepper its own trapq
-//! (`motion_queuing.allocate_trapq`) and appends a move's trapezoid to it
-//! (`_submit_move`), so the motor really steps. This port has **no** public
-//! path to allocate a trapq and add a stepper to the toolhead's motion queue
-//! after connect, so the timeline here is **dwell-only**: `do_move` advances
-//! the planner's print time by `calc_move_time`'s trapezoid duration
-//! (`toolhead.dwell`) and moves `commanded_pos`, but **no trapq is appended and
-//! no steps are generated for a `MOVE`**. The corpus exercises the command
-//! surface, not the motion, so this is enough for `manual_stepper.test`; the
-//! step generation is the gap to close with a motion-queue seam.
+//! (`motion_queuing.allocate_trapq`) and appends a move's trapezoid to it,
+//! both from `MANUAL_STEPPER MOVE=` (`_submit_move`) and from the planner's
+//! `process_move` for a `GCODE_AXIS`, so the motor really steps. This port does
+//! the same. The trapq is taken on the stepper's first need rather than at
+//! load — a trapq id only means something for one connection — and taking it
+//! also installs the `PrinterStepper` into the toolhead's motion queue, reading
+//! that trapq (upstream does both in `__init__`,
+//! `manual_stepper.py:31-34`). `do_set_position` flushes step generation and
+//! re-points the solver, upstream's `rail.set_position([commanded_pos, 0, 0])`;
+//! `do_move` ends with a flush because this host's step generation runs on a
+//! 10 ms tick and has no `note_mcu_movequeue_activity` to pull it forward.
 //!
-//! `do_set_position` also skips upstream's `toolhead.flush_step_generation()`
-//! and the rail position write for the same reason. `STOP_ON_ENDSTOP` is
-//! parsed and answers `No endstop for this manual stepper` when the section
-//! has none, but an actual endstop-triggered homing run is not driven (there
-//! is no `homing.manual_home` in this port).
+//! Still missing here:
+//!
+//! * `STOP_ON_ENDSTOP` is parsed and answers `No endstop for this manual
+//!   stepper` when the section has none, but an endstop-triggered run is not
+//!   driven: upstream's `drip_move` needs `motion_queuing.drip_update_time`,
+//!   which this host does not have, and
+//!   [`motion::ToolHead::drip_move`](crate::core::klippy::motion::toolhead)
+//!   only feeds the toolhead's **main** trapq (and drops the extra axes), so a
+//!   manual-stepper drip loop has to be written against its own trapq.
+//! * This stepper's trapq is not registered with `motion_report`, which
+//!   streams the toolhead's and the extruders' queues only (upstream registers
+//!   one per manual stepper, `motion_report.py:177-179`). Its **steps** are
+//!   still on `motion_report/dump_stepper` — every `PrinterStepper` registers
+//!   one — just not its queue.
 //!
 //! A registered `GCODE_AXIS` reaches the planner (`G1 A10` gives it a position
-//! slot and a distance), and `process_move` follows the move — but it follows
-//! it the same way: the commanded position only, no trapq, no steps.
+//! slot and a distance) and `process_move` appends that planned move to this
+//! stepper's trapq, the same way the extruder queues into its own.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -61,10 +72,12 @@ use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::stepper::{PrinterStepper, RailGeometry};
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::z_tilt::block_in_command;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::mathutil::Xyz;
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{cartesian_active_flags, cartesian_position_fn, Axis};
 use crate::core::klippy::motion::kinematics::MoveContext;
@@ -98,6 +111,10 @@ pub struct ManualStepper {
     next_cmd_time: Mutex<f64>,
     /// Where the stepper has been commanded to.
     commanded_pos: Mutex<f64>,
+    /// The trapq this stepper's moves are queued in, once it has one
+    /// (`get_trapq`). `None` until the first command that needs motion — a
+    /// trapq id belongs to one connection, so it cannot be made at load.
+    trapq: Mutex<Option<usize>>,
     /// The G-Code letter this stepper is registered under, if any.
     axis_gcode_id: Mutex<Option<String>>,
     /// The corner speed `GCODE_AXIS` registered (`INSTANTANEOUS_CORNER_VELOCITY`).
@@ -152,6 +169,13 @@ impl ManualStepper {
             cartesian_position_fn(Axis::X),
             cartesian_active_flags(Axis::X),
         );
+        // A hidden object so the stepper's own `connect` runs and builds the
+        // host `Stepper` this section takes on its first move — the same shape
+        // `[extruder]` uses for its stepper (`extruder_stepper <name>`).
+        printer.add_object(
+            &format!("manual_stepper_stepper {short_name}"),
+            Arc::clone(&stepper) as Arc<dyn PrinterObject>,
+        )?;
 
         // `velocity` (default 5, `above=0`) and `accel` (default 0,
         // `minval=0`), read exactly as upstream's `getfloat`s are.
@@ -172,6 +196,7 @@ impl ManualStepper {
             pos_max,
             next_cmd_time: Mutex::new(0.0),
             commanded_pos: Mutex::new(0.0),
+            trapq: Mutex::new(None),
             axis_gcode_id: Mutex::new(None),
             instant_corner_v: Mutex::new(0.0),
             gaxis_limit_velocity: Mutex::new(0.0),
@@ -239,19 +264,89 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `_submit_move` (`manual_stepper.py:63-73`) minus the trapq append.
+    /// This stepper's trapq, once it has one (upstream's `get_trapq`). `None`
+    /// until the first command that needs motion installs it.
+    pub fn trapq(&self) -> Option<usize> {
+        *self.lock_trapq()
+    }
+
+    /// The trapq this stepper appends to, installing the stepper into the
+    /// toolhead's motion queue on first use.
     ///
-    /// Returns the print time the move ends at. The trapezoid is *not* queued
-    /// (see the module docs); only the time and `commanded_pos` advance.
-    fn submit_move(&self, movetime: f64, movepos: f64, speed: f64, accel: f64) -> f64 {
+    /// Upstream allocates the trapq and points the rail at it in
+    /// `ManualStepper.__init__` (`manual_stepper.py:31-34`). A trapq id only
+    /// means something for one connection, so this port takes it on the first
+    /// command that needs motion instead: the hidden
+    /// `manual_stepper_stepper <name>` object has built the host `Stepper` by
+    /// then, and the toolhead can take it and read this trapq.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect (no host stepper to take, or no
+    /// motion state), or a failure from the toolhead installing it.
+    fn ensure_motion(&self) -> Result<usize, CommandError> {
+        if let Some(trapq) = *self.lock_trapq() {
+            return Ok(trapq);
+        }
+        let toolhead = self.toolhead()?;
+        let stepper = self
+            .stepper
+            .take_stepper()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let trapq =
+            toolhead.add_extra_axis_stepper(stepper, Arc::clone(self.stepper.mcu_stepper()))?;
+        // The trapq's x is this stepper's own coordinate, not the toolhead's:
+        // start the solver where the commanded position stands, so the first
+        // appended move starts where the motor is.
+        toolhead.set_stepper_position(&self.name, *self.lock_commanded_pos())?;
+        *self.lock_trapq() = Some(trapq);
+        Ok(trapq)
+    }
+
+    /// `_submit_move` (`manual_stepper.py:63-73`): append this move's
+    /// trapezoid to the stepper's trapq and advance the commanded position.
+    ///
+    /// The trapezoid is the stepper's own coordinate on its trapq's x, which is
+    /// why `axes_r` is `(axis_r, 0, 0)` and the velocities carry `axis_r`
+    /// already unfolded into that coordinate (upstream passes the same shape).
+    ///
+    /// # Errors
+    /// "Printer is not ready" when the motion state is gone.
+    fn submit_move(
+        &self,
+        trapq: usize,
+        movetime: f64,
+        movepos: f64,
+        speed: f64,
+        accel: f64,
+    ) -> Result<f64, CommandError> {
         let cp = *self.lock_commanded_pos();
         let dist = movepos - cp;
-        let (_axis_r, accel_t, cruise_t, _cruise_v) = calc_move_time(dist, speed, accel);
+        let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
+        self.toolhead()?.append_to_trapq(
+            trapq,
+            movetime,
+            accel_t,
+            cruise_t,
+            accel_t,
+            Xyz::new(cp, 0.0, 0.0),
+            Xyz::new(axis_r, 0.0, 0.0),
+            0.0,
+            cruise_v,
+            accel,
+        )?;
         *self.lock_commanded_pos() = movepos;
-        movetime + accel_t + cruise_t + accel_t
+        Ok(movetime + accel_t + cruise_t + accel_t)
     }
 
     /// `do_move` (`manual_stepper.py:73-80`).
+    ///
+    /// Upstream notes the queue activity (`note_mcu_movequeue_activity`) so its
+    /// flush loop wakes sooner; this host generates on a 10 ms tick with no such
+    /// note, so the trapezoid appended here is generated and sent before the
+    /// command returns.
+    ///
+    /// # Errors
+    /// "Printer is not ready", or a step-generation/send failure.
     fn do_move(
         &self,
         movepos: f64,
@@ -259,14 +354,16 @@ impl ManualStepper {
         accel: f64,
         sync: bool,
     ) -> Result<(), CommandError> {
+        let trapq = self.ensure_motion()?;
         self.sync_print_time()?;
         let start = *self.lock_next_cmd_time();
-        let end = self.submit_move(start, movepos, speed, accel);
+        let end = self.submit_move(trapq, start, movepos, speed, accel)?;
         *self.lock_next_cmd_time() = end;
         if sync {
             self.sync_print_time()?;
         }
-        Ok(())
+        let toolhead = self.toolhead()?;
+        block_in_command(toolhead.flush_step_generation())
     }
 
     /// `do_enable` (`manual_stepper.py:54-57`): drive the enable line through
@@ -284,10 +381,25 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `do_set_position` (`manual_stepper.py:58-62`), minus the flush and the
-    /// rail write (module docs).
-    fn do_set_position(&self, setpos: f64) {
+    /// `do_set_position` (`manual_stepper.py:58-62`): flush what is queued,
+    /// move the commanded position, and put the solver there
+    /// (`self.rail.set_position([commanded_pos, 0., 0.])`).
+    ///
+    /// The flush comes first, as upstream's does: the trapezoids already queued
+    /// have to be generated before the position they were planned against is
+    /// rewritten.
+    ///
+    /// # Errors
+    /// "Printer is not ready", or a step-generation/send failure.
+    fn do_set_position(&self, setpos: f64) -> Result<(), CommandError> {
+        let toolhead = self.toolhead()?;
+        block_in_command(toolhead.flush_step_generation())?;
         *self.lock_commanded_pos() = setpos;
+        let installed = self.lock_trapq().is_some();
+        if installed {
+            toolhead.set_stepper_position(&self.name, setpos)?;
+        }
+        Ok(())
     }
 
     /// `do_homing_move` (`manual_stepper.py:81-92`).
@@ -319,7 +431,7 @@ impl ManualStepper {
         }
         if gcmd.get_command_parameters().contains_key("SET_POSITION") {
             let setpos = gcmd.get_float("SET_POSITION")?;
-            self.do_set_position(setpos);
+            self.do_set_position(setpos)?;
         }
         let speed = gcmd.get(
             "SPEED",
@@ -458,6 +570,10 @@ impl ManualStepper {
                 Ok(())
             }
             GcodeAxisPlan::Register(id) => {
+                // Upstream's trapq exists from `__init__`, so a planned move
+                // always has somewhere to go; here registration is the first
+                // need (module docs).
+                self.ensure_motion()?;
                 *self.lock_instant_corner_v() = instant_corner_v;
                 *self.lock_gaxis_limit_velocity() = limit_velocity;
                 *self.lock_gaxis_limit_accel() = limit_accel;
@@ -477,6 +593,12 @@ impl ManualStepper {
 
     fn lock_commanded_pos(&self) -> MutexGuard<'_, f64> {
         self.commanded_pos
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn lock_trapq(&self) -> MutexGuard<'_, Option<usize>> {
+        self.trapq
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
@@ -589,17 +711,35 @@ impl ExtraAxis for ManualStepper {
 
     fn process_move(
         &self,
-        _queuing: &mut MotionQueuing,
-        _print_time: f64,
+        queuing: &mut MotionQueuing,
+        print_time: f64,
         move_: &Move,
         ea_index: usize,
     ) {
-        // Upstream appends this move's trapezoid to the stepper's own trapq
-        // (`manual_stepper.py:168-179`) and the motor steps. This port has no
-        // trapq for a manual stepper and no way to put its `PrinterStepper` in
-        // the motion queue after connect, so only the commanded position
-        // follows the planned move: `G1 A10` updates the position and the
-        // planner, it does **not** generate steps (module docs).
+        // Upstream's `process_move` (`manual_stepper.py:168-179`): the move's
+        // trapezoid goes into this stepper's own trapq, with the axis ratio
+        // unfolded into the trapezoid's velocities and acceleration, and the x
+        // direction of 1.0 (this trapq holds one axis).
+        let Some(trapq) = *self.lock_trapq() else {
+            // No trapq means no motion was ever asked for; a move can only be
+            // planned for a registered axis, and registering one installs it
+            // (`ensure_motion`). Follow the position alone, as before.
+            *self.lock_commanded_pos() = move_.end_axis(ea_index);
+            return;
+        };
+        let axis_r = move_.axes_r[ea_index];
+        queuing.append(
+            trapq,
+            print_time,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::new(move_.start_axis(ea_index), 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            move_.start_v * axis_r,
+            move_.cruise_v * axis_r,
+            move_.accel * axis_r,
+        );
         *self.lock_commanded_pos() = move_.end_axis(ea_index);
     }
 

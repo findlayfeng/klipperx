@@ -467,6 +467,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] **`tmc_spi` 的总线共享**（2026-10-18）：多设备链复用首个节的 `McuSpi` 与一把 `busy` 锁；
       后续节仍会发一次被丢弃的 `config_spi`/`spi_set_bus`（为了走选项与片选校验），与上游共用同一个
       pin 对象不同，但帧与互斥已共享。
+- [ ] **`FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 真机不出步**（2026-10-18 真板实测）：这三条
+      路径在 F446 上**没有产生任何 `queue_step`**（驱动侧 `MSCNT` 不动），而 `[stepper_x]` + cartesian
+      的 `G1` 正常；`stress --task motion` 也正常（3780 步、读回一致）。待定位是 force_move 的
+      trapq/manual-move 未接 flush，还是 `kinematics: none` 下 toolhead 不接受。**影响**：`STEPPER_BUZZ`
+      这个"识别电机"的常用动作目前不可用。
+- [ ] **失败态后的 `SET_KINEMATIC_POSITION` 会撞 stepcompress**（2026-10-18 真板实测）：`G28` 以
+      `No trigger on x after full movement` 失败后，再 `SET_KINEMATIC_POSITION` + `G1` ⇒
+      `Internal error in stepcompress: … Invalid sequence` 直接 shutdown；正常路径与零长度移动都不触发。
 - [ ] **both-edge（`dedge`）**：`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，固件配置侧
       没有 both-edge 步进模式，所以 TMC 不写 `dedge`。属优化项，不影响正确性。
 - 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。

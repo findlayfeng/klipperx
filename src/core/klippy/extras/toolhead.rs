@@ -2021,6 +2021,41 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// One motion stepper's firmware step counter
+    /// (`MCU_stepper.get_mcu_position`), found by section name.
+    ///
+    /// `None` before connect (the toolhead has no motion state yet), or when no
+    /// motion stepper answers to `name` — a stepper whose rail the kinematics
+    /// did not take. The steppers themselves live here: the toolhead took them
+    /// from [`crate::core::klippy::extras::stepper::PrinterStepper`] at connect.
+    pub fn stepper_mcu_position(&self, name: &str) -> Option<i64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)
+            .map(|stepper| stepper.mcu_position())
+    }
+
+    /// One motion stepper's host position, as its solver last commanded it
+    /// (upstream's `MCU_stepper.get_commanded_position`), found by section
+    /// name. `None` under the same conditions as
+    /// [`ToolHeadObject::stepper_mcu_position`].
+    pub fn stepper_commanded_position(&self, name: &str) -> Option<f64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)
+            .map(|stepper| stepper.commanded_position())
+    }
+
     /// Drive one stepper `dist` millimetres in its own coordinates, outside the
     /// planner and the kinematics (upstream `ForceMove.manual_move`,
     /// `force_move.py:75-91`): the `FORCE_MOVE` / `STEPPER_BUZZ` move.

@@ -18,8 +18,10 @@
 //! (`tmc2660.py:242-283`), so no `<driver>_<stepper>` chip is registered and
 //! `<driver>_<stepper>:virtual_endstop` cannot be named. **No wave table, no
 //! stealthchop and no `tcoolthrs`** — the chip has none of `mslut*`/`en_pwm_mode`
-//! and upstream's setup omits them. The `tmc/stallguard_dump` bulk endpoint is
-//! likewise absent, as it is for every driver in this host.
+//! and upstream's setup omits them. The `tmc/stallguard_dump` endpoint is
+//! **not** registered for this chip, and upstream does not register it either:
+//! the helper needs a `DRV_STATUS` register to probe, which the 2660 lacks
+//! (`tmc.py:241-242`).
 
 use std::collections::HashMap;
 use std::sync::Arc;

@@ -19,7 +19,7 @@
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -66,6 +66,17 @@ const VERBOSE_LEVEL: &str = "debug";
 
 /// The level used when neither source asks for one.
 const DEFAULT_LEVEL: &str = "info";
+
+/// How long a log file covers before it is rotated: a day.
+///
+/// Upstream's `bglogger` is a `TimedRotatingFileHandler` with
+/// `when='midnight'`, `backupCount=5` (`klippy/queuelogger.py:24-31`): the file
+/// in use is the one for the day it is written on, and the first record after
+/// local midnight starts the next day's file.
+const ROTATION_PERIOD: i64 = 24 * 60 * 60;
+
+/// How many rotated files are kept (`backupCount`), the oldest going first.
+const BACKUP_COUNT: usize = 5;
 
 /// The filter the host runs with.
 ///
@@ -158,28 +169,208 @@ fn window() -> Option<UnboundedSender<Record>> {
         .clone()
 }
 
+/// What the log file's clock reads: seconds since the epoch.
+///
+/// A seam rather than a direct `time()` call so that a test can cross a day
+/// boundary without waiting for one — the same reason the reactor has a manual
+/// clock. There is no production way to replace it.
+type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
+/// The wall clock, in seconds since the epoch.
+fn wall_clock() -> i64 {
+    // SAFETY: `time(NULL)` only reads the clock.
+    unsafe { libc::time(std::ptr::null_mut()) as i64 }
+}
+
 /// Where the formatted output goes: stdout (unless a window is up) and, when
 /// `--logfile` was given, that file too.
 #[derive(Clone)]
 struct LogOutput {
     /// The open log file, shared with every writer the layer makes.
-    file: Option<Arc<Mutex<File>>>,
+    file: Option<Arc<Mutex<LogFile>>>,
 }
 
 impl LogOutput {
     /// Open `path` for appending, or report on stderr and log to stdout only.
     fn new(path: Option<&Path>) -> Self {
-        let file =
-            path.and_then(
-                |path| match OpenOptions::new().create(true).append(true).open(path) {
-                    Ok(file) => Some(Arc::new(Mutex::new(file))),
-                    Err(err) => {
-                        eprintln!("warning: cannot open log file {}: {err}", path.display());
-                        None
-                    }
-                },
-            );
+        Self::with_clock(path, Arc::new(wall_clock))
+    }
+
+    /// The same, reading "now" from `clock` instead of the wall clock.
+    fn with_clock(path: Option<&Path>, clock: Clock) -> Self {
+        let file = path.and_then(|path| match LogFile::open(path, clock) {
+            Ok(file) => Some(Arc::new(Mutex::new(file))),
+            Err(err) => {
+                eprintln!("warning: cannot open log file {}: {err}", path.display());
+                None
+            }
+        });
         Self { file }
+    }
+}
+
+/// The log file in use, rotated at each local midnight.
+///
+/// One file covers one day: `klippy.log` holds today's records, and the day
+/// that ends is renamed to `klippy.log.<date>` — the suffix stdlib derives from
+/// `when='midnight'` (`%Y-%m-%d`). Keeping the rollover information in the new
+/// file is upstream's whole point in rotating
+/// (`QueueListener.doRollover`, `klippy/queuelogger.py:49-61`): a log attached
+/// to a bug report names the build and the config even after it was rotated.
+struct LogFile {
+    /// The file in use, `klippy.log`.
+    path: PathBuf,
+    file: File,
+    /// Seconds since the epoch at which the next rollover is due: the next
+    /// local midnight.
+    rollover_at: i64,
+    /// Where "now" comes from.
+    clock: Clock,
+}
+
+impl LogFile {
+    /// Open `path` for appending, due to rotate at the next local midnight.
+    fn open(path: &Path, clock: Clock) -> std::io::Result<Self> {
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            rollover_at: next_midnight((clock)()),
+            clock,
+        })
+    }
+
+    /// Append one record, rotating first if the day it belongs to has ended.
+    ///
+    /// Upstream checks per record (`TimedRotatingFileHandler.emit` calls
+    /// `shouldRollover` then `doRollover`), which is why a host left running
+    /// overnight rotates on its next log line rather than at midnight itself.
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        let now = (self.clock)();
+        if now >= self.rollover_at {
+            self.rollover(now)?;
+        }
+        self.file.write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+
+    /// Rotate the file in use and start the next one, `now` being the moment the
+    /// day boundary was noticed.
+    fn rollover(&mut self, now: i64) -> std::io::Result<()> {
+        // A rotated file is named for the day it holds, not for the moment of
+        // the rollover: stdlib's `doRollover` derives the suffix from
+        // `rolloverAt - interval`.
+        let rotated = rotated_name(&self.path, self.rollover_at - ROTATION_PERIOD);
+        // The writes are unbuffered, so the handle being open across the rename
+        // costs nothing; upstream's close-then-rename reaches the same files.
+        self.file.flush()?;
+        if rotated.exists() {
+            std::fs::remove_file(&rotated)?;
+        }
+        std::fs::rename(&self.path, &rotated)?;
+        prune_old_backups(&self.path);
+
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        self.rollover_at = next_midnight(now);
+
+        // Upstream's `doRollover` emits the rollover information once the
+        // rotation is done, so it lands in the new file rather than in the one
+        // that was just closed.
+        let header = rollover_text();
+        if !header.is_empty() {
+            self.file.write_all(header.as_bytes())?;
+            self.file.write_all(b"\n")?;
+        }
+        self.file.flush()
+    }
+}
+
+/// The name a rotated file takes: the base name plus the day it holds.
+fn rotated_name(path: &Path, at: i64) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}", local_time(b"%Y-%m-%d\0", at)));
+    PathBuf::from(name)
+}
+
+/// Whether `suffix` is the `%Y-%m-%d` a midnight rollover appends.
+fn is_rotation_suffix(suffix: &str) -> bool {
+    let bytes = suffix.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+/// Delete rotated files until only the newest [`BACKUP_COUNT`] are left.
+///
+/// `TimedRotatingFileHandler.getFilesToDelete`: the dated files of this base
+/// name, sorted, everything past the newest `backupCount` removed.
+fn prune_old_backups(path: &Path) {
+    let (Some(dir), Some(base)) = (path.parent(), path.file_name()) else {
+        return;
+    };
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let prefix = format!("{}.", base.to_string_lossy());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut dated: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.strip_prefix(&prefix).is_some_and(is_rotation_suffix)
+        })
+        .map(|entry| entry.path())
+        .collect();
+    if dated.len() < BACKUP_COUNT {
+        return;
+    }
+    // A `%Y-%m-%d` suffix sorts chronologically.
+    dated.sort();
+    for old in &dated[..dated.len() - BACKUP_COUNT] {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// The local midnight after `now`, in seconds since the epoch.
+///
+/// Upstream's `_computeRollover` for `when='midnight'`: the boundary of the next
+/// local day, not `now` plus a fixed interval — a day with a DST change is not
+/// 24 hours long ([`ROTATION_PERIOD`] is the period as upstream measures it when
+/// naming the rotated file, which is also why that arithmetic is copied as is).
+fn next_midnight(now: i64) -> i64 {
+    // SAFETY: `localtime_r` writes into a `tm` this frame owns; `mktime`
+    // normalizes that struct and reports the instant, or -1.
+    unsafe {
+        let at: libc::time_t = now as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&at, &mut tm).is_null() {
+            return now + ROTATION_PERIOD;
+        }
+        tm.tm_hour = 0;
+        tm.tm_min = 0;
+        tm.tm_sec = 0;
+        tm.tm_mday += 1;
+        // Let `mktime` work out whether that day is in daylight time.
+        tm.tm_isdst = -1;
+        let midnight = libc::mktime(&mut tm);
+        if midnight == -1 {
+            now + ROTATION_PERIOD
+        } else {
+            midnight as i64
+        }
     }
 }
 
@@ -196,7 +387,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
 /// One formatted record's destination: stdout (or nowhere while a window is up)
 /// plus the log file.
 struct Tee {
-    file: Option<Arc<Mutex<File>>>,
+    file: Option<Arc<Mutex<LogFile>>>,
 }
 
 impl Write for Tee {
@@ -318,16 +509,16 @@ pub fn clear_rollover_info() {
         .clear();
 }
 
-/// Write the rollover blocks and the banner as one log record.
+/// The rollover block: every named text, sorted by name, then the banner that
+/// dates the seam — upstream's `QueueListener.doRollover`
+/// (`klippy/queuelogger.py:50-57`). Empty when there is nothing to report.
 ///
-/// Upstream writes the same text when the log rotates
-/// (`klippy/queuelogger.py:49-53`). A host that rolls its log by restarting (the
-/// only rotation there is today) calls this at each start; the banner is what
-/// makes the seam visible in the file.
-pub fn write_rollover() {
+/// The lock is released before the text is used, so a writer that holds the log
+/// file while rotating a record cannot deadlock against a caller of this.
+fn rollover_text() -> String {
     let info = ROLLOVER.lock().unwrap_or_else(|poison| poison.into_inner());
     if info.is_empty() {
-        return;
+        return String::new();
     }
     let mut block: String = info
         .values()
@@ -338,23 +529,38 @@ pub fn write_rollover() {
         "\n=============== Log rollover at {} ===============",
         asctime()
     ));
+    block
+}
+
+/// Write the rollover blocks and the banner as one log record.
+///
+/// Upstream writes the same text when the log rotates
+/// (`klippy/queuelogger.py:49-53`), and once at each start for the versions
+/// block (`klippy/klippy.py:339-345`); a rotation writes it into the new file
+/// itself (see [`LogFile::rollover`]). The banner is what makes the seam visible
+/// in the file.
+pub fn write_rollover() {
+    let block = rollover_text();
+    if block.is_empty() {
+        return;
+    }
     tracing::info!("{block}");
 }
 
-/// The current local time as `time.asctime()` spells it.
-fn asctime() -> String {
-    // SAFETY: `localtime_r` is given a null-terminated-ish pointer to a `time_t`
-    // and a `tm` it may write; `strftime` writes into `buf` and reports how many
-    // bytes it used, which is bounded by the buffer length. The format string is
-    // a static C string.
+/// `at` (seconds since the epoch) in local time, in `format` — one of the C
+/// formats the log uses, which must be null-terminated.
+fn local_time(format: &[u8], at: i64) -> String {
+    // SAFETY: `localtime_r` is given a pointer to a `time_t` and a `tm` it may
+    // write; `strftime` writes into `buf` and reports how many bytes it used,
+    // which is bounded by the buffer length. The format string is a static C
+    // string, null-terminated by its callers.
     unsafe {
-        let now = libc::time(std::ptr::null_mut());
+        let at: libc::time_t = at as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
+        if libc::localtime_r(&at, &mut tm).is_null() {
             return "?".to_string();
         }
         let mut buf = [0 as libc::c_char; 64];
-        let format = b"%a %b %e %H:%M:%S %Y\0";
         let written = libc::strftime(
             buf.as_mut_ptr(),
             buf.len(),
@@ -366,6 +572,11 @@ fn asctime() -> String {
     }
 }
 
+/// The current local time as `time.asctime()` spells it.
+fn asctime() -> String {
+    local_time(b"%a %b %e %H:%M:%S %Y\0", wall_clock())
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -373,6 +584,7 @@ fn asctime() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
     use tokio::sync::mpsc::unbounded_channel;
 
     /// The window slot is process-wide, so these two tests would otherwise race
@@ -532,5 +744,263 @@ mod tests {
         // Sorted by name: `config` before `versions`.
         assert!(text.starts_with("the config\nthe versions\n"), "{text}");
         assert!(text.contains("Log rollover at"), "{text}");
+    }
+
+    // =======================================================================
+    // Rotation
+    // =======================================================================
+
+    /// A directory of this test's own, removed when the test ends.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "klipperx-log-rotation-{tag}-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("the test directory is created");
+            Self(dir)
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+
+        /// The directory's entries, sorted, as bare names.
+        fn names(&self) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(&self.0)
+                .expect("the test directory is readable")
+                .map(|entry| {
+                    entry
+                        .expect("an entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            names.sort();
+            names
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A log file whose clock the test moves, and the handle it is moved with.
+    ///
+    /// The clock is why these tests need no midnight of their own: a rollover is
+    /// a comparison against "now", so moving "now" is the whole trigger.
+    fn test_log(dir: &TempDir, start: i64) -> (LogOutput, Arc<AtomicI64>) {
+        let now = Arc::new(AtomicI64::new(start));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        (
+            LogOutput::with_clock(Some(&dir.path("klippy.log")), clock),
+            now,
+        )
+    }
+
+    /// A local wall-clock time in seconds since the epoch, so a test names a day
+    /// without having to know its time zone.
+    fn local(year: i32, month: i32, day: i32, hour: i32, minute: i32, second: i32) -> i64 {
+        // SAFETY: `mktime` normalizes a `tm` this frame owns and reports the
+        // instant it names.
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            tm.tm_year = year - 1900;
+            tm.tm_mon = month - 1;
+            tm.tm_mday = day;
+            tm.tm_hour = hour;
+            tm.tm_min = minute;
+            tm.tm_sec = second;
+            tm.tm_isdst = -1;
+            libc::mktime(&mut tm) as i64
+        }
+    }
+
+    /// The date a rotated file covering the day that starts at `at` is named
+    /// after, spelled the way stdlib's midnight suffix spells it.
+    fn day_name(at: i64) -> String {
+        format!("klippy.log.{}", local_time(b"%Y-%m-%d\0", at))
+    }
+
+    /// Append one record through the production writer.
+    ///
+    /// The callers keep a window up, which is what stops the tee from also
+    /// echoing these records into the test output.
+    fn append(output: &LogOutput, text: &str) {
+        use tracing_subscriber::fmt::MakeWriter;
+
+        let mut writer = output.make_writer();
+        writer
+            .write_all(text.as_bytes())
+            .expect("the record writes");
+        writer.flush().expect("the record flushes");
+    }
+
+    /// The day boundary is what rotates the log: the first record after local
+    /// midnight goes to a new file, and the file that was left behind holds the
+    /// day it was written on.
+    #[test]
+    fn test_the_first_record_after_midnight_rotates_the_log() {
+        let _slot = exclusive();
+        let (entries, _logs) = unbounded_channel();
+        let _window = to_window(entries);
+
+        let dir = TempDir::new("day");
+        let (output, now) = test_log(&dir, local(2026, 6, 10, 23, 59, 59));
+        append(&output, "before midnight\n");
+        assert_eq!(
+            dir.names(),
+            vec!["klippy.log".to_string()],
+            "no rotation yet"
+        );
+
+        now.store(local(2026, 6, 11, 0, 0, 1), Ordering::SeqCst);
+        append(&output, "after midnight\n");
+
+        let names = dir.names();
+        assert_eq!(names.len(), 2, "the day that ended was rotated: {names:?}");
+        let rotated = names
+            .iter()
+            .find(|name| *name != "klippy.log")
+            .expect("the rotated file");
+        assert_eq!(*rotated, day_name(local(2026, 6, 10, 0, 0, 0)), "{names:?}");
+        // What was in the file in use is what the rotated file holds.
+        assert_eq!(
+            std::fs::read_to_string(dir.path(rotated)).unwrap(),
+            "before midnight\n"
+        );
+        let current = std::fs::read_to_string(dir.path("klippy.log")).unwrap();
+        assert!(current.contains("after midnight"), "{current}");
+        assert!(!current.contains("before midnight"), "{current}");
+    }
+
+    /// A rotated log opens with the rollover information, so a file taken from
+    /// the middle of a run still says what produced it — upstream's reason for
+    /// writing the block on every rollover (`klippy/queuelogger.py:50-57`).
+    #[test]
+    fn test_a_rotated_log_starts_with_the_rollover_block() {
+        let _slot = exclusive();
+        let (entries, _logs) = unbounded_channel();
+        let _window = to_window(entries);
+
+        clear_rollover_info();
+        set_rollover_info("versions", Some("Versions: klipperx test"));
+        set_rollover_info(
+            "config",
+            Some("===== Config file =====\n[printer]\nkinematics: none\n======================="),
+        );
+
+        let dir = TempDir::new("header");
+        let (output, now) = test_log(&dir, local(2026, 6, 10, 23, 59, 59));
+        append(&output, "yesterday\n");
+        now.store(local(2026, 6, 11, 0, 0, 1), Ordering::SeqCst);
+        append(&output, "today\n");
+        clear_rollover_info();
+
+        let current = std::fs::read_to_string(dir.path("klippy.log")).unwrap();
+        // Sorted by name — `config` before `versions` — and then the banner, all
+        // of it ahead of the record that caused the rotation.
+        assert!(
+            current.starts_with(concat!(
+                "===== Config file =====\n",
+                "[printer]\n",
+                "kinematics: none\n",
+                "=======================\n",
+                "Versions: klipperx test\n",
+                "=============== Log rollover at ",
+            )),
+            "{current}"
+        );
+        assert!(
+            current.contains("[printer]"),
+            "the loaded config: {current}"
+        );
+        assert!(current.ends_with("today\n"), "{current}");
+    }
+
+    /// Five rotated files are kept, the oldest going as the newest arrives
+    /// (`backupCount=5`), and the file in use is always `klippy.log`.
+    #[test]
+    fn test_every_rotation_keeps_five_dated_files() {
+        let _slot = exclusive();
+        let (entries, _logs) = unbounded_channel();
+        let _window = to_window(entries);
+
+        let dir = TempDir::new("backups");
+        let (output, now) = test_log(&dir, local(2026, 6, 10, 12, 0, 0));
+        // Eight days of use: the first write opens the file, each later one lands
+        // on a new day and rotates what the day before left.
+        for day in 10..=17 {
+            now.store(local(2026, 6, day, 12, 0, 0), Ordering::SeqCst);
+            append(&output, &format!("day {day}\n"));
+        }
+
+        let expected: Vec<String> = (12..=16)
+            .map(|day| day_name(local(2026, 6, day, 0, 0, 0)))
+            .collect();
+        let mut with_current = expected.clone();
+        with_current.push("klippy.log".to_string());
+        with_current.sort();
+        assert_eq!(
+            dir.names(),
+            with_current,
+            "five rotated files plus the one in use"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path("klippy.log")).unwrap(),
+            "day 17\n",
+            "the file in use is the newest one"
+        );
+    }
+
+    /// Without `--logfile` there is no file: the day boundary passes with nothing
+    /// to rotate and nothing written anywhere.
+    #[test]
+    fn test_no_logfile_means_nothing_to_rotate() {
+        let _slot = exclusive();
+        let (entries, _logs) = unbounded_channel();
+        let _window = to_window(entries);
+
+        let dir = TempDir::new("absent");
+        let now = Arc::new(AtomicI64::new(local(2026, 6, 10, 23, 59, 59)));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || now.load(Ordering::SeqCst))
+        };
+        let output = LogOutput::with_clock(None, clock);
+        assert!(output.file.is_none());
+
+        append(&output, "no file\n");
+        now.store(local(2026, 6, 11, 0, 0, 1), Ordering::SeqCst);
+        append(&output, "still no file\n");
+
+        assert!(dir.names().is_empty(), "{:?}", dir.names());
+    }
+
+    /// The boundary a rotation waits for is local midnight, not a fixed day's
+    /// worth of seconds after the file was opened.
+    #[test]
+    fn test_the_rotation_boundary_is_local_midnight() {
+        let start = local(2026, 6, 10, 13, 45, 10);
+        let boundary = next_midnight(start);
+        assert!(boundary > start);
+        assert_eq!(local_time(b"%H:%M:%S\0", boundary), "00:00:00");
+        assert_eq!(
+            local_time(b"%Y-%m-%d\0", boundary),
+            local_time(b"%Y-%m-%d\0", local(2026, 6, 11, 0, 0, 0))
+        );
+        // A moment that is already midnight belongs to the day that ended, so the
+        // next boundary is the following one.
+        let midnight = local(2026, 6, 11, 0, 0, 0);
+        assert_eq!(next_midnight(midnight), local(2026, 6, 12, 0, 0, 0));
     }
 }

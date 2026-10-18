@@ -83,7 +83,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*）——**✅ 收官**（传感器族、`M105` gcode-id 表、`TEMPERATURE_WAIT`、`M109`/`M190` 等待、eddy 校准工具均已落地，见 H1 节） | — |
-| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`static_pwm_clock`、`replicape`、`duplicate_pin_override` 与 `SET_PIN TEMPLATE=`/`static_value`（见 H2 节） | F3、F4、F6、F7 |
+| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`replicape` 与 `pwm_tool` 的 `maximum_mcu_duration` 中间更新（见 H2 节） | F3、F4、F6、F7 |
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——三者主体**均已落地**（含单测）；`rename_existing` 连接期换名已落地（2026-10-06，`8113056`），余项＝`printer.objects` 的可枚举反射（Q5），见 H3 节 | G1b、Q5 |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
@@ -91,7 +91,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout 已落地）——余项＝G2/G3 弧规划、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`GET_POSITION`/`axis_map`，见 H10 节 | C1 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`motion_report` 两端点已落地）——余项＝G2/G3 弧规划、`manual_stepper` 自己的 trapq（出步）与回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -209,12 +209,11 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
-- [ ] **G4-2 外围**：`GET_POSITION`（要 `kin.get_steppers()` + `calc_position` + MCU 位置）、
-      extra-axes 的 `axis_map`（`Coord` 目前固定 4 轴）、上游 `ToolHead.manual_move` /
-      `ToolHead.add_extra_axis` 的其余调用方（`toolhead:manual_move` 由 `safe_z_home` 发、
-      `toolhead:update_extra_axes` 由 `ToolHeadObject` 发，见下表；`extruder:activate_extruder`
-      仍只有处理器、无发送方）、`bed_mesh`（`set_move_transform` 已实现，`bed_tilt` /
-      `exclude_object` 在用）。
+- [ ] **G4-2 外围**：extra-axes 的 `axis_map` 已落地（`gcode_move` 随 `toolhead:update_extra_axes` 重建，`G1 A…` 按字母寻址并进入规划器；2026-10-18），
+      仍缺 **额外轴真正出步**（`manual_stepper` 的 trapq，见 H10）与 `Coord` 的定容上限（`MAX_AXES = 8`，第 5 个字母轴不映射）；
+      上游 `ToolHead.manual_move` / `ToolHead.add_extra_axis` 的其余调用方（`toolhead:manual_move` 由 `safe_z_home` 发、
+      `toolhead:update_extra_axes` 由 `ToolHeadObject` 发，见下表；`extruder:activate_extruder` 已由 `ACTIVATE_EXTRUDER` 发出）、
+      `bed_mesh`（`set_move_transform` 已实现，`bed_tilt` / `exclude_object` 在用）。
 
 ### B4 其余端点（机制部分 FW9）
 
@@ -222,6 +221,9 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 对象先存在：
 
 - [ ] `bed_mesh/dump_mesh` 与其余 `*/dump_*`（mux 机制已就绪，实例随各自 extras 落地）。
+      `motion_report/dump_trapq` / `dump_stepper` **已落地**（2026-10-18，`extras/motion_report.rs`）；
+      仍缺的是它的 `get_status`（`live_position`/`live_velocity`/`live_extruder_velocity`）与
+      shutdown 诊断（`analyze_shutdown` 的窗口转储）。
 
 ### F MCU 基础资源（F6、F8、F9）
 
@@ -421,14 +423,15 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H2 风扇与通用输出
 
-- [ ] **引用（拆分、拍板点与依赖以笔记为准）**：[H2 动工前调查](docs/work-log/2026-09-23-h2-notes.md)
-  ——上游 21 个文件的依赖盘点、H2-1…H2-7 拆分与四个拍板点。**已落地**：`fan`/`fan_generic`/
-  `heater_fan`/`controller_fan`（含 heater 注册表）、`tachometer_pin`→`pulse_counter`、
-  `pwm_tool`/`pwm_cycle_time`/`servo` 模块本体、`multi_pin`（批 #26）、`sx1509`（批 #41）、
-  电位器/DAC 驱动族 `mcp4018`/`mcp4451`/`ad5206`/`dac084s085`、`led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`
-  （`extras/led.rs` 六个 section，2026-10-06 复核）；
-  **余项**：`static_pwm_clock.py`（语料 1 处）、`replicape.py`（语料 1 处，另见本文件「特定板/芯片」）、
-  `duplicate_pin_override.py`（语料 0 用）；`pwm_tool` 队列化已完成（2026-10-03，`cf9c884`，同 **G2b**）。
+- [ ] **余项**：`replicape.py`（语料 1 处，另见本文件「特定板/芯片」——回归里唯一的静态缺节）。
+      **已落地**：`fan`/`fan_generic`/`heater_fan`/`controller_fan`（含 heater 注册表 `lookup_heater`，批 #20）、
+      `tachometer_pin`→`pulse_counter`（批 #8）、`pwm_tool`/`pwm_cycle_time`/`servo` 模块本体与队列化、
+      `multi_pin`（批 #26）、`sx1509`（批 #41）、电位器/DAC 驱动族 `mcp4018`/`mcp4451`/`ad5206`/`dac084s085`、
+      `led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`（`extras/led.rs` 六个 section）、
+      `static_pwm_clock`（2026-10-18）、`duplicate_pin_override`（2026-10-18）、
+      `SET_PIN`/`SET_FAN_SPEED` 的 `TEMPLATE=`（共享 `template_evaluator`，2026-10-18）。
+      `pwm_tool` 另缺 `maximum_mcu_duration` 的**主机侧**中间更新（上游 `MCU_queued_pwm._gen_intermediate_updates`；
+      固件 `queue_pwm_out` 已在），见 `pwm_tool.rs` 模块文档。
 
 ### H3 G-Code 宏与脚本
 

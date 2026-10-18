@@ -6,3 +6,11 @@
 	path = third_party/katapult
 	url = https://github.com/findlayfeng/katapult.git
 	branch = klipperx
+[submodule "third_party/moonraker"]
+	path = third_party/moonraker
+	url = https://github.com/findlayfeng/moonraker.git
+	branch = klipperx
+[submodule "third_party/mainsail"]
+	path = third_party/mainsail
+	url = https://github.com/findlayfeng/mainsail.git
+	branch = klipperx

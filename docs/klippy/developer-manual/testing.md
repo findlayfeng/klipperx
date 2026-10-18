@@ -690,6 +690,22 @@ git config core.hooksPath .githooks
 | `cmd/uart.rs` | **配置期端口命令的主机侧结构（M1-P7，无独立测试）**：`ConfigUart{oid,baud,slot}`/`ConfigBridgePort{oid,uart}`（`NAME` 与固件 `DECL_COMMAND` 逐字同形）与 `DEFAULT_UART_BAUD = 250_000`；由 `mcu/bridge_ports.rs::wire_bridge_port` 排进桥的 `ConfigBuilder`，行为由上面两条配置驱动测试与真实固件构建覆盖 |
 | `error_mcu.rs` | 已知固件消息拿到它的提示、MCU shutdown 被扩成原因+提示、`is_shutdown` 说“此前已停”、无关停机仍告诉用户敲什么；连接错误拿到 firmware_restart 提示；协议错误列出需要升级的 MCU（6 例，无配置节、由第一个 `[mcu]` 拉起） |
 
+### 2026-10-18 收尾新增（单列一节，避免与上表计数耦合）
+
+| 模块 | 覆盖 |
+|------|------|
+| `static_pwm_clock.rs`（7 测） | `frequency` 默认 100 / 边界（`> 3.3333`、`≤ 5.2e8`）；`pin` 缺失与“不是 MCU 上的 pin”两类错误；真 `McuChip` 构建后解码 `config_pwm_out`（`cycle_ticks`、start/default 均 0.5、`max_duration=0`）；整除与余数文案逐字（`Frequency output must be without remainder`）；**不**注册 pin 芯片、无 `get_status` |
+| `duplicate_pin_override.rs`（5 测） | 声明的 pin 可被两处使用、未声明的仍 `UsedMultipleTimes`、`pins` 缺失报上游文案、别名按拼写记账、对象不可查询；并在 `pins.rs` 钉住`allow_multi_use_pin` 用 `parse_pin(false,false)`（`!PA1`/`^PA1` 被拒） |
+| `template_evaluator.rs`（6 测） | `SET_PIN TEMPLATE=` 订阅后每次 `render_once` 写值、`TEMPLATE=`（空值）退订、`VALUE`/`TEMPLATE` 互斥、未知模板/非法 `PARAM_*`/非字面量三类文案、渲染失败只告警并落 0；`SET_FAN_SPEED TEMPLATE=` 同形；**无永久定时器**（测试用 `render_once` 同步驱动） |
+| `motion_report.rs`（6 测） | `dump_trapq` 行形状（`accel = 2*half_accel`、`direction = axes_r`）与重读窗口去重、`dump_stepper` 批次在首个 `step_count==0` 处截断、空批次不发消息、两端点按 `name` mux 注册且 header 逐字上游 |
+| `print_stats.rs`（+1） | `extruder:activate_extruder` 到达后 `last_epos` 重锚（跳变不累加、后续累加正常） |
+| `extruder.rs`（+2） | `ACTIVATE_EXTRUDER` 成功后发事件（一次）、未知名发不出事件且活动挤出机不变 |
+| `gcode_move.rs`（+9） | `GET_POSITION` 七行逐字（含 `mcu:` 整数、`kinematic:`/`gcode homing:` 只三轴）、`kinematic:` 逐轴回落、无 toolhead 报 `Printer not ready`；`axis_map` 随 `toolhead:update_extra_axes` 重建与上游过滤规则、孤立 manual_stepper 不落 E 槽、容量上限；`G1 A5` 按字母寻址、`G92`/`RESTORE` 只动前 4 个锚点 |
+| `plan.rs` / `motion/toolhead.rs`（+4） | `Move` 携带第四个以外的额外轴（`axes_r` 长度、`extra_end`）；纯额外轴 move 不被零长丢弃；`ea_index==4` 的额外轴被 check 并入队；主 trapq 仍三轴 |
+| `idle_timeout.rs`（+3） | `toolhead:sync_print_time` 到达 → 转 `Printing` + 载荷 `print_time + PIN_MIN_TIME` + 按 `READY_TIMEOUT + est − print` 重挂；收到过事件后观察者不再二次触发；未收事件时旧路径仍工作 |
+| `motion/toolhead.rs`（sync 载荷，+3） | 仅 `calc_print_time` 抬高时才入待发槽（raise-only）、锁内只入槽而锁外发送（三元组顺序）、空槽不发 |
+| `manual_stepper.rs`（+13，S4a） | 首次需要时装进运动队列、**trapq ≠ 主 trapq**、`mcu_stepper`/`stepper_commanded_position` 可查；`MOVE=` 得到直接步进（有界，假固件 `atmega2560.dict`）；`SET_POSITION` 先 flush 再摆 solver；`GCODE_AXIS=A` 后 `G1 A…` 进该轴自己的 trapq（S3+S4 接合点）；全套 13 条 1.35 s |
+
 ### `interface`
 
 | 模块 | 覆盖 |

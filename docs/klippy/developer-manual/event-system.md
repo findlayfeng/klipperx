@@ -144,9 +144,9 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `klippy:` | 全部 8 个 | — |
 | `homing:` | 全部 4 个（`toolhead` 的回零循环发 begin/end） | — |
 | `gcode:` | `command_error`、`request_restart` | —（`debuginput_exit` 已不声明：上游只有行协议输入会发它） |
-| `toolhead:` | `set_position`、`manual_move`（`safe_z_home` 的 `manual_move`）、`update_extra_axes`（`ToolHeadObject` 加/减额外轴） | `sync_print_time` |
+| `toolhead:` | `set_position`、`manual_move`（`safe_z_home` 的 `manual_move`）、`update_extra_axes`（`ToolHeadObject` 加/减额外轴）、`sync_print_time`（`calc_print_time` 抬高 print time 时入待发槽，由 flush 任务在**锁外**发出） | — |
 | `stepper_enable:` | `motor_off` | — |
-| `extruder:` | — | `activate_extruder`（已注册处理器，发送方是 G4-2） |
+| `extruder:` | `activate_extruder`（`ACTIVATE_EXTRUDER` 切换成功后发出，无载荷） | — |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
 | `virtual_sdcard:` | `reset_file` | `_reset_file` 末尾发出（`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`/`M23` 重置时） |
 | `idle_timeout:` | `ready`、`idle`、`printing`（批 #21） | — |
@@ -462,7 +462,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：34 个里 25 个已发出（逐项见 §2.2 表）。仍无发送方的 9 个：`toolhead:sync_print_time`、`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`extruder:activate_extruder`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：34 个里 27 个已发出（逐项见 §2.2 表）。仍无发送方的 7 个：`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` |
 
 ## 6. 与上游的差异
 

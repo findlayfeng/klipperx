@@ -64,7 +64,8 @@ Moonraker 自己提供，本仓不实现。2026-10-18 已对照 Moonraker 源码
 
 ```console
 # klipperx：socket 用 Moonraker 的默认值，日志与配置落在 Moonraker 的 data_path 下
-$ klipperx klippy -c ~/printer_data/config/printer.cfg \
+# 配置是**位置参数**（没有 -c）；-a 就是 Moonraker 的 klippy_uds_address
+$ klipperx klippy ~/printer_data/config/printer.cfg \
       -a /tmp/klippy_uds --logfile ~/printer_data/logs/klippy.log
 ```
 

@@ -2332,8 +2332,8 @@ impl ToolHeadObject {
     /// motor is not.
     ///
     /// # Errors
-    /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"
-    /// when no motion stepper answers to `name`.
+    /// "Printer is not ready" before connect, or the unknown-stepper error when
+    /// no motion stepper answers to `name`.
     pub fn set_stepper_position(&self, name: &str, position: f64) -> Result<(), CommandError> {
         let mut guard = self.lock();
         let connected = guard

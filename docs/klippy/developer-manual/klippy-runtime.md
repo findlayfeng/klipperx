@@ -139,13 +139,32 @@ Printer.__init__          _connect（reactor 回调）                 对象图
 `_read_config`（`klippy/klippy.py:114-127`）按上表顺序建立对象；`load_object`（`:90-113`）
 完成节名到模块的映射，重复装载直接返回已有对象。配置项的读取经 `ConfigWrapper` 记录，
 `check_unused_options` 据此拒绝未被任何对象读过的 section 或 option——**读取记录即 schema**。
-`objects/list` 的过滤见 `klippy/webhooks.py:484`。
+`objects/list` 的过滤见 `klippy/webhooks.py:484`。对象之间的依赖因此有一条硬规矩：
+解析别的对象要么在装载期（对方已登记）做，要么推迟到 `klippy:ready`，不能指望自己的
+`connect` 里对方已经连上——理由见下节。
 
 > **与上游的差异**：本项目的 section → 对象表在编译期生成（各模块的 `section!` 声明，见
 > [声明式表生成](codegen.md)），不依赖运行时按文件导入。配置解析器读取上游全部 259 份 `.cfg`
 > （由 [回归测试](regression-tests.md) 覆盖），仅保留一处宽松：引号内的 `#` 不作注释，而上游
 > 在第一个 `#` 处截断。`deprecate` / `deprecate_gcode` / `deprecate_mcu_code` / `runtime_warning`
 > 与 `configfile` 的 `warnings` 已实现；`autosave` / `SAVE_CONFIG`（`#*#` 块的读取与回写、写回后请求重启）也已实现。
+
+## 非配置节模块：为什么只能在 `klippy:ready` 解析宿主
+
+不是每个对象都有自己的配置节。`gcode_move` 就没有：它由 `[printer]` 的 toolhead 工厂
+`ensure` 出来（`extras/toolhead.rs:3905-3907`），因此**注册顺序排在 toolhead 之前**——
+`load.rs` 的 `register` 是先跑工厂、再 `add_object`（`load.rs:331-341`），toolhead 工厂跑到
+一半才把它 ensure 出来。
+
+构造分两段：装载期只建对象并登记，**全部装载完**才 `bring_up` 按注册顺序逐个 `connect`
+（`printer.rs:1016-1040`，上游 `_connect` 同形）。于是 `gcode_move` 的 `connect` 早于
+toolhead 的 `connect`：此时 toolhead 对象已在表里，但**还没连上**，它的位置/运动接口不可用。
+
+所以这类模块把「解析宿主」放在 `klippy:ready`（`printer.rs` 在全部 connect 之后才发）：
+`gcode_move` 的 `handle_ready`（`extras/gcode_move.rs:229-253`，上游 `gcode_move.py:58-64`）
+在 ready 才把 move target 钉到 toolhead 上，并允许 `bed_mesh` 之类的变换在此之前占用该槽。
+**新写「被别的工厂 ensure 出来、又依赖后面才连上的对象」的模块时，照这条办：`connect`
+里只做不依赖宿主的准备，取宿主一律推迟到 `klippy:ready`。**
 
 ## 事件总线
 

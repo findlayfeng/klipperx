@@ -6,10 +6,73 @@
 //! is driven explicitly (`generate`) so the host logic can be tested without a
 //! device, and the MCU side attaches on top of it.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use super::stepcompress::{StepCommand, StepCompressError};
 use super::stepper::Stepper;
 use super::trapq::{Trapq, NEVER_TIME};
 use crate::core::klippy::mathutil::Xyz;
+
+/// One callback fired when its stepper first has real motion queued.
+///
+/// Upstream's `MCU_stepper._active_callbacks` entry: the stepper's own list,
+/// emptied into the callbacks the flush pass invokes.
+type ActiveCallback = Box<dyn Fn(f64) + Send + 'static>;
+
+/// The per-stepper "enable me when I really move" callbacks
+/// (`MCU_stepper.add_active_callback`).
+///
+/// Upstream keys these on the stepper and installs `_check_active` on the
+/// motion queue's flush callbacks when the first one arrives; the list lives
+/// here because the flush pass is the only place with both the trapq and the
+/// solver state the check reads. It is `Arc`-shared so `stepper_enable` can arm
+/// a stepper from outside the toolhead — at config load, when no planner exists
+/// yet, and again after every `M84` (`EnableTracking.motor_disable` re-arms).
+#[derive(Default)]
+pub struct ActiveCallbacks {
+    /// Waiting callbacks per stepper name, in registration order.
+    entries: Mutex<HashMap<String, Vec<ActiveCallback>>>,
+}
+
+impl ActiveCallbacks {
+    /// An empty set of callbacks.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Arm `stepper`: the next queued motion fires `callback` **once** with the
+    /// print time that motion starts at (`MCU_stepper.add_active_callback`).
+    pub fn add(&self, stepper: &str, callback: ActiveCallback) {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .entry(stepper.to_string())
+            .or_default()
+            .push(callback);
+    }
+
+    /// The steppers with callbacks still waiting; a name drops out once it has
+    /// fired.
+    fn waiting(&self) -> Vec<String> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        entries.retain(|_, callbacks| !callbacks.is_empty());
+        entries.keys().cloned().collect()
+    }
+
+    /// Take `stepper`'s waiting callbacks (`_check_active` clears the list it
+    /// just fired). A name with none answers empty.
+    fn take(&self, stepper: &str) -> Vec<ActiveCallback> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(stepper)
+            .unwrap_or_default()
+    }
+}
 
 /// The trapqs and the steppers reading them.
 ///
@@ -25,6 +88,9 @@ pub struct MotionQueuing {
     /// flush time at the start of every [`MotionQueuing::generate`]
     /// (`motion_queuing.py:147-150`).
     flush_callbacks: Vec<Box<dyn Fn(f64) + Send>>,
+    /// The per-stepper active callbacks, checked before every
+    /// [`MotionQueuing::generate`] (`MCU_stepper.add_active_callback`).
+    active_callbacks: Arc<ActiveCallbacks>,
 }
 
 impl std::fmt::Debug for MotionQueuing {
@@ -47,6 +113,7 @@ impl MotionQueuing {
             trapqs: Vec::new(),
             steppers: Vec::new(),
             flush_callbacks: Vec::new(),
+            active_callbacks: Arc::new(ActiveCallbacks::new()),
         }
     }
 
@@ -58,6 +125,20 @@ impl MotionQueuing {
     /// only the flush time crosses this seam.
     pub fn register_flush_callback(&mut self, callback: Box<dyn Fn(f64) + Send + 'static>) {
         self.flush_callbacks.push(callback);
+    }
+
+    /// The per-stepper active callbacks (`MCU_stepper.add_active_callback`).
+    pub fn active_callbacks(&self) -> Arc<ActiveCallbacks> {
+        Arc::clone(&self.active_callbacks)
+    }
+
+    /// Check `active_callbacks` instead of this queue's own, empty set.
+    ///
+    /// The toolhead installs `stepper_enable`'s set here at connect: that object
+    /// is armed at config load, long before this queue exists
+    /// (`klippy/extras/toolhead.rs`).
+    pub fn set_active_callbacks(&mut self, callbacks: Arc<ActiveCallbacks>) {
+        self.active_callbacks = callbacks;
     }
 
     /// Create a trapq and return its id (`MotionQueuing.allocate_trapq`).
@@ -156,9 +237,39 @@ impl MotionQueuing {
             trapqs,
             steppers,
             flush_callbacks,
+            active_callbacks,
         } = self;
-        // Flush callbacks run first (`_advance_flush_time` invokes them before
-        // generating, `motion_queuing.py:149-150`) — and they run even when
+        // Active checks first (`_advance_flush_time` runs the flush callbacks —
+        // which is where upstream installs `_check_active` — before generating):
+        // a stepper with real motion queued has its enable scheduled at that
+        // motion's print time, before this pass generates its steps.
+        let waiting = active_callbacks.waiting();
+        if !waiting.is_empty() {
+            let mut fired: Vec<(Vec<ActiveCallback>, f64)> = Vec::new();
+            for name in waiting {
+                let Some(stepper) = steppers.iter().find(|stepper| stepper.name() == name) else {
+                    continue;
+                };
+                // A detached stepper generates nothing, so nothing can move.
+                let Some(trapq_id) = stepper.trapq_id() else {
+                    continue;
+                };
+                if let Some(print_time) = stepper
+                    .kinematics()
+                    .check_active(&trapqs[trapq_id], flush_time)
+                {
+                    fired.push((active_callbacks.take(&name), print_time));
+                }
+            }
+            // Outside the queue borrows: a callback drives an enable pin and may
+            // defer work, but must not need the queue.
+            for (callbacks, print_time) in fired {
+                for callback in callbacks {
+                    callback(print_time);
+                }
+            }
+        }
+        // Flush callbacks run before generating, and they run even when
         // there is no stepper to generate for: a macro-driven dwell timeline
         // queues no steps, but its flush time still advances.
         for callback in flush_callbacks.iter() {
@@ -397,6 +508,120 @@ mod tests {
                 ("second", 2.0)
             ]
         );
+    }
+
+    #[test]
+    fn test_a_queued_move_fires_the_active_callback_once_at_its_print_time() {
+        // `MCU_stepper.add_active_callback` + `_check_active`: the callback runs
+        // once, with the print time the stepper's first real move starts at, and
+        // its registration is consumed — a later flush does not fire it again.
+        let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
+        queuing.add_stepper(Stepper::cartesian(
+            "stepper_x",
+            0,
+            1.0,
+            Axis::X,
+            1_000_000.0,
+        ));
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&fired);
+        queuing.active_callbacks().add(
+            "stepper_x",
+            Box::new(move |print_time| recorded.lock().unwrap().push(print_time)),
+        );
+        // A dwell first (a `G4`): it moves no axis, so the move after it is what
+        // the callback has to report.
+        let mut move_ = move_(0.0, 10.0);
+        move_.set_junction(0.0, 10_000.0, 0.0);
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            0.1,
+            0.0,
+            0.0,
+            Xyz::default(),
+            Xyz::default(),
+            0.0,
+            0.0,
+            0.0,
+        );
+        queuing.trapq_mut(trapq).append(
+            0.1,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::default(),
+            Xyz::new(10.0, 0.0, 0.0),
+            move_.start_v,
+            move_.cruise_v,
+            move_.accel,
+        );
+
+        queuing.generate(0.5).unwrap();
+
+        assert_eq!(
+            *fired.lock().unwrap(),
+            [0.1],
+            "once, at the print time the move starts at"
+        );
+
+        // Already fired: the registration is gone, so a later flush is silent.
+        queuing.generate(0.8).unwrap();
+        assert_eq!(*fired.lock().unwrap(), [0.1]);
+    }
+
+    #[test]
+    fn test_a_flush_with_no_motion_never_fires_the_active_callback() {
+        // Only a dwell is queued (a `G4`): nothing that moves an axis is queued,
+        // so the motor stays off and the callback keeps waiting for the next
+        // flush.
+        let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
+        queuing.add_stepper(Stepper::cartesian(
+            "stepper_y",
+            0,
+            1.0,
+            Axis::Y,
+            1_000_000.0,
+        ));
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&fired);
+        queuing.active_callbacks().add(
+            "stepper_y",
+            Box::new(move |print_time| recorded.lock().unwrap().push(print_time)),
+        );
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            0.0,
+            1.1,
+            0.0,
+            Xyz::default(),
+            Xyz::default(),
+            0.0,
+            0.0,
+            0.0,
+        );
+
+        queuing.generate(1.05).unwrap();
+        assert!(fired.lock().unwrap().is_empty(), "a dwell moves no axis");
+
+        // The waiting callback is still armed for the real motion that follows.
+        let mut move_ = move_(0.0, 10.0);
+        move_.set_junction(0.0, 10_000.0, 0.0);
+        queuing.trapq_mut(trapq).append(
+            1.1,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::default(),
+            Xyz::new(0.0, 10.0, 0.0),
+            move_.start_v,
+            move_.cruise_v,
+            move_.accel,
+        );
+
+        queuing.generate(2.0).unwrap();
+        assert_eq!(*fired.lock().unwrap(), [1.1]);
     }
 
     #[test]

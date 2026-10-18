@@ -27,7 +27,7 @@ canbus_nodeid: 2
 host_library: /usr/local/lib/libklipper_host.so
 ```
 
-节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。
+节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。**连接期如果 tty 还不存在**（板子刚复位/上电、或宿主机先于内核枚举启动），独占串口的**打开**会按上游的预算重试：间隔 **5 s**、总预算 **90 s**（`serialhdl.py:181-204`），期间每条命令/信号都会让等待提前结束；握手与配置**不**重试，所以真正的协议错误仍是一次就报。`reset` 之后的重新打开走另一套有界重连循环（3 次），两层预算不叠加。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。
 
 CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**CAN 的键名沿用 Klipper**（`canbus_interface` / `canbus_nodeid` 照旧），身份键则规范为 `uuid`——`canbus_uuid` 仍兼容（现有 Klipper 配置照用，同节两个都写会报错），「机器怎么接线」的语义不变。代码里那层实现叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
 

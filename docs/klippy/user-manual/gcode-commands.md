@@ -401,6 +401,12 @@ STEPPER_BUZZ STEPPER=<name>
 
 `M18`/`M84` 会广播 `stepper:motor_off`，让其余部件一起收尾。
 
+**电机由自己的运动自动使能**（2026-10-18 补齐，对齐上游 `EnableTracking` 的
+`stepper.add_active_callback(motor_enable)`，`klippy/stepper.py:239-258` 与
+`klippy/extras/stepper_enable.py:45-70`）：队列派发现真实运动时，使能按那段运动的 `print_time`
+排期发出（不是立即写），所以上电后第一条 `G28`/`G1` 就能动；`M84`/`M18` 失能后回调会重新武装，
+下一次运动会再次使能。`SET_STEPPER_ENABLE` 仍可手工开关。
+
 ---
 
 ## 温度与加热器
@@ -470,6 +476,16 @@ M109 [S<temperature>] [T<index>]
 `wait=true` 经 `PrinterHeaters::set_temperature(.., wait)` 阻塞到加热器到达目标
 （2026-10-03，`6900894`，匹配上游 `kinematics/extruder.py:260-279`）；`M104` 仅设目标即返回。编号指向的挤出机不存在时报
 `Extruder not configured`。
+
+### TURN_OFF_HEATERS — 关闭全部加热器
+
+```
+TURN_OFF_HEATERS
+```
+
+把每个已注册的加热器（床、挤出机、`heater_generic`）目标温度置 `0`（上游
+`heaters.py:319-321`），不阻塞。`[idle_timeout]` 默认脚本的第一行就是它（2026-10-18 补上；
+此前落到未知命令、实际只跑了 `M84`）。仅就绪后可用（上游同样注册在 ready 表，`heaters.py:255-256`）。
 
 ### M140 / M190 — 设置热床温度
 

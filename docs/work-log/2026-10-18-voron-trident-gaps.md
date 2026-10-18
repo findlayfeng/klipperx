@@ -53,7 +53,7 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 
 | # | 项 | 现状 | 证据 | 本阶段判定 |
 |---|---|---|---|---|
-| A-1 | **`toolhead` 缺 `axis_minimum`/`axis_maximum`** | 未实现 | ✅复核 `extras/toolhead.rs:1182-1210` 只回 8 个键（`position`/`homed_axes`/`print_time`/`extruder`/四个速度限）；上游 `toolhead.py:502-515` | **P0（UI）**：Mainsail 的床尺寸/软限位/剩余时间直接读这两个键，缺失就是空/0。调试时不致命但会一直误判「床多大」 |
+| A-1 | **`toolhead` 缺 `axis_minimum`/`axis_maximum`** | 未实现 | ✅复核 `extras/toolhead.rs:1182-1210` 只回 8 个键（`position`/`homed_axes`/`print_time`/`extruder`/四个速度限）；上游 `toolhead.py:502-515` | **P0（UI）**：Mainsail 的床尺寸/软限位/剩余时间直接读这两个键，缺失就是空/0。调试时不致命但会一直误判「床多大」。（**定级已错**：Moonraker 不读这两个字段，实际是 P2——见 §9） |
 | A-2 | `info` 握手 | 可用 | ✅复核 `api/endpoints/info.rs:59-63`；`python_path`/`klipper_path` 报不存在的路径（Moonraker 更新面板会是空壳，已登记 E2） | 可用；**需实测** Moonraker 是否能起（它对这两个字段的下标访问是硬依赖） |
 | A-3 | `webhooks` 状态（`ready`/`error`/`shutdown`） | 可用 | ◻侦察 `api/webhooks.rs:256-263` | 阶段一**关键**：停机/掉线要在 UI 上直接可见，否则 P0-3 那种幽灵运行连界面都看不出来 |
 | A-4 | `objects/{list,query,subscribe}`（0.25 s） | 可用 | ✅复核 三端点存在；`objects_subscribe.rs:68,75` | 温度曲线 + 位置就靠它 —— 阶段一的主界面 |
@@ -119,3 +119,26 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 4. **A-1 + Moonraker 实连**：让 UI 能看能用，之后再谈操作。
 5. **P1-1 + P1-4**：Z 回零的安全与失败恢复，`G28 Z` 反复调试前必须解决。
 6. **P1-5 + P1-6**：把诊断与远程复位手段补齐，长跑调试效率在这里。
+
+## 9. 实施记录（唯一随实现推进回填的一节）
+
+### 2026-10-18 第一批：P0 五条 + API 一处（已合入 `work`）
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| P0-1 电机自动使能 | ✅ 落地（`5fd2eee` 系列） | `motion/itersolve` 的 `check_active`、`motion/queuing` 的 `ActiveCallbacks`、`extras/stepper_enable` 的按 `print_time` 排期使能；TMC 虚拟使能由同一条链驱动（`toff` 回填有单测） |
+| P0-2 `TURN_OFF_HEATERS` | ✅ 落地（`73ee003`） | `extras/heaters.rs` 注册（ready 表，文案同上游），三种 heater 归零有测试；`config.md`/`gcode-commands.md` 已同步 |
+| P0-3 MCU 失联检测 | ✅ 落地（`2aa5bc0`） | 判据按上游实际实现（未答查询 > 4），不是「估计打印时间 vs 单调时钟」——侦察报告里的表述**有误**，已按 `mcu.py:897-905` 修正；挂在既有 1 s poll 上，file-output 不判 |
+| P0-4 串口打开重试 | ✅ 落地（`a1e5548` + `728972f`） | 5 s × 90 s，只包打开；**重试改在阻塞池执行**（原本同步睡在 async 里会停住 2 worker 运行时） |
+| P0-5 加热固件看门狗 | ✅ 落地（`73ee003`） | `setup_max_duration(MAX_HEAT_TIME=3.0)`；`set_pwm` 的 `verify_mainthread_time` 那一半仍缺（记 `TODO` H1） |
+| A-1 轴范围 + 估计时间 | ✅ 落地（`68a92da`） | 按 Moonraker 源码复核后**降为 P2（UI）**：它不读这两个字段 |
+| L1 契约守卫 | ✅ 落地（`8198077`） | `info` 两路径字段、四态 `state`、`print_stats` 首帧 `state` 三条回归守卫 |
+
+**Moonraker 对接结论（只读 `/home/fengcheng/project/klipperx.worktrees/moonraker` 源码）**：
+现成 Moonraker 可把本机当 klippy 用，L1 无阻塞项；握手链 `info` → `objects/*` → `gcode/subscribe_output`
+→ `list_endpoints` → `register_remote_method` 全部已注册且形状一致。三条硬依赖已加守卫。
+部署约定（非代码缺口）：`-a /tmp/klippy_uds`、`-c <data_path>/config/printer.cfg`、
+`--logfile <data_path>/logs/klippy.log`、`[virtual_sdcard] path: <data_path>/gcodes`。
+
+**下一步（第二批，未开始）**：P1-1（Z 兄弟电机进端停刹车）、P1-2/P1-3（日志落盘与轮转、定时器 panic 兜底）、
+P1-4（失败 `G28` 后的恢复）、P1-5 归因、P1-6（admin takeover）、上板实测（§4 五项）与 Moonraker 端到端冒烟。

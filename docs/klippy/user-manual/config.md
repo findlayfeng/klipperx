@@ -547,7 +547,7 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 |------|------|------|--------|------|
 | `sensor_type` | 字符串 | 是 | — | 温度传感器类型，查 `heaters` 注册表（可选值见 `[temperature_sensor]` 的速查表） |
 | `sensor_pin` | 引脚 | 是* | — | 传感器的 ADC 引脚；`DS18B20` / `temperature_mcu` / `temperature_combined` 不用它 |
-| `heater_pin` | 引脚 | 是 | — | 加热输出（按 PWM 接） |
+| `heater_pin` | 引脚 | 是 | — | 加热输出（按 PWM 接）；固件看门狗上限 `MAX_HEAT_TIME = 3.0 s`（主机停刷新则固件把口拉回 `shutdown_value`） |
 | `min_temp` | 浮点 (°C) | 是 | — | 报警下限 |
 | `max_temp` | 浮点 (°C) | 是 | — | 报警上限，`> min_temp` |
 | `min_extrude_temp` | 浮点 (°C) | 否 | `170` | 允许挤出的最低温度（须在 `[min_temp, max_temp]` 内） |
@@ -1143,7 +1143,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `timeout` | `600` | 空闲秒数，`above 0` |
 | `gcode` | 内置（`{% if 'heaters' in printer %}` → `TURN_OFF_HEATERS`；`M84`） | 超时后跑的脚本 |
 
-`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。起印识别以 `toolhead:sync_print_time` 事件为准（`calc_print_time` 抬高 print time 时发出）；事件未到达时仍回退到“观察 `print_time` 前进”，且收到过一次事件后不再双发。gap：`TURN_OFF_HEATERS` 未实现（默认脚本里那行走「未知命令」）；上游的 `update_timer` 用本仓的 `arm`（注销后重挂）顶替。
+`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。起印识别以 `toolhead:sync_print_time` 事件为准（`calc_print_time` 抬高 print time 时发出）；事件未到达时仍回退到“观察 `print_time` 前进”，且收到过一次事件后不再双发。默认脚本的两行现在都真生效（`TURN_OFF_HEATERS` 与 `M84`）；上游的 `update_timer` 用本仓的 `arm`（注销后重挂）顶替。
 
 ### `[verify_heater <heater_name>]` — 加热器升温校验（批 #20）
 

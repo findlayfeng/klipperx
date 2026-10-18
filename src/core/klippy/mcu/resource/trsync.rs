@@ -13,9 +13,13 @@
 //! Here it is plain Rust:
 //!
 //! * [`TriggerGroup`] holds the `McuTrsync`s of one dispatch and the completion;
-//! * a per-MCU [`TrsyncRegistry`] binds **one** `trsync_state` handler for the
-//!   whole MCU and routes by oid (our `Mcu::bind_event` keeps one handler per
-//!   message name, so several endstops on one MCU must share it);
+//! * a per-MCU [`TrsyncRegistry`] routes `trsync_state` by oid, through **one**
+//!   handler for the whole MCU (our `Mcu::bind_event` keeps one handler per
+//!   message name, so several endstops on one MCU must share it). The handler is
+//!   bound per **arm**, not per configuration: an MCU's event table belongs to
+//!   one connection, and this host keeps a section connected across a firmware
+//!   reset by replacing the session (`McuTrsync::start`, upstream
+//!   `MCU_trsync.start`);
 //! * on each report the group recomputes the minimum acknowledged print time and
 //!   resends `trsync_set_timeout` when the extension is worth it
 //!   (`handle_trsync_state`, `chelper/trdispatch.c:70-140`).
@@ -207,6 +211,15 @@ pub struct McuTrsync {
     /// The oid `config_trsync` assigned.
     oid: u8,
     chip: TrsyncChip,
+    /// The MCU's shared `trsync_state` router, for (re)binding on the session
+    /// that is about to report.
+    ///
+    /// Strong, while the registry keeps its trsyncs [weak](Weak): that is the
+    /// direction that neither leaves the registry without an owner nor makes
+    /// `registry ↔ trsync` a cycle (the registry is per MCU and the trsyncs are
+    /// what keep it alive; a trsync that reported into it strongly would keep
+    /// the connected `Mcu`, and its device read, alive forever).
+    registry: Arc<TrsyncRegistry>,
     group: Weak<TriggerGroup>,
     /// The steps that stop when the group fires, with the name their rail uses
     /// (for the multi-MCU shared-axis check).
@@ -230,15 +243,12 @@ impl McuTrsync {
     fn new(chip: McuChip, group: Weak<TriggerGroup>) -> Result<Arc<Self>, McuError> {
         let builder: Arc<ConfigBuilder> = chip.config();
         let oid = builder.create_oid()?;
-        // The registry is captured for the config callback only. Storing it —
-        // or the whole chip that owns it — in the trsync would make
-        // `registry ↔ trsync` a strong cycle and keep the connected `Mcu`
-        // alive forever (these slots are kept `Weak` for exactly that reason).
         let registry = chip.trsync_registry();
         let trsync_chip = chip.trsync_chip();
         let trsync = Arc::new(Self {
             oid,
             chip: trsync_chip,
+            registry: Arc::clone(&registry),
             group,
             steppers: Mutex::new(Vec::new()),
             expire_clock: Mutex::new(0),
@@ -248,9 +258,25 @@ impl McuTrsync {
             home_end_clock: Mutex::new(None),
         });
         let registered = Arc::clone(&trsync);
-        builder.register_config_callback(Box::new(move |builder, mcu| {
+        let router = Arc::downgrade(&registry);
+        builder.register_config_callback(Box::new(move |builder, _mcu| {
             builder.add_config_cmd(&ConfigTrsync { oid })?;
-            registry.register(Arc::clone(&registered), mcu)
+            // Disarm the group on **every** connect, as upstream's `on_restart`
+            // `trsync_start … report_ticks=0` does (`klippy/mcu.py:189-193`).
+            // Only `trsync_trigger` and a new `trsync_start` delete the
+            // firmware's periodic report timer (`src/trsync.c:171-186`), so a
+            // board that was reset while a homing move had one armed would
+            // otherwise keep reporting on the session that replaces it.
+            builder.add_restart_cmd(&TrsyncStart {
+                oid,
+                report_clock: 0,
+                report_ticks: 0,
+                expire_reason: 0,
+            })?;
+            if let Some(router) = router.upgrade() {
+                router.register(&registered);
+            }
+            Ok(())
         }))?;
         Ok(trsync)
     }
@@ -309,6 +335,10 @@ impl McuTrsync {
         expire_timeout: f64,
     ) -> Result<(), McuError> {
         let mcu = self.require_mcu()?;
+        // The report handler goes in **before** the arm messages: the firmware
+        // may report as soon as it processes `trsync_start`, and the first
+        // report is what completes a dispatch.
+        self.bind_report_handler(&mcu)?;
         let freq = self.require_clock()?.estimator().mcu_freq();
         let clock = self
             .chip
@@ -452,6 +482,23 @@ impl McuTrsync {
         }
     }
 
+    /// Install the MCU's shared `trsync_state` handler on the session that is
+    /// about to report.
+    ///
+    /// Per arm, not per configuration: `ConfigBuilder::build` runs the config
+    /// callbacks **once** per configuration (`mcu/config.rs`), while the event
+    /// table a handler lives in belongs to one connection
+    /// ([`McuEvents`](crate::core::klippy::mcu::events)) — and a section that is
+    /// reset in place keeps its chips but gets a new session (`McuObject`'s
+    /// `reconnect`). A binding made at configuration time therefore covers only
+    /// the first session; every report on a replacement session was dropped as
+    /// unhandled (`mcu/mod.rs`, "Unhandled message") and the dispatch waited
+    /// forever. Upstream binds its handler in `MCU_trsync.start` for the same
+    /// reason (`klippy/mcu.py:255-259`).
+    fn bind_report_handler(&self, mcu: &Arc<Mcu>) -> Result<(), McuError> {
+        self.registry.bind(mcu)
+    }
+
     fn require_mcu(&self) -> Result<Arc<Mcu>, McuError> {
         self.chip
             .mcu()
@@ -471,8 +518,12 @@ impl McuTrsync {
 /// every trsync on the MCU must share it.
 #[derive(Default)]
 pub struct TrsyncRegistry {
-    by_oid: Mutex<HashMap<u8, Arc<McuTrsync>>>,
-    bound: AtomicBool,
+    /// The trsyncs of this MCU, by the oid `config_trsync` assigned.
+    ///
+    /// Weak: each trsync holds this registry (to bind the report handler), so
+    /// a strong entry would be a cycle — and through the trsync's chip slot it
+    /// would keep the connected `Mcu` alive past teardown.
+    by_oid: Mutex<HashMap<u8, Weak<McuTrsync>>>,
 }
 
 impl TrsyncRegistry {
@@ -481,29 +532,42 @@ impl TrsyncRegistry {
         Self::default()
     }
 
-    /// Register `trsync` and, on the first call, bind the shared handler.
-    ///
-    /// # Errors
-    /// Returns [`McuError`] if the message is not in the dictionary.
-    pub fn register(self: &Arc<Self>, trsync: Arc<McuTrsync>, mcu: &Mcu) -> Result<(), McuError> {
+    /// Remember `trsync`, so a report naming its oid can be routed to it.
+    pub fn register(&self, trsync: &Arc<McuTrsync>) {
         self.by_oid
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(trsync.oid(), trsync);
-        if !self.bound.swap(true, Ordering::SeqCst) {
-            let registry = Arc::clone(self);
-            mcu.bind_event::<TrsyncState, _>(move |state| registry.route(state))?;
-        }
-        Ok(())
+            .insert(trsync.oid(), Arc::downgrade(trsync));
     }
 
+    /// Bind the shared `trsync_state` handler on `mcu`, replacing a handler an
+    /// earlier session left behind (`Mcu::bind_event` keeps one per message).
+    ///
+    /// # Errors
+    /// Returns [`McuError`] if the message is not in the session's dictionary.
+    fn bind(self: &Arc<Self>, mcu: &Mcu) -> Result<(), McuError> {
+        // Weak, like the connection's own handlers (`McuObject`'s
+        // `watch_connect_shutdown`): the table this closure sits in belongs to
+        // the session, and a handler that kept its resource strongly would be
+        // another `Mcu → events → resource` edge for `clear_events` to break.
+        let registry = Arc::downgrade(self);
+        mcu.bind_event::<TrsyncState, _>(move |state| {
+            if let Some(registry) = registry.upgrade() {
+                registry.route(state);
+            }
+        })
+    }
+
+    /// Route `state` to its trsync; an oid nobody owns is dropped silently, as
+    /// upstream's per-oid handlers drop a late report
+    /// (`_handle_trsync_state`, `klippy/mcu.py:228-240`).
     fn route(&self, state: TrsyncState) {
         let trsync = self
             .by_oid
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&state.oid)
-            .cloned();
+            .and_then(Weak::upgrade);
         if let Some(trsync) = trsync {
             trsync.handle_state(state);
         }
@@ -692,12 +756,16 @@ impl TriggerDispatch {
 mod tests {
     use super::*;
 
-    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, RecordingWire};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::pins::{PinParams, PrinterPins};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
 
     /// A dictionary with the trsync/stepper commands.
     fn dictionary() -> Dictionary {
@@ -869,7 +937,19 @@ mod tests {
         let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
         let trsync = first(&dispatch);
         let registry = chip.trsync_registry();
-        registry.register(Arc::clone(&trsync), &mcu).unwrap();
+        registry.register(&trsync);
+
+        // An oid nobody owns stops at the registry: the handler is bound to the
+        // MCU, so a late report never falls through to the "unhandled message"
+        // path (`mcu/mod.rs`) — upstream ignores it the same way
+        // (`_handle_trsync_state`, `klippy/mcu.py:228-240`).
+        registry.route(TrsyncState {
+            oid: trsync.oid.wrapping_add(1),
+            can_trigger: false,
+            trigger_reason: TriggerReason::EndstopHit as u8,
+            clock: 0,
+        });
+        assert_eq!(dispatch.completion().reason(), None);
 
         registry.route(TrsyncState {
             oid: trsync.oid,
@@ -900,8 +980,8 @@ mod tests {
         assert_eq!(tx.chip.name(), ty.chip.name());
 
         let registry = chip.trsync_registry();
-        registry.register(Arc::clone(&tx), &mcu).unwrap();
-        registry.register(Arc::clone(&ty), &mcu).unwrap();
+        registry.register(&tx);
+        registry.register(&ty);
         registry.route(TrsyncState {
             oid: ty.oid,
             can_trigger: false,
@@ -1030,6 +1110,164 @@ mod tests {
                 .unwrap_or_else(|p| p.into_inner())
                 .len(),
             2
+        );
+    }
+
+    /// One message's wire payload, as the host encodes it from the fixture
+    /// dictionary (`wire_bytes` in `endstop.rs` does the same).
+    fn payload(name: &str, args: &[ArgValue]) -> Vec<u8> {
+        let mut parser = Parser::new();
+        dictionary().install(&mut parser).unwrap();
+        parser.encode(name, args).unwrap().into_raw()
+    }
+
+    /// The message names in the payloads `wire` was sent, in order (one block
+    /// may carry several).
+    fn sent_names(sent: &Arc<Mutex<Vec<Vec<u8>>>>) -> Vec<String> {
+        let mut parser = Parser::new();
+        dictionary().install(&mut parser).unwrap();
+        sent.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .flat_map(|payload| {
+                parser
+                    .decode(Payload::from_raw(payload.clone()))
+                    .unwrap_or_default()
+            })
+            .map(|(msg, _)| msg.name.clone())
+            .collect()
+    }
+
+    /// Closes a fake session when a test ends — on a failed assertion too.
+    ///
+    /// A trsync reaches its `Mcu` through the chip's device slot while the
+    /// chip's builder holds the config callback, so the dispatch a test holds
+    /// keeps the session alive: `Mcu::Drop` never runs and its parked device
+    /// read would hold up runtime shutdown (`endstop.rs`'s `SessionGuard` has
+    /// the full note).
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
+    /// The `trsync_state` handler must be bound on the session that **arms**,
+    /// not only on the one the configuration was built on.
+    ///
+    /// A section survives a firmware reset by replacing its session
+    /// (`McuObject::reconnect`): the chips stay, the event table does not, and
+    /// the config callbacks never run again (`ConfigBuilder::build` runs them
+    /// once per configuration). Binding in the config callback therefore left a
+    /// replaced session with **no** handler: every `trsync_state` it received was
+    /// dropped as unhandled (`mcu/mod.rs`, "Unhandled message") and
+    /// `home_wait` waited for a completion nothing could deliver.
+    #[tokio::test]
+    async fn test_a_replaced_session_binds_the_report_handler_when_it_arms() {
+        // Session 1: the configuration is built here, which is where the
+        // handler used to be installed.
+        let first_session = identified_mcu("mcu");
+        let chip = chip("mcu", Arc::clone(&first_session));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let trsync = first(&dispatch);
+        let _built = chip.config().build(&first_session).unwrap();
+
+        // Session 2 replaces it. Its wire answers `trsync_trigger` with the
+        // `trsync_state` the firmware would send back — a plain report, because
+        // the trigger went out with `send_msg`, so no pending call owns it.
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        wire.reply_to(
+            payload(
+                "trsync_trigger",
+                &[
+                    ArgValue::UInt8(trsync.oid()),
+                    ArgValue::UInt8(TriggerReason::HostRequest as u8),
+                ],
+            ),
+            payload(
+                "trsync_state",
+                &[
+                    ArgValue::UInt8(trsync.oid()),
+                    ArgValue::UInt8(0),
+                    ArgValue::UInt8(TriggerReason::HostRequest as u8),
+                    ArgValue::UInt32(0),
+                ],
+            ),
+        );
+        let second_session = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        second_session.install_dictionary(dictionary()).unwrap();
+        second_session.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&second_session));
+        chip.attach(Arc::clone(&second_session));
+
+        let completion = dispatch.start(0.0).unwrap();
+        // Let the arm flush as its own block, so the trigger below is answered
+        // on its own (the wire answers a whole block at a time).
+        sleep(Duration::from_millis(120)).await;
+        dispatch.stop();
+
+        let reason = timeout(Duration::from_secs(2), completion.wait())
+            .await
+            .expect("the report must be routed, not dropped as unhandled");
+        assert_eq!(reason, TriggerReason::HostRequest);
+
+        // The arm and the stop both reached the firmware. `trsync_trigger` is
+        // what deletes the firmware's report and expire timers
+        // (`src/trsync.c:171-186`), i.e. what ends the periodic feed an armed
+        // group otherwise keeps producing (`src/trsync.c:57-65`).
+        let names = sent_names(&sent);
+        assert!(
+            names.iter().any(|name| name == "trsync_start"),
+            "the group was never armed: {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "trsync_trigger"),
+            "the firmware was never told to stop reporting: {names:?}"
+        );
+    }
+
+    /// The restart list disarms every group, upstream's `on_restart`
+    /// `trsync_start … report_ticks=0` (`klippy/mcu.py:189-193`).
+    ///
+    /// Only `trsync_trigger` and a new `trsync_start` delete the firmware's
+    /// periodic report timer (`src/trsync.c:171-186`), so without this a board
+    /// that was reset while a homing move had a group armed keeps reporting on
+    /// the session that replaces it.
+    #[tokio::test]
+    async fn test_the_restart_list_disarms_a_group_left_armed() {
+        let mcu = identified_mcu("mcu");
+        let chip = chip("mcu", Arc::clone(&mcu));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let oid = first(&dispatch).oid();
+        let built = chip.config().build(&mcu).unwrap();
+
+        let mut parser = Parser::new();
+        dictionary().install(&mut parser).unwrap();
+        let mut disarmed = false;
+        for payload in &built.restart {
+            for (msg, args) in parser.decode(payload.clone()).unwrap_or_default() {
+                if msg.name != "trsync_start" {
+                    continue;
+                }
+                assert_eq!(
+                    args,
+                    [
+                        ArgValue::UInt8(oid),
+                        ArgValue::UInt32(0),
+                        ArgValue::UInt32(0),
+                        ArgValue::UInt8(0),
+                    ],
+                    "the restart must disarm (report_ticks=0), not arm"
+                );
+                disarmed = true;
+            }
+        }
+        assert!(
+            disarmed,
+            "the restart list must disarm the group on every connect"
         );
     }
 }

@@ -262,14 +262,24 @@ impl McuTrsync {
 
     /// Register a stepper to stop when the group fires.
     ///
+    /// A stepper already registered here is ignored, as upstream's
+    /// `MCU_trsync.add_stepper` does (`klippy/mcu.py:183-186`): a rail registers
+    /// all of its motors with its endstop and a virtual endstop's helper (the
+    /// probe's `LookupZSteppers`) registers the same motors again, and the
+    /// firmware must get one `stepper_stop_on_trigger` per motor, not two.
+    ///
     /// The handle is weak: the oid is read when the group is armed, not now,
     /// because this happens at config-load time and the oid is only assigned
     /// when the configuration is built.
     pub fn add_stepper(&self, stepper: Weak<McuStepper>, name: &str) {
-        self.steppers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push((stepper, name.to_string()));
+        let mut steppers = self.steppers.lock().unwrap_or_else(|p| p.into_inner());
+        if steppers
+            .iter()
+            .any(|(known, _)| Weak::ptr_eq(known, &stepper))
+        {
+            return;
+        }
+        steppers.push((stepper, name.to_string()));
     }
 
     /// The `(name, is the stepper alive)` pairs registered on this trsync.
@@ -934,6 +944,27 @@ mod tests {
 
         let trsync = first(&dispatch);
         assert_eq!(trsync.stepper_names(), vec!["stepper_x", "stepper_x1"]);
+    }
+
+    /// Registering the same stepper twice keeps one entry: a rail registers all
+    /// of its motors with its endstop, and a virtual endstop's helper (the
+    /// probe's `LookupZSteppers`) registers the same motors again — upstream's
+    /// `MCU_trsync.add_stepper` ignores the repeat (`klippy/mcu.py:183-186`),
+    /// and the firmware must get one stop message per motor.
+    #[tokio::test]
+    async fn test_a_stepper_is_registered_once_even_if_added_twice() {
+        let chip = chip("mcu", identified_mcu("mcu"));
+        let dispatch = TriggerDispatch::new(vec![chip.clone()]).unwrap();
+        let z1 = stepper(&chip, "PA2");
+
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&z1), "stepper_z1")
+            .unwrap();
+        dispatch
+            .add_stepper(chip.clone(), Arc::downgrade(&z1), "stepper_z1")
+            .unwrap();
+
+        assert_eq!(first(&dispatch).stepper_names(), vec!["stepper_z1"]);
     }
 
     /// A trigger analog's dispatch is handed the Z rail's steppers

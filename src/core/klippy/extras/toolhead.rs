@@ -4142,6 +4142,13 @@ mod tests {
         // The sibling is registered (so its connect runs) and its options were
         // read, which is what makes the factory-less section valid.
         assert!(printer.lookup_object("stepper_z1").is_some());
+        // `GET_POSITION` names the steppers in `kin.get_steppers()` order: each
+        // rail's motors in axis order, the sibling inside its rail
+        // (`kinematics/cartesian.py:46-47`).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_x", "stepper_y", "stepper_z", "stepper_z1"]
+        );
     }
 
     #[test]
@@ -4216,6 +4223,13 @@ mod tests {
         assert_eq!(object.max_angular_velocity, 5.0);
         // The Z rail is found by name, not by cartesian index.
         assert_eq!(object.z_stepper_names(), ["stepper_z"]);
+        // `kin.get_steppers()` puts the bare bed stepper **before** the rails
+        // (`kinematics/polar.py:33-34`), which is not the order connect adds
+        // them in (rails, then bed).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_bed", "stepper_arm", "stepper_z"]
+        );
     }
 
     #[test]

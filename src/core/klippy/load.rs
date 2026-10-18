@@ -401,6 +401,9 @@ mod tests {
                 "stepper_enable",
                 "multi_pin",
                 "sx1509",
+                // The multi-use pin escape hatch (order 17): after the sections
+                // that register a chip, before every consumer of a reused pin.
+                "duplicate_pin_override",
                 // The force-move helper, before every section that builds a
                 // stepper (`force_move` is created on first stepper load).
                 "force_move",
@@ -467,6 +470,7 @@ mod tests {
                 "virtual_sdcard",
                 "z_tilt",
                 "static_digital_output",
+                "static_pwm_clock",
                 "ad5206",
                 "adxl345",
                 "dac084S085",
@@ -847,6 +851,13 @@ mod tests {
                 // when the config named no `[force_move]` section, so it lands
                 // just before the stepper that asked for it.
                 "force_move",
+                // The same build registers the stepper's `motion_report`
+                // instance (`stepper.py:282-285`'s third helper module), which
+                // creates that object too — and its mux registration installs
+                // `webhooks` (the table the endpoint is buffered in) right
+                // behind it.
+                "motion_report",
+                "webhooks",
                 "stepper_x",
                 "stepper_y",
                 "stepper_z",
@@ -1054,7 +1065,10 @@ mod tests {
         );
 
         result.unwrap();
-        // Main sections first, then the prefix section.
+        // Main sections first, then the prefix section. `[output_pin]` also asks
+        // for the shared `display_template` registry and the
+        // `template_evaluator` `TEMPLATE=` subscribes through, as upstream's
+        // constructor does (`output_pin.py:228`).
         assert_eq!(
             printer.objects(),
             [
@@ -1065,6 +1079,8 @@ mod tests {
                 "error_mcu",
                 "serial_ports",
                 "mcu",
+                "display_template",
+                "template_evaluator",
                 "output_pin fan"
             ]
         );

@@ -18,15 +18,18 @@
 //! upstream's `minval=0.` and no upper bound — `max_power` caps the duty inside
 //! the `Fan` core). `get_status` is the fan's own: `speed` and `rpm`.
 //!
-//! # What is not here
+//! # `TEMPLATE=`
 //!
-//! * **`TEMPLATE=`.** Upstream evaluates a display template and re-applies the
-//!   rendered value every 0.5 s (`fan_generic.py:36-42` →
-//!   `output_pin.lookup_template_eval`). This port has no template evaluator
-//!   (`output_pin` leaves its own `template` / `static_value` out for the same
-//!   reason), so a `TEMPLATE` parameter is **rejected** with a command error
-//!   instead of being silently ignored — the difference from upstream this
-//!   module is allowed to have. No config in the corpus uses it.
+//! `SET_FAN_SPEED FAN=<name> TEMPLATE=<display_template> [PARAM_*=<literal>...]`
+//! subscribes the fan to the shared
+//! [`template_evaluator`](crate::core::klippy::extras::template_evaluator)
+//! (`fan_generic.py:15-32`): the template is rendered every 0.5 s and each
+//! rendered text is parsed as a number and handed to
+//! [`Fan::set_speed`](crate::core::klippy::extras::fan::Fan::set_speed), which
+//! sends it at the estimated print time. A text that is not a number, or a
+//! template body that fails, drives `0.` with a logged error. `SPEED` and
+//! `TEMPLATE` are mutually exclusive in both directions, and an empty
+//! `TEMPLATE=` cancels the subscription.
 
 use std::sync::Arc;
 
@@ -34,11 +37,15 @@ use serde_json::Value;
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::fan::Fan;
+use crate::core::klippy::extras::template_evaluator::{
+    lookup_template_eval, PrinterTemplateEvaluator,
+};
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::printer::{Printer, PrinterObject};
+use tracing::warn;
 
 // Only the prefix form (`[fan_generic <name>]`) exists upstream
 // (`fan_generic.py:44`).
@@ -71,8 +78,13 @@ impl PrinterFanGeneric {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
+        let template_eval = lookup_template_eval(printer)?;
         let speed = Arc::clone(&fan);
-        let handler: CommandHandler = sync(move |gcmd| cmd_set_fan_speed(&speed, gcmd));
+        let handler: CommandHandler = {
+            let template_eval = Arc::clone(&template_eval);
+            let fan_name = name.clone();
+            sync(move |gcmd| cmd_set_fan_speed(&speed, &fan_name, &template_eval, gcmd))
+        };
         gcode
             .register_mux_command_with_params(
                 "SET_FAN_SPEED",
@@ -120,12 +132,17 @@ fn speed_word(gcmd: &GcodeCommand) -> Result<Option<f64>, CommandError> {
     )?))
 }
 
-/// `SET_FAN_SPEED FAN=<name> SPEED=<0..>`: set the fan's speed.
+/// `SET_FAN_SPEED FAN=<name> SPEED=<0..>`: set the fan's speed, or
+/// `... TEMPLATE=<display_template>`: subscribe it to a template.
 ///
 /// Upstream's `cmd_SET_FAN_SPEED` (`fan_generic.py:34-43`): exactly one of
-/// `SPEED` and `TEMPLATE` must be given. `TEMPLATE` is answered with this
-/// port's own refusal — see the module docs.
-fn cmd_set_fan_speed(fan: &Arc<Fan>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+/// `SPEED` and `TEMPLATE` must be given.
+fn cmd_set_fan_speed(
+    fan: &Arc<Fan>,
+    fan_name: &str,
+    template_eval: &Arc<PrinterTemplateEvaluator>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
     let speed = speed_word(gcmd)?;
     // Upstream: `gcmd.get('TEMPLATE', None)` — present or absent, never parsed.
     let template = gcmd.get_command_parameters().get("TEMPLATE").cloned();
@@ -135,11 +152,35 @@ fn cmd_set_fan_speed(fan: &Arc<Fan>, gcmd: &GcodeCommand) -> Result<(), CommandE
         ));
     }
     let Some(speed) = speed else {
-        return Err(CommandError::new(
-            "SET_FAN_SPEED TEMPLATE is not supported: the template evaluator is not implemented",
-        ));
+        // `TEMPLATE=` (possibly empty: an unsubscribe, which drives nothing).
+        let fan = Arc::clone(fan);
+        let fan_name = fan_name.to_string();
+        return template_eval.set_template(
+            &format!("fan_generic {fan_name}"),
+            gcmd,
+            Arc::new(move |text| set_rendered_speed(&fan, &fan_name, text)),
+        );
     };
     fan.set_speed_from_command(speed)
+}
+
+/// One rendered template's text as a fan speed: upstream's `_template_update`
+/// (`fan_generic.py:27-32`) parses `float(text)`, falls back to `0.` with a
+/// logged error, and hands the result to `Fan.set_speed`.
+///
+/// The timer callback has no error channel, so a failed send is logged the way
+/// upstream logs it.
+fn set_rendered_speed(fan: &Arc<Fan>, fan_name: &str, text: &str) {
+    let speed = match text.trim().parse::<f64>() {
+        Ok(speed) if speed.is_finite() => speed,
+        _ => {
+            warn!("fan_generic template render error: '{text}' is not a number");
+            0.0
+        }
+    };
+    if let Err(err) = fan.set_speed(speed) {
+        warn!("Error setting fan_generic speed for fan '{fan_name}': {err}");
+    }
 }
 
 /// The factory `section!` names (`fan_generic.py:44-45`).
@@ -346,19 +387,69 @@ mod tests {
         }
     }
 
+    /// A `[display_template <name>]` section filed into the shared registry.
+    fn add_display_template(printer: &Arc<Printer>, name: &str, text: &str) {
+        let mut section = ConfigSection::new("display_template", Some(name));
+        section
+            .parameters
+            .insert("text".to_string(), ConfigValue::Single(text.to_string()));
+        crate::core::klippy::extras::led::load_display_template(&wrap(&section), printer)
+            .expect("the template loads");
+    }
+
+    /// The shared evaluator a `TEMPLATE=` subscription lands in.
+    fn evaluator(printer: &Arc<Printer>) -> Arc<PrinterTemplateEvaluator> {
+        crate::core::klippy::extras::template_evaluator::lookup_template_eval(printer)
+            .expect("the evaluator is created on first use")
+    }
+
     #[test]
-    fn test_template_is_rejected_as_not_implemented() {
+    fn test_set_fan_speed_template_re_renders_the_speed() {
+        let (printer, chip) = printer();
+        add_display_template(&printer, "slow", "0.25");
+        add_display_template(&printer, "fast", "0.5");
+        let fan = load(
+            &printer,
+            &section("side_fan", "PH0", &[("kick_start_time", "0")]),
+        )
+        .unwrap();
+        let eval = evaluator(&printer);
+
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=slow")
+            .unwrap();
+        assert_eq!(eval.render_once(0.0), Some(0.5));
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25]);
+        assert_eq!(speed(&fan), 0.25);
+
+        // A second subscription replaces the first (one per fan), and the next
+        // render period drives the new value.
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=fast")
+            .unwrap();
+        assert_eq!(eval.render_once(0.5), Some(1.0));
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25, 0.5]);
+        assert_eq!(speed(&fan), 0.5);
+
+        // `TEMPLATE=` cancels it: with nothing subscribed the timer retires and
+        // the fan stays where it was.
+        gcode(&printer)
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=")
+            .unwrap();
+        assert_eq!(eval.render_once(1.0), None);
+        assert_eq!(updates(&pwm(&chip, 0)), [0.25, 0.5]);
+    }
+
+    #[test]
+    fn test_set_fan_speed_template_must_name_a_display_template() {
         let (printer, chip) = printer();
         load(&printer, &section("side_fan", "PH0", &[])).unwrap();
 
         let err = gcode(&printer)
-            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=hot")
+            .run_script_sync("SET_FAN_SPEED FAN=side_fan TEMPLATE=nosuch")
             .unwrap_err();
 
-        assert_eq!(
-            err.to_string(),
-            "SET_FAN_SPEED TEMPLATE is not supported: the template evaluator is not implemented"
-        );
+        assert_eq!(err.to_string(), "Unknown display_template 'nosuch'");
         assert!(updates(&pwm(&chip, 0)).is_empty(), "nothing was driven");
     }
 

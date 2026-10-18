@@ -100,6 +100,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("G90", &[]),
     ("G91", &[]),
     ("G92", &["X", "Y", "Z", "E"]),
+    ("GET_POSITION", &[]),
     ("GET_RETRACTION", &[]),
     ("IIC_READ", &["DEVICE", "WRITE", "READ_LEN"]),
     ("IIC_WRITE", &["DEVICE", "DATA"]),
@@ -286,7 +287,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         "SET_KINEMATIC_POSITION",
         &["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"],
     ),
-    ("SET_PIN", &["PIN", "VALUE", "CYCLE_TIME"]),
+    ("SET_PIN", &["PIN", "VALUE", "TEMPLATE", "CYCLE_TIME"]),
     (
         "SET_PRESSURE_ADVANCE",
         &["EXTRUDER", "ADVANCE", "SMOOTH_TIME"],

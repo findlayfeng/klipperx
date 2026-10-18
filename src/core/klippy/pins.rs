@@ -1034,11 +1034,17 @@ impl PrinterPins {
 
     /// Allow a pin to be used by several owners.
     ///
+    /// Upstream's `allow_multi_use_pin` parses the description with
+    /// `parse_pin`'s defaults (`pins.py:133`: `can_invert=False,
+    /// can_pullup=False`), so a decorated description (`!PA1`, `^PA1`) is
+    /// refused here as an invalid description; the decoration belongs to the
+    /// resource that actually uses the pin.
+    ///
     /// # Errors
     /// Returns [`PinError::UnknownChip`] / [`PinError::InvalidDescription`]
     /// from parsing `description`.
     pub fn allow_multi_use_pin(&self, description: &str) -> Result<(), PinError> {
-        let params = self.parse_pin(description, true, true)?;
+        let params = self.parse_pin(description, false, false)?;
         self.lock().allow_multi_use.insert(params.share_name());
         Ok(())
     }
@@ -1498,6 +1504,24 @@ mod tests {
 
         pins.lookup_pin("PA1", false, false, None).unwrap();
         pins.lookup_pin("PA1", false, false, None).unwrap();
+    }
+
+    #[test]
+    fn test_multi_use_pin_refuses_a_decorated_description() {
+        // Upstream parses with `can_invert`/`can_pullup` at their defaults
+        // (`pins.py:133`), so a decoration is a malformed description, not a
+        // pin with a polarity.
+        let pins = pins();
+
+        for description in ["!PA1", "^PA1"] {
+            let err = pins.allow_multi_use_pin(description).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Invalid pin description '{description}'\nFormat is: [chip_name:] pin_name"
+                )
+            );
+        }
     }
 
     #[test]

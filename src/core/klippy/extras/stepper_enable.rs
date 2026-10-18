@@ -455,6 +455,11 @@ fn setup_enable_pin(
         .map_err(|err| {
             ConfigError::new(format!("enable_pin in section '{}': {}", identifier, err))
         })?;
+    // The enable line is held, not refreshed: the firmware's default 2 s watchdog
+    // would shut the printer down (`Missed scheduling of next digital out event`)
+    // two seconds after the motor is turned on. Upstream clears it the same way
+    // (`stepper_enable.py`: `enable.setup_max_duration(0.)`).
+    mcu_enable.setup_max_duration(0.0);
 
     Ok(Arc::new(Mutex::new(StepperEnablePin::dedicated(
         mcu_enable,

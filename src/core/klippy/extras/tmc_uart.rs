@@ -162,8 +162,13 @@ const UART_READ_LEN: u8 = 10;
 /// How long one wire exchange may take before it is given up.
 ///
 /// Upstream waits forever (`tmc_uart.py:240`); a board with nothing on the UART
-/// would park the reactor here.
-const UART_TIMEOUT: Duration = Duration::from_secs(5);
+/// would park the reactor there. Half a second is already two orders of
+/// magnitude above a working exchange (~5 ms at 40 kbaud), and a **dropped**
+/// frame — the firmware drops a `tmcuart_send` that arrives while the line is
+/// busy — then costs a bounded wait before the retry loop sends it again,
+/// instead of stalling the flush for five seconds (measured on the bench: a
+/// five-second stall made the MCU miss a digital-out deadline and shut down).
+const UART_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How many times a read is retried before it is reported as failed
 /// (`tmc_uart.py:231`, `for retry in range(5)`).

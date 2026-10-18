@@ -472,6 +472,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       的 `G1` 正常；`stress --task motion` 也正常（3780 步、读回一致）。待定位是 force_move 的
       trapq/manual-move 未接 flush，还是 `kinematics: none` 下 toolhead 不接受。**影响**：`STEPPER_BUZZ`
       这个"识别电机"的常用动作目前不可用。
+- [ ] **`admin` 工具的 attach 没有会话 takeover**（2026-10-18 发现）：klippy 能接管陈旧会话
+      （`Firmware is still in an earlier session (sequence N); taking it over`），而
+      `flash/bridge_flash.rs` 的 attach 只重试 3 次就放弃。**重置已绕开它**（`reset` 不再先 identify，
+      2026-10-18），但 `admin scan` / `admin flash --bridge` 仍会因此进不去一块被硬杀过的桥，
+      只能断电重插或先用 klippy 接管一次。
 - [ ] **失败态后的 `SET_KINEMATIC_POSITION` 会撞 stepcompress**（2026-10-18 真板实测）：`G28` 以
       `No trigger on x after full movement` 失败后，再 `SET_KINEMATIC_POSITION` + `G1` ⇒
       `Internal error in stepcompress: … Invalid sequence` 直接 shutdown；正常路径与零长度移动都不触发。

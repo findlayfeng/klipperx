@@ -48,6 +48,16 @@
 //! `async` code that `.await`s; a callback is for work that is already ready to
 //! do.
 //!
+//! # Panics in a callback
+//!
+//! A callback that panics does not take the dispatcher down with it: the panic
+//! is caught, logged as an `error!` naming the callback, and the timer is
+//! retired — the dispatcher keeps running every other timer, so a bug in one
+//! module cannot silently freeze the whole machine. The same holds for the two
+//! other things the dispatcher calls: the latency notifier
+//! ([`Reactor::set_latency_notifier`]) and the flush callbacks of the motion
+//! queue (`motion::queuing`).
+//!
 //! # Latency
 //!
 //! Because the dispatcher runs callbacks one at a time, a slow one is directly
@@ -67,6 +77,8 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+use tracing::error;
 
 /// A timer callback: given the event time, return the next wake time.
 ///
@@ -117,6 +129,21 @@ pub struct LatencyReport {
 /// Shared (`Arc`) so the dispatcher can clone it out and call it without
 /// holding the lock that holds it.
 pub type LatencyCallback = Arc<dyn Fn(LatencyReport) + Send + Sync>;
+
+/// The message a caught panic carried, for a log line.
+///
+/// `panic!("literal")` carries a `&'static str` and a formatted one a `String`;
+/// a `panic_any` payload is neither, so its type is named rather than dropping
+/// the message from the log altogether.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// The machine's clock and its timers.
 ///
@@ -414,11 +441,19 @@ impl Dispatcher {
             }
         };
         if let Some(callback) = callback {
-            callback(LatencyReport {
-                eventtime,
-                busy,
-                callbacks,
-            });
+            // The notifier is another callback the dispatcher runs, so it is
+            // isolated the same way a timer is: a panic in it must not end the
+            // dispatcher.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                callback(LatencyReport {
+                    eventtime,
+                    busy,
+                    callbacks,
+                });
+            }));
+            if let Err(payload) = result {
+                error!("latency notifier panicked: {}", panic_message(&*payload));
+            }
         }
     }
 }
@@ -457,6 +492,35 @@ impl Ord for TimerEntry {
             .waketime
             .total_cmp(&self.waketime)
             .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+/// Run one timer callback, catching a panic in it.
+///
+/// A panic in a callback must not end the dispatcher: that would silently stop
+/// **every** timer — MCU clock polling, idle timeouts, subscription pushes —
+/// while the machine still looks like it is running. The panic is logged with
+/// the name the callback was registered under, and the timer is dropped: a
+/// panicking callback returns no next wake time, so there is nothing to
+/// reschedule it for, and its state after a panic is not trustworthy.
+///
+/// The rest of the round still runs, so one broken timer does not make the
+/// timers behind it late.
+fn run_timer_callback(
+    name: &'static str,
+    callback: &mut TimerCallback,
+    eventtime: f64,
+) -> Option<f64> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback(eventtime))) {
+        Ok(next) => next,
+        Err(payload) => {
+            error!(
+                callback = name,
+                "timer callback panicked, timer retired: {}",
+                panic_message(&*payload)
+            );
+            None
+        }
     }
 }
 
@@ -549,7 +613,7 @@ async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instan
             // one is visible in the next callback's `eventtime`.
             let started = origin.elapsed().as_secs_f64();
             let lateness = started - entry.waketime;
-            if let Some(next) = (entry.callback)(started) {
+            if let Some(next) = run_timer_callback(name, &mut entry.callback, started) {
                 entry.waketime = next;
                 entry.seq = dispatcher.next_seq();
                 dispatcher.push(entry);
@@ -587,6 +651,8 @@ pub struct ManualReactor {
 
 struct ManualTimer {
     waketime: f64,
+    /// The name the callback was registered with, shown when it panics.
+    name: &'static str,
     callback: TimerCallback,
     /// Shared with the handle whose cancellation sets it.
     cancelled: Arc<AtomicBool>,
@@ -700,7 +766,7 @@ impl ManualReactor {
                     continue;
                 }
                 fired += 1;
-                if let Some(waketime) = (timer.callback)(now) {
+                if let Some(waketime) = run_timer_callback(timer.name, &mut timer.callback, now) {
                     timer.waketime = waketime;
                     self.timers
                         .lock()
@@ -725,7 +791,7 @@ impl Reactor for ManualReactor {
 
     fn register_timer_named(
         &self,
-        _name: &'static str,
+        name: &'static str,
         callback: TimerCallback,
         waketime: f64,
     ) -> TimerHandle {
@@ -735,6 +801,7 @@ impl Reactor for ManualReactor {
             .unwrap_or_else(|p| p.into_inner())
             .push(ManualTimer {
                 waketime,
+                name,
                 callback,
                 cancelled: Arc::clone(&cancelled),
             });
@@ -751,6 +818,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::mpsc;
+    use tracing_subscriber::layer::SubscriberExt;
 
     // ---------------------------------------------------------------------
     // ManualReactor — the deterministic driver
@@ -1192,6 +1260,142 @@ mod tests {
                 assert!(late.lateness >= 0.05, "lateness was {}", late.lateness);
                 return;
             }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Panics in callbacks — the dispatcher must survive them
+    // ---------------------------------------------------------------------
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_panicking_timer_does_not_stop_the_dispatcher() {
+        // The dispatcher is one task: before this was caught, one panicking
+        // callback ended it, and every timer behind it went silent for good.
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.register_timer_named("boom", Box::new(|_| panic!("timer exploded")), 0.5);
+        reactor.register_timer_named(
+            "after",
+            Box::new(move |eventtime| {
+                tx.send(eventtime).ok();
+                None
+            }),
+            1.0,
+        );
+
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the dispatcher must still run timers after a panic")
+            .expect("the channel must be open");
+    }
+
+    #[test]
+    fn test_a_panicking_timer_is_logged_by_name_and_retired() {
+        // The panic is not silent: the line names the callback and carries the
+        // panic's own message. The timer is retired — a panicking callback has
+        // no next wake time to give.
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::ERROR)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            let reactor = ManualReactor::new();
+            let fired = Arc::new(AtomicUsize::new(0));
+            let seen = Arc::clone(&fired);
+            reactor.register_timer_named("boom", Box::new(|_| panic!("timer exploded")), 0.0);
+            reactor.register_timer_named(
+                "after",
+                Box::new(move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                0.0,
+            );
+
+            assert_eq!(reactor.run_due(), 2, "the timer behind the panic still ran");
+            assert_eq!(fired.load(Ordering::SeqCst), 1);
+            assert_eq!(reactor.run_due(), 0, "the panicking timer was retired");
+        });
+
+        let log = capture.text();
+        assert!(
+            log.contains("boom"),
+            "the log must name the callback: {log}"
+        );
+        assert!(
+            log.contains("timer exploded"),
+            "the log must carry the panic message: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_panicking_latency_notifier_does_not_stop_the_dispatcher() {
+        // The notifier is another closure the dispatcher calls; a panic in it
+        // must not become a dead dispatcher either. The threshold is 0, so every
+        // round reports and the panic repeats — and later timers still run.
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(0.0, Arc::new(|_| panic!("notifier exploded")));
+        let now = reactor.monotonic();
+        reactor.register_timer_named("first", Box::new(|_| None), now + 0.02);
+        reactor.register_timer_named(
+            "after",
+            Box::new(move |eventtime| {
+                tx.send(eventtime).ok();
+                None
+            }),
+            now + 0.04,
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the dispatcher must still run timers after the notifier panicked")
+            .expect("the channel must be open");
+    }
+
+    /// A byte sink for the fmt layer above. `with_default` keeps the capture off
+    /// the process-wide subscriber, the same shape `serial_ports.rs` uses.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
         }
     }
 }

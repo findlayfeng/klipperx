@@ -24,6 +24,34 @@
 //! (`klippy/extras/output_pin.py:217`), so the firmware's "return to the
 //! shutdown value" limit is off and `value` and `shutdown_value` may differ.
 //!
+//! `static_value` was a **startup-value** option until upstream removed it
+//! (`Config_Changes.md` 20240912) and it is now silently ignored there
+//! (`Config_Reference.md` still says "deprecated and should no longer be
+//! specified"). This port reads it only so a config migrated from an older
+//! klipper still loads, and reports it as deprecated; it drives nothing.
+//!
+//! # `TEMPLATE=`
+//!
+//! `SET_PIN PIN=<name> TEMPLATE=<display_template> [PARAM_*=<literal>...]`
+//! subscribes the pin to the shared
+//! [`template_evaluator`]: the template is rendered every 0.5 s, each result is
+//! parsed as a number and driven through `send_async_request` — **immediately**,
+//! dated with the *estimated* print time, exactly as upstream's
+//! `_template_update` does (`output_pin.py:68-90, 245-250`). A rendered value is
+//! **not** divided by `scale` and not bounded by it: upstream divides only the
+//! `VALUE=` path (`:255, 265`). A render that does not parse as a number, or a
+//! template body that fails, drives `0.` with a logged error.
+//!
+//! `TEMPLATE=` with an **empty** value cancels the subscription (upstream reads
+//! the word's truthiness, `output_pin.py:165-167`), and `VALUE=`/`TEMPLATE=` are
+//! mutually exclusive either way around: giving both or neither is
+//! `SET_PIN command must specify VALUE or TEMPLATE` (`:256-257`).
+//!
+//! Two upstream behaviours are reproduced rather than fixed: a `VALUE=` command
+//! does **not** cancel an existing `TEMPLATE=` subscription (the timer keeps
+//! overwriting it), and a digital output treats the rendered number with this
+//! port's `>= 0.5` rule rather than upstream's `bool()`.
+//!
 //! # Scheduling
 //!
 //! `SET_PIN` schedules like upstream (`output_pin.py:15-90, 196-269`): the
@@ -51,7 +79,6 @@
 //!
 //! # What is not here
 //!
-//! * **`static_value` / `template`**: the display-template machinery.
 //! * **`pwm_cycle_time`** is not on the queue because upstream's is not
 //!   either (see that module). `output_pin` / `fan` / `servo` / `pwm_tool`
 //!   all ride this queue: the schedule state and the lookahead wiring here
@@ -68,10 +95,14 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::gcode_request_queue::{
     FlushAction, GCodeRequestQueue, RequestSink,
 };
+use crate::core::klippy::extras::spi_device::mcu_object_name;
+use crate::core::klippy::extras::template_evaluator::{
+    lookup_template_eval, PrinterTemplateEvaluator,
+};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{sync, CommandError, CommandHandler, GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::McuError;
+use crate::core::klippy::mcu::{McuError, McuObject};
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -135,6 +166,13 @@ impl OutputPin {
             None,
         )? / scale;
 
+        // `static_value` was removed upstream (`Config_Changes.md` 20240912)
+        // and is silently ignored there. This host's undefined-option check
+        // would refuse the section, so read it as a deprecated option and drop
+        // the value: a config written for an older klipper still loads.
+        config.deprecate("static_value", None);
+        let _ = config.get_str("static_value");
+
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
             .expect("the loader registers `pins` before any section");
@@ -165,17 +203,29 @@ impl OutputPin {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
+        let template_eval = lookup_template_eval(printer)?;
+        // The `[mcu …]` object the pin's clock lives on, which the template
+        // path dates its sends with. Upstream reads it off the pin
+        // (`mcu_pin.get_mcu()`); here the description's chip prefix names it,
+        // the way `fan` resolves its own. Resolved by parsing the description
+        // again — pure, no resource — and looked up lazily, because the MCU
+        // object may register after this section.
+        let mcu_object = pins
+            .parse_pin(&pin_desc, true, true)
+            .ok()
+            .map(|params| mcu_object_name(&params.chip_name));
         let value_slot = Arc::new(Mutex::new(value));
         let schedule = Arc::new(PinSchedule {
             name: name.clone(),
             value: value_slot,
             handle,
             printer: Arc::downgrade(printer),
+            mcu_object,
             armed: Mutex::new(None),
         });
         let handler: CommandHandler = {
             let schedule = Arc::clone(&schedule);
-            sync(move |gcmd| cmd_set_pin(&schedule, scale, gcmd))
+            sync(move |gcmd| cmd_set_pin(&schedule, scale, &template_eval, gcmd))
         };
         gcode
             .register_mux_command_with_params(
@@ -184,9 +234,9 @@ impl OutputPin {
                 Some(&name),
                 handler,
                 Some("Set the value of a pin"),
-                // `cmd_set_pin` reads the level; the mux key `PIN` is prepended
-                // by the registration.
-                &["VALUE"],
+                // `cmd_set_pin` reads the level or the `TEMPLATE` subscription;
+                // the mux key `PIN` is prepended by the registration.
+                &["VALUE", "TEMPLATE"],
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
 
@@ -244,6 +294,12 @@ pub(crate) struct PinSchedule {
     /// Weak: the printer owns the g-code handlers, a strong handle would be a
     /// `printer → objects → gcode → handler → printer` cycle.
     printer: Weak<Printer>,
+    /// The `[mcu …]` object the pin's clock lives on, for the template path's
+    /// estimated print time; `None` when the description could not be
+    /// re-parsed (an alias the pins registry resolves later) or when the
+    /// section has no template consumer at all (`pwm_tool`'s
+    /// [`Self::new_pwm`]).
+    mcu_object: Option<String>,
     /// The queue, built and armed (its flush callback registered with the
     /// toolhead) exactly once — by the first command that finds both a
     /// toolhead and a schedulable resource. See the module docs for the two
@@ -276,6 +332,9 @@ impl PinSchedule {
             value: Arc::new(Mutex::new(initial_value)),
             handle,
             printer: Arc::downgrade(printer),
+            // `pwm_tool`'s section has no template consumer; `output_pin`
+            // fills this in after building its handle.
+            mcu_object: None,
             armed: Mutex::new(None),
         }
     }
@@ -323,6 +382,58 @@ impl PinSchedule {
         }
     }
 
+    /// Send `value` **now**, dated with the estimated print time: upstream's
+    /// `_template_update` → `send_async_request` (`output_pin.py:68-90,
+    /// 245-250`), what every rendered template lands through.
+    ///
+    /// Unlike [`Self::queue`] this does not wait for a lookahead callback — a
+    /// template render is a timer tick, not a move — so the date is the
+    /// estimate `mcu.estimated_print_time(now + min_schedule_time)` upstream
+    /// computes when its caller gives none (`:70-72`). The module docs' two
+    /// fallbacks apply: with no timeline to date the change against, the value
+    /// is driven at once, and a failed drive is logged rather than raised (the
+    /// timer callback has no error channel, as the sink's warn notes).
+    pub(crate) fn send_async(&self, value: f64) {
+        let request = self.arm().and_then(|(_toolhead, queue)| {
+            let print_time = self.estimated_print_time()?;
+            Some((queue, print_time))
+        });
+        if let Some((queue, print_time)) = request {
+            queue.send_async_request(value, print_time);
+            return;
+        }
+        if let Err(err) = self.drive_now(value) {
+            warn!("SET_PIN PIN={}: {err}", self.name);
+        }
+    }
+
+    /// The queue, arming it on the first request that can use it — the flush
+    /// callback is registered **before** the queue is published, so a push can
+    /// never sit in a queue nothing drains. `None` means no timeline could date
+    /// the change: no `toolhead` object, or `min_schedule_time()` is `None`
+    /// (the resource's MCU is not connected).
+    fn arm(&self) -> Option<(Arc<ToolHeadObject>, Arc<GCodeRequestQueue<PinSink>>)> {
+        arm_queue(
+            &self.printer,
+            &self.armed,
+            self.handle.min_schedule_time(),
+            self.sink(),
+        )
+    }
+
+    /// The date upstream's `send_async_request` computes when none is given
+    /// (`output_pin.py:70-72`):
+    /// `mcu.estimated_print_time(reactor.monotonic() + min_schedule_time)`.
+    /// `None` while the pin's `[mcu …]` object or its schedule floor is not
+    /// there yet — no date, so the caller keeps the immediate path.
+    fn estimated_print_time(&self) -> Option<f64> {
+        let printer = self.printer.upgrade()?;
+        let mcu = printer.lookup_object_as::<McuObject>(self.mcu_object.as_deref()?)?;
+        let min_schedule_time = self.handle.min_schedule_time()?;
+        let now = printer.reactor().monotonic();
+        mcu.estimated_print_time(now + min_schedule_time)
+    }
+
     /// The immediate path: drive the pin now and record the value
     /// (`update_digital_out` / `update_pwm`).
     ///
@@ -358,20 +469,36 @@ pub(crate) fn queue_at_lookahead<S: RequestSink>(
     sink: S,
     value: f64,
 ) -> bool {
+    let Some((toolhead, queue)) = arm_queue(printer, armed, min_schedule_time, sink) else {
+        return false;
+    };
+    toolhead.register_lookahead_callback(Box::new(move |print_time| {
+        queue.push(print_time, value);
+    }));
+    true
+}
+
+/// The queue's arm step, shared by [`queue_at_lookahead`] and
+/// [`PinSchedule::send_async`]: find a timeline, then build (and build the flush
+/// callback for) the queue once.
+///
+/// `None` means no timeline could date the change — no `toolhead` object, or
+/// `min_schedule_time()` is `None` (the resource's MCU is not connected) — and
+/// the caller keeps its immediate path.
+pub(crate) fn arm_queue<S: RequestSink>(
+    printer: &Weak<Printer>,
+    armed: &Mutex<Option<Arc<GCodeRequestQueue<S>>>>,
+    min_schedule_time: Option<f64>,
+    sink: S,
+) -> Option<(Arc<ToolHeadObject>, Arc<GCodeRequestQueue<S>>)> {
     // The toolhead (`phase = late, order = 60`) loads after these sections
     // (`order = 20`), so it is looked up per command, never at config load.
-    let Some(toolhead) = printer
+    let toolhead = printer
         .upgrade()
-        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
-    else {
-        // No `[printer]` section: nothing to date the change against.
-        return false;
-    };
-    let Some(min_schedule_time) = min_schedule_time else {
-        // The resource cannot schedule yet: its MCU is not connected, so the
-        // queue's schedule floor does not exist.
-        return false;
-    };
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))?;
+    // The resource must be able to schedule: its MCU is connected, so the
+    // queue's schedule floor exists.
+    let min_schedule_time = min_schedule_time?;
     let queue = {
         let mut armed = armed.lock().unwrap_or_else(|poison| poison.into_inner());
         if let Some(queue) = armed.as_ref() {
@@ -386,10 +513,7 @@ pub(crate) fn queue_at_lookahead<S: RequestSink>(
             queue
         }
     };
-    toolhead.register_lookahead_callback(Box::new(move |print_time| {
-        queue.push(print_time, value);
-    }));
-    true
+    Some((toolhead, queue))
 }
 
 /// The queue's downstream end: where a due request lands at its print time
@@ -481,21 +605,38 @@ impl PinHandle {
     }
 }
 
-/// `SET_PIN PIN=<name> VALUE=<0..scale>`: queue the change at the print time
-/// the toolhead gives it (upstream `cmd_SET_PIN`, `output_pin.py:249-269`),
-/// or drive the pin at once when no timeline can date it.
+/// `SET_PIN PIN=<name> VALUE=<0..scale>` or `... TEMPLATE=<display_template>`:
+/// set the pin's level, or subscribe it to a template (upstream `cmd_SET_PIN`,
+/// `output_pin.py:249-269`).
 ///
 /// `VALUE` is bounded by the pin's `scale` and divided by it first; a digital
-/// output treats the result `>= 0.5` as "on", a PWM takes it as a duty.
+/// output treats the result `>= 0.5` as "on", a PWM takes it as a duty. The
+/// `TEMPLATE` path does neither — see the module docs. `VALUE` and `TEMPLATE`
+/// are mutually exclusive in both directions, and an empty `TEMPLATE=` cancels
+/// the subscription.
 fn cmd_set_pin(
-    schedule: &PinSchedule,
+    schedule: &Arc<PinSchedule>,
     scale: f64,
+    template_eval: &Arc<PrinterTemplateEvaluator>,
     gcmd: &crate::core::klippy::gcode::GcodeCommand,
 ) -> Result<(), CommandError> {
-    let value = gcmd
-        .get_float_range("VALUE", 0.0, scale)
-        .map_err(|err| CommandError::new(err.to_string()))?
-        / scale;
+    let value = value_word(gcmd, scale)?;
+    let template = gcmd.get_command_parameters().get("TEMPLATE").cloned();
+    if value.is_none() == template.is_none() {
+        return Err(CommandError::new(
+            "SET_PIN command must specify VALUE or TEMPLATE",
+        ));
+    }
+    let Some(value) = value else {
+        // `TEMPLATE=` (possibly empty: an unsubscribe, which moves nothing).
+        let schedule = Arc::clone(schedule);
+        return template_eval.set_template(
+            gcmd,
+            Arc::new(move |text| schedule.send_async(render_value(text))),
+        );
+    };
+    // The client's `0..=scale` figure as the resource's `0..=1` duty.
+    let value = value / scale;
     if schedule.queue(value) {
         return Ok(());
     }
@@ -503,6 +644,34 @@ fn cmd_set_pin(
         .drive_now(value)
         .map_err(|err| CommandError::new(err.to_string()))?;
     Ok(())
+}
+
+/// `gcmd.get_float('VALUE', None, minval=0., maxval=scale)`: an absent word is
+/// `None`, a present one is parsed and bounded (`output_pin.py:255`).
+fn value_word(
+    gcmd: &crate::core::klippy::gcode::GcodeCommand,
+    scale: f64,
+) -> Result<Option<f64>, CommandError> {
+    if !gcmd.get_command_parameters().contains_key("VALUE") {
+        return Ok(None);
+    }
+    Ok(Some(gcmd.get_float_range("VALUE", 0.0, scale)?))
+}
+
+/// A rendered template's text as a pin level: upstream's `_template_update`
+/// parses `float(text)` and falls back to `0.` with a logged error
+/// (`output_pin.py:245-250`).
+///
+/// The value is **not** divided by `scale` and not bounded — upstream has
+/// neither check on this path (`:262-265` is the `VALUE` path).
+fn render_value(text: &str) -> f64 {
+    match text.trim().parse::<f64>() {
+        Ok(value) if value.is_finite() => value,
+        _ => {
+            warn!("output_pin template render error: '{text}' is not a number");
+            0.0
+        }
+    }
 }
 
 /// Upstream's `load_config_prefix` for `[output_pin <name>]`.

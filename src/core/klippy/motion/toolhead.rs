@@ -89,6 +89,47 @@ impl EstimatedPrintTime {
     }
 }
 
+/// Notified when [`ToolHead::calc_print_time`] raises the print time, with the
+/// estimate and the new print time (`_calc_print_time`'s
+/// `send_event("toolhead:sync_print_time", curtime, est_print_time,
+/// self.print_time)`, `klippy/toolhead.py:264-268`).
+///
+/// Upstream sends the event right there; this layer only calls a hook, because
+/// every path into `calc_print_time` runs under the connected state lock
+/// (`ToolHeadObject`) and a handler that reaches back into the planner would
+/// deadlock on it. The object that owns the printer injects a recording hook
+/// at connect and sends the event once that lock is released — the same shape
+/// as [`EstimatedPrintTime`]: a value handed in, not a clock this layer owns
+/// (the hook dates the event, `toolhead.py:261`).
+#[derive(Clone)]
+pub struct SyncPrintTimeNotify(Arc<dyn Fn(f64, f64) + Send + Sync>);
+
+impl std::fmt::Debug for SyncPrintTimeNotify {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SyncPrintTimeNotify")
+    }
+}
+
+impl Default for SyncPrintTimeNotify {
+    /// A hook that drops the notification — the toolhead before anything
+    /// injected one (a test, or a machine that has not connected yet).
+    fn default() -> Self {
+        Self(Arc::new(|_, _| {}))
+    }
+}
+
+impl SyncPrintTimeNotify {
+    /// A hook calling `notify(est_print_time, print_time)` on every raise.
+    pub fn new(notify: impl Fn(f64, f64) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(notify))
+    }
+
+    /// Report one raise.
+    fn notify(&self, est_print_time: f64, print_time: f64) {
+        (self.0)(est_print_time, print_time)
+    }
+}
+
 /// One iteration of the wait `M400` drives on (`ToolHead.wait_moves`,
 /// `klippy/toolhead.py:422-428`), as a single snapshot: the caller holds the
 /// planner for one short read and then sleeps with it released.
@@ -133,6 +174,10 @@ pub struct ToolHead {
     /// The live source of the MCU's estimated print time (see
     /// [`EstimatedPrintTime`]): read on every prime, never cached.
     estimated_print_time: EstimatedPrintTime,
+    /// Where a raised print time is reported (see [`SyncPrintTimeNotify`]):
+    /// upstream's `toolhead:sync_print_time`, which `calc_print_time` cannot
+    /// send from under the state lock.
+    sync_print_time: SyncPrintTimeNotify,
     /// The step-generation horizon the planner has actually reached: the
     /// `step_gen_time` of the last successful `flush_step_generation`.
     /// Upstream's `motion_queuing.last_step_gen_time`
@@ -167,6 +212,7 @@ impl ToolHead {
             commanded_pos: Coord::default(),
             print_time: 0.0,
             estimated_print_time: EstimatedPrintTime::default(),
+            sync_print_time: SyncPrintTimeNotify::default(),
             last_step_gen_time: 0.0,
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:227`).
@@ -275,6 +321,13 @@ impl ToolHead {
     /// read fresh — [`EstimatedPrintTime`]).
     pub fn set_estimated_print_time_source(&mut self, source: EstimatedPrintTime) {
         self.estimated_print_time = source;
+    }
+
+    /// Where a raised print time is reported (`ToolHeadObject::connect`
+    /// installs it: a hook that parks the event for the flush task — see
+    /// [`SyncPrintTimeNotify`]).
+    pub fn set_sync_print_time_notify(&mut self, notify: SyncPrintTimeNotify) {
+        self.sync_print_time = notify;
     }
 
     /// Register a lookahead callback (`ToolHead.register_lookahead_callback`,
@@ -421,6 +474,10 @@ impl ToolHead {
         let min_print_time = (est + BUFFER_TIME_START).max(kin_time);
         if min_print_time > self.print_time {
             self.print_time = min_print_time;
+            // Raise-only, as upstream's `send_event` is: a print time the
+            // machine has not caught up with was not re-synced, so there is
+            // nothing to tell the handlers.
+            self.sync_print_time.notify(est, self.print_time);
         }
     }
 
@@ -1017,6 +1074,45 @@ mod tests {
         assert!(
             (floor - (10.0 + BUFFER_TIME_START)).abs() < 1e-9,
             "the buffer floor binds once the estimate passes the horizon: {floor}"
+        );
+    }
+
+    /// Upstream sends `toolhead:sync_print_time` only inside the branch that
+    /// raises the print time (`klippy/toolhead.py:264-268`), and this layer's
+    /// hook fires from the same branch: a floor that does not move the print
+    /// time reports nothing.
+    #[test]
+    fn test_the_sync_notify_fires_only_when_the_print_time_is_raised() {
+        let est = Arc::new(Mutex::new(0.0));
+        let mut toolhead = toolhead_with_estimate(&est);
+        let raised = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&raised);
+        toolhead.set_sync_print_time_notify(SyncPrintTimeNotify::new(move |est, print_time| {
+            sink.lock().unwrap().push((est, print_time));
+        }));
+
+        // The first prime floors the print time at the buffer: one report.
+        toolhead.set_position(Coord::default(), &[0]);
+        let first = toolhead.get_last_move_time();
+        assert!((first - BUFFER_TIME_START).abs() < 1e-9);
+        assert_eq!(*raised.lock().unwrap(), [(0.0, BUFFER_TIME_START)]);
+
+        // A second prime reads the same estimate: nothing raised, nothing
+        // reported.
+        toolhead.set_position(Coord::default(), &[0]);
+        let second = toolhead.get_last_move_time();
+        assert!((second - BUFFER_TIME_START).abs() < 1e-9);
+        assert_eq!(raised.lock().unwrap().len(), 1);
+
+        // The estimate runs on and the next prime raises again: the report
+        // carries that raise's estimate and print time.
+        *est.lock().unwrap() = 10.0;
+        toolhead.set_position(Coord::default(), &[0]);
+        let third = toolhead.get_last_move_time();
+        assert!((third - (10.0 + BUFFER_TIME_START)).abs() < 1e-9);
+        assert_eq!(
+            *raised.lock().unwrap(),
+            [(0.0, BUFFER_TIME_START), (10.0, 10.0 + BUFFER_TIME_START)]
         );
     }
 

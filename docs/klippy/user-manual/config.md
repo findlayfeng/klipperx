@@ -1055,7 +1055,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `fan_speed` | `1.0`（0..=1） | 触发时的风扇速度 |
 
 `pin`/`kick_start_time`/`max_power`/`shutdown_speed`/`off_below`/`cycle_time`/`hardware_pwm` 由 `[fan]` 核心读取。语义：每秒 tick；**任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`**；仅速度变化时写 PWM；掉线关机速度默认 **1.0**（与 `[controller_fan]` 的 0.0 不同）。无 G-Code 命令，`get_status` 转发 fan 状态。
-gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
+`heater` 名经加热器注册表的 `lookup_heater` 解析（`heaters.rs:501-506`，批 #20），未知名报上游逐字文案 `Unknown heater '<name>'`（`heater_fan.rs:119-120`）；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
 
 ### `[safe_z_home]` — 归零前安全 Z 抬升（批 #6）
 

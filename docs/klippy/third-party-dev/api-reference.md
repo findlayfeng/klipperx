@@ -699,7 +699,7 @@
 |------|------|------|
 | `absolute_coordinates` | bool | 绝对坐标模式 |
 | `absolute_extrude` | bool | 绝对挤出模式 |
-| `speed` | float | 当前速度（mm/s） |
+| `speed` | float | 当前速度（mm/min） |
 | `speed_factor` | float | 速度系数（默认 1.0） |
 | `extrude_factor` | float | 挤出系数（默认 1.0） |
 | `position` | Coord | 上次设置的位置 `[x, y, z, e]` |

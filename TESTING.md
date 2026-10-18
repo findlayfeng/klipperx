@@ -195,7 +195,9 @@
   `SET_PORT_NODEID`/`RESET_PORT`。判定：同 M1-1/M1-2 的 identify + `get_clock`，且**单元不被截断**。
   **缺件（2026-10-17 复核，已缩小）**：固件的 CAN **下游端口**后端（`BRIDGE_PORT_CAN`）与它的
   单帧 admin 代理**已经落地并真机验过**（见下方「经桥刷 CAN 下游」，F446 桥 + F103 下游，含可反复刷）；
-  仍未接线的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 **CAN 上游 attach**
+  仍未接线的只剩 **CAN 上游 attach**（桥自己经 CAN 被宿主连）；`printer.cfg` 的 `[can_device]` 端口节
+  已接线并真机跑通（主机在配置期发 `config_can` + `config_bridge_port`，见
+  [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的 CAN 一节）。
   （桥自己经 CAN 被宿主连）。
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
@@ -233,8 +235,9 @@
 **上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
 B) `REQUEST_BOOTLOADER (0x02)` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）
 ——不带就是设计内 no-op，它属**刷写工具**；「重启固件」用 `RESTART_DEVICE (0x05)`（`restart_method: admin`）；
-C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」还需 MCU 侧 **UART 端口后端**
-（`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
+C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」当时还缺 MCU 侧的 **UART 端口后端**
+（`CONFIG_SERIAL_UART` 那时只有 host 库实现）——**现已落地**（stm32 `src/stm32/bridge_serial.c`，多选 USART1/2/3 + UART4/5，
+见 [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的多端口一节），这句留作上板当天的记录。
 
 **刷写这台板的正确姿势（本轮踩过，写下来）**：`./venv/bin/pyocd load -O connect_mode=halt
 -O frequency=1000000 -e chip --target stm32f103ze out/firmware/klipper/klipper.elf`
@@ -260,6 +263,36 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   `the bridge port tty came back; restarting the printer to reopen it` ⇒ plain restart ⇒ **bridge 22 /
   child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
   没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
+
+### 真机结果（2026-10-16，mux 设备半直连：隧道 / 送引导 / 重启）
+
+目的：**不摆桥**、只把板子当一个 mux 设备半，先验「设备对新指令的应答对不对」。固件 = klipper
+子模组 `test/configs/stm32f103-usb-mux.config` 加 `CONFIG_STM32_FLASH_START_2000=y`（应用偏移
+`0x8002000`，与 katapult 对齐），**构建外移**（`KCONFIG_CONFIG`/`OUT` 指自建目录
+`target/hw-phase1`，不碰子模组的 `.config`/`out/`）；用 `klipperx admin flash --device <by-id>` 直连
+USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/devices/serial.rs` 的两条
+`#[ignore]` 探针，tty 由 `KLIPPERX_HW_MUX_TTY=<by-id>` 给（uuid 默认本板 `e512c60ac0e6`，可
+`KLIPPERX_HW_MUX_UUID` 覆盖）。
+
+| # | 验项 | 结果 |
+|---|------|------|
+| 1 | 发现（未指派）：应答落在 admin 应答 id `0x3f1`、`application=None`、`NEED_NODEID` | ✓ |
+| 2 | 指派被采纳：再扫**静默**（号只由主机持有） | ✓ |
+| 3 | `SET_PORT_NODEID (0x03)`：设备不执行（桥自身命令），无任何应答 | ✓ |
+| 4 | 隧道单元（`01 88 …`）：整段丢弃且流恢复 | ✓ |
+| 5 | `RESTART_DEVICE (0x05)`：真重启、号丢失、再扫仍应答同一 uuid | ✓ |
+| 6 | `REQUEST_BOOTLOADER (0x02)`：板子重枚举为 `usb-katapult_stm32f103xe_devloop1-if00` | ✓ |
+
+实测耗时：第 1 条 8.91 s、第 2 条 2.41 s。**阶段结束时板子停在 katapult**（第 6 条是最后一步）。
+
+两条踩出来的口径（已写进探针注释）：
+
+- **板子会自发 1 Hz `stats` 帧**（固件字典记作 id `-12`，编码首字节 `0x74`），且上一轮残留的应答头
+  会先到；所以探针开端口时必须 `tcflush` 清输入缓冲，并且**盲读第一个单元会把两者粘连误判**——
+  解析器必须按 arb 分派、必要时 `drop_to_sync`。
+- **隧道单元之后至多吞一帧**：设备解析器遇到内层 katapult 帧（首字节 `0x01` 不是合法长度）就进入
+  「等下一个 SYNC」态，紧随其后那一帧被整体吃掉、再下一帧恢复——与主机侧「丢到下一个 `0x7e`、至多
+  损失一个单元」同性质，刷写会话的重传（`tries=5`）盖得过它。
 
 ### 真机结果（2026-10-17，主机直连 CAN：上游 USB-CAN 桥）
 

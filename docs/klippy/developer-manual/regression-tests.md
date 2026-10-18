@@ -115,7 +115,7 @@ connect_file(输出文件, 字典):
 |----|------|
 | `.test` 文件 | 37 |
 | 运行（`CONFIG` 块） | 239（`printers.test` 占 203） |
-| `test/configs/*.config` 目标 | 47 |
+| `test/configs/*.config` 文件 | 49（默认闸门按 `KLIPPERX_ARCHES` 建 46 份；simu/pru/ar100 三份要 `KLIPPERX_ALL_ARCHES=1`） |
 | 被 `.test` 引用的目标 | 28 |
 
 按 `CONFIG_MACH_<FAMILY>` 聚合（`目标` 为该架构的 kconfig 片段数，`引用` 为声明该架构字典

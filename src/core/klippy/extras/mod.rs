@@ -89,6 +89,7 @@ pub mod smart_effector;
 pub mod spi_device;
 pub mod spi_temperature;
 pub mod static_digital_output;
+pub mod static_pwm_clock;
 pub mod stepper;
 pub mod stepper_enable;
 pub mod sx1509;

@@ -49,7 +49,7 @@
 //!   stepper` when the section has none, but an endstop-triggered run is not
 //!   driven: upstream's `drip_move` needs `motion_queuing.drip_update_time`,
 //!   which this host does not have, and
-//!   [`motion::ToolHead::drip_move`](crate::core::klippy::motion::toolhead)
+//!   [`ToolHead::drip_move`](crate::core::klippy::motion::toolhead::ToolHead::drip_move)
 //!   only feeds the toolhead's **main** trapq (and drops the extra axes), so a
 //!   manual-stepper drip loop has to be written against its own trapq.
 //! * This stepper's trapq is not registered with `motion_report`, which
@@ -721,9 +721,10 @@ impl ExtraAxis for ManualStepper {
         // unfolded into the trapezoid's velocities and acceleration, and the x
         // direction of 1.0 (this trapq holds one axis).
         let Some(trapq) = *self.lock_trapq() else {
-            // No trapq means no motion was ever asked for; a move can only be
-            // planned for a registered axis, and registering one installs it
-            // (`ensure_motion`). Follow the position alone, as before.
+            // No trapq means no motion was ever asked for, and a move is only
+            // planned for a registered axis — registering one installs it
+            // (`ensure_motion`), so this is a guard rather than a path: the
+            // commanded position still follows the move.
             *self.lock_commanded_pos() = move_.end_axis(ea_index);
             return;
         };

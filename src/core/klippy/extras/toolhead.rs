@@ -2266,7 +2266,7 @@ impl ToolHeadObject {
     ///
     /// The stepper reads `trapq` and no other, and its generated steps reach
     /// the firmware only through the `mcu_steppers` entry registered here —
-    /// [`Connected::generate`] looks a batch's stepper up by name to send it.
+    /// `Connected::generate` looks a batch's stepper up by name to send it.
     /// Returns the trapq id, which the caller keeps to append to.
     ///
     /// # Errors

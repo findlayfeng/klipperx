@@ -1185,11 +1185,24 @@ impl PrinterObject for ToolHeadObject {
             return json!({});
         };
         let position = connected.toolhead.commanded_pos();
-        let homed_axes = connected
+        // Upstream starts its status from the kinematics' own
+        // (`res = dict(self.kin.get_status(eventtime))`, `toolhead.py:502`),
+        // which is where `homed_axes` and the four-axis `axis_minimum` /
+        // `axis_maximum` come from. No kinematics reads as the same zeros
+        // `none` reports (`kinematics/none.py:25`).
+        let kinematics_status = connected
             .toolhead
             .kinematics()
-            .map(|kinematics| kinematics.get_status()["homed_axes"].clone())
-            .unwrap_or_else(|| json!(""));
+            .map(|kinematics| kinematics.get_status());
+        let kinematics_key = |key: &str, fallback: Value| {
+            kinematics_status
+                .as_ref()
+                .map(|status| status[key].clone())
+                .unwrap_or(fallback)
+        };
+        let homed_axes = kinematics_key("homed_axes", json!(""));
+        let axis_minimum = kinematics_key("axis_minimum", json!([0.0, 0.0, 0.0, 0.0]));
+        let axis_maximum = kinematics_key("axis_maximum", json!([0.0, 0.0, 0.0, 0.0]));
         // The four velocity limits as upstream reports them (`get_status`,
         // `toolhead.py:502-515`); this object owns the copy the planner was
         // built from, and the runtime setters keep the two in step.
@@ -1197,7 +1210,12 @@ impl PrinterObject for ToolHeadObject {
         json!({
             "position": position.as_slice(),
             "homed_axes": homed_axes,
+            "axis_minimum": axis_minimum,
+            "axis_maximum": axis_maximum,
             "print_time": connected.toolhead.print_time(),
+            // The MCU's estimate of the print time now, read fresh from the
+            // source `connect` installed (`toolhead.py:505-510`).
+            "estimated_print_time": connected.toolhead.estimated_print_time(),
             // The active extruder's name, as upstream reports it
             // (`toolhead.py:511`); `PARK_{printer.toolhead.extruder}` and
             // friends read it through the macro template.
@@ -4749,6 +4767,14 @@ mod tests {
 
     /// A toolhead over one X stepper, homed, as if the machine were up.
     fn homed_toolhead() -> ToolHead {
+        homed_toolhead_with_range(
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+        )
+    }
+
+    /// [`homed_toolhead`] over the given cartesian `axes_min` / `axes_max`.
+    fn homed_toolhead_with_range(axes_min: Coord, axes_max: Coord) -> ToolHead {
         use crate::core::klippy::motion::{Axis, CartesianKinematics, Stepper};
 
         let limits = MoveLimits {
@@ -4767,8 +4793,8 @@ mod tests {
         }
         toolhead.set_kinematics(Box::new(CartesianKinematics::new(
             ["stepper_x".into(), "stepper_y".into(), "stepper_z".into()],
-            Coord::new(0.0, 0.0, 0.0, 0.0),
-            Coord::new(200.0, 200.0, 200.0, 0.0),
+            axes_min,
+            axes_max,
             15.0,
             100.0,
             CartesianTransform::Standard,
@@ -6306,6 +6332,42 @@ mod tests {
         assert_eq!(status["max_accel"].as_f64(), Some(100.0));
         assert_eq!(status["square_corner_velocity"].as_f64(), Some(1.0));
         assert_eq!(status["minimum_cruise_ratio"].as_f64(), Some(0.0));
+    }
+
+    /// `axis_minimum` / `axis_maximum` are the kinematics' configured range as
+    /// a four-axis coordinate, as upstream merges them in from
+    /// `kin.get_status()` (`toolhead.py:502`, `kinematics/cartesian.py:124-125`)
+    /// — the pair a host draws the bed and the soft limits from.
+    #[test]
+    fn test_get_status_reports_the_kinematics_axis_range() {
+        let (state, _gcode) = connected(homed_toolhead_with_range(
+            Coord::new(-5.0, -4.0, -2.0, 0.0),
+            Coord::new(250.0, 210.0, 220.0, 0.0),
+        ));
+        let (_printer, object) = object_over(state);
+        let status = object.get_status(0.0);
+        assert_eq!(status["axis_minimum"], json!([-5.0, -4.0, -2.0, 0.0]));
+        assert_eq!(status["axis_maximum"], json!([250.0, 210.0, 220.0, 0.0]));
+    }
+
+    /// `estimated_print_time` is the MCU's estimate *now*, read fresh from the
+    /// source `connect` installs (`toolhead.py:505-510`).
+    #[test]
+    fn test_get_status_reports_the_estimated_print_time() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(|| 12.5));
+        let (state, _gcode) = connected(toolhead);
+        let (_printer, object) = object_over(state);
+        let status = object.get_status(0.0);
+        assert_eq!(status["estimated_print_time"].as_f64(), Some(12.5));
+    }
+
+    /// Nothing is reported before the machine is connected.
+    #[test]
+    fn test_get_status_is_empty_before_connect() {
+        let state = Arc::new(Mutex::new(None::<Connected>));
+        let (_printer, object) = object_over(state);
+        assert_eq!(object.get_status(0.0), json!({}));
     }
 
     /// The planner profiles the *next* move from the new limits: a 100 mm move

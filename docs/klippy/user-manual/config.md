@@ -1269,7 +1269,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `run_current` / `sense_resistor` / `stealthchop_threshold` | — / 0.110 / — | 电流与静音阈值 |
 | `interpolate` / `driver_SGTHRS` / `diag_pin` | True / — / — | 仅 tmc2209 |
 
-命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0。
+命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。**活线已接通（2026-10-18）**：真板上读写走 `tmcuart_send`/`tmcuart_response`（5 次重试 + IFCNT 回读校验，共享 UART 有总线锁，`select_pins` 会真拉脚），`DUMP_TMC` 读的是芯片真值、`SET_TMC_CURRENT`/`INIT_TMC` 真的生效；`--lib tmc` 102 测覆盖编解码与两条重试环路。fileoutput（语料）下仍短路：读 0、写丢弃、不发帧。
 
 **SPI 族（`[tmc2130]` / `[tmc2240]` / `[tmc2660]` / `[tmc5160]`）也已落地**（2026-10-06 复核：四个
 `section!` 均在工厂表，命令与 UART 族同）；本页尚未为它们补逐项选项表——选项集与上游同名节一致，

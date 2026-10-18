@@ -19,11 +19,13 @@
 //! # Gaps
 //!
 //! `PhaseCalc.lookup_tmc` resolves a `<driver> <stepper>` object and asks it
-//! for `get_phase_offset()`, but nothing in this host *sets* that offset: it
-//! comes from upstream's position-sync handler on the driver's `enable`, and
-//! `TmcDriver` runs none, so it reports `None` and `PhaseCalc.calc_phase` keeps
-//! the phase it last recorded. `phases` still comes from the section's own
-//! `microsteps`; a stepper with no prefix section takes both from the driver.
+//! for `get_phase_offset()`; the driver measures that offset when its motor is
+//! enabled (`TmcDriver`'s phase sync reads `mscnt`/`mstep` and compares it with
+//! the solver's step count), so the trigger position is shifted by the real
+//! offset. A driver that has not measured one yet (motor never enabled, or the
+//! read failed) reports `None`, and `PhaseCalc.calc_phase` keeps the phase it
+//! last recorded. `phases` still comes from the section's own `microsteps`; a
+//! stepper with no prefix section takes both from the driver.
 //!
 //! Upstream widens `endstop_phase_accuracy` to `phases` under `debugoutput`
 //! (its test mode); this host has no such start argument, so the computed

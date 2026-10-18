@@ -1832,8 +1832,6 @@ type StallguardSample = (f64, i64, i64);
 /// hands the batch so far to the client every [`BATCH_INTERVAL`].
 pub struct TmcStallguardDump {
     printer: Weak<Printer>,
-    /// The stepper name the samples belong to; the mux endpoint's value.
-    stepper_name: String,
     fields: Arc<FieldHelper>,
     transport: Arc<dyn TmcTransport>,
     /// Where the chip keeps its separate stallguard result, if it has one.
@@ -1876,7 +1874,6 @@ impl TmcStallguardDump {
 
         let state = Arc::new(Self {
             printer: Arc::downgrade(printer),
-            stepper_name: stepper_name.to_string(),
             fields,
             transport,
             sg4_reg_name,
@@ -1922,11 +1919,6 @@ impl TmcStallguardDump {
             json!({ "header": DUMP_HEADER }),
         )?;
         Ok(Some(state))
-    }
-
-    /// The stepper the samples belong to.
-    pub fn stepper_name(&self) -> &str {
-        &self.stepper_name
     }
 
     /// Start sampling: forget the last failure and arm the poll timer
@@ -3060,10 +3052,14 @@ impl HomingEndstop for TmcVirtualEndstop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::protocol::{PushTarget, Request};
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
+    use crate::core::klippy::api::webhooks;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
     use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::{ManualReactor, Reactor};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A transport that records what it was asked to read and write, and answers
     /// every read with 0 like the file-output short-circuit does (unless a test
@@ -3078,6 +3074,8 @@ mod tests {
         /// Reads that fail before they answer, in order (a transport that
         /// cannot reach the chip).
         read_errors: Mutex<Vec<String>>,
+        /// The print time every answer carries (`#receive_time`).
+        read_time: Mutex<f64>,
     }
 
     impl RecordingTransport {
@@ -3111,6 +3109,11 @@ mod tests {
                 errors.push(message.to_string());
             }
         }
+
+        /// Date every answer with `time` (the read's print time).
+        fn set_read_time(&self, time: f64) {
+            *self.read_time.lock().unwrap() = time;
+        }
     }
 
     impl TmcTransport for RecordingTransport {
@@ -3131,7 +3134,7 @@ mod tests {
                 .unwrap_or(0);
             Ok(TmcRegister {
                 data,
-                receive_time: 0.,
+                receive_time: *self.read_time.lock().unwrap(),
             })
         }
 
@@ -3999,5 +4002,291 @@ homing_speed: 50
         assert_eq!(check.get_status().temperature, Some(10.0));
         check.stop_checks();
         assert_eq!(check.get_status().temperature, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Stallguard dump (`TMCStallguardDump`)
+    // ---------------------------------------------------------------------
+
+    /// A printer on a reactor the test steps by hand.
+    fn stepped_machine() -> (Arc<Printer>, Arc<ManualReactor>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        (printer, reactor)
+    }
+
+    /// A transport whose register table is `names`, so a test can give a chip
+    /// the registers upstream's chip modules declare.
+    fn named_transport(names: &[(&str, u8)]) -> Arc<RecordingTransport> {
+        Arc::new(RecordingTransport {
+            names: names
+                .iter()
+                .map(|(name, address)| ((*name).to_string(), *address))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    /// The TMC2209's stallguard tables: the result lives in its own
+    /// `SG_RESULT` register, so `DRV_STATUS` has no `sg_result` field
+    /// (`sg2_supp` false).
+    fn tmc2209_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                    ("stealth".to_string(), 0x01u32 << 30),
+                ]),
+            ),
+            (
+                "SG_RESULT".to_string(),
+                HashMap::from([("sg_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// The TMC5160's stallguard tables: `DRV_STATUS` carries the SG2 result,
+    /// the current scale and the stealthchop flag, and the SG4 result has its
+    /// own register.
+    fn sg4_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("sg_result".to_string(), 0x3ffu32),
+                    ("stealth".to_string(), 0x01u32 << 14),
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                ]),
+            ),
+            (
+                "SG4_RESULT".to_string(),
+                HashMap::from([("sg4_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// A recording push target for the endpoint test.
+    #[derive(Default)]
+    struct Recorder {
+        closed: AtomicBool,
+        messages: Mutex<Vec<Value>>,
+    }
+
+    impl PushTarget for Recorder {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn push(&self, message: Value) {
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
+    /// The TMC2660 answers through `READRSP@RDSEL*`, so it has no `DRV_STATUS`
+    /// and gets no endpoint (`It is possible to support TMC2660, just disable it
+    /// for now`).
+    #[test]
+    fn test_a_chip_without_drv_status_registers_no_stallguard_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("READRSP@RDSEL0", 0x00)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none(), "the TMC2660 has nothing to dump");
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty(), "no endpoint was registered");
+    }
+
+    /// A TMC2208 has neither an `sg_result` field nor an `SG_RESULT` register,
+    /// so upstream's dead guard (`sg2_supp is None and sg4_reg_name is None`)
+    /// never fires there; here the endpoint is simply not registered.
+    #[test]
+    fn test_a_chip_without_a_stallguard_result_registers_no_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none());
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty());
+    }
+
+    /// The TMC2209 branch: one `SG_RESULT` read per poll, whose raw value is the
+    /// result; `cs_actual` stays at its `-1` sentinel and the sample is dated
+    /// with the read's `receive_time`.
+    #[test]
+    fn test_a_tmc2209_samples_sg_result_with_a_sentinel_cs_actual() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 0x1234);
+        transport.set_read_time(7.25);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1, "the poll timer runs at NOW");
+        assert_eq!(transport.reads(), vec!["SG_RESULT".to_string()]);
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[7.25, 0x1234, -1]]})),
+            "the sample is dated with the read's print time"
+        );
+        assert_eq!(dump.dump().unwrap(), None, "the batch was taken");
+    }
+
+    /// The SG4_RESULT branch (TMC2130/TMC5160): the SG2 result and the current
+    /// scale come from `DRV_STATUS`, and stealthchop switches the result to the
+    /// separate SG4 register.
+    #[test]
+    fn test_the_sg4_branch_reads_drv_status_and_sg4_in_stealthchop() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg4_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG4_RESULT", 0x6c)]);
+        transport.set_read_time(3.5);
+        transport.set_read_value("SG4_RESULT", 0x155);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // SpreadCycle: the SG2 result and the current scale are both there.
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        reactor.run_due();
+        // Stealthchop: the useful result is the one in SG4_RESULT.
+        transport.set_read_value("DRV_STATUS", (1 << 14) | (7 << 16));
+        reactor.advance(QUERY_INTERVAL);
+
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[3.5, 42, 7], [3.5, 0x155, 7]]}))
+        );
+        assert_eq!(
+            transport.reads(),
+            vec![
+                "DRV_STATUS".to_string(),
+                "DRV_STATUS".to_string(),
+                "SG4_RESULT".to_string()
+            ],
+            "the SG4 register is read only in stealthchop"
+        );
+    }
+
+    /// The endpoint is registered under the stepper name and answers a
+    /// connecting client with the column header.
+    #[tokio::test]
+    async fn test_the_stallguard_endpoint_streams_under_the_stepper_name() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        // Held for the endpoint's lifetime: the callbacks reach the state
+        // through a `Weak`, and on a live machine the driver owns it.
+        let _dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].path, DUMP_ENDPOINT);
+        assert_eq!(registrations[0].key, DUMP_KEY);
+        assert_eq!(registrations[0].value.as_deref(), Some("stepper_x"));
+
+        let request = Request::parse(
+            br#"{"method":"tmc/stallguard_dump","params":{"name":"stepper_x",
+                 "response_template":{"method":"dump"}}}"#,
+        )
+        .unwrap();
+        let api = Api::new();
+        let recorder = Arc::new(Recorder::default());
+        let context = EndpointContext {
+            api: &api,
+            client: Arc::clone(&recorder) as Arc<dyn PushTarget>,
+        };
+        let reply = registrations[0]
+            .handler
+            .handle(&request, &context)
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({"header": ["time", "sg_result", "cs_actual"]}));
+        // The batch loop waits out its interval before the first batch, so the
+        // header is all the client has received.
+        assert!(recorder.messages.lock().unwrap().is_empty());
+    }
+
+    /// A failed read is reported to the client and retires the poll timer
+    /// (upstream stores the error and returns `NEVER`).
+    #[test]
+    fn test_a_failed_read_is_dumped_as_an_error_and_stops_the_polling() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.fail_reads("driver unreachable", 1);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1);
+        let error = dump.dump().unwrap_err();
+        assert!(
+            error.contains("driver unreachable"),
+            "the read failure is reported: {error}"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "the timer retired on the error");
+    }
+
+    /// Start, sample, hand the batch over, stop: the timer stops and the
+    /// buffered samples are dropped.
+    #[test]
+    fn test_samples_move_to_the_client_and_stop_cancels_the_timer() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 11);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // Polls at 0, 5, 10, 15 and 20 ms.
+        reactor.advance(0.02);
+        let batch = dump.dump().unwrap().unwrap();
+        let samples = batch["data"].as_array().unwrap();
+        assert_eq!(samples.len(), 5);
+        assert!(samples
+            .iter()
+            .all(|sample| sample[1] == 11 && sample[2] == -1));
+
+        // One more sample, dropped by `stop`.
+        reactor.advance(QUERY_INTERVAL);
+        dump.stop();
+        assert_eq!(
+            dump.dump().unwrap(),
+            None,
+            "stop drops the buffered samples"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "stop cancels the poll timer");
     }
 }

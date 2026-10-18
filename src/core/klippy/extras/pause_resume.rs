@@ -290,7 +290,17 @@ impl PauseResume {
         }
     }
 
-    /// Register the four commands, capturing a handle to this object.
+    /// Register the four commands, capturing a **weak** handle to this object.
+    ///
+    /// The handles are **weak**: the dispatcher's command table lives in
+    /// `gcode`, a part of the same config, and this object holds the SD card,
+    /// which holds that same dispatcher (`virtual_sdcard.rs`, its `gcode`
+    /// field). A strong capture here would close the loop `dispatcher → command
+    /// table → pause_resume → sd card → dispatcher`, which no part's `Drop` can
+    /// reach: the table would outlive `Printer::teardown` and keep every part it
+    /// captured — each `Mcu` among them, whose `Drop` releases the blocking
+    /// device read — alive with it (`virtual_sdcard` and `idle_timeout` hold the
+    /// table weakly for the same reason).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -322,10 +332,15 @@ impl PauseResume {
         ];
         for &(name, command, help, params) in COMMANDS {
             let handler: CommandHandler = {
-                let object = Arc::clone(self);
+                let object = Arc::downgrade(self);
                 Arc::new(move |gcmd| {
-                    let object = Arc::clone(&object);
-                    Box::pin(async move { command(&object, gcmd).await })
+                    let object = object.clone();
+                    Box::pin(async move {
+                        let Some(object) = object.upgrade() else {
+                            return Err(CommandError::new("the pause_resume object is gone"));
+                        };
+                        command(&object, gcmd).await
+                    })
                 })
             };
             gcode
@@ -1089,6 +1104,48 @@ mod tests {
         assert_eq!(
             emitted(&lines),
             ["// action:paused", "// action:resumed", "// action:cancel"]
+        );
+    }
+
+    /// Neither `pause_resume` nor the SD card outlives `Printer::teardown`.
+    ///
+    /// The two parts close a loop through the dispatcher's command table —
+    /// `gcode → command table → pause_resume → sd card → gcode` — and
+    /// `teardown` drops the parts from the registry, so nothing else ever
+    /// breaks it: a strong capture of this object in the table kept all three
+    /// alive, and with them every part the table captured, each `Mcu` among
+    /// them. A leaked `Mcu` parks its receive task in a blocking device read,
+    /// which is what blocked a host runtime from shutting down
+    /// (`upstream.rs`, `the_mainsail_client_macros_load_and_run`). Upstream's
+    /// `PauseResume` holds `self.gcode` for `respond_info`, which this host
+    /// looks up through the printer instead, so the table needs no strong
+    /// handle.
+    #[test]
+    fn teardown_releases_the_sd_card_and_pause_resume() {
+        let dir = TempDir::new("teardown_cycle");
+        let (_reactor, printer, gcode, object, vsd) = sd_machine(dir.path());
+        let object_weak = Arc::downgrade(&object);
+        let vsd_weak = Arc::downgrade(&vsd);
+        // The test's own handles must not be what keeps the parts up.
+        drop(object);
+        drop(vsd);
+
+        printer.teardown();
+
+        // The dispatcher is still in this test's hand, so the command table is
+        // alive: what must be gone is its grip on the parts — and with it the
+        // parts themselves.
+        assert!(
+            gcode.command_exists("PAUSE"),
+            "the table is still the one built"
+        );
+        assert!(
+            object_weak.upgrade().is_none(),
+            "the command table kept pause_resume alive past teardown"
+        );
+        assert!(
+            vsd_weak.upgrade().is_none(),
+            "pause_resume kept the SD card alive past teardown"
         );
     }
 }

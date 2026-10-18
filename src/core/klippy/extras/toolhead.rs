@@ -3686,12 +3686,27 @@ async fn home_unified(
     for rail in rails {
         // A rail whose endstop never fired comes back as `0.0`
         // (`mcu/resource/endstop.rs`); `home_axis` below reads the same value.
-        let trigger_time = rail
+        let trigger_time = match rail
             .endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
-            .map_err(command_error)?;
+        {
+            Ok(trigger_time) => trigger_time,
+            Err(err) => {
+                // The wait itself failed: the rail's dispatch never reported a
+                // trigger and `HOME_WAIT_TIMEOUT` gave up on it (a comms timeout
+                // reaches the same place). `home_wait` already disarmed that
+                // endstop and stopped its trsync; a rail this host never gets to
+                // keeps its firmware deadline (`TRSYNC_SINGLE_MCU_TIMEOUT`),
+                // which stops its steppers without the host. What is left is to
+                // end the move and settle the planner where the drip ran to, as
+                // the missed path below does.
+                send(printer, &KlippyEvent::HomingHomingMoveEnd);
+                settle_halt_position(connected, target);
+                return Err(command_error(err));
+            }
+        };
         if trigger_time <= 0.0 {
             // Upstream keeps walking the rails after a miss, so its last note
             // is still recorded; this host errors right after the move-end
@@ -3803,7 +3818,21 @@ async fn home_axis(
         }
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // The wait itself failed — the dispatch's trigger report never
+            // arrived and `HOME_WAIT_TIMEOUT` failed it as a communication
+            // timeout. `home_wait` already disarmed the endstop and stopped its
+            // trsync in the firmware; what is left is to end the move the way
+            // the miss below does (event, planner settled where the drip ran to)
+            // and raise the error, so `G28` fails instead of parking the script
+            // that started it.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            settle_halt_position(connected, home);
+            return Err(command_error(err));
+        }
+    };
     // A miss: upstream raises "No trigger on {name} after full movement" from
     // `homing_move` **after** the move-end event (`homing.py:119`). Without
     // this the axis would be marked homed at its endstop after driving the
@@ -3969,7 +3998,16 @@ async fn probing_move(
         // run past 30 minutes).
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // A failed wait (the dispatch's report never arrived) still ends the
+            // probe: pair the begin event and raise the error, as the miss below
+            // does.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            return Err(command_error(err));
+        }
+    };
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
 
     // No trigger: upstream raises "No trigger on {name} after full movement"
@@ -5590,6 +5628,158 @@ mod tests {
             !homing.lock().is_primary("stepper_x"),
             "a miss must not record an endstop trigger position"
         );
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// An endstop whose dispatch's trigger report never arrives: its completion
+    /// carries the dispatch's silence deadline and nothing ever completes it.
+    ///
+    /// This is the shipped failure (`bench-can-tmc2209.cfg`, 2026-02): every
+    /// `trsync_state` report went unhandled, so the completion never fired,
+    /// `home_wait` waited for ever, and `G28` — holding the g-code script that
+    /// started it — never returned. The whole client went unresponsive, `M112`
+    /// included.
+    struct LostReportEndstop {
+        completion: Arc<Completion>,
+    }
+
+    impl LostReportEndstop {
+        fn new() -> Self {
+            Self {
+                completion: Completion::new(),
+            }
+        }
+    }
+
+    impl HomingEndstop for LostReportEndstop {
+        fn home_start(
+            &self,
+            _print_time: f64,
+            _sample_time: f64,
+            _sample_count: u8,
+            _rest_time: f64,
+            _triggered: bool,
+        ) -> Result<Arc<Completion>, McuError> {
+            // What `TriggerDispatch::start` does for a real dispatch.
+            self.completion.arm_deadline();
+            Ok(Arc::clone(&self.completion))
+        }
+
+        fn home_wait(&self, _home_end_time: f64) -> EndstopFuture<'_> {
+            Box::pin(async move {
+                // `McuEndstop::home_wait`: the dispatch's silence deadline turns
+                // into upstream's communication-timeout error.
+                if self.completion.wait().await.is_failure() {
+                    return Err(McuError::Config(
+                        "Communication timeout during homing".to_string(),
+                    ));
+                }
+                Ok(0.0)
+            })
+        }
+    }
+
+    /// A lost trigger report must fail the homing move instead of parking it:
+    /// `home_axis` gives up after `HOME_WAIT_TIMEOUT`, ends the move, settles the
+    /// planner where the drip ran to, and the machine takes the next command.
+    ///
+    /// The drip loop stops as soon as the deadline fires, so the bound holds for
+    /// a move of any length — the shipped case was a homing move that never got
+    /// its report at all.
+    #[tokio::test(start_paused = true)]
+    async fn test_home_axis_fails_when_the_trigger_report_is_lost() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        let endstop = LostReportEndstop::new();
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let ended = Arc::clone(&ended);
+            printer.register_event_handler(
+                KlippyEvent::HomingHomingMoveEnd,
+                Box::new(move |_| ended.store(true, std::sync::atomic::Ordering::SeqCst)),
+            );
+        }
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        let started = tokio::time::Instant::now();
+        let error = home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await
+        .expect_err("a lost trigger report must fail the home, not park it");
+
+        // (a) Upstream's message for a dispatch whose answer never came
+        // (`klippy/mcu.py:393`), after the silence timeout — not later. The
+        // port's `command_error` puts the section context in front of every
+        // `McuError`, as it does for the other `home_wait` failures.
+        assert!(
+            error
+                .to_string()
+                .contains("Communication timeout during homing"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() >= crate::core::klippy::mcu::HOME_WAIT_TIMEOUT,
+            "the wait is bounded by the silence timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "homing_move_end must fire before the error (upstream's order)"
+        );
+        // The failure leaves the machine in the state a miss leaves it in: the
+        // dripped segment is not left queued for a later pass to re-walk.
+        assert!(
+            connected.toolhead.trapq().moves().is_empty(),
+            "the dripped segment must not stay queued for a later pass to re-walk"
+        );
+
+        // (b) The machine still takes commands: the recovery a session runs
+        // after a failed `G28` (`SET_KINEMATIC_POSITION` + a move) generates,
+        // which is what "the g-code lock was released" means at this seam.
+        connected.toolhead.get_last_move_time();
+        connected
+            .toolhead
+            .set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
+        connected
+            .toolhead
+            .move_to(Coord::new(10.0, 10.0, 0.0, 0.0), 100.0)
+            .expect("the move is inside the bed");
+        connected
+            .generate()
+            .expect("the flush pass runs after a timed-out home");
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 

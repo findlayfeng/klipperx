@@ -43,6 +43,6 @@ pub use spi::{McuSpi, SpiMode};
 pub use stepper::McuStepper;
 pub use trigger_analog::{McuTriggerAnalog, SosFilter, SosFilterDesign, MONITOR_MAX};
 pub use trsync::{
-    Completion, McuTrsync, TriggerDispatch, TrsyncRegistry, TRSYNC_SINGLE_MCU_TIMEOUT,
-    TRSYNC_TIMEOUT,
+    Completion, McuTrsync, TriggerDispatch, TrsyncRegistry, HOME_WAIT_TIMEOUT,
+    TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
 };

@@ -30,8 +30,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use super::pin::{McuChip, TrsyncChip};
 use super::stepper::McuStepper;
@@ -49,6 +51,24 @@ pub const TRSYNC_TIMEOUT: f64 = 0.025;
 /// `klippy/mcu.py:260`).
 pub const TRSYNC_SINGLE_MCU_TIMEOUT: f64 = 0.250;
 
+/// How long a homing dispatch may go without a `trsync_state` report before its
+/// wait fails as a communication timeout.
+///
+/// Upstream has no host-side bound on this wait: its firmware deadline
+/// (`expire_clock`, `TRSYNC_TIMEOUT`/`TRSYNC_SINGLE_MCU_TIMEOUT` above) ends a
+/// live dispatch, and the report that follows completes it. What it does bound
+/// is the *missing answer* — a retried query gives up after
+/// `RetryAsyncCommand.TIMEOUT_TIME` (`klippy/mcu.py:41`), the same 5 s this host
+/// uses for `QUERY_TIMEOUT` elsewhere. The report is exactly such an answer, so
+/// a dispatch that has been silent that long is treated the same way: the wait
+/// fails with [`TriggerReason::CommsTimeout`] (`home_wait` raises upstream's
+/// "Communication timeout during homing", `klippy/mcu.py:393`) instead of
+/// parking the g-code script that started the homing forever.
+///
+/// The clock it measures is **silence**, not the length of the move: every
+/// report pushes it out (see [`Completion::refresh_deadline`]).
+pub const HOME_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A one-shot completion the homing move waits on.
 ///
 /// The `McuTrsync` that sees `can_trigger=0` completes it; `home_wait` awaits.
@@ -63,6 +83,11 @@ pub const TRSYNC_SINGLE_MCU_TIMEOUT: f64 = 0.250;
 pub struct Completion {
     raw: Mutex<Option<u8>>,
     notify: Notify,
+    /// When a wait gives up, in the reactor's time: [`HOME_WAIT_TIMEOUT`] of
+    /// silence. [`TriggerDispatch::start`] arms it and every `trsync_state`
+    /// report pushes it out; `None` — a completion no dispatch owns, such as a
+    /// test endstop's — waits forever, as before.
+    deadline: Mutex<Option<Instant>>,
 }
 
 impl Completion {
@@ -74,6 +99,31 @@ impl Completion {
     /// Clear it for a new dispatch.
     pub fn reset(&self) {
         *self.raw.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Start the silence clock a dispatch's wait is bounded by: unless a report
+    /// pushes it out first, the wait fails [`HOME_WAIT_TIMEOUT`] from now.
+    pub fn arm_deadline(&self) {
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now() + HOME_WAIT_TIMEOUT);
+    }
+
+    /// Push the clock out: called for every report the firmware makes, so the
+    /// bound covers silence rather than the length of the move.
+    pub fn refresh_deadline(&self) {
+        let mut deadline = self.deadline.lock().unwrap_or_else(|p| p.into_inner());
+        if deadline.is_some() {
+            *deadline = Some(Instant::now() + HOME_WAIT_TIMEOUT);
+        }
+    }
+
+    /// How long a wait may still sleep before it gives up.
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Complete it with `reason`; the first reason stands.
@@ -114,6 +164,12 @@ impl Completion {
     }
 
     /// Wait for the completion and return its raw reason.
+    ///
+    /// A completion a dispatch owns is bounded by [`HOME_WAIT_TIMEOUT`] of
+    /// silence: the wait then fails it with [`TriggerReason::CommsTimeout`],
+    /// which is what a caller checking
+    /// [`TriggerReason::is_failure`] reads as the upstream "Communication
+    /// timeout during homing".
     pub async fn wait_raw(&self) -> u8 {
         loop {
             let notified = self.notify.notified();
@@ -133,7 +189,21 @@ impl Completion {
             if let Some(raw) = self.raw() {
                 return raw;
             }
-            notified.await;
+            let Some(remaining) = self.remaining() else {
+                notified.await;
+                continue;
+            };
+            if tokio::time::timeout(remaining, notified).await.is_ok() {
+                continue;
+            }
+            // The firmware has not reported for `HOME_WAIT_TIMEOUT`: the
+            // dispatch's trigger report is lost, and waiting for it any longer
+            // is what would leave the homing script — and the g-code command
+            // that started it — parked for good. Record the failure the way a
+            // late report would be recorded, so `reason()` and `stop()` see it
+            // too, and let the caller's error path close the dispatch down.
+            self.complete_raw(TriggerReason::CommsTimeout as u8);
+            return self.raw().unwrap_or(TriggerReason::CommsTimeout as u8);
         }
     }
 
@@ -159,7 +229,12 @@ pub struct TriggerGroup {
 impl TriggerGroup {
     /// Recompute the minimum acknowledged time and extend each MCU's deadline
     /// (`handle_trsync_state`).
+    ///
+    /// Also pushes the host-side silence clock out: a report is the firmware
+    /// saying the dispatch is still alive, which is what
+    /// [`HOME_WAIT_TIMEOUT`] measures the absence of.
     fn on_report(&self) {
+        self.completion.refresh_deadline();
         let trsyncs: Vec<Arc<McuTrsync>> = self
             .trsyncs
             .lock()
@@ -733,6 +808,7 @@ impl TriggerDispatch {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         self.group.completion.reset();
+        self.group.completion.arm_deadline();
         self.group.can_trigger.store(true, Ordering::SeqCst);
         let timeout = if trsyncs.len() == 1 {
             TRSYNC_SINGLE_MCU_TIMEOUT
@@ -826,6 +902,63 @@ mod tests {
         Arc::new(mcu)
     }
 
+    /// An identified MCU whose sends a test can read back as raw blocks.
+    ///
+    /// A `RecordingWire`, not a `FrameMock`: the frame mock accepts only what a
+    /// mapping entry scripts, so an unsolicited `trsync_trigger` would never be
+    /// recorded.
+    fn recording_mcu(name: &str) -> (Arc<Mcu>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test(name, Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        (mcu, sent)
+    }
+
+    /// Closes the fake session when a test ends — on a failed assertion too.
+    ///
+    /// A `RecordingWire`'s read parks in `spawn_blocking`; only `Mcu::close`
+    /// releases it, and a session left open holds up the runtime's shutdown for
+    /// the whole test binary (the shape `endstop.rs`'s `SessionGuard` documents).
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
+    /// The message names the recorded wire blocks carry, decoded with this test
+    /// dictionary's command table.
+    fn sent_message_names(blocks: &[Vec<u8>]) -> Vec<String> {
+        use crate::core::klippy::msg::parser::Parser;
+        use crate::core::klippy::msg::proto::Payload;
+
+        let mut parser = Parser::new();
+        for (id, format) in [
+            (30, "config_trsync oid=%c"),
+            (
+                31,
+                "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            ),
+            (32, "trsync_set_timeout oid=%c clock=%u"),
+            (33, "trsync_trigger oid=%c reason=%c"),
+            (34, "stepper_stop_on_trigger oid=%c trsync_oid=%c"),
+        ] {
+            parser.register(id, format).unwrap();
+        }
+        blocks
+            .iter()
+            .flat_map(|block| {
+                parser
+                    .decode(Payload::from_raw(block.clone()))
+                    .unwrap_or_default()
+            })
+            .map(|(message, _)| message.name.clone())
+            .collect()
+    }
+
     fn chip(name: &str, mcu: Arc<Mcu>) -> McuChip {
         let pins = Arc::new(PrinterPins::new());
         let chip = McuChip::new(
@@ -917,6 +1050,93 @@ mod tests {
 
         assert_eq!(completion.raw(), None);
         assert_eq!(completion.reason(), None);
+    }
+
+    /// A dispatch whose trigger report never arrives must not park the wait:
+    /// [`HOME_WAIT_TIMEOUT`] of silence fails it as a communication timeout —
+    /// what `home_wait` raises as upstream's "Communication timeout during
+    /// homing" — and the close-out puts `trsync_trigger` on the wire, so the
+    /// firmware stops the group instead of driving on.
+    ///
+    /// This is the shipped hang: every `trsync_state` report went unhandled, the
+    /// completion never fired, and `G28` — with the g-code script parked on it —
+    /// never returned.
+    ///
+    /// Real time, not the paused clock: an `Mcu` in the runtime (its receive task
+    /// parks in `spawn_blocking`) stops `start_paused` from advancing the clock,
+    /// so a virtual wait would hang instead of timing out.
+    #[tokio::test]
+    async fn test_a_dispatch_with_no_report_fails_the_wait_after_the_silence_timeout() {
+        let (mcu, sent) = recording_mcu("mcu");
+        // Declared before the resource, so it drops last.
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", Arc::clone(&mcu))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            completion.wait().await,
+            TriggerReason::CommsTimeout,
+            "a lost trigger report must fail the dispatch, not hang it"
+        );
+        assert!(
+            started.elapsed() >= HOME_WAIT_TIMEOUT,
+            "the wait is bounded by HOME_WAIT_TIMEOUT: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(completion.raw(), Some(TriggerReason::CommsTimeout as u8));
+
+        // The dispatcher is closed down the way `McuEndstop::home_wait` does it
+        // on the failure path, and the firmware is told to fire the group.
+        assert_eq!(dispatch.stop(), TriggerReason::CommsTimeout);
+        mcu.flush(Duration::from_millis(500)).await.unwrap();
+        let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let names = sent_message_names(&blocks);
+        assert!(
+            names.iter().any(|name| name == "trsync_trigger"),
+            "the firmware must be told to stop the group: {names:?}"
+        );
+    }
+
+    /// The clock the wait is bounded by measures *silence*, not the length of
+    /// the move: a `trsync_state` report pushes it out, so a long homing move
+    /// whose firmware keeps reporting is never failed by it.
+    #[tokio::test]
+    async fn test_a_report_pushes_the_silence_deadline_out() {
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+        let trsync = first(&dispatch);
+
+        // Four seconds in, the firmware reports it is still armed.
+        //
+        // Real time, not the paused clock: an `Mcu` in the runtime (its receive
+        // task parks in `spawn_blocking`) stops `start_paused` from advancing
+        // the clock at all, so a virtual sleep here would hang the test.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        trsync.handle_state(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: true,
+            trigger_reason: 0,
+            clock: 0,
+        });
+
+        // Six seconds after the arm — past the deadline the arm set — the wait
+        // still stands, because that report restarted the clock.
+        let pending = completion.wait_raw();
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut pending)
+                .await
+                .is_err(),
+            "a live report must restart the silence clock"
+        );
+        // And it gives up five seconds after that report.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(4), pending)
+                .await
+                .expect("the silence clock runs out"),
+            TriggerReason::CommsTimeout as u8
+        );
     }
 
     #[tokio::test]

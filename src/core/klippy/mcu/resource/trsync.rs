@@ -98,27 +98,20 @@ impl Completion {
         *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
-    /// Start the silence clock a dispatch's wait is bounded by.
-    ///
-    /// Until [`refresh_deadline`](Completion::refresh_deadline) is called the
-    /// wait fails [`HOME_WAIT_TIMEOUT`] from now, as
-    /// [`TriggerReason::CommsTimeout`].
+    /// Start the silence clock a dispatch's wait is bounded by: unless a report
+    /// pushes it out first, the wait fails [`HOME_WAIT_TIMEOUT`] from now.
     pub fn arm_deadline(&self) {
-        self.set_deadline();
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now() + HOME_WAIT_TIMEOUT);
     }
 
-    /// Push the deadline out: called for every report the firmware makes, so
-    /// the bound covers silence rather than the length of the move.
+    /// Push the clock out: called for every report the firmware makes, so the
+    /// bound covers silence rather than the length of the move.
     pub fn refresh_deadline(&self) {
         let mut deadline = self.deadline.lock().unwrap_or_else(|p| p.into_inner());
         if deadline.is_some() {
             *deadline = Some(Instant::now() + HOME_WAIT_TIMEOUT);
         }
-    }
-
-    fn set_deadline(&self) {
-        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(Instant::now() + HOME_WAIT_TIMEOUT);
     }
 
     /// How long a wait may still sleep before it gives up.
@@ -969,6 +962,7 @@ mod tests {
     /// This is the shipped hang: every `trsync_state` report went unhandled, the
     /// completion never fired, and `G28` — with the g-code script parked on it —
     /// never returned.
+    ///
     /// Real time, not the paused clock: an `Mcu` in the runtime (its receive task
     /// parks in `spawn_blocking`) stops `start_paused` from advancing the clock,
     /// so a virtual wait would hang instead of timing out.

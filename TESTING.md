@@ -353,6 +353,45 @@ USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/de
 **CAN 端口运行期会话已闭环**：`identify` → 配置握手 → 周期 `get_clock`，同一拓扑连续两次 `klippy` 都成功。
 仍未覆盖：CAN 上游 attach（桥经 CAN 被宿主连）。
 
+### 真机结果（2026-10-18，TMC2209 直接挂在桥板上，单线 UART）
+
+拓扑：F446 桥（USB CDC 控制台 + CAN1）；TMC2209 接在**桥板**上——STEP=PC8、DIR=PC7、
+EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂在 CAN 端口（它的 PC13 是状态灯）。
+配置：`kinematics: cartesian` + `[stepper_x]`（Y/Z 是没接电机的占位轴，只为 cartesian 成立）+
+`[tmc2209 stepper_x]` + `[endstop_phase stepper_x]`；`run_current 0.35 A`、`driver_SGTHRS 80`。
+
+**验过的（硬证据）**：
+
+| 项 | 证据 |
+|---|---|
+| UART 读 | `IOIN 21000041 version=0x21`（TMC2209）、`GCONF 1c0`（`pdn_disable`/`mstep_reg_select`/`multistep_filt`）、`CHOPCONF 14030053`（`toff=3 mres=16 intpol=1`）、`DRV_STATUS cs_actual/stealth/stst` |
+| UART 写 | `SLAVECONF 200 senddelay=2`、`IHOLD_IRUN` 随 `SET_TMC_CURRENT` 变化、`SET_TMC_FIELD toff` 改 `CHOPCONF` 后读回 |
+| 转动 | `MSCNT` 451→911（驱动侧微步计数）、±100 mm @5 mm/s 连续来回多轮不出错；也能用 `G1` 往复做出"嗡鸣" |
+| 相位 | `SET_STEPPER_ENABLE` 后 `mcu_phase_offset=1`、`phase_offset_position=0.0013228`（正好 1 微步） |
+| 周期检查 | 1 s 一次，`drv_status` 出现在 `tmc2209 stepper_x` 状态里 |
+| DIAG 接线 | 接上后空闲读引脚为**低**（`G28 X` 跑满行程报 `No trigger on x after full movement`）；未接时因内部上拉而"立刻触发" |
+
+**这一轮踩出并修掉的三个缺陷**（`603565b6`、`d3c31b8f`）：
+
+1. **写必须等固件自己的应答**：固件对每一条 `tmcuart_send` 都回一个 `tmcuart_response`（写也回，
+   载荷为空），那是"这一帧已发完"的完成信号。主机之前 fire-and-forget，于是只能靠 sleep 猜，
+   且那条没人收的应答会被下一条查询吃掉，返回上一帧的状态（表现为 `IFCNT` 不前进而寄存器其实已改）。
+2. **使能脚要关掉固件看门狗**：`digital_out` 默认带 2 s `max_duration`，使能后 move queue 空时固件
+   直接 shutdown（`Missed scheduling of next digital out event`）。上游 `stepper_enable.py` 会
+   `setup_max_duration(0.)`，本仓漏了 ⇒ **任何写 `enable_pin` 的轴都会中枪**（此前 bench 配置都没写它）。
+3. **周期检查不能阻塞反应堆**：一次 5 s 的 UART 读超时让反应堆忙 5 s，MCU 错过下一个 digital-out
+   截止时间而 shutdown。改成 `spawn` 到运行时，并把 UART 交换超时收到 500 ms（正常交换 ~5 ms）。
+
+**两个发现，未修（见 `TODO.md`）**：
+
+- `FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 在真机上**不产生任何 `queue_step`**（`MSCNT`
+  不动）；只有 `[stepper_x]` + cartesian 的 `G1` 走完整 host 路径才真的出步。
+- `G28` 失败（`No trigger …`）之后再做 `SET_KINEMATIC_POSITION` + `G1`，会撞
+  `Internal error in stepcompress: … Invalid sequence` 而 shutdown（正常路径与零长度移动都不触发）。
+
+**仍未验**：无感回零的**真触发**（这台电机是空悬的，不会堵转，需要负载或手捏轴）与
+`tmc/stallguard_dump` 的随负载采样；SPI 族（2130/2240/2660/5160）的真板读写本轮没上板。
+
 ## 范围外的真板项（不属最小打印任务，未排期）
 
 - **双板时序/漂移**：第二块板（`[mcu zboard]`）跨 MCU 停轴、小时级运行的实际晶振漂移与
@@ -362,13 +401,10 @@ USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/de
 - **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD——
   各接一个真实外设后验。（宿主模块已落地但尚未上真板的：`pulse_counter`、`neopixel`/`dotstar`、
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
-- **TMC 驱动的真板验收（2026-10-18 补齐活线后新列入）**：`[tmc2208/2209]` 的 UART 与
-  `[tmc2130/2240/2660/5160]` 的 SPI 读写现在都真上总线了，待上板验四件事：① `DUMP_TMC` 读到**非 0 且
-  字段合理**（`IOIN.version`、`GSTAT`、`DRV_STATUS`）；② `SET_TMC_CURRENT` 改电流后堵转力矩/温度跟变；
-  ③ `tmc2209_<stepper>:virtual_endstop` 能触发回零，且 `[endstop_phase]` 的相位偏移不再恒为 0；
-  ④ `tmc/stallguard_dump` 端点能采到随负载变化的 `sg_result`（2209 走 `SG_RESULT`，2130/5160 走
-  `DRV_STATUS.sg_result`）。**注意**：这两条传输层的 `block_in_command` 要求多线程 runtime，所以在
-  真板上跑时不能把命令塞进 current-thread runtime。
+- **TMC 驱动剩下的真板项**：UART 侧已在 2026-10-18 验过（见上一节），剩下三项：① 无感回零的**真触发**
+  （需要带负载的机构，空悬电机不会堵转）；② `tmc/stallguard_dump` 端点在**有负载**时采到随推力变化的
+  `sg_result`；③ SPI 族（`tmc2130`/`tmc2240`/`tmc2660`/`tmc5160`）的真板读写**一次都还没上板**。
+  **注意**：两条传输层的 `block_in_command` 要求多线程 runtime，真板上不能把命令塞进 current-thread runtime。
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
 - **katapult 刷写真机验证（直连）**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 直刷——

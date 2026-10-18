@@ -524,6 +524,12 @@ impl PrinterStepper {
         // `[force_move]` section (`ForceMove::ensure`).
         ForceMove::ensure(printer).register_stepper(&name, units_in_radians)?;
 
+        // Register with motion_report, upstream's third per-stepper helper
+        // module (`klippy/stepper.py:282-285`): every MCU stepper gets a
+        // `motion_report/dump_stepper` instance named after its section.
+        crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+            .register_stepper(&name)?;
+
         Ok(Self {
             name,
             axis,

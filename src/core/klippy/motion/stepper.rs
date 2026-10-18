@@ -99,6 +99,19 @@ impl Stepper {
         self.step_dist
     }
 
+    /// The frequency that turns print seconds into this stepper's clock ticks
+    /// (`StepCompressor::mcu_freq`), as a motion report needs it to convert
+    /// its rows back.
+    pub fn mcu_freq(&self) -> f64 {
+        self.compressor.mcu_freq()
+    }
+
+    /// The print time this stepper's clock 0 corresponds to
+    /// (`StepCompressor::time_offset`, upstream's `stepcompress_set_time`).
+    pub fn time_offset(&self) -> f64 {
+        self.compressor.time_offset()
+    }
+
     /// The solver state.
     pub fn kinematics(&self) -> &StepKinematics {
         &self.kinematics

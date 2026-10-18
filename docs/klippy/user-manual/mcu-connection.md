@@ -196,7 +196,9 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
   = 300 ms，窗口内迟到的应答丢掉）」归属，所以最坏情况是**漏报**（少列一个口上的设备），不会错报。
 - 桥已指派、但号不是 `admin` 工具默认的 `1`（`BRIDGE_MCU_ID`）时，初次打开需要
   `--bridge-uuid <12 位十六进制>` 点名（或先用 `admin scan` 取身份）；每一轮都重启桥的结构下，这是
-  正常代价，不是配置错。
+  正常代价，不是配置错。（可自动化：同一个 by-id 的 `admin scan --port` 已经能拿到该身份，现在只做到
+
+「不填就提示」，没有替你回填。）
 - 桥已在我们上一条命令里被赋过 node id 时，紧接着的**下一条命令**可能先报一次 `opening the bridge: Receive timeout`
   ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）；仍失败就等几秒再试，或用 `--bridge-uuid`。
 - **`printer.cfg` 侧已接线并真机跑通**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，

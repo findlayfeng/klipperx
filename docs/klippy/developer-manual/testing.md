@@ -293,6 +293,8 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
 | `test_m18_disables_every_motor_on_a_real_board` | `core/klippy/extras/stepper_enable.rs` | R9（`M18` 半边） | 经机器自己的 `GCodeDispatch` 发 `M18`，断言既有事件 `stepper_enable:motor_off` **恰好触发一次**、且 `get_status` 报每个电机 `false`。**零运动**（不产生步进脉冲）；doc 说明本仓 bring-up 本来就不使能电机、所以「状态已是 false」是正确结果而非产品不符 |
 | `test_r4_x_axis_homes_to_its_position_endstop_on_a_real_board` | `core/klippy/extras/toolhead.rs` | R4 单轴归零 | **本批唯一有运动的一条**：`G28 X` 后断言 `homed_axes` 含该轴、`position[axis] == position_endstop`（容差 1e-6）。doc 写明：会以配置里的 `homing_speed` **快速移动该轴直到触碰端停**、跑前先跑 R3 确认端停极性/电平、建议临时把 `homing_speed` 调小、不要在打印/加热中跑 |
 | `test_r4_all_axes_home_on_a_real_board` | `core/klippy/extras/toolhead.rs` | R4 全轴归零 | 同上但 `G28` 全轴——**风险高于单轴版**（三电机同时快移），doc 单独标注；默认建议先跑单轴那条 |
+| `hw_mux_device_answers_the_admin_commands` | `core/klippy/interface/devices/serial.rs` | mux 设备半（不摆桥） | 对着一块跑 mux 设备半的板子逐步发单元：发现 → 指派（再扫应静默）→ `SET_PORT_NODEID`（设备不执行、无应答）→ 隧道单元（整段丢弃且流恢复）。`#[ignore]`，tty 由 `KLIPPERX_HW_MUX_TTY` 给（uuid 默认本板，可 `KLIPPERX_HW_MUX_UUID` 覆盖）；**不动轴不加热**，但会改板子的 node id 状态 |
+| `hw_mux_device_bootloader_and_restart` | `core/klippy/interface/devices/serial.rs` | `0x05` / `0x02` | `RESTART_DEVICE` → 板子重新枚举、号丢失、再扫仍应答同一 uuid；`REQUEST_BOOTLOADER` → 重枚举为 katapult。**板子结束时停在 katapult**，要重跑必须先刷回应用 |
 
 两条 `stress.rs` 的用例复用 `--task motion` 那套 L1 machinery，并共用 `stress.rs` 已有的「`ResetRequired` → reset + 重连 + 重握手」路径
 （限 2 次重试、每次打日志与耗时）。

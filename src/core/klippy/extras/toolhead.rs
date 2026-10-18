@@ -2460,15 +2460,16 @@ impl ToolHeadObject {
     /// `FORCE_MOVE` works on an unhomed machine while a planned `G1` still
     /// answers `Must home axis first`.
     ///
-    /// A `stepper_name` the toolhead's motion queue does not hold — a stepper
-    /// `force_move` knows but no kinematics put in the queue, or a
-    /// `[manual_stepper]` that has not taken a first `MOVE=` yet — is
-    /// **refused** ([`unwired_stepper`]): nothing would generate its steps, and
-    /// a diagnostic command must not report success without moving the motor.
+    /// A `stepper_name` the toolhead's motion queue does not hold — a
+    /// `[manual_stepper]` that has not taken a first `MOVE=` yet, or the IDEX
+    /// second carriage, which never joins the queue in this port — carries the
+    /// move on the timeline only, with a warning: nothing would generate its
+    /// steps. See [`warn_unwired_stepper`] for why that is a warning rather
+    /// than an error.
     ///
     /// # Errors
-    /// "Printer is not ready" before connect, the unwired-stepper refusal, or a
-    /// step-generation/send failure.
+    /// "Printer is not ready" before connect, or a step-generation/send
+    /// failure.
     pub async fn manual_move(
         &self,
         stepper_name: &str,
@@ -2707,28 +2708,35 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
     result
 }
 
-/// The refusal a force move gives a stepper the toolhead's motion queue does
-/// not hold — a `[manual_stepper]` no `MOVE=` has installed yet, or a carriage
-/// no kinematics put in the queue.
+/// Report a force move on a stepper the toolhead's motion queue does not hold:
+/// the move travels the timeline, but no steps are generated for that motor.
 ///
-/// Upstream has no such case: every `MCU_stepper` allocates a syncemitter in
-/// `motion_queuing` as it is built (`klippy/stepper.py:50-56`), so its flush
-/// generates steps for all of them, wired into a rail or not. This port's queue
-/// holds the toolhead's and the extruders' steppers plus the ones
+/// **Why this is a warning and not an error**: upstream's `STEPPER_BUZZ` is
+/// legal G-code for every registered stepper, and the upstream corpus exercises
+/// exactly that on a carriage this port cannot drive —
+/// `test/klippy/dual_carriage.test:49` and
+/// `hybrid_corexy_dual_carriage.test:42` run `STEPPER_BUZZ STEPPER=dual_carriage`
+/// and require it to succeed. Upstream gets steps there because every
+/// `MCU_stepper` allocates a syncemitter in `motion_queuing` as it is built
+/// (`klippy/stepper.py:50-56`), so its flush generates all of them; this port's
+/// queue holds the toolhead's and the extruders' steppers plus the ones
 /// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a
 /// [`manual_stepper`](crate::core::klippy::extras::manual_stepper) installs
-/// there on its first `MOVE=`; taking the stepper over here instead would fight
-/// that module for its one-shot `PrinterStepper::take_stepper`.
+/// there on its first `MOVE=`. The IDEX second carriage never does, which is a
+/// real gap of that module (not of `force_move`): the motor steps nowhere, for
+/// this command or any other. Reporting it as a command error would make this
+/// port's own defect punish legal upstream G-code, so the refusal is on the log
+/// and the command still answers.
 ///
-/// So the move is refused rather than carried on the timeline alone: `MSCNT`
-/// holding still with a command that reported success is the one answer these
-/// two diagnostic commands must never give.
-fn unwired_stepper(stepper_name: &str) -> CommandError {
-    CommandError::new(format!(
-        "Stepper {stepper_name} is not in the motion queue, so there are no steps to generate \
-         (a [manual_stepper] joins it on its first MANUAL_STEPPER STEPPER=<short name> MOVE=…; \
-         a [stepper_*] or an extruder is always in it)"
-    ))
+/// Every call warns: the commands are rare, and a state that silently steps
+/// nothing is what made this look like "force_move produces no `queue_step` at
+/// all".
+fn warn_unwired_stepper(stepper_name: &str) {
+    warn!(
+        "Stepper {stepper_name} is not in the motion queue: no steps will be generated \
+         (force_move drives whichever stepper the queue holds; a [manual_stepper] joins it on \
+         its first MANUAL_STEPPER STEPPER=<short name> MOVE=…)"
+    );
 }
 
 /// Upstream `ForceMove.manual_move` (`force_move.py:75-91`): drive one motion
@@ -2746,9 +2754,10 @@ fn unwired_stepper(stepper_name: &str) -> CommandError {
 /// so there is nothing to note. See [`force_move`](crate::core::klippy::extras::force_move).
 ///
 /// # Errors
-/// [`unwired_stepper`] when the toolhead's motion queue holds no stepper by
-/// that name (nothing would generate steps for it), or a step-generation/send
-/// failure.
+/// A step-generation/send failure. A stepper the toolhead's motion queue does
+/// not hold is not an error: the move travels the timeline and
+/// [`warn_unwired_stepper`] says that no steps will be generated (upstream's
+/// corpus requires `STEPPER_BUZZ` to succeed for such a name).
 async fn manual_move(
     connected: &mut Connected,
     stepper_name: &str,
@@ -2756,17 +2765,24 @@ async fn manual_move(
     speed: f64,
     accel: f64,
 ) -> Result<(), CommandError> {
-    // The stepper to drive, found before anything is generated or the timeline
-    // moved: a name the queue does not hold has no motor this port can drive,
-    // and a force move that quietly travelled the timeline without stepping
-    // would be the worst answer a diagnostic command can give.
+    let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
+    let move_time = accel_t + cruise_t + accel_t;
+    // The stepper to drive. A name the queue does not hold has no motor this
+    // port can generate for — the IDEX second carriage never joins it — so the
+    // move is carried on the timeline only, with a warning (see
+    // [`warn_unwired_stepper`] for why that is not a command error).
     let index = connected
         .toolhead
         .motion_queuing_mut()
         .steppers()
         .iter()
-        .position(|stepper| stepper.name() == stepper_name)
-        .ok_or_else(|| unwired_stepper(stepper_name))?;
+        .position(|stepper| stepper.name() == stepper_name);
+    let Some(index) = index else {
+        warn_unwired_stepper(stepper_name);
+        connected.toolhead.get_last_move_time();
+        connected.toolhead.dwell(move_time);
+        return Ok(());
+    };
 
     // Upstream's first `toolhead.flush_step_generation()`: drain what is
     // queued before the solver is swapped, so the two timelines do not
@@ -2794,8 +2810,6 @@ async fn manual_move(
 
     // Swap in the cartesian single-axis solver and the force-move trapq,
     // keeping the old pair to restore afterwards.
-    let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
-    let move_time = accel_t + cruise_t + accel_t;
     let (prev_kinematics, prev_trapq) = {
         let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[index];
         let solver = StepKinematics::new(
@@ -4426,6 +4440,7 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::mcu::McuError;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn test_axis_indices_reads_the_letters() {
@@ -7191,34 +7206,88 @@ mod tests {
             .expect("the state was restored, so a third move still runs");
     }
 
-    /// A name the motion queue does not hold is refused, not carried on the
-    /// timeline: with no motor to generate for, a successful return would tell
-    /// the operator a motor moved when none could. Nothing is generated or
-    /// timed, so the state stays usable.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_manual_move_refuses_a_stepper_the_motion_queue_does_not_hold() {
+    /// A name the motion queue does not hold travels the timeline without
+    /// stepping anything, and says so on the log — the state the operator sees
+    /// as "the command answered but the motor did not move". The warning is
+    /// captured here with a subscriber of this test's own; the command itself
+    /// must stay successful, because upstream's corpus requires `STEPPER_BUZZ`
+    /// to answer for such a carriage (`dual_carriage.test:49`).
+    #[tokio::test]
+    async fn test_manual_move_warns_and_carries_an_unwired_stepper_on_the_timeline_only() {
         let mut connected = force_move_connected();
         let print_time = connected.toolhead.print_time();
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
 
-        let err = manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
+        let _guard = tracing::subscriber::set_default(subscriber);
+        manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
             .await
-            .expect_err("the move is refused");
+            .expect("the move still answers");
 
+        let logged = capture.text();
         assert!(
-            err.to_string()
-                .contains("not_on_the_queue is not in the motion queue"),
-            "{err}"
+            logged.contains("not_on_the_queue is not in the motion queue"),
+            "{logged}"
         );
-        assert!(err.to_string().contains("MANUAL_STEPPER"), "{err}");
-        assert_eq!(
-            connected.toolhead.print_time(),
-            print_time,
-            "the refusal moved no timeline"
+        assert!(logged.contains("MANUAL_STEPPER"), "{logged}");
+        // The move's 0.1 s still lands on the timeline: that is what "carried
+        // on the timeline only" means, and what keeps the next command's print
+        // time coherent (0.25 s of it is the first move's prime).
+        assert!(
+            (connected.toolhead.print_time() - 0.35).abs() < 1e-9,
+            "print time landed at {}",
+            connected.toolhead.print_time()
         );
+        assert!(connected.toolhead.print_time() > print_time);
         // And the state is whole: a stepper the queue does hold still moves.
         manual_move(&mut connected, "stepper_x", 10.0, 100.0, 0.0)
             .await
             .expect("the wired stepper still moves");
+    }
+
+    /// A byte sink for the `fmt` layer above (the shape
+    /// `config/mcu.rs`'s tests use): `with_default` keeps the capture off the
+    /// process-wide subscriber.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -42,11 +42,6 @@ minijinja = { version = "2.24", features = ["custom_syntax", "json"] }
 
 [features]
 default = []
-# Embed the built Mainsail site into the binary (build.rs reads
-# third_party/mainsail/dist, or KLIPPERX_MAINSAIL_DIST when set). Off by
-# default: it makes the build depend on a `dist/` existing and adds the site's
-# bytes to the binary.
-embedded-mainsail = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

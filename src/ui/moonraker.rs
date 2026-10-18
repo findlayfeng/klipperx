@@ -8,13 +8,10 @@
 //! **Where the sources come from** — the first that applies wins, and the
 //! startup line says which:
 //!
-//! 1. `--source <DIR>` — a checkout to run as it is.
-//! 2. The **bundled copy**, `$XDG_DATA_HOME/klipperx/moonraker`
-//!    (`~/.local/share/klipperx/moonraker`), copied there from the checkout on
-//!    first run. This is the layer packaging owns: put Moonraker's sources here
-//!    and this program runs them, no checkout and no code change.
-//! 3. The **checkout**, `<repo>/third_party/moonraker` (or
-//!    `KLIPPERX_MOONRAKER_DIR`).
+//! 1. `--source <DIR>` — a source tree to run as it is.
+//! 2. `<data-path>/klipperx/moonraker` — a copy kept beside the data, made from
+//!    the checkout on the first run and then used as it is.
+//! 3. `<repo>/third_party/moonraker` — the development checkout.
 //!
 //! **Where the dependencies come from**: a virtualenv of this program's own
 //! (`~/.local/share/klipperx/moonraker-venv` by default), created on first run,
@@ -23,10 +20,7 @@
 //! [`MARKER_FILE`]; a run whose recorded digest matches does nothing at all — no
 //! `pip`, no network, no wait — and a run whose digest differs reinstalls. A
 //! failed install leaves the old marker, so the next run retries rather than
-//! believing a broken environment is ready. `--offline` installs from a
-//! directory of wheels with `pip --no-index`, and refuses to run at all when
-//! that directory is missing, because pip would otherwise fall back to the
-//! network after a warning nobody reads.
+//! believing a broken environment is ready.
 //!
 //! Moonraker needs a directory tree around it as much as an interpreter:
 //! `config/`, `logs/`, `gcodes/` and friends under its data path, and a
@@ -42,7 +36,7 @@ use clap::Args;
 
 use crate::ui::command::{self, CommandRunner, Invocation, SystemRunner};
 use crate::ui::sha256::sha256_hex;
-use crate::ui::{bundled_moonraker, expand_home, moonraker_checkout};
+use crate::ui::{expand_home, repo_root};
 
 /// Where Moonraker's files live by default: the same `~/printer_data` Klipper's
 /// own installation scripts use.
@@ -68,18 +62,15 @@ const ENTRY_POINT: &str = "moonraker/moonraker.py";
 /// checkout — or which copy — a run will execute.
 const SOURCE_HELP: &str = "\
 MOONRAKER SOURCE (the first that applies is used):
-  1. --source <DIR>                 a checkout to run as it is
-  2. the bundled copy               $XDG_DATA_HOME/klipperx/moonraker
-                                    (~/.local/share/klipperx/moonraker), copied
-                                    there from the checkout on first run
+  1. --source <DIR>                 a source tree to run as it is
+  2. <data-path>/klipperx/moonraker copied there from the checkout on first run,
+                                    and used as it is afterwards
   3. <repo>/third_party/moonraker   the development checkout
-                                    (KLIPPERX_MOONRAKER_DIR moves this layer)
 
-The bundled copy is made once and then kept: a newer checkout is not picked up
-by itself — pass --source for a checkout being edited. --offline installs from
---wheels (default <source>/python_wheels) with `pip --no-index`, and a missing
-wheels directory is an error. The source, the entry point and the command line
-are printed at startup, and --dry-run also prints which layer answered.";
+The copy named in 2 is made once: a newer checkout is not picked up by itself —
+pass --source for a checkout being edited. --dry-run prepares the environment,
+prints the sources, the virtualenv and the command line, and does not start
+Moonraker.";
 
 /// The configuration written when there is none.
 ///
@@ -131,21 +122,13 @@ pub struct MoonrakerArgs {
     #[arg(long, value_name = "DIR", default_value = DEFAULT_VENV)]
     pub venv: PathBuf,
 
-    /// The Moonraker sources to run (default: the bundled copy, else the checkout)
+    /// The Moonraker sources to run (default: <data-path>/klipperx/moonraker, else the checkout)
     #[arg(long, value_name = "DIR")]
     pub source: Option<PathBuf>,
 
     /// The requirements file to install (default: <source>/scripts/moonraker-requirements.txt)
     #[arg(long, value_name = "FILE")]
     pub requirements: Option<PathBuf>,
-
-    /// Install from a local wheels directory instead of the network
-    #[arg(long)]
-    pub offline: bool,
-
-    /// The wheels directory for --offline (default: <source>/python_wheels)
-    #[arg(long, value_name = "DIR", requires = "offline")]
-    pub wheels: Option<PathBuf>,
 
     /// Prepare the environment and print the command; do not start Moonraker
     #[arg(long)]
@@ -160,17 +143,17 @@ pub fn run(args: MoonrakerArgs) -> Result<i32, Box<dyn std::error::Error>> {
 
 /// [`run`] with the program runner given, for tests.
 fn run_with(args: &MoonrakerArgs, runner: &dyn CommandRunner) -> Result<i32, String> {
-    let resolution = resolve(args)?;
+    let service = Service::resolve(args)?;
     // One line, always: which sources this run actually executes.
-    println!("{}", resolution.source_line());
+    println!(
+        "moonraker: source: {} ({})",
+        service.source.display(),
+        service.layer.describe()
+    );
+    let launch = service.prepare(runner)?;
     if args.dry_run {
-        // The whole order, so `--dry-run` answers "which layer would answer?".
-        for line in resolution.layer_lines() {
-            println!("{line}");
-        }
+        println!("moonraker: venv: {}", service.venv.display());
     }
-
-    let launch = resolution.service().prepare(runner)?;
     println!("moonraker: {}", launch.command_line());
     if args.dry_run {
         println!("moonraker: --dry-run, not starting");
@@ -179,79 +162,40 @@ fn run_with(args: &MoonrakerArgs, runner: &dyn CommandRunner) -> Result<i32, Str
     launch.run_to_completion()
 }
 
-/// Where the sources may come from, in the order they are tried.
-#[derive(Clone, Debug)]
-struct Candidates {
-    /// `--source`, when it was given.
-    given: Option<PathBuf>,
-    /// The copy kept beside the venv.
-    bundled: PathBuf,
-    /// The development checkout.
-    checkout: PathBuf,
-}
-
-impl Candidates {
-    /// The candidates a run is given: the arguments plus the two fixed places.
-    fn from_args(args: &MoonrakerArgs) -> Result<Candidates, String> {
-        Ok(Candidates {
-            given: match &args.source {
-                Some(dir) => Some(expand_home(dir)?),
-                None => None,
-            },
-            bundled: bundled_moonraker()?,
-            checkout: moonraker_checkout(),
-        })
-    }
-}
-
-/// Which layer the sources came from.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SourceChoice {
+/// Which of the three places the sources came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
     /// `--source`.
-    Given(PathBuf),
-    /// The bundled copy, already there.
-    Bundled(PathBuf),
-    /// The bundled copy, just made from the checkout.
-    Copied(PathBuf),
+    Given,
+    /// The copy under the data path, already there.
+    Bundled,
+    /// The copy under the data path, just made from the checkout.
+    Copied,
     /// The checkout itself.
-    Checkout(PathBuf),
+    Checkout,
 }
 
-impl SourceChoice {
-    /// The directory this layer runs.
-    fn dir(&self) -> &Path {
-        match self {
-            SourceChoice::Given(dir)
-            | SourceChoice::Bundled(dir)
-            | SourceChoice::Copied(dir)
-            | SourceChoice::Checkout(dir) => dir,
-        }
-    }
-
-    /// Which layer of the three answered: 0 `--source`, 1 the bundled copy, 2
-    /// the checkout.
-    fn layer(&self) -> usize {
-        match self {
-            SourceChoice::Given(_) => 0,
-            SourceChoice::Bundled(_) | SourceChoice::Copied(_) => 1,
-            SourceChoice::Checkout(_) => 2,
-        }
-    }
-
+impl Source {
     /// How to say which layer answered.
-    fn describe(&self) -> String {
+    fn describe(self) -> &'static str {
         match self {
-            SourceChoice::Given(dir) => format!("--source {}", dir.display()),
-            SourceChoice::Bundled(dir) => format!("the bundled copy at {}", dir.display()),
-            SourceChoice::Copied(dir) => {
-                format!(
-                    "the bundled copy at {} (copied from the checkout now)",
-                    dir.display()
-                )
-            }
-            SourceChoice::Checkout(dir) => format!("the checkout at {}", dir.display()),
+            Source::Given => "from --source",
+            Source::Bundled => "the bundled copy",
+            Source::Copied => "the bundled copy, just copied from the checkout",
+            Source::Checkout => "the checkout",
         }
     }
+}
+
+/// The Moonraker checkout: the Python sources `moonraker/moonraker.py` lives in.
+fn checkout() -> PathBuf {
+    repo_root().join("third_party").join("moonraker")
+}
+
+/// Where the sources are kept when they are not taken from a checkout:
+/// `<data-path>/klipperx/moonraker`, beside the data Moonraker itself writes.
+fn bundled_dir(data_path: &Path) -> PathBuf {
+    data_path.join("klipperx").join("moonraker")
 }
 
 /// Whether `dir` is a Moonraker source tree: the entry point is what is run, so
@@ -263,10 +207,13 @@ fn is_source(dir: &Path) -> bool {
 /// The source resolution: `--source`, then the bundled copy, then the checkout.
 ///
 /// The bundled copy is made here on a first run, because that is the only moment
-/// it can be: once it exists it is what runs, which is what lets a package place
-/// its own sources there instead.
-fn choose_source(candidates: &Candidates) -> Result<SourceChoice, String> {
-    if let Some(given) = &candidates.given {
+/// it can be: once it exists it is what runs.
+fn choose_source(
+    given: Option<&Path>,
+    bundled: &Path,
+    checkout: &Path,
+) -> Result<(PathBuf, Source), String> {
+    if let Some(given) = given {
         if !is_source(given) {
             return Err(format!(
                 "--source {} is not a Moonraker source tree: {} does not exist",
@@ -274,34 +221,34 @@ fn choose_source(candidates: &Candidates) -> Result<SourceChoice, String> {
                 given.join(ENTRY_POINT).display()
             ));
         }
-        return Ok(SourceChoice::Given(given.clone()));
+        return Ok((given.to_path_buf(), Source::Given));
     }
 
-    if is_source(&candidates.bundled) {
-        return Ok(SourceChoice::Bundled(candidates.bundled.clone()));
+    if is_source(bundled) {
+        return Ok((bundled.to_path_buf(), Source::Bundled));
     }
 
-    if !candidates.bundled.exists() && is_source(&candidates.checkout) {
-        copy_tree(&candidates.checkout, &candidates.bundled).map_err(|error| {
+    if !bundled.exists() && is_source(checkout) {
+        copy_tree(checkout, bundled).map_err(|error| {
             format!(
                 "cannot make the bundled copy in {}: {error}",
-                candidates.bundled.display()
+                bundled.display()
             )
         })?;
-        if is_source(&candidates.bundled) {
-            return Ok(SourceChoice::Copied(candidates.bundled.clone()));
+        if is_source(bundled) {
+            return Ok((bundled.to_path_buf(), Source::Copied));
         }
     }
 
-    if is_source(&candidates.checkout) {
-        if candidates.bundled.exists() {
+    if is_source(checkout) {
+        if bundled.exists() {
             println!(
                 "moonraker: warning: {} is not a usable copy ({ENTRY_POINT} is missing); \
                  using the checkout",
-                candidates.bundled.display()
+                bundled.display()
             );
         }
-        return Ok(SourceChoice::Checkout(candidates.checkout.clone()));
+        return Ok((checkout.to_path_buf(), Source::Checkout));
     }
 
     Err(format!(
@@ -309,8 +256,8 @@ fn choose_source(candidates: &Candidates) -> Result<SourceChoice, String> {
          not a source tree. An empty submodule is not a checkout — initialize it in \
          the main one (`git submodule update --init third_party/moonraker`) or pass \
          --source",
-        candidates.bundled.display(),
-        candidates.checkout.display()
+        bundled.display(),
+        checkout.display()
     ))
 }
 
@@ -340,6 +287,8 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 pub struct Service {
     /// The source tree that is run.
     pub source: PathBuf,
+    /// Which layer that source came from.
+    layer: Source,
     /// `moonraker/moonraker.py` inside it.
     pub entry_point: PathBuf,
     /// Moonraker's data directory.
@@ -350,112 +299,39 @@ pub struct Service {
     pub venv: PathBuf,
     /// The requirements file those dependencies are read from.
     pub requirements: PathBuf,
-    /// The wheels directory `--offline` installs from.
-    pub wheels: PathBuf,
-    /// Whether the dependencies must come from `wheels`, never the network.
-    pub offline: bool,
-}
-
-/// One run's resolution: the installation, the layer that answered, and the
-/// candidates that were considered.
-#[derive(Clone, Debug)]
-pub struct Resolution {
-    service: Service,
-    choice: SourceChoice,
-    candidates: Candidates,
-}
-
-impl Resolution {
-    /// The installation this run uses.
-    pub fn service(&self) -> &Service {
-        &self.service
-    }
-
-    /// The one line naming where the sources came from.
-    fn source_line(&self) -> String {
-        format!("moonraker: source: {}", self.choice.describe())
-    }
-
-    /// All three layers with their verdicts, for `--dry-run`.
-    fn layer_lines(&self) -> Vec<String> {
-        layer_lines(&self.candidates, &self.choice)
-    }
-}
-
-/// The candidates, one line each, marking the one that answered.
-///
-/// The mark is per layer, not per path: `--source <the checkout>` and the
-/// checkout layer are the same directory but different answers, and the report
-/// is about the answers.
-fn layer_lines(candidates: &Candidates, choice: &SourceChoice) -> Vec<String> {
-    let answered = choice.layer();
-    let mark = |layer: usize| {
-        if layer == answered {
-            "used"
-        } else {
-            "not used"
-        }
-    };
-    vec![
-        format!(
-            "moonraker:   --source: {}",
-            match &candidates.given {
-                Some(dir) => format!("{} ({})", dir.display(), mark(0)),
-                None => "not given".to_string(),
-            }
-        ),
-        format!(
-            "moonraker:   bundled copy: {} ({})",
-            candidates.bundled.display(),
-            mark(1)
-        ),
-        format!(
-            "moonraker:   checkout: {} ({})",
-            candidates.checkout.display(),
-            mark(2)
-        ),
-    ]
-}
-
-/// Resolve the arguments into one installation.
-fn resolve(args: &MoonrakerArgs) -> Result<Resolution, String> {
-    let candidates = Candidates::from_args(args)?;
-    let choice = choose_source(&candidates)?;
-    let source = choice.dir().to_path_buf();
-
-    let data_path = expand_home(&args.data_path)?;
-    let config = match &args.config {
-        Some(path) => expand_home(path)?,
-        None => data_path.join("config").join("moonraker.conf"),
-    };
-    let venv = expand_home(&args.venv)?;
-    let requirements = match &args.requirements {
-        Some(path) => expand_home(path)?,
-        None => source.join("scripts").join("moonraker-requirements.txt"),
-    };
-    let wheels = match &args.wheels {
-        Some(dir) => expand_home(dir)?,
-        None => source.join("python_wheels"),
-    };
-
-    let service = Service {
-        entry_point: source.join(ENTRY_POINT),
-        source,
-        data_path,
-        config,
-        venv,
-        requirements,
-        wheels,
-        offline: args.offline,
-    };
-    Ok(Resolution {
-        service,
-        choice,
-        candidates,
-    })
 }
 
 impl Service {
+    /// Resolve the arguments into one installation, making the bundled copy on a
+    /// first run.
+    fn resolve(args: &MoonrakerArgs) -> Result<Service, String> {
+        let data_path = expand_home(&args.data_path)?;
+        let config = match &args.config {
+            Some(path) => expand_home(path)?,
+            None => data_path.join("config").join("moonraker.conf"),
+        };
+        let venv = expand_home(&args.venv)?;
+        let given = match &args.source {
+            Some(dir) => Some(expand_home(dir)?),
+            None => None,
+        };
+        let (source, layer) =
+            choose_source(given.as_deref(), &bundled_dir(&data_path), &checkout())?;
+        let requirements = match &args.requirements {
+            Some(path) => expand_home(path)?,
+            None => source.join("scripts").join("moonraker-requirements.txt"),
+        };
+        Ok(Service {
+            entry_point: source.join(ENTRY_POINT),
+            source,
+            layer,
+            data_path,
+            config,
+            venv,
+            requirements,
+        })
+    }
+
     /// Prepare everything a run needs, and describe the command to run.
     ///
     /// The order matters: the data tree first (Moonraker refuses to start
@@ -541,10 +417,15 @@ impl Service {
             });
         }
 
-        // Only an install reads the wheels directory, so the check is here: a
-        // ready environment needs nothing from it.
-        self.check_wheels()?;
-        let invocation = self.pip_install();
+        let pip = self.venv.join("bin").join("pip").display().to_string();
+        let invocation = Invocation::new(
+            &pip,
+            [
+                "install".to_string(),
+                "-r".to_string(),
+                self.requirements.display().to_string(),
+            ],
+        );
         let completed = runner
             .run(&invocation)
             .map_err(|error| command::start_error(&invocation, &error))?;
@@ -556,46 +437,10 @@ impl Service {
         std::fs::write(&marker, format!("{wanted}\n"))
             .map_err(|error| format!("cannot write {}: {error}", marker.display()))?;
         println!(
-            "moonraker: installed the dependencies from {}{}",
-            self.requirements.display(),
-            if self.offline {
-                " (offline, from wheels)"
-            } else {
-                ""
-            }
+            "moonraker: installed the dependencies from {}",
+            self.requirements.display()
         );
         Ok(VenvState::Installed)
-    }
-
-    /// The `pip install` this environment needs: from the wheel directory when
-    /// `--offline` asked for it, from the index otherwise.
-    fn pip_install(&self) -> Invocation {
-        let pip = self.venv.join("bin").join("pip");
-        let mut arguments: Vec<String> = vec!["install".to_string()];
-        if self.offline {
-            arguments.push("--no-index".to_string());
-            arguments.push("--find-links".to_string());
-            arguments.push(self.wheels.display().to_string());
-        }
-        arguments.push("-r".to_string());
-        arguments.push(self.requirements.display().to_string());
-        Invocation::new(&pip.display().to_string(), arguments)
-    }
-
-    /// Refuse an offline install without a wheels directory.
-    ///
-    /// pip treats a missing `--find-links` directory as a warning and then goes
-    /// to the network, which is the one thing `--offline` promises not to do.
-    fn check_wheels(&self) -> Result<(), String> {
-        if !self.offline || self.wheels.is_dir() {
-            return Ok(());
-        }
-        Err(format!(
-            "--offline needs a wheels directory, and {} does not exist: pip only \
-             warns about a missing --find-links and would download from the network \
-             instead. Point --wheels at the directory holding the wheels.",
-            self.wheels.display()
-        ))
     }
 
     /// The digest of the requirements file, as the marker records it.
@@ -712,7 +557,6 @@ mod tests {
     use crate::ui::command::Completed;
     use clap::FromArgMatches;
     use std::cell::RefCell;
-    use std::path::Path;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     /// A runner that records what would have run, answers with scripted output,
@@ -757,7 +601,7 @@ mod tests {
     }
 
     impl CommandRunner for FakeRunner {
-        fn run(&self, invocation: &Invocation) -> std::io::Result<Completed> {
+        fn run(&self, invocation: &Invocation) -> Result<Completed, std::io::Error> {
             self.invocations.borrow_mut().push(invocation.clone());
             if let Some(effect) = &self.side_effect {
                 effect(invocation);
@@ -805,9 +649,8 @@ mod tests {
         Service {
             entry_point: source.join(ENTRY_POINT),
             requirements: source.join("scripts").join("moonraker-requirements.txt"),
-            wheels: source.join("python_wheels"),
             source: source.clone(),
-            offline: false,
+            layer: Source::Given,
             config: data_path.join("config").join("moonraker.conf"),
             venv: directory.join("venv"),
             data_path,
@@ -826,43 +669,37 @@ mod tests {
         })
     }
 
-    fn candidates(directory: &Path) -> Candidates {
-        Candidates {
-            given: None,
-            bundled: directory.join("bundled"),
-            checkout: directory.join("checkout"),
-        }
-    }
-
     #[test]
     fn the_source_layers_are_tried_in_order() {
         let directory = scratch("layers");
         let given = source_tree(&directory, "given", "a\n");
-        let mut candidates = candidates(&directory);
         let checkout = source_tree(&directory, "checkout", "b\n");
-        candidates.checkout = checkout.clone();
+        let bundled = directory.join("data").join("klipperx").join("moonraker");
+        assert_eq!(
+            bundled,
+            bundled_dir(&directory.join("data")),
+            "the copy lives under the data path"
+        );
 
         // 1. `--source`, whatever else exists.
-        candidates.given = Some(given.clone());
         assert_eq!(
-            choose_source(&candidates).expect("the given tree"),
-            SourceChoice::Given(given.clone())
+            choose_source(Some(&given), &bundled, &checkout).expect("the given tree"),
+            (given.clone(), Source::Given)
         );
-        candidates.given = Some(directory.join("absent"));
-        let error = choose_source(&candidates).expect_err("not a source tree");
+        let absent = directory.join("absent");
+        let error =
+            choose_source(Some(&absent), &bundled, &checkout).expect_err("not a source tree");
         assert!(error.contains("--source"), "{error}");
         assert!(error.contains("moonraker/moonraker.py"), "{error}");
-        candidates.given = None;
 
         // 2. The bundled copy, made from the checkout on the first run …
         assert_eq!(
-            choose_source(&candidates).expect("a copy is made"),
-            SourceChoice::Copied(candidates.bundled.clone())
+            choose_source(None, &bundled, &checkout).expect("a copy is made"),
+            (bundled.clone(), Source::Copied)
         );
-        assert!(is_source(&candidates.bundled), "the copy is a source tree");
+        assert!(is_source(&bundled), "the copy is a source tree");
         assert!(
-            candidates
-                .bundled
+            bundled
                 .join("scripts")
                 .join("moonraker-requirements.txt")
                 .is_file(),
@@ -870,13 +707,13 @@ mod tests {
         );
 
         // … and used as it is afterwards.
-        std::fs::write(candidates.bundled.join("marker"), "edited\n").expect("a marker");
+        std::fs::write(bundled.join("marker"), "edited\n").expect("a marker");
         assert_eq!(
-            choose_source(&candidates).expect("the copy is kept"),
-            SourceChoice::Bundled(candidates.bundled.clone())
+            choose_source(None, &bundled, &checkout).expect("the copy is kept"),
+            (bundled.clone(), Source::Bundled)
         );
         assert_eq!(
-            std::fs::read_to_string(candidates.bundled.join("marker")).expect("the marker"),
+            std::fs::read_to_string(bundled.join("marker")).expect("the marker"),
             "edited\n"
         );
 
@@ -887,16 +724,20 @@ mod tests {
     fn a_broken_copy_falls_back_to_the_checkout() {
         let directory = scratch("broken");
         let checkout = source_tree(&directory, "checkout", "b\n");
-        let mut candidates = candidates(&directory);
-        candidates.checkout = checkout.clone();
+        let bundled = directory.join("bundled");
         // A copy that exists but has no entry point is not a copy this program
         // made; the checkout still works.
-        std::fs::create_dir_all(&candidates.bundled).expect("an empty bundled dir");
+        std::fs::create_dir_all(&bundled).expect("an empty bundled dir");
 
         assert_eq!(
-            choose_source(&candidates).expect("the checkout"),
-            SourceChoice::Checkout(checkout)
+            choose_source(None, &bundled, &checkout).expect("the checkout"),
+            (checkout.clone(), Source::Checkout)
         );
+        // And with nothing anywhere, the error says what to do.
+        let error =
+            choose_source(None, &bundled, &directory.join("absent")).expect_err("no sources");
+        assert!(error.contains("--source"), "{error}");
+        assert!(error.contains("git submodule update --init"), "{error}");
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
     }
@@ -913,7 +754,7 @@ mod tests {
         )
         .expect("a cache file");
 
-        let bundled = directory.join("bundled");
+        let bundled = bundled_dir(&directory);
         copy_tree(&checkout, &bundled).expect("the copy");
 
         assert!(is_source(&bundled));
@@ -921,85 +762,6 @@ mod tests {
         assert!(!bundled.join("moonraker").join("__pycache__").exists());
 
         std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn no_sources_anywhere_says_what_to_do() {
-        let directory = scratch("none");
-        let candidates = candidates(&directory);
-        let error = choose_source(&candidates).expect_err("no sources");
-        assert!(error.contains("--source"), "{error}");
-        assert!(error.contains("bundled"), "{error}");
-        assert!(error.contains("git submodule update --init"), "{error}");
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn the_layer_report_marks_the_one_that_answered() {
-        let directory = scratch("lines");
-        let mut candidates = candidates(&directory);
-        candidates.given = Some(directory.join("given"));
-
-        let lines = layer_lines(
-            &candidates,
-            &SourceChoice::Bundled(candidates.bundled.clone()),
-        );
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        assert!(lines[0].contains("--source"), "{}", lines[0]);
-        assert!(lines[0].ends_with("(not used)"), "{}", lines[0]);
-        assert!(lines[1].contains("bundled copy"), "{}", lines[1]);
-        assert!(lines[1].ends_with("(used)"), "{}", lines[1]);
-        assert!(lines[2].contains("checkout"), "{}", lines[2]);
-        assert!(lines[2].ends_with("(not used)"), "{}", lines[2]);
-
-        // `--source` naming the checkout is still the first layer answering,
-        // even though both lines name the same directory.
-        let same = layer_lines(
-            &Candidates {
-                given: Some(candidates.checkout.clone()),
-                ..candidates.clone()
-            },
-            &SourceChoice::Given(candidates.checkout.clone()),
-        );
-        assert!(same[0].ends_with("(used)"), "{}", same[0]);
-        assert!(same[2].ends_with("(not used)"), "{}", same[2]);
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn the_default_candidates_name_the_bundled_copy_and_the_checkout() {
-        let defaults = MoonrakerArgs {
-            data_path: PathBuf::from(DEFAULT_DATA_PATH),
-            config: None,
-            venv: PathBuf::from(DEFAULT_VENV),
-            source: None,
-            requirements: None,
-            offline: false,
-            wheels: None,
-            dry_run: false,
-        };
-        let candidates = Candidates::from_args(&defaults).expect("the defaults resolve");
-
-        assert!(candidates.given.is_none());
-        assert_eq!(
-            candidates.bundled,
-            bundled_moonraker().expect("a data directory")
-        );
-        assert_eq!(candidates.checkout, moonraker_checkout());
-        assert!(
-            candidates.checkout.ends_with("third_party/moonraker"),
-            "{}",
-            candidates.checkout.display()
-        );
-
-        let given = Candidates::from_args(&MoonrakerArgs {
-            source: Some(PathBuf::from("/srv/moonraker")),
-            ..defaults
-        })
-        .expect("--source resolves");
-        assert_eq!(given.given, Some(PathBuf::from("/srv/moonraker")));
     }
 
     #[test]
@@ -1018,17 +780,12 @@ mod tests {
         assert_eq!(defaults.data_path, PathBuf::from(DEFAULT_DATA_PATH));
         assert_eq!(defaults.venv, PathBuf::from(DEFAULT_VENV));
         assert!(defaults.source.is_none() && defaults.config.is_none());
-        assert!(defaults.requirements.is_none() && defaults.wheels.is_none());
-        assert!(!defaults.offline && !defaults.dry_run);
+        assert!(defaults.requirements.is_none());
+        assert!(!defaults.dry_run);
 
-        assert!(
-            parse(&["--wheels", "/tmp/wheels"]).is_err(),
-            "--wheels is only meaningful with --offline"
-        );
-        let offline = parse(&["--offline", "--wheels", "/tmp/wheels", "--dry-run"])
-            .expect("offline with wheels");
-        assert!(offline.offline && offline.dry_run);
-        assert_eq!(offline.wheels, Some(PathBuf::from("/tmp/wheels")));
+        let given = parse(&["--source", "/srv/moonraker", "--dry-run"]).expect("parsed");
+        assert_eq!(given.source, Some(PathBuf::from("/srv/moonraker")));
+        assert!(given.dry_run);
     }
 
     #[test]
@@ -1135,56 +892,6 @@ mod tests {
     }
 
     #[test]
-    fn offline_installs_from_the_wheels_directory() {
-        let directory = scratch("offline");
-        let mut service = service(&directory, "tornado>=6.2.0\n");
-        service.offline = true;
-        std::fs::create_dir_all(&service.wheels).expect("a wheels directory");
-        std::fs::write(service.wheels.join("tornado-6.5-py3-none-any.whl"), "wheel")
-            .expect("a wheel");
-
-        let runner = venv_creating_runner();
-        service.ensure_venv(&runner).expect("the offline install");
-
-        // The virtualenv is created first; the install is the call that carries
-        // the offline flags.
-        let calls = runner.calls();
-        assert_eq!(calls.len(), 2, "{calls:?}");
-        assert_eq!(
-            calls[1],
-            format!(
-                "{} install --no-index --find-links {} -r {}",
-                service.venv.join("bin").join("pip").display(),
-                service.wheels.display(),
-                service.requirements.display()
-            )
-        );
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
-    fn offline_without_wheels_refuses_instead_of_downloading() {
-        let directory = scratch("nowheels");
-        let mut service = service(&directory, "tornado>=6.2.0\n");
-        service.offline = true;
-        assert!(!service.wheels.exists(), "the fixture has no wheels");
-
-        let error = service
-            .ensure_venv(&venv_creating_runner())
-            .expect_err("offline without wheels");
-        assert!(error.contains("--offline"), "{error}");
-        assert!(error.contains("--wheels"), "{error}");
-        assert!(error.contains("download from the network"), "{error}");
-        assert!(
-            !service.venv.join(MARKER_FILE).exists(),
-            "a refused install records nothing"
-        );
-
-        std::fs::remove_dir_all(&directory).expect("cleanup");
-    }
-
-    #[test]
     fn the_data_tree_and_a_starting_configuration_are_created() {
         let directory = scratch("tree");
         let service = service(&directory, "tornado>=6.2.0\n");
@@ -1279,8 +986,6 @@ mod tests {
             venv: service.venv.clone(),
             source: Some(service.source.clone()),
             requirements: Some(service.requirements.clone()),
-            offline: false,
-            wheels: None,
             dry_run: true,
         };
 

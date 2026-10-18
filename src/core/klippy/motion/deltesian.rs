@@ -410,8 +410,8 @@ impl Kinematics for DeltesianKinematics {
             .collect();
         json!({
             "homed_axes": homed,
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 

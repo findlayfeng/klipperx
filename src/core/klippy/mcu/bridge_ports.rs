@@ -1,6 +1,6 @@
 //! `[uart_device <name>]` / `[can_device <name>]` — a bridge downstream port.
 //!
-//! M1's configuration face (see the work-log plan): a downstream port is a
+//! M1's configuration face: a downstream port is a
 //! named config section that later passes look up by section name, instead of
 //! the topology being learned from the wire. `*_mcu` says which `[mcu]` the
 //! port's hardware sits on (the bridge). For a UART port, `uart_oid` is the

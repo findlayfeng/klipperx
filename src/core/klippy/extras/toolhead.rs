@@ -2455,17 +2455,20 @@ impl ToolHeadObject {
     /// and trapq back and wipes the force-move trapq. The toolhead's
     /// `commanded_pos` and the stepper's own solver position are deliberately
     /// **not** touched: the move invalidates the kinematics (a
-    /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner.
+    /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner. No
+    /// homing state is consulted — upstream's `manual_move` never checks, so
+    /// `FORCE_MOVE` works on an unhomed machine while a planned `G1` still
+    /// answers `Must home axis first`.
     ///
     /// A `stepper_name` the toolhead's motion queue does not hold — a stepper
-    /// `force_move` knows but those modules have not wired (the IDEX second
-    /// carriage, or a `[manual_stepper]` that has not taken a first `MOVE=`
-    /// yet) — carries the move on the timeline only; see [`manual_move`] for
-    /// why.
+    /// `force_move` knows but no kinematics put in the queue, or a
+    /// `[manual_stepper]` that has not taken a first `MOVE=` yet — is
+    /// **refused** ([`unwired_stepper`]): nothing would generate its steps, and
+    /// a diagnostic command must not report success without moving the motor.
     ///
     /// # Errors
-    /// "Printer is not ready" before connect, or a step-generation/send
-    /// failure.
+    /// "Printer is not ready" before connect, the unwired-stepper refusal, or a
+    /// step-generation/send failure.
     pub async fn manual_move(
         &self,
         stepper_name: &str,
@@ -2704,6 +2707,31 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
     result
 }
 
+/// The refusal a force move gives a stepper the toolhead's motion queue does
+/// not hold — the `` `[manual_stepper]` `` a `MOVE=` has not installed yet, or
+/// a carriage no kinematics put in the queue.
+///
+/// Upstream has no such case: every `MCU_stepper` allocates a syncemitter in
+/// `motion_queuing` as it is built (`klippy/stepper.py:50-56`), so its flush
+/// generates steps for all of them, wired into a rail or not. This port's queue
+/// holds the toolhead's and the extruders' steppers plus the ones
+/// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a `[manual_stepper]`
+/// installs there on its first `MOVE=`
+/// (`[manual_stepper](crate::core::klippy::extras::manual_stepper)`'s
+/// `ensure_motion`); taking the stepper over here instead would fight that
+/// module for its one-shot `PrinterStepper::take_stepper`.
+///
+/// So the move is refused rather than carried on the timeline alone: `MSCNT`
+/// holding still with a command that reported success is the one answer these
+/// two diagnostic commands must never give.
+fn unwired_stepper(stepper_name: &str) -> CommandError {
+    CommandError::new(format!(
+        "Stepper {stepper_name} is not in the motion queue, so there are no steps to generate \
+         (a [manual_stepper] joins it on its first MANUAL_STEPPER STEPPER=<short name> MOVE=…; \
+         a [stepper_*] or an extruder is always in it)"
+    ))
+}
+
 /// Upstream `ForceMove.manual_move` (`force_move.py:75-91`): drive one motion
 /// stepper in its own coordinates, bypassing the planner and the kinematics.
 ///
@@ -2719,7 +2747,9 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
 /// so there is nothing to note. See [`force_move`](crate::core::klippy::extras::force_move).
 ///
 /// # Errors
-/// A step-generation/send failure.
+/// [`unwired_stepper`] when the toolhead's motion queue holds no stepper by
+/// that name (nothing would generate steps for it), or a step-generation/send
+/// failure.
 async fn manual_move(
     connected: &mut Connected,
     stepper_name: &str,
@@ -2727,6 +2757,18 @@ async fn manual_move(
     speed: f64,
     accel: f64,
 ) -> Result<(), CommandError> {
+    // The stepper to drive, found before anything is generated or the timeline
+    // moved: a name the queue does not hold has no motor this port can drive,
+    // and a force move that quietly travelled the timeline without stepping
+    // would be the worst answer a diagnostic command can give.
+    let index = connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .position(|stepper| stepper.name() == stepper_name)
+        .ok_or_else(|| unwired_stepper(stepper_name))?;
+
     // Upstream's first `toolhead.flush_step_generation()`: drain what is
     // queued before the solver is swapped, so the two timelines do not
     // interleave.
@@ -2753,26 +2795,8 @@ async fn manual_move(
 
     // Swap in the cartesian single-axis solver and the force-move trapq,
     // keeping the old pair to restore afterwards.
-    //
-    // A stepper `force_move` knows but the toolhead's motion queue does not
-    // (the IDEX second carriage builds a `PrinterStepper` without being added
-    // to it, and a `[manual_stepper]` joins on its first `MOVE=`) has no motor
-    // this port can drive. Upstream would move it; here the move is carried on
-    // the timeline only, so `STEPPER_BUZZ` / `FORCE_MOVE` on such a name still
-    // answer instead of erroring.
-    let index = connected
-        .toolhead
-        .motion_queuing_mut()
-        .steppers()
-        .iter()
-        .position(|stepper| stepper.name() == stepper_name);
     let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
     let move_time = accel_t + cruise_t + accel_t;
-    let Some(index) = index else {
-        connected.toolhead.get_last_move_time();
-        connected.toolhead.dwell(move_time);
-        return Ok(());
-    };
     let (prev_kinematics, prev_trapq) = {
         let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[index];
         let solver = StepKinematics::new(
@@ -7168,27 +7192,34 @@ mod tests {
             .expect("the state was restored, so a third move still runs");
     }
 
-    /// A name the motion queue does not hold carries the move on the timeline
-    /// only, so `STEPPER_BUZZ` / `FORCE_MOVE` answer for a stepper those
-    /// modules have not wired (the IDEX second carriage) instead of erroring.
-    /// The planner's position is still untouched.
+    /// A name the motion queue does not hold is refused, not carried on the
+    /// timeline: with no motor to generate for, a successful return would tell
+    /// the operator a motor moved when none could. Nothing is generated or
+    /// timed, so the state stays usable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_manual_move_carries_an_unwired_stepper_on_the_timeline_only() {
+    async fn test_manual_move_refuses_a_stepper_the_motion_queue_does_not_hold() {
         let mut connected = force_move_connected();
-        let commanded = connected.toolhead.commanded_pos();
+        let print_time = connected.toolhead.print_time();
 
-        manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
+        let err = manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
             .await
-            .expect("the move is accepted");
+            .expect_err("the move is refused");
 
-        assert_eq!(connected.toolhead.commanded_pos(), commanded);
-        // The move's 0.1 s still lands on the timeline, after the first move's
-        // 0.25 s prime (print time starts at the fixture's 0.01 s dwell).
         assert!(
-            (connected.toolhead.print_time() - 0.35).abs() < 1e-9,
-            "print time landed at {}",
-            connected.toolhead.print_time()
+            err.to_string()
+                .contains("not_on_the_queue is not in the motion queue"),
+            "{err}"
         );
+        assert!(err.to_string().contains("MANUAL_STEPPER"), "{err}");
+        assert_eq!(
+            connected.toolhead.print_time(),
+            print_time,
+            "the refusal moved no timeline"
+        );
+        // And the state is whole: a stepper the queue does hold still moves.
+        manual_move(&mut connected, "stepper_x", 10.0, 100.0, 0.0)
+            .await
+            .expect("the wired stepper still moves");
     }
 
     // -----------------------------------------------------------------------

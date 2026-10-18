@@ -26,8 +26,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use super::pin::{McuChip, TrsyncChip};
 use super::stepper::McuStepper;
@@ -45,6 +47,24 @@ pub const TRSYNC_TIMEOUT: f64 = 0.025;
 /// `klippy/mcu.py:260`).
 pub const TRSYNC_SINGLE_MCU_TIMEOUT: f64 = 0.250;
 
+/// How long a homing dispatch may go without a `trsync_state` report before its
+/// wait fails as a communication timeout.
+///
+/// Upstream has no host-side bound on this wait: its firmware deadline
+/// (`expire_clock`, `TRSYNC_TIMEOUT`/`TRSYNC_SINGLE_MCU_TIMEOUT` above) ends a
+/// live dispatch, and the report that follows completes it. What it does bound
+/// is the *missing answer* — a retried query gives up after
+/// `RetryAsyncCommand.TIMEOUT_TIME` (`klippy/mcu.py:41`), the same 5 s this host
+/// uses for `QUERY_TIMEOUT` elsewhere. The report is exactly such an answer, so
+/// a dispatch that has been silent that long is treated the same way: the wait
+/// fails with [`TriggerReason::CommsTimeout`] (`home_wait` raises upstream's
+/// "Communication timeout during homing", `klippy/mcu.py:393`) instead of
+/// parking the g-code script that started the homing forever.
+///
+/// The clock it measures is **silence**, not the length of the move: every
+/// report pushes it out (see [`Completion::refresh_deadline`]).
+pub const HOME_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A one-shot completion the homing move waits on.
 ///
 /// The `McuTrsync` that sees `can_trigger=0` completes it; `home_wait` awaits.
@@ -59,6 +79,11 @@ pub const TRSYNC_SINGLE_MCU_TIMEOUT: f64 = 0.250;
 pub struct Completion {
     raw: Mutex<Option<u8>>,
     notify: Notify,
+    /// When a wait gives up, in the reactor's time: [`HOME_WAIT_TIMEOUT`] of
+    /// silence. [`TriggerDispatch::start`] arms it and every `trsync_state`
+    /// report pushes it out; `None` — a completion no dispatch owns, such as a
+    /// test endstop's — waits forever, as before.
+    deadline: Mutex<Option<Instant>>,
 }
 
 impl Completion {
@@ -70,6 +95,38 @@ impl Completion {
     /// Clear it for a new dispatch.
     pub fn reset(&self) {
         *self.raw.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Start the silence clock a dispatch's wait is bounded by.
+    ///
+    /// Until [`refresh_deadline`](Completion::refresh_deadline) is called the
+    /// wait fails [`HOME_WAIT_TIMEOUT`] from now, as
+    /// [`TriggerReason::CommsTimeout`].
+    pub fn arm_deadline(&self) {
+        self.set_deadline();
+    }
+
+    /// Push the deadline out: called for every report the firmware makes, so
+    /// the bound covers silence rather than the length of the move.
+    pub fn refresh_deadline(&self) {
+        let mut deadline = self.deadline.lock().unwrap_or_else(|p| p.into_inner());
+        if deadline.is_some() {
+            *deadline = Some(Instant::now() + HOME_WAIT_TIMEOUT);
+        }
+    }
+
+    fn set_deadline(&self) {
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Instant::now() + HOME_WAIT_TIMEOUT);
+    }
+
+    /// How long a wait may still sleep before it gives up.
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
     }
 
     /// Complete it with `reason`; the first reason stands.
@@ -110,6 +167,12 @@ impl Completion {
     }
 
     /// Wait for the completion and return its raw reason.
+    ///
+    /// A completion a dispatch owns is bounded by [`HOME_WAIT_TIMEOUT`] of
+    /// silence: the wait then fails it with [`TriggerReason::CommsTimeout`],
+    /// which is what a caller checking
+    /// [`TriggerReason::is_failure`] reads as the upstream "Communication
+    /// timeout during homing".
     pub async fn wait_raw(&self) -> u8 {
         loop {
             let notified = self.notify.notified();
@@ -129,7 +192,21 @@ impl Completion {
             if let Some(raw) = self.raw() {
                 return raw;
             }
-            notified.await;
+            let Some(remaining) = self.remaining() else {
+                notified.await;
+                continue;
+            };
+            if tokio::time::timeout(remaining, notified).await.is_ok() {
+                continue;
+            }
+            // The firmware has not reported for `HOME_WAIT_TIMEOUT`: the
+            // dispatch's trigger report is lost, and waiting for it any longer
+            // is what would leave the homing script — and the g-code command
+            // that started it — parked for good. Record the failure the way a
+            // late report would be recorded, so `reason()` and `stop()` see it
+            // too, and let the caller's error path close the dispatch down.
+            self.complete_raw(TriggerReason::CommsTimeout as u8);
+            return self.raw().unwrap_or(TriggerReason::CommsTimeout as u8);
         }
     }
 
@@ -155,7 +232,12 @@ pub struct TriggerGroup {
 impl TriggerGroup {
     /// Recompute the minimum acknowledged time and extend each MCU's deadline
     /// (`handle_trsync_state`).
+    ///
+    /// Also pushes the host-side silence clock out: a report is the firmware
+    /// saying the dispatch is still alive, which is what
+    /// [`HOME_WAIT_TIMEOUT`] measures the absence of.
     fn on_report(&self) {
+        self.completion.refresh_deadline();
         let trsyncs: Vec<Arc<McuTrsync>> = self
             .trsyncs
             .lock()
@@ -638,6 +720,7 @@ impl TriggerDispatch {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         self.group.completion.reset();
+        self.group.completion.arm_deadline();
         self.group.can_trigger.store(true, Ordering::SeqCst);
         let timeout = if trsyncs.len() == 1 {
             TRSYNC_SINGLE_MCU_TIMEOUT

@@ -21,7 +21,9 @@ use crate::core::klippy::gcode::CommandError;
 /// Methods take `&self`: the axis is shared (`Arc`) between the printer's
 /// object registry and the toolhead, so anything mutable lives behind interior
 /// mutability. `ea_index` is the axis' index in the toolhead position (`3` for
-/// the first extra axis), as upstream passes `e_index + 3`.
+/// the first extra axis), as upstream passes `e_index + 3`. The toolhead makes
+/// every move as long as its extra-axis list (`Move::new_extended`), so
+/// `axes_d[ea_index]` and `Move::end_axis(ea_index)` are always in range.
 pub trait ExtraAxis: Send + Sync + std::fmt::Debug {
     /// The name in `toolhead.extra_axes` status (`extruder`, `extruder1`).
     fn name(&self) -> &str;

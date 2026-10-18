@@ -46,6 +46,10 @@
 //! parsed and answers `No endstop for this manual stepper` when the section
 //! has none, but an actual endstop-triggered homing run is not driven (there
 //! is no `homing.manual_home` in this port).
+//!
+//! A registered `GCODE_AXIS` reaches the planner (`G1 A10` gives it a position
+//! slot and a distance), and `process_move` follows the move — but it follows
+//! it the same way: the commanded position only, no trapq, no steps.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -558,7 +562,7 @@ impl ExtraAxis for ManualStepper {
     }
 
     fn check_move(&self, ctx: &mut MoveContext<'_>, ea_index: usize) -> Result<(), CommandError> {
-        let movepos = ctx.end_pos()[ea_index];
+        let movepos = ctx.end_axis(ea_index);
         if self.pos_min.is_some_and(|min| movepos < min)
             || self.pos_max.is_some_and(|max| movepos > max)
         {
@@ -590,9 +594,13 @@ impl ExtraAxis for ManualStepper {
         move_: &Move,
         ea_index: usize,
     ) {
-        // Upstream appends to this stepper's own trapq; this port has none, so
-        // only the commanded position follows the planned move (module docs).
-        *self.lock_commanded_pos() = move_.end_pos[ea_index];
+        // Upstream appends this move's trapezoid to the stepper's own trapq
+        // (`manual_stepper.py:168-179`) and the motor steps. This port has no
+        // trapq for a manual stepper and no way to put its `PrinterStepper` in
+        // the motion queue after connect, so only the commanded position
+        // follows the planned move: `G1 A10` updates the position and the
+        // planner, it does **not** generate steps (module docs).
+        *self.lock_commanded_pos() = move_.end_axis(ea_index);
     }
 
     fn find_past_position(&self, _print_time: f64) -> f64 {

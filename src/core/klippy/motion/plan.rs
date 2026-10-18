@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use super::extra::ExtraAxis;
 use crate::core::klippy::gcode::CommandError;
-use crate::core::klippy::mathutil::{Coord, E_AXIS};
+use crate::core::klippy::mathutil::{Coord, AXES, E_AXIS};
 
 /// How long the look-ahead accumulates moves before flushing, in seconds
 /// (`LOOKAHEAD_FLUSH_TIME`, `klippy/toolhead.py:116`).
@@ -72,14 +72,23 @@ impl MoveLimits {
 /// and ratios `_r`, as upstream's naming convention
 /// (`klippy/toolhead.py:9-11`) has it.
 pub struct Move {
-    /// Where the move starts.
+    /// Where the move starts, four axes (see [`Move::start_axis`]).
     pub start_pos: Coord,
-    /// Where it ends (after the extrude-only adjustment).
+    /// Where it ends (after the extrude-only adjustment), four axes.
     pub end_pos: Coord,
-    /// Per-axis distance.
-    pub axes_d: [f64; 4],
+    /// Per-axis distance, one slot per position axis: four modelled axes, then
+    /// the extra axes (index [`AXES`] is the first extra axis).
+    pub axes_d: Vec<f64>,
     /// Per-axis distance over the total distance (the direction cosines).
-    pub axes_r: [f64; 4],
+    pub axes_r: Vec<f64>,
+    /// Where the extra axes start, index 0 == the first extra axis.
+    ///
+    /// Upstream keeps these in `commanded_pos`/`end_pos`, which are as long as
+    /// the toolhead's position (`toolhead.py:14-30`); a [`Coord`] here carries
+    /// the four modelled axes only, so the tail travels beside it.
+    pub extra_start: Vec<f64>,
+    /// Where the extra axes end, index 0 == the first extra axis.
+    pub extra_end: Vec<f64>,
     /// The total distance.
     pub move_d: f64,
     /// The acceleration used for this move, mm/s^2.
@@ -119,16 +128,46 @@ pub struct Move {
 }
 
 impl Move {
-    /// Profile one requested move.
+    /// Profile a requested move that carries no extra axes.
     ///
     /// `start_pos`/`end_pos` are four-axis toolhead positions; `speed` is the
     /// requested speed in mm/s, capped at [`MoveLimits::max_velocity`]
     /// (`klippy/toolhead.py:15-51`).
     pub fn new(start_pos: Coord, end_pos: Coord, speed: f64, limits: &MoveLimits) -> Self {
-        let mut axes_d = [0.0; 4];
-        for (axis, slot) in axes_d.iter_mut().enumerate() {
-            *slot = end_pos[axis] - start_pos[axis];
-        }
+        Self::new_extended(start_pos, &[], end_pos, &[], speed, limits)
+    }
+
+    /// Profile a requested move over every axis the toolhead carries.
+    ///
+    /// `extra_start`/`extra_end` are the positions of the extra axes, index 0
+    /// being the first one past `E` — upstream's `start_pos`/`end_pos` tail
+    /// (`toolhead.py:20-24`: `axes_d = [ep - sp for sp, ep in zip(...)]` walks
+    /// as many slots as the positions have).
+    ///
+    /// # Panics
+    /// When the two extra-axis slices differ in length.
+    pub fn new_extended(
+        start_pos: Coord,
+        extra_start: &[f64],
+        end_pos: Coord,
+        extra_end: &[f64],
+        speed: f64,
+        limits: &MoveLimits,
+    ) -> Self {
+        assert_eq!(
+            extra_start.len(),
+            extra_end.len(),
+            "a move needs a start and an end for every extra axis"
+        );
+        let mut axes_d: Vec<f64> = (0..AXES)
+            .map(|axis| end_pos[axis] - start_pos[axis])
+            .collect();
+        axes_d.extend(
+            extra_start
+                .iter()
+                .zip(extra_end)
+                .map(|(start, end)| end - start),
+        );
         let mut end_pos = end_pos;
         let mut accel = limits.max_accel;
         let mut velocity = speed.min(limits.max_velocity);
@@ -137,27 +176,33 @@ impl Move {
             (axes_d[0] * axes_d[0] + axes_d[1] * axes_d[1] + axes_d[2] * axes_d[2]).sqrt();
         if move_d < 0.000_000_001 {
             // An extrude-only move: nothing moves in space, so it gets the
-            // extruder's own distance and an effectively unbounded
-            // acceleration (an extruder has no kinematic limits).
+            // longest of the non-kinematic distances (E and the extra axes,
+            // `toolhead.py:28-29`'s `max([abs(ad) for ad in axes_d[3:]])`) and
+            // an effectively unbounded acceleration (an extruder has no
+            // kinematic limits).
             end_pos = Coord::new(start_pos.x(), start_pos.y(), start_pos.z(), end_pos.e());
             axes_d[0] = 0.0;
             axes_d[1] = 0.0;
             axes_d[2] = 0.0;
-            move_d = axes_d[E_AXIS].abs();
+            move_d = axes_d[E_AXIS..]
+                .iter()
+                .fold(0.0, |longest, distance| longest.max(distance.abs()));
             accel = 99999999.9;
             velocity = speed;
             is_kinematic_move = false;
         }
         let inv_move_d = if move_d != 0.0 { 1.0 / move_d } else { 0.0 };
-        let mut axes_r = [0.0; 4];
-        for (axis, slot) in axes_r.iter_mut().enumerate() {
-            *slot = axes_d[axis] * inv_move_d;
-        }
+        let axes_r = axes_d
+            .iter()
+            .map(|distance| distance * inv_move_d)
+            .collect();
         Self {
             start_pos,
             end_pos,
             axes_d,
             axes_r,
+            extra_start: extra_start.to_vec(),
+            extra_end: extra_end.to_vec(),
             move_d,
             accel,
             junction_deviation: limits.junction_deviation,
@@ -177,6 +222,33 @@ impl Move {
             cruise_t: 0.0,
             decel_t: 0.0,
             timing_callbacks: Vec::new(),
+        }
+    }
+
+    /// Where the move starts on `axis`, extra axes included.
+    ///
+    /// `axis < AXES` reads [`Move::start_pos`], everything from there on reads
+    /// [`Move::extra_start`] (upstream reads one list for both).
+    ///
+    /// # Panics
+    /// When `axis` is past the last axis the move carries.
+    pub fn start_axis(&self, axis: usize) -> f64 {
+        if axis < AXES {
+            self.start_pos.axis(axis)
+        } else {
+            self.extra_start[axis - AXES]
+        }
+    }
+
+    /// Where the move ends on `axis`, extra axes included.
+    ///
+    /// # Panics
+    /// When `axis` is past the last axis the move carries.
+    pub fn end_axis(&self, axis: usize) -> f64 {
+        if axis < AXES {
+            self.end_pos.axis(axis)
+        } else {
+            self.extra_end[axis - AXES]
         }
     }
 
@@ -359,7 +431,8 @@ impl LookAheadQueue {
     ///
     /// `extra_axes` are the non-kinematic axes (the extruder); each contributes
     /// a junction limit, as upstream's `Move.calc_junction` folds in
-    /// (`klippy/toolhead.py:66-99`).
+    /// (`klippy/toolhead.py:66-99`). The toolhead makes a move as long as its
+    /// extra-axis list, so every axis has a slot to read here.
     pub fn add_move(&mut self, move_: Move, extra_axes: &[Arc<dyn ExtraAxis>]) -> bool {
         let len = self.queue.len();
         self.queue.push(move_);
@@ -374,9 +447,6 @@ impl LookAheadQueue {
             extra_axes
                 .iter()
                 .enumerate()
-                // Slots past the move's four are skipped, as `ToolHead::move_to`
-                // skips the axis itself: no slot, no junction limit to fold in.
-                .filter(|(index, _)| *index + E_AXIS < cur.axes_d.len())
                 .map(|(index, axis)| axis.calc_junction(prev, cur, index + E_AXIS))
                 .collect()
         };
@@ -532,6 +602,55 @@ mod tests {
         assert_eq!(move_.move_d, 5.0);
         assert_eq!(move_.accel, 99999999.9);
         assert_eq!(move_.end_pos, Coord::new(0.0, 0.0, 0.0, 5.0));
+    }
+
+    #[test]
+    fn test_a_move_carries_an_extra_axis_past_the_fourth_slot() {
+        let limits = limits();
+        let move_ = Move::new_extended(
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            &[2.0],
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            &[10.0],
+            30.0,
+            &limits,
+        );
+
+        // One slot per position axis: four modelled axes plus the extra one.
+        assert_eq!(move_.axes_d.len(), AXES + 1);
+        assert_eq!(move_.axes_r.len(), AXES + 1);
+        assert_eq!(move_.axes_d[E_AXIS], 0.0);
+        assert_eq!(move_.start_axis(4), 2.0);
+        assert_eq!(move_.end_axis(4), 10.0);
+        assert_eq!(move_.extra_start, [2.0]);
+        assert_eq!(move_.extra_end, [10.0]);
+        // An extra-axis-only move is an extrude-only move: it moves nothing in
+        // space, and takes the longest non-kinematic distance as its length
+        // (`toolhead.py:28-29`).
+        assert!(!move_.is_kinematic_move);
+        assert_eq!(move_.move_d, 8.0);
+        assert_eq!(move_.axes_r[4], 1.0);
+    }
+
+    #[test]
+    fn test_an_extrude_only_move_keeps_an_extra_axis_moving() {
+        let limits = limits();
+        // E moves 5 mm while the extra axis moves 12: the move's length is the
+        // longest of the non-kinematic distances, so the extra axis is what
+        // the profile is shaped by.
+        let move_ = Move::new_extended(
+            Coord::new(1.0, 2.0, 3.0, 0.0),
+            &[0.0],
+            Coord::new(1.0, 2.0, 3.0, 5.0),
+            &[12.0],
+            30.0,
+            &limits,
+        );
+
+        assert!(!move_.is_kinematic_move);
+        assert_eq!(move_.move_d, 12.0);
+        assert_eq!(move_.end_pos, Coord::new(1.0, 2.0, 3.0, 5.0));
+        assert_eq!(move_.extra_end, [12.0]);
     }
 
     #[test]

@@ -2025,6 +2025,27 @@ impl ToolHeadObject {
         connected.toolhead.move_to(position, speed)
     }
 
+    /// Queue a move that also drives the extra axes.
+    ///
+    /// `extras` are the new positions of the non-kinematic axes on position
+    /// index `E_AXIS + 1` and up — a `GCODE_AXIS` manual stepper's slot, or a
+    /// second extruder's. An axis the caller leaves out keeps where it is.
+    ///
+    /// # Errors
+    /// As [`Self::move_to`].
+    pub fn move_to_extended(
+        &self,
+        position: Coord,
+        extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let Some(connected) = guard.as_mut() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected.toolhead.move_to_extended(position, extras, speed)
+    }
+
     /// The commanded position (upstream's `toolhead.get_position`).
     ///
     /// `None` before connect: there is no planner to ask yet, and

@@ -382,12 +382,17 @@ EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂
 3. **周期检查不能阻塞反应堆**：一次 5 s 的 UART 读超时让反应堆忙 5 s，MCU 错过下一个 digital-out
    截止时间而 shutdown。改成 `spawn` 到运行时，并把 UART 交换超时收到 500 ms（正常交换 ~5 ms）。
 
-**两个发现，未修（见 `TODO.md`）**：
+**两个发现（当日均未修，2026-10-18 当晚已处理，见 `TODO.md`）**：
 
 - `FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 在真机上**不产生任何 `queue_step`**（`MSCNT`
   不动）；只有 `[stepper_x]` + cartesian 的 `G1` 走完整 host 路径才真的出步。
+  **重新归因**：假固件上 host 侧本来就出步（`FORCE_MOVE` +800、`STEPPER_BUZZ` ±800），所以真机症状
+  的成因是 ① 电机没使能（EN 未开 / TMC `toff=0`）② `[manual_stepper]` 未进队列 ③ 队列外电机静默空跑。
+  ①②已修（自动使能链、manual_stepper 自有 trapq），③改为 `warn!`。**这三条仍需上板逐条复验。**
 - `G28` 失败（`No trigger …`）之后再做 `SET_KINEMATIC_POSITION` + `G1`，会撞
   `Internal error in stepcompress: … Invalid sequence` 而 shutdown（正常路径与零长度移动都不触发）。
+  **已修**：失败回零没有补上游的收尾三步，导致生成地平线被后台 flush pass 回退；现在地平线取
+  `max(两处)` + 未触发分支补收尾。仍需上板复验一次。
 
 **仍未验**：无感回零的**真触发**（这台电机是空悬的，不会堵转，需要负载或手捏轴）与
 `tmc/stallguard_dump` 的随负载采样；SPI 族（2130/2240/2660/5160）的真板读写本轮没上板。

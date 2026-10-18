@@ -86,6 +86,8 @@ OctoPrint 只走 pty，与本条取舍无关。
 | MCU 失联的判定点 | `MCUConnHelper.check_timeout` 由 `calibrate_clock` 调（`mcu.py:1231`），判据是 `clocksync.is_active()`（未答查询 > 4） | 判据与文案相同，但挂在本仓的 **1 s `mcu_clock_poll`** 上（本仓没有独立的 clock calibration 轮）；每 MCU 只报一次，file-output 模式不判 | [模块表](README.md) |
 | 连接期串口打开重试 | `connect_uart` 里 5 s 间隔、90 s 预算（`serialhdl.py:181-204`） | 同值同语义，但：预算在**测试构建**下缩到 300 ms（单测不能等 90 s）；重试在**阻塞池**上跑（机器运行时只有 2 个 worker），退出请求在睡眠切片内被察觉；只包「打开端口」，握手与配置不重试 | [MCU 连接方式](../user-manual/mcu-connection.md) |
 | 时间敏感回调的锁 | 单线程 reactor，回调自然串行 | `GCodeRequestQueue` 的 sink 回调在**锁外**执行（gcode/flush 双线程） | [模块表](README.md) |
+| 回调里的 panic | 无隔离：异常直接打死主循环（所有定时器停掉） | 定时器 / latency notifier / flush 回调 / active 回调全部 `catch_unwind`：记 `error!`（带回调名与 panic 文本）后**丢弃那个定时器**，其余照常调度（2026-10-18） | [架构总览](architecture.md)、[模块表](README.md) |
+| `force_move` 对「不在运动队列」的电机 | 每个 `MCU_stepper` 建时就 `allocate_syncemitter`（`klippy/stepper.py:50-56`），所以 `FORCE_MOVE`/`STEPPER_BUZZ` 对任何已注册电机都能出步 | 只驱动 `MotionQueuing` 里持有的那些；名字不在其中时**走时间轴 + `warn!`**（不报错），因为上游语料要求 `STEPPER_BUZZ STEPPER=dual_carriage` 成功（`dual_carriage.test:49`、`hybrid_corexy_dual_carriage.test:42`）。根因是本仓 `idex_modes` 的 carriage 从不进队列（见 §3） | [模块表](README.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 | `start_reason` | 主循环每轮写回 `start_args` | 只在一处表示差异 | [klippy-runtime](klippy-runtime.md) |
 | `webhooks` 实现形态 | 一个文件同时是传输/派发机器与一个 printer object | 拆成 `klippy-api`（传输/派发）与 `core/klippy/api`（端点） | [klippy-runtime](klippy-runtime.md)、[运行时编排](runtime.md) |
 | `[verify_heater <不存在的 heater>]` | 报 `Unknown heater` | 报装载器的 `Section '…' is not a valid config section` | [配置手册](../user-manual/config.md) |
@@ -111,6 +113,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | TMC 的活线与运行期链路 | **已补齐并真机验过（2026-10-18，F446 + TMC2209 单线 UART）**：`DUMP_TMC` 读到芯片真值（`IOIN.version=0x21`）、`SET_TMC_CURRENT` 写进去、`MSCNT` 随转动变化、`mcu_phase_offset` 有了写入者。行为偏移四条：① **写要等固件自己的 `tmcuart_response`**（写也回一个空载荷应答，那是「这帧已发完」的完成信号；上游靠阻塞传输天然有它，本仓不收集就会读到写前的旧值）；② SPI 的「写 + 回读」是 `spi_send` 紧跟一次 `spi_transfer`（两条消息、两个 ack），上游 `spi_transfer_with_preface` 是一次片选内连发两帧；③ `TmcRegister.receive_time` 取调用返回后的 reactor 时刻再换 print_time，上游取响应的 `#receive_time`，最多差一个往返；④ `tmc/stallguard_dump` 的读路径按芯片能力判定（`DRV_STATUS.sg_result` 或 `SG_RESULT`/`SG4_RESULT`），上游按 `spi_status` 猜出的 `optimized_spi` 判定（本仓无该字段，节拍统一 5 ms）。另：UART 交换超时 **500 ms**（上游无限等）；both-edge（`dedge`）未启用（`get_pulse_duration()` 第二项恒 `false`） | [配置手册](../user-manual/config.md)、[模块表](README.md)、[真机记录](../../TESTING.md) |
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |
 | MCU `output` 表的异步投递等 | 见该页「当前未实现」 | [MCU 协议](mcu-protocol.md#当前未实现) |
+| IDEX 第二滑车（`idex_modes`）的步进 | **真实缺口**（2026-10-18 发现）：`[dual_carriage]` 的 `PrinterStepper` 从不调 `take_stepper()`、也从不进 `MotionQueuing`，所以它的 solver 没挂任何 trapq → **不但 `STEPPER_BUZZ` 不出步，这一路根本没有步进生成**。上游每个 `MCU_stepper` 建时即加入生成集，所以 IDEX 机器在那里是正常的。语料此前是「假绿」（只要求命令不报错） | `src/core/klippy/extras/idex_modes.rs`、[模块表](README.md) |
 | 事件名无发送方的其余项 | `stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |
 
 ## 4. 本仓特有（上游没有）

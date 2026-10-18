@@ -52,6 +52,7 @@
 //! chip: nothing here can tell a SPI chain from a UART one.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
@@ -2141,6 +2142,10 @@ pub struct TmcDriver {
     read_registers: Vec<String>,
     read_translate: Option<ReadTranslate>,
     mcu_phase_offset: Mutex<Option<i64>>,
+    /// Whether a phase sync an enable started is still owed because the
+    /// solver's step count could not be read at that moment
+    /// (`complete_owed_phase_sync`).
+    phase_sync_owed: AtomicBool,
     stepper: Mutex<Option<Arc<PrinterStepper>>>,
     /// `stepper_enable`'s tracking for this stepper, once connect found it
     /// (`self.stepper_enable`), used to read the enabled state.
@@ -2213,6 +2218,7 @@ impl TmcDriver {
             read_registers,
             read_translate,
             mcu_phase_offset: Mutex::new(None),
+            phase_sync_owed: AtomicBool::new(false),
             stepper: Mutex::new(None),
             enable_line: Mutex::new(None),
             toff: Mutex::new(None),
@@ -2318,8 +2324,11 @@ impl TmcDriver {
     ///
     /// The offset is written by the enable path ([`TmcDriver::sync_mcu_pos`]
     /// reads the driver's own phase counter once the motor is on), which is
-    /// what `[endstop_phase]` looks for.
+    /// what `[endstop_phase]` looks for. An enable whose sync could not run at
+    /// the time finishes it here rather than leaving the offset unmeasured
+    /// ([`TmcDriver::complete_owed_phase_sync`]).
     pub fn get_phase_offset(&self) -> (Option<i64>, i64) {
+        self.complete_owed_phase_sync();
         let offset = self.phase_offset();
         (offset, self.phases())
     }
@@ -2383,23 +2392,26 @@ impl TmcDriver {
     /// only passed on **while the motor is enabled** — a disabled motor is
     /// allowed to be unreadable (upstream's semantics).
     ///
+    /// When the solver's step count cannot be read *yet* the sync is not
+    /// dropped: it is owed, and the next [`TmcDriver::get_phase_offset`] finishes
+    /// it ([`TmcDriver::complete_owed_phase_sync`]).
+    ///
     /// # Errors
     /// The read error, when the motor is on.
     fn sync_mcu_pos(&self) -> Result<(), McuError> {
-        let stepper = self
-            .stepper
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        let mcu_position = stepper.as_ref().and_then(|stepper| {
-            self.printer
-                .upgrade()
-                .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
-                .and_then(|toolhead| stepper.get_mcu_position(&toolhead))
-        });
-        let (Some(stepper), Some(mcu_position)) = (stepper, mcu_position) else {
-            // No stepper or no toolhead: there is no position to align to.
-            tracing::info!("Unable to obtain tmc {} phase", self.stepper_name);
+        let Some((stepper, mcu_position)) = self.solver_step_count() else {
+            // Upstream reads the count off the solver, which always has one.
+            // Here it lives in the toolhead's connected state, and a move that
+            // owns that state takes it out of its slot for its whole duration
+            // (`ToolHeadObject::probing_move`, `flush_step_generation`) — which
+            // is where the enable of the move's first step fires from. The sync
+            // is owed instead of lost: `get_phase_offset` finishes it once the
+            // count is readable again.
+            tracing::debug!(
+                "Deferring tmc {} phase sync: the solver's step count is not readable yet",
+                self.stepper_name
+            );
+            self.set_phase_sync_owed(true);
             *self
                 .mcu_phase_offset
                 .lock()
@@ -2410,6 +2422,8 @@ impl TmcDriver {
             Ok(driver_phase) => driver_phase,
             Err(err) => {
                 tracing::info!("Unable to obtain tmc {} phase", self.stepper_name);
+                // Upstream gives up on a read it could not make.
+                self.set_phase_sync_owed(false);
                 *self
                     .mcu_phase_offset
                     .lock()
@@ -2441,7 +2455,58 @@ impl TmcDriver {
             .mcu_phase_offset
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(moff);
+        self.set_phase_sync_owed(false);
         Ok(())
+    }
+
+    /// This stepper and the solver's step count at this instant
+    /// (`MCU_stepper.get_mcu_position`).
+    ///
+    /// `None` before connect, when this driver has no stepper, or while the
+    /// toolhead's connected state is out of its shared slot (a move owns it) —
+    /// [`ToolHeadObject::stepper_mcu_position`] answers `None` for all three.
+    fn solver_step_count(&self) -> Option<(Arc<PrinterStepper>, i64)> {
+        let stepper = self
+            .stepper
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()?;
+        let mcu_position = self
+            .printer
+            .upgrade()
+            .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
+            .and_then(|toolhead| stepper.get_mcu_position(&toolhead))?;
+        Some((stepper, mcu_position))
+    }
+
+    fn phase_sync_owed(&self) -> bool {
+        self.phase_sync_owed.load(Ordering::SeqCst)
+    }
+
+    fn set_phase_sync_owed(&self, owed: bool) {
+        self.phase_sync_owed.store(owed, Ordering::SeqCst);
+    }
+
+    /// Finish a phase sync an enable owed (`get_phase_offset`).
+    ///
+    /// The offset pairs the driver's counter with the solver's step count, so it
+    /// can be measured whenever both are readable while the rotor holds still —
+    /// the pairing does not change with the position. Upstream re-measures it
+    /// that way on every `stepper:sync_mcu_position`; here the moment a move
+    /// that owned the toolhead has finished is when `[endstop_phase]` asks for
+    /// it (`homing:home_rails_end`), so that read is where an owed sync
+    /// completes.
+    ///
+    /// Nothing is read while the motor is off: a disabled driver's counter says
+    /// nothing about the rotor.
+    fn complete_owed_phase_sync(&self) {
+        if !self.phase_sync_owed() || !self.motor_enabled() {
+            return;
+        }
+        // A read failure is `sync_mcu_pos`'s to report, and only the enable path
+        // can raise: a getter has nowhere to put it. `sync_mcu_pos` stops owing
+        // the sync either way, so a dead chip is asked once and not again.
+        let _ = self.sync_mcu_pos();
     }
 
     /// Whether `stepper_enable` has this motor on (`enable_line.is_motor_enabled`).

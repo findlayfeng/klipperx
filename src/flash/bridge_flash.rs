@@ -312,17 +312,77 @@ enum BridgeOpen {
 /// own reason, with what the caller can check
 /// ([`BridgeFlashError::AttachUnanswered`]).
 ///
+/// # The stale session behind an unanswered handshake
+///
+/// A bridge left in an **earlier session's state** — the host that was driving
+/// it was killed, so its firmware still waits for a block nobody will send — is
+/// alive, says nothing to this session's handshake, and answers everything else.
+/// Reporting it as failed is what made such a board need a power cycle, so the
+/// budget being spent is not the end of the run: the link is opened **without**
+/// the handshake ([`serial::attach_downstream`], which registers the same slot
+/// and writes nothing) and the handshake is **owed**
+/// ([`OwedHandshake`]) until [`BridgeLink::identify`] has cleared the earlier
+/// session. That clearance is the MCU transport's own takeover, unchanged
+/// (`mcu/mod.rs`: a first block that is answered with a number past a fresh
+/// session's window is renumbered onto and re-sent) — this function only stops
+/// the handshake from being the thing that locks the run out of it.
+///
+/// The fallback runs **once**, after the attempts above are spent: it replaces
+/// no attempt, adds no wait of its own, and a board that is genuinely gone still
+/// fails — with the handshake's own report, because taking over a session that
+/// is not there answers nothing.
+///
 /// # Errors
-/// As [`attach_bridge_once`], with the unanswered case retried as above.
+/// As [`attach_bridge_once`], with the unanswered case retried as above and then
+/// falling back to the owed handshake.
 fn attach_bridge(
     path: &Path,
     baud: u32,
     mcu_id: u32,
     uuid: Option<[u8; 6]>,
-) -> Result<Arc<SharedSerialHandle>, BridgeFlashError> {
-    attach_with_retries(RUN_ATTACH_RETRY, path, || {
-        attach_bridge_once(path, baud, mcu_id, uuid)
-    })
+) -> Result<(Arc<SharedSerialHandle>, Option<OwedHandshake>), BridgeFlashError> {
+    // The identity the attempts name the board with, kept for the fallback: a
+    // bridge opened without `--bridge-uuid` is named with the uuid its
+    // discovery scan found, and only the attempt knows which that was.
+    let mut named: Option<[u8; 6]> = uuid;
+    let attached = attach_with_retries(RUN_ATTACH_RETRY, path, || {
+        attach_bridge_once(path, baud, mcu_id, uuid, &mut named)
+    });
+    match attached {
+        Ok(handle) => Ok((handle, None)),
+        Err(unanswered @ BridgeFlashError::AttachUnanswered { .. }) => {
+            let handle =
+                serial::attach_downstream(path, baud, mcu_id).map_err(BridgeFlashError::Open)?;
+            Ok((
+                handle,
+                Some(OwedHandshake {
+                    uuid: named,
+                    unanswered,
+                }),
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// The assignment handshake a **shared serial** attach owes because nothing
+/// answered it: the link is open, the board was named by the attempts
+/// themselves, and the session it is stuck in is cleared by the identify.
+///
+/// Owned by [`BridgeLink`] and spent by [`BridgeLink::identify`], which is where
+/// the takeover happens and therefore the first point the handshake can be
+/// answered at all.
+struct OwedHandshake {
+    /// The identity the attempts named the board with — the caller's
+    /// `--bridge-uuid`, or the one an unassigned bridge answered the discovery
+    /// scan with. `None` when the attach named nothing (an id-only attach),
+    /// where there is no naming to re-confirm and identify is the proof.
+    uuid: Option<[u8; 6]>,
+    /// What the attach itself reported. Kept so a board that was simply not
+    /// answering is still reported as that
+    /// ([`BridgeFlashError::AttachUnanswered`]) rather than as a session this
+    /// run could not take over.
+    unanswered: BridgeFlashError,
 }
 
 /// The retry bounds [`attach_bridge`] runs with: the constants above, in one
@@ -410,6 +470,12 @@ fn attach_with_retries<T>(
 /// against it fail with `Receive timeout`). `identify`, which every caller runs
 /// next, is what proves the bridge answers on that id.
 ///
+/// `uuid` is the identity the board is **named** with; `named` reports it back,
+/// because an attempt that had to find the bridge is the only one that knows
+/// which uuid it used (the fallback [`attach_bridge`] takes when the handshake
+/// stays unanswered needs it). An attempt that names nothing — the id-only
+/// attach below — leaves it as it was.
+///
 /// # Errors
 /// [`BridgeFlashError::AmbiguousBridge`] when more than one unassigned bridge
 /// answers — naming the wrong one would restart and re-assign the wrong board —
@@ -421,6 +487,7 @@ fn attach_bridge_once(
     baud: u32,
     mcu_id: u32,
     uuid: Option<[u8; 6]>,
+    named: &mut Option<[u8; 6]>,
 ) -> Result<Arc<SharedSerialHandle>, BridgeFlashError> {
     let uuid = match uuid {
         Some(uuid) => uuid,
@@ -448,13 +515,14 @@ fn attach_bridge_once(
             Err(e) => return Err(e),
         },
     };
+    *named = Some(uuid);
     serial::attach(path, baud, mcu_id, SERIAL_ATTACH_TIMEOUT, Some(uuid))
         .map_err(BridgeFlashError::Open)
 }
 
 impl BridgeOpen {
-    /// Open the transport these parameters name, as a fresh link handle and its
-    /// [`Interface`].
+    /// Open the transport these parameters name: the two faces of the bridge,
+    /// and the assignment handshake a serial attach still owes (if any).
     ///
     /// The serial arm is a **first** open — nothing has restarted the bridge, so
     /// a session that left it in its residual state is met here and not by a
@@ -463,9 +531,9 @@ impl BridgeOpen {
     /// # Errors
     /// As [`BridgeLink::open_host_library`] / [`BridgeLink::open_serial`]:
     /// [`BridgeFlashError::BridgeNotFound`] / [`BridgeFlashError::AmbiguousBridge`]
-    /// for a serial bridge no uuid names, [`BridgeFlashError::Open`] otherwise,
-    /// and [`BridgeFlashError::AttachUnanswered`] when the retry ran out.
-    fn build(&self) -> Result<(Interface, BridgeDevice), BridgeFlashError> {
+    /// for a serial bridge no uuid names, and [`BridgeFlashError::Open`]
+    /// otherwise.
+    fn build(&self) -> Result<OpenedTransport, BridgeFlashError> {
         match self {
             BridgeOpen::Host {
                 path,
@@ -478,7 +546,11 @@ impl BridgeOpen {
                         .map_err(BridgeFlashError::Open)?,
                 );
                 let link = Interface::from_host(Arc::clone(&device));
-                Ok((link, BridgeDevice::Host(device)))
+                Ok(OpenedTransport {
+                    link,
+                    device: BridgeDevice::Host(device),
+                    owed: None,
+                })
             }
             BridgeOpen::Serial {
                 path,
@@ -486,12 +558,29 @@ impl BridgeOpen {
                 mcu_id,
                 uuid,
             } => {
-                let handle = attach_bridge(path, *baud, *mcu_id, *uuid)?;
+                let (handle, owed) = attach_bridge(path, *baud, *mcu_id, *uuid)?;
                 let link = Interface::shared_serial(Arc::clone(&handle));
-                Ok((link, BridgeDevice::Shared(handle)))
+                Ok(OpenedTransport {
+                    link,
+                    device: BridgeDevice::Shared(handle),
+                    owed,
+                })
             }
         }
     }
+}
+
+/// What opening a transport hands back: the two faces of the bridge, and the
+/// assignment handshake a serial attach still owes
+/// ([`OwedHandshake`]).
+struct OpenedTransport {
+    /// The [`Interface`] the port-level commands travel on.
+    link: Interface,
+    /// The device itself, for the tunnel's downlink and the sink registration.
+    device: BridgeDevice,
+    /// `Some` when the attach's handshake went unanswered and the session is to
+    /// be taken over by the identify in front of it.
+    owed: Option<OwedHandshake>,
 }
 
 /// Write one assignment unit on a **shared serial** bridge's admin channel and
@@ -626,6 +715,10 @@ pub struct BridgeLink {
     /// The live connection, absent only while [`reset`](BridgeLink::reset) is
     /// between dropping the restarted one and opening a fresh one.
     live: Option<LiveBridge>,
+    /// The assignment handshake a serial attach still owes because nothing
+    /// answered it. Spent by [`identify`](BridgeLink::identify), which is where
+    /// the takeover clears the earlier session the handshake was stuck in.
+    owed: Mutex<Option<OwedHandshake>>,
     /// The reason the bridge's firmware gave when it last shut down. The
     /// `shutdown` event handler records it; a run reports it with the
     /// declaration that triggered it instead of letting the next step time out.
@@ -679,9 +772,11 @@ impl BridgeLink {
     /// fails, [`BridgeFlashError::AmbiguousBridge`] when several unassigned
     /// bridges answer the broadcast, [`BridgeFlashError::Open`] when the port
     /// cannot be opened, `mcu_id` is outside the addressable range, or the
-    /// handshake with a named bridge is refused, and
-    /// [`BridgeFlashError::AttachUnanswered`] when nothing answered it on any
-    /// of the attempts [`attach_bridge`] makes.
+    /// handshake with a named bridge is refused, and, when nothing answered it
+    /// on any of the attempts [`attach_bridge`] makes, from
+    /// [`identify`](BridgeLink::identify) instead: the link is opened without
+    /// the handshake and the session taken over first (see
+    /// [`OwedHandshake`]).
     pub fn open_serial(
         path: &Path,
         baud: u32,
@@ -699,11 +794,12 @@ impl BridgeLink {
     /// Build the `Mcu` over the transport `open` names, with the interface kept
     /// for the port-level commands.
     fn from_open(open: BridgeOpen) -> Result<Self, BridgeFlashError> {
-        let (link, device) = open.build()?;
+        let OpenedTransport { link, device, owed } = open.build()?;
         let mcu = Mcu::new("bridge", link.clone());
         Ok(Self {
             open,
             live: Some(LiveBridge { mcu, link, device }),
+            owed: Mutex::new(owed),
             shutdown: Arc::new(Mutex::new(None)),
         })
     }
@@ -766,17 +862,106 @@ impl BridgeLink {
     /// commands are encoded from comes from the running firmware, so nothing of
     /// them can be sent before this returns.
     ///
+    /// This is also where a bridge left in an **earlier session's state** is
+    /// taken over, and it is the same takeover every MCU connection gets: the
+    /// identify's first block goes out, and a board that answers it with a
+    /// number past a fresh session's window — one that was already running when
+    /// the port was opened — is renumbered onto and the block re-sent
+    /// (`mcu/mod.rs`, `place_frame` / `Sender::settle`). Nothing about the
+    /// sequence is the flash tool's own.
+    ///
+    /// An attach whose handshake went unanswered left that takeover as the only
+    /// way in ([`OwedHandshake`]), so its assignment handshake is run here,
+    /// **after** the session is this connection's, and over the same handle the
+    /// session runs on.
+    ///
+    /// The three failures are told apart, because they call for different
+    /// things:
+    ///
+    /// * the board answered from a session that is not ours and never took the
+    ///   renumbered blocks — its counter kept moving, which is another driver,
+    ///   so the run refuses instead of competing with it
+    ///   ([`BridgeFlashError::SessionHeldByAnotherProcess`]);
+    /// * nothing was answering at all, which is the case the attach itself
+    ///   already reported — a tty with no bridge on it, or a board parked in
+    ///   its bootloader ([`BridgeFlashError::AttachUnanswered`]);
+    /// * anything else is the identify's own ([`BridgeFlashError::Identify`]).
+    ///
     /// # Errors
-    /// [`BridgeFlashError::Identify`] when the handshake fails or times out.
+    /// As above: [`BridgeFlashError::Identify`] when the handshake fails or
+    /// times out, [`BridgeFlashError::SessionHeldByAnotherProcess`] when the
+    /// board turned out to be driven by something else, and
+    /// [`BridgeFlashError::AttachUnanswered`] when this link's attach never got
+    /// an answer and the identify did not either.
     pub async fn identify(&self, timeout: Duration) -> Result<(), BridgeFlashError> {
-        self.live()
-            .mcu
-            .identify(timeout)
+        let owed = self
+            .owed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        match self.live().mcu.identify(timeout).await {
+            Ok(_) => {
+                self.finish_owed_handshake(owed, timeout).await?;
+                self.watch_shutdown();
+                Ok(())
+            }
+            Err(error) if self.live().mcu.took_over_session() => {
+                Err(BridgeFlashError::SessionHeldByAnotherProcess {
+                    port: self.serial_path().map(Path::to_path_buf),
+                    error,
+                })
+            }
+            Err(error) => Err(match owed {
+                Some(owed) => owed.unanswered,
+                None => BridgeFlashError::Identify(error),
+            }),
+        }
+    }
+
+    /// Run the assignment handshake the attach never got an answer to, now that
+    /// the identify has cleared the session it was stuck in.
+    ///
+    /// `handshake` waits on the board's answer, so it goes to the blocking pool
+    /// rather than occupying a runtime worker — the same rule the port open
+    /// follows. A link that named nothing (an id-only attach) has no naming to
+    /// re-confirm: the identify is the proof there, exactly as it is for the
+    /// attach that never handshakes at all (`attach_bridge_once`'s id-only
+    /// arm).
+    ///
+    /// A handshake that is still unanswered after the takeover reports the
+    /// attach's own failure: the id the run opened the board as is not the one
+    /// it answers on, which is what
+    /// [`BridgeFlashError::AttachUnanswered`] already says.
+    async fn finish_owed_handshake(
+        &self,
+        owed: Option<OwedHandshake>,
+        timeout: Duration,
+    ) -> Result<(), BridgeFlashError> {
+        let Some(owed) = owed else {
+            return Ok(());
+        };
+        let Some(uuid) = owed.uuid else {
+            return Ok(());
+        };
+        let Some(handle) = self.shared_handle().cloned() else {
+            return Ok(());
+        };
+        let answered = tokio::task::spawn_blocking(move || handle.handshake(uuid, timeout))
             .await
-            .map(|_| ())
-            .map_err(BridgeFlashError::Identify)?;
-        self.watch_shutdown();
-        Ok(())
+            .unwrap_or_else(|error| {
+                Err(InterfaceError::Other(format!(
+                    "the attach handshake's thread failed: {error}"
+                )))
+            });
+        answered.map_err(|_| owed.unanswered)
+    }
+
+    /// The tty this bridge was opened on, when it is a serial one.
+    fn serial_path(&self) -> Option<&Path> {
+        match &self.open {
+            BridgeOpen::Serial { path, .. } => Some(path),
+            BridgeOpen::Host { .. } => None,
+        }
     }
 
     /// Restart the bridge so its port table is empty before a run declares
@@ -834,6 +1019,13 @@ impl BridgeLink {
         }
         let fresh = self.reopen().await?;
         self.live = Some(fresh);
+        // The restarted firmware is a fresh session: whatever handshake the
+        // first attach still owed was answered by the reopen's own, or the
+        // reopen failed above.
+        *self
+            .owed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = None;
         self.watch_shutdown();
         Ok(())
     }
@@ -897,7 +1089,7 @@ impl BridgeLink {
     /// One reopen attempt: open the transport the restart left behind, name the
     /// bridge when it has to be named, and identify.
     async fn open_after_restart(&self) -> Result<LiveBridge, BridgeFlashError> {
-        let (link, device) = match &self.open {
+        let OpenedTransport { link, device, .. } = match &self.open {
             BridgeOpen::Serial {
                 path,
                 baud,
@@ -911,9 +1103,16 @@ impl BridgeLink {
                 // only: [`BridgeLink::reopen`] is the retry here, and nesting
                 // [`attach_bridge`]'s own into its deadline would spend the
                 // reopen budget several times over.
-                let handle = attach_bridge_once(path, *baud, *mcu_id, *uuid)?;
+                let handle = attach_bridge_once(path, *baud, *mcu_id, *uuid, &mut None)?;
                 let link = Interface::shared_serial(Arc::clone(&handle));
-                (link, BridgeDevice::Shared(handle))
+                OpenedTransport {
+                    link,
+                    device: BridgeDevice::Shared(handle),
+                    // A restarted firmware is a fresh session, and a handshake
+                    // this reopen leaves unanswered is what
+                    // [`BridgeLink::reopen`] retries — never an owed one.
+                    owed: None,
+                }
             }
             // A host library never restarts, so `reset` never reopens one; the
             // shared construction keeps the two paths from drifting.
@@ -1404,6 +1603,23 @@ pub enum BridgeFlashError {
         /// What the last attempt failed with.
         error: InterfaceError,
     },
+    /// The board answered this run's identify from a session that is **not
+    /// this run's**, and kept refusing the blocks that tried to take it over:
+    /// the counter moved between attempts, so something else is driving it.
+    ///
+    /// A stale session is the *other* shape of the same answer — a board left
+    /// behind by a host that was killed — and that one is taken over in
+    /// silence, because its counter stays where it was until this connection
+    /// adopts it. A counter that keeps moving is another driver: usually a
+    /// klippy still running against that board, which this run must not
+    /// compete with.
+    SessionHeldByAnotherProcess {
+        /// The tty the board is on; `None` for a host library (an in-process
+        /// bridge no other process can be driving).
+        port: Option<PathBuf>,
+        /// What the identify reported, kept as the cause.
+        error: McuError,
+    },
     /// [`open_bridge`](super::bridge_session::open_bridge) refused or failed a
     /// step.
     Bridge(BridgeError),
@@ -1482,6 +1698,22 @@ impl fmt::Display for BridgeFlashError {
                     path.display()
                 )
             }
+            BridgeFlashError::SessionHeldByAnotherProcess { port, error } => match port {
+                Some(path) => write!(
+                    f,
+                    "the board on {} is answering another connection: it reports a session that is \
+                     not this run's and kept refusing the blocks this run renumbered onto it \
+                     ({error}); another process — usually klippy — is driving that board, so stop \
+                     it and run the command again",
+                    path.display()
+                ),
+                None => write!(
+                    f,
+                    "the bridge is answering another connection: it reports a session that is \
+                     not this run's and kept refusing the blocks this run renumbered onto it \
+                     ({error})"
+                ),
+            },
             BridgeFlashError::Bridge(e) => write!(f, "opening the bridge port: {e}"),
             BridgeFlashError::Reset(message) => write!(f, "resetting the bridge: {message}"),
             BridgeFlashError::PortReset(e) => write!(f, "resetting the bridge port: {e}"),
@@ -1513,6 +1745,7 @@ impl std::error::Error for BridgeFlashError {
             | BridgeFlashError::AttachUnanswered { error, .. } => Some(error),
             BridgeFlashError::PortReset(e) => Some(e),
             BridgeFlashError::Identify(e) => Some(e),
+            BridgeFlashError::SessionHeldByAnotherProcess { error, .. } => Some(error),
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
             BridgeFlashError::Unaddressable { .. }
@@ -1570,6 +1803,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::{Config, ConfigWrapper};
+    use crate::core::klippy::frame::{MESSAGE_HEADER_SIZE, MESSAGE_POS_SEQ, MESSAGE_TRAILER_SIZE};
     use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
@@ -3656,24 +3890,11 @@ mod tests {
 
     /// The whole units in `wire`, leaving a trailing partial one unparsed — the
     /// host's own split of the stream, header by header.
-    fn split_units(mut wire: &[u8]) -> Vec<(u32, Vec<u8>)> {
+    fn split_units(wire: &[u8]) -> Vec<(u32, Vec<u8>)> {
+        let mut rest = wire.to_vec();
         let mut units = Vec::new();
-        loop {
-            match serial::decode_header(wire) {
-                serial::HeaderScan::Complete { arb, consumed } => {
-                    if wire.len() < consumed + 1 {
-                        break;
-                    }
-                    let length = wire[consumed] as usize;
-                    if wire.len() < consumed + length {
-                        break;
-                    }
-                    units.push((arb, wire[consumed..consumed + length].to_vec()));
-                    wire = &wire[consumed + length..];
-                }
-                serial::HeaderScan::NeedMore => break,
-                serial::HeaderScan::Invalid => panic!("a sent unit must start with a header"),
-            }
+        while let Some(unit) = take_unit(&mut rest) {
+            units.push(unit);
         }
         units
     }
@@ -3789,5 +4010,451 @@ mod tests {
         );
         responder.join().expect("the responder thread");
         handle.clear_unit_sink(ADMIN_REPLY);
+    }
+
+    // =======================================================================
+    // The bridge on the far end: a session an earlier host left behind
+    //
+    // `admin flash --bridge` against a board whose klippy was killed meets a
+    // bridge that is alive, says nothing to this session's assignment handshake,
+    // and answers the MCU session from the counter the earlier one left. The
+    // fixture below is that board, scripted to the shapes the run has to tell
+    // apart — and the tests are the four outcomes: taken over and continued,
+    // nothing to take over, another driver, and nothing answering at all.
+    // =======================================================================
+
+    /// Who answers the admin channel the assignment handshake travels on.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum AdminAnswers {
+        /// A healthy bridge: the re-confirm is answered as it arrives.
+        Always,
+        /// A bridge stuck in an earlier session: silent until this connection
+        /// has taken the session over.
+        AfterTakeover,
+        /// Nothing there to answer it.
+        Never,
+    }
+
+    /// The bridge on the far end of a pty, in the shape the takeover has to
+    /// judge.
+    struct FakeBridge {
+        /// Where the MCU's counter sits before this connection takes it over:
+        /// `0` for a board that just booted, the earlier session's number for
+        /// one nothing reset.
+        counter: u8,
+        /// Whether the assignment handshake is answered, and when.
+        admin: AdminAnswers,
+        /// Whether the board answers the session at all — `false` is a tty with
+        /// nothing of this bridge on it.
+        answers_session: bool,
+        /// Whether the board's counter moves on between this connection's
+        /// blocks — another driver at the board, so nothing it adopts is ever
+        /// the block the board waits for.
+        driven_by_another: bool,
+        /// The identify payload handed over, compressed the way the firmware
+        /// keeps it.
+        compressed: Vec<u8>,
+        /// Set by the test once it has what it needs, so the fixture stops
+        /// without waiting a window out (the pty outlives the link).
+        stop: Arc<AtomicBool>,
+    }
+
+    impl FakeBridge {
+        /// Answer whatever the host sends until `stop` is set, handing back
+        /// every whole unit it sent — the wire record the assertions read.
+        fn run(mut self, mut master: std::fs::File) -> Vec<(u32, Vec<u8>)> {
+            let mut wire: Vec<u8> = Vec::new();
+            let mut seen: Vec<(u32, Vec<u8>)> = Vec::new();
+            let mut buf = [0u8; 512];
+            let mut refused = false;
+            let mut taken_over = false;
+            while !self.stop.load(Ordering::SeqCst) {
+                while let Some((arb, frame)) = take_unit(&mut wire) {
+                    self.answer(arb, &frame, &mut master, &mut refused, &mut taken_over);
+                    seen.push((arb, frame));
+                }
+                let mut poll = libc::pollfd {
+                    fd: master.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                if unsafe { libc::poll(&mut poll, 1, 50) } <= 0 {
+                    continue;
+                }
+                match master.read(&mut buf) {
+                    Ok(0) => continue,
+                    Ok(read) => wire.extend_from_slice(&buf[..read]),
+                    Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                }
+            }
+            seen
+        }
+
+        /// One unit: the admin channel, the re-confirm, or a block of the
+        /// session.
+        fn answer(
+            &mut self,
+            arb: u32,
+            frame: &[u8],
+            master: &mut std::fs::File,
+            refused: &mut bool,
+            taken_over: &mut bool,
+        ) {
+            let reply_arb =
+                assign::reply_arb_id(BRIDGE_MCU_ID).expect("the bridge id is addressable");
+            if arb != assign::arb_id(BRIDGE_MCU_ID).expect("the bridge id is addressable") {
+                // The admin unit that names the board (SET_NODEID): adopted in
+                // silence, exactly as the firmware adopts it — the answer to it
+                // is the re-confirm below, not a unit of its own.
+                return;
+            }
+            let payload = &frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE];
+            if payload == serial::MAGIC {
+                let answering = match self.admin {
+                    AdminAnswers::Always => true,
+                    AdminAnswers::AfterTakeover => *taken_over,
+                    AdminAnswers::Never => false,
+                };
+                if answering {
+                    let reply = serial::assignment_reply(BRIDGE_MCU_ID)
+                        .expect("the bridge id is addressable");
+                    master.write_all(&reply).expect("the re-confirm answers");
+                }
+                return;
+            }
+            if !self.answers_session {
+                return;
+            }
+            let seq = frame[MESSAGE_POS_SEQ] & 0x0f;
+            if self.driven_by_another {
+                // Another driver takes blocks in between this run's, so the
+                // board's counter has always moved on by the time one of ours
+                // arrives: whatever number this run adopts is already stale.
+                self.counter = self.counter.wrapping_add(1) & 0x0f;
+                *refused = true;
+                master
+                    .write_all(&bridge_ack(self.counter))
+                    .expect("the nak goes out");
+                return;
+            }
+            if seq != self.counter {
+                // Not the block this board is waiting for. A session nobody
+                // drives keeps its number until this connection adopts it.
+                *refused = true;
+                master
+                    .write_all(&bridge_ack(self.counter))
+                    .expect("the nak goes out");
+                return;
+            }
+            self.counter = self.counter.wrapping_add(1) & 0x0f;
+            if *refused {
+                *taken_over = true;
+            }
+            if let Some(offset) = identify_offset(payload) {
+                let data: &[u8] = if offset == 0 { &self.compressed } else { &[] };
+                write_bridge_frame(
+                    master,
+                    reply_arb,
+                    self.counter,
+                    identify_answer(offset, data),
+                );
+            }
+            // The ack of the block it took, whatever it carried.
+            write_bridge_frame(master, reply_arb, self.counter, Vec::new());
+        }
+    }
+
+    /// The whole unit at the front of `wire`, taken off it — `None` while the
+    /// front is still incomplete.
+    fn take_unit(wire: &mut Vec<u8>) -> Option<(u32, Vec<u8>)> {
+        match serial::decode_header(wire) {
+            serial::HeaderScan::Complete { arb, consumed } => {
+                let length = *wire.get(consumed)? as usize;
+                if wire.len() < consumed + length {
+                    return None;
+                }
+                let frame = wire[consumed..consumed + length].to_vec();
+                wire.drain(..consumed + length);
+                Some((arb, frame))
+            }
+            serial::HeaderScan::NeedMore => None,
+            serial::HeaderScan::Invalid => panic!("a sent unit must start with a header"),
+        }
+    }
+
+    /// One unit of the bridge's own frames, on its reply id.
+    fn write_bridge_frame(master: &mut std::fs::File, arb: u32, seq: u8, payload: Vec<u8>) {
+        use crate::core::klippy::frame::Frame;
+        let mut unit = serial::encode_header(arb);
+        unit.extend_from_slice(&Frame::new(seq, payload).raw_bytes());
+        master.write_all(&unit).expect("the answer goes out");
+    }
+
+    /// The offset an `identify_request` names, or `None` for a block that is not
+    /// one.
+    fn identify_offset(payload: &[u8]) -> Option<u32> {
+        use crate::core::klippy::msg::proto::Payload;
+        let raw = Payload::from_raw(payload.to_vec());
+        let mut parser = raw.as_parser();
+        // `identify_request offset=%u count=%c` is message id 1; the answer is
+        // id 0, which no host ever sends.
+        if parser.pop_i16().ok()? != 1 {
+            return None;
+        }
+        let offset = parser.pop_u32().ok()?;
+        parser.pop_u8().ok()?;
+        Some(offset)
+    }
+
+    /// The bytes of an `identify_response offset=%u data=%.*s` answer.
+    fn identify_answer(offset: u32, data: &[u8]) -> Vec<u8> {
+        use crate::core::klippy::msg::proto::Payload;
+        let mut payload = Payload::new();
+        payload.push_i16(0).expect("the response id fits");
+        payload.push_u32(offset).expect("the offset fits");
+        payload.push_bytes(data).expect("the data fits");
+        payload.into_raw()
+    }
+
+    /// A body compressed the way the firmware stores the dictionary
+    /// (`zlib.compress(...)` output).
+    fn compress(body: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).expect("the dictionary compresses");
+        encoder.finish().expect("the dictionary compresses")
+    }
+
+    /// The dictionary the fake bridge hands over: the fields the identify
+    /// parser needs and nothing else.
+    const FAKE_DICTIONARY: &[u8] = br#"{"app": "Klipper", "version": "fake"}"#;
+
+    /// The **rewritten** report, end to end: a serial bridge whose assignment
+    /// handshake goes unanswered over the whole retry budget is opened without
+    /// it, the identify takes the earlier session over — the same block at `0`,
+    /// the board's nak, the same block again under the board's own number — and
+    /// only then is the handshake that names the id run, over the same handle.
+    ///
+    /// Before the fallback this run ended at `AttachUnanswered`, which is what
+    /// made a hard-killed bridge need a power cycle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_session_a_killed_host_left_behind_is_taken_over_and_the_run_continues() {
+        const STALE_SEQ: u8 = 5;
+        let pty = Pty::new();
+        let master = pty.master.try_clone().expect("the pty master clones");
+        let uuid = [0x91, 0x92, 0x93, 0x94, 0x95, 0x96];
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = FakeBridge {
+            counter: STALE_SEQ,
+            admin: AdminAnswers::AfterTakeover,
+            answers_session: true,
+            driven_by_another: false,
+            compressed: compress(FAKE_DICTIONARY),
+            stop: Arc::clone(&stop),
+        };
+        let responder = std::thread::spawn(move || bridge.run(master));
+
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, Some(uuid))
+            .expect("the unanswered handshake leaves the link open, not the run failed");
+        tokio::time::timeout(Duration::from_secs(30), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify is bounded")
+            .expect("the session is taken over and the identify completes");
+        link.close();
+        drop(link);
+        stop.store(true, Ordering::SeqCst);
+        let units = responder.join().expect("the responder thread");
+
+        let bridge_arb = assign::arb_id(BRIDGE_MCU_ID).expect("the bridge id is addressable");
+        let block = |frame: &[u8]| {
+            (
+                frame[MESSAGE_POS_SEQ] & 0x0f,
+                frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE].to_vec(),
+            )
+        };
+        let blocks: Vec<(u8, Vec<u8>)> = units
+            .iter()
+            .filter(|(arb, frame)| *arb == bridge_arb && block(frame).1 != serial::MAGIC)
+            .map(|(_, frame)| block(frame))
+            .collect();
+        assert_eq!(blocks[0].0, 0, "the identify's first block goes out at 0");
+        assert_eq!(
+            blocks[1].0, STALE_SEQ,
+            "and again under the number the board reported"
+        );
+        assert_eq!(
+            blocks[1].1, blocks[0].1,
+            "the same block, renumbered — not a new request"
+        );
+        assert!(
+            units.iter().any(|(arb, frame)| *arb == bridge_arb
+                && frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE]
+                    == *serial::MAGIC),
+            "the assignment handshake the attach owed is run once the session is taken over"
+        );
+    }
+
+    /// A healthy bridge is untouched: the handshake is answered on the first
+    /// attempt, so nothing falls back, and the identify asks each chunk once at
+    /// its own number — no renumber, no repeated block, no second handshake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_healthy_bridge_sees_no_takeover_at_all() {
+        let pty = Pty::new();
+        let master = pty.master.try_clone().expect("the pty master clones");
+        let uuid = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6];
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = FakeBridge {
+            counter: 0,
+            admin: AdminAnswers::Always,
+            answers_session: true,
+            driven_by_another: false,
+            compressed: compress(FAKE_DICTIONARY),
+            stop: Arc::clone(&stop),
+        };
+        let responder = std::thread::spawn(move || bridge.run(master));
+
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, Some(uuid))
+            .expect("the bridge answers its handshake");
+        tokio::time::timeout(Duration::from_secs(30), link.identify(IDENTIFY_TIMEOUT))
+            .await
+            .expect("the identify is bounded")
+            .expect("a fresh session identifies");
+        link.close();
+        drop(link);
+        stop.store(true, Ordering::SeqCst);
+        let units = responder.join().expect("the responder thread");
+
+        let bridge_arb = assign::arb_id(BRIDGE_MCU_ID).expect("the bridge id is addressable");
+        let renumbers: Vec<u8> = units
+            .iter()
+            .filter(|(arb, frame)| {
+                *arb == bridge_arb
+                    && frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE]
+                        != *serial::MAGIC
+            })
+            .map(|(_, frame)| frame[MESSAGE_POS_SEQ] & 0x0f)
+            .collect();
+        assert_eq!(
+            renumbers,
+            vec![0, 1],
+            "one block per chunk, each at its own number: nothing was renumbered or repeated"
+        );
+        let handshakes = units
+            .iter()
+            .filter(|(arb, frame)| {
+                *arb == bridge_arb
+                    && frame[MESSAGE_HEADER_SIZE..frame.len() - MESSAGE_TRAILER_SIZE]
+                        == *serial::MAGIC
+            })
+            .count();
+        assert_eq!(
+            handshakes, 1,
+            "the attach's own handshake, and no second one"
+        );
+    }
+
+    /// A board another process is driving is **not** taken over: every block this
+    /// run renumbers onto is nak'd with a number that has moved on in the
+    /// meantime, so nothing it sends is ever the block the board waits for. The
+    /// run says so and names the other driver instead of competing with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_board_another_process_is_driving_is_reported_not_taken_over() {
+        let pty = Pty::new();
+        let master = pty.master.try_clone().expect("the pty master clones");
+        let uuid = [0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6];
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = FakeBridge {
+            counter: 5,
+            admin: AdminAnswers::Always,
+            answers_session: true,
+            driven_by_another: true,
+            compressed: compress(FAKE_DICTIONARY),
+            stop: Arc::clone(&stop),
+        };
+        let responder = std::thread::spawn(move || bridge.run(master));
+
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, Some(uuid))
+            .expect("a driven board still answers its own admin channel");
+        let started = Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(30),
+            link.identify(Duration::from_secs(2)),
+        )
+        .await
+        .expect("the identify is bounded")
+        .expect_err("nothing this run sends is ever the block the board waits for");
+        let elapsed = started.elapsed();
+        link.close();
+        drop(link);
+        stop.store(true, Ordering::SeqCst);
+        responder.join().expect("the responder thread");
+
+        match &err {
+            BridgeFlashError::SessionHeldByAnotherProcess { port, error } => {
+                assert_eq!(port.as_deref(), Some(pty.path.as_path()));
+                assert!(
+                    matches!(error, McuError::Call(_)),
+                    "the transport's own reason is kept: {error:?}"
+                );
+            }
+            other => panic!("a driven board is reported as such, got {other}"),
+        }
+        let text = err.to_string();
+        assert!(text.contains("another process"), "{text}");
+        assert!(text.contains("klippy"), "{text}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "the refusal is bounded, took {elapsed:?}"
+        );
+    }
+
+    /// A board that answers **nothing** — no handshake, no session — is still
+    /// reported as an unanswered attach, not as a session this run could not
+    /// take over: a port with no bridge on it must not be read as a board another
+    /// process holds. That is also the exact pair of calls `admin scan` makes, so
+    /// a silent line reads there exactly as it did before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_board_that_answers_nothing_still_reports_its_unanswered_attach() {
+        let pty = Pty::new();
+        let master = pty.master.try_clone().expect("the pty master clones");
+        let uuid = [0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6];
+        let stop = Arc::new(AtomicBool::new(false));
+        let bridge = FakeBridge {
+            counter: 0,
+            admin: AdminAnswers::Never,
+            answers_session: false,
+            driven_by_another: false,
+            compressed: compress(FAKE_DICTIONARY),
+            stop: Arc::clone(&stop),
+        };
+        let responder = std::thread::spawn(move || bridge.run(master));
+
+        let started = Instant::now();
+        let link = BridgeLink::open_serial(&pty.path, 250_000, BRIDGE_MCU_ID, Some(uuid))
+            .expect("the handshake went unanswered, which is an owed one now");
+        let err = tokio::time::timeout(
+            Duration::from_secs(60),
+            link.identify(Duration::from_millis(800)),
+        )
+        .await
+        .expect("the identify is bounded")
+        .expect_err("nothing on the line answers");
+        let elapsed = started.elapsed();
+        link.close();
+        drop(link);
+        stop.store(true, Ordering::SeqCst);
+        responder.join().expect("the responder thread");
+
+        assert!(
+            matches!(err, BridgeFlashError::AttachUnanswered { .. }),
+            "a silent line is the attach's failure, not another process: {err}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("no answer to the attach handshake"), "{text}");
+        assert!(
+            elapsed < Duration::from_secs(30),
+            "the dead line still fails inside the attach budget, took {elapsed:?}"
+        );
     }
 }

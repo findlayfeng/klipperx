@@ -128,6 +128,23 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+
+    /// Serve the Mainsail web UI from this machine, building it on first run
+    ///
+    // The service half of the pair below: the site is static, so this is a file
+    // server plus the `npm ci && npm run build` that produces what it serves. Its
+    // arguments all have defaults — there is one site to build and one port to
+    // serve it on — so naming `mainsail` alone is an instruction, not a question,
+    // and it gets no `arg_required_else_help`.
+    Mainsail(klipperx::ui::mainsail::MainsailArgs),
+
+    /// Run Moonraker against this host, keeping its Python environment here
+    ///
+    // The other half of the pair: Moonraker is what the site talks to, and it
+    // needs a virtualenv and a data directory that this subcommand owns. Same
+    // rule as `mainsail` — every argument has a default, so a bare `moonraker`
+    // runs it.
+    Moonraker(klipperx::ui::moonraker::MoonrakerArgs),
 }
 
 /// The `admin` command family: one subcommand per board-level job.
@@ -221,6 +238,8 @@ fn main() {
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
         (Some(Commands::Admin { command }), _) => run_admin(command),
+        (Some(Commands::Mainsail(args)), _) => klipperx::ui::mainsail::run(args),
+        (Some(Commands::Moonraker(args)), _) => klipperx::ui::moonraker::run(args),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };

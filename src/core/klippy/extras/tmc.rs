@@ -9,6 +9,7 @@
 //! | `TMCCommandHelper` + `TMCCurrentHelper` + `TMCErrorCheck` | [`TmcDriver`] |
 //! | `TMCVirtualPinHelper` | [`TmcVirtualPin`] (chip) + [`TmcVirtualEndstop`] |
 //! | `TMCMicrostepHelper` / `TMCStealthchopHelper` / `TMCVcoolthrsHelper` / `TMCtstepHelper` | the free functions below |
+//! | `TMCStallguardDump` | [`TmcStallguardDump`] |
 //!
 //! # One concrete driver type
 //!
@@ -37,6 +38,17 @@
 //! drivers share, and the TMC2660's own, are provided by a separate `tmc_spi`
 //! module and short-circuit the same way: under file output a read answers 0
 //! and a write is dropped.
+//!
+//! # Deliberate deviation: the stallguard dump's read path
+//!
+//! Upstream's `TMCStallguardDump` picks its read path with one flag,
+//! `optimized_spi`, which it learns from the `spi_status` byte a SPI read
+//! returns — and uses the same flag for its poll cadence. A [`TmcRegister`]
+//! carries no bus status, so here the path is chosen by what the chip declares
+//! instead: a chip whose `DRV_STATUS` holds `sg_result` is read through
+//! `DRV_STATUS` (TMC2130/TMC5160/TMC2240), one with a separate `SG_RESULT`
+//! register through that (TMC2209). The cadence stays the UART one for every
+//! chip: nothing here can tell a SPI chain from a UART one.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, Weak};
@@ -45,6 +57,9 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::bulk_sensor::{
+    BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
+};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::heaters::{PrinterHeaters, HEATERS_OBJECT};
 use crate::core::klippy::extras::stepper::PrinterStepper;
@@ -1776,6 +1791,292 @@ pub fn wave_table_helper(config: &ConfigWrapper, fields: &FieldHelper) -> Result
 }
 
 // ===========================================================================
+// Record driver status (`tmc.TMCStallguardDump`)
+// ===========================================================================
+
+/// The mux endpoint the stallguard samples stream on
+/// (`add_mux_endpoint`'s path).
+pub const DUMP_ENDPOINT: &str = "tmc/stallguard_dump";
+
+/// The request key that selects a stepper's instance (`name`).
+pub const DUMP_KEY: &str = "name";
+
+/// The column header a connecting client receives.
+const DUMP_HEADER: [&str; 3] = ["time", "sg_result", "cs_actual"];
+
+/// The `DRV_STATUS` field carrying the stallguard result on the older chips;
+/// a chip that has it is upstream's `sg2_supp`.
+const SG2_FIELD: &str = "sg_result";
+
+/// The register TMC2209 keeps its stallguard result in.
+const SG_RESULT_REG: &str = "SG_RESULT";
+
+/// The separate stallguard-4 result register the TMC2240 also has.
+const SG4_RESULT_REG: &str = "SG4_RESULT";
+
+/// Seconds between polls of the driver's result registers (`_query_tmc`'s
+/// "UART queried as fast as possible" cadence).
+const QUERY_INTERVAL: f64 = 0.005;
+
+/// One sample: `(print time, sg_result, cs_actual)`.
+///
+/// `sg_result` and `cs_actual` start at `-1`, the sentinel a chip that does not
+/// report that value keeps (`_query_tmc`'s initialisers).
+type StallguardSample = (f64, i64, i64);
+
+/// Streams a driver's stallguard result to API clients, for tuning the SG
+/// threshold of sensorless homing (`tmc.TMCStallguardDump`).
+///
+/// Upstream builds this for every chip and lets the constructor decide whether
+/// there is anything to read. That decision is [`new`](Self::new)'s `None`:
+///
+/// - the TMC2660 has no `DRV_STATUS`, so it is unsupported for now (`It is
+///   possible to support TMC2660, just disable it for now`);
+/// - a chip with neither an `sg_result` field in `DRV_STATUS` nor a separate
+///   `SG_RESULT`/`SG4_RESULT` register (the TMC2208) has no stallguard result.
+///   Upstream's guard here (`if self.sg2_supp is None and self.sg4_reg_name is
+///   None`) can never fire — `sg2_supp` is a bool — so it registers a stream
+///   of `-1`s; here the endpoint is not registered at all.
+///
+/// The helper is a [`BatchBulkHelper`] client producer: its start callback arms
+/// a poll timer, the timer appends one sample per poll, and the batch callback
+/// hands the batch so far to the client every [`BATCH_INTERVAL`].
+pub struct TmcStallguardDump {
+    printer: Weak<Printer>,
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    /// `DRV_STATUS` declares `sg_result`, so the SG2 result is read from that
+    /// register (upstream's `sg2_supp`).
+    sg2_supp: bool,
+    /// Where the chip keeps its separate stallguard result, if it has one.
+    sg4_reg_name: Option<&'static str>,
+    /// The samples taken since the last batch.
+    samples: Mutex<Vec<StallguardSample>>,
+    /// The poll timer, while a client is connected.
+    query_timer: Mutex<Option<TimerHandle>>,
+    /// The read failure that stopped the polling, for the next batch.
+    error: Mutex<Option<String>>,
+}
+
+impl TmcStallguardDump {
+    /// Build the helper for `stepper_name`, or `None` when the chip has no
+    /// stallguard result to stream.
+    ///
+    /// # Errors
+    /// The mux endpoint's registration failure (a conflicting instance).
+    pub fn new(
+        printer: &Arc<Printer>,
+        stepper_name: &str,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Option<Arc<Self>>, ConfigError> {
+        let Some(drv_status) = fields.register_fields("DRV_STATUS") else {
+            return Ok(None);
+        };
+        let sg2_supp = drv_status.contains_key(SG2_FIELD);
+        // New drivers have a separate register for the SG4 result.
+        let sg4_reg_name = if transport.name_to_reg().contains_key(SG_RESULT_REG) {
+            Some(SG_RESULT_REG)
+        } else if transport.name_to_reg().contains_key(SG4_RESULT_REG) {
+            Some(SG4_RESULT_REG)
+        } else {
+            None
+        };
+        if !sg2_supp && sg4_reg_name.is_none() {
+            return Ok(None);
+        }
+
+        let state = Arc::new(Self {
+            printer: Arc::downgrade(printer),
+            fields,
+            transport,
+            sg2_supp,
+            sg4_reg_name,
+            samples: Mutex::new(Vec::new()),
+            query_timer: Mutex::new(None),
+            error: Mutex::new(None),
+        });
+
+        let weak = Arc::downgrade(&state);
+        let start_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.start();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.stop();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let batch_cb: BatchCb = Arc::new(move |_eventtime| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.dump()
+            })
+        });
+        let batch_bulk = BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, BATCH_INTERVAL);
+        // The registration owns the helper from here on: it holds the mux
+        // handler, and the handler reads this state through its `Weak`, so the
+        // driver only has to keep the state itself alive.
+        batch_bulk.add_mux_endpoint(
+            DUMP_ENDPOINT,
+            DUMP_KEY,
+            stepper_name,
+            json!({ "header": DUMP_HEADER }),
+        )?;
+        Ok(Some(state))
+    }
+
+    /// Start sampling: forget the last failure and arm the poll timer
+    /// (`_start`).
+    ///
+    /// Upstream also reads `DRV_STATUS` here to learn `optimized_spi` from the
+    /// reply's `spi_status` (a 1 ms poll on a SPI chain, 5 ms on UART). A
+    /// [`TmcRegister`] carries no bus status, so every chip is polled at the
+    /// UART period ([`QUERY_INTERVAL`]) and the read path comes from the chip's
+    /// declared fields instead (see the module docs).
+    fn start(self: &Arc<Self>) {
+        *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let reactor = printer.reactor();
+        let weak = Arc::downgrade(self);
+        let handle = reactor.register_timer_named(
+            "tmc_stallguard_dump",
+            Box::new(move |eventtime| {
+                // A configuration reload detaches the endpoint without running
+                // the stop callback, so the state can be gone while the timer
+                // still ticks: retire instead of polling a driver that no
+                // longer exists.
+                let state = weak.upgrade()?;
+                state.query(eventtime)
+            }),
+            reactor.monotonic(),
+        );
+        *self.query_timer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    }
+
+    /// Stop sampling: cancel the poll timer and drop the buffered samples
+    /// (`_stop`).
+    fn stop(&self) {
+        let timer = self
+            .query_timer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let (Some(handle), Some(printer)) = (timer, self.printer.upgrade()) {
+            printer.reactor().unregister_timer(handle);
+        }
+        self.samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// One poll: read the chip's result registers and append a sample
+    /// (`_query_tmc`).
+    ///
+    /// A failed read is remembered for the next batch and retires the timer
+    /// (upstream returns `NEVER` after storing the error), so a driver that
+    /// fell off the bus reports the failure instead of streaming stale values.
+    fn query(&self, eventtime: f64) -> Option<f64> {
+        // The values a chip does not report stay at the sentinel.
+        let mut sample: StallguardSample = (eventtime, -1, -1);
+        match self.read_sample(&mut sample) {
+            Ok(()) => {
+                self.samples
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(sample);
+                Some(eventtime + QUERY_INTERVAL)
+            }
+            Err(err) => {
+                *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Fill `sample` from the chip (the body of `_query_tmc`'s `try`).
+    ///
+    /// `sample`'s time starts as the event time and becomes the read's
+    /// `receive_time` — already a print time — once a register was read.
+    fn read_sample(&self, sample: &mut StallguardSample) -> Result<(), McuError> {
+        if self.sg2_supp || self.sg4_reg_name == Some(SG4_RESULT_REG) {
+            // The chip reports its SG2 result in DRV_STATUS. `stealth` is looked
+            // up tolerantly: the TMC2130's DRV_STATUS has no such field, where
+            // upstream raises a `KeyError` — a defect we do not copy.
+            let status = self.transport.get_register_raw("DRV_STATUS")?;
+            sample.2 = self
+                .drv_status_field("cs_actual", status.data)
+                .unwrap_or(-1);
+            sample.1 = self.drv_status_field(SG2_FIELD, status.data).unwrap_or(-1);
+            let stealth = self.drv_status_field("stealth", status.data).unwrap_or(0) != 0;
+            sample.0 = status.receive_time;
+            // The TMC2240 keeps both results and switches to the SG4 one while
+            // stealthchop is on.
+            if stealth && self.sg4_reg_name == Some(SG4_RESULT_REG) {
+                let sg4 = self.transport.get_register_raw(SG4_RESULT_REG)?;
+                sample.1 = i64::from(sg4.data);
+                sample.0 = sg4.receive_time;
+            }
+        } else if self.sg4_reg_name == Some(SG_RESULT_REG) {
+            // TMC2209: the register holds the result itself, not a field.
+            let sg = self.transport.get_register_raw(SG_RESULT_REG)?;
+            sample.1 = i64::from(sg.data);
+            sample.0 = sg.receive_time;
+        }
+        Ok(())
+    }
+
+    /// A `DRV_STATUS` field of `reg_value`, or `None` when the chip does not
+    /// declare it.
+    ///
+    /// [`FieldHelper::get_field`] panics on an unknown field, so the field has
+    /// to be looked up first — upstream would raise instead.
+    fn drv_status_field(&self, field_name: &str, reg_value: u32) -> Option<i64> {
+        if !self
+            .fields
+            .register_fields("DRV_STATUS")?
+            .contains_key(field_name)
+        {
+            return None;
+        }
+        Some(
+            self.fields
+                .get_field(field_name, Some(reg_value), Some("DRV_STATUS")),
+        )
+    }
+
+    /// The batch callback: the samples taken since the last batch, or the
+    /// failure that stopped them (`_dump`).
+    ///
+    /// Unlike upstream, which always reports (even an empty `data` list), an
+    /// empty batch reports nothing: a poll every 5 ms would otherwise push a
+    /// message per batch carrying no sample at all.
+    fn dump(&self) -> Result<Option<Value>, String> {
+        if let Some(error) = self.error.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Err(error);
+        }
+        let samples = std::mem::take(&mut *self.samples.lock().unwrap_or_else(|p| p.into_inner()));
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({ "data": samples })))
+    }
+}
+
+// ===========================================================================
 // G-Code command helpers + the driver object
 // ===========================================================================
 
@@ -1816,6 +2117,11 @@ pub struct TmcDriver {
     virtual_prev_state: Mutex<Vec<(&'static str, i64)>>,
     /// Registers the virtual-endstop homing changed, awaiting a send.
     virtual_dirty: Mutex<Vec<(String, u32)>>,
+    /// The stallguard dump helper (`self.record_helper` upstream), when the
+    /// chip has a result to stream (`[`DUMP_ENDPOINT`]`). The driver only keeps
+    /// it alive: the API endpoint and its poll timer drive it.
+    #[allow(dead_code)]
+    stallguard_dump: Option<Arc<TmcStallguardDump>>,
 }
 
 impl TmcDriver {
@@ -1823,10 +2129,12 @@ impl TmcDriver {
     ///
     /// `fields` must already carry the driver's default register values (the
     /// chip module sets them before calling this). This runs the microstep
-    /// helper, builds the error check and registers the command surface.
+    /// helper, builds the error check and the stallguard dump helper, and
+    /// registers the command surface.
     ///
     /// # Errors
-    /// A missing stepper section or a duplicate mux command.
+    /// A missing stepper section, a duplicate mux command, or a duplicate
+    /// `tmc/stallguard_dump` instance for this stepper.
     pub fn new(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -1851,6 +2159,12 @@ impl TmcDriver {
             printer,
             config,
         ));
+        let stallguard_dump = TmcStallguardDump::new(
+            printer,
+            &stepper_name,
+            Arc::clone(&fields),
+            Arc::clone(&transport),
+        )?;
         let driver = Arc::new_cyclic(|self_ref| Self {
             printer: Arc::downgrade(printer),
             name,
@@ -1868,6 +2182,7 @@ impl TmcDriver {
             self_ref: self_ref.clone(),
             virtual_prev_state: Mutex::new(Vec::new()),
             virtual_dirty: Mutex::new(Vec::new()),
+            stallguard_dump,
         });
         driver.clone().register_commands(printer)?;
         Ok(driver)
@@ -2758,10 +3073,14 @@ impl HomingEndstop for TmcVirtualEndstop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::protocol::{PushTarget, Request};
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
+    use crate::core::klippy::api::webhooks;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
     use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::{ManualReactor, Reactor};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A transport that records what it was asked to read and write, and answers
     /// every read with 0 like the file-output short-circuit does (unless a test
@@ -2776,6 +3095,8 @@ mod tests {
         /// Reads that fail before they answer, in order (a transport that
         /// cannot reach the chip).
         read_errors: Mutex<Vec<String>>,
+        /// The print time every answer carries (`#receive_time`).
+        read_time: Mutex<f64>,
     }
 
     impl RecordingTransport {
@@ -2809,6 +3130,11 @@ mod tests {
                 errors.push(message.to_string());
             }
         }
+
+        /// Date every answer with `time` (the read's print time).
+        fn set_read_time(&self, time: f64) {
+            *self.read_time.lock().unwrap() = time;
+        }
     }
 
     impl TmcTransport for RecordingTransport {
@@ -2829,7 +3155,7 @@ mod tests {
                 .unwrap_or(0);
             Ok(TmcRegister {
                 data,
-                receive_time: 0.,
+                receive_time: *self.read_time.lock().unwrap(),
             })
         }
 
@@ -3697,5 +4023,335 @@ homing_speed: 50
         assert_eq!(check.get_status().temperature, Some(10.0));
         check.stop_checks();
         assert_eq!(check.get_status().temperature, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Stallguard dump (`TMCStallguardDump`)
+    // ---------------------------------------------------------------------
+
+    /// A printer on a reactor the test steps by hand.
+    fn stepped_machine() -> (Arc<Printer>, Arc<ManualReactor>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        (printer, reactor)
+    }
+
+    /// A transport whose register table is `names`, so a test can give a chip
+    /// the registers upstream's chip modules declare.
+    fn named_transport(names: &[(&str, u8)]) -> Arc<RecordingTransport> {
+        Arc::new(RecordingTransport {
+            names: names
+                .iter()
+                .map(|(name, address)| ((*name).to_string(), *address))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    /// The TMC2209's stallguard tables: the result lives in its own
+    /// `SG_RESULT` register, so `DRV_STATUS` has no `sg_result` field
+    /// (`sg2_supp` false).
+    fn tmc2209_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                    ("stealth".to_string(), 0x01u32 << 30),
+                ]),
+            ),
+            (
+                "SG_RESULT".to_string(),
+                HashMap::from([("sg_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// The TMC2130's stallguard tables: `DRV_STATUS` carries the SG2 result and
+    /// the current scale, and there is no SG4/`SG_RESULT` register (upstream
+    /// registers neither for this chip).
+    fn sg2_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([(
+            "DRV_STATUS".to_string(),
+            HashMap::from([
+                ("sg_result".to_string(), 0x3ffu32),
+                ("cs_actual".to_string(), 0x1fu32 << 16),
+            ]),
+        )])
+    }
+
+    /// The TMC5160's stallguard tables: `DRV_STATUS` carries the SG2 result,
+    /// the current scale and the stealthchop flag, and the SG4 result has its
+    /// own register.
+    fn sg4_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("sg_result".to_string(), 0x3ffu32),
+                    ("stealth".to_string(), 0x01u32 << 14),
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                ]),
+            ),
+            (
+                "SG4_RESULT".to_string(),
+                HashMap::from([("sg4_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// A recording push target for the endpoint test.
+    #[derive(Default)]
+    struct Recorder {
+        closed: AtomicBool,
+        messages: Mutex<Vec<Value>>,
+    }
+
+    impl PushTarget for Recorder {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn push(&self, message: Value) {
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
+    /// The TMC2660 answers through `READRSP@RDSEL*`, so it has no `DRV_STATUS`
+    /// and gets no endpoint (`It is possible to support TMC2660, just disable it
+    /// for now`).
+    #[test]
+    fn test_a_chip_without_drv_status_registers_no_stallguard_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("READRSP@RDSEL0", 0x00)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none(), "the TMC2660 has nothing to dump");
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty(), "no endpoint was registered");
+    }
+
+    /// A TMC2208 has neither an `sg_result` field nor an `SG_RESULT` register,
+    /// so upstream's dead guard (`sg2_supp is None and sg4_reg_name is None`)
+    /// never fires there; here the endpoint is simply not registered.
+    #[test]
+    fn test_a_chip_without_a_stallguard_result_registers_no_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none());
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty());
+    }
+
+    /// A chip that reports its SG2 result in `DRV_STATUS` and has no SG4 or
+    /// `SG_RESULT` register (the TMC2130/TMC5160) streams that result. Upstream
+    /// reaches this path only through `optimized_spi`; here the chip's declared
+    /// fields choose it. `DRV_STATUS` of a TMC2130 has no `stealth` field, where
+    /// upstream raises a `KeyError`: the lookup is tolerant and the SG2 result
+    /// is streamed.
+    #[test]
+    fn test_a_chip_with_only_the_sg2_result_samples_drv_status() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg2_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        transport.set_read_time(1.5);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        reactor.run_due();
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[1.5, 42, 7]]})),
+            "the SG2 result and the current scale come from DRV_STATUS"
+        );
+        assert_eq!(transport.reads(), vec!["DRV_STATUS".to_string()]);
+    }
+
+    /// The TMC2209 branch: one `SG_RESULT` read per poll, whose raw value is the
+    /// result; `cs_actual` stays at its `-1` sentinel and the sample is dated
+    /// with the read's `receive_time`.
+    #[test]
+    fn test_a_tmc2209_samples_sg_result_with_a_sentinel_cs_actual() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 0x1234);
+        transport.set_read_time(7.25);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1, "the poll timer runs at NOW");
+        assert_eq!(transport.reads(), vec!["SG_RESULT".to_string()]);
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[7.25, 0x1234, -1]]})),
+            "the sample is dated with the read's print time"
+        );
+        assert_eq!(dump.dump().unwrap(), None, "the batch was taken");
+    }
+
+    /// The SG4_RESULT branch (TMC2130/TMC5160): the SG2 result and the current
+    /// scale come from `DRV_STATUS`, and stealthchop switches the result to the
+    /// separate SG4 register.
+    #[test]
+    fn test_the_sg4_branch_reads_drv_status_and_sg4_in_stealthchop() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg4_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG4_RESULT", 0x6c)]);
+        transport.set_read_time(3.5);
+        transport.set_read_value("SG4_RESULT", 0x155);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // SpreadCycle: the SG2 result and the current scale are both there.
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        reactor.run_due();
+        // Stealthchop: the useful result is the one in SG4_RESULT.
+        transport.set_read_value("DRV_STATUS", (1 << 14) | (7 << 16));
+        reactor.advance(QUERY_INTERVAL);
+
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[3.5, 42, 7], [3.5, 0x155, 7]]}))
+        );
+        assert_eq!(
+            transport.reads(),
+            vec![
+                "DRV_STATUS".to_string(),
+                "DRV_STATUS".to_string(),
+                "SG4_RESULT".to_string()
+            ],
+            "the SG4 register is read only in stealthchop"
+        );
+    }
+
+    /// The endpoint is registered under the stepper name and answers a
+    /// connecting client with the column header.
+    #[tokio::test]
+    async fn test_the_stallguard_endpoint_streams_under_the_stepper_name() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        // Held for the endpoint's lifetime: the callbacks reach the state
+        // through a `Weak`, and on a live machine the driver owns it.
+        let _dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].path, DUMP_ENDPOINT);
+        assert_eq!(registrations[0].key, DUMP_KEY);
+        assert_eq!(registrations[0].value.as_deref(), Some("stepper_x"));
+
+        let request = Request::parse(
+            br#"{"method":"tmc/stallguard_dump","params":{"name":"stepper_x",
+                 "response_template":{"method":"dump"}}}"#,
+        )
+        .unwrap();
+        let api = Api::new();
+        let recorder = Arc::new(Recorder::default());
+        let context = EndpointContext {
+            api: &api,
+            client: Arc::clone(&recorder) as Arc<dyn PushTarget>,
+        };
+        let reply = registrations[0]
+            .handler
+            .handle(&request, &context)
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({"header": ["time", "sg_result", "cs_actual"]}));
+        // The batch loop waits out its interval before the first batch, so the
+        // header is all the client has received.
+        assert!(recorder.messages.lock().unwrap().is_empty());
+    }
+
+    /// A failed read is reported to the client and retires the poll timer
+    /// (upstream stores the error and returns `NEVER`).
+    #[test]
+    fn test_a_failed_read_is_dumped_as_an_error_and_stops_the_polling() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.fail_reads("driver unreachable", 1);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1);
+        let error = dump.dump().unwrap_err();
+        assert!(
+            error.contains("driver unreachable"),
+            "the read failure is reported: {error}"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "the timer retired on the error");
+    }
+
+    /// Start, sample, hand the batch over, stop: the timer stops and the
+    /// buffered samples are dropped.
+    #[test]
+    fn test_samples_move_to_the_client_and_stop_cancels_the_timer() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 11);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // Polls at 0, 5, 10, 15 and 20 ms.
+        reactor.advance(0.02);
+        let batch = dump.dump().unwrap().unwrap();
+        let samples = batch["data"].as_array().unwrap();
+        assert_eq!(samples.len(), 5);
+        assert!(samples
+            .iter()
+            .all(|sample| sample[1] == 11 && sample[2] == -1));
+
+        // One more sample, dropped by `stop`.
+        reactor.advance(QUERY_INTERVAL);
+        dump.stop();
+        assert_eq!(
+            dump.dump().unwrap(),
+            None,
+            "stop drops the buffered samples"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "stop cancels the poll timer");
     }
 }

@@ -76,6 +76,18 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
 /// `os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`), so a path
 /// that does not exist leaves that updater a no-op instead of pointing it at a
 /// directory that is not Klipper. Both keys must still be present strings.
+///
+/// # Do not delete these two fields
+///
+/// `TODO.md` E2 lists them as removable Klipper leftovers; deleting either key
+/// breaks the stock Moonraker this host talks to. `_save_path_info` indexes
+/// both without a default (`moonraker/components/klippy_connection.py:352-354`),
+/// and the resulting `KeyError` is not a `ServerError`, so it is not caught by
+/// the `except ServerError` around the initialization task
+/// (`klippy_connection.py:418-427`): that task dies with nobody awaiting it,
+/// the socket stays connected, `klippy_state` stays `startup` forever and no
+/// reconnect follows. External dependency, do not delete — and do not fill
+/// either key with a real path, for the reason below.
 const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
 
 /// The interpreter this host does not have. See [`NO_KLIPPER_PATH`].
@@ -283,6 +295,8 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target};
+    use crate::core::klippy::api::WebhooksStatus;
+    use crate::core::klippy::printer::PrinterObject;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
@@ -379,10 +393,61 @@ mod tests {
 
         let response = ask(&endpoint, r#"{"method":"info"}"#).await;
 
+        // Neither may name something this host actually has: a real Klipper
+        // checkout or its interpreter would make Moonraker manage them (see
+        // `InfoResponse::python_path`), so pin that the reported paths are
+        // neither this crate's source tree nor the running binary — the two
+        // "real path" values a future edit is most likely to reach for.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let executable = std::env::current_exe().expect("the test binary has a path");
+
         for key in ["klipper_path", "python_path"] {
             let path = response[key].as_str().expect("a string");
             assert!(!path.is_empty(), "{key} is empty");
             assert!(!std::path::Path::new(path).exists(), "{key} exists: {path}");
+            assert_ne!(
+                std::path::Path::new(path),
+                manifest_dir,
+                "{key} is this crate"
+            );
+            assert_ne!(
+                std::path::Path::new(path),
+                executable,
+                "{key} is this binary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_state_is_one_moonraker_accepts_and_webhooks_agrees() {
+        // Moonraker maps the reported state through its own enum and only knows
+        // `startup|ready|error|shutdown`: `KlippyState.from_string` raises
+        // `ValueError` for anything else (`moonraker/common.py:137-151`), from
+        // call sites that are not behind a `ServerError` guard
+        // (`klippy_connection.py:456,583`) — the host would sit in `startup`
+        // with the socket connected. `info` and `webhooks` both report the
+        // state, so both must draw from that same four-name domain and agree on
+        // the value.
+        let (endpoint, printer) = endpoint();
+        let webhooks = WebhooksStatus::new(Arc::clone(&printer));
+        let accepted = ["startup", "ready", "error", "shutdown"];
+
+        for halted in [false, true] {
+            if halted {
+                printer.invoke_shutdown("Printer is halted");
+            }
+            let info = ask(&endpoint, r#"{"method":"info"}"#).await;
+            let info_state = info["state"].as_str().expect("a string").to_string();
+            let webhooks_state = webhooks.get_status(0.0)["state"]
+                .as_str()
+                .expect("a string")
+                .to_string();
+
+            assert_eq!(info_state, webhooks_state, "the two state reports differ");
+            assert!(
+                accepted.contains(&info_state.as_str()),
+                "{info_state} is not a state Moonraker accepts"
+            );
         }
     }
 

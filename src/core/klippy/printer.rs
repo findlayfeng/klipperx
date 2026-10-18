@@ -62,7 +62,13 @@ pub enum PrinterState {
 impl PrinterState {
     /// Get the state category string ("startup", "ready", "shutdown", "error").
     ///
-    /// These are the four values the `info` endpoint may report as `state`.
+    /// These are the four values the `info` endpoint may report as `state`, and
+    /// the only four Moonraker accepts: `KlippyState.from_string`
+    /// (`moonraker/common.py:137-151`) raises `ValueError` for any other
+    /// spelling, at call sites with no `ServerError` guard around them
+    /// (`klippy_connection.py:456,583`), leaving the host silently in
+    /// `startup`. External dependency, do not rename — a new variant also has
+    /// to be added to `ALL_PRINTER_STATES` in this module's tests.
     pub fn as_category(&self) -> &'static str {
         match self {
             PrinterState::Startup => "startup",
@@ -1195,6 +1201,41 @@ mod tests {
         assert_eq!(PrinterState::Ready.as_category(), "ready");
         assert_eq!(PrinterState::Shutdown.as_category(), "shutdown");
         assert_eq!(PrinterState::Error.as_category(), "error");
+    }
+
+    /// Every variant, for [`test_every_state_category_is_one_moonraker_accepts`].
+    /// Included via the array rather than through introspection (the crate has no
+    /// `strum`), so a variant added to the enum has to be added here too — the
+    /// exhaustive `match` in `as_category` makes that visible.
+    const ALL_PRINTER_STATES: [PrinterState; 4] = [
+        PrinterState::Startup,
+        PrinterState::Ready,
+        PrinterState::Shutdown,
+        PrinterState::Error,
+    ];
+
+    #[test]
+    fn test_every_state_category_is_one_moonraker_accepts() {
+        // `info` and `webhooks` both put this string on the wire, and Moonraker
+        // feeds it straight to `KlippyState.from_string`
+        // (`moonraker/common.py:137-151`): an unrecognised name is a
+        // `ValueError` and a frontend that never leaves `startup`.
+        const ACCEPTED: [&str; 4] = ["startup", "ready", "error", "shutdown"];
+
+        for state in ALL_PRINTER_STATES {
+            let name = state.as_category();
+            assert!(ACCEPTED.contains(&name), "{state:?} reports {name}");
+        }
+
+        // Four distinct names: a new variant reusing an existing one would slip
+        // past the check above and confuse Moonraker's state transitions.
+        let mut names: Vec<&str> = ALL_PRINTER_STATES
+            .iter()
+            .map(PrinterState::as_category)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL_PRINTER_STATES.len());
     }
 
     #[test]

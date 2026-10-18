@@ -526,7 +526,7 @@ impl Kinematics for RotaryDeltaKinematics {
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
         let end = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         let end_xy2 = end.x() * end.x() + end.y() * end.y();
         if end_xy2 <= *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner())
             && axes_d[Z_AXIS] == 0.0

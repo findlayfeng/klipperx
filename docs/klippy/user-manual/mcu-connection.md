@@ -171,8 +171,7 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 out/firmware
 `--port-nodeid` 是桥给那个口的名字（`1..=255`），**不能是 `1`**——那是桥自己在这条链路上的 id，
 撞了隧道上的块会与桥自己的帧同 arb。
 
-**单独复位也行**：`admin reset --bridge <tty>` 复位**桥自身**（`RESTART_DEVICE(0xFF)` 穿透给它，重开 +
-重 identify 成功才算完）；`admin reset --bridge <tty> --port N [--port-reset reset-port|restart-device|bootloader]`
+**单独复位也行**：`admin reset --bridge <tty>` 复位**桥自身**（`RESTART_DEVICE(0xFF)` 穿透给它；**下发命令不需要 identify**，重置之后才重开 + identify 确认桥回来了）；`admin reset --bridge <tty> --port N [--port-reset reset-port|restart-device|bootloader]`
 复位该口设备（`0x04`/`0x05`/`0x02`，无回执，只能当“已发出”）。**注意**：这里的 `bootloader` 发的是裸
 `0x02`，只有该口已经被命名成 UNITS 时才送得到（且不会把口改回 legacy）；**要“刷之前切引导”，用 ④
 的 `--port-reset bootloader`**——它会自己先切 UNITS、发请求、等 5 s、再切回 legacy 开隧道。
@@ -350,7 +349,7 @@ B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UA
 
 ## 固件重启方式（`restart_method`）
 
-系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。
+系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 与桥端口子节有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。
 
 | 值 | 做法 | 说明 |
 |----|------|------|
@@ -358,7 +357,7 @@ B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UA
 | `arduino` | 以 2400 波特打开串口，翻转 DTR | 串口**缺省**值；Arduino 及克隆板 |
 | `cheetah` | 以 2400 波特做一串 RTS/DTR 时序 | Fysetc Cheetah v1.2 等采用状态机 bootloader 电路的板子 |
 | `rpi_usb` | 切断再恢复该 USB 端口的供电 | 树莓派等能给 USB 口断电的机器 |
-| `admin` | 经桥转发 `RESTART_DEVICE (0x05)`，让该设备**重启自己的固件**（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **仅用于桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」。**设备重启会重新枚举 USB**：下游是 USB CDC 时，宿主库桥会因打不开该端口而失败——主机会**有界等 `uart_device` 的 `uart_path` 回来**（≤10s，建议写 by-id/by-path），回来就请求一次 plain restart（重走库会话、按配置重新登记端口）从而自动恢复；每个 MCU 只有一次这样的恢复预算（成功连上即归还），所以「路径在但一直打不开」只会重启一次便停在 error |
+| `admin` | **串口 `[mcu]`（桥自己）**：连接**之前**在自己的 admin 通道上发 `RESTART_DEVICE [0x05][0xFF]`（`0xFF` 超出任何桥的端口数，固件因此把它当"本机"），不需要 identify——板子卡在陈旧会话里也能这样重启。**桥下游命名设备**：经桥转发 `[0x05][index]`，让该设备重启自己的固件（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **串口桥自己**（不需要 `uuid:`）或**桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」。**设备重启会重新枚举 USB**：下游是 USB CDC 时，宿主库桥会因打不开该端口而失败——主机会**有界等 `uart_device` 的 `uart_path` 回来**（≤10s，建议写 by-id/by-path），回来就请求一次 plain restart（重走库会话、按配置重新登记端口）从而自动恢复；每个 MCU 只有一次这样的恢复预算（成功连上即归还），所以「路径在但一直打不开」只会重启一次便停在 error |
 
 ```ini
 [mcu]

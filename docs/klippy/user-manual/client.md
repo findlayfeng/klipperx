@@ -83,6 +83,11 @@ Moonraker 对这两个键无默认下标（`klippy_connection.py:352-354`），�
 本仓不实现行协议输入，连带没有：`ok` 应答行、`gcode:debuginput_exit` 事件、`stats`/`gcodein`
 计数。逐条登记见开发手册的[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
 
+**Mainsail 的客户端宏文件（`mainsail.cfg`）已入库作回归语料**（`src/core/klippy/extras/mainsail.cfg`，逐字副本）：
+`upstream::the_mainsail_client_macros_load_and_run` 逐宏起一台假固件机器跑 13 条脚本（`PAUSE`/`RESUME`/
+`CANCEL_PRINT`/`_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_*` 与两条暂停层钩子）。真机上把它 `[include]` 进
+`printer.cfg` 即可，与上游 Klipper 同一份文件、同一套行为。
+
 ### 顺便开个窗口
 
 主机可以自己开一扇客户端窗口，不用另外起进程、也不用 `-a`：

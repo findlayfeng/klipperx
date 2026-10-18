@@ -861,15 +861,15 @@ fn position_lines(report: &PositionReport, toolhead_position: Coord, state: &Mov
          gcode: {}\n\
          gcode base: {}\n\
          gcode homing: {homing_pos}",
-        xyze_line(toolhead_position.as_array()),
-        xyze_line(state.last_position.as_array()),
+        xyze_line(toolhead_position.as_slice()),
+        xyze_line(state.last_position.as_slice()),
         xyze_line(&state.base_position),
     )
 }
 
 /// `X:` … `E:` with six decimals — the shape of `GET_POSITION`'s four-axis
 /// lines (`zip("XYZE", position)`, `gcode_move.py:275-280`).
-fn xyze_line(position: &[f64; AXES]) -> String {
+fn xyze_line(position: &[f64]) -> String {
     ["X", "Y", "Z", "E"]
         .into_iter()
         .zip(position)

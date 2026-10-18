@@ -1194,7 +1194,7 @@ impl PrinterObject for ToolHeadObject {
         // built from, and the runtime setters keep the two in step.
         let limits = self.limits_guard();
         json!({
-            "position": position.as_array(),
+            "position": position.as_slice(),
             "homed_axes": homed_axes,
             "print_time": connected.toolhead.print_time(),
             // The active extruder's name, as upstream reports it

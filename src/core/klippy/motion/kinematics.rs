@@ -563,8 +563,8 @@ impl Kinematics for NoneKinematics {
         let zero = Coord::new(0.0, 0.0, 0.0, 0.0);
         json!({
             "homed_axes": "",
-            "axis_minimum": zero.as_array(),
-            "axis_maximum": zero.as_array(),
+            "axis_minimum": zero.as_slice(),
+            "axis_maximum": zero.as_slice(),
         })
     }
 
@@ -743,8 +743,8 @@ impl Kinematics for CartesianKinematics {
             .collect();
         json!({
             "homed_axes": homed,
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 
@@ -1055,8 +1055,8 @@ impl Kinematics for PolarKinematics {
         };
         json!({
             "homed_axes": format!("{xy_home}{z_home}"),
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 

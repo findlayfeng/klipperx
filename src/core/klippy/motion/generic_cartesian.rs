@@ -251,8 +251,8 @@ impl Kinematics for GenericCartesianKinematics {
             .collect();
         json!({
             "homed_axes": homed,
-            "axis_minimum": self.axis_min.as_array(),
-            "axis_maximum": self.axis_max.as_array(),
+            "axis_minimum": self.axis_min.as_slice(),
+            "axis_maximum": self.axis_max.as_slice(),
         })
     }
 

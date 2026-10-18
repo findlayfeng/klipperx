@@ -1628,6 +1628,10 @@ fn report(summary: session::Summary) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::interface::devices::serial::{
+        admin_unit, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE,
+    };
+    use crate::core::klippy::interface::pty::Pty;
 
     /// Parse a command line the way the shell would hand it over.
     fn parse(args: &[&str]) -> Result<FlashArgs, clap::Error> {
@@ -3115,5 +3119,131 @@ mod tests {
 
         let err = planned_reset(&["--uuid", "11aa22bb33cc"]).expect_err("a board on what?");
         assert!(err.contains("--interface"), "{err}");
+    }
+
+    // =======================================================================
+    // Running a reset: the bridge does not have to identify
+    // =======================================================================
+
+    /// The index a **bridge-wide** reset carries: `0xFF` names no port, which
+    /// is what makes the bridge's own device half take the unit
+    /// (`bridge_flash::RESTART_DEVICE_TO_BRIDGE` /
+    /// `REQUEST_BOOTLOADER_TO_BRIDGE`).
+    const BRIDGE_INDEX: u8 = 0xFF;
+
+    /// A pty as a bridge whose far end answers **nothing**: the uuid-less
+    /// discovery scan finds no unassigned bridge and the link falls back to the
+    /// id the run opens it as, so the reset has a live admin channel while the
+    /// bridge answers no identify — the state a session-stuck bridge is in, and
+    /// the one [`run_reset`] has to work in.
+    fn stuck_bridge() -> Pty {
+        Pty::new()
+    }
+
+    /// The `--bridge` argument naming `pty`'s device.
+    fn bridge_arg(pty: &Pty) -> String {
+        pty.path.display().to_string()
+    }
+
+    /// Everything a run wrote to the bridge within `window`, read on the pty's
+    /// far end.
+    fn read_wire(pty: &Pty, window: Duration) -> Vec<u8> {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+
+        let mut wire = Vec::new();
+        let mut buf = [0u8; 256];
+        let mut master = &pty.master;
+        let deadline = std::time::Instant::now() + window;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let mut poll = libc::pollfd {
+                fd: pty.master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as i32) };
+            if ready <= 0 {
+                return wire;
+            }
+            match master.read(&mut buf) {
+                Ok(0) => return wire,
+                Ok(n) => wire.extend_from_slice(&buf[..n]),
+                Err(e) => panic!("reading the pty master: {e}"),
+            }
+        }
+    }
+
+    /// Whether `unit` is among the bytes on the wire. Position is no evidence:
+    /// a uuid-less open sends its discovery broadcast first.
+    fn sent(wire: &[u8], unit: &[u8]) -> bool {
+        wire.windows(unit.len()).any(|window| window == unit)
+    }
+
+    /// `admin reset --port`: the port-level admin unit goes out to a bridge that
+    /// answers nothing, and it is the **whole** of the run — no identify first
+    /// (that would fail on this pty after its own timeout) and no dictionary
+    /// behind it (`[RESET_PORT][0]` is addressed by the admin channel alone).
+    #[test]
+    fn test_a_port_reset_is_sent_without_identifying_the_bridge() {
+        let bridge = stuck_bridge();
+        let tty = bridge_arg(&bridge);
+        let args = parse_reset(&["--bridge", &tty, "--port", "0"]).expect("a port reset line");
+
+        run_reset(args).expect("a port reset needs no identify");
+
+        let wire = read_wire(&bridge, Duration::from_millis(500));
+        assert!(
+            sent(&wire, &admin_unit(&[CMD_RESET_PORT, 0])),
+            "the port reset unit crossed the line: {wire:02x?}"
+        );
+    }
+
+    /// `admin reset --bootloader`: the same, with the device half's
+    /// `[REQUEST_BOOTLOADER][0xFF]` — the bridge parks itself without ever being
+    /// identified.
+    #[test]
+    fn test_a_bridge_bootloader_reset_is_sent_without_identifying_the_bridge() {
+        let bridge = stuck_bridge();
+        let tty = bridge_arg(&bridge);
+        let args = parse_reset(&["--bridge", &tty, "--bootloader"])
+            .expect("a bridge bootloader reset line");
+
+        run_reset(args).expect("the bootloader request needs no identify");
+
+        let wire = read_wire(&bridge, Duration::from_millis(500));
+        assert!(
+            sent(&wire, &admin_unit(&[CMD_REQUEST_BOOTLOADER, BRIDGE_INDEX])),
+            "the bootloader request crossed the line: {wire:02x?}"
+        );
+    }
+
+    /// `admin reset` on the bridge itself: the restart unit is **delivered** to
+    /// a bridge that answers nothing, and only its confirmation fails — the
+    /// bounded reopen inside [`BridgeLink::reset`], which nothing here answers.
+    ///
+    /// The pre-identify this command used to run first is not what fails: that
+    /// one read the dictionary out of a session that cannot be had, and the
+    /// attempt to open one on a bridge left mid-session is exactly what this
+    /// command must not need.
+    #[test]
+    fn test_a_bridge_reset_reaches_a_bridge_that_cannot_identify() {
+        let bridge = stuck_bridge();
+        let tty = bridge_arg(&bridge);
+        let args = parse_reset(&["--bridge", &tty]).expect("a bridge reset line");
+
+        let err = run_reset(args).expect_err("nothing answers the reopen");
+        let text = err.to_string();
+        assert!(text.contains("did not come back within"), "{text}");
+        assert!(
+            !text.contains("did not identify"),
+            "the reset itself is not an identify: {text}"
+        );
+
+        let wire = read_wire(&bridge, Duration::from_millis(500));
+        assert!(
+            sent(&wire, &admin_unit(&[CMD_RESTART_DEVICE, BRIDGE_INDEX])),
+            "the restart unit crossed the line: {wire:02x?}"
+        );
     }
 }

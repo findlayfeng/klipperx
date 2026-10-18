@@ -17,17 +17,17 @@
 //!
 //! One exchange is `tmcuart_send oid=%c write=%*s read=%c` followed by
 //! `tmcuart_response oid=%c read=%*s` (`src/tmcuart.c`). A read encodes the
-//! request with [`TmcuartMessage::encode_read`](encode_read), sends it with
-//! `read = `[`UART_READ_LEN`] and decodes the answer with [`decode_read`]; a
-//! write encodes `reg | 0x80` with [`encode_write`] and sends it with
-//! `read = 0`, which makes the firmware answer **nothing** — so the write path
-//! goes out through [`Mcu::send_msg_clocked`] and is never waited on.
+//! request with [`encode_read`], sends it with `read = `[`UART_READ_LEN`] and
+//! decodes the answer with [`decode_read`]; a write encodes `reg | 0x80` with
+//! [`encode_write`] and sends it with `read = 0`, which makes the firmware
+//! answer **nothing** — so the write path goes out through
+//! [`Mcu::send_msg_clocked`](crate::core::klippy::mcu::Mcu::send_msg_clocked)
+//! and is never waited on.
 //!
 //! Several chips share one bit-banged UART, so every answer carries the
 //! bitbang's `oid` and the read path resolves it with
-//!
-//! [`Mcu::call_msg_oid`]: a `tmcuart_response` belonging to another chip does
-//! not answer this caller.
+//! [`Mcu::call_msg_oid`](crate::core::klippy::mcu::Mcu::call_msg_oid): a
+//! `tmcuart_response` belonging to another chip does not answer this caller.
 //!
 //! ## Deviations from upstream (`tmc_uart.py`)
 //!
@@ -46,7 +46,9 @@
 //! * **The bus lock** is per [`TmcUartBitbang`]; upstream shares one lock per
 //!   MCU (`lookup_tmc_uart_mutex`) to keep a slow board from being flooded with
 //!   concurrent UART traffic. Which answer belongs to whom does not rest on the
-//!   lock either way — the `oid` filter in [`Mcu::call_msg_oid`] does that.
+//!   lock either way — the `oid` filter in
+//!   [`Mcu::call_msg_oid`](crate::core::klippy::mcu::Mcu::call_msg_oid) does
+//!   that.
 //! * **Writing `IFCNT`.** Upstream sends it and then reads the counter back to
 //!   compare against itself, which can only fail; here a write to `IFCNT` is
 //!   sent and accepted without the IFCNT handshake.
@@ -63,7 +65,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::spi_device::mcu_object_name;
 use crate::core::klippy::extras::tmc::{TmcRegister, TmcTransport};
 use crate::core::klippy::extras::z_tilt::block_in_command;
-use crate::core::klippy::mcu::{Mcu, McuCallError, McuError, McuObject, SendClocks};
+use crate::core::klippy::mcu::{McuCallError, McuError, McuObject, SendClocks};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{DigitalOut, PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -107,8 +109,9 @@ impl McuCommand for ConfigTmcuart {
 ///
 /// `read = 0` is the write path: the firmware then sends **no**
 /// `tmcuart_response` at all (`src/tmcuart.c`), so that frame must not be
-/// waited on ([`Mcu::send_msg_clocked`]). [`UART_READ_LEN`] is the read path's
-/// length — one full response frame.
+/// waited on
+/// ([`Mcu::send_msg_clocked`](crate::core::klippy::mcu::Mcu::send_msg_clocked)).
+/// [`UART_READ_LEN`] is the read path's length — one full response frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmcuartSend {
     /// The bitbang device oid (`config_tmcuart`'s).
@@ -499,18 +502,18 @@ impl TmcUartBitbang {
         self.bus.lock().unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// The live MCU handle, or the reason there is none.
+    /// The `[mcu]` object this bitbang registered its `config_tmcuart` with.
     ///
     /// # Errors
-    /// The `[mcu]` object is gone, or the MCU has not connected yet.
-    fn mcu(&self) -> Result<Arc<Mcu>, McuError> {
-        let mcu_object = self.mcu_object.upgrade().ok_or_else(|| {
+    /// The object is gone, which only happens while the printer is being torn
+    /// down.
+    fn mcu_object(&self) -> Result<Arc<McuObject>, McuError> {
+        self.mcu_object.upgrade().ok_or_else(|| {
             McuError::Config(format!(
                 "the MCU '{}' of this TMC uart is gone",
                 self.chip_name
             ))
-        })?;
-        mcu_object.mcu().ok_or(McuError::NotIdentified)
+        })
     }
 
     /// The print time an answer just received is dated with.
@@ -543,11 +546,8 @@ impl TmcUartBitbang {
         addr: u8,
         reg: u8,
     ) -> Result<Option<TmcRegister>, McuError> {
-        let mcu_object = self
-            .mcu_object
-            .upgrade()
-            .ok_or_else(|| McuError::Config("the TMC uart's MCU object is gone".to_string()))?;
-        let mcu = self.mcu()?;
+        let mcu_object = self.mcu_object()?;
+        let mcu = mcu_object.mcu().ok_or(McuError::NotIdentified)?;
         if let Some(mux) = &self.mux {
             mux.activate(instance_id.unwrap_or(&[]))?;
         }
@@ -592,11 +592,8 @@ impl TmcUartBitbang {
         val: u32,
         print_time: Option<f64>,
     ) -> Result<(), McuError> {
-        let mcu_object = self
-            .mcu_object
-            .upgrade()
-            .ok_or_else(|| McuError::Config("the TMC uart's MCU object is gone".to_string()))?;
-        let mcu = self.mcu()?;
+        let mcu_object = self.mcu_object()?;
+        let mcu = mcu_object.mcu().ok_or(McuError::NotIdentified)?;
         // Upstream sends `minclock=0` for a write with no print time, which is
         // the same as no gate at all (`SendClocks::default`).
         let min_clock =

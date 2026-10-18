@@ -214,7 +214,38 @@ X:<x> Y:<y> Z:<z> E:<e>
 
 保留三位小数，直接输出（无 `// ` 前缀）；**未就绪时也可执行**。
 
-### M220 / M221 — 速度/挤出系数
+### GET_POSITION — 报告七个位置（排障用）
+
+```
+GET_POSITION
+```
+
+```
+// mcu: stepper_x:100 stepper_y:-200 stepper_z:0
+// stepper: stepper_x:12.500000 stepper_y:-25.000000 stepper_z:0.000000
+// kinematic: X:12.500000 Y:-25.000000 Z:0.000000
+// toolhead: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000
+// gcode: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000
+// gcode base: X:0.000000 Y:0.000000 Z:0.000000 E:0.000000
+// gcode homing: X:0.000000 Y:0.000000 Z:0.000000
+```
+
+七行各看一层（与 `M114` 的四点差别）：
+
+| 行 | 数据源 | 精度 |
+|----|--------|------|
+| `mcu:` | 每个运动学 stepper 的**固件步数**（`get_mcu_position`，整数） | `%d` |
+| `stepper:` | 每个 stepper 的**主机指令位置** | 六位小数 |
+| `kinematic:` | 反解出的车架位置（**只 X/Y/Z**） | 六位小数 |
+| `toolhead:` | 规划器的 commanded 位置（**不经** `move_transform`） | 六位小数 |
+| `gcode:` | `last_position` 原值（**不减** `base_position`、**不除** `extrude_factor`） | 六位小数 |
+| `gcode base:` | `base_position`（`G92`/`SET_GCODE_OFFSET`/`G28` 的锚点） | 六位小数 |
+| `gcode homing:` | `homing_position`（**只 X/Y/Z**） | 六位小数 |
+
+- 本仓 `mcu:` 行是「主机指令位置换算回步数」（`mcmd_pos / step_dist`），**不是**读固件计数器；两者在步压缩缓冲排空时一致，缓冲未发完时会差。
+- `kinematic:` 某轴无法反解（未归零、不可逆解）时，**该轴回落为 `toolhead:` 行的值**（上游 `homing.py` 的同一口径）；不是打 0。
+- 没有 toolhead 时（未就绪）报 `Printer not ready`。
+- `axis_map`（见下）里有额外轴字母时，`mcu:`/`stepper:` 两行**不**包含它们（额外轴不是运动学 stepper）。
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
@@ -245,7 +276,7 @@ RESTORE_GCODE_STATE [NAME=<name>] [MOVE=0|1] [MOVE_SPEED=<mm/s>]
 `gcode_move` 自己也是一个可查询对象（对象名 `gcode_move`，`objects/list` 里能看到）。
 `get_status` 报：`speed`（mm/min）、`speed_factor`（倍数，`1.0` 即 100%）、`extrude_factor`、
 `absolute_coordinates` / `absolute_extrude`、`homing_origin`、`position`（工具头坐标）、
-`gcode_position`（g-code 坐标）、`axis_map`（`X/Y/Z/E` → 0..3）。
+`gcode_position`（g-code 坐标）、`axis_map`（对象：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`，`toolhead:update_extra_axes` 到达后追加额外轴字母，如 `"A":4`）。
 
 ---
 

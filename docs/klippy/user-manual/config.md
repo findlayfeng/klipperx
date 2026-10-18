@@ -332,9 +332,10 @@ uuid: 11aa22cc33dd        # 同一条口上第二台必须写互异 uuid
 
 **注意：**
 - 数字输出与 PWM 都支持 `!` 取反前缀。
-- 值变化**按打印时间生效**（有 `[printer]` 即 toolhead 在时）：`SET_PIN` 经 `GCodeRequestQueue` 排进前瞻、flush 时以 `queue_digital_out(clock)`／对齐后的 `set_pwm` 落地，同值重复设置去重不发帧，`G4` 推进的时间线因此真正给引脚换相定时。**两条兑底**：配置里没有 `[printer]`（lookup 不到 toolhead）或资源未连接时，退回“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`，软 PWM 对齐到软件周期边界）。`TEMPLATE` / `static_value` 仍未做。
+- 值变化**按打印时间生效**（有 `[printer]` 即 toolhead 在时）：`SET_PIN` 经 `GCodeRequestQueue` 排进前瞻、flush 时以 `queue_digital_out(clock)`／对齐后的 `set_pwm` 落地，同值重复设置去重不发帧，`G4` 推进的时间线因此真正给引脚换相定时。**两条兑底**：配置里没有 `[printer]`（lookup 不到 toolhead）或资源未连接时，退回“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`，软 PWM 对齐到软件周期边界）。
+- `SET_PIN PIN=<名> TEMPLATE=<display_template 名> [PARAM_*=…]` **已支持**：模板每 0.5 s 求值一次（上游同款 reactor 定时器，**不走**前瞻），结果经 `send_async_request` 按最近的 min_schedule_time 下发；渲染失败只告警并落 `0`。`TEMPLATE=`（空值）取消订阅；`VALUE=` 与 `TEMPLATE=` 必须给且只给一个（否则报 `SET_PIN command must specify VALUE or TEMPLATE`）。模板路径的值**不除 `scale`**、也不做 `0/1` 校验（上游同）。
+- `static_value` 上游已删该参数（`Config_Changes` 20240912），本仓只**接受并忽略**它、不再当非法选项报错；启动值用 `value`。
 - 软件 PWM 的 `shutdown_value` 只能是 `0.0` 或 `1.0`（固件只能把引脚固定在高或低）。
-- `scale` / `static_value` / `TEMPLATE` 尚未实现。
 
 **示例：**
 
@@ -768,6 +769,41 @@ voltage2: 4.5
 pins: !PD0, PD1, PD2
 ```
 
+### `[static_pwm_clock <name>]` — 固定频率、50% 占空比的时钟输出
+
+只消费一个引脚（**不是 pin 芯片**，不注册可被 `pin:` 引用的 chip），建硬件 PWM 并按 `frequency` 输出方波（0.5 / 0.5、`max_duration = 0`）；典型用途是给外部传感器送时钟。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `pin` | 必需 | PWM 引脚（可带 `!`） |
+| `frequency` | `100` | 输出频率（Hz），必须 > 1/0.3 ≈ 3.3333 且 ≤ 520000000 |
+
+周期必须能被 MCU 时钟整除：`1/frequency` 换算出的 tick 数乘回频率须等于 MCU 时钟频率，否则 build 期报 `Frequency output must be without remainder`（上游同一算法/同一文案）。脉宽低于 40% 或高于 60% 只告警。无 `get_status`。`order = 35`，排在 `[board_pins]` 之后，别名可用。
+
+```ini
+[static_pwm_clock ldc1612_clk_in]
+pin: carto:PB4
+frequency: 24000000
+```
+
+### `[duplicate_pin_override]` — 允许一个 pin 被多处使用
+
+上游的“逃生门”：把一个 pin 在**这里**声明一次，之后多个节可以各自占用它（仍按节序解析，本仓按固定装载表）。
+
+| 参数 | 必需 | 说明 |
+|------|------|------|
+| `pins` | 是 | 逗号分隔的引脚描述 |
+
+- 描述里**不能带修饰符**（`!PA1`/`^PA1` 报 `Invalid pin description`）——极性属于真正驱动它的那一侧；
+- 别名按**拼写**记账：`pins: my_alias` 只覆盖同样写 `my_alias` 的节，不覆盖它的目标引脚（上游同）；
+- 装载相位 `phase = early`、`order = 17`，在 `[mcu]`(10)/`[multi_pin]`(15)/`[sx1509]`(16) 之后、其余泛型节之前——**晚于 17 才注册的芯片（如 `[adc_scaled]` 的虚拟 pin）不能在这里声明**（上游靠文件顺序，本仓靠固定表）；
+- 无资源、无命令、无 `get_status`。语料里没有任何配置使用它。
+
+```ini
+[duplicate_pin_override]
+pins: PA1, my_alias
+```
+
 ---
 
 - [← 用户手册首页](README.md)
@@ -1055,7 +1091,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `fan_speed` | `1.0`（0..=1） | 触发时的风扇速度 |
 
 `pin`/`kick_start_time`/`max_power`/`shutdown_speed`/`off_below`/`cycle_time`/`hardware_pwm` 由 `[fan]` 核心读取。语义：每秒 tick；**任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`**；仅速度变化时写 PWM；掉线关机速度默认 **1.0**（与 `[controller_fan]` 的 0.0 不同）。无 G-Code 命令，`get_status` 转发 fan 状态。
-gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
+`heater` 名经加热器注册表的 `lookup_heater` 解析（`heaters.rs:501-506`，批 #20），未知名报上游逐字文案 `Unknown heater '<name>'`（`heater_fan.rs:119-120`）；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
 
 ### `[safe_z_home]` — 归零前安全 Z 抬升（批 #6）
 
@@ -1079,7 +1115,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `accel` | `0.0`（≥0） | 默认加速度 |
 | `position_min`/`position_max` | 无 | 可选软限位 |
 
-命令见 G-Code 参考的 `MANUAL_STEPPER`。gap（如实登记）：本仓只推进时间线与 `commanded_pos`，**不 append trapq、不产生 steps**；`G1 A<..>` 的 extra axis 词被 `gcode_move` 静默忽略；有 endstop 时的 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`。
+命令见 G-Code 参考的 `MANUAL_STEPPER`。现状：**`MOVE=` 与 `G1 A<..>` 都会真正出步**——这台电机有自己的 trapq（首次需要时 `take_stepper()` 装进运动队列），`process_move` 按上游 append（`start_axis/end_axis` + `axes_r[ea_index]`），`SET_POSITION` 先 flush 再把 solver 摆到 `commanded_pos`。gap（如实登记）：**自带回零仍缺**——有 `endstop_pin` 时 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`（本仓没有 `drip_update_time`，且 `drip_move` 只灌主 trapq、不带额外轴）。
 
 ### `[display]` — 液晶与编码器（st7920/hd44780/uc1701/ssd1306 已落地，批 #7+#13）
 
@@ -1098,7 +1134,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 ### `[fan_generic <name>]` — 通用风扇（批 #18）
 
-本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（渲染引擎已在 `extras/template.rs`，但这条缝未接，调用报明确拒绝）。
+本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=<display_template 名> [PARAM_*=…]` **已支持**：与 `[output_pin]` 共用同一个 `template_evaluator`（0.5 s 求值一次，结果直接 `Fan::set_speed`）；`SPEED=` 与 `TEMPLATE=` 必须给且只给一个。
 
 ### `[idle_timeout]` — 空闲超时（批 #21）
 
@@ -1107,7 +1143,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `timeout` | `600` | 空闲秒数，`above 0` |
 | `gcode` | 内置（`{% if 'heaters' in printer %}` → `TURN_OFF_HEATERS`；`M84`） | 超时后跑的脚本 |
 
-`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。gap：`TURN_OFF_HEATERS` 未实现（默认脚本里那行走「未知命令」）；上游的 `update_timer` 抢占唤醒与 `toolhead:sync_print_time` 事件在本仓降级为定时器自续期 + 观察 `print_time` 前进。
+`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。起印识别以 `toolhead:sync_print_time` 事件为准（`calc_print_time` 抬高 print time 时发出）；事件未到达时仍回退到“观察 `print_time` 前进”，且收到过一次事件后不再双发。gap：`TURN_OFF_HEATERS` 未实现（默认脚本里那行走「未知命令」）；上游的 `update_timer` 用本仓的 `arm`（注销后重挂）顶替。
 
 ### `[verify_heater <heater_name>]` — 加热器升温校验（批 #20）
 

@@ -49,11 +49,6 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 /// (`set_motors_enable`'s `toolhead.get_last_move_time()`).
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
-// The constant upstream uses for the dwell before disabling motors
-// (`DISABLE_STALL_TIME`, `stepper_enable.py:8`).
-#[allow(dead_code)]
-const DISABLE_STALL_TIME: f64 = 0.100;
-
 /// Shared enable pin with reference counting.
 ///
 /// Upstream's `StepperEnablePin`: it tracks how many steppers share this pin,
@@ -962,15 +957,15 @@ mod tests {
     ///
     /// # The state before `M18`, and why it is not a bug
     ///
-    /// On this port nothing enables a motor at bring-up: `motor_enable` /
-    /// `set_motors_enable` are called only by `force_move`, `manual_stepper` and
-    /// `SET_STEPPER_ENABLE`, never by the toolhead (the print-time enable wiring
-    /// is exactly what the module docs say has not landed). So the status is
-    /// normally already all-`false` before `M18`. The case therefore asserts
-    /// what is true — **after `M18` every stepper reads `false`**, plus the
-    /// event — rather than a `true → false` transition it could not produce
-    /// without first energising a motor. `motor_off` short-circuits an already
-    /// disabled line; that is the correct idempotent behaviour, not a mismatch.
+    /// Bringing a machine up queues no motion, so the auto-enable chain
+    /// (`MCU_stepper.add_active_callback`) has not fired: `motor_enable` runs
+    /// when a real move reaches the trapq. No command before `M18` queues one
+    /// here, so the status is normally already all-`false` before `M18`. The
+    /// case therefore asserts what is true — **after `M18` every stepper reads
+    /// `false`**, plus the event — rather than a `true → false` transition it
+    /// could not produce without first energising a motor. `motor_off`
+    /// short-circuits an already disabled line; that is the correct idempotent
+    /// behaviour, not a mismatch.
     ///
     /// # What it assumes about the wiring
     ///

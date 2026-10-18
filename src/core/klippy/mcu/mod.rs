@@ -2179,6 +2179,22 @@ impl Mcu {
         self.parser.lookup(name).is_some()
     }
 
+    /// Whether an [`McuEvent`](crate::core::klippy::event::McuEvent) handler for
+    /// `E` is bound on **this** session's event table.
+    ///
+    /// The table belongs to one connection: a session that replaced a firmware
+    /// reset starts empty, and reports for it are dropped as unhandled
+    /// (`mcu/mod.rs`'s receive loop). Resources bind at use time for exactly
+    /// that reason (`McuChip::attach`), so a test can pin "this session has a
+    /// router" without sending a report.
+    #[cfg(test)]
+    pub(crate) fn has_event_handler<E>(&self) -> bool
+    where
+        E: crate::core::klippy::event::McuEvent,
+    {
+        self.events.has_callback(&self.parser, E::NAME)
+    }
+
     /// Check whether the firmware implements `format`, without failing.
     ///
     /// Upstream's `MCU.try_lookup_command` (`klippy/mcu.py:1197`, wrapping

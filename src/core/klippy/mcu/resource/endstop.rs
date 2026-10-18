@@ -231,10 +231,16 @@ impl McuEndstop {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         self.dispatch.wait_end(home_end_time);
         let reason = self.dispatch.completion().wait().await;
-        // Disable the check before anything else, as upstream does.
-        mcu.send_msg(&EndstopHome::disable(self.oid))?;
+        // Disable the check before anything else, as upstream does. Its failure
+        // must not skip the disarm below: the firmware deletes a group's report
+        // timer only on `trsync_trigger` (`src/trsync.c:171-186`), so a
+        // dispatch left armed keeps reporting every `report_ticks` forever
+        // (`src/trsync.c:57-65`) — upstream never has the hole because its
+        // disable is fire-and-forget (`klippy/mcu.py:396-398`).
+        let disabled = mcu.send_msg(&EndstopHome::disable(self.oid));
         // Reset the firmware's group; the completion already recorded why.
         self.dispatch.stop();
+        disabled?;
         if reason.is_failure() {
             return Err(McuError::Config(
                 "Communication timeout during homing".to_string(),
@@ -297,6 +303,7 @@ mod tests {
             },
             "responses": {
                 "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c": 43,
+                "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u": 35,
                 "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
             },
             "enumerations": {"pin": {"PA0": 0, "PA1": 1}},

@@ -89,6 +89,8 @@
 //! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
 //! | a container joined with `~` | `str()` of it, elements `repr`-quoted: `'x' ~ {'call': 'PAUSE'}` is `x{'call': 'PAUSE'}` | the engine's `Display`, elements unquoted: `'x' ~ {'call': 'PAUSE'}` is `x{call: PAUSE}` — `~` joins through `Display` before the formatter sees a string, so only a whole tag (`{ … }`) gets Python's spelling |
 //! | printing a *silent* undefined (`{x if c}`, which has no `else`) | blank | an `undefined value` error: the engine's own formatter lets *that* one print nothing (it tells the two kinds of undefined apart), a custom formatter does not — `ValueKind::Undefined` is one kind — so the strict check [`format_output`] repeats covers both; a *default* undefined (`{nope}`) is the error it always was |
+//! | `"…%s…" % value` (a **string literal** directly left of `%`) | Python's printf formatting | rewritten at compile time into the engine's `\|format` filter, which is the same printf formatting with its arguments passed separately: `{"Restoring \"%s\"" % x}` → `{"Restoring \"%s\""\|format(x)}` ([`rewrite_printf_formatting`]). Both tag kinds carry expressions, so `{ … }` and `{% … %}` are both rewritten; a `{# … #}` comment is not. Narrow on purpose: the literal must be alone on the left and its `%` must end an operand position — any other `%` stays the remainder operator, and a formatting this rewrite cannot read fails the load the way it did before rather than mis-rendering |
+//! | `"%(key)s" % {'key': v}` (a mapping operand) | formatted from the mapping | unsupported: the operand right of `%` is a dict literal this rewrite does not read, so the tag keeps its Python spelling and fails the load (`%` is the remainder, which a string left operand cannot take); `\|format` reads a mapping only when the whole operand is one map value |
 //!
 //! Detail wording differs wherever the engine owns the wording. The frames
 //! (`Error loading template '<name>'\nline <n>: …`, `Error evaluating
@@ -111,6 +113,7 @@
 //! A failure the engine reports without a location (`error.line()` is `None`)
 //! reads as line 1.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -441,12 +444,19 @@ impl Template {
     /// Compile `source`, reporting an unparsable body with upstream's
     /// load-error frame (`gcode_macro.py:57-60`).
     ///
+    /// Python's string `%` formatting is rewritten into the engine's
+    /// `\|format` filter first ([`rewrite_printf_formatting`]) — in a `{ … }`
+    /// expression tag and in a `{% … %}` statement tag alike. The rewrite adds
+    /// and removes no newline, so a load error still names the line the body
+    /// wrote.
+    ///
     /// # Errors
     /// A syntax error in the body: an unclosed tag, a statement the engine
     /// does not know, an unbalanced block, a malformed expression.
     pub fn parse(name: &str, source: &str) -> Result<Self, TemplateError> {
         let mut env = environment();
-        env.add_template_owned(name.to_string(), source.to_string())
+        let source = rewrite_printf_formatting(source);
+        env.add_template_owned(name.to_string(), source.into_owned())
             .map_err(|error| TemplateError::of(name, Phase::Load, &error))?;
         Ok(Self {
             name: name.to_string(),
@@ -475,6 +485,379 @@ impl Template {
             .render(&context.bindings())
             .map_err(|error| TemplateError::of(&self.name, Phase::Evaluate, &error))
     }
+}
+
+// ===========================================================================
+// Python's `%` formatting
+// ===========================================================================
+
+/// Rewrite Python's string formatting into the engine's `\|format` filter.
+///
+/// Upstream runs Jinja2, where a string on the left of `%` is Python's printf
+/// formatting (`"Restoring \"%s\"" % printer.toolhead.extruder`); this engine's
+/// `%` is the remainder operator and refuses a string operand outright. Its
+/// `format` filter is printf formatting with the arguments passed separately
+/// (`"%s, %s!"\|format(a, b)`), so such a formatting is rewritten into that call
+/// — the eleven in `mainsail.cfg`, eight inside a `{ … }` tag and three inside
+/// a `{% set %}` (`145`, `152`, `163`).
+///
+/// Both tag kinds carry expressions, so both are rewritten; the rewrite is
+/// narrow on purpose, so every other `%` keeps the engine's own meaning:
+///
+/// - `{ … }` expression tags and `{% … %}` statement tags are rewritten; a
+///   `{# … #}` comment and everything between tags are copied byte for byte.
+///   The `%` of a `{%` opener and of a `%}` closer is a delimiter, never an
+///   operator, because a body starts after the one and ends before the other;
+/// - the operand left of `%` must be **exactly one string literal** (single or
+///   double quoted, escapes included) with only whitespace between it and the
+///   `%`, and it must not itself be the right operand of something else;
+///   otherwise the `%` stays the remainder operator — `{% set x = 100 %}` and
+///   `{% if n % 2 == 0 %}` come through untouched;
+/// - the operand right of it must end an operand position (the body's end, a
+///   `,` `)` `]` `}` or `|`); a formatting this rewrite cannot read (an
+///   unbalanced bracket, a dict operand, an operator binding looser than a
+///   filter) is left as it is and fails the load the way it does today — never
+///   silently mis-rendered;
+/// - that operand becomes the filter's arguments: one parenthesized group
+///   whose top level holds commas is a tuple (`(a, b)` → `format(a, b)`), one
+///   without is a single argument (`(a)` → `format(a)`), and any other operand
+///   is taken whole, trailers included (`(xs.split(" "))[1]` is one argument);
+/// - no newline is added or removed, so an error still reports the line number
+///   the body wrote.
+fn rewrite_printf_formatting(source: &str) -> Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let mut rewritten = String::with_capacity(source.len());
+    let mut kept = 0;
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let (body_start, body_end, after) = match bytes.get(i + 1).copied() {
+            // A statement tag: its body is what `{%` and `%}` enclose.
+            Some(b'%') => {
+                let Some(close) = find_bytes(bytes, b"%}", i + 2) else {
+                    break;
+                };
+                (i + 2, close, close + 2)
+            }
+            // A comment tag: copied verbatim, end or no end.
+            Some(b'#') => {
+                let Some(close) = find_bytes(bytes, b"#}", i + 2) else {
+                    break;
+                };
+                i = close + 2;
+                continue;
+            }
+            // An expression tag, whose `}` a dict literal or a `split("}")`
+            // inside it does not end early.
+            _ => {
+                let Some(close) = tag_end(bytes, i + 1) else {
+                    break;
+                };
+                (i + 1, close, close + 1)
+            }
+        };
+        if let Some(body) = rewrite_tag_body(&source[body_start..body_end]) {
+            rewritten.push_str(&source[kept..body_start]);
+            rewritten.push_str(&body);
+            kept = body_end;
+            changed = true;
+        }
+        i = after;
+    }
+    if !changed {
+        return Cow::Borrowed(source);
+    }
+    rewritten.push_str(&source[kept..]);
+    Cow::Owned(rewritten)
+}
+
+/// One tag body with every `"…" % operand` in it rewritten, or `None` when it
+/// holds no formatting this rewrite reads.
+fn rewrite_tag_body(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut rewritten: Option<String> = None;
+    let mut kept = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // A string literal's own characters are never structure: not its
+            // brackets, and not its `%`.
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'%' => {
+                // A `%` this rewrite cannot read stays the remainder it is.
+                let Some((start, call, end)) = printf_call(body, i) else {
+                    i += 1;
+                    continue;
+                };
+                let out = rewritten.get_or_insert_with(String::new);
+                out.push_str(&body[kept..start]);
+                out.push_str(&call);
+                kept = end;
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut rewritten = rewritten?;
+    rewritten.push_str(&body[kept..]);
+    Some(rewritten)
+}
+
+/// The `"…"\|format(…)` call replacing the formatting whose `%` sits at `pct`,
+/// the index of the literal it starts at, and the index just past the operand
+/// it replaces.
+fn printf_call(body: &str, pct: usize) -> Option<(usize, String, usize)> {
+    let bytes = body.as_bytes();
+    let literal = string_before(bytes, pct)?;
+    // The literal has to start an operand itself: right after a value or a
+    // closing bracket it is the *right* operand of something, where a filter
+    // would bind tighter than the operator there and change the meaning.
+    if let Some(before) = bytes[..literal]
+        .iter()
+        .rfind(|byte| !byte.is_ascii_whitespace())
+    {
+        if before.is_ascii_alphanumeric()
+            || matches!(before, b'_' | b'\'' | b'"' | b')' | b']' | b'}')
+        {
+            return None;
+        }
+    }
+    let (arguments, end) = printf_arguments(body, pct + 1)?;
+    // ... and what follows it has to end an operand position; an operator there
+    // binds looser than a filter and would be rebound by the rewrite.
+    if !matches!(
+        bytes.get(skip_whitespace(bytes, end)).copied(),
+        None | Some(b',') | Some(b')') | Some(b']') | Some(b'}') | Some(b'|')
+    ) {
+        return None;
+    }
+    Some((
+        literal,
+        // The literal without the whitespace the `%` was padded with.
+        format!(
+            "{}|format({})",
+            &body[literal..string_close(bytes, literal)? + 1],
+            arguments
+        ),
+        end,
+    ))
+}
+
+/// The filter arguments of the formatting whose `%` sits just before `from`,
+/// and the index just past the operand they were read from.
+fn printf_arguments(body: &str, from: usize) -> Option<(String, usize)> {
+    let bytes = body.as_bytes();
+    let start = skip_whitespace(bytes, from);
+    if bytes.get(start) == Some(&b'(') {
+        let close = bracket_close(bytes, start)?;
+        // A group with a trailer — `(xs.split(" "))[1]` — is one operand, not a
+        // tuple: the trailer belongs to it.
+        let trailered = matches!(bytes.get(close + 1).copied(), Some(b'[' | b'.' | b'('));
+        if !trailered {
+            let arguments = tuple_arguments(body, start + 1, close)?;
+            return Some((arguments, close + 1));
+        }
+    }
+    let end = simple_operand_end(bytes, start)?;
+    Some((body[start..end].to_string(), end))
+}
+
+/// The arguments of a parenthesized group whose body is `body[from..to]`: its
+/// top-level commas split them, and a group without one is one argument.
+fn tuple_arguments(body: &str, from: usize, to: usize) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut arguments: Vec<&str> = Vec::new();
+    let mut depth = 0usize;
+    let mut item = from;
+    let mut i = from;
+    while i < to {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.checked_sub(1)?,
+            b',' if depth == 0 => {
+                arguments.push(body[item..i].trim());
+                item = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = body[item..to].trim();
+    // `(a,)` is Python's one-element tuple.
+    if !last.is_empty() {
+        arguments.push(last);
+    }
+    if arguments.is_empty() || arguments.iter().any(|argument| argument.is_empty()) {
+        return None;
+    }
+    Some(arguments.join(", "))
+}
+
+/// The end of the single operand starting at `start`: a primary (a name, a
+/// number, a string, a bracketed group) followed by its `.name` / `[…]` / `(…)`
+/// trailers, so `(xs.split(" "))[1]` is one operand.
+fn simple_operand_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = primary_end(bytes, start)?;
+    loop {
+        end = match bytes.get(end).copied() {
+            Some(b'.') => name_end(bytes, end + 1)?,
+            Some(b'[' | b'(') => bracket_close(bytes, end)? + 1,
+            _ => return Some(end),
+        };
+    }
+}
+
+/// The end of a primary expression: a name, a number, a string literal or a
+/// bracketed group.
+fn primary_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'\'' | b'"' => string_close(bytes, start).map(|close| close + 1),
+        b'(' | b'[' => bracket_close(bytes, start).map(|close| close + 1),
+        digit if digit.is_ascii_digit() => {
+            let mut end = start;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            // A fraction, not the `.name` trailer of a name.
+            if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+            }
+            Some(end)
+        }
+        name if name.is_ascii_alphabetic() || name == b'_' => name_end(bytes, start),
+        _ => None,
+    }
+}
+
+/// The end of the name starting at `start`.
+fn name_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    (end > start).then_some(end)
+}
+
+/// The opening quote of the string literal that ends (whitespace aside) right
+/// before `pct`, or `None` when the operand left of it is not a string literal.
+fn string_before(bytes: &[u8], pct: usize) -> Option<usize> {
+    let mut end = pct;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let quote = *bytes.get(end.checked_sub(1)?)?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    // The closing quote is the one we landed on; the literal's opening one is
+    // the nearest same quote before it that no backslash escapes.
+    let mut open = end - 1;
+    while open > 0 {
+        open -= 1;
+        if bytes[open] != quote {
+            continue;
+        }
+        let mut escapes = 0;
+        while open > escapes && bytes[open - escapes - 1] == b'\\' {
+            escapes += 1;
+        }
+        if escapes % 2 == 0 {
+            return Some(open);
+        }
+    }
+    None
+}
+
+/// The index of the quote closing the string literal that opens at `open`, its
+/// escapes counted, or `None` when it never closes.
+fn string_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let quote = *bytes.get(open)?;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == quote {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The index of the `}` closing a `{ … }` tag whose body starts at `from`: the
+/// first one at bracket depth zero and outside a string.
+fn tag_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the bracket closing the one at `open`, strings and nesting
+/// inside it accounted for.
+fn bracket_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The first index of `needle` in `haystack` at or after `from`.
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the first non-whitespace byte at or after `from`.
+fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
 }
 
 /// The environment every body is compiled into: upstream's delimiters,
@@ -938,6 +1321,215 @@ mod tests {
             "\n\n\nSET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer \
              VALUE=\"{'call': 'PAUSE', 'enable': True}\"\n"
         );
+    }
+
+    /// `mainsail.cfg`'s printf formatings in **expression** tags, body for
+    /// body: upstream runs Jinja2, where a string on the left of `%` is
+    /// Python's printf formatting, which this engine's `%` (the remainder)
+    /// refuses; [`rewrite_printf_formatting`] turns each tag into the engine's
+    /// `|format` filter before it is compiled, `%s` / `%d` / `%3.1f` / `%%`
+    /// included.
+    #[test]
+    fn mainsail_printf_formatings_render() {
+        let printer = printer_with("toolhead", json!({"extruder": "extruder"}));
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("last_extruder_temp", Rt::Json(json!({"temp": 205.0})));
+        context.insert("element", Rt::Json(json!("M117 hello")));
+        context.insert("pause_next_layer", Rt::Json(json!({"call": "PAUSE"})));
+        context.insert(
+            "pause_at_layer",
+            Rt::Json(json!({"call": "PAUSE_AT_LAYER", "layer": 12})),
+        );
+
+        // A `(a, b)` tuple becomes two arguments, a `%3.1f` a printf float.
+        assert_eq!(
+            render(
+                r#"{"Restoring \"%s\" temperature to %3.1f\u00B0C, this may take some time" % (printer.toolhead.extruder, last_extruder_temp.temp) }"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:138 renders"),
+            "Restoring \"extruder\" temperature to 205.0\u{00B0}C, this may take some time"
+        );
+        // A single operand, no parentheses.
+        assert_eq!(
+            render(
+                r#"{"Resume aborted !!! \"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:144 renders"),
+            "Resume aborted !!! \"extruder\" not hot enough, please heat up again and press RESUME"
+        );
+        assert_eq!(
+            render(r#"{"action:prompt_text %s" % element}"#, &mut context)
+                .expect("mainsail.cfg:169 renders"),
+            "action:prompt_text M117 hello"
+        );
+        assert_eq!(
+            render(
+                r#"{"%s, forced by pause_next_layer" % pause_next_layer.call}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:203 renders"),
+            "PAUSE, forced by pause_next_layer"
+        );
+        assert_eq!(
+            render(
+                r#"{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:207 renders"),
+            "PAUSE_AT_LAYER, forced by pause_at_layer [12]"
+        );
+        // `%%` is one literal `%`, as in Python.
+        assert_eq!(
+            render(r#"{"%d%% of %s" % (12, element)}"#, &mut context).expect("a `%%` renders"),
+            "12% of M117 hello"
+        );
+    }
+
+    /// A statement tag carries expressions too, so `{% set %}` is rewritten
+    /// the same way: `mainsail.cfg:145`/`:152` (one body) and `:163`, whose
+    /// printf sits inside a `prompt_txt.append(…)` call — the exact source and
+    /// the exact rewritten text, then a render of the same tag.
+    #[test]
+    fn mainsail_printf_formatings_in_set_tags_are_rewritten() {
+        let not_hot_enough: &str = r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder) %}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(not_hot_enough),
+            r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME"|format(printer.toolhead.extruder)) %}"#
+        );
+
+        let no_filament: &str = r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]) %}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(no_filament),
+            r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])) %}"#
+        );
+
+        // `.append(…)` and `.split(…)` are Python **methods** this port's
+        // engine does not have yet (the `|format` operand text is the part
+        // this unit owns), so the render keeps the tag and the literal and
+        // binds what the call would have produced.
+        let printer = printer_with("toolhead", json!({"extruder": "extruder"}));
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("runout_name", Rt::Json(json!("Sensor")));
+        assert_eq!(
+            render(
+                r##"{% set txt = "\"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder %}{txt}"##,
+                &mut context
+            )
+            .expect("a set-tag formatting renders"),
+            "\"extruder\" not hot enough, please heat up again and press RESUME"
+        );
+        assert_eq!(
+            render(
+                r##"{% set txt = "\"%s\" detects no filament, please load filament and press RESUME" % runout_name %}{txt}"##,
+                &mut context
+            )
+            .expect("a set-tag formatting renders"),
+            "\"Sensor\" detects no filament, please load filament and press RESUME"
+        );
+    }
+
+    /// The expression-tag half of `mainsail.cfg:162`: a parenthesized group with
+    /// a trailer is **one** argument, `(client.runout_sensor.split(" "))[1]`.
+    #[test]
+    fn a_trailered_group_is_one_format_argument() {
+        let source: &str = r#"{"\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(source),
+            r#"{"\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])}"#
+        );
+        // `.split(…)` is a Python method this port's engine does not have yet,
+        // so the render binds what the call would have produced.
+        let mut context = context(&[], "");
+        context.insert("runout_name", Rt::Json(json!("Sensor")));
+        assert_eq!(
+            render(
+                r#"{"\"%s\" detects no filament, please load filament and press RESUME" % runout_name}"#,
+                &mut context
+            )
+            .expect("renders"),
+            "\"Sensor\" detects no filament, please load filament and press RESUME"
+        );
+    }
+
+    /// Every other `%` keeps the engine's meaning: a numeric left operand is
+    /// untouched, a non-literal one is left to fail the way it does today, and
+    /// a formatting the rewrite cannot read is not guessed at (no panic, the
+    /// loud load error it always was).
+    #[test]
+    fn a_percent_that_is_not_a_string_formatting_is_left_alone() {
+        assert_eq!(ok("{ 7 % 3 }"), "1");
+        assert_eq!(ok("{ 17 * 2 + 1 % 4 }"), "35");
+
+        let mut context = context(&[], "");
+        context.insert("s", Rt::Json(json!("abc")));
+        let error = render("{ s % 3 }", &mut context).expect_err("% of a string");
+        assert!(
+            error
+                .to_string()
+                .contains("tried to use % operator on unsupported types string and number"),
+            "{error}"
+        );
+        assert!(Template::parse("t", r#"{"x %s" % (a}"#).is_err());
+        let error = render(r#"{"%(key)s" % {'key': 1}}"#, &mut context).expect_err("a mapping");
+        assert!(
+            error
+                .to_string()
+                .contains("tried to use % operator on unsupported types string and map"),
+            "{error}"
+        );
+    }
+
+    /// A `{% set %}` or `{% if %}` whose `%` is an **operator**, a comment tag
+    /// and the text between tags keep their bytes, and the rewrite adds no
+    /// newline — an error still names the line the body wrote.
+    #[test]
+    fn the_printf_rewrite_leaves_non_formatings_and_comments_alone() {
+        for source in [
+            "{% set x = 100 %}",
+            "{% if n % 2 == 0 %}even{% else %}odd{% endif %}",
+            "{# \"%s\" % x #}",
+            "{# \"%s\" % x #}\"%s\" % x",
+        ] {
+            assert_eq!(&*rewrite_printf_formatting(source), source);
+        }
+        assert_eq!(ok("{% set x = 100 %}{x}"), "100");
+        let mut context = context(&[], "");
+        context.insert("n", Rt::Json(json!(4)));
+        assert_eq!(
+            render(
+                "{% if n % 2 == 0 %}even{% else %}odd{% endif %}",
+                &mut context
+            )
+            .expect("`%` is still the remainder"),
+            "even"
+        );
+        context.insert("t", Rt::Json(json!("v")));
+        assert_eq!(
+            render(
+                "{# \"%s\" % t #}\"%s\" % t\n{% set x = 1 %}{x}",
+                &mut context
+            )
+            .expect("text and tags survive"),
+            "\"%s\" % t\n1"
+        );
+        let error = render("{\"%s\" % t}\n{nope}", &mut context).expect_err("undefined");
+        assert!(error.to_string().contains("line 2"), "{error}");
+    }
+
+    /// The vendored client macro file itself: every one of its eleven printf
+    /// formatings is rewritten — six in `{ … }` tags, five in `{% set %}` —
+    /// and no newline moves, so its error frames still name its own lines.
+    #[test]
+    fn every_printf_in_the_vendored_mainsail_file_is_rewritten() {
+        let source = include_str!("mainsail.cfg");
+        let rewritten = rewrite_printf_formatting(source);
+        assert_eq!(source.matches("|format(").count(), 0);
+        assert_eq!(rewritten.matches("|format(").count(), 11);
+        assert_eq!(rewritten.lines().count(), source.lines().count());
     }
 
     /// `if` / `elif` / `else` and `for` over `range(… | int)`, the shapes

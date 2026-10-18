@@ -775,7 +775,7 @@ impl TriggerDispatch {
 mod tests {
     use super::*;
 
-    use crate::core::klippy::interface::devices::frame_mock::FrameMock;
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, RecordingWire};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
     use crate::core::klippy::pins::{PinParams, PrinterPins};
@@ -808,6 +808,63 @@ mod tests {
         let mcu = Mcu::for_test(name, Interface::new(FrameMock::new(Vec::new())));
         mcu.install_dictionary(dictionary()).unwrap();
         Arc::new(mcu)
+    }
+
+    /// An identified MCU whose sends a test can read back as raw blocks.
+    ///
+    /// A `RecordingWire`, not a `FrameMock`: the frame mock accepts only what a
+    /// mapping entry scripts, so an unsolicited `trsync_trigger` would never be
+    /// recorded.
+    fn recording_mcu(name: &str) -> (Arc<Mcu>, Arc<Mutex<Vec<Vec<u8>>>>) {
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test(name, Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        (mcu, sent)
+    }
+
+    /// Closes the fake session when a test ends — on a failed assertion too.
+    ///
+    /// A `RecordingWire`'s read parks in `spawn_blocking`; only `Mcu::close`
+    /// releases it, and a session left open holds up the runtime's shutdown for
+    /// the whole test binary (the shape `endstop.rs`'s `SessionGuard` documents).
+    struct SessionGuard(Arc<Mcu>);
+
+    impl Drop for SessionGuard {
+        fn drop(&mut self) {
+            self.0.clear_events();
+            self.0.close();
+        }
+    }
+
+    /// The message names the recorded wire blocks carry, decoded with this test
+    /// dictionary's command table.
+    fn sent_message_names(blocks: &[Vec<u8>]) -> Vec<String> {
+        use crate::core::klippy::msg::parser::Parser;
+        use crate::core::klippy::msg::proto::Payload;
+
+        let mut parser = Parser::new();
+        for (id, format) in [
+            (30, "config_trsync oid=%c"),
+            (
+                31,
+                "trsync_start oid=%c report_clock=%u report_ticks=%u expire_reason=%c",
+            ),
+            (32, "trsync_set_timeout oid=%c clock=%u"),
+            (33, "trsync_trigger oid=%c reason=%c"),
+            (34, "stepper_stop_on_trigger oid=%c trsync_oid=%c"),
+        ] {
+            parser.register(id, format).unwrap();
+        }
+        blocks
+            .iter()
+            .flat_map(|block| {
+                parser
+                    .decode(Payload::from_raw(block.clone()))
+                    .unwrap_or_default()
+            })
+            .map(|(message, _)| message.name.clone())
+            .collect()
     }
 
     fn chip(name: &str, mcu: Arc<Mcu>) -> McuChip {
@@ -901,6 +958,92 @@ mod tests {
 
         assert_eq!(completion.raw(), None);
         assert_eq!(completion.reason(), None);
+    }
+
+    /// A dispatch whose trigger report never arrives must not park the wait:
+    /// [`HOME_WAIT_TIMEOUT`] of silence fails it as a communication timeout —
+    /// what `home_wait` raises as upstream's "Communication timeout during
+    /// homing" — and the close-out puts `trsync_trigger` on the wire, so the
+    /// firmware stops the group instead of driving on.
+    ///
+    /// This is the shipped hang: every `trsync_state` report went unhandled, the
+    /// completion never fired, and `G28` — with the g-code script parked on it —
+    /// never returned.
+    /// Real time, not the paused clock: an `Mcu` in the runtime (its receive task
+    /// parks in `spawn_blocking`) stops `start_paused` from advancing the clock,
+    /// so a virtual wait would hang instead of timing out.
+    #[tokio::test]
+    async fn test_a_dispatch_with_no_report_fails_the_wait_after_the_silence_timeout() {
+        let (mcu, sent) = recording_mcu("mcu");
+        // Declared before the resource, so it drops last.
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", Arc::clone(&mcu))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            completion.wait().await,
+            TriggerReason::CommsTimeout,
+            "a lost trigger report must fail the dispatch, not hang it"
+        );
+        assert!(
+            started.elapsed() >= HOME_WAIT_TIMEOUT,
+            "the wait is bounded by HOME_WAIT_TIMEOUT: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(completion.raw(), Some(TriggerReason::CommsTimeout as u8));
+
+        // The dispatcher is closed down the way `McuEndstop::home_wait` does it
+        // on the failure path, and the firmware is told to fire the group.
+        assert_eq!(dispatch.stop(), TriggerReason::CommsTimeout);
+        mcu.flush(Duration::from_millis(500)).await.unwrap();
+        let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let names = sent_message_names(&blocks);
+        assert!(
+            names.iter().any(|name| name == "trsync_trigger"),
+            "the firmware must be told to stop the group: {names:?}"
+        );
+    }
+
+    /// The clock the wait is bounded by measures *silence*, not the length of
+    /// the move: a `trsync_state` report pushes it out, so a long homing move
+    /// whose firmware keeps reporting is never failed by it.
+    #[tokio::test]
+    async fn test_a_report_pushes_the_silence_deadline_out() {
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+        let trsync = first(&dispatch);
+
+        // Four seconds in, the firmware reports it is still armed.
+        //
+        // Real time, not the paused clock: an `Mcu` in the runtime (its receive
+        // task parks in `spawn_blocking`) stops `start_paused` from advancing
+        // the clock at all, so a virtual sleep here would hang the test.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        trsync.handle_state(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: true,
+            trigger_reason: 0,
+            clock: 0,
+        });
+
+        // Six seconds after the arm — past the deadline the arm set — the wait
+        // still stands, because that report restarted the clock.
+        let pending = completion.wait_raw();
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), &mut pending)
+                .await
+                .is_err(),
+            "a live report must restart the silence clock"
+        );
+        // And it gives up five seconds after that report.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(4), pending)
+                .await
+                .expect("the silence clock runs out"),
+            TriggerReason::CommsTimeout as u8
+        );
     }
 
     #[tokio::test]

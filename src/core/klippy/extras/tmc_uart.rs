@@ -1002,6 +1002,9 @@ fn write_register_verified(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::msg::parser::Parser;
+    use serde_json::json;
 
     #[test]
     fn the_crc8_matches_a_known_read_frame() {
@@ -1031,5 +1034,253 @@ mod tests {
     #[test]
     fn a_short_response_does_not_decode() {
         assert_eq!(decode_read(0x6f, &[0, 1, 2]), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // The wire commands
+    // -----------------------------------------------------------------------
+
+    /// A parser carrying the two `tmcuart` messages as `src/tmcuart.c` declares
+    /// them, so a frame is checked against the firmware's own format string.
+    fn parser() -> Parser {
+        let dictionary = Dictionary::from_json(json!({
+            "commands": {"tmcuart_send oid=%c write=%*s read=%c": 60},
+            "responses": {"tmcuart_response oid=%c read=%*s": 61}
+        }))
+        .unwrap();
+        let mut parser = Parser::new();
+        dictionary.install(&mut parser).unwrap();
+        parser
+    }
+
+    #[test]
+    fn the_send_command_is_oid_bytes_and_a_read_length() {
+        let command = read_command(3, 0x00, 0x6f);
+
+        assert_eq!(TmcuartSend::NAME, "tmcuart_send");
+        assert_eq!(
+            command.args(),
+            vec![
+                ArgValue::UInt8(3),
+                ArgValue::Bytes(encode_read(0x00, 0x6f)),
+                ArgValue::UInt8(UART_READ_LEN),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_send_command_round_trips_through_the_firmware_format() {
+        let parser = parser();
+        let command = read_command(3, 0x00, 0x6f);
+
+        let encoded = parser.encode(TmcuartSend::NAME, &command.args()).unwrap();
+        let decoded = parser.decode(encoded).unwrap();
+
+        assert_eq!(decoded[0].0.name, TmcuartSend::NAME);
+        assert_eq!(decoded[0].1, command.args());
+    }
+
+    #[test]
+    fn the_response_decodes_its_oid_and_bytes() {
+        let parser = parser();
+        let encoded = parser
+            .encode(
+                TmcuartResponse::NAME,
+                &[ArgValue::UInt8(3), ArgValue::Bytes(vec![1, 2, 3])],
+            )
+            .unwrap();
+        let decoded = parser.decode(encoded).unwrap();
+
+        let response =
+            TmcuartResponse::decode(&Params::new(Arc::clone(&decoded[0].0), &decoded[0].1))
+                .unwrap();
+
+        assert_eq!(TmcuartResponse::NAME, "tmcuart_response");
+        assert_eq!(
+            response,
+            TmcuartResponse {
+                oid: 3,
+                read: vec![1, 2, 3]
+            }
+        );
+    }
+
+    #[test]
+    fn a_requested_read_length_is_one_full_response_frame() {
+        // `read = 10` is what the firmware clocks in for one register; the
+        // decoder refuses anything else, so the two must agree.
+        let frame = encode_write(0x05, 0xff, 0x6f, 0);
+        assert_eq!(frame.len(), usize::from(UART_READ_LEN));
+        assert_eq!(UART_READ_LEN, 10);
+    }
+
+    #[test]
+    fn a_write_frame_asks_for_no_response() {
+        // `read = 0` makes the firmware skip `tmcuart_response` entirely
+        // (`src/tmcuart.c`), so the write path sends this frame through
+        // `Mcu::send_msg_clocked` and never waits for an answer — a `call`
+        // here would park until the timeout, every time.
+        let command = write_command(3, 0x00, 0x6f, 0x1234_5678);
+
+        assert_eq!(
+            command,
+            TmcuartSend {
+                oid: 3,
+                write: encode_write(UART_SYNC, 0x00, 0x6f | 0x80, 0x1234_5678),
+                read: 0,
+            }
+        );
+        assert_eq!(command.args()[2], ArgValue::UInt8(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // The retry loops
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_write_is_accepted_once_the_frame_counter_advances() {
+        // The first two frames never reach the chip (the counter stands still);
+        // the third one does.
+        let counter = std::cell::Cell::new(10u8);
+        let mut writes = 0;
+        let mut ifcnt = None;
+
+        write_register_verified(
+            "stepper_x",
+            "GCONF",
+            &mut ifcnt,
+            || {
+                writes += 1;
+                if writes == 3 {
+                    counter.set(counter.get().wrapping_add(1));
+                }
+                Ok(())
+            },
+            || Ok(u32::from(counter.get())),
+        )
+        .unwrap();
+
+        assert_eq!(writes, 3);
+        assert_eq!(ifcnt, Some(11));
+    }
+
+    #[test]
+    fn a_cached_frame_counter_saves_the_baseline_read() {
+        let counter = std::cell::Cell::new(5u8);
+        let mut reads = 0;
+        let mut ifcnt = Some(5);
+
+        write_register_verified(
+            "stepper_x",
+            "GCONF",
+            &mut ifcnt,
+            || {
+                counter.set(counter.get().wrapping_add(1));
+                Ok(())
+            },
+            || {
+                reads += 1;
+                Ok(u32::from(counter.get()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reads, 1, "only the read-back, not a fresh baseline");
+        assert_eq!(ifcnt, Some(6));
+    }
+
+    #[test]
+    fn a_write_whose_frame_counter_never_advances_gives_up_after_five() {
+        let mut writes = 0;
+        let mut reads = 0;
+        let mut ifcnt = None;
+
+        let err = write_register_verified(
+            "stepper_x",
+            "GCONF",
+            &mut ifcnt,
+            || {
+                writes += 1;
+                Ok(())
+            },
+            || {
+                reads += 1;
+                Ok(7)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(writes, UART_ATTEMPTS as usize);
+        assert_eq!(
+            reads,
+            UART_ATTEMPTS as usize + 1,
+            "one baseline read plus a read-back per attempt"
+        );
+        match err {
+            McuError::Config(msg) => {
+                assert_eq!(msg, "Unable to write tmc uart 'stepper_x' register GCONF")
+            }
+            other => panic!("expected the write report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bad_read_frame_is_retried_and_a_later_one_is_used() {
+        let mut attempts = 0;
+
+        let register = read_register_with_retries("stepper_x", "GCONF", || {
+            attempts += 1;
+            if attempts < 3 {
+                Ok(None)
+            } else {
+                Ok(Some(TmcRegister {
+                    data: 7,
+                    receive_time: 1.5,
+                }))
+            }
+        })
+        .unwrap();
+
+        assert_eq!(attempts, 3);
+        assert_eq!(register.data, 7);
+        assert_eq!(register.receive_time, 1.5);
+    }
+
+    #[test]
+    fn five_bad_read_frames_report_upstream_s_message() {
+        let mut attempts = 0;
+
+        let err = read_register_with_retries("stepper_x", "GCONF", || {
+            attempts += 1;
+            Ok(None)
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, UART_ATTEMPTS as usize);
+        match err {
+            McuError::Config(msg) => {
+                assert_eq!(msg, "Unable to read tmc uart 'stepper_x' register GCONF")
+            }
+            other => panic!("expected the read report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bus_error_is_reported_without_a_retry() {
+        let mut attempts = 0;
+
+        let err = read_register_with_retries("stepper_x", "GCONF", || {
+            attempts += 1;
+            Err(McuError::Call(McuCallError::Timeout(
+                "no tmcuart_response".to_string(),
+            )))
+        })
+        .unwrap_err();
+
+        assert_eq!(attempts, 1, "a timeout is not a frame error");
+        assert!(
+            matches!(err, McuError::Call(McuCallError::Timeout(_))),
+            "{err:?}"
+        );
     }
 }

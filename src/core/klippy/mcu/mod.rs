@@ -2730,6 +2730,9 @@ impl Mcu {
     /// Returns [`McuCallError`] if the command is unknown, already has a
     /// callback, the send buffer is full, or the response does not arrive
     /// within `timeout`.
+    ///
+    /// When several answers share this response name and only a tag tells them
+    /// apart, use [`Mcu::call_oid`].
     pub async fn call(
         &self,
         command: &str,
@@ -2737,19 +2740,62 @@ impl Mcu {
         response_name: &str,
         timeout: Duration,
     ) -> Result<Vec<ArgValue>, McuCallError> {
-        self.call_gated(command, args, response_name, timeout, SendClocks::default())
-            .await
+        self.call_gated_oid(
+            command,
+            args,
+            None,
+            response_name,
+            timeout,
+            SendClocks::default(),
+        )
+        .await
     }
 
-    /// [`Mcu::call`] with scheduling gates on the request ([`SendClocks`]).
+    /// [`Mcu::call`] whose response must carry `oid`, upstream's
+    /// `serial.register_response(cb, name, oid)`.
     ///
-    /// Used by the typed clocked call (`Mcu::call_msg_clocked`, `cmd`) — the
-    /// homing query paths are the callers that gate (`endstop_query_state`'s
-    /// `minclock`, upstream `klippy/mcu.py:401-405`).
-    pub(crate) async fn call_gated(
+    /// The response only resolves this call when its first parameter is `oid`.
+    /// That is what keeps several peripherals on one connection apart: the TMC
+    /// UART and SPI layers query many chips over the same MCU, and every answer
+    /// arrives under the same message name (`tmc_uart_read_response oid=%c
+    /// data=%*s`). A response for a different `oid` is dropped, never handed to
+    /// whoever happens to be waiting.
+    ///
+    /// # Errors
+    /// As [`Mcu::call`].
+    pub async fn call_oid(
         &self,
         command: &str,
         args: &[ArgValue],
+        oid: u8,
+        response_name: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ArgValue>, McuCallError> {
+        self.call_gated_oid(
+            command,
+            args,
+            Some(oid),
+            response_name,
+            timeout,
+            SendClocks::default(),
+        )
+        .await
+    }
+
+    /// Shared body of the synchronous calls: register, send, wait, clean up.
+    ///
+    /// `oid` is `None` for the plain call and `Some` for [`Mcu::call_oid`]; it
+    /// goes into the registration so the receive task can tell the answers
+    /// apart, and it is part of what gets cancelled on every failure path.
+    ///
+    /// The typed calls in [`cmd`](crate::core::klippy::cmd) pass their
+    /// [`SendClocks`] through here — the homing query paths gate
+    /// (`endstop_query_state`'s `minclock`, upstream `klippy/mcu.py:401-405`).
+    pub(crate) async fn call_gated_oid(
+        &self,
+        command: &str,
+        args: &[ArgValue],
+        oid: Option<u8>,
         response_name: &str,
         timeout: Duration,
         clocks: SendClocks,
@@ -2768,16 +2814,16 @@ impl Mcu {
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
 
-        // 3. Register the pending call.
+        // 3. Register the pending call — with its `oid`, when it has one.
         self.pending_calls
-            .register(response_name.to_string(), tx)
+            .register(response_name.to_string(), oid, tx)
             .await;
 
         // 4. Send the command. Its line names the response it is waiting for.
         if let Err(e) = self.enqueue(command, args, Some(response_name), clocks) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
-            self.pending_calls.cancel(response_name).await;
+            self.pending_calls.cancel(response_name, oid).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
 
@@ -2789,7 +2835,7 @@ impl Mcu {
             Ok(Ok(params)) => Ok(params),
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
-                self.pending_calls.cancel(response_name).await;
+                self.pending_calls.cancel(response_name, oid).await;
                 error!(
                     "[{}] Response receiver dropped for '{}'",
                     self.name, response_name
@@ -2800,7 +2846,7 @@ impl Mcu {
             }
             Err(_) => {
                 // Timeout — clean up the pending call.
-                self.pending_calls.cancel(response_name).await;
+                self.pending_calls.cancel(response_name, oid).await;
                 warn!(
                     "[{}] Timeout waiting for response '{}'",
                     self.name, response_name
@@ -3078,6 +3124,154 @@ mod tests {
                 .expect("both exchanges must complete");
             assert_eq!(params, vec![ArgValue::UInt32(0x1234)]);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // call_oid: answers told apart by their `oid`
+    // -----------------------------------------------------------------------
+
+    /// `tmc_uart_read oid=%c write=%*s read_len=%u` / `tmc_uart_read_response
+    /// oid=%c data=%*s` — the TMC bus pair: one command and one answer name for
+    /// every chip, `oid` first in the answer.
+    fn tmc_dictionary() -> Dictionary {
+        Dictionary::from_json(serde_json::json!({
+            "commands": {"tmc_uart_read oid=%c write=%*s read_len=%u": 70},
+            "responses": {"tmc_uart_read_response oid=%c data=%*s": 71}
+        }))
+        .unwrap()
+    }
+
+    /// One chip's register read. The `write` blob is 45 bytes, past the send
+    /// task's batching threshold, so each query leaves as its own block and two
+    /// of them can be in flight at once.
+    fn tmc_request(oid: u8) -> Vec<ArgValue> {
+        vec![
+            ArgValue::UInt8(oid),
+            ArgValue::Bytes(vec![oid; 45]),
+            ArgValue::UInt32(4),
+        ]
+    }
+
+    fn tmc_answer(oid: u8) -> Vec<ArgValue> {
+        vec![ArgValue::UInt8(oid), ArgValue::Bytes(vec![oid; 3])]
+    }
+
+    fn tmc_payload(parser: &Parser, name: &str, values: &[ArgValue]) -> Vec<u8> {
+        parser.encode(name, values).unwrap().into_raw()
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_hands_each_answer_to_its_own_caller() {
+        // Two chips answer on one connection with both queries in flight. The
+        // answers come back in the same order the queries went out, which is
+        // *not* the order that tells them apart — the `oid` is.
+        let mut parser = Parser::new();
+        parser
+            .register(70, "tmc_uart_read oid=%c write=%*s read_len=%u")
+            .unwrap();
+        parser
+            .register(71, "tmc_uart_read_response oid=%c data=%*s")
+            .unwrap();
+        let request = |oid: u8| tmc_payload(&parser, "tmc_uart_read", &tmc_request(oid));
+        let answer = |oid: u8| tmc_payload(&parser, "tmc_uart_read_response", &tmc_answer(oid));
+
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &request(1)),
+                outputs: vec![make_frame(0, &answer(1))],
+            },
+            MappingEntry {
+                input: make_frame(1, &request(2)),
+                outputs: vec![make_frame(1, &answer(2))],
+            },
+        ]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let (request_one, request_two) = (tmc_request(1), tmc_request(2));
+        let (one, two) = tokio::join!(
+            mcu.call_oid(
+                "tmc_uart_read",
+                &request_one,
+                1,
+                "tmc_uart_read_response",
+                Duration::from_millis(500),
+            ),
+            mcu.call_oid(
+                "tmc_uart_read",
+                &request_two,
+                2,
+                "tmc_uart_read_response",
+                Duration::from_millis(500),
+            ),
+        );
+
+        assert_eq!(one.unwrap(), tmc_answer(1));
+        assert_eq!(two.unwrap(), tmc_answer(2));
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_takes_no_answer_that_carries_another_oid() {
+        // The mapping answers oid 1's query with oid 2's data: the shape of an
+        // answer another chip's query picked up. The call must sit out its
+        // timeout rather than return that data as its own.
+        let mut parser = Parser::new();
+        parser
+            .register(70, "tmc_uart_read oid=%c write=%*s read_len=%u")
+            .unwrap();
+        parser
+            .register(71, "tmc_uart_read_response oid=%c data=%*s")
+            .unwrap();
+        let request = tmc_payload(&parser, "tmc_uart_read", &tmc_request(1));
+        let foreign = tmc_payload(&parser, "tmc_uart_read_response", &tmc_answer(2));
+
+        let device = FrameMock::new(vec![MappingEntry {
+            input: make_frame(0, &request),
+            outputs: vec![make_frame(0, &foreign)],
+        }]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let err = mcu
+            .call_oid(
+                "tmc_uart_read",
+                &tmc_request(1),
+                1,
+                "tmc_uart_read_response",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            McuCallError::Timeout(msg) => {
+                assert!(
+                    msg.contains("no response for tmc_uart_read_response"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_times_out_when_no_answer_arrives() {
+        // Nothing is mapped, so the device stays silent; both names are known,
+        // so the call reaches the timeout path.
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let err = mcu
+            .call_oid(
+                "tmc_uart_read",
+                &tmc_request(3),
+                3,
+                "tmc_uart_read_response",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McuCallError::Timeout(_)), "{err:?}");
     }
 
     #[tokio::test]

@@ -606,6 +606,11 @@ mod tests {
         run_phases_with(config, config_file, script, true).await
     }
 
+    /// How long one case's script may run. A fake firmware answers at once, so
+    /// a wait here is a stuck exchange; the bound is what turns it into a
+    /// failure this harness can report and then tear down after.
+    pub(super) const SCRIPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// [`run_phases`], with the case's shape chosen by the caller.
     ///
     /// `fileoutput = true` is the corpus' shape (`-o`, `can_pause` false);
@@ -655,19 +660,32 @@ mod tests {
         }
         .await;
 
+        // The case's script runs under a bound of its own, *inside* the
+        // harness: `teardown` below has to run even when a script never
+        // finishes. A caller-side `tokio::time::timeout` would drop this
+        // future mid-flight instead, leaving the receive task parked on the
+        // device — and a parked task blocks the test runtime from shutting
+        // down, so the case hangs for good rather than failing.
         let gcode = if setup.is_ok() {
             match printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) {
-                Some(dispatcher) => match dispatcher.run_script(script).await {
-                    Ok(()) => {
-                        let state = printer.get_state_message();
-                        if state.category == PrinterState::Ready {
-                            Ok(())
-                        } else {
-                            Err(format!("left ready: {}", state.message))
+                Some(dispatcher) => {
+                    match tokio::time::timeout(SCRIPT_TIMEOUT, dispatcher.run_script(script)).await
+                    {
+                        Err(_) => Err(format!(
+                            "the script did not finish in {}s",
+                            SCRIPT_TIMEOUT.as_secs()
+                        )),
+                        Ok(Ok(())) => {
+                            let state = printer.get_state_message();
+                            if state.category == PrinterState::Ready {
+                                Ok(())
+                            } else {
+                                Err(format!("left ready: {}", state.message))
+                            }
                         }
+                        Ok(Err(e)) => Err(e.to_string()),
                     }
-                    Err(e) => Err(e.to_string()),
-                },
+                }
                 None => Err("the g-code dispatcher is not registered".to_string()),
             }
         } else {
@@ -1872,16 +1890,14 @@ async fn the_mainsail_client_macros_load_and_run() {
             Err(error) => panic!("mainsail.cfg does not load: {error}"),
         };
         let cfg = tests::injected(&config, &[(None, dict.clone())]);
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            tests::run_phases(&cfg, "<mainsail.cfg>", script),
-        )
-        .await;
-        match outcome {
-            Err(_) => failures.push(format!("{script}: timed out")),
-            Ok(Err(error)) => failures.push(format!("{script}: setup failed: {error}")),
-            Ok(Ok(Err(error))) => failures.push(format!("{script}: {error}")),
-            Ok(Ok(Ok(()))) => {}
+        // `run_phases` bounds the script itself and tears the machine down
+        // whatever happens; wrapping it in a caller-side timeout here would
+        // drop that future mid-flight and leave a receive task parked on the
+        // device, which blocks the test runtime from shutting down.
+        match tests::run_phases(&cfg, "<mainsail.cfg>", script).await {
+            Err(error) => failures.push(format!("{script}: setup failed: {error}")),
+            Ok(Err(error)) => failures.push(format!("{script}: {error}")),
+            Ok(Ok(())) => {}
         }
     }
     assert!(

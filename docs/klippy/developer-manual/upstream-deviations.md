@@ -108,7 +108,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | TMC 的活线与运行期链路 | **已补齐并真机验过（2026-10-18，F446 + TMC2209 单线 UART）**：`DUMP_TMC` 读到芯片真值（`IOIN.version=0x21`）、`SET_TMC_CURRENT` 写进去、`MSCNT` 随转动变化、`mcu_phase_offset` 有了写入者。行为偏移四条：① **写要等固件自己的 `tmcuart_response`**（写也回一个空载荷应答，那是「这帧已发完」的完成信号；上游靠阻塞传输天然有它，本仓不收集就会读到写前的旧值）；② SPI 的「写 + 回读」是 `spi_send` 紧跟一次 `spi_transfer`（两条消息、两个 ack），上游 `spi_transfer_with_preface` 是一次片选内连发两帧；③ `TmcRegister.receive_time` 取调用返回后的 reactor 时刻再换 print_time，上游取响应的 `#receive_time`，最多差一个往返；④ `tmc/stallguard_dump` 的读路径按芯片能力判定（`DRV_STATUS.sg_result` 或 `SG_RESULT`/`SG4_RESULT`），上游按 `spi_status` 猜出的 `optimized_spi` 判定（本仓无该字段，节拍统一 5 ms）。另：UART 交换超时 **500 ms**（上游无限等）；both-edge（`dedge`）未启用（`get_pulse_duration()` 第二项恒 `false`） | [配置手册](../user-manual/config.md)、[模块表](README.md)、[真机记录](../../TESTING.md) |
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |
 | MCU `output` 表的异步投递等 | 见该页「当前未实现」 | [MCU 协议](mcu-protocol.md#当前未实现) |
-| 事件名无发送方的其余项 | `toolhead:sync_print_time`、`stepper:*`、`extruder:activate_extruder`、`menu:*`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |
+| 事件名无发送方的其余项 | `stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |
 
 ## 4. 本仓特有（上游没有）
 

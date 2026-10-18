@@ -877,8 +877,10 @@ impl std::fmt::Debug for PrinterStepper {
 ///
 /// The range and homing info come from the **primary** stepper, as upstream's
 /// `get_range`/`get_homing_info` read the rail's own (`[stepper_z]`) values.
-/// Homing all steppers of a multi-stepper rail from one endstop is the
-/// `endstop_phase`/trsync refinement (H9); this group only drives them.
+/// Every stepper of the rail is registered with the rail's endstop dispatch, as
+/// upstream's `add_stepper_from_config` does (`stepper.py:434-445`), so the
+/// firmware stops the whole rail on a trigger; the `endstop_phase` refinement
+/// for such a rail is H9.
 pub struct Rail {
     /// The base section name (`stepper_z`).
     name: String,
@@ -911,12 +913,42 @@ impl Rail {
                 ))
             })?;
         let mut steppers = vec![primary];
+        // The endstop the whole rail homes to. Upstream's `LookupMultiRail`
+        // registers **every** stepper of the rail with it — the primary through
+        // `LookupRail`, each sibling through `add_stepper_from_config`
+        // (`klippy/stepper.py:434-445`) — so one trigger stops all the motors.
+        // Without that, a Trident gantry (`stepper_z` + `z1` + `z2` on one
+        // rail) only stops `stepper_z` in firmware while `z1`/`z2` walk the rest
+        // of the queued move, and `set_position(home)` then records all three at
+        // the endstop: a skewed gantry that nothing accounts for.
+        let rail_endstop = steppers[0].endstop().cloned();
         for index in 1..99 {
             let identifier = format!("{base_id}{index}");
             let Some(sibling) = config.sibling(&identifier) else {
                 break;
             };
             let stepper = Arc::new(PrinterStepper::new(&sibling, printer, axis, false)?);
+            // A sibling that names its own `endstop_pin` was registered with
+            // that endstop by `PrinterStepper::new` — upstream's
+            // `add_stepper(stepper, config.get('endstop_pin', None))` likewise
+            // resolves such a stepper to its own endstop, not the rail's.
+            if stepper.endstop().is_none() {
+                if let Some(endstop) = &rail_endstop {
+                    let dispatch = endstop.dispatch().ok_or_else(|| {
+                        ConfigError::new(format!(
+                            "{identifier}: the rail's endstop must drive a trigger dispatch"
+                        ))
+                    })?;
+                    let mcu_stepper = stepper.mcu_stepper();
+                    dispatch
+                        .add_stepper(
+                            mcu_stepper.chip().clone(),
+                            Arc::downgrade(mcu_stepper),
+                            stepper.name(),
+                        )
+                        .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+                }
+            }
             printer.add_object(&identifier, stepper.clone())?;
             steppers.push(stepper);
         }
@@ -1626,5 +1658,93 @@ mod tests {
         let (_, result) = load(&text);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("position_endstop"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // One endstop stops every motor of its rail (`stepper.py:434-445`)
+    // -----------------------------------------------------------------------
+
+    /// A Trident-shaped Z rail: `[stepper_z]` carries the rail's endstop,
+    /// `[stepper_z1]`/`[stepper_z2]` are bare siblings on the same axis.
+    fn three_motor_z(endstop_pin: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             position_endstop: 0\nposition_max: 200\nendstop_pin: {endstop_pin}\n\
+             [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [stepper_z2]\nstep_pin: PC0\ndir_pin: PC1\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n"
+        )
+    }
+
+    /// The stepper names the endstop of `name` stops on a trigger.
+    fn dispatched(printer: &Arc<Printer>, name: &str) -> Vec<String> {
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        let endstop = stepper
+            .endstop()
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} named an endstop_pin"));
+        endstop
+            .dispatch()
+            .unwrap_or_else(|| panic!("{name}'s endstop drives a trigger dispatch"))
+            .stepper_names()
+    }
+
+    /// Every motor of a rail is registered with the rail's endstop, so the
+    /// firmware stops all three on a Trident gantry instead of stopping
+    /// `stepper_z` while `z1`/`z2` walk the rest of the queued move (which
+    /// leaves the gantry skewed while `set_position` records all three at the
+    /// endstop).
+    #[test]
+    fn test_a_rails_endstop_dispatches_for_every_motor_on_the_rail() {
+        let (printer, result) = load(&three_motor_z("^PA8"));
+        result.unwrap();
+
+        assert_eq!(
+            dispatched(&printer, "stepper_z"),
+            ["stepper_z", "stepper_z1", "stepper_z2"]
+        );
+    }
+
+    /// A rail with no siblings is unchanged: its endstop stops its one motor.
+    #[test]
+    fn test_a_single_motor_rail_dispatches_only_its_own_stepper() {
+        let (printer, result) = load(&config_with_x("endstop_pin: ^PA2\n"));
+        result.unwrap();
+
+        assert_eq!(dispatched(&printer, "stepper_x"), ["stepper_x"]);
+    }
+
+    /// A rail spanning two MCUs is still refused: one firmware trigger can only
+    /// stop the motors on its own MCU (`TriggerDispatch.add_stepper`,
+    /// `klippy/mcu.py:300-308`).
+    #[test]
+    fn test_a_rail_still_refuses_a_shared_axis_across_mcus() {
+        let (_, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [mcu zboard]\nserial: /dev/b\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             position_endstop: 0\nposition_max: 200\nendstop_pin: ^PA8\n\
+             [stepper_z1]\nstep_pin: zboard:PA6\ndir_pin: zboard:PA7\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Multi-mcu homing not supported"), "{err}");
     }
 }

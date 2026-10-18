@@ -365,6 +365,7 @@ mod tests {
     use crate::core::klippy::motion::itersolve::Axis;
     use crate::core::klippy::motion::plan::{Move, MoveLimits};
     use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn limits() -> MoveLimits {
         MoveLimits {
@@ -537,6 +538,108 @@ mod tests {
                 ("second", 2.0)
             ]
         );
+    }
+
+    #[test]
+    fn test_a_panicking_flush_callback_does_not_stop_the_flush_pass() {
+        // The pass runs on the reactor's dispatcher (through the toolhead's flush
+        // timer): a panic in one registered callback must neither end the pass
+        // nor hide the panic — the callbacks behind it still run, the step
+        // generation still happens, and the log names the source.
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::ERROR)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        tracing::subscriber::with_default(subscriber, || {
+            let mut queuing = MotionQueuing::new();
+            let trapq = queuing.allocate_trapq();
+            queuing.add_stepper(Stepper::cartesian(
+                "stepper_x",
+                0,
+                1.0,
+                Axis::X,
+                1_000_000.0,
+            ));
+            let mut move_ = move_(0.0, 10.0);
+            move_.set_junction(0.0, 10_000.0, 0.0);
+            append(&mut queuing, trapq, &move_);
+
+            queuing.register_flush_callback(Box::new(|_| panic!("flush exploded")));
+            let recorded = Arc::clone(&calls);
+            queuing.register_flush_callback(Box::new(move |flush_time| {
+                recorded.lock().unwrap().push(flush_time);
+            }));
+
+            let commands = queuing
+                .generate(0.2)
+                .expect("the pass still generates after a panic");
+            assert!(
+                !commands.is_empty(),
+                "the stepper still generated its steps"
+            );
+            assert_eq!(
+                *calls.lock().unwrap(),
+                [0.2],
+                "the callback behind the panicking one still ran"
+            );
+
+            // The registration survives: the next pass runs both again.
+            queuing.generate(0.4).unwrap();
+            assert_eq!(*calls.lock().unwrap(), [0.2, 0.4]);
+        });
+
+        let log = capture.text();
+        assert!(
+            log.contains("flush callback #0"),
+            "the log must name the callback that panicked: {log}"
+        );
+        assert!(
+            log.contains("flush exploded"),
+            "the log must carry the panic message: {log}"
+        );
+    }
+
+    /// A byte sink for the fmt layer above. `with_default` keeps the capture off
+    /// the process-wide subscriber, the same shape `serial_ports.rs` uses.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]

@@ -9,11 +9,13 @@
 ///
 /// Upstream reads the option only for a serial MCU; every other transport
 /// resets with `command` (`klippy/mcu.py:668-671`). klipperx adds
-/// [`McuRestartMethod::Admin`] for a device behind a bridge port that answers
-/// the mux itself (a `uuid:` on the child): only such a device has the admin
-/// channel the command needs. A legacy (uuid-less) bridge-port device takes no
-/// method of its own — its **port's** `uart_restart_method` decides
-/// (`config/mcu.rs`, `mcu/bridge_ports.rs`).
+/// [`McuRestartMethod::Admin`], which needs a mux **admin channel** — and two
+/// shapes have one: a serial MCU, which *is* the bridge and restarts itself over
+/// its own link, and a device behind a bridge port that answers the mux itself
+/// (a `uuid:` on the child), whose restart the bridge forwards to its port. A
+/// legacy (uuid-less) bridge-port device takes no method of its own — its
+/// **port's** `uart_restart_method` decides (`config/mcu.rs`,
+/// `mcu/bridge_ports.rs`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McuRestartMethod {
     /// Toggle DTR (common on Arduino boards and clones)
@@ -24,16 +26,18 @@ pub enum McuRestartMethod {
     RpiUsb,
     /// Send a Klipper command to reset itself
     Command,
-    /// Have the device reset itself, with the bridge it hangs behind forwarding
-    /// the command (`RESET_DEVICE`). Needs the device's own admin channel, so it
-    /// only applies to a bridge-port child that writes a `uuid:`.
+    /// Have the device reset itself over its mux **admin** channel. Two shapes
+    /// reach one: a **serial** MCU is the bridge itself, whose own `mcu_restart`
+    /// the admin unit triggers (`mcu/restart.rs`), and a bridge-port child that
+    /// writes a `uuid:`, whose restart the bridge forwards to its port
+    /// (`RESET_DEVICE`).
     Admin,
 }
 
 impl McuRestartMethod {
     /// The spellings a config file may use, for error messages. Upstream's
     /// `getchoice` list without its `None` (`klippy/mcu.py:666`), plus klipperx's
-    /// `admin` for a named bridge-port device (`config/mcu.rs`).
+    /// `admin` (`config/mcu.rs`).
     pub const CHOICES: &'static [&'static str] =
         &["arduino", "cheetah", "command", "rpi_usb", "admin"];
 

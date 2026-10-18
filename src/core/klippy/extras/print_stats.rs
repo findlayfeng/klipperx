@@ -494,6 +494,27 @@ mod tests {
 
     // -- reset / initial state -------------------------------------------
 
+    /// The very first status frame has to carry `state`.
+    ///
+    /// Moonraker reads `prev_ps['state']` off the previous `print_stats`
+    /// frame with no default (`moonraker/components/job_state.py:62-65`), so a
+    /// frame that leaves the key out is a `KeyError` on connect — before any
+    /// print has happened, which is exactly when the first frame is sent.
+    /// External dependency, do not drop the field.
+    #[test]
+    fn the_first_status_frame_carries_a_state_string() {
+        let (_reactor, _printer, _gcode, object) = machine();
+
+        let s = object.get_status(0.0);
+
+        let state = s
+            .as_object()
+            .expect("an object")
+            .get("state")
+            .expect("print_stats always reports state, even on the first frame");
+        assert_eq!(state.as_str(), Some("standby"));
+    }
+
     /// `reset` (and the initial state) match upstream's `reset`
     /// (`print_stats.py:90-98`).
     #[test]

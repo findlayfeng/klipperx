@@ -24,7 +24,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::pin::pin_number;
+use super::pin::{pin_number, AdcClock};
 use crate::core::klippy::cmd::adc::{
     AnalogInState, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld,
 };
@@ -96,6 +96,10 @@ impl AdcRegistry {
 
 /// The state one input's config callback builds and its reports update.
 struct AdcState {
+    /// The chip's clock facts: what dates a report. A view, not the [`McuChip`]
+    /// itself — the chip owns the registry that owns this state, so a chip here
+    /// would be a strong cycle (`AdcClock` has the details).
+    clock: AdcClock,
     // Sampling parameters, set by `setup_adc_sample`.
     report_time: Mutex<f64>,
     sample_time: Mutex<f64>,
@@ -117,8 +121,10 @@ struct AdcState {
     report_clock: Mutex<u32>,
     /// Whether the old `value=%hu` format is in use.
     old_format: Mutex<bool>,
-    /// The last `(clock, value)` seen.
-    last_value: Mutex<Option<(u64, f64)>>,
+    /// The last `(print time, value)` seen.
+    last_value: Mutex<Option<(f64, f64)>>,
+    /// Whether an undatable report has already been warned about.
+    undated_reported: Mutex<bool>,
     /// The consumer's callback.
     callback: Mutex<Option<AdcCallback>>,
 }
@@ -139,8 +145,10 @@ impl McuAdc {
         chip_name: String,
         registry: Arc<AdcRegistry>,
         pin: PinParams,
+        clock: AdcClock,
     ) -> Self {
         let state = Arc::new(AdcState {
+            clock,
             report_time: Mutex::new(0.0),
             sample_time: Mutex::new(0.0),
             sample_count: Mutex::new(1),
@@ -156,6 +164,7 @@ impl McuAdc {
             report_clock: Mutex::new(0),
             old_format: Mutex::new(true),
             last_value: Mutex::new(None),
+            undated_reported: Mutex::new(false),
             callback: Mutex::new(None),
         });
 
@@ -208,7 +217,7 @@ impl Adc for McuAdc {
         *self.state.lock(|state| &state.callback) = Some(callback);
     }
 
-    fn get_last_value(&self) -> Option<(u64, f64)> {
+    fn get_last_value(&self) -> Option<(f64, f64)> {
         *self.state.lock(|state| &state.last_value)
     }
 }
@@ -229,38 +238,55 @@ impl AdcState {
     ///
     /// The values arrive positionally in the firmware's declaration order:
     /// `oid`, `next_clock`, then `value` (old) or `values` (new).
+    ///
+    /// `next_clock` is the firmware's **low 32 bits**, so it is extended before
+    /// it is used — a report that straddles the 2^32 wrap would otherwise date
+    /// its samples backwards — and the extended clock is mapped to print time
+    /// (`klippy/mcu.py:636-646`). Dating a report needs the MCU's clock
+    /// mapping, which the chip fills at connect; a report that arrives before
+    /// that is dropped whole (the extension needs the clock estimate, and a
+    /// bare firmware clock is not in the consumer's time domain). The first
+    /// such drop is warned about, once: a silently starved sensor looks exactly
+    /// like a sensor whose reports never arrive.
     fn handle(&self, values: &[ArgValue]) {
         let next_clock = match values.get(1) {
-            Some(ArgValue::UInt32(clock)) => u64::from(*clock),
+            Some(ArgValue::UInt32(clock)) => *clock,
             _ => return,
+        };
+        let Some(mapping) = self.clock.mapping() else {
+            self.note_undated_report();
+            return;
+        };
+        // The mapping and the estimate are filled together at connect
+        // (`McuChip::set_clock`), so this only closes the type.
+        let Some(next_clock) = self.clock.clock32_to_clock64(next_clock) else {
+            return;
         };
         let old_format = *self.lock(|state| &state.old_format);
 
-        let samples: Vec<(u64, f64)> = if old_format {
+        let samples: Vec<(f64, f64)> = if old_format {
             let raw = match values.get(2) {
                 Some(ArgValue::UInt16(value)) => *value,
                 _ => return,
             };
-            vec![(next_clock, self.scale(raw))]
+            vec![(mapping.print_time(next_clock), self.scale(raw))]
         } else {
             let bytes = match values.get(2) {
                 Some(ArgValue::Bytes(bytes)) => bytes,
                 _ => return,
             };
-            let report_clock = u64::from(*self.lock(|state| &state.report_clock));
+            let report_clock = i64::from(*self.lock(|state| &state.report_clock));
             let count = bytes.len() / 2;
-            bytes
-                .chunks_exact(2)
-                .enumerate()
-                .map(|(index, pair)| {
-                    let raw = u16::from_le_bytes([pair[0], pair[1]]);
-                    // The last sample is the report; earlier ones are one
-                    // report period apart.
-                    let clock =
-                        next_clock.saturating_sub((count - 1 - index) as u64 * report_clock);
-                    (clock, self.scale(raw))
-                })
-                .collect()
+            let mut samples = Vec::with_capacity(count);
+            for (index, pair) in bytes.chunks_exact(2).enumerate() {
+                let raw = u16::from_le_bytes([pair[0], pair[1]]);
+                // The last sample is the report; earlier ones are one report
+                // period apart. The back-off happens in the 64-bit domain, so
+                // the wrap cannot fold into a huge unsigned difference.
+                let clock = next_clock - (count - 1 - index) as i64 * report_clock;
+                samples.push((mapping.print_time(clock), self.scale(raw)));
+            }
+            samples
         };
 
         if let Some(last) = samples.last() {
@@ -270,6 +296,20 @@ impl AdcState {
         if let Some(callback) = callback.as_ref() {
             callback(&samples);
         }
+    }
+
+    /// Warn once that a report could not be dated.
+    fn note_undated_report(&self) {
+        let mut reported = self.lock(|state| &state.undated_reported);
+        if *reported {
+            return;
+        }
+        *reported = true;
+        let oid = *self.lock(|state| &state.oid);
+        warn!(
+            "ADC input oid={oid:?}: a report arrived before the MCU clock mapping; \
+             dropping its samples until the chip has one"
+        );
     }
 
     /// The build-time half: resolve the pin and add the configuration/query.
@@ -423,12 +463,14 @@ impl AdcState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::mcu::McuChip;
     use crate::core::klippy::msg::proto::Payload;
+    use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
     /// A dictionary whose query/response pair matches `batched`.
@@ -615,7 +657,7 @@ mod tests {
 
     /// A state with the sampling parameters `build` would have stored.
     fn armed_state(old_format: bool, batch_num: u32) -> Arc<AdcState> {
-        let state = state(old_format, 1.0 / 32760.0, 2_000_000);
+        let state = state(undated_clock(), old_format, 1.0 / 32760.0, 2_000_000);
         *state.lock(|s| &s.sample_ticks) = 200_000;
         *state.lock(|s| &s.sample_count) = 8;
         *state.lock(|s| &s.report_clock) = 2_000_000;
@@ -630,8 +672,40 @@ mod tests {
     // Response handling
     // -----------------------------------------------------------------------
 
-    fn state(old_format: bool, inv_max_adc: f64, report_clock: u32) -> Arc<AdcState> {
+    /// A clock view with no mapping yet: a report cannot be dated.
+    fn undated_clock() -> AdcClock {
+        McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        )
+        .adc_clock()
+    }
+
+    /// A chip whose clock is seeded at `clock` (20 MHz, from the test
+    /// dictionary), and the view an ADC input dates reports with.
+    fn dated_clock(clock: i64) -> (McuChip, AdcClock) {
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let mcu = Arc::new(mcu(true));
+        let estimate = Arc::new(McuClock::new(Arc::clone(&mcu), ManualReactor::shared()));
+        estimate.seed(0.0, clock);
+        chip.set_clock(estimate, 0.0);
+        let view = chip.adc_clock();
+        (chip, view)
+    }
+
+    fn state(
+        clock: AdcClock,
+        old_format: bool,
+        inv_max_adc: f64,
+        report_clock: u32,
+    ) -> Arc<AdcState> {
         Arc::new(AdcState {
+            clock,
             report_time: Mutex::new(0.0),
             sample_time: Mutex::new(0.0),
             sample_count: Mutex::new(1),
@@ -647,14 +721,17 @@ mod tests {
             report_clock: Mutex::new(report_clock),
             old_format: Mutex::new(old_format),
             last_value: Mutex::new(None),
+            undated_reported: Mutex::new(false),
             callback: Mutex::new(None),
         })
     }
 
-    #[test]
-    fn test_the_old_report_scales_the_single_value() {
-        let state = state(true, 1.0 / 4095.0, 2_000_000);
-        let seen: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    #[tokio::test]
+    async fn test_the_old_report_scales_the_single_value() {
+        let (chip, clock) = dated_clock(0);
+        let expected_time = chip.clock_to_print_time(5_000).unwrap();
+        let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
+        let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
@@ -670,15 +747,20 @@ mod tests {
 
         assert_eq!(
             state.lock(|state| &state.last_value).as_ref().copied(),
-            Some((5_000, 1.0))
+            Some((expected_time, 1.0))
         );
-        assert_eq!(*seen.lock().unwrap(), vec![(5_000, 1.0)]);
+        assert_eq!(*seen.lock().unwrap(), vec![(expected_time, 1.0)]);
     }
 
-    #[test]
-    fn test_a_report_clock_that_wraps_32_bits_still_dates_samples_forwards() {
-        let state = state(true, 1.0 / 4095.0, 2_000_000);
-        let seen: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+    #[tokio::test]
+    async fn test_a_report_clock_that_wraps_32_bits_still_dates_samples_forwards() {
+        // Seeded just below the wrap, so both reports extend forwards from it:
+        // the first stays at 0xffff_ff00, the second becomes 0x1_0000_0100.
+        let (chip, clock) = dated_clock(0xffff_fe00);
+        let first = chip.clock_to_print_time(0xffff_ff00).unwrap();
+        let second = chip.clock_to_print_time(0x0001_0000_0100).unwrap();
+        let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
+        let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
@@ -705,12 +787,23 @@ mod tests {
             "the second sample is dated before the first: {:?}",
             *seen
         );
-        assert_eq!(seen[1].0 - seen[0].0, 0x200);
+        // 0x200 ticks apart, both dates from the chip's own conversion.
+        assert_eq!([seen[0].0, seen[1].0], [first, second]);
     }
 
-    #[test]
-    fn test_the_batched_report_dates_each_sample() {
-        let state = state(false, 1.0 / 4095.0, 1_000);
+    #[tokio::test]
+    async fn test_the_batched_report_dates_each_sample() {
+        let (chip, clock) = dated_clock(0);
+        let first = chip.clock_to_print_time(8_000).unwrap();
+        let last = chip.clock_to_print_time(9_000).unwrap();
+        let state = state(clock, false, 1.0 / 4095.0, 1_000);
+        let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_callback = Arc::clone(&seen);
+        state
+            .lock(|state| &state.callback)
+            .replace(Box::new(move |samples| {
+                seen_for_callback.lock().unwrap().extend_from_slice(samples);
+            }));
         // Two samples, the report clock 1000 later: the first is one period back.
         let bytes = vec![0xff, 0x0f, 0x00, 0x08]; // 4095, 2048
         state.handle(&[
@@ -719,8 +812,39 @@ mod tests {
             ArgValue::Bytes(bytes),
         ]);
 
-        let (clock, value) = state.lock(|state| &state.last_value).unwrap();
-        assert_eq!(clock, 9_000);
+        let (time, value) = state.lock(|state| &state.last_value).unwrap();
+        assert_eq!(time, last);
         assert!((value - 2048.0 / 4095.0).abs() < f64::EPSILON);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(first, 1.0), (last, 2048.0 / 4095.0)]
+        );
+    }
+
+    #[test]
+    fn test_a_report_before_the_clock_mapping_is_dropped_whole() {
+        let state = state(undated_clock(), false, 1.0 / 4095.0, 1_000);
+        let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_callback = Arc::clone(&seen);
+        state
+            .lock(|state| &state.callback)
+            .replace(Box::new(move |samples| {
+                seen_for_callback.lock().unwrap().extend_from_slice(samples);
+            }));
+
+        state.handle(&[
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(9_000),
+            ArgValue::Bytes(vec![0xff, 0x0f, 0x00, 0x08]),
+        ]);
+
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a batch was dated without a clock mapping"
+        );
+        assert_eq!(
+            state.lock(|state| &state.last_value).as_ref().copied(),
+            None
+        );
     }
 }

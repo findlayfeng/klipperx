@@ -31,13 +31,13 @@
 //!   offsets in a map keyed by the active extruder's name
 //!   (`_get_extrusion_offsets`, `:94-101`) and this port keeps one array,
 //!   which is the same value while one extruder prints.
-//! - **The transform does not chain over other transforms.** Upstream keeps
-//!   the previous slot occupant (`next_transform`, `exclude_object.py:38-57`)
-//!   because Python's `set_move_transform` returns it; this port's
-//!   `gcode_move::set_move_transform` does not, so the transform forwards to
-//!   the toolhead captured at `klippy:connect`. A config that combines this
-//!   with `bed_mesh`/`bed_tilt` would lose their adjustment while excluding.
-//!   The `tuning_tower` guard (`:47-53`) has no ported tuning tower to consult.
+//! - **The transform chains over the occupancy it displaces.**
+//!   `_register_transform` keeps what `set_move_transform` returns
+//!   (`next_transform`, `exclude_object.py:38-57`) and forwards every move
+//!   through it first, so `bed_mesh`/`bed_tilt` keep their Z adjustment while
+//!   an object is excluded; `_unregister_transform` (`:62-73`) hands the slot
+//!   back to that occupant. The `tuning_tower` guard (`:47-53`) has no ported
+//!   tuning tower to consult.
 //! - **`virtual_sdcard:reset_file` is not wired** (`:29-30`): upstream resets
 //!   on a new file; here `EXCLUDE_OBJECT_DEFINE RESET=1` is the only reset.
 //!   `was_excluded_at_start` (`:197`) is not tracked either.
@@ -126,8 +126,13 @@ pub struct ExcludeObject {
     /// transform both reach.
     state: Mutex<State>,
     /// The transform chain below this one — the toolhead, captured at
-    /// `klippy:connect` (`exclude_object.py:_handle_connect`).
-    target: Mutex<Option<Arc<dyn MoveTarget>>>,
+    /// `klippy:connect` (`exclude_object.py:_handle_connect`). It stays the
+    /// chain's end until an exclusion registers and the occupant it displaces
+    /// takes over.
+    toolhead: Mutex<Option<Arc<dyn MoveTarget>>>,
+    /// The transform this one displaced from `gcode_move`'s slot (upstream
+    /// `next_transform`, `exclude_object.py:43`); `None` while unregistered.
+    next_transform: Mutex<Option<Arc<dyn MoveTarget>>>,
     /// The machine this object belongs to, for looking up `gcode_move` when
     /// the transform registers.
     printer: Weak<Printer>,
@@ -153,7 +158,8 @@ impl ExcludeObject {
     pub fn new(_config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         Ok(Self {
             state: Mutex::new(State::default()),
-            target: Mutex::new(None),
+            toolhead: Mutex::new(None),
+            next_transform: Mutex::new(None),
             printer: Arc::downgrade(printer),
         })
     }
@@ -166,12 +172,26 @@ impl ExcludeObject {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// The transform chain below this one, copied out of its lock.
-    fn target(&self) -> Option<Arc<dyn MoveTarget>> {
-        self.target
+    /// The transform this one displaced, copied out of its lock.
+    fn next_transform(&self) -> Option<Arc<dyn MoveTarget>> {
+        self.next_transform
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
+    }
+
+    /// The toolhead captured at `klippy:connect`, copied out of its lock.
+    fn toolhead_target(&self) -> Option<Arc<dyn MoveTarget>> {
+        self.toolhead
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The transform chain below this one: the displaced occupant once
+    /// registered, the connect-time toolhead before that.
+    fn target(&self) -> Option<Arc<dyn MoveTarget>> {
+        self.next_transform().or_else(|| self.toolhead_target())
     }
 
     /// Upstream's `_handle_connect`: the toolhead exists by `klippy:connect`
@@ -181,17 +201,16 @@ impl ExcludeObject {
             return;
         };
         if let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) {
-            *self.target.lock().unwrap_or_else(|p| p.into_inner()) =
+            *self.toolhead.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(Arc::new(ToolheadMove(toolhead)));
         }
     }
 
     /// Upstream's `_register_transform` (`exclude_object.py:38-57`): take
-    /// `gcode_move`'s slot on the first exclusion.
+    /// `gcode_move`'s slot on the first exclusion, keeping the occupant it
+    /// displaces as the chain below this transform.
     ///
-    /// Needs the `Arc` because the transform registers itself. Upstream keeps
-    /// the previous occupant; here the chain below is the toolhead captured
-    /// at connect (module docs).
+    /// Needs the `Arc` because the transform registers itself.
     fn register_transform(object: &Arc<ExcludeObject>) -> Result<(), CommandError> {
         if object.lock().transform_registered {
             return Ok(());
@@ -208,9 +227,19 @@ impl ExcludeObject {
         let gcode_move = printer
             .lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT)
             .ok_or_else(|| CommandError::new("gcode_move is not loaded"))?;
-        gcode_move
+        let previous = gcode_move
             .set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true)
             .map_err(|error| CommandError::new(error.to_string()))?;
+        // `next_transform` (`exclude_object.py:43`): whatever held the slot —
+        // `bed_mesh`/`bed_tilt` when one of them registered first — is what the
+        // forwarded moves go through. An empty slot leaves the connect-time
+        // toolhead as the chain's end, which is what it resolves to at ready.
+        if let Some(previous) = previous {
+            *object
+                .next_transform
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(previous);
+        }
         // `_register_transform` (`exclude_object.py:38-57`): the offsets start
         // empty and the three tracked positions start at the toolhead's.
         let pos = object
@@ -230,7 +259,8 @@ impl ExcludeObject {
     }
 
     /// Upstream's `_unregister_transform` (`exclude_object.py:62-73`): hand
-    /// the slot back to the toolhead below this transform.
+    /// the slot back to the occupant this transform displaced and re-anchor
+    /// `gcode_move`'s position.
     fn unregister_transform(&self) {
         if !self.lock().transform_registered {
             return;
@@ -239,12 +269,19 @@ impl ExcludeObject {
             return;
         };
         if let Some(gcode_move) = printer.lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT) {
-            // Restoring the toolhead rather than the previous occupant is the
-            // chaining gap in the module docs; `force` keeps the write exact.
             let _ = gcode_move.set_move_transform(target, true);
-            let mut state = self.lock();
-            state.transform_registered = false;
-            state.motion = None;
+            *self
+                .next_transform
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+            {
+                let mut state = self.lock();
+                state.transform_registered = false;
+                state.motion = None;
+            }
+            // Upstream re-anchors after the hand-back (`exclude_object.py:73`);
+            // the state lock is released first, because `position()` takes it.
+            gcode_move.reset_last_position();
         }
     }
 
@@ -773,6 +810,12 @@ mod tests {
         }
     }
 
+    /// The transform chain below this one, as `klippy:connect` (the toolhead)
+    /// or a later `register_transform` (the displaced occupant) leaves it.
+    fn chain_below(object: &ExcludeObject, target: Arc<dyn MoveTarget>) {
+        *object.next_transform.lock().unwrap() = Some(target);
+    }
+
     /// Upstream reads no options (`exclude_object.py:12-36`): the bare
     /// `[exclude_object]` in the corpus's `exclude_object.cfg:70` loads, and
     /// the factory claiming the section is what `check_unused` needs
@@ -935,7 +978,7 @@ mod tests {
     fn a_move_in_an_excluded_region_is_dropped_and_the_rest_forwarded() {
         let (_printer, _gcode, object) = machine();
         let fake = Arc::new(FakeTarget::new());
-        *object.target.lock().unwrap() = Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        chain_below(&object, Arc::clone(&fake) as Arc<dyn MoveTarget>);
 
         // Nothing excluded: every move passes on.
         object
@@ -973,7 +1016,7 @@ mod tests {
     fn excluded_extrusion_is_never_forwarded_after_leaving_the_region() {
         let (_printer, _gcode, object) = machine();
         let fake = Arc::new(FakeTarget::new());
-        *object.target.lock().unwrap() = Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        chain_below(&object, Arc::clone(&fake) as Arc<dyn MoveTarget>);
 
         // Armed as `register_transform` arms it, at the toolhead's position.
         let start = Coord::new(11.0, 0.0, 0.0, 0.0);
@@ -1036,7 +1079,7 @@ mod tests {
     fn without_an_exclusion_positions_forward_untouched() {
         let (_printer, _gcode, object) = machine();
         let fake = Arc::new(FakeTarget::new());
-        *object.target.lock().unwrap() = Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        chain_below(&object, Arc::clone(&fake) as Arc<dyn MoveTarget>);
         let start = Coord::new(0.0, 0.0, 0.0, 0.0);
         {
             let mut state = object.lock();
@@ -1067,6 +1110,128 @@ mod tests {
             );
             assert_eq!(object.position(), position, "get_position tracks it");
         }
+    }
+
+    /// The transform chains over the occupant it displaced: with a
+    /// `bed_mesh`-like transform in `gcode_move`'s slot, the exclusion's moves
+    /// go through it instead of straight to the toolhead
+    /// (`exclude_object.py:43-46,182-195`).
+    #[test]
+    fn a_registration_chains_over_the_displaced_occupant() {
+        let (printer, _gcode, object) = machine();
+        let gcode_move = gcode_move::ensure(&printer).expect("gcode_move registers");
+        // What `_handle_connect` leaves behind (`exclude_object.py:59-60`):
+        // the toolhead as the chain's end.
+        let toolhead = Arc::new(FakeTarget::new());
+        *object.toolhead.lock().unwrap() = Some(Arc::clone(&toolhead) as Arc<dyn MoveTarget>);
+        // A `bed_mesh`-like transform that registered first (`force = false`).
+        let mesh = Arc::new(FakeTarget::new());
+        assert!(
+            gcode_move
+                .set_move_transform(Arc::clone(&mesh) as Arc<dyn MoveTarget>, false)
+                .unwrap()
+                .is_none(),
+            "the slot was empty before the mesh took it"
+        );
+
+        ExcludeObject::register_transform(&object).unwrap();
+        assert!(object.lock().transform_registered);
+        let chained = object.target().expect("the chain below the transform");
+        assert!(
+            Arc::ptr_eq(&chained, &(Arc::clone(&mesh) as Arc<dyn MoveTarget>)),
+            "the mesh is what the exclusion displaced"
+        );
+
+        // Armed as `register_transform` arms it, past the tracked prologue,
+        // with object 1 excluded: the move is dropped before the chain.
+        {
+            let mut state = object.lock();
+            state.motion.as_mut().unwrap().initial_extrusion_moves = 0;
+            state.current_object = Some("1".to_string());
+            state.excluded_objects = vec!["1".to_string()];
+        }
+        object
+            .move_to(Coord::new(-11.0, 0.0, 0.0, 0.0), 50.0)
+            .unwrap();
+        assert!(
+            mesh.moves().is_empty(),
+            "the excluded move never reaches the mesh"
+        );
+        assert!(toolhead.moves().is_empty());
+
+        // Current object 2 is not excluded: the move chains through the mesh.
+        object.lock().current_object = Some("2".to_string());
+        object
+            .move_to(Coord::new(13.0, 0.0, 0.0, 0.0), 50.0)
+            .unwrap();
+        assert_eq!(mesh.moves().len(), 1);
+        assert_eq!(mesh.moves()[0], (Coord::new(13.0, 0.0, 0.0, 0.0), 50.0));
+        assert!(
+            toolhead.moves().is_empty(),
+            "the chain ends at the mesh, not the toolhead"
+        );
+    }
+
+    /// With nothing registered ahead of it, the chain below is the toolhead
+    /// captured at connect and behaviour is the un-chained one
+    /// (`exclude_object.py:59-60,182-195`).
+    #[test]
+    fn without_a_displaced_occupant_the_toolhead_stays_the_chain() {
+        let (printer, _gcode, object) = machine();
+        let gcode_move = gcode_move::ensure(&printer).expect("gcode_move registers");
+        let toolhead = Arc::new(FakeTarget::new());
+        *object.toolhead.lock().unwrap() = Some(Arc::clone(&toolhead) as Arc<dyn MoveTarget>);
+
+        ExcludeObject::register_transform(&object).unwrap();
+        assert!(
+            object.next_transform().is_none(),
+            "an empty slot displaces nothing"
+        );
+        assert!(
+            gcode_move
+                .set_move_transform(Arc::new(FakeTarget::new()), false)
+                .is_err(),
+            "the exclusion took the slot"
+        );
+
+        object
+            .move_to(Coord::new(3.0, 0.0, 0.0, 0.0), 50.0)
+            .unwrap();
+        assert_eq!(
+            toolhead.moves(),
+            vec![(Coord::new(3.0, 0.0, 0.0, 0.0), 50.0)],
+            "the move forwards to the toolhead untouched"
+        );
+    }
+
+    /// `_unregister_transform` (`exclude_object.py:62-73`) hands the slot back
+    /// to the displaced occupant: after it a dispatched `G1` reaches the mesh
+    /// with no exclusion in between.
+    #[test]
+    fn unregistering_hands_the_slot_back_to_the_displaced_occupant() {
+        let (printer, gcode, object) = machine();
+        let gcode_move = gcode_move::ensure(&printer).expect("gcode_move registers");
+        let toolhead = Arc::new(FakeTarget::new());
+        *object.toolhead.lock().unwrap() = Some(Arc::clone(&toolhead) as Arc<dyn MoveTarget>);
+        let mesh = Arc::new(FakeTarget::new());
+        gcode_move
+            .set_move_transform(Arc::clone(&mesh) as Arc<dyn MoveTarget>, false)
+            .unwrap();
+        ExcludeObject::register_transform(&object).unwrap();
+
+        object.unregister_transform();
+        assert!(!object.lock().transform_registered);
+        assert!(object.next_transform().is_none(), "the chain is released");
+
+        gcode.run_script_sync("G1 X7 F600").unwrap();
+        let moves = mesh.moves();
+        assert_eq!(
+            moves.len(),
+            1,
+            "the move goes to the restored occupant alone"
+        );
+        assert_eq!(moves[0].0.x(), 7.0);
+        assert!(toolhead.moves().is_empty());
     }
 
     /// The four commands register with upstream's help text — a duplicate or

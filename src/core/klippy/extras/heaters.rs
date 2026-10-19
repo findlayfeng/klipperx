@@ -76,6 +76,15 @@ const MAX_MAINTHREAD_TIME: f64 = 5.0;
 /// `verify_heater` sees a cold, unresponsive heater rather than a warm one that
 /// merely froze (`heaters.py:116-122`).
 const QUELL_STALE_TIME: f64 = 7.0;
+/// The share of full power a duty-cycle change must reach to be sent inside the
+/// send window (upstream `MIN_PWM_CHANGE_RATIO`, `heaters.py:19`).
+///
+/// A heater that resent on every reading would put the *reading's* age on the
+/// wire; a batch of readings that reached the host late would then date a change
+/// in the firmware's past (`Rescheduled timer in the past`). Upstream sends at
+/// most one new duty per window (see [`HeaterState::next_pwm_time`]) and skips
+/// the small changes in between.
+const MIN_PWM_CHANGE_RATIO: f64 = 0.05;
 
 /// Whether a stalled-main-thread drop is worth a log line now.
 ///
@@ -287,6 +296,9 @@ pub struct Heater {
     /// from: a batch of readings that reached the host late must not date its
     /// PWM change behind the firmware's clock.
     printer: Weak<Printer>,
+    /// The smallest duty change worth sending inside the send window
+    /// (`max_power * MIN_PWM_CHANGE_RATIO`, upstream `heaters.py:41`).
+    min_pwm_change: f64,
     /// How far after a reading this heater may date its PWM change (upstream's
     /// `pwm_delay`, `heaters.py:32`): one report period of the sensor that
     /// produced the reading.
@@ -315,6 +327,11 @@ struct HeaterState {
     /// Print time of the last `output dropped` line, so a stall cannot flood
     /// the log. `NEG_INFINITY` until the first drop.
     stall_reported_at: f64,
+    /// The next print time at which a new duty may be sent (upstream's
+    /// `next_pwm_time`, `heaters.py:80`): the previous change plus
+    /// `MAX_HEAT_TIME`, minus three report periods so the pin's auto-off never
+    /// expires between two changes.
+    next_pwm_time: f64,
     control: Box<dyn HeaterControl>,
 }
 
@@ -478,21 +495,31 @@ impl Heater {
             .upgrade()
             .and_then(|printer| self.pwm.as_ref()?.estimated_print_time(printer.eventtime()));
         let base = now_print.map_or(read_time, |now| read_time.max(now));
-        if let Some(pwm) = &self.pwm {
-            match pwm.print_time_to_clock(base + self.pwm_delay) {
-                Some(clock) => {
-                    let _ = pwm.set_pwm(clock as u32, value);
-                }
-                None => {
-                    let _ = pwm.update_pwm(value);
+        let pwm_time = base + self.pwm_delay;
+        // Upstream's update ratchet (`heaters.py:73-81`): inside the send window
+        // a change smaller than `min_pwm_change` is dropped, and only a sent
+        // change opens the next window. This is what keeps the wire from
+        // carrying one date per reading.
+        let suppressed = (read_time < state.next_pwm_time || state.last_pwm_value == 0.0)
+            && (value - state.last_pwm_value).abs() < self.min_pwm_change;
+        if !suppressed {
+            if let Some(pwm) = &self.pwm {
+                match pwm.print_time_to_clock(pwm_time) {
+                    Some(clock) => {
+                        let _ = pwm.set_pwm(clock as u32, value);
+                    }
+                    None => {
+                        let _ = pwm.update_pwm(value);
+                    }
                 }
             }
+            state.last_pwm_value = value;
+            state.next_pwm_time = pwm_time + MAX_HEAT_TIME - (3.0 * self.pwm_delay + 0.001);
         }
         let temp_diff = temp - state.smoothed_temp;
         let adj_time = (time_diff * self.inv_smooth_time).min(1.0);
         state.smoothed_temp += temp_diff * adj_time;
         state.can_extrude = state.smoothed_temp >= self.min_extrude_temp;
-        state.last_pwm_value = value;
     }
 
     /// Whether a `target` has not settled yet (`Heater.check_busy`).
@@ -1160,6 +1187,7 @@ impl PrinterHeaters {
             max_power,
             inv_smooth_time: 1.0 / smooth_time,
             printer: Arc::downgrade(printer),
+            min_pwm_change: max_power * MIN_PWM_CHANGE_RATIO,
             pwm_delay,
             state: Mutex::new(HeaterState {
                 target_temp: 0.0,
@@ -1174,6 +1202,7 @@ impl PrinterHeaters {
                 can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
                 last_pwm_value: 0.0,
                 stall_reported_at: f64::NEG_INFINITY,
+                next_pwm_time: 0.0,
                 control: Box::new(control),
             }),
         });
@@ -1953,6 +1982,101 @@ mod tests {
         heater.stamp_mainthread(5.000_001);
         heater.temperature_callback(5.000_002, 20.0);
         assert_eq!(heater.get_status()["power"], 1.0);
+    }
+
+    /// A PID heater, whose output can sit between 0 and 1, so the `5% of full
+    /// power` threshold is reachable.
+    fn pid_heater(printer: &Arc<Printer>) -> Arc<Heater> {
+        let heaters = ensure(printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "pid"),
+            ("pid_kp", "64"),
+            ("pid_ki", "1.4"),
+            ("pid_kd", "128"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), printer, None)
+            .unwrap();
+        heater.set_temp(200.0).unwrap();
+        heater
+    }
+
+    /// `heaters.py:73-77`: inside the send window, a duty change smaller than
+    /// `max_power * 0.05` is dropped — this is what keeps the wire from carrying
+    /// one dated event per reading.
+    #[test]
+    fn test_a_small_change_inside_the_window_is_suppressed() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        // First reading: the ratchet always speaks once (`not last_pwm_value`).
+        heater.temperature_callback(0.0, 25.0);
+        let sent = calls.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(sent, 1);
+
+        // A reading one report period later, still inside the window, with a
+        // duty change below the threshold: nothing goes out.
+        let before = heater.get_status()["power"].as_f64().unwrap();
+        heater.temperature_callback(0.3, 25.0);
+        assert_eq!(
+            calls.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            sent,
+            "a change below {} must not be sent",
+            heater.min_pwm_change
+        );
+        // `power` keeps reporting what was actually sent (upstream semantics).
+        assert_eq!(heater.get_status()["power"].as_f64().unwrap(), before);
+    }
+
+    /// The window: past `next_pwm_time` a change goes out however small, which
+    /// is how the loop keeps the pin's auto-off from expiring.
+    #[test]
+    fn test_a_change_past_the_window_is_always_sent() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        heater.temperature_callback(0.0, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+
+        // `MAX_HEAT_TIME - (3 * pwm_delay + 0.001)` after the change: the
+        // window reopens, so even a below-threshold change is delivered.
+        heater.temperature_callback(2.5, 25.0);
+        assert_eq!(
+            calls.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            2,
+            "past the window the change must be sent"
+        );
+    }
+
+    /// `heaters.py:80`: the next window opens `MAX_HEAT_TIME` minus three report
+    /// periods after the change that was sent.
+    #[test]
+    fn test_the_send_window_is_upstreams_three_seconds_less_three_reports() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        heater.temperature_callback(0.0, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+
+        // The change was dated at 0.0 + pwm_delay; the window is that plus
+        // MAX_HEAT_TIME - (3 * pwm_delay + 0.001).
+        let expected = 0.3 + MAX_HEAT_TIME - (3.0 * 0.3 + 0.001);
+        // 0.3 + 3.0 - (0.9 + 0.001) = 2.399, i.e. a send about every 2.1 s.
+        assert!((expected - 2.399).abs() < 1e-9, "{expected}");
+        // A reading just inside the window is suppressed, just outside it is not.
+        heater.temperature_callback(expected - 0.01, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+        heater.temperature_callback(expected + 0.01, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
     }
 
     /// A stall is reported at most once a second of reading time, so one stall

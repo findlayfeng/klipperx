@@ -8,26 +8,18 @@
 //! | `gcode` | — (required) | the homing script, compiled as a macro template (`:18`) |
 //!
 //! The section takes `G28` away from the toolhead and installs its own handler
-//! in its place (`homing_override.py:18-20`). A `G28` that names no axis, or
-//! one that names an axis `axes` selects, runs the section's `gcode` template
-//! instead of homing (`:33-46`); every other statement is handed to the
-//! previous handler unchanged, so `axes: Z` only overrides `G28 Z` and friends.
-//! Before the script runs, whichever `set_position_*` options are set overwrite
-//! that axis of the toolhead's position and mark it homed (`:54-60`).
+//! (`:18-20`): a `G28` naming no axis, or one naming an axis `axes` selects,
+//! runs the `gcode` template instead of homing (`:33-46`), after the configured
+//! `set_position_*` axes have been forced and marked homed (`:54-60`); every
+//! other statement goes to the previous handler unchanged.
 //!
-//! **Load order is load-bearing**: the section is `phase = late, order = 70`,
-//! after the toolhead's `[printer]` section (`order = 60`, the same phase),
-//! which is what registers `G28` (`toolhead.rs:603-606`). Loaded any earlier,
-//! the handler would be installed before the toolhead's and then silently
-//! overwritten by it.
+//! **Load order is load-bearing** (`phase = late, order = 70`): the toolhead's
+//! `[printer]` section (`order = 60`, same phase) is what registers `G28`
+//! (`toolhead.rs:603-606`); loaded earlier, this handler would be overwritten.
 //!
-//! The script is a `[gcode_macro]`-style template: `params` carries the `G28`
-//! statement's parsed parameters and `rawparams` the text after the command
-//! name (`homing_override.py:57-58`), alongside the globals every macro body
-//! sees (`printer`, `action_respond_info`, `action_raise_error`, `range`). A
-//! `G28` *inside* the script reaches the previous handler rather than
-//! re-entering the override — upstream's `in_script` flag, set for the run and
-//! cleared however it ends (`:22-24`, `:61-63`).
+//! The body renders against the `G28` statement's `params`/`rawparams` and the
+//! usual macro globals (`:57-58`). A `G28` *inside* the script reaches the
+//! previous handler — upstream's `in_script` flag (`:22-24`, `:61-63`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,14 +47,13 @@ section!(
 /// The toolhead object, as the loader registers `[printer]`.
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
-/// The `G28` axis parameters and the axis index each one names
-/// (`homing_override.py:33-46`).
+/// The `G28` axis parameters and the axis index each names (`:33-46`).
 const AXES: [(usize, &str); 3] = [(0, "X"), (1, "Y"), (2, "Z")];
 
-/// The `[homing_override]` option values (`homing_override.py:14-16`).
+/// The option values (`homing_override.py:14-16`).
 #[derive(Debug, PartialEq, Clone)]
 struct HomingOverrideOptions {
-    /// The `axes` option, upper-cased (`:16`).
+    /// `axes`, upper-cased (`:16`).
     axes: String,
     /// `set_position_x`/`_y`/`_z` in axis order; `None` where unset
     /// (`:14-15`).
@@ -70,9 +61,8 @@ struct HomingOverrideOptions {
 }
 
 impl HomingOverrideOptions {
-    /// Read the section in upstream's order (`homing_override.py:14-16`). The
-    /// `gcode` option is the template's, read by [`HomingOverride::new`] the
-    /// way `gcode_macro.load_template` reads it (`:18`).
+    /// Read the section in upstream's order (`:14-16`); `gcode` is the
+    /// template's, read by [`HomingOverride::new`] (`:18`).
     ///
     /// # Errors
     /// A `set_position_*` that is not a number (upstream's `getfloat`).
@@ -89,9 +79,8 @@ impl HomingOverrideOptions {
         Ok(Self { axes, start_pos })
     }
 
-    /// The three trigger axes as a mask, from the `axes` option
-    /// (`homing_override.py:12` + `cmd_G28`'s `for axis in self.axes`).
-    /// Letters outside `x`/`y`/`z` select nothing.
+    /// The trigger axes as a mask (`:12` + `cmd_G28`'s `for axis in
+    /// self.axes`); letters outside `x`/`y`/`z` select nothing.
     fn axis_mask(&self) -> [bool; 3] {
         let mut mask = [false; 3];
         for letter in self.axes.chars() {
@@ -106,8 +95,8 @@ impl HomingOverrideOptions {
     }
 
     /// Whether a `G28` with the given parameter axes runs the override
-    /// (`homing_override.py:33-46`): no axis named means the whole override,
-    /// otherwise any named axis that `axes` selects.
+    /// (`:33-46`): no axis named means the whole override, otherwise any named
+    /// axis that `axes` selects.
     fn overrides(&self, requested: &[bool; 3]) -> bool {
         if requested.iter().all(|requested| !requested) {
             return true;
@@ -118,9 +107,9 @@ impl HomingOverrideOptions {
             .any(|(selected, asked)| *selected && *asked)
     }
 
-    /// The forced start position (`homing_override.py:54-60`): every axis with
-    /// a `set_position_*` takes that value, and the axes so set are the ones
-    /// the toolhead is told are now homed.
+    /// The forced start position (`:54-60`): every axis with a
+    /// `set_position_*` takes that value, and the axes so set are the ones the
+    /// toolhead is told are homed.
     fn start_position(&self, mut position: Coord) -> (Coord, Vec<usize>) {
         let mut homing_axes = Vec::new();
         for (axis, location) in self.start_pos.iter().enumerate() {
@@ -133,8 +122,7 @@ impl HomingOverrideOptions {
     }
 }
 
-/// One `set_position_*` value — upstream's `getfloat` (`configfile.py`),
-/// whose parse failure carries the option and section names.
+/// One `set_position_*` value — upstream's `getfloat` (`configfile.py`).
 ///
 /// # Errors
 /// `Unable to parse option '<option>' in section '<identifier>'`.
@@ -147,13 +135,10 @@ fn parse_position(option: &str, identifier: &str, raw: &str) -> Result<f64, Conf
 }
 
 /// What the installed handler needs: the option values, the compiled script,
-/// and the recursion flag. Shared with the handler, which outlives any read of
-/// [`HomingOverride`].
+/// and the recursion flag (`:22-24`).
 struct OverrideCore {
     options: HomingOverrideOptions,
     template: Template,
-    /// Set while the script runs, so a `G28` inside it reaches the previous
-    /// handler (`homing_override.py:22-24`).
     in_script: AtomicBool,
 }
 
@@ -163,7 +148,7 @@ impl OverrideCore {
     }
 
     /// Claim the run, releasing the flag however it ends — upstream's
-    /// `try/finally` (`homing_override.py:61-63`).
+    /// `try/finally` (`:61-63`).
     fn enter(&self) -> ScriptRun<'_> {
         self.in_script.store(true, Ordering::SeqCst);
         ScriptRun(&self.in_script)
@@ -179,13 +164,13 @@ impl Drop for ScriptRun<'_> {
     }
 }
 
-/// The toolhead effects the `G28` handler performs, so the override is
-/// testable without a machine (the `safe_z_home.rs` `HomeOps` pattern).
+/// The toolhead effects the `G28` handler performs, so the override is testable
+/// without a machine (the `safe_z_home.rs` `HomeOps` pattern).
 trait HomingEffects {
-    /// `toolhead.get_position()`.
+    /// `toolhead.get_position()`; "Printer is not ready" before connect.
     ///
     /// # Errors
-    /// "Printer is not ready" before connect.
+    /// As the toolhead reports it.
     fn position(&self) -> Result<Coord, CommandError>;
     /// `toolhead.set_position(position, homing_axes)`.
     ///
@@ -219,7 +204,7 @@ impl HomingEffects for LiveHoming {
     }
 }
 
-/// The `G28` replacement itself (`homing_override.py:21-63`).
+/// The `G28` replacement itself (`:21-63`).
 ///
 /// # Errors
 /// Whatever the previous handler reports, whatever the toolhead refuses, or a
@@ -232,14 +217,13 @@ async fn run_g28<O: HomingEffects + ?Sized>(
     prev_g28: &CommandHandler,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
-    // Was called recursively - invoke the real G28 command
-    // (`homing_override.py:22-24`).
+    // Was called recursively - invoke the real G28 command (`:22-24`).
     if core.in_script() {
         return prev_g28(gcmd).await;
     }
 
-    // if no axis is given as parameter we assume the override; otherwise check
-    // if we home an axis which needs the override (`:26-46`).
+    // No axis named means the override; otherwise any axis `axes` selects
+    // (`:26-46`).
     let mut requested = [false; 3];
     for (axis, name) in AXES {
         requested[axis] = gcmd.get_command_parameters().contains_key(name);
@@ -252,8 +236,7 @@ async fn run_g28<O: HomingEffects + ?Sized>(
     let (position, homing_axes) = core.options.start_position(ops.position()?);
     ops.set_position(position, &homing_axes).await?;
 
-    // Perform homing (`:52-60`): the script renders against the statement's
-    // own parameters, then runs as a script of its own.
+    // Perform homing (`:52-60`).
     let mut context = template_context(printer, gcmd);
     let script = core
         .template
@@ -263,9 +246,8 @@ async fn run_g28<O: HomingEffects + ?Sized>(
     gcode.run_script_from_command(&script).await
 }
 
-/// The render context upstream's `run_gcode_from_command` gets
-/// (`homing_override.py:56-58`): the globals a macro body sees plus the `G28`
-/// statement's `params` / `rawparams`.
+/// The context `run_gcode_from_command` gets (`:56-58`): the globals a macro
+/// body sees plus the statement's `params` / `rawparams`.
 fn template_context(printer: &Arc<Printer>, gcmd: &GcodeCommand) -> Context {
     let mut context = Context::new();
     context.insert(
@@ -293,31 +275,30 @@ fn template_context(printer: &Arc<Printer>, gcmd: &GcodeCommand) -> Context {
 
 /// The `[homing_override]` section: the `G28` wrapper's registration.
 ///
-/// The options and the compiled script are not kept here: the installed
+/// The options and the compiled script are not kept here — the installed
 /// handler captures them, and it outlives any read of this object.
 pub struct HomingOverride {
-    /// The handler this section replaced — the toolhead's. Nothing consumes
-    /// the value after registration, hence the field-level `allow`; the tests
-    /// read it to pin the load order and the recursion path.
+    /// The handler this section replaced — the toolhead's. Nothing consumes the
+    /// value after registration, hence the field-level `allow`; the tests read
+    /// it to pin the load order.
     #[allow(dead_code)]
     prev_g28: Arc<Mutex<Option<CommandHandler>>>,
 }
 
 impl HomingOverride {
-    /// Read the section, compile the script, and install the `G28` wrapper
-    /// (`homing_override.py:10-20`).
+    /// Read the section, compile the script and install the `G28` wrapper
+    /// (`:10-20`).
     ///
     /// # Errors
-    /// As [`HomingOverrideOptions::read`], a missing or unparsable `gcode`
-    /// template, a `G28` this section cannot chain to (loaded before the
-    /// toolhead), or a name already taken.
+    /// As [`HomingOverrideOptions::read`], a missing or unparsable `gcode`, a
+    /// `G28` this section cannot chain to (loaded before the toolhead), or a
+    /// name already taken.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let options = HomingOverrideOptions::read(config)?;
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` first");
-        // `gcode_macro.load_template(config, 'gcode')` (`:17-18`): the shared
-        // template holder reads the option and compiles it.
+        // `gcode_macro.load_template(config, 'gcode')` (`:17-18`).
         let template = PrinterGCodeMacro::ensure(printer)?.load_template(config, "gcode", None)?;
         let core = Arc::new(OverrideCore {
             options,
@@ -326,10 +307,9 @@ impl HomingOverride {
         });
 
         // Take the previous `G28` so this section can chain to it (`:19-20`).
-        // `section!` loads this after the toolhead, which is where `G28` is
-        // registered (`toolhead.rs:603-606`); without it there would be nothing
-        // to home through, so a missing one is a wiring error rather than a
-        // silently dropped `G28`.
+        // `section!` loads this after the toolhead (`toolhead.rs:603-606`);
+        // without it there would be nothing to home through, so a missing one
+        // is a wiring error rather than a silently dropped `G28`.
         let prev = gcode.unregister_command("G28").ok_or_else(|| {
             ConfigError::new("homing_override must be loaded after `G28` is registered")
         })?;
@@ -339,38 +319,32 @@ impl HomingOverride {
             let core = Arc::clone(&core);
             let prev_g28 = Arc::clone(&prev_g28);
             // Weak: this handler lives in the dispatcher's command table, so a
-            // strong handle would be a reference cycle (`safe_z_home.rs` takes
-            // the same care).
+            // strong handle would be a reference cycle (`safe_z_home.rs`).
             let gcode = Arc::downgrade(&gcode);
             let printer = Arc::downgrade(printer);
             Arc::new(move |gcmd: &GcodeCommand| {
                 let core = Arc::clone(&core);
                 let prev_g28 = Arc::clone(&prev_g28);
-                let gcode = gcode.clone();
-                let printer = printer.clone();
+                let (gcode, printer) = (gcode.clone(), printer.clone());
                 Box::pin(async move {
-                    let gcode = gcode
-                        .upgrade()
-                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
-                    let printer = printer
-                        .upgrade()
-                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                    let not_ready = || CommandError::new("Printer is not ready");
+                    let gcode = gcode.upgrade().ok_or_else(not_ready)?;
+                    let printer = printer.upgrade().ok_or_else(not_ready)?;
                     let toolhead = printer
                         .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
-                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        .ok_or_else(not_ready)?;
                     let prev = prev_g28
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .clone()
-                        .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        .ok_or_else(not_ready)?;
                     let ops = LiveHoming { toolhead };
                     run_g28(&core, &gcode, &printer, &ops, &prev, gcmd).await
                 })
             })
         };
-        // No help text: upstream leaves the previous one in place
-        // (`gcode.rs`). The axes are `X` / `Y` / `Z`, the ones `run_g28` looks
-        // for in the statement's parameters; declaring them keeps the list the
+        // No help text: upstream leaves the previous one in place. The axes are
+        // the parameters `run_g28` reads, so declaring them keeps the list the
         // toolhead's `G28` put on the re-registration.
         gcode
             .register_command_with_params("G28", handler, None, &["X", "Y", "Z"], false)
@@ -381,8 +355,8 @@ impl HomingOverride {
 }
 
 impl PrinterObject for HomingOverride {
-    /// Upstream's `HomingOverride` defines no `get_status`; like the sections
-    /// it wraps, the port reports an empty object.
+    /// Upstream's `HomingOverride` defines no `get_status`; like the sections it
+    /// wraps, the port reports an empty object.
     fn get_status(&self, _eventtime: f64) -> Value {
         json!({})
     }
@@ -393,8 +367,7 @@ pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
-    let object = HomingOverride::new(config, printer)?;
-    Ok(Arc::new(object))
+    Ok(Arc::new(HomingOverride::new(config, printer)?))
 }
 
 // ===========================================================================
@@ -409,10 +382,8 @@ mod tests {
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::gcode::sync;
     use crate::core::klippy::reactor::ManualReactor;
-    use std::collections::HashMap;
 
-    /// A `[homing_override]` section with the given options, as the parser
-    /// would build it.
+    /// A `[homing_override]` section with the given options.
     fn section(options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("homing_override", None);
         for (option, value) in options {
@@ -428,21 +399,8 @@ mod tests {
         Arc::new(Printer::new(ManualReactor::shared()))
     }
 
-    fn dispatch() -> Arc<GCodeDispatch> {
-        Arc::new(GCodeDispatch::new(printer()))
-    }
-
-    /// A dispatcher whose printer has become ready, so its registered commands
-    /// are found (`process_line` only sees the ready table then).
-    fn ready_dispatch() -> (Arc<GCodeDispatch>, Arc<Printer>) {
-        let printer = printer();
-        let gcode = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
-        printer.send_event(&KlippyEvent::KlippyReady);
-        (gcode, printer)
-    }
-
-    /// The section's `gcode` option, loaded through the shared template holder
-    /// the way [`HomingOverride::new`] loads it.
+    /// The `gcode` option, loaded through the shared template holder the way
+    /// [`HomingOverride::new`] loads it.
     fn load_template(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -450,11 +408,9 @@ mod tests {
         PrinterGCodeMacro::ensure(printer)?.load_template(config, "gcode", None)
     }
 
-    /// The corpus option set (`test/klippy/sdcard_loop.cfg:9-14`) is read
-    /// back through the tracker, so `check_unused` accepts the section —
-    /// the option-level half of the loader's validation
-    /// (`config/validate.rs:48`). `kit-zav3d-2019.cfg:141` writes the same
-    /// option set.
+    /// The corpus option set (`test/klippy/sdcard_loop.cfg:9-14`, and
+    /// `kit-zav3d-2019.cfg:141`) is read back through the tracker, so
+    /// `check_unused` accepts the section.
     #[test]
     fn every_option_the_section_writes_is_recorded_as_read() {
         let text = "[homing_override]
@@ -474,17 +430,14 @@ gcode:
         let template = load_template(&wrapper, &printer()).expect("the body compiles");
         check_unused(&config, &access, &[]).expect("no option is left unread");
 
-        // The `axes` value is upper-cased (`homing_override.py:16`).
-        assert_eq!(parsed.axes, "XYZ");
+        assert_eq!(parsed.axes, "XYZ"); // upper-cased (`:16`)
         assert_eq!(parsed.start_pos, [Some(0.), Some(0.), Some(0.)]);
-        // The template is named after its section and option
-        // (`gcode_macro.py:47-52`).
+        // Named after its section and option (`gcode_macro.py:47-52`).
         assert_eq!(template.name(), "homing_override:gcode");
     }
 
-    /// With only the mandatory script, `axes` falls back to upstream's
-    /// `XYZ` and no position is forced (`homing_override.py:14-16`); the
-    /// default is recorded the way `config.get` records a used default
+    /// With only the mandatory script, `axes` falls back to upstream's `XYZ`
+    /// and no position is forced (`:14-16`); the default is recorded as used
     /// (`config/wrapper.rs:179-190`).
     #[test]
     fn the_defaults_are_upstreams() {
@@ -503,7 +456,7 @@ gcode:
         assert!(access.contains("homing_override", "axes"));
         assert!(!access.contains("homing_override", "set_position_x"));
 
-        // No context is needed: the body is one plain statement.
+        // The body is one plain statement, so no context is needed.
         let mut context = Context::new();
         assert_eq!(
             template
@@ -516,7 +469,7 @@ gcode:
 
     /// A `set_position_*` that is not a number is refused with upstream's
     /// `getfloat` wording, and a missing `gcode` with the loader's
-    /// required-option wording (`homing_override.py:14,18`).
+    /// required-option wording (`:14,18`).
     #[test]
     fn malformed_options_are_refused_with_upstream_wording() {
         let sect = section(&[("gcode", "G28"), ("set_position_x", "abc")]);
@@ -537,9 +490,7 @@ gcode:
     }
 
     /// The `G28` statement decides against the `axes` mask exactly as
-    /// upstream's `cmd_G28` (`homing_override.py:33-46`): no axis named
-    /// means the whole override, otherwise any named axis that `axes`
-    /// selects; letters outside `xyz` in `axes` select nothing.
+    /// upstream's `cmd_G28` (`:33-46`).
     #[test]
     fn a_g28_statement_decides_against_the_axes_mask() {
         let override_xyz = HomingOverrideOptions {
@@ -553,16 +504,15 @@ gcode:
         // Any requested axis that `axes` selects → override.
         assert!(override_xyz.overrides(&requested(true, false, false)));
         assert!(override_xyz.overrides(&requested(false, true, true)));
-        // `axes: Z` only overrides a Z statement; X/Y pass through to the
-        // real `G28`.
+        // `axes: Z` only overrides a Z statement.
         let override_z = HomingOverrideOptions {
             axes: "Z".to_string(),
             start_pos: [None; 3],
         };
         assert!(!override_z.overrides(&requested(true, false, false)));
         assert!(override_z.overrides(&requested(false, false, true)));
-        // The mask comes from the upper-cased option; unknown letters in
-        // it select nothing.
+        // The mask comes from the upper-cased option; unknown letters in it
+        // select nothing.
         assert_eq!(override_xyz.axis_mask(), [true, true, true]);
         let odd = HomingOverrideOptions {
             axes: "XW".to_string(),
@@ -575,8 +525,8 @@ gcode:
     // The `G28` handler
     // -----------------------------------------------------------------------
 
-    /// `[mcu]`, three axes and `[printer]` — what a `G28` needs to exist —
-    /// with `extra` appended.
+    /// `[mcu]`, three axes and `[printer]` — what a `G28` needs to exist — with
+    /// `extra` appended.
     fn loadable(extra: &str) -> Config {
         Config::from_text(&format!(
             "[mcu]\nserial: /dev/not-opened-yet\n\
@@ -590,10 +540,9 @@ gcode:
         .0
     }
 
-    /// The load order is load-bearing: the toolhead registers `G28` when it
-    /// loads (`toolhead.rs:603-606`), so the section must load after it
-    /// (`order = 70` against the toolhead's `order = 60`, both `phase = late`)
-    /// to take that handler away rather than have its own overwritten.
+    /// The load order is load-bearing: the section must load after the toolhead
+    /// (`order = 70` against `60`, both `phase = late`) to take its `G28` away
+    /// rather than have its own overwritten.
     #[test]
     fn g28_is_replaced_after_the_toolhead_registers_it() {
         let printer = printer();
@@ -623,30 +572,101 @@ gcode:
             "[homing_override]\ngcode: G28\n\
              [safe_z_home]\nhome_xy_position: 160,120\n",
         );
-        let err = printer.load_config(&config).unwrap_err();
         assert_eq!(
-            err.to_string(),
+            printer.load_config(&config).unwrap_err().to_string(),
             "homing_override and safe_z_homing cannot be used simultaneously"
         );
     }
 
-    /// The toolhead side of `run_g28`, recording into a log the tests also
-    /// write the script's own effects into, so their order is observable.
-    struct RecordingHome {
-        position: Mutex<Coord>,
+    /// The toolhead side of `run_g28`, plus the dispatcher the script runs on.
+    /// Both write into one log, so the forced position and the script's effects
+    /// are ordered.
+    struct Rig {
         log: Arc<Mutex<Vec<String>>>,
+        position: Mutex<Coord>,
+        gcode: Arc<GCodeDispatch>,
+        printer: Arc<Printer>,
     }
 
-    impl RecordingHome {
-        fn new(position: Coord, log: Arc<Mutex<Vec<String>>>) -> Arc<Self> {
+    impl Rig {
+        /// A ready dispatcher over a fresh printer, with `MARK` recording the
+        /// parameters the script renders into the log.
+        fn new() -> Arc<Self> {
+            let printer = printer();
+            let gcode = Arc::new(GCodeDispatch::new(Arc::clone(&printer)));
+            printer.send_event(&KlippyEvent::KlippyReady);
+            let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            {
+                let log = Arc::clone(&log);
+                gcode
+                    .register_command(
+                        "MARK",
+                        sync(move |gcmd: &GcodeCommand| {
+                            let mut pairs: Vec<String> = gcmd
+                                .get_command_parameters()
+                                .iter()
+                                .map(|(key, value)| format!("{key}={value}"))
+                                .collect();
+                            // A `HashMap` has no order; the log has to be stable.
+                            pairs.sort();
+                            log.lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(format!("script {}", pairs.join(" ")));
+                            Ok(())
+                        }),
+                        None,
+                        false,
+                    )
+                    .expect("MARK registers");
+            }
             Arc::new(Self {
-                position: Mutex::new(position),
                 log,
+                position: Mutex::new(Coord::new(1.0, 2.0, 3.0, 0.0)),
+                gcode,
+                printer,
             })
+        }
+
+        fn push(&self, entry: String) {
+            self.log
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(entry);
+        }
+
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        }
+
+        fn statement(&self, params: &[(&str, &str)]) -> GcodeCommand {
+            let params = params
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect();
+            self.gcode.create_gcode_command("G28", "G28 X0", params)
+        }
+
+        fn position(&self) -> Coord {
+            *self.position.lock().unwrap_or_else(|p| p.into_inner())
+        }
+
+        /// Install the override's handler for a nested `G28`: the real one's
+        /// body without the toolhead look-up, which needs a connected machine.
+        fn install(self: &Arc<Self>, core: &Arc<OverrideCore>, prev: &CommandHandler) {
+            let (core, rig, prev) = (Arc::clone(core), Arc::clone(self), Arc::clone(prev));
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let (core, rig, prev) = (Arc::clone(&core), Arc::clone(&rig), Arc::clone(&prev));
+                Box::pin(async move {
+                    run_g28(&core, &rig.gcode, &rig.printer, rig.as_ref(), &prev, gcmd).await
+                })
+            });
+            self.gcode
+                .register_command_with_params("G28", handler, None, &["X", "Y", "Z"], false)
+                .expect("G28 registers");
         }
     }
 
-    impl HomingEffects for RecordingHome {
+    impl HomingEffects for Rig {
         fn position(&self) -> Result<Coord, CommandError> {
             Ok(*self.position.lock().unwrap_or_else(|p| p.into_inner()))
         }
@@ -656,132 +676,62 @@ gcode:
             position: Coord,
             homing_axes: &[usize],
         ) -> Result<(), CommandError> {
-            self.log
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(format!(
-                    "set_position x={:.3} homing={homing_axes:?}",
-                    position.x()
-                ));
+            self.push(format!(
+                "set_position x={:.3} homing={homing_axes:?}",
+                position.x()
+            ));
             *self.position.lock().unwrap_or_else(|p| p.into_inner()) = position;
             Ok(())
         }
     }
 
-    fn log_of(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
-        log.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-
     /// A previous `G28` that records the statement it was handed.
-    fn recording_prev(log: Arc<Mutex<Vec<String>>>) -> CommandHandler {
+    fn recording_prev(log: &Arc<Mutex<Vec<String>>>) -> CommandHandler {
+        let log = Arc::clone(log);
         Arc::new(move |gcmd: &GcodeCommand| {
-            let line = gcmd.commandline().to_string();
-            log.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(format!("prev {line}"));
+            let entry = format!("prev {}", gcmd.commandline());
+            log.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
             Box::pin(async { Ok::<(), CommandError>(()) })
         })
     }
 
-    fn statement(gcode: &GCodeDispatch, params: &[(&str, &str)]) -> GcodeCommand {
-        let params = params
-            .iter()
-            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-            .collect();
-        gcode.create_gcode_command("G28", "G28 X0", params)
-    }
-
-    fn core(options: HomingOverrideOptions, body: &str) -> Arc<OverrideCore> {
+    fn core(axes: &str, start_pos: [Option<f64>; 3], body: &str) -> Arc<OverrideCore> {
         Arc::new(OverrideCore {
-            options,
+            options: HomingOverrideOptions {
+                axes: axes.to_string(),
+                start_pos,
+            },
             template: Template::parse("homing_override:gcode", body).expect("the body compiles"),
             in_script: AtomicBool::new(false),
         })
     }
 
-    /// The installed handler's body without the toolhead look-up: the tests
-    /// inject the effects, since `LiveHoming` needs a connected machine.
-    fn local_handler(
-        core: &Arc<OverrideCore>,
-        gcode: &Arc<GCodeDispatch>,
-        printer: &Arc<Printer>,
-        ops: &Arc<RecordingHome>,
-        prev: &CommandHandler,
-    ) -> CommandHandler {
-        let (core, gcode, printer, ops, prev) = (
-            Arc::clone(core),
-            Arc::clone(gcode),
-            Arc::clone(printer),
-            Arc::clone(ops),
-            Arc::clone(prev),
-        );
-        Arc::new(move |gcmd: &GcodeCommand| {
-            let (core, gcode, printer, ops, prev) = (
-                Arc::clone(&core),
-                Arc::clone(&gcode),
-                Arc::clone(&printer),
-                Arc::clone(&ops),
-                Arc::clone(&prev),
-            );
-            Box::pin(
-                async move { run_g28(&core, &gcode, &printer, ops.as_ref(), &prev, gcmd).await },
-            )
-        })
-    }
-
     /// A `G28` the `axes` mask selects renders the script — against the
-    /// statement's own `params` / `rawparams` (`homing_override.py:57-58`) —
-    /// and runs it after the forced start position (`:48-60`).
+    /// statement's own `params`/`rawparams` (`:57-58`) — and runs it after the
+    /// forced start position (`:48-60`).
     #[tokio::test]
     async fn the_script_runs_after_the_forced_start_position() {
-        let log = Arc::new(Mutex::new(Vec::new()));
+        let rig = Rig::new();
         let core = core(
-            HomingOverrideOptions {
-                axes: "XYZ".to_string(),
-                start_pos: [Some(10.0), None, None],
-            },
+            "XYZ",
+            [Some(10.0), None, None],
             "MARK VALUE={params.X} RAW={rawparams}",
         );
-        let (gcode, printer) = ready_dispatch();
-        let ops = RecordingHome::new(Coord::new(1.0, 2.0, 3.0, 0.0), Arc::clone(&log));
-        let prev = recording_prev(Arc::clone(&log));
-        {
-            let log = Arc::clone(&log);
-            gcode
-                .register_command(
-                    "MARK",
-                    sync(move |gcmd: &GcodeCommand| {
-                        let mut pairs: Vec<String> = gcmd
-                            .get_command_parameters()
-                            .iter()
-                            .map(|(key, value)| format!("{key}={value}"))
-                            .collect();
-                        // A `HashMap` has no order; the log has to be stable.
-                        pairs.sort();
-                        log.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(format!("script {}", pairs.join(" ")));
-                        Ok(())
-                    }),
-                    None,
-                    false,
-                )
-                .expect("MARK registers");
-        }
+        let prev = recording_prev(&rig.log);
 
         run_g28(
             &core,
-            &gcode,
-            &printer,
-            ops.as_ref(),
+            &rig.gcode,
+            &rig.printer,
+            rig.as_ref(),
             &prev,
-            &statement(&gcode, &[("X", "0")]),
+            &rig.statement(&[("X", "0")]),
         )
         .await
         .expect("the override runs");
 
         assert_eq!(
-            log_of(&log),
+            rig.log(),
             [
                 "set_position x=10.000 homing=[0]".to_string(),
                 "script RAW=X0 VALUE=0".to_string(),
@@ -790,103 +740,53 @@ gcode:
     }
 
     /// A `G28` naming no axis of `axes` is homed by the previous handler:
-    /// `axes: Z` leaves `G28 X` alone (`homing_override.py:39-46`).
+    /// `axes: Z` leaves `G28 X` alone (`:39-46`).
     #[tokio::test]
     async fn an_axis_outside_axes_is_homed_by_the_previous_handler() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let core = core(
-            HomingOverrideOptions {
-                axes: "Z".to_string(),
-                start_pos: [Some(10.0), None, None],
-            },
-            "MARK",
-        );
-        let (gcode, printer) = ready_dispatch();
-        let ops = RecordingHome::new(Coord::new(1.0, 2.0, 3.0, 0.0), Arc::clone(&log));
-        let prev = recording_prev(Arc::clone(&log));
+        let rig = Rig::new();
+        let core = core("Z", [Some(10.0), None, None], "MARK");
+        let prev = recording_prev(&rig.log);
 
         run_g28(
             &core,
-            &gcode,
-            &printer,
-            ops.as_ref(),
+            &rig.gcode,
+            &rig.printer,
+            rig.as_ref(),
             &prev,
-            &statement(&gcode, &[("X", "0")]),
+            &rig.statement(&[("X", "0")]),
         )
         .await
         .expect("the statement passes through");
 
         // Nothing of the override ran: no forced position, no script.
-        assert_eq!(log_of(&log), ["prev G28 X0".to_string()]);
+        assert_eq!(rig.log(), ["prev G28 X0".to_string()]);
+        assert_eq!(rig.position().z(), 3.0);
     }
 
     /// A `G28` inside the script reaches the previous handler instead of
-    /// re-entering the override, and the flag is cleared once the script ends
-    /// (`homing_override.py:22-24`, `:61-63`).
+    /// re-entering the override, and the flag is cleared once it ends
+    /// (`:22-24`, `:61-63`).
     #[tokio::test]
     async fn a_g28_inside_the_script_reaches_the_previous_handler() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let core = core(
-            HomingOverrideOptions {
-                axes: "XYZ".to_string(),
-                start_pos: [None; 3],
-            },
-            "G28 Y0",
-        );
-        let (gcode, printer) = ready_dispatch();
-        let ops = RecordingHome::new(Coord::new(0.0, 0.0, 0.0, 0.0), Arc::clone(&log));
-        let prev = recording_prev(Arc::clone(&log));
-        gcode
-            .register_command_with_params(
-                "G28",
-                local_handler(&core, &gcode, &printer, &ops, &prev),
-                None,
-                &["X", "Y", "Z"],
-                false,
-            )
-            .expect("G28 registers");
+        let rig = Rig::new();
+        let core = core("XYZ", [None; 3], "G28 Y0");
+        let prev = recording_prev(&rig.log);
+        rig.install(&core, &prev);
 
-        gcode
+        rig.gcode
             .run_script_from_command("G28")
             .await
             .expect("the override runs");
 
-        // One forced position (from the outer statement only) and one homing
-        // through the previous handler: the inner `G28 Y0` did not re-enter.
+        // One forced position (the outer statement's) and one homing through
+        // the previous handler: the inner `G28 Y0` did not re-enter.
         assert_eq!(
-            log_of(&log),
+            rig.log(),
             [
-                "set_position x=0.000 homing=[]".to_string(),
+                "set_position x=1.000 homing=[]".to_string(),
                 "prev G28 Y0".to_string(),
             ]
         );
         assert!(!core.in_script(), "the run releases the recursion flag");
-    }
-
-    /// A template that does not render fails the statement, and the failure
-    /// still releases the recursion flag — upstream's `finally`
-    /// (`homing_override.py:61-63`).
-    #[tokio::test]
-    async fn a_failing_render_leaves_the_recursion_flag_clear() {
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let core = core(
-            HomingOverrideOptions {
-                axes: "XYZ".to_string(),
-                start_pos: [None; 3],
-            },
-            "{params.X + 1}",
-        );
-        let gcode = Arc::new(dispatch());
-        let printer = printer();
-        let ops = RecordingHome::new(Coord::new(0.0, 0.0, 0.0, 0.0), Arc::clone(&log));
-        let prev = recording_prev(Arc::clone(&log));
-        let params = HashMap::from([("X".to_string(), "not-a-number".to_string())]);
-        let gcmd = gcode.create_gcode_command("G28", "G28 X=not-a-number", params);
-
-        let err = run_g28(&core, &gcode, &printer, ops.as_ref(), &prev, &gcmd)
-            .await
-            .expect_err("a template that does not render fails the statement");
-        assert!(err.to_string().contains("Error evaluating"), "{err}");
-        assert!(!core.in_script());
     }
 }

@@ -470,21 +470,47 @@ fn strip_template_tags(body: &str) -> String {
 /// A line whose command is computed by the template (`{% set cmd = … %}` then
 /// `{{ cmd }}`, or a command emitted by an `{% if %}` branch) cannot be read
 /// off the source, so it is simply not collected — the check stays quiet on
-/// what it cannot see, and only warns about names written verbatim. The
-/// macro's own alias is registered by the time the check runs, so a
-/// self-referencing body does not warn about itself.
+/// what it cannot see, and only warns about names written verbatim. A word
+/// **glued** to a variable tag (`G9{ 0 if ABSOLUTE else 1 }`, which renders
+/// `G90`/`G91`) is the same case: the tag decides the rest of the name, so the
+/// line is skipped rather than warned about as `G9`. The macro's own alias is
+/// registered by the time the check runs, so a self-referencing body does not
+/// warn about itself.
 fn static_command_names(body: &str) -> Vec<String> {
     let stripped = strip_template_tags(body);
     let mut names: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for line in stripped.lines() {
+    // `strip_template_tags` is length-preserving, so the raw lines and the
+    // blanked ones zip up: the raw line still shows what the word was glued to.
+    for (raw, line) in body.lines().zip(stripped.lines()) {
         if let Some(command) = command_of_line(line) {
+            if glued_to_a_tag(raw) {
+                continue;
+            }
             if seen.insert(command.clone()) {
                 names.push(command);
             }
         }
     }
     names
+}
+
+/// Whether the line's command word runs straight into a `{ … }` variable tag,
+/// as `G9{ 0 if ABSOLUTE else 1 }` does (`mainsail.cfg`'s
+/// `_CLIENT_LINEAR_MOVE`, which renders `G90`/`G91`). What follows the prefix
+/// is the tag's, so the line states no command name and has nothing to warn
+/// about; a tag after a space (`G1 { x_move }`) leaves `G1` a verbatim name.
+fn glued_to_a_tag(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let word = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    i > word && bytes.get(i) == Some(&b'{')
 }
 
 /// The macro's own command (`GCodeMacro.cmd`, `gcode_macro.py:188-200`): render
@@ -1740,6 +1766,27 @@ STEPPER_RELEASE";
         assert!(
             static_command_names(body).is_empty(),
             "the command is an expression, not a verbatim token"
+        );
+    }
+
+    /// A command word glued to a variable tag states no name — the tag decides
+    /// the rest of it — so the line is skipped instead of being warned about
+    /// as `G9` / `M8`. The body is `mainsail.cfg`'s `_CLIENT_LINEAR_MOVE`
+    /// shape: `G9{ 0 if ABSOLUTE else 1 }` renders `G90`/`G91` and
+    /// `M8{ 2 if ABSOLUTE_E else 3 }` renders `M82`/`M83`, while a tag after a
+    /// space leaves `G1` a verbatim name worth checking.
+    #[test]
+    fn a_command_glued_to_a_variable_tag_is_not_collected() {
+        let body = "\
+SAVE_GCODE_STATE NAME=_client_movement
+G9{ 0 if ABSOLUTE else 1 }
+M8{ 2 if ABSOLUTE_E else 3 }
+G1 { x_move } { y_move }
+RESTORE_GCODE_STATE NAME=_client_movement";
+        assert_eq!(
+            static_command_names(body),
+            vec!["SAVE_GCODE_STATE", "G1", "RESTORE_GCODE_STATE"],
+            "the glued words are not names; the spaced tag leaves G1 alone"
         );
     }
 

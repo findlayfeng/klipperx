@@ -211,8 +211,13 @@ mod tests {
         assert!(bed.heater().get_temp().0 < 58.0);
 
         // `M190` waits: the call does not return until the feeder has brought
-        // the bed within `max_delta` of the target.
-        gcode.run_script("M190 S60").await.unwrap();
+        // the bed within `max_delta` of the target.  The wait is bounded so a
+        // model that never reaches the target fails here instead of hanging.
+        let wait = gcode.run_script("M190 S60");
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("M190 returned once the bed reached the target: the wait timed out")
+            .unwrap();
         feeder.abort();
 
         assert_eq!(bed.heater().get_status()["target"], 60.0);

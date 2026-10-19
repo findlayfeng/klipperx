@@ -423,11 +423,21 @@ impl McuClock {
     /// `reactor` is the host clock each sample is timed against; it is what
     /// upstream's serial queue would stamp on every message.
     pub fn new(mcu: Arc<Mcu>, reactor: Arc<dyn Reactor>) -> Self {
+        let mut estimator = ClockEstimator::new(1.0);
+        // Upstream takes the frequency from the dictionary as it connects
+        // (`klippy/clocksync.py:34`), so 1 Hz is only ever a starting value: a
+        // session whose `get_uptime` never answers still converts print time
+        // with the firmware's own frequency. A clock built before identify
+        // keeps the placeholder; [`McuClock::firmware_freq`] reads the
+        // dictionary then.
+        if let Ok(freq) = mcu.clock_freq() {
+            estimator.set_mcu_freq(freq);
+        }
         Self {
             mcu,
             reactor,
             timeout: CLOCK_TIMEOUT,
-            estimator: Arc::new(Mutex::new(ClockEstimator::new(1.0))),
+            estimator: Arc::new(Mutex::new(estimator)),
         }
     }
 
@@ -440,6 +450,18 @@ impl McuClock {
     /// The MCU this module talks to.
     pub fn mcu(&self) -> &Arc<Mcu> {
         &self.mcu
+    }
+
+    /// The frequency the firmware reports for its clock, once identify has read
+    /// the dictionary; `None` before that.
+    ///
+    /// This is what a print-time mapping has to convert with. The estimator
+    /// starts at upstream's placeholder 1 Hz (`klippy/clocksync.py:22`) and only
+    /// `CLOCK_FREQ` replaces it (`:34`), so a mapping built before any sample
+    /// must come back here: converting on the placeholder reads ticks as
+    /// seconds.
+    pub fn firmware_freq(&self) -> Option<f64> {
+        self.mcu.clock_freq().ok()
     }
 
     /// The clock estimate, for reads and for seeding.
@@ -786,6 +808,31 @@ mod tests {
         assert!((clock.estimated_print_time(7.5) - 10.0).abs() < 1e-9);
         // And it advances with the host clock from there.
         assert!((clock.estimated_print_time(8.5) - 11.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_a_new_clock_takes_its_frequency_from_the_dictionary() {
+        // Upstream connects with the dictionary's `CLOCK_FREQ`
+        // (`klippy/clocksync.py:34`), so the estimate converts with a real
+        // frequency before any sample arrives: a connect whose `get_uptime`
+        // never answered still has to map print time.
+        let mcu = mcu_answering(Vec::new());
+        let clock = McuClock::new(mcu, ManualReactor::shared());
+
+        assert_eq!(clock.estimator().mcu_freq(), 20_000_000.0);
+        assert_eq!(clock.firmware_freq(), Some(20_000_000.0));
+        assert_eq!(clock.print_time_to_clock(1.5), 30_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_a_clock_built_before_identify_has_no_firmware_frequency() {
+        // Nothing to take: the estimator keeps the placeholder, and reports no
+        // frequency rather than standing behind 1 Hz.
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
+        let clock = McuClock::new(Arc::new(mcu), ManualReactor::shared());
+
+        assert_eq!(clock.firmware_freq(), None);
+        assert_eq!(clock.estimator().mcu_freq(), 1.0);
     }
 
     #[tokio::test]

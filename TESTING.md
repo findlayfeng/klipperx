@@ -140,7 +140,7 @@
 ### 2026-10-19 自动化 lane 首次跑通（裸 STM32F103，桥固件 / mux 控制台）
 
 配置：`/tmp/kx-hw.cfg`（单 `[mcu]` + 一个桥端口节让主机按 id 寻址；`[stepper_x]` 用空闲 GPIO
-PB4/PB5/`!PB6`，`endstop_pin: ^PB3`，不接任何负载）。`KLIPPERX_HW_CONFIG=<cfg> cargo hwtest`：
+PB4/PB5/`!PB6`，`endstop_pin: ^PD10`，不接任何负载）。`KLIPPERX_HW_CONFIG=<cfg> cargo hwtest`：
 
 | 用例 | 结果 |
 |---|---|
@@ -148,7 +148,11 @@ PB4/PB5/`!PB6`，`endstop_pin: ^PB3`，不接任何负载）。`KLIPPERX_HW_CONF
 | R2 复位三轮 | ✅ 每轮 `rebooted, identified and answered get_clock`：765 / 763 / 764 ms，共 2.64 s |
 | R5 单轴步数 | ✅ `firmware position: 400 step(s), expected 400`（5 mm @ 10 mm/s，0.96 s） |
 | R11 短时 soak | ✅ `5000 steps/s for 2.0 s` → 10000 步（≈125 mm），无 shutdown，2.70 s |
-| R3 端停电平 | ⏸ **交互式**：读一次电平后停在 `HW-ENDSTOP: change the X endstop's physical state now … press Enter`，需人工短接/断开 PB3 并在终端回车，不能在自动化批次里跑 |
+| R3 端停电平 | ✅ **交互式跑通（需人手一次）**：`endstop_pin: ^PD10`（上拉）→ `read 1: TRIGGERED`（悬空被上拉为高）；把 PD10 短到 GND 后回车 → `read 2: open`，输出 `电平翻转确认：TRIGGERED -> open`（44 s，含等人） |
+
+> **接线语义（实测确认，与上游同款）**：`^` 只置上拉、`!` 才置 flip（`pins.py:70-76` ↔ `pins.rs:970-972`）；主机
+> `query_endstop` 返回 `pin_value ^ invert`（`endstop.rs:146` ↔ `mcu.py:406`），`true` 打印为 `TRIGGERED`。
+> 所以 `^PD10` **悬空 = 高 = TRIGGERED**、**短到 GND = 低 = open**——klipper 的 `^` 端停按常闭接法工作。
 
 **前置修复（同批）**：这份 lane 以前打不通这块板——`hardware_test`/`stress` 各自只拿到一节就
 `McuConfig::open()`，而"这条 `serial:` 路径按 id 寻址"是**装载期**在整份配置上判定的，于是 lane 用

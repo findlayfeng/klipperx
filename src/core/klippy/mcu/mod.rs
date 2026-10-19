@@ -92,6 +92,13 @@ const SYNC_SEND_HEADROOM: usize = 16;
 /// in the reported error.
 const SYNC_SEND_WAIT: Duration = Duration::from_secs(1);
 
+/// How long an awaiting producer ([`Mcu::send_payload`],
+/// [`Mcu::send_move_payload`]) waits for a slot above [`SYNC_SEND_HEADROOM`]
+/// before it reports the queue as full — the same second as [`SYNC_SEND_WAIT`],
+/// though this producer yields while it waits: no slot after that means a send
+/// task that stopped draining.
+const PAYLOAD_ROOM_WAIT: Duration = Duration::from_secs(1);
+
 /// The first wait between two looks at the queue in [`try_send_bounded`].
 const SYNC_SEND_POLL_START: Duration = Duration::from_micros(50);
 
@@ -627,6 +634,28 @@ fn try_send_bounded(
 /// synchronous senders.
 fn payload_has_room(send_buf_tx: &mpsc::Sender<SendItem>) -> bool {
     send_buf_tx.capacity() > SYNC_SEND_HEADROOM
+}
+
+/// Queue `item` the way an awaiting producer does: wait for a slot above
+/// [`SYNC_SEND_HEADROOM`] for at most [`PAYLOAD_ROOM_WAIT`], then send. The
+/// condition it waits on has no other exit, like [`try_send_bounded`]'s.
+async fn queue_awaiting_room(
+    send_buf_tx: &mpsc::Sender<SendItem>,
+    item: SendItem,
+) -> Result<(), McuError> {
+    let deadline = tokio::time::Instant::now() + PAYLOAD_ROOM_WAIT;
+    while !payload_has_room(send_buf_tx) && !send_buf_tx.is_closed() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(McuError::Msg(MsgError::new(format!(
+                "send queue has no free slot within {PAYLOAD_ROOM_WAIT:?}"
+            ))));
+        }
+        sleep(Duration::from_micros(100)).await;
+    }
+    send_buf_tx
+        .send(item)
+        .await
+        .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
 }
 
 /// MCU object that represents a physical microcontroller unit.
@@ -2401,18 +2430,14 @@ impl Mcu {
     /// blocking-in-the-async-sense counterpart the configuration phase uses.
     ///
     /// # Errors
-    /// Returns [`McuError::Msg`] if the send task has gone away.
+    /// Returns [`McuError::Msg`] if the send task has gone away, or if no slot
+    /// above [`SYNC_SEND_HEADROOM`] came free within [`PAYLOAD_ROOM_WAIT`] —
+    /// the queue is then reported, not waited on.
     pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
         // Hold back at the headroom so the sync `Mcu::send` keeps slots to
-        // land in (see `SYNC_SEND_HEADROOM`); give up waiting only if the
-        // channel closed, so the error below still surfaces.
-        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
-            sleep(Duration::from_micros(100)).await;
-        }
-        self.send_buf_tx
-            .send(SendItem::Payload(payload))
-            .await
-            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
+        // land in (`SYNC_SEND_HEADROOM`); no slot within `PAYLOAD_ROOM_WAIT` is
+        // reported, not waited on.
+        queue_awaiting_room(&self.send_buf_tx, SendItem::Payload(payload)).await
     }
 
     /// Encode and send a command to the MCU.
@@ -2531,14 +2556,9 @@ impl Mcu {
             show_est(self.gate_clock().estimated_clock()),
         );
         // Same headroom wait as `send_payload`: a long step batch must not
-        // starve the synchronous senders (`SYNC_SEND_HEADROOM`).
-        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
-            sleep(Duration::from_micros(100)).await;
-        }
-        self.send_buf_tx
-            .send(SendItem::Clocked(payload, clocks))
-            .await
-            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
+        // starve the synchronous senders (`SYNC_SEND_HEADROOM`), and the same
+        // bound reports a send task that stopped draining (`PAYLOAD_ROOM_WAIT`).
+        queue_awaiting_room(&self.send_buf_tx, SendItem::Clocked(payload, clocks)).await
     }
 
     /// The gates for one move-class command: the pool's floor for its
@@ -5901,5 +5921,36 @@ mod tests {
             describe_value(&ArgValue::Bytes(vec![1, 2, 0xff])),
             r#"b"\x01\x02\xff""#
         );
+    }
+}
+
+/// The awaiting producers' bound ([`PAYLOAD_ROOM_WAIT`]), driven on a bare
+/// channel: an `Mcu`'s send task would drain a slot at the test's first await.
+#[cfg(test)]
+mod queue_room_deadline {
+    use super::*;
+
+    /// A queue nobody drains, and that never holds room above the headroom, is
+    /// reported after [`PAYLOAD_ROOM_WAIT`] instead of waited on.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_queue_that_never_drains_is_reported_after_the_wait() {
+        // Two slots never clear the headroom; `_rx` keeps the queue open (a
+        // closed one is the other exit).
+        let (tx, _rx) = mpsc::channel::<SendItem>(2);
+        let started = tokio::time::Instant::now();
+        // Virtual clock: the timeout catches a missing deadline, not a hang.
+        let result = tokio::time::timeout(
+            PAYLOAD_ROOM_WAIT * 3,
+            queue_awaiting_room(&tx, SendItem::Payload(Payload::new())),
+        )
+        .await
+        .expect("the wait is bounded");
+
+        let error = result.expect_err("a queue that never drains is an error");
+        assert_eq!(
+            error.to_string(),
+            format!("send queue has no free slot within {PAYLOAD_ROOM_WAIT:?}")
+        );
+        assert!(started.elapsed() >= PAYLOAD_ROOM_WAIT, "the bound");
     }
 }

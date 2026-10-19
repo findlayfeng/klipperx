@@ -975,13 +975,20 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
             format!("no [mcu {name}] section")
         }
     })?;
-    McuConfig::new(&ConfigWrapper::with_config(
+    #[allow(unused_mut)]
+    let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
         section,
         AccessTracking::shared(),
         None,
         config,
     ))
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    // The same question the load path asks: is this `serial:` path addressed by
+    // id (a bridge's mux console, a shared port)? A stress case opens the
+    // section itself, so it applies the answer here.
+    #[cfg(test)]
+    crate::hardware_test::apply_id_addressed_transport(config, section, &mut mcu);
+    Ok(mcu)
 }
 
 /// How one selected board's session is opened.
@@ -3068,17 +3075,21 @@ mod tests {
             .expect_err("no tty is behind the fixture's path");
         assert!(err.contains("shared port attach failed"), "{err}");
 
-        // The same section parsed the way the run used to take it: no stamps, so
-        // the transport falls to the exclusive arm and sends no assignment.
-        let unstamped = resolve_mcu(&config, "bridge").expect("the section resolves");
-        assert_eq!(unstamped.shared_baud, None, "nothing stamped it");
-        let err = unstamped
+        // The lane's own resolve (`resolve_mcu`, what the hardware cases and
+        // `stress` open through) stamps the same facts: it used to open such a
+        // path exclusive, which is why a mux firmware could not be reached from
+        // a hardware test at all.
+        let stamped = resolve_mcu(&config, "bridge").expect("the section resolves");
+        assert_eq!(
+            stamped.shared_baud,
+            Some(500_000),
+            "the lane stamps the shared baud the load path would"
+        );
+        assert_eq!(stamped.id, Some(4), "and the first id of the sequence");
+        let err = stamped
             .open()
             .expect_err("no tty is behind the fixture's path");
-        assert!(
-            !err.contains("shared port attach failed"),
-            "without the stamps the path opens exclusive: {err}"
-        );
+        assert!(err.contains("shared port attach failed"), "{err}");
     }
 
     /// A `uart:` device on a bridge port parses, and the run brings it up

@@ -76,7 +76,7 @@ pub const MCU_IDS_OBJECT: &str = "mcu_ids";
 
 /// The first id in the MCU id sequence. Upstream's `NODEID_FIRST`
 /// (`canbus_ids.py:7`): ids 1-3 are left to the host/bridge.
-const NODEID_FIRST: u32 = 4;
+pub const NODEID_FIRST: u32 = 4;
 
 /// The shared bookkeeping.
 #[derive(Default)]

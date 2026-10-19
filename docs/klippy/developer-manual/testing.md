@@ -201,6 +201,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | ③ 内置资产特性 | 构建期嵌入 config/docs + 三级链释放 + `info` 报释放根（`assets.rs` 新增 12 测；嵌入 +6.6 MB 不影响墙钟） | **57.6 s** | 3506 |
 | ④ 传感器时钟域统一 | ADC 样本时间改 print time（含 32 位绕圈修复）+ 加热器 5 s 主线程护栏与 7 s 陈旧压制（+20 测）
 | ⑤ 加热 PWM 按上游排期 | `Sensor::get_report_time_delta` + `Heater::pwm_delay`，修掉真机 `[heater_generic]` 的 `Timer too close`（+4 测：排期时钟、迟到读数按 now 起算、告警限速、PWM 更新棘轮） | **57.4 s** | 3521 |
+| ⑨ 出真机前一批（6 lane） | exclude_object 变换链、探针触发时刻位置、bed_mesh profile 命令族、homing_override 接 G28、时钟映射频率、flash 锁改私有副本（+25 测；墙钟从 57.8 → 47.9 s，主要是最后一项） | **47.9 s** | 3557 |
 | ⑧ 串口重新枚举下的身份 | `same_file`（路径 `(dev,ino)` 对比）+ `attach` 重开 4×250 ms：板子复位重新枚举后同进程重连成功（此前 EIO 直接失败，+1 测） | **57.8 s** | 3527 |
 | ⑦ 真机 lane 支持 mux/桥 | `apply_id_addressed_transport`：`hardware_test`/`stress` 与装载期用同一分类（`serial_ports` + `NODEID_FIRST`），mux 固件板不再 identify 超时（+2 测 / 真机 R1/R2/R5/R11 跑通） | **57.6 s** | 3526 |
 | ⑥ PWM 更新棘轮（对齐上游） | `min_pwm_change = max_power × 5%` + `next_pwm_time`（≈每 2.1 s 一个发送窗口）：事件从 3.3 条/秒降到 0.5 条/秒，批次迟到不再把旧样本年龄写上线（+3 测） | **57.6 s** | 3524 |
@@ -705,7 +706,7 @@ git config core.hooksPath .githooks
 | `virtual_sdcard.rs`（33 测，2026-10-19 实测重核） | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy`；**`do_pause` 同步等待**（2026-10-03 +2 测）：回放中 `do_pause` 等 task 退出后 `work_active==false`、`cmd_from_sd=true` 时不等待避自死锁；**放弃等待的上界**（2026-10-19 +1 测）：回放任务永不退出时 `PAUSE_DRAIN_TIMEOUT`(10s) 到点 `warn!` 返回而不是挂住（`do_pause_gives_up_on_a_replay_task_that_never_exits`，`start_paused` 虚拟时钟） |
 | `print_stats.rs` | reset 初值、`set_current_file`、`note_start`→`note_pause`→`note_complete` 流转与 duration、`note_error`/`note_cancel`/`note_pause` 不覆盖 error、`SET_PRINT_STATS_INFO` layer 逻辑（0 清空/切换 total 重置/截断/无参保持）、`get_status` standby/printing/paused 三态、命令注册、`ensure` 单例、filament 随 E 累积（19 测） |
 | `display_status.rs` | 裸段+`check_unused`+状态形状（1 测） |
-| `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`（4 测） |
+| `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`；**G28 包装（2026-10-19，共 9 测）**：注册在 toolhead 之后且真的替换了原 handler（`unregister_command` 拿到的 `is_some`）、按 `axes` 选择性接管/未点名的轴交给原 handler、`set_position_*` 强制起点先于脚本、脚本体里再调 `G28` 回落到原 handler（`in_script` 守卫）、`params`/`rawparams` 映射、与 `safe_z_home` 互斥文案、选项读取记账（模板名） |
 | `sdcard_loop.rs` | 裸段、sd 内外 BEGIN/END、count 0/1/>1 索引、空栈+嵌套、DESIST（5 测） |
 | `servo.rs` | 段选项全读+`SET_SERVO` 注册、脉宽↔占空比公式、mux ANGLE/WIDTH/缺参、`maximum_pulse_width` 下界措辞、`initial_angle`（11 测；2026-10-03 +6 队列化：前瞻钉时落 clocked `set_pwm`、后请求覆盖、两条兕底、sink `reschedule`/`discard`） |
 | `idex_modes.rs` | cartesian 认领（主轨 stepper_x+初始 0）、corexy 不认领、对象三命令与 SAVE→RESTORE 还原、四类上游措辞、`safe_distance` 下界、双挤出超槽守卫双侧语义（6 测）；批 #4 增：轨间坐标交接（SET/RESTORE 携 gcode 坐标到目标帧） |

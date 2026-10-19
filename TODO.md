@@ -90,7 +90,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate 均已落地；余项＝`bed_mesh` 的 faulty/零参照/profile 命令族、探针精度、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`bed_mesh` 的 faulty 区域与 `set_zero_reference`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`motion_report` 两端点已落地）——余项＝G2/G3 弧规划、`manual_stepper` 自己的 trapq（出步）与回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -239,13 +239,13 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 样本时间已于 2026-10-19 统一到 print time（资源层换算，与上游 `mcu.py:636-646` 同形）：
 
-- [ ] **连接时没有 `get_uptime` 样本会让映射用占位频率**：`McuChip::set_clock` 取
-      `clock.estimator().mcu_freq()`，而 `ClockEstimator` 的初值是占位 `1.0`，真正频率由
-      `McuClock::seed` 从字典的 `CLOCK_FREQ` 写入（`cmd/clock.rs:456-463`）。
-      `install_clock` 的 `uptime=None` 分支（`mcu/object.rs:1006-1010`）不 seed ⇒ 映射“存在但错”
-      （tick 当秒），而 ADC 的丢弃门只看映射**存在与否**，不查频率是否已校准。
-      先例：同一映射也被 endstop/trsync 用；语料不可见（那里都有 uptime）。
-      修法方向：`set_clock` 在 `mcu_freq()` 仍为占位时回落到字典频或暂不发布映射。
+- [ ] **二级 MCU 没有 `get_uptime` 样本时 `recalibrate` 会发布垃圾 offset（2026-10-19 由时钟映射单元发现）**：
+      `McuObject::recalibrate` 对二级 MCU 无条件跑 `SecondarySync::calibrate`，而它读
+      `secondary.get_clock()`——`ClockEstimator::new` 把三个字段都清零，未 seed 时它返回 0，
+      于是 `adjusted_freq = (0 - sync1_clock)/4 s` 为负、`set_mapping` 发出**错的 offset**
+      （频率部分现在由 `time_mapping` 回落到字典频）。修法方向：`SecondarySync::calibrate` /
+      `recalibrate` 加"已有样本"闸门。落点在 `mcu/object.rs`（本轮 6 lane 的边界外，故只登记）。
+
 - [ ] **样本日期比上游晚一个报告周期**（对拍后确认的既有偏移，无差分影响）：上游把最后一个样本
       定在 `next_clock - report_clock`（`mcu.py:636-646`，老格式 `:635` 同），本仓定在 `next_clock`。
       两边消费者都再加 `SAMPLE_COUNT * SAMPLE_TIME`，所以这是一个**常量平移**：PID/平滑用差分不受影响，
@@ -645,19 +645,16 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       规格校正：**`BED_MESH_CLEAR` 不撤销 transform**——上游只注册一次，clear 就是 `set_mesh(None)`，
       `move()` 在无网格时直通 `toolhead.move`；另新增 `split_delta_z`（默认 `.025`、min `0.01`）、
       `move_check_distance` 补 min `3.`。
-      仍未做：faulty 区域替换、`mesh_offsets`/`set_zero_reference`（仅被 `BED_MESH_OFFSET`/`ZERO_REFERENCE` 驱动，
-      与 move 正确性可分离）、profile 命令族（`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。
-- [ ] **保真单元：探针精度**（排在 H9 模块闭包之后）：按触发步数反算位置与 `rest_time`
-      （上游 `_calc_endstop_rate`）。前置已满足：模拟器步数模型与多实例假 MCU 已落地
-      （Q10 + `d14ce6a`，两 MCU 端到端测试在案）。
-- **已知偏离（探针精度）**：本仓回零与探针移动返回**指令位置**，未按上游 `StepperPosition.note_home_end`
-      + `calc_toolhead_pos` 用触发步数反算；`home_start` 的 `rest_time` 也硬编码（上游 `_calc_endstop_rate`
-      按 move 距离与步数计算）。两者都影响真实探针 Z 精度，属后续精度单元；模拟器语料不受影响。
+      **profile 命令族已落地（2026-10-19）**：`BED_MESH_PROFILE`（LOAD/SAVE/REMOVE，存 `[bed_mesh <name>]`、
+      `SAVE_CONFIG` 写回）、`BED_MESH_OUTPUT`（`PGP`）、`BED_MESH_MAP`、`BED_MESH_OFFSET`（`X`/`Y`/**`ZFADE`**），
+      `BED_MESH_CALIBRATE PROFILE=` 自动存盘；`bed_mesh/dump_mesh` 的 `profiles` 改读真实表。
+      仍未做：faulty 区域替换、`set_zero_reference`（`ZERO_REFERENCE` 无人调用）、`mesh_min`/`mesh_max`
+      在 dump 端点仍取配置选项而非已装载网格。
 - [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
       `BED_MESH_CALIBRATE` 逐点探测存格（按 Y 分行、行内 X 升序）、`BED_MESH_CLEAR`、
       `bed_mesh/dump_mesh` 端点（2026-10-03）、插值网格（2026-10-06 `dc1dd1e`）、
       **fade + `MoveSplitter` + move transform 注册（2026-10-06 `05f93f6`——已标定后 `G1` 真的走网格补偿）**；
-      **待做**：faulty 区域替换、`mesh_offsets`/`set_zero_reference`、profile 命令族
+      **待做**：faulty 区域替换、`set_zero_reference`
       （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。）
 - [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段 + 命令族均已落地**（2026-10-06，`fdf182e`：`BED_SCREWS_ADJUST`
       常驻注册，`ACCEPT`/`ADJUSTED`/`ABORT` 随会话注册与注销；粗调→精调两遍；`bed_screws.test` 走真命令转绿）。
@@ -665,9 +662,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、
       `z_thermal_adjust`、`tuning_tower`（三者无文件、无 section，语料不覆盖）。
 - [x] 回零周边：`homing_heaters`（批 #31）已落地；事件 `probe:update_results` 已带载荷并触发（批 #36），`homing:*` 四个已随 toolhead 产线触发（见事件清单）。
-- [ ] `homing_override` 的 **`G28` 包装未安装**：`extras/homing_override.rs` 只解析 `axes`/
-      `set_position_x/y/z`/`gcode` 三个选项（文件头已自陈），脚本体是宏模板、暂不渲染、
-      也不捕获 `G28`——**写了该节 `G28` 仍走正常归零**（`config.md` 同口径，H9 共担）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 
 ### H10 运动相关 extras

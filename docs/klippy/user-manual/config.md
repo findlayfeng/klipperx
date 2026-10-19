@@ -978,7 +978,7 @@ pins: PA1, my_alias
 
 ### [exclude_object]
 
-零选项段（上游 `exclude_object.py:12-37`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。相关语料用例已转绿（2026-09-24）。
+零选项段（上游 `exclude_object.py:12-37`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。**变换是链式的**（2026-10-19）：它转发给被自己顶替的占用者（`bed_mesh`/`bed_tilt` 先注册时就是它们），注销时交还——因此与网格/床倾斜同用**不会再丢它们的 Z 补偿**（此前会）。
 
 ### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
 
@@ -986,7 +986,7 @@ pins: PA1, my_alias
 |---|------|------|
 | `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 回放命令族已注册（`extras/virtual_sdcard.rs:449-470`）：`M20`–`M27`、`M28`–`M30`（上游同款 `SD write not supported`，`virtual_sdcard.py:41,143`）、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE` |
 | `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7）；进度/消息由这两条命令驱动（无 `[display]` 时也按需创建） |
-| `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | G28 包装未装——脚本体是宏模板、暂不渲染（H9 共担） |
+| `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | **接管 `G28`**（`order = 70, phase = late`，晚于 `[printer]` 的注册）：按 `axes` 掩码选择性接管、`G28` 的参数进模板的 `params`/`rawparams`、脚本体里再调 `G28` 回落到原 handler；与 `[safe_z_home]` 互斥 |
 | `sdcard_loop` | 无 | `SDCARD_LOOP_BEGIN/_END/_DESIST` 未注册；栈/索引语义已单测钉住 |
 
 ### [dual_carriage]

@@ -1804,7 +1804,6 @@ mod tests {
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::{Config, ConfigWrapper};
     use crate::core::klippy::frame::{MESSAGE_HEADER_SIZE, MESSAGE_POS_SEQ, MESSAGE_TRAILER_SIZE};
-    use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
@@ -1974,28 +1973,6 @@ mod tests {
         })
     }
 
-    /// Block (bounded) until the process-wide library on `path` is unloaded,
-    /// then return — and **fail here** rather than let the next library test
-    /// meet a live image. Same probe as the bridge-session test:
-    /// [`HostDevice::load_bytes`] fails while the mux library is live and
-    /// succeeds (dropping the probe unloads it again) once it is gone.
-    fn wait_for_library_unload(path: &Path) {
-        for _ in 0..200 {
-            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
-                Ok(probe) => {
-                    drop(probe);
-                    return;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        panic!(
-            "the mux host library at {} was still loaded after 2s; the next \
-             library test would meet a live image",
-            path.display()
-        );
-    }
-
     /// The whole bridge flash over a **real** host library: the mux library as
     /// the bridge, one pty as its port 0, and [`FakeBootloader`] as the
     /// bootloader behind that port.
@@ -2006,22 +1983,20 @@ mod tests {
     /// session then runs over the tunnel, and the pty's bytes are the session's
     /// katapult frames exactly.
     ///
-    /// `multi_thread` is not incidental: the connection's transport tasks hold
-    /// `Interface` clones (and so the library) until their aborts land, and the
-    /// unload wait below blocks the test thread — on the default current-thread
-    /// runtime those aborts would only be processed after the wait, leaving the
-    /// library live for the next test (see the bridge-session test's note).
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_flash_via_bridge_over_the_real_library() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // The bridge's port 0 opens at configuration time, so its tty has to
         // exist before the library comes up — and it is named to the library as
         // the port table's slot 0.
         let port = Pty::new();
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
 
         // The config layer's judgment for the path is what the library is given
@@ -2103,12 +2078,11 @@ mod tests {
         );
 
         // The connection's transport tasks hold references to the library, so
-        // its drop is not synchronous with `drop(link)`: close it, let the
-        // blocked device read see the shutdown, then wait the library out — all
-        // under `_serial`, whose scope is the whole test.
+        // its drop is not synchronous with `drop(link)`: close it, and let the
+        // blocked device read see the shutdown. Nothing waits the copy out —
+        // its path belongs to this test alone.
         link.close();
         drop(link);
-        wait_for_library_unload(&library);
     }
 
     /// `admin bridge config` and `admin bridge port` over the **real** mux
@@ -2117,14 +2091,18 @@ mod tests {
     /// device is reset and no session runs, so the port's pty stays silent (a
     /// reset pulse or a katapult frame would show there), which is what
     /// [`BridgeLink::declare_ports`] and [`BridgeLink::open_target_port`] promise.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_config_and_port_halves_leave_the_port_silent() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         let port = Pty::new();
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
 
         let link = BridgeLink::open_host_library(
@@ -2174,7 +2152,6 @@ mod tests {
 
         link.close();
         drop(link);
-        wait_for_library_unload(&library);
     }
 
     /// `admin reset --port 0 --port-reset bootloader`'s one write, over the
@@ -2186,14 +2163,18 @@ mod tests {
     /// with. A flash run's bootloader step names the port **units** first, the
     /// only route that does not strip this very unit on its way down
     /// ([`request_bootloader`](crate::flash::bridge_session::request_bootloader)).
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_admin_reset_sends_the_target_port_into_its_bootloader() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         let port = Pty::new();
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
 
         let link = BridgeLink::open_host_library(
@@ -2254,7 +2235,6 @@ mod tests {
 
         link.close();
         drop(link);
-        wait_for_library_unload(&library);
     }
 
     /// A bridge's own firmware says how many UART slots its backend offers: the
@@ -2389,14 +2369,18 @@ mod tests {
     /// The host library's count is the host's own tty table: one UART slot per
     /// slot a tty could be named in, which is what its backend enforces
     /// (`klipper_host_port`, `KLIPPER_HOST_PORT_SLOTS`).
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_host_library_bridge_reports_a_slot_per_tty() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         let port = Pty::new();
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
         let link = BridgeLink::open_host_library(
             Path::new(&path),
@@ -2419,7 +2403,6 @@ mod tests {
 
         link.close();
         drop(link);
-        wait_for_library_unload(&library);
     }
 
     /// `admin reset`'s **bridge** path: the self-restart goes out, the firmware
@@ -2997,13 +2980,18 @@ mod tests {
     /// A host-library bridge is used because the failure is the firmware's own
     /// shutdown, which a real bridge and a library reach the same way — only
     /// the tty the port is told to open differs.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr — the
+    /// shutdown reason it reads is the firmware's message, not its stderr — and
+    /// it loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_a_declaration_the_bridge_refuses_names_the_shutdown_reason() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
         // A tty the library is told its port 0 is on, but which is not there:
         // `config_uart` cannot open it, so the firmware shuts down.
@@ -3046,7 +3034,6 @@ mod tests {
 
         link.close();
         drop(link);
-        wait_for_library_unload(&library);
     }
 
     /// Two runs against the **same** bridge instance: each run resets the

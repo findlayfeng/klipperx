@@ -444,6 +444,16 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
+- [ ] **真机 `[heater_generic]` 连接即 `Timer too close`（2026-10-19 裸 F103 实测，与时钟域批次无关）**：
+      `[heater_generic]` + `sensor_type: temperature_mcu` + 软件 PWM 脚（PC13）→ 上电 3.28 s（`clock 236129547`）
+      固件 shutdown `Timer too close`；同一份配置用**合并前的二进制**（`a9518afe`）同样 shutdown，
+      而 ADC-传感器单独跑、`[output_pin]` 软件 PWM 单独跑都 **ready**。
+      首因判断（待确认）：加热器初始化把 `MAX_HEAT_TIME=3.0` 交给固件（软件 PWM 的 auto-off 定时器落在
+      boot+3 s），而第一条 PWM 更新由首条 ADC 读数触发、走的是**无时钟即时路径** `PwmOut::update_pwm`
+      （`heaters.rs:412-415`）自陈“上游是 `read_time + pwm_delay` 排期，本仓立即发” ⇒ 正好撞在那一格。
+      候选修法：① 按上游改成 `set_pwm(print_time_to_clock(read_time + pwm_delay), value)`（= C1d 的那半，
+      `pwm_delay = sensor.get_report_time_delta()`，`heaters.py:32,79`）；② 先用 `hardware_pwm: True` +
+      定时器脚绕过软件 PWM 的 auto-off 冲突（真机加热因此从未验过，R6/R12 都被它挡住）。
 - [x] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
       10 测）；`M105` gcode-id 表已接（2026-10-03，`14f5055`）：`register_sensor` 存 `gcode_id→sensor` 表（`BTreeMap` 排序），
       `M105` 输出 `<id>:%.1f /%.1f` 列表（空表/未 ready 回 `T:0`），`TEMPERATURE_WAIT` 等待循环每轮回真报表（5 新测）。

@@ -104,6 +104,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
 | S5 | 断开 API 订阅的 reactor 定时器环：`api/endpoints/objects_subscribe.rs:160` 的定时器回调强持 `Arc<Inner>`，而 `Inner{printer: Arc<Printer>, reactor: Arc<dyn Reactor>}` 持住两者 ⇒ 环 `reactor → heap → Inner → reactor`（同类环的第三处，前两处 `verify_heater`/`virtual_sdcard` 已于 2026-10-06 修）。**影响**：就地重启后旧订阅会把旧 `printer`（含其 `Mcu`）活者——与 Q11 同类的产线隐患。修法照既有 `Weak` 约定（回调持 `Weak<Inner>`） | — |
 | S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**，需先完成 Q11 那条 reactor 定时器断环）；R8 回放 | S3、Q11 |
+| S6 | 运行时临时产物收口（**暂缓，2026-10-19 登记**）：`/tmp` 侧有 `kx-start.log`（每次手动拉 klippy 重新生成）、活连接文件 `klippy_uds` 与 Moonraker 的 `moonraker_instance_ids`、harness 的 `pi-bash-*.log`；仓库侧 `.staging/tmp-2026-10-19/` 存着 13 项旧产物（7 个 `klipperx-log-*` 运行目录 + 6 份闸门/启动日志，3.1 MB，已 gitignore）。要做的：按已定路径约定把日志改道（`klippy` 已有 `--logfile` 落 `<data-path>/logs/`，手动启动的 stdout 也应落那里），并给 `.staging` 定一个清理时机。判据：`klippy_uds` / `moonraker_instance_ids` 是**活 IPC 与第三方状态——不迁移、不进释放链**；`pi-bash-*.log` 归 harness；清 `.staging` 前先确认里面的日志不再作任何结论的证据 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
 
 **串口复用 / 桥（跨主机与固件）**

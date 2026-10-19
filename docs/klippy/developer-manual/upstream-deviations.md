@@ -103,6 +103,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | MCU 连接 `restart_method` | 值域 `command`/`arduino`/`cheetah`/`rpi_usb`，都是「复位这条连接」 | 多一个上游没有的 **`admin`**：经桥转发 `RESTART_DEVICE (0x05)`，让**桥下游的命名设备**重启自己的固件（进引导的 `REQUEST_BOOTLOADER (0x02)` 属刷写工具、**不属** `restart_method`）；桥下游 legacy 设备的线级复位改由**端口节**的 `uart_restart_method` 决定；共享串口仍在解析层被强制成 `command` | [MCU 连接方式](../user-manual/mcu-connection.md)、[串口复用协议](serial-mux-protocol.md) |
 | 固件构建的源文件去重 | 每个 `src-$(CONFIG_*) +=` 各列各的；各载体在上游天然互斥，从不重复 | 架构 makefile include 之后加一行 `src-y := $(call uniq,$(src-y))`（**保序去重，不是 `sort`**）：本仓的 `MUX_SERIAL` 可与 `USBSERIAL` 同开，多个载体都会列 `<arch>/chipid.c` ⇒ 重复链接（并让 `compile_time_request` 计入两次）。**保序本身是 ABI**：字典的 message id 按 `src-y` 顺序发放（`buildcommands.py`），排序会把每个目标的字典重新编号，而测试、golden 数据与已记录的线上形状都引用那些 id。顶层 `Makefile` 只包装调用它（`OUT`/`KCONFIG_CONFIG` 外移，见 4.3），不改 `src-y` | `third_party/klipper/Makefile` |
 | API 若干已知差异 | 上游 `machine`/`calibration`/`get_status` 等更完整 | 缺 `probe_path`/`rapid_path`、部分 `get_status` 字段未返回等 | [API 参考](../third-party-dev/api-reference.md) |
+| ADC 样本的时间戳 | `MCU_adc._handle_analog_in_state` 在 `mcu.py:636-646` 内部把报告时钟转成 print time，消费者拿到的一律是 print time | 同语义，但转换在**资源层**一次完成（2026-10-19）：`AdcCallback` 携带 print time，`clock32_to_clock64` 后再按芯片映射换算（修掉此前把未扩展的 32 位时钟当时间戳、绕圈后样本倒退的 bug）。两处有意偏移：① 芯片**尚无时钟映射**的报整批丢弃并 `warn!` 一次（带 oid）——上游的 `clock_est` 恒可换算，本仓刚连上时可能还没有；② 最后一个样本定在 `next_clock`，上游早一个 `report_clock`（常量平移，见 `TODO.md` F5 余项） | [模块表](README.md)、[配置手册](../user-manual/config.md) |
 
 ## 3. 暂缓/未实现（本仓没做，方向上不排除）
 

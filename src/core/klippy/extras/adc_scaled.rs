@@ -166,7 +166,7 @@ impl PinChip for AdcScaled {
             last_vref: Arc::clone(&self.last_vref),
             last_vssa: Arc::clone(&self.last_vssa),
             callback: Arc::new(Mutex::new(None)),
-            last_state: Arc::new(Mutex::new((0, 0.0))),
+            last_state: Arc::new(Mutex::new((0.0, 0.0))),
         }))
     }
 
@@ -224,9 +224,9 @@ struct ScaledAdc {
     last_vssa: Arc<Mutex<(f64, f64)>>,
     /// The consumer's callback, installed through `setup_adc_callback`.
     callback: Arc<Mutex<Option<AdcCallback>>>,
-    /// The last rescaled sample, `(time, value)`; `(0, 0.0)` until one arrives,
-    /// as upstream's `_last_state` starts.
-    last_state: Arc<Mutex<(u64, f64)>>,
+    /// The last rescaled sample, `(print time, value)`; `(0.0, 0.0)` until one
+    /// arrives, as upstream's `_last_state` starts.
+    last_state: Arc<Mutex<(f64, f64)>>,
 }
 
 impl Adc for ScaledAdc {
@@ -267,7 +267,7 @@ impl Adc for ScaledAdc {
         self.inner.setup_adc_callback(Box::new(move |samples| {
             let max_adc = vref.lock().unwrap_or_else(|p| p.into_inner()).1;
             let min_adc = vssa.lock().unwrap_or_else(|p| p.into_inner()).1;
-            let adjusted: Vec<(u64, f64)> = samples
+            let adjusted: Vec<(f64, f64)> = samples
                 .iter()
                 .map(|&(time, read_value)| (time, (read_value - min_adc) / (max_adc - min_adc)))
                 .collect();
@@ -280,7 +280,7 @@ impl Adc for ScaledAdc {
         }));
     }
 
-    fn get_last_value(&self) -> Option<(u64, f64)> {
+    fn get_last_value(&self) -> Option<(f64, f64)> {
         Some(*self.last_state.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
@@ -309,10 +309,10 @@ fn calc_smooth(
 
 /// Fold one reference report into `state`: the last sample of the batch, as
 /// upstream's `vref_callback`/`vssa_callback` do (`samples[-1]`).
-fn smooth_into(state: &Mutex<(f64, f64)>, samples: &[(u64, f64)], inv_smooth_time: f64) {
+fn smooth_into(state: &Mutex<(f64, f64)>, samples: &[(f64, f64)], inv_smooth_time: f64) {
     let (read_time, read_value) = samples[samples.len() - 1];
     let mut last = state.lock().unwrap_or_else(|p| p.into_inner());
-    *last = calc_smooth(read_time as f64, read_value, *last, inv_smooth_time);
+    *last = calc_smooth(read_time, read_value, *last, inv_smooth_time);
 }
 
 /// The chip a pin description names, as `setup_adc` would resolve it:
@@ -381,12 +381,12 @@ mod tests {
     struct FakeAdc {
         sampling: Mutex<Option<Sampling>>,
         callback: Mutex<Option<AdcCallback>>,
-        last_value: Mutex<Option<(u64, f64)>>,
+        last_value: Mutex<Option<(f64, f64)>>,
     }
 
     impl FakeAdc {
         /// Push one batch, as a report from the firmware would.
-        fn emit(&self, samples: &[(u64, f64)]) {
+        fn emit(&self, samples: &[(f64, f64)]) {
             *self.last_value.lock().unwrap() = samples.last().copied();
             if let Some(callback) = self.callback.lock().unwrap().as_ref() {
                 callback(samples);
@@ -420,7 +420,7 @@ mod tests {
             *self.callback.lock().unwrap() = Some(callback);
         }
 
-        fn get_last_value(&self) -> Option<(u64, f64)> {
+        fn get_last_value(&self) -> Option<(f64, f64)> {
             *self.last_value.lock().unwrap()
         }
     }
@@ -686,8 +686,8 @@ mod tests {
         assert_eq!(built[3].0, "PB1");
         // The wrapper has not seen a report yet, so its last state is the
         // `(0, 0.0)` upstream starts from.
-        assert_eq!(first.get_last_value(), Some((0, 0.0)));
-        assert_eq!(second.get_last_value(), Some((0, 0.0)));
+        assert_eq!(first.get_last_value(), Some((0.0, 0.0)));
+        assert_eq!(second.get_last_value(), Some((0.0, 0.0)));
     }
 
     #[test]
@@ -731,20 +731,20 @@ mod tests {
         let built = adcs(&chip);
         // vref reads 0.8, vssa 0.1 — the first report is unsmoothed (Δt from
         // the `(0., 0.)` start is large, so `adj` is capped at 1).
-        built[0].1.emit(&[(1_000, 0.8)]);
-        built[1].1.emit(&[(1_000, 0.1)]);
+        built[0].1.emit(&[(1_000.0, 0.8)]);
+        built[1].1.emit(&[(1_000.0, 0.1)]);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         scaled.setup_adc_callback(Box::new(move |samples| {
             seen_for_callback.lock().unwrap().extend_from_slice(samples);
         }));
 
-        built[2].1.emit(&[(2_000, 0.4)]);
+        built[2].1.emit(&[(2_000.0, 0.4)]);
 
         // `(raw - vssa) / (vref - vssa)`, vref being the maximum.
         let expected = (0.4 - 0.1) / (0.8 - 0.1);
-        assert_eq!(*seen.lock().unwrap(), vec![(2_000, expected)]);
-        assert_eq!(scaled.get_last_value(), Some((2_000, expected)));
+        assert_eq!(*seen.lock().unwrap(), vec![(2_000.0, expected)]);
+        assert_eq!(scaled.get_last_value(), Some((2_000.0, expected)));
     }
 
     #[test]
@@ -766,14 +766,14 @@ mod tests {
         // a division by zero. Upstream has no guard; both shapes are
         // reproduced.
         let built = adcs(&chip);
-        built[2].1.emit(&[(1_000, 0.0)]);
-        built[2].1.emit(&[(2_000, 0.4)]);
+        built[2].1.emit(&[(1_000.0, 0.0)]);
+        built[2].1.emit(&[(2_000.0, 0.4)]);
 
         let samples = seen.lock().unwrap();
         assert_eq!(samples.len(), 2);
         assert!(samples[0].1.is_nan());
         assert_eq!(samples[1].1, f64::INFINITY);
-        assert_eq!(scaled.get_last_value(), Some((2_000, f64::INFINITY)));
+        assert_eq!(scaled.get_last_value(), Some((2_000.0, f64::INFINITY)));
     }
 
     #[test]
@@ -800,13 +800,13 @@ mod tests {
 
         // Two reports a second apart: the second moves vref halfway to 1.0.
         let built = adcs(&chip);
-        built[0].1.emit(&[(0, 0.0)]);
-        built[0].1.emit(&[(1, 1.0)]);
+        built[0].1.emit(&[(0.0, 0.0)]);
+        built[0].1.emit(&[(1.0, 1.0)]);
         assert_eq!(*scaled.last_vref.lock().unwrap(), (1.0, 0.5));
 
         // Only the last sample of a batch counts: vssa moves half of the way
         // from (0, 0) to the batch's last reading (1, 0.5).
-        built[1].1.emit(&[(0, 0.25), (1, 0.5)]);
+        built[1].1.emit(&[(0.0, 0.25), (1.0, 0.5)]);
         assert_eq!(*scaled.last_vssa.lock().unwrap(), (1.0, 0.25));
     }
 

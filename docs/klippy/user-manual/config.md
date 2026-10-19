@@ -1156,7 +1156,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `heating_gain` | `2` | 期望升温（`above 0.`） |
 | `check_gain_time` | `60`（`heater_bed`）/ `20`（其他） | 升温窗口秒数（`minval=1.`） |
 
-每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
+每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。它读到的是 `Heater::get_temp` 的两个保护后的值：目标为 0 输出 0；**读数超 7 s 未更新时报 `0`**（传感器静默当冷热床，上游 `QUELL_STALE_TIME`）；另有一个与它无关的宿主侧保护——主线程超 5 s 未证明自己活着时 PWM 直接归 0（`MAX_MAINTHREAD_TIME`）。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
 
 ### `[dac084S085 <name>]` — 四通道 SPI DAC（批 #23）
 

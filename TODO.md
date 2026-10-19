@@ -227,7 +227,6 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       shutdown 诊断（`analyze_shutdown` 的窗口转储）。
 
 ### F MCU 基础资源（F6、F8、F9）
-
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
 建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
 之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
@@ -235,6 +234,23 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 与 pin 解析（F2）也已完成，数字输出、PWM（F4）与 ADC（F5）三个 `config_*` 资源已落地
 （见文末索引），SPI/I2C 总线（F6/F7）也已落地（细节已归档），剩下的缺口是 endstop/trsync（F8，另有
 一条测试侧待办）与其余固件资源（F9）；`MCU_bus_digital_out`（F3）能力已具备，不另做包装。
+
+#### F5 ADC 采样时间（余项）
+
+样本时间已于 2026-10-19 统一到 print time（资源层换算，与上游 `mcu.py:636-646` 同形）：
+
+- [ ] **连接时没有 `get_uptime` 样本会让映射用占位频率**：`McuChip::set_clock` 取
+      `clock.estimator().mcu_freq()`，而 `ClockEstimator` 的初值是占位 `1.0`，真正频率由
+      `McuClock::seed` 从字典的 `CLOCK_FREQ` 写入（`cmd/clock.rs:456-463`）。
+      `install_clock` 的 `uptime=None` 分支（`mcu/object.rs:1006-1010`）不 seed ⇒ 映射“存在但错”
+      （tick 当秒），而 ADC 的丢弃门只看映射**存在与否**，不查频率是否已校准。
+      先例：同一映射也被 endstop/trsync 用；语料不可见（那里都有 uptime）。
+      修法方向：`set_clock` 在 `mcu_freq()` 仍为占位时回落到字典频或暂不发布映射。
+- [ ] **样本日期比上游晚一个报告周期**（对拍后确认的既有偏移，无差分影响）：上游把最后一个样本
+      定在 `next_clock - report_clock`（`mcu.py:636-646`，老格式 `:635` 同），本仓定在 `next_clock`。
+      两边消费者都再加 `SAMPLE_COUNT * SAMPLE_TIME`，所以这是一个**常量平移**：PID/平滑用差分不受影响，
+      只有 7 s 陈旧判定的绝对边界与报告时刻差一个周期（`adc_temperature` 的 `REPORT_TIME`）。
+      要真“同形”时改 `adc.rs` 的 index 公式并同步现有时序测试。
 
 #### F6 SPI 总线
 
@@ -426,8 +442,7 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H1 加热与温度
 
-- [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）；顺带补了 `set_pwm` 保护的可达一半（`target_temp <= 0 ⇒ 输出 0`）。
-- [ ] **余项**：`set_pwm` 的第二重保护 `read_time > verify_mainthread_time ⇒ 输出 0` 仍未做（需要本机没有的「主线程截止时间」时钟，`heaters.rs` 的 `temperature_callback` 文档里留了方案）。
+- [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
 - [x] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
       10 测）；`M105` gcode-id 表已接（2026-10-03，`14f5055`）：`register_sensor` 存 `gcode_id→sensor` 表（`BTreeMap` 排序），

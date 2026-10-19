@@ -2159,6 +2159,7 @@ mod tests {
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use tokio::time::Duration;
 
     fn section(sub: Option<&str>) -> ConfigSection {
@@ -2366,8 +2367,15 @@ mod tests {
         // MCU factory brings it in, and this test does too.
         crate::core::klippy::extras::error_mcu::ensure(&printer).unwrap();
         mcu.send("get_uptime", &[]).unwrap();
-        // Let the receive task decode and dispatch the shutdown frame.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait for the receive task to decode and dispatch the shutdown frame,
+        // on a bound rather than in a fixed window the scheduler can miss.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || printer.get_state_message().category == PrinterState::Shutdown,
+            "the firmware's shutdown reached the printer",
+        )
+        .await;
 
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Shutdown);
@@ -3318,7 +3326,15 @@ mod tests {
         // old transport stays silent.
         let before = object.clock().unwrap().estimator().last_clock();
         let _ = manual.advance(0.35); // `test:` cadence is 150 ms
-        tokio::time::sleep(Duration::from_millis(100)).await;
+                                      // Poll for the new session's sample instead of betting the round trip
+                                      // and the fold both land inside a fixed 100 ms window.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || object.clock().unwrap().estimator().last_clock() != before,
+            "a sample from the new session folded into the estimate",
+        )
+        .await;
         let after = object.clock().unwrap().estimator().last_clock();
         assert_ne!(
             before, after,

@@ -3049,6 +3049,7 @@ mod tests {
     };
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -4614,7 +4615,15 @@ mod tests {
         // re-anchors the estimate, and the parked gate re-polls within
         // `GATE_REPOLL_MAX`.
         mcu.set_clock_base(release + 1);
-        sleep(Duration::from_millis(60)).await;
+        // Poll the wire instead of betting on a fixed window: under the full
+        // gate's load the gate's re-poll and the send task can both be late.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "not sent at the release clock",
+        )
+        .await;
         assert_eq!(recorder.frames().len(), 1, "not sent at the release clock");
         assert_eq!(recorder.frames()[0].payload(), &[5]);
     }
@@ -4662,7 +4671,13 @@ mod tests {
 
         // Inside the window for both: PR_NOW, lowest req_clock first.
         mcu.set_clock_base(BASE + (10.1 * FREQ) as u64);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "expected one coalesced block",
+        )
+        .await;
         let frames = recorder.frames();
         assert_eq!(frames.len(), 1, "expected one coalesced block: {frames:?}");
         assert_eq!(
@@ -4740,7 +4755,13 @@ mod tests {
         };
 
         // At the base clock only the two with a free slot go.
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 0, 0],
+            "the over-capacity moves went with the burst",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 0, 0],
@@ -4750,7 +4771,13 @@ mod tests {
 
         // The first slot's completion (+ margin): exactly one move lands.
         mcu.set_clock_base(free_at(c1) + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 1, 0],
+            "one slot did not release exactly one move",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 1, 0],
@@ -4773,7 +4800,13 @@ mod tests {
         // The digital out releases on its own clock's lead window, ahead of
         // the pool floor that would otherwise still hold it.
         mcu.set_clock_base(own_clock - (MIN_REQTIME_DELTA * FREQ) as u64 + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || d_sent() == 1,
+            "the digital out missed its req_clock window",
+        )
+        .await;
         assert_eq!(d_sent(), 1, "the digital out missed its req_clock window");
         assert_eq!(
             counts(),
@@ -4783,7 +4816,13 @@ mod tests {
 
         // The slot the digital out held: `m4` goes at its completion (+ margin).
         mcu.set_clock_base(free_at(own_clock) + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 1, 1],
+            "moves did not release one slot at a time",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 1, 1],
@@ -4875,7 +4914,13 @@ mod tests {
         let (mcu, recorder) = gate_mcu(vec![gate_block(0, &[5]), gate_block(1, &[6])], BASE);
         mcu.set_move_slot_capacity(1);
         mcu.send_move("get_clock", &[], BASE, completion).unwrap();
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || sent_count(&recorder, 5) == 1,
+            "the predecessor goes",
+        )
+        .await;
         assert_eq!(sent_count(&recorder, 5), 1, "the predecessor goes");
 
         // The move: floor = free-at(predecessor completion), req = start.
@@ -4902,7 +4947,13 @@ mod tests {
         // (+1 tick of re-poll). If a (buggy) floor ever sat *past* this point,
         // this step would stay red — the Timer-too-close detector.
         mcu.set_clock_base(window + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || sent_count(&recorder, 6) == 1,
+            "not sent by its start clock minus MIN_SCHEDULE_TIME",
+        )
+        .await;
         assert_eq!(
             sent_count(&recorder, 6),
             1,
@@ -4931,7 +4982,13 @@ mod tests {
         mcu.send_move_payload(payload_from(&first), BASE, completion)
             .await
             .unwrap();
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "first batch on the wire",
+        )
+        .await;
         assert_eq!(recorder.frames().len(), 1, "first batch on the wire");
 
         // Second batch: its completion entered the pool, so its floor is the
@@ -4947,7 +5004,13 @@ mod tests {
         );
 
         mcu.set_clock_base(floor + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 2,
+            "released at its predecessor's slot-free clock",
+        )
+        .await;
         assert_eq!(
             recorder.frames().len(),
             2,
@@ -5006,7 +5069,13 @@ mod tests {
         )
         .unwrap();
 
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "a gated message parked on an unjudgeable clock",
+        )
+        .await;
         assert_eq!(
             recorder.frames().len(),
             1,
@@ -5038,7 +5107,15 @@ mod tests {
 
         mcu.send("get_clock", &[]).unwrap();
         // The first send is immediate; the retransmit waits out MIN_RTO (25 ms).
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Poll for it: a fixed window is only worth the timer's own latency,
+        // and the full gate's load can spend that on scheduling alone.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() >= 2,
+            "expected the block to be sent again",
+        )
+        .await;
 
         let frames = recorder.frames();
         assert!(
@@ -5302,10 +5379,26 @@ mod tests {
                 .expect("get_clock while nudging the counter past the fresh range");
         }
         let running_at = seq(&mcu);
+        // The old session has to be gone before the port is reopened: `Drop`
+        // aborts both transport tasks, and their finishing is the port closing.
+        // Poll that instead of guessing how long the runtime needs.
+        let transport = [&mcu.recv_handle, &mcu.send_handle].map(|handles| {
+            handles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .expect("both transport tasks are running here")
+                .abort_handle()
+        });
         drop(clock);
         drop(mcu);
-        // Let the receive task finish and the port close before reopening it.
-        sleep(Duration::from_millis(300)).await;
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || transport.iter().all(|handle| handle.is_finished()),
+            "the old session's transport tasks finish before the port reopens",
+        )
+        .await;
 
         // 4. The board was never reset, so its counter carried on from where
         //    the first connection left it. The new connection numbers its first
@@ -5731,8 +5824,14 @@ mod tests {
         // Actively drop the `Mcu`; this must abort the receive task.
         drop(mcu);
 
-        // Give the runtime a chance to process the cancellation.
-        sleep(Duration::from_millis(20)).await;
+        // Wait for the runtime to process the cancellation, on a bound.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || abort_handle.is_finished(),
+            "receive task should be aborted after the Mcu is dropped",
+        )
+        .await;
         assert!(
             abort_handle.is_finished(),
             "receive task should be aborted after the Mcu is dropped"

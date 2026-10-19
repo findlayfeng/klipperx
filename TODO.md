@@ -444,6 +444,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
+- [ ] **会话中途 MCU 复位后 `serial::attach` 不重试 EIO（2026-10-19 实测）**：
+      真机 R3（`endstop` lane）在"固件带着另一套配置"时会 `reset` 掉 MCU 再重连，而 USB-CDC 板
+      复位即**重新枚举**（`ttyACM0 → ttyACM1`），此时 `serial::attach` 的 SET_NODEID 握手写进旧节点，
+      直接以 `serial write … Input/output error (os error 5)` 失败，而不是像 `SerialDevice::open_retrying`
+      那样把 EIO 当"端口走了"继续等到超时。影响所有走共享/mux 路径的 USB 板（桥固件尤甚）。
+      修法：附件握手期间的 I/O 错误按 `ASSIGN_ATTACH_TIMEOUT` 重试（按路径重新解析 by-id 软链）。
+      现场：R1/R2/R5/R11 不受影响（它们不重配板子）；R3 的 `configure_taking_over` 会。
+
 - [ ] **`MAX_MAINTHREAD_TIME` 护栏在真实加热器上不可达（2026-10-19 真机结论，留作记录）**：
       klipper 的加热器一律软件 PWM（上游 `heaters.py:61` 也写死 `setup_cycle_time(pwm_cycle_time)`），
       每 0.1 s 需要一个新边沿；宿主一停，固件先报 `Missed scheduling of next digital out event`

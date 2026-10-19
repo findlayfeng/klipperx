@@ -444,23 +444,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
-- [ ] **共享/mux 串口在"复位后重新枚举"下有两处缺口（2026-10-19 核实到行号）**：
-      现场：真机 R3 在"固件带着另一套配置"时 `reset` 掉 MCU 再重连，USB-CDC 板随即重新枚举
-      （`ttyACM0 → ttyACM1`），重连以 `serial write … Input/output error (os error 5)` 失败。
-      核实（读码，不是推断）：
-      ① `serial.rs:2631-2633` 的 SET_NODEID 只写**一次**，`write_unit(..)?` 把写错误直接抛出；
-         `:2642-2657` 的 assign 请求虽然重试 `ASSIGN_ATTACH_ATTEMPTS` 次，但**重试只覆盖"没应答"**
-         （超时），`write_unit(..)?` 的写错误同样立刻失败 ⇒ EIO 没有任何重试；
-      ② `serial.rs:1920-1927` `port_for` 的复用判据只有 `!stopped`，**不检查 tty 是否已被重新枚举**
-         （`devices/shared.rs` 文档里描述的 `usable` 谓词在串口上没有实现）⇒ 旧 fd 被复用。
-      **对照实验已做（2026-10-19，R3 现场）**：改一次配置（`endstop_pin` PB13 → PD10）→ lane 必须 `reset`
-      并重连 → 当场 `Input/output error`；**紧接着下一次运行就 `accepted`**（复位后固件失去了旧配置，
-      于是不再触发 reset 路径）。也就是说这条缺口**每次配置变更只赔一次失败**、不会卡死；klippy 主路径
-      连续复位三次（R2：763/763/765 ms）是通的，因为它先 `previous.close()` 归还 port（`object.rs:950-958`），
-      而 lane 的 reopen 在旧 handle 还活着时就再 attach —— 这仍是最可疑的一层，修之前照上面两步走。
-      修法：①写错误按 `ASSIGN_ATTACH_TIMEOUT` 重试（每次重新解析路径）；②`port_for` 的 usable
-      加"底层 fd 仍指向当前节点"判据。先做差异实验再改，避免修错层。
-
 - [ ] **`MAX_MAINTHREAD_TIME` 护栏在真实加热器上不可达（2026-10-19 真机结论，留作记录）**：
       klipper 的加热器一律软件 PWM（上游 `heaters.py:61` 也写死 `setup_cycle_time(pwm_cycle_time)`），
       每 0.1 s 需要一个新边沿；宿主一停，固件先报 `Missed scheduling of next digital out event`

@@ -509,6 +509,44 @@ pub(crate) fn last_error(call: &str) -> InterfaceError {
 
 #[cfg(test)]
 mod tests {
+    /// A path that names a different file than the open descriptor is what a
+    /// USB board's re-enumeration looks like from here: the port must not be
+    /// handed out again.
+    #[test]
+    fn test_a_path_that_names_another_file_does_not_match_the_opened_one() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("kx-same-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let link = dir.join("path");
+        std::fs::write(&first, b"a").expect("the first file");
+        std::fs::write(&second, b"b").expect("the second file");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&first, &link).expect("the symlink");
+
+        let mut opened = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&link)
+            .expect("the link opens");
+        assert!(same_file(&opened, &link), "the path names what was opened");
+        opened.write_all(b"x").expect("the descriptor writes");
+
+        // Repoint the link: this is the re-enumeration, seen from the host.
+        std::fs::remove_file(&link).expect("the old link goes");
+        std::os::unix::fs::symlink(&second, &link).expect("the new symlink");
+        assert!(
+            !same_file(&opened, &link),
+            "the path moved to another node, so the held descriptor is stale"
+        );
+
+        // And a path that vanished entirely is stale too.
+        std::fs::remove_file(&link).expect("the link goes");
+        assert!(!same_file(&opened, &link));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use crate::core::klippy::interface::pty::Pty;
     use std::sync::atomic::AtomicUsize;
@@ -777,11 +815,20 @@ mod tests {
 
 pub const ASSIGN_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How many times [`attach`] reopens a path whose device node moved under it.
+///
+/// A board that resets on a USB link re-enumerates; the wait below covers the
+/// re-plug, and four rounds is about a second — far more than a re-enumeration
+/// takes, and short enough that a genuinely broken path still fails promptly.
+const ATTACH_REOPEN_ATTEMPTS: u32 = 4;
+/// How long [`attach`] waits between those reopens.
+const ATTACH_REOPEN_DELAY: Duration = Duration::from_millis(250);
+
 /// How many times `attach` re-sends the request before giving up.
 ///
 /// A lost or ignored frame must not cost the whole session: each retry re-sends
 /// the request and waits another `ASSIGN_ATTACH_TIMEOUT`.
-pub const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
+pub(crate) const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
 
 /// How long a device behind a **CAN** port is given to answer its assignment
 /// ([`SharedSerialHandle::name_can_device`]), at most.
@@ -1832,6 +1879,24 @@ pub fn serial_query_unassigned(
 }
 
 /// A physical serial port, its one reader thread, and a slot per attached MCU.
+/// Whether the file `opened` still is the one `path` names now.
+///
+/// A USB CDC board that resets re-enumerates: `path` (a `by-id` symlink, say)
+/// resolves to a **new** device node while the descriptor we hold belongs to the
+/// old one, where writes fail with `EIO`. Comparing the path's current
+/// `(device, inode)` with the open descriptor's is how a port tells "still the
+/// port I opened" from "the tty went away under me".
+pub(crate) fn same_file(opened: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(held) = opened.metadata() else {
+        return false;
+    };
+    current.dev() == held.dev() && current.ino() == held.ino()
+}
+
 pub struct SharedSerialPort {
     path: PathBuf,
     baud: u32,
@@ -1921,7 +1986,10 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
     resource_for(
         port_registry(),
         path,
-        |port| !port.stopped.load(Ordering::SeqCst),
+        // A registry entry is the port for `path` only while it is running **and**
+        // the tty it opened is still what `path` names: a board that reset
+        // re-enumerates, and the descriptor left behind fails every write.
+        |port| !port.stopped.load(Ordering::SeqCst) && same_file(&port.port, path),
         |path| SharedSerialPort::open(path, baud),
     )
 }
@@ -1954,31 +2022,45 @@ pub fn attach(
         )));
     }
 
-    let port = port_for(path, baud)?;
-    let slot = Arc::new(McuSlot::new());
-    port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
-    let handle = Arc::new(SharedSerialHandle {
-        port: Arc::clone(&port),
-        mcu_id,
-        slot,
-        stopped: AtomicBool::new(false),
-    });
+    let mut reopened = 0u32;
+    loop {
+        let port = port_for(path, baud)?;
+        let slot = Arc::new(McuSlot::new());
+        port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+        let handle = Arc::new(SharedSerialHandle {
+            port: Arc::clone(&port),
+            mcu_id,
+            slot,
+            stopped: AtomicBool::new(false),
+        });
 
-    // The handshake is the one `handshake` runs; `attach` only registers the
-    // slot in front of it. A failure takes the slot down again — a port that
-    // never answered is left as `attach` found it.
-    let handshake = match uuid {
-        Some(uuid) => handle.handshake(uuid, timeout),
-        None => handle.run_handshake(None, timeout),
-    };
-    if let Err(e) = handshake {
-        // The slot this attach opened goes down through the same guarded
-        // unregister the teardown paths use; the `ptr_eq` check only removes
-        // the slot this handle registered.
-        handle.unregister();
-        return Err(e);
+        // The handshake is the one `handshake` runs; `attach` only registers the
+        // slot in front of it. A failure takes the slot down again — a port that
+        // never answered is left as `attach` found it.
+        let handshake = match uuid {
+            Some(uuid) => handle.handshake(uuid, timeout),
+            None => handle.run_handshake(None, timeout),
+        };
+        if let Err(e) = handshake {
+            // The slot this attach opened goes down through the same guarded
+            // unregister the teardown paths use; the `ptr_eq` check only removes
+            // the slot this handle registered.
+            handle.unregister();
+            // A **stale** port is worth one more open: the descriptor belongs to
+            // a device node the path no longer names (the board reset and
+            // re-enumerated), so every write to it fails and waiting on the same
+            // handle cannot help. The port this attempt held goes with it — the
+            // registry keeps only a `Weak`, and `port_for` refuses an entry whose
+            // tty moved — so the next round opens the node that exists now.
+            if reopened < ATTACH_REOPEN_ATTEMPTS && !same_file(&port.port, path) {
+                reopened += 1;
+                std::thread::sleep(ATTACH_REOPEN_DELAY);
+                continue;
+            }
+            return Err(e);
+        }
+        return Ok(handle);
     }
-    Ok(handle)
 }
 
 /// Register a **downstream** device on the shared serial port at `path`,

@@ -438,6 +438,15 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 2. **设备每次进引导都要重新指派**：CAN node id 是 RAM 态，应用启动丢一次、katapult 启动又丢一次——所以刷写流程是「指派 → 0x02 → 等引导 → 再指派 → 隧道」，这就是 `--assign-uuid` 存在的理由。
 3. **过滤器预算**：`0x3f1` 占 1 个 bank，每个下游 id 占 1 个（bit0 掩码一格盯 `id`/`id+1` 一对），追加项上限 `CANHW_EXTRA_FILTERS = 8`；装不下就 `shutdown` 点名，**不静默听不见**。
 
+## 端口在"重新枚举"下的身份
+
+一条共享串口路径（`by-id` 软链）在 USB 板复位后会指向**新的**设备节点，而已打开的描述符仍在旧节点上——写它只会得到 `EIO`。本仓的两层处理（2026-10-19，真机 R3 现场验证）：
+
+1. **判定失效**：`port_registry` 的复用判据是「未停机 **且** 路径当前解析到的 `(dev, ino)` 与已打开描述符一致」（`serial.rs` 的 `same_file`）。不一致 ⇒ 该条目不再算这条路径的端口，按需重开（旧端口继续服务仍持有它的引用）。
+2. **attach 重试**：`attach` 在握手失败且端口已失效时重开（`ATTACH_REOPEN_ATTEMPTS = 4` × `ATTACH_REOPEN_DELAY = 250 ms`）；写错误本身不重试，因为失效描述符再写多少次都还是 `EIO`。
+
+实测：改一次配置 → 宿主 `reset` 板子 → USB 重新枚举（`ttyACM0 → ttyACM1`）→ 同一进程内重连成功（此前是 `serial write … Input/output error (os error 5)` 直接失败）。
+
 #### 桥扫描的发现路径与归属规则
 
 - 打开桥的**共享串口**、identify、**重启桥**，在 `SharedSerialHandle` 上为 `ADMIN_REPLY`

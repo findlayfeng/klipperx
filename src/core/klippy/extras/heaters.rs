@@ -1405,7 +1405,11 @@ mod tests {
             "Fake",
             Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
         );
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
 
@@ -1923,7 +1927,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_temperature_wait_returns_in_file_output_mode() {
         let (printer, gcode, _sensor) = temperature_sensor_printer();
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         gcode

@@ -31,6 +31,14 @@ pub struct StartArgs {
     /// `None` until a `--logfile` exists: the host logs to stdout, and upstream
     /// reports `null` for exactly this case.
     pub log_file: Option<String>,
+    /// The Klipper assets directory this host reports to clients
+    /// (`klipper_path`): the root the embedded trees were released to
+    /// ([`crate::assets::release`]). It holds `config/` (the upstream
+    /// configuration examples), `docs/` (this host's user manuals plus a
+    /// generated index) and `docs/klipper/` (the upstream documentation, at
+    /// the subpath Moonraker's lookup expects). Filled by the host at
+    /// start-up, before anything serves the API.
+    pub klipper_path: String,
     /// Version of the host software: the pinned upstream baseline plus this
     /// crate's version ([`crate::version::software_version`]).
     pub software_version: String,
@@ -54,15 +62,22 @@ impl StartArgs {
     /// Gather the start arguments a host knows at startup.
     ///
     /// `log_file` is the `--logfile` path, or `None` when the host logs to the
-    /// terminal only. `debug_output` stays `None` until the parser carries
-    /// `--debugoutput`, and the API address is filled in by the host, which is
-    /// where the option lives. Upstream's `--debuginput` file-input mode is not
-    /// implemented here, so there is no field for it (see
+    /// terminal only. `klipper_path` is the released assets root the host
+    /// gathered at start-up (see [`StartArgs::klipper_path`]). `debug_output`
+    /// stays `None` until the parser carries `--debugoutput`, and the API
+    /// address is filled in by the host, which is where the option lives.
+    /// Upstream's `--debuginput` file-input mode is not implemented here, so
+    /// there is no field for it (see
     /// `docs/klippy/developer-manual/upstream-deviations.md`).
-    pub fn collect(config_file: impl Into<String>, log_file: Option<String>) -> Self {
+    pub fn collect(
+        config_file: impl Into<String>,
+        log_file: Option<String>,
+        klipper_path: impl Into<String>,
+    ) -> Self {
         Self {
             config_file: config_file.into(),
             log_file,
+            klipper_path: klipper_path.into(),
             software_version: crate::version::software_version(),
             cpu_info: cpu_info(),
             apiserver: None,
@@ -154,10 +169,18 @@ model name\t: ARMv7 Processor rev 4 (v7l)
 
     #[test]
     fn test_collected_start_args_carry_the_config_file_and_a_version() {
-        let args = StartArgs::collect("/tmp/printer.cfg", None);
+        let args = StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
 
         assert_eq!(args.config_file, "/tmp/printer.cfg");
         assert_eq!(args.log_file, None);
+        assert_eq!(
+            args.klipper_path,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH
+        );
         assert_eq!(args.software_version, crate::version::software_version());
         // The CPU description depends on the machine, so only its shape is
         // pinned here; `parse_cpu_info` above covers the text.
@@ -166,7 +189,11 @@ model name\t: ARMv7 Processor rev 4 (v7l)
 
     #[test]
     fn test_a_log_file_reaches_the_start_args() {
-        let args = StartArgs::collect("/tmp/printer.cfg", Some("/tmp/klippy.log".to_string()));
+        let args = StartArgs::collect(
+            "/tmp/printer.cfg",
+            Some("/tmp/klippy.log".to_string()),
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
 
         assert_eq!(args.log_file.as_deref(), Some("/tmp/klippy.log"));
     }
@@ -175,7 +202,11 @@ model name\t: ARMv7 Processor rev 4 (v7l)
     fn test_a_fresh_run_starts_for_the_first_reason() {
         // Upstream's `main()`: `start_args = {..., 'start_reason': 'startup'}`
         // (`klippy/klippy.py:288`).
-        let args = StartArgs::collect("/tmp/printer.cfg", None);
+        let args = StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
 
         assert_eq!(args.start_reason, "startup");
         assert_eq!(args.apiserver, None);

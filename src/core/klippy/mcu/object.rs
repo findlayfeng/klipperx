@@ -2931,7 +2931,11 @@ mod tests {
         /// `--debugoutput` file, which is what [`Printer::is_fileoutput`]
         /// reads.
         fn as_fileoutput(&self) {
-            let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+            let mut args = crate::core::klippy::api::StartArgs::collect(
+                "/tmp/printer.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
             args.debug_output = Some("_test_output".to_string());
             self.printer.set_start_args(Arc::new(args));
         }

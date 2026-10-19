@@ -638,7 +638,11 @@ mod tests {
         // The host builds the same dictionary at startup (`src/klippy.rs`);
         // this is that step for a case run, done before the config is loaded,
         // as the host does.
-        let mut start_args = crate::core::klippy::api::StartArgs::collect(config_file, None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            config_file,
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = fileoutput.then(|| "_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
@@ -1239,7 +1243,11 @@ mod tests {
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
         // The corpus' shape is `-o`, so a case's `G1 E…` is not rejected as cold.
-        let mut start_args = StartArgs::collect(config_file, None);
+        let mut start_args = StartArgs::collect(
+            config_file,
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = fileoutput.then(|| "_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
@@ -1599,7 +1607,11 @@ mod tests {
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
             let printer = Arc::new(Printer::new(reactor));
-            let mut start_args = crate::core::klippy::api::StartArgs::collect("corexyuv.cfg", None);
+            let mut start_args = crate::core::klippy::api::StartArgs::collect(
+                "corexyuv.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
             start_args.debug_output = Some("_test_output".to_string());
             printer.set_start_args(Arc::new(start_args));
             printer.load_config(&config).expect("corexyuv.cfg loads");

@@ -599,7 +599,11 @@ mod tests {
     fn test_a_file_output_run_starts_no_timer() {
         let reactor = Arc::new(ManualReactor::new());
         let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
-        let mut args = StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         let check = check_from(

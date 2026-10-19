@@ -5264,7 +5264,11 @@ mod tests {
         let (state, _gcode, printer) = connected_with_printer(toolhead);
         if debug_output {
             // The `-o` shape every corpus and harness run has.
-            let mut start_args = StartArgs::collect("m400.cfg", None);
+            let mut start_args = StartArgs::collect(
+                "m400.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
             start_args.debug_output = Some("_test_output".to_string());
             printer.set_start_args(Arc::new(start_args));
         }
@@ -6955,7 +6959,11 @@ mod tests {
 
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("two-mcu.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "two-mcu.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
@@ -7188,7 +7196,9 @@ mod tests {
         // (`toolhead.py:221-223`, `:426-427`). A real machine runs this way,
         // with a working clock.
         printer.set_start_args(Arc::new(crate::core::klippy::api::StartArgs::collect(
-            "m400.cfg", None,
+            "m400.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
         )));
 
         /// Read while the machine is up, asserted after it is down.

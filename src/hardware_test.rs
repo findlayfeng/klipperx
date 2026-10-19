@@ -579,6 +579,7 @@ impl Machine {
         printer.set_start_args(Arc::new(StartArgs::collect(
             self.path.display().to_string(),
             None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
         )));
 
         let setup = runtime.block_on(async {

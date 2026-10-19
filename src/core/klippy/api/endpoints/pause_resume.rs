@@ -233,6 +233,7 @@ mod tests {
             start_args: &crate::core::klippy::api::start_args::StartArgs::collect(
                 "/tmp/printer.cfg",
                 None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
             ),
         };
 

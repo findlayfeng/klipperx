@@ -124,6 +124,7 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use crate::core::klippy::msg::Msg;
+use crate::core::klippy::sleep_off_worker;
 use crate::core::klippy::trace_enabled;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -616,7 +617,7 @@ fn try_send_bounded(
                 item = returned;
             }
         }
-        std::thread::sleep(backoff);
+        sleep_off_worker(backoff);
         backoff = (backoff * 2).min(SYNC_SEND_POLL_MAX);
     }
 }

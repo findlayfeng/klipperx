@@ -201,6 +201,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | ③ 内置资产特性 | 构建期嵌入 config/docs + 三级链释放 + `info` 报释放根（`assets.rs` 新增 12 测；嵌入 +6.6 MB 不影响墙钟） | **57.6 s** | 3506 |
 | ④ 传感器时钟域统一 | ADC 样本时间改 print time（含 32 位绕圈修复）+ 加热器 5 s 主线程护栏与 7 s 陈旧压制（+20 测）
 | ⑤ 加热 PWM 按上游排期 | `Sensor::get_report_time_delta` + `Heater::pwm_delay`，修掉真机 `[heater_generic]` 的 `Timer too close`（+4 测：排期时钟、迟到读数按 now 起算、告警限速、PWM 更新棘轮） | **57.4 s** | 3521 |
+| ⑧ 串口重新枚举下的身份 | `same_file`（路径 `(dev,ino)` 对比）+ `attach` 重开 4×250 ms：板子复位重新枚举后同进程重连成功（此前 EIO 直接失败，+1 测） | **57.8 s** | 3527 |
 | ⑦ 真机 lane 支持 mux/桥 | `apply_id_addressed_transport`：`hardware_test`/`stress` 与装载期用同一分类（`serial_ports` + `NODEID_FIRST`），mux 固件板不再 identify 超时（+2 测 / 真机 R1/R2/R5/R11 跑通） | **57.6 s** | 3526 |
 | ⑥ PWM 更新棘轮（对齐上游） | `min_pwm_change = max_power × 5%` + `next_pwm_time`（≈每 2.1 s 一个发送窗口）：事件从 3.3 条/秒降到 0.5 条/秒，批次迟到不再把旧样本年龄写上线（+3 测） | **57.6 s** | 3524 |
 

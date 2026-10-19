@@ -154,6 +154,12 @@ PB4/PB5/`!PB6`，`endstop_pin: ^PD10`，不接任何负载）。`KLIPPERX_HW_CON
 > `query_endstop` 返回 `pin_value ^ invert`（`endstop.rs:146` ↔ `mcu.py:406`），`true` 打印为 `TRIGGERED`。
 > 所以 `^PD10` **悬空 = 高 = TRIGGERED**、**短到 GND = 低 = open**——klipper 的 `^` 端停按常闭接法工作。
 
+**同日修复并复验（串口在重新枚举下的身份）**：改一次 `endstop_pin`（PD10 → PD11 → 再回 PD10）⇒ lane 必须
+`reset` 板子 ⇒ USB 重新枚举；此前同一场景是 `serial write … Input/output error (os error 5)` 直接失败，
+现在两轮都 `the firmware accepted the configuration` 并读到电平（`^PD10` 短到 GND 时 `read 1: open`）。
+机制：`port_for` 的复用判据加了「路径当前解析到的 `(dev, ino)` 与已打开描述符一致」(`same_file`)，
+`attach` 在握手失败且端口已失效时重开（4 × 250 ms）。
+
 **前置修复（同批）**：这份 lane 以前打不通这块板——`hardware_test`/`stress` 各自只拿到一节就
 `McuConfig::open()`，而"这条 `serial:` 路径按 id 寻址"是**装载期**在整份配置上判定的，于是 lane 用
 独占裸帧对 mux 固件说话、identify 必然超时（日志里 `serial port …` 没有 `shared` 字样）。现在两处都

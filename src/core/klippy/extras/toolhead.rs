@@ -4201,8 +4201,14 @@ async fn probing_move(
     let trigger_time = trigger_instant(trigger_time, end, printer);
     let trigger_travel = travel_at(connected, &start_steps, trigger_time);
     let trigpos = calc_toolhead_pos(connected, &kin_spos, &trigger_travel);
-    let halt_travel = travel_at(connected, &start_steps, end);
-    let haltpos = calc_toolhead_pos(connected, &kin_spos, &halt_travel);
+    // The toolhead is left where the move ended — the position the drip
+    // generated to, not the step-quantized one the trigger position is read
+    // back from: this host's `set_position` does not re-anchor the step
+    // compressor the way upstream's `MCU_stepper.set_position` does with
+    // `_mcu_position_offset`, so a halt rounded back by a fraction of a step
+    // re-walks steps already sent (`stepcompress …: Invalid sequence`, seen in
+    // multi_z's third probe).
+    let haltpos = connected.toolhead.commanded_pos();
     // A following probe still has room to move down because every consumer
     // lifts first — each sample retracts (`run_with`) and each point is
     // preceded by a raise (`ProbePointsHelper`) — so it never probes twice

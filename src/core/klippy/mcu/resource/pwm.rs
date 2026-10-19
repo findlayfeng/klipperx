@@ -248,6 +248,12 @@ impl PwmOut for McuPwm {
         self.chip.print_time_to_clock(print_time)
     }
 
+    fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        self.chip
+            .clock()
+            .map(|clock| clock.estimated_print_time(eventtime))
+    }
+
     fn min_schedule_time(&self) -> Option<f64> {
         self.chip.mcu().map(|mcu| mcu.min_schedule_time())
     }

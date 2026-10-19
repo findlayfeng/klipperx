@@ -253,6 +253,19 @@ pub trait PwmOut: Send + Sync {
         None
     }
 
+    /// The estimated print time this resource's MCU is at, at a host instant
+    /// (upstream's `mcu_pwm.get_mcu().estimated_print_time()`).
+    ///
+    /// The heater's main-thread deadline is dated in the PWM chip's print time
+    /// (`heaters.py:137-140`), which is why this sits on the resource rather
+    /// than on the printer. The default answers `None`: a resource with no clock
+    /// (a test double before it has one, or a chip that does not model one)
+    /// makes the caller skip its dated work.
+    fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        let _ = eventtime;
+        None
+    }
+
     /// The lead the firmware's scheduler puts between a request and its clock;
     /// see [`DigitalOut::min_schedule_time`]. The default answers `None`.
     fn min_schedule_time(&self) -> Option<f64> {

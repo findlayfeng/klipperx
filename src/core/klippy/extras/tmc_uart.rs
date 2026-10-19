@@ -69,6 +69,7 @@ use crate::core::klippy::mcu::{McuCallError, McuError, McuObject, SendClocks};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{DigitalOut, PinError, PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
+use crate::core::klippy::sleep_off_worker;
 
 /// The printer object that shares one [`TmcUartBitbang`] per `(rx, tx)` pair
 /// (upstream's `PrinterTMCUartMutexes`, registered as `tmc_uart`).
@@ -562,7 +563,9 @@ impl TmcUartBitbang {
         }
         let command = read_command(self.oid, addr, reg);
         // Let the line settle before this frame goes out (see [`COMMAND_GAP`]).
-        std::thread::sleep(COMMAND_GAP);
+        // This path runs inside a command future, so the wait hands the
+        // multi-threaded runtime's worker off rather than holding it.
+        sleep_off_worker(COMMAND_GAP);
         // `call_msg_oid` already carries `UART_TIMEOUT`; the `tokio` timeout is
         // the outer net the rest of the tree puts around a call that must not
         // park a command forever.

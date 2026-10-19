@@ -78,6 +78,7 @@ use crate::core::klippy::pins::{
 };
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 use crate::core::klippy::reactor::TimerHandle;
+use crate::core::klippy::sleep_off_worker;
 
 /// The toolhead object's registered name (upstream `lookup_object('toolhead')`).
 const TOOLHEAD_OBJECT: &str = "toolhead";
@@ -1340,10 +1341,10 @@ impl TmcErrorCheck {
                     count += 1;
                     if count < MAX_CHECK_ATTEMPTS && is_uart_read_error(&err) {
                         // Upstream pauses its own greenlet for 50 ms here. This
-                        // check is synchronous, so the wait is a sleep: it holds
-                        // the reactor's dispatcher for 50 ms, in a path that is
-                        // already failing.
-                        std::thread::sleep(UART_RETRY_DELAY);
+                        // check is synchronous, so the wait is a sleep — but one
+                        // that hands the multi-threaded runtime's worker off for
+                        // the 50 ms, in a path that is already failing.
+                        sleep_off_worker(UART_RETRY_DELAY);
                         continue;
                     }
                     return Err(err);

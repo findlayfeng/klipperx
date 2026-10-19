@@ -41,6 +41,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -83,6 +84,15 @@ const Y_AXIS: usize = 1;
 /// The sample windows one drift sweep takes (`DRIFT_SAMPLE_COUNT`), each a
 /// half-millimetre of Z apart (`temperature_probe.py:476`).
 const DRIFT_SAMPLE_COUNT: usize = 9;
+
+/// How long one drift sweep waits for the probe's batch stream to retire its
+/// sample windows before it reports the stream as stalled.
+///
+/// Upstream polls the same list from `reactor.pause` with no bound
+/// (`temperature_probe.py:626-628`), so a sensor that stops delivering waits
+/// forever; past this bound the sweep goes on to `into_samples`, which already
+/// refuses a window the stream left empty.
+const DRIFT_SWEEP_WAIT: Duration = Duration::from_secs(10);
 
 // ===========================================================================
 // Polynomial2d
@@ -1795,9 +1805,9 @@ impl EddyDriftCompensation {
     /// `flush_step_generation` (the queued moves generated and sent), and its
     /// `reactor.pause` loop (`:626-628`) becomes a `tokio` sleep polling the
     /// same condition — the window list emptying as the probe's data arrives.
-    /// Like upstream's, the wait is unbounded: a sensor that stops delivering
-    /// leaves the sweep waiting, where a reactor that never sees the data
-    /// would.
+    /// Unlike upstream's, that wait is bounded ([`DRIFT_SWEEP_WAIT`]): a sensor
+    /// that stops delivering is reported with a `warn!` and the sweep carries
+    /// on to the windows it did get.
     ///
     /// # Errors
     /// "Unknown config object 'probe_eddy_current \<name\>'" (upstream's
@@ -1866,17 +1876,13 @@ impl EddyDriftCompensation {
         // Upstream's `toolhead.wait_moves()`.
         toolhead.flush_step_generation().await?;
         // "Wait for sample collection to finish" (`:626-628`): upstream polls
-        // the window list on its reactor — the condition is the same one.
-        loop {
-            let drained = sweep
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .move_times
-                .is_empty();
-            if drained {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // the window list on its reactor — the condition is the same one, and
+        // the wait is bounded here (see `DRIFT_SWEEP_WAIT`).
+        if !wait_for_sweep_drain(&sweep, DRIFT_SWEEP_WAIT).await {
+            let name = &self.name;
+            tracing::warn!(
+                "{name}: the drift sweep's windows did not fill within {DRIFT_SWEEP_WAIT:?}"
+            );
         }
         let taken = std::mem::take(&mut *sweep.lock().unwrap_or_else(|p| p.into_inner()));
         let (sample_temp, windows) = taken.into_samples(mpresult.z())?;
@@ -2051,6 +2057,27 @@ impl SweepState {
             windows.push((sample_temp, avg_freq));
         }
         Ok((sample_temp, windows))
+    }
+}
+
+/// Wait for one drift sweep's window list to empty, bounded by `timeout` — the
+/// condition upstream polls from its reactor without a bound (`:626-628`).
+/// Returns whether the list emptied; `false` is the stall the caller reports.
+async fn wait_for_sweep_drain(sweep: &Mutex<SweepState>, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let drained = sweep
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .move_times
+            .is_empty();
+        if drained {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -3937,6 +3964,40 @@ calibration_bed_temp: 60
         // With no window open every message is a keep-alive (`:586-587`).
         let mut idle = SweepState::default();
         assert!(idle.absorb(&[[10.05, 1000., 0.]], 42.));
+    }
+
+    /// The bounded drain wait: a window list the stream never retires is
+    /// reported after [`DRIFT_SWEEP_WAIT`] instead of waited on (upstream's
+    /// loop there has no bound; `temperature_probe.py:626-628`).
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_drain_wait_gives_up_on_a_stalled_stream() {
+        // No client is registered, so nothing will ever retire this window.
+        let mut sweep = SweepState::default();
+        sweep.move_times.push((0, 10., 10.1));
+        let sweep = Mutex::new(sweep);
+
+        let started = tokio::time::Instant::now();
+        // The virtual clock, so the bound costs no real time; the timeout is the
+        // backstop that turns a missing deadline into a failure.
+        let drained = tokio::time::timeout(
+            DRIFT_SWEEP_WAIT * 3,
+            wait_for_sweep_drain(&sweep, DRIFT_SWEEP_WAIT),
+        )
+        .await
+        .expect("the wait is bounded");
+
+        assert!(!drained, "a stream that never arrives reports the stall");
+        let waited = started.elapsed();
+        assert!(
+            waited >= DRIFT_SWEEP_WAIT,
+            "it waited the bound: {waited:?}"
+        );
+        let left = sweep
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .move_times
+            .len();
+        assert_eq!(left, 1, "the window stays where the stream left it");
     }
 
     /// The sweep's results (`:617-624`): the averaged temperature over all

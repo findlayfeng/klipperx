@@ -153,6 +153,65 @@ pub fn linux_bridge_firmware_path() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("KLIPPER_LINUX_BRIDGE_FIRMWARE"))
 }
 
+/// A private copy of a build artefact, so a test that wants its own instance of
+/// it does not share the one the other tests load.
+///
+/// The host library the interface tests load is registered **per path**: every
+/// reference on one `.so` path shares one loaded library, its runtime and its
+/// reader (the registry in `src/core/klippy/interface/devices/host.rs`). So a test
+/// that has to own its library — because it runs beside the others rather than
+/// under their serialising lock — makes a copy on a path of its own.
+///
+/// The copy lands in a directory of its own under [`std::env::temp_dir`], named
+/// from the process id, the creating thread's id and a per-process counter, so
+/// two copies in one process never land on the same path. The directory is
+/// removed when this is dropped.
+pub struct PrivateCopy {
+    dir: std::path::PathBuf,
+    path: std::path::PathBuf,
+}
+
+impl PrivateCopy {
+    /// Copy `source` next to itself, under a path no other copy uses.
+    pub fn of(source: &std::path::Path) -> std::io::Result<Self> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static NEXT_COPY: AtomicUsize = AtomicUsize::new(0);
+
+        let name = source
+            .file_name()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("{} has no file name to copy under", source.display()),
+                )
+            })?
+            .to_os_string();
+        let dir = std::env::temp_dir().join(format!(
+            "klipperx-private-copy-{}-{:?}-{}",
+            std::process::id(),
+            std::thread::current().id(),
+            NEXT_COPY.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(name);
+        std::fs::copy(source, &path)?;
+        Ok(Self { dir, path })
+    }
+
+    /// The copy's own path — the one to load, and the one to hand to anything
+    /// that waits for that library to unload.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateCopy {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// The linux firmware process fixture (spawn / reap, see [`LinuxFirmware`]).
 pub mod linux_firmware;
 pub use linux_firmware::LinuxFirmware;
@@ -160,6 +219,47 @@ pub use linux_firmware::LinuxFirmware;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A private copy holds the same bytes on a path of its own, and leaves
+    /// nothing behind: the two properties a test that loads it relies on (the
+    /// registry is per path, and a leftover `.so` would pile up in the temp
+    /// directory).
+    #[test]
+    fn a_private_copy_copies_the_bytes_to_a_path_of_its_own_and_cleans_up() {
+        let source = std::env::temp_dir().join(format!(
+            "klipperx-private-copy-source-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&source, b"library bytes").expect("the source file is written");
+
+        let first = PrivateCopy::of(&source).expect("the first copy is made");
+        let second = PrivateCopy::of(&source).expect("the second copy is made");
+        assert_ne!(first.path(), source, "the copy is not the source path");
+        assert_ne!(first.path(), second.path(), "two copies never share a path");
+        assert_eq!(
+            std::fs::read(first.path()).expect("the copy is readable"),
+            std::fs::read(&source).expect("the source is readable"),
+            "the copy carries the source's bytes"
+        );
+
+        let dir = first
+            .path()
+            .parent()
+            .expect("the copy lives in a directory")
+            .to_path_buf();
+        drop(first);
+        assert!(!dir.exists(), "dropping the copy removes its directory");
+
+        let dir = second
+            .path()
+            .parent()
+            .expect("the copy lives in a directory")
+            .to_path_buf();
+        drop(second);
+        assert!(!dir.exists(), "dropping the copy removes its directory");
+        let _ = std::fs::remove_file(&source);
+    }
 
     /// The resolution contract both submodule checkouts share: a non-empty
     /// override wins, anything else falls back to the in-tree submodule — the

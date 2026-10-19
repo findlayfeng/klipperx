@@ -150,6 +150,7 @@ condvar 上，只有 `Device::shutdown()`（由 `Mcu::close()` 调）能放它�
 | `mcu/mod.rs:100` 的 `PAYLOAD_ROOM_WAIT` | 1s | 异步生产者（`send_payload` / `send_move_payload`）等队列空位的上界，统一在 `mod.rs:642` 的 `queue_awaiting_room`（2026-10-19）：到点报 `send queue has no free slot within …`，不再是无出口自旋 |
 | `mcu/object.rs:92` 的 `RESET_SETTLE` | 500ms | 复位后重新打开端口前的 settle（`object.rs:1445`）；上游对应步骤是 0.100s（`serialhdl.py:357/375-388`），本仓取 5×，待评 |
 | `mcu/object.rs:61` 的 `RECONNECT_DELAY` | 250ms | 重连前等待（`object.rs:543`） |
+| `mcu/bridge_attach.rs` 的 `PORT_RETURN_BUDGET` | 生产 10s / **测试 300ms** | 等桥下游 tty 回来的预算（`wait_for_port_paths`）；生产值就是 `BRIDGE_PORT_RETURN_TIMEOUT`(10 s)，测试构建换成 300 ms（2026-10-19）——原来八条真机链路用例各**断言等满 10 s**（`waited >= BRIDGE_PORT_RETURN_TIMEOUT`），占全量闸门 128 s 的六成；缩短后闸门 **128 s → 88 s**。生产值由 `the_production_budget_is_the_usb_return_bound` 钉住，另一条测试用**不同**预算（150 ms）钉住「deadline 由传入预算推导」，防止有人把延迟写死进循环 |
 | `extras/virtual_sdcard.rs:84` 的 `PAUSE_DRAIN_TIMEOUT` | 10s | `do_pause`（`:314`）等回放任务退出的上界（2026-10-19）；上游是**无界**的 `while work_timer is not None: reactor.pause(.001)`（`virtual_sdcard.py:123-127`），本仓超时 `warn!` 后返回，签名仍是 `()` |
 | `extras/temperature_probe.rs:94` 的 `DRIFT_SWEEP_WAIT` | 10s | drift sweep 等 `move_times` 排空的上界（`:2065` 的 `wait_for_sweep_drain`，2026-10-19）；上游同款无界（`temperature_probe.py:605`），本仓超时后交给既有的 `incomplete sensor data` 拒绝 |
 | 发送任务的 1ms 合批定时器 | ~1ms × 多次 | `mcu/mod.rs:1908` |

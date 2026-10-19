@@ -200,6 +200,10 @@ mod tests {
                 let power = feed.get_status()["power"].as_f64().unwrap();
                 time += 0.1;
                 temp += (power * 120.0 - (temp - 20.0) * 0.5) * 0.1;
+                // This feeder is the test stand-in for the 1 s main-thread
+                // stamp the production timer takes: every reading it delivers
+                // comes from a main thread that is alive.
+                feed.stamp_mainthread(time);
                 feed.temperature_callback(time, temp);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }

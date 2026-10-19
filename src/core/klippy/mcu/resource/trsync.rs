@@ -870,6 +870,7 @@ mod tests {
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::pins::{PinParams, PrinterPins};
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use serde_json::json;
     use std::time::Duration;
     use tokio::time::{sleep, timeout};
@@ -1107,12 +1108,26 @@ mod tests {
         let completion = dispatch.start(0.0).unwrap();
         let trsync = first(&dispatch);
 
-        // Four seconds in, the firmware reports it is still armed.
+        // Four seconds in — one second inside the arm's silence deadline —
+        // the firmware reports it is still armed. The wait is polled on that
+        // deadline rather than timed by a fixed 4 s sleep: it is real time, and
+        // a loaded machine can stretch the sleep past the 5 s it has to stay
+        // inside, which would fail the arm before the report is sent.
         //
         // Real time, not the paused clock: an `Mcu` in the runtime (its receive
         // task parks in `spawn_blocking`) stops `start_paused` from advancing
         // the clock at all, so a virtual sleep here would hang the test.
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        wait_until(
+            HOME_WAIT_TIMEOUT,
+            Duration::from_millis(20),
+            || {
+                completion
+                    .remaining()
+                    .is_some_and(|left| left <= Duration::from_secs(1))
+            },
+            "the report is sent inside the arm's silence deadline",
+        )
+        .await;
         trsync.handle_state(TrsyncState {
             oid: trsync.oid(),
             can_trigger: true,

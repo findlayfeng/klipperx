@@ -453,9 +453,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
          （超时），`write_unit(..)?` 的写错误同样立刻失败 ⇒ EIO 没有任何重试；
       ② `serial.rs:1920-1927` `port_for` 的复用判据只有 `!stopped`，**不检查 tty 是否已被重新枚举**
          （`devices/shared.rs` 文档里描述的 `usable` 谓词在串口上没有实现）⇒ 旧 fd 被复用。
-      **一个待确认的差异**（修之前先验）：klippy 主路径连续复位三次是通的（R2：763/763/765 ms），
-      因为它先 `previous.close()` 让最后一个 handle 归还 port、再重新 `open`（`object.rs:950-958`）；
-      而 lane 的 reopen 在旧 handle 还活着时就再 attach，可能因此命中缓存的失效 port。
+      **对照实验已做（2026-10-19，R3 现场）**：改一次配置（`endstop_pin` PB13 → PD10）→ lane 必须 `reset`
+      并重连 → 当场 `Input/output error`；**紧接着下一次运行就 `accepted`**（复位后固件失去了旧配置，
+      于是不再触发 reset 路径）。也就是说这条缺口**每次配置变更只赔一次失败**、不会卡死；klippy 主路径
+      连续复位三次（R2：763/763/765 ms）是通的，因为它先 `previous.close()` 归还 port（`object.rs:950-958`），
+      而 lane 的 reopen 在旧 handle 还活着时就再 attach —— 这仍是最可疑的一层，修之前照上面两步走。
       修法：①写错误按 `ASSIGN_ATTACH_TIMEOUT` 重试（每次重新解析路径）；②`port_for` 的 usable
       加"底层 fd 仍指向当前节点"判据。先做差异实验再改，避免修错层。
 

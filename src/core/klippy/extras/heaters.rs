@@ -45,6 +45,7 @@ use crate::core::klippy::gcode::{
 use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
 use crate::core::klippy::reactor::TimerHandle;
+use tracing::warn;
 
 /// The name other modules look the registry up by.
 pub const HEATERS_OBJECT: &str = "heaters";
@@ -75,6 +76,15 @@ const MAX_MAINTHREAD_TIME: f64 = 5.0;
 /// `verify_heater` sees a cold, unresponsive heater rather than a warm one that
 /// merely froze (`heaters.py:116-122`).
 const QUELL_STALE_TIME: f64 = 7.0;
+
+/// Whether a stalled-main-thread drop is worth a log line now.
+///
+/// `last_reported_at` is the print time of the previous line; a host that just
+/// came out of a stall produces a reading every report period, so without this
+/// bound one stall would write tens of identical lines.
+fn stall_report_due(last_reported_at: f64, read_time: f64) -> bool {
+    read_time - last_reported_at >= STALL_REPORT_INTERVAL
+}
 /// The temperature the PID's first derivative is measured against
 /// (upstream `AMBIENT_TEMP`, `heaters.py:15`).
 const AMBIENT_TEMP: f64 = 25.0;
@@ -273,6 +283,10 @@ pub struct Heater {
     max_power: f64,
     /// `1 / smooth_time`, for the smoothed temperature.
     inv_smooth_time: f64,
+    /// The machine, for the reactor instant a reading's delay is measured
+    /// from: a batch of readings that reached the host late must not date its
+    /// PWM change behind the firmware's clock.
+    printer: Weak<Printer>,
     /// How far after a reading this heater may date its PWM change (upstream's
     /// `pwm_delay`, `heaters.py:32`): one report period of the sensor that
     /// produced the reading.
@@ -298,8 +312,19 @@ struct HeaterState {
     verify_mainthread_time: f64,
     can_extrude: bool,
     last_pwm_value: f64,
+    /// Print time of the last `output dropped` line, so a stall cannot flood
+    /// the log. `NEG_INFINITY` until the first drop.
+    stall_reported_at: f64,
     control: Box<dyn HeaterControl>,
 }
+
+/// How often a stalled-main-thread drop may be logged, in seconds of reading
+/// time.
+///
+/// A stalled host produces readings faster than it produces log lines, and the
+/// condition repeats for as long as the stall lasts, so the report is bounded
+/// to one line a second — enough to date the stall, not enough to bury the log.
+const STALL_REPORT_INTERVAL: f64 = 1.0;
 
 impl Heater {
     /// The heater's short name (`extruder`, `heater_bed`).
@@ -422,17 +447,39 @@ impl Heater {
             ..
         } = &mut *state;
         let value = control.update(read_time, temp, target_temp, self.max_power);
-        let value = if *target_temp <= 0.0 || read_time > *verify_mainthread_time {
+        let stalled = *target_temp > 0.0 && read_time > *verify_mainthread_time;
+        let deadline = *verify_mainthread_time;
+        let value = if *target_temp <= 0.0 || stalled {
             0.0
         } else {
             value
         };
+        if stalled && stall_report_due(state.stall_reported_at, read_time) {
+            state.stall_reported_at = read_time;
+            warn!(
+                "Heater {}: output dropped, the main thread has not proved itself alive since print time {:.3} \
+                 (reading dated {:.3}, {:.1}s later); a stalled host is the usual cause",
+                self.name,
+                deadline,
+                read_time,
+                read_time - deadline
+            );
+        }
         // Upstream dates the change at `read_time + pwm_delay` so it lands in
         // the future, before the next reading (`heaters.py:79`). A pin whose
         // chip has no print-time mapping (the file-output stand-ins) keeps the
         // immediate path.
+        // A reading that reached the host late would otherwise date its change
+        // behind the firmware's clock ("Rescheduled timer in the past"), so the
+        // delay is measured from whichever is later: the reading, or the chip's
+        // print time now.
+        let now_print = self
+            .printer
+            .upgrade()
+            .and_then(|printer| self.pwm.as_ref()?.estimated_print_time(printer.eventtime()));
+        let base = now_print.map_or(read_time, |now| read_time.max(now));
         if let Some(pwm) = &self.pwm {
-            match pwm.print_time_to_clock(read_time + self.pwm_delay) {
+            match pwm.print_time_to_clock(base + self.pwm_delay) {
                 Some(clock) => {
                     let _ = pwm.set_pwm(clock as u32, value);
                 }
@@ -1112,6 +1159,7 @@ impl PrinterHeaters {
             min_extrude_temp,
             max_power,
             inv_smooth_time: 1.0 / smooth_time,
+            printer: Arc::downgrade(printer),
             pwm_delay,
             state: Mutex::new(HeaterState {
                 target_temp: 0.0,
@@ -1125,6 +1173,7 @@ impl PrinterHeaters {
                 // answered and so no reading ever flips this on again.
                 can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
                 last_pwm_value: 0.0,
+                stall_reported_at: f64::NEG_INFINITY,
                 control: Box::new(control),
             }),
         });
@@ -1906,6 +1955,18 @@ mod tests {
         assert_eq!(heater.get_status()["power"], 1.0);
     }
 
+    /// A stall is reported at most once a second of reading time, so one stall
+    /// cannot bury the log in identical lines.
+    #[test]
+    fn test_a_stall_is_reported_at_most_once_a_second() {
+        // Nothing reported yet: the first drop always speaks.
+        assert!(stall_report_due(f64::NEG_INFINITY, 12.0));
+        // Reported at 12.0: the next line waits a second of reading time.
+        assert!(!stall_report_due(12.0, 12.0));
+        assert!(!stall_report_due(12.0, 12.999));
+        assert!(stall_report_due(12.0, 13.0));
+    }
+
     /// `heaters.py:18`: a reading is trusted for upstream's 7 s.
     #[test]
     fn test_the_quell_age_is_upstreams_seven_seconds() {
@@ -1968,6 +2029,34 @@ mod tests {
         assert_eq!(calls[0].0, 1_300_000);
         // A cold heater with a target: the control asks for full power.
         assert_eq!(calls[0].1, 1.0);
+    }
+
+    /// A reading that reached the host late must not date its PWM change behind
+    /// the chip's clock: the delay is measured from the later of the reading and
+    /// "print time now" (the firmware reports `Rescheduled timer in the past`
+    /// otherwise).
+    #[test]
+    fn test_a_late_reading_is_dated_from_now_not_from_the_reading() {
+        // The chip's print time runs 5 s ahead of the host instant, which is
+        // what a batch of readings that reached the host late looks like.
+        let reactor = Arc::new(ManualReactor::new());
+        let chip = NoopChip {
+            clock_freq: Some(1_000_000.0),
+            print_time_offset: Some(5.0),
+            ..NoopChip::default()
+        };
+        let calls = Arc::clone(&chip.pwm_calls);
+        let printer = ready_printer_with(chip, Arc::clone(&reactor) as Arc<dyn Reactor>);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(100.0);
+        reactor.advance(10.0);
+        // The reading is dated 1.0, but print time now is 15.0.
+        heater.temperature_callback(1.0, 20.0);
+
+        let calls = calls.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(calls.len(), 1, "{:?}", *calls);
+        // max(1.0, 15.0) + 0.3 s, at 1e6 ticks/s.
+        assert_eq!(calls[0].0, 15_300_000);
     }
 
     /// The delay is the sensor's, not a constant: a heater over a slower sensor

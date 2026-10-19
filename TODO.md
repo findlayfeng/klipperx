@@ -444,12 +444,13 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
-- [ ] **主线程护栏与 7 s 压制的真机可观测性（2026-10-19 真机负结果）**：
-      两者都已在真机代码路径上，但进程级 `SIGSTOP` 构造不出触发条件——恢复时 1 s 的 `heater_stats`
-      定时器先把截止戳推到 `now + 5`，排队的读数时间戳都早于 `now`（6 s 停顿后连采 40 次 `power`
-      全 1.0）；压制窗口同样只有恢复后第一条读数之前的几毫秒，且 `M105` 文本不经 API 应答回传。
-      要做的是**可观测性**：护栏归零时留一条 debug 日志（速率受限）、或在真机用例里构造长阻塞段
-      占住打戳任务。边界本身已由单测钉住。
+- [ ] **`MAX_MAINTHREAD_TIME` 护栏在真实加热器上不可达（2026-10-19 真机结论，留作记录）**：
+      klipper 的加热器一律软件 PWM（上游 `heaters.py:61` 也写死 `setup_cycle_time(pwm_cycle_time)`），
+      每 0.1 s 需要一个新边沿；宿主一停，固件先报 `Missed scheduling of next digital out event`
+      （实测 `SIGSTOP` 6 s 即触发）。因此 5 s 的主线程截止对加热器只是纵深防御，7 s 陈旧压制同样
+      只有恢复后第一条读数之前的几毫秒窗口。两者边界由单测钉住，归零时有限速告警可查。若要别的
+      场景真验，只能给 `[heater_generic]` 加 `hardware_pwm` 选项（上游没有这个选项，属新增行为，
+      需先拍板）或构造「读数在跑、打戳任务被独占」的阻塞段。
 
 - [x] **`M105` / gcode_id 表**（heaters 域）：`TEMPERATURE_WAIT` 已落地（2026-10-03，`b5da84e`，
       10 测）；`M105` gcode-id 表已接（2026-10-03，`14f5055`）：`register_sensor` 存 `gcode_id→sensor` 表（`BTreeMap` 排序），

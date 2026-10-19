@@ -113,18 +113,23 @@
   每 2 s 采一次共 90 样本 —— 温度 min 36.24 / max 36.51 / **极差 0.27 ℃**、`power` **90/90 全 1.0**、
   分段均值 36.31→36.36→36.45 单调微升、会话全程 `ready`。改动前（ADC 样本时间是裸 tick）绕圈后
   `time_diff` 变负巨值 ⇒ 平滑温度乱跳 ⇒ watermark 把占空比打 0（LED 会每 ~60 s 闪一下）。
-  **② 6 s 进程级停顿测不出护栏**（负结果，记录在此而不是当通过）：`SIGSTOP` 6 s 后 `SIGCONT`，
-  立刻以 ~30 ms 间隔连采 40 次 `power` —— **40/40 仍是 1.0**。原因：恢复时 1 s 的 `heater_stats`
-  定时器先跑、把截止戳推到 `now + 5`，而排队中的读数时间戳都早于 `now` ⇒ `read_time > 截止`
-  不成立。也就是说这条护栏只在「读数在跑、而打戳路径被卡住」时才会咬人，进程级 SIGSTOP 构造不出来；
-  要用真机证明它，需要在它归零时留一条 debug 日志（或构造长阻塞段占住打戳任务）。
-  **③ 7 s 陈旧压制同样未被真机观测**：`SIGSTOP` 之后第一条恢复的读数就刷新了 `last_temp_time`，
-  压制窗口只有那几毫秒；且 `M105` 的文本不经 `gcode/script` 的应答回传，CLI 侧抓不到。
-  ②③ 的边界现由单测钉住（`test_a_reading_past_the_mainthread_deadline_sends_no_power`、
-  `test_a_quiet_sensor_quells_to_zero_after_seven_seconds`）。
+  **② 5 s 主线程护栏在真机上「结构上不可达」——由 6 s 停顿实测证明**：`SIGSTOP` 6 s 后固件先报
+  `MCU shutdown: Missed scheduling of next digital out event`（软件 PWM 每 0.1 s 需要一个新边沿，
+  宿主停下就漏排；上游的加热器同样是软件 PWM，`heaters.py:61` 写死 `setup_cycle_time(pwm_cycle_time)`），
+  也就是说对**真实加热器**来说，0.1 s 级的固件看门狗比 5 s 的主线程截止先咬人，护栏只是纵深防御。
+  同一次停顿在修「迟到读数排到过去」之前还会先报 `Rescheduled timer in the past`（见下），修后只剩
+  固件的 missed-scheduling。护栏归零时现已留限速告警（每秒读时一条），但正常与停顿两条路都到不了它。
+  **③ 7 s 陈旧压制同样未被真机观测**：恢复后第一条读数即刷新 `last_temp_time`，窗口只有其前几毫秒；
+  且 `M105` 文本不经 `gcode/script` 应答回传。②③ 的边界由单测钉住
+  （`test_a_reading_past_the_mainthread_deadline_sends_no_power`、
+  `test_a_quiet_sensor_quells_to_zero_after_seven_seconds`、`test_a_stall_is_reported_at_most_once_a_second`）。
   **前置修复（同批）**：真机首次跑时 `[heater_generic]` 一连接就 `Timer too close`（上电 3.28 s），
   首因是 PWM 变更走无时钟即时路径、撞上固件的 `MAX_HEAT_TIME` auto-off；改成上游的
   `set_pwm(read_time + pwm_delay)` 排期后 `state: ready`、`power 1.0`。
+  **第二层（同批后续修）**：排期后又出现 `Rescheduled timer in the past`（上电 10.4 s）——USB CDC
+  把多批报告攒在一起送达时，最后一条读数的 `read_time` 已落后宿主 ~0.3 s，`read_time + pwm_delay`
+  正好落在固件时钟之后；现在延迟从「读数与芯片 print time 之较晚者」起算，修后同场景只剩固件的
+  missed-scheduling（预期行为）。
 
 ## 已完成真机验证（留档）
 

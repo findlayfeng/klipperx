@@ -119,6 +119,10 @@
   也就是说对**真实加热器**来说，0.1 s 级的固件看门狗比 5 s 的主线程截止先咬人，护栏只是纵深防御。
   同一次停顿在修「迟到读数排到过去」之前还会先报 `Rescheduled timer in the past`（见下），修后只剩
   固件的 missed-scheduling。护栏归零时现已留限速告警（每秒读时一条），但正常与停顿两条路都到不了它。
+  （补记：对齐上游后已加 **PWM 更新棘轮**——`min_pwm_change = max_power×5%` +
+  `next_pwm_time = pwm_time + 3.0 − (3×pwm_delay + 0.001)`，PWM 事件从约 3.3 条/秒降到
+  约 0.5 条/秒；重跑 6 s `SIGSTOP` **仍然**以 `Missed scheduling of next digital out event`
+  结束——这在软件 PWM 下是上游设计行为（宿主必须持续服务），不是本仓缺陷。）
   **③ 7 s 陈旧压制同样未被真机观测**：恢复后第一条读数即刷新 `last_temp_time`，窗口只有其前几毫秒；
   且 `M105` 文本不经 `gcode/script` 应答回传。②③ 的边界由单测钉住
   （`test_a_reading_past_the_mainthread_deadline_sends_no_power`、

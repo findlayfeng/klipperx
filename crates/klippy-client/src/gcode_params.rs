@@ -34,8 +34,13 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
             "SAMPLES_TOLERANCE",
             "SAMPLES_TOLERANCE_RETRIES",
             "SAMPLES_RESULT",
+            "PROFILE",
         ],
     ),
+    ("BED_MESH_MAP", &[]),
+    ("BED_MESH_OFFSET", &["X", "Y", "ZFADE"]),
+    ("BED_MESH_OUTPUT", &["PGP"]),
+    ("BED_MESH_PROFILE", &["LOAD", "SAVE", "REMOVE"]),
     (
         "BED_TILT_CALIBRATE",
         &[

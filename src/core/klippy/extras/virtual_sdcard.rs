@@ -76,13 +76,11 @@ const DEFAULT_ERROR_GCODE: &str = "
 ";
 
 /// How long `do_pause` waits for the replay task to exit before it reports the
-/// stall and returns anyway.
-///
-/// Upstream spins on its reactor until the work timer is gone
-/// (`virtual_sdcard.py:123-127`) with no bound at all, so a replay task that
-/// never observes `must_pause_work` wedges every caller — `M25`, `M0`,
-/// `do_cancel` and `reset_file` all wait here. One replay iteration is a g-code
-/// line plus a yield, so ten seconds is a stall, not a slow line.
+/// stall and returns anyway. Upstream spins on its reactor until the work timer
+/// is gone (`virtual_sdcard.py:123-127`) with no bound, so one replay task that
+/// never observes `must_pause_work` wedges `M25`, `M0`, `do_cancel` and
+/// `reset_file`. One replay iteration is a g-code line plus a yield, so ten
+/// seconds is a stall, not a slow line.
 const PAUSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 section!("virtual_sdcard", order = 30, load = load_config);
@@ -1563,29 +1561,24 @@ mod tests {
     }
 
     /// The bounded wait: a replay task that never clears `work_active` cannot
-    /// wedge `do_pause` — the deadline fires, `do_pause` warns and returns,
-    /// and the flag is left as it was (nothing exited to clear it).
+    /// wedge `do_pause` — the deadline fires, `do_pause` warns and returns, and
+    /// the flag is left as it was (nothing exited to clear it).
     #[tokio::test(start_paused = true)]
     async fn do_pause_gives_up_on_a_replay_task_that_never_exits() {
         let (_dir, _printer, object, _gcode) = machine();
         // No replay task is running here, so nothing will ever clear the flag.
         *object.work_active.lock().unwrap() = true;
 
+        // Virtual clock: the timeout catches a missing deadline, not a hang.
         let started = tokio::time::Instant::now();
-        // The virtual clock, so the whole bound costs no real time; the timeout
-        // is the backstop that turns a missing deadline into a failure.
         let result = tokio::time::timeout(PAUSE_DRAIN_TIMEOUT * 3, object.do_pause()).await;
 
         assert!(result.is_ok(), "do_pause returned at its deadline");
         assert!(
             started.elapsed() >= PAUSE_DRAIN_TIMEOUT,
-            "it waited the whole bound: {:?}",
-            started.elapsed()
+            "the bound was waited out"
         );
-        assert!(
-            object.is_active(),
-            "work_active is untouched (no task exited)"
-        );
+        assert!(object.is_active(), "work_active is untouched");
         assert!(*object.must_pause_work.lock().unwrap(), "pause flag is set");
     }
 

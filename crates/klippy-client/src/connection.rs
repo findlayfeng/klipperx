@@ -490,10 +490,14 @@ mod tests {
         connection.request("push_later", Map::new()).await.unwrap();
 
         // The reply comes first, then the push: one read, or two, but the
-        // order is the server's.
+        // order is the server's.  Both reads are bounded, so a push that never
+        // arrives fails the test instead of leaving it waiting forever.
         let mut saw_push = false;
         for _ in 0..2 {
-            match connection.receive().await.unwrap() {
+            let incoming = tokio::time::timeout(Duration::from_secs(5), connection.receive())
+                .await
+                .expect("the reply and the push arrived within 5 s: the read timed out");
+            match incoming.unwrap() {
                 Incoming::Reply(reply) => assert_eq!(reply.method.as_deref(), Some("push_later")),
                 Incoming::Push(message) => {
                     assert_eq!(message["method"], json!("klippy:status"));

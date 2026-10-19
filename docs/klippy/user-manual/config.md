@@ -644,7 +644,7 @@ max_temp: 110
 | 电阻/热敏（内建表） | `PT1000`、`PT100 INA826`，以及 8 个内建热敏：`ATC Semitec 104GT-2`、`ATC Semitec 104NT-4-R025H42G`、`EPCOS 100K B57560G104F`、`Generic 3950`、`SliceEngineering 450`、`TDK NTCG104LH104JT1`、`Honeywell 100K 135-104LAG-J01`、`NTC 100K MGB18-104F39050L32` |
 | SPI 热电偶 / RTD | `MAX6675` `MAX31855` `MAX31856` `MAX31865`（选项含 `tc_averaging_count` / `tc_use_50Hz_filter` / `rtd_nominal_r` / `rtd_num_of_wires` / `rtd_use_50Hz_filter`，以及 SPI 共用的 `spi_bus` / `spi_mcu` / `cs_pin` 等） |
 | 1-wire | `DS18B20`（`serial_no` 必需、`sensor_mcu` 必需、`ds18_report_time` 默认 3.0 s ≥ 1.0 s） |
-| MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`） |
+| MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`；它写的是**芯片名**，即 `[mcu 下游名]` 里的 `下游名`，如 `sensor_mcu: downstream` 对应 printer 对象 `mcu downstream`，与上游 `'%s:ADC_TEMPERATURE' % mcu_name` 同口径） |
 | 组合 | `temperature_combined`（`sensor_list` 必需、`maximum_deviation` ≥ 0、`combination_method` ∈ `min`/`max`/`mean` 必需） |
 | 主机热区 | `temperature_host`（`sensor_path` 可选，默认 `/sys/class/thermal/thermal_zone0/temp`，见下节） |
 | 自定义 | 用 `[thermistor <name>]` / `[adc_temperature <name>]` 定义后按 `<name>` 引用（见下节） |

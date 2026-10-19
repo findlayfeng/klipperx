@@ -111,6 +111,11 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 | D7 | `docs/klippy/third-party-dev/README.md:27-45` | `list_endpoints` 样例 16 条 | 实际必含 `bed_mesh/dump_mesh` |
 | D8 | `docs/klippy/third-party-dev/api-reference.md` §4 | `response_template` 必填 | 可选、缺省 `{}`（`register_remote_method.rs:59-64`） |
 
+**2026-10-19 复核：D1–D8 已全部按源码改写**——D1 改成「回放命令族已注册」并点名
+`virtual_sdcard.rs:449-470`；D2 拆成「`homing_heaters` 已落地 + `homing_override` 的 G28 包装未装」
+两条；D3 的 Q12 与 D4 的 `tmcuart` 条目已从 `TODO.md` **删除**（完成即删）；D5 改成「等待期每秒
+回 `M105`，与上游同形」（`wait_for_temperature` 走同一张 gcode-id 表）；D6/D7/D8 已随实现改写。
+
 ## 8. 建议顺序
 
 1. **P0-1 + P0-4**：不动与连不上，其它都无从谈起（P0-1 有临时绕行，可先上机）。

@@ -33,11 +33,10 @@
 //!
 //! # What differs from upstream
 //!
-//! * **No `M105` line during the wait.** Upstream answers the wait loop with
-//!   the temperature report every second (`heaters.py:359`); the `M105`
-//!   g-code-id table is not wired here yet (`TODO H1`), so there is nothing
-//!   to report and the loop only waits — see
-//!   [`PrinterHeaters::set_temperature`].
+//! * **`M105` while waiting matches upstream.** Upstream answers the wait loop
+//!   with the temperature report every second (`heaters.py:349-359`); so does
+//!   [`PrinterHeaters::wait_for_temperature`], through the same g-code-id table
+//!   upstream's `_get_temp` reads (`heaters.py:331-340`).
 //! * **`write_file` sample times carry no `pwm_delay`.** Upstream dates a PWM
 //!   change at `read_time + pwm_delay` (`pid_calibrate.py:74`); this host
 //!   applies the output immediately (`Heater::temperature_callback`), so the

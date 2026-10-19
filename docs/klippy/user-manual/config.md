@@ -984,7 +984,7 @@ pins: PA1, my_alias
 
 | 节 | 选项 | 说明 |
 |---|------|------|
-| `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 文件回放命令族（M20-M27、`SDCARD_RESET_FILE` 等）未注册（H4） |
+| `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 回放命令族已注册（`extras/virtual_sdcard.rs:449-470`）：`M20`–`M27`、`M28`–`M30`（上游同款 `SD write not supported`，`virtual_sdcard.py:41,143`）、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE` |
 | `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7）；进度/消息由这两条命令驱动（无 `[display]` 时也按需创建） |
 | `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | G28 包装未装——脚本体是宏模板、暂不渲染（H9 共担） |
 | `sdcard_loop` | 无 | `SDCARD_LOOP_BEGIN/_END/_DESIST` 未注册；栈/索引语义已单测钉住 |

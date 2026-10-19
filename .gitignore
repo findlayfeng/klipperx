@@ -18,7 +18,7 @@
 # contents of Mainsail's dist/ are put here for a release build, not committed.
 /assets/mainsail/
 
-# Scratch area for logs and run artifacts moved out of /tmp (never committed).
+# Local scratch: logs and run artifacts (never committed).
 /.staging/
 
 src/core/klippy/upstream_generated/cases/

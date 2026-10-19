@@ -145,17 +145,47 @@ condvar 上，只有 `Device::shutdown()`（由 `Mcu::close()` 调）能放它�
 
 | 位置 | 时长 | 来源 |
 |---|---|---|
-| `klippy.rs:192` 的 `RESTART_DELAY` | 1s / 每次重启 | 上游同款（`klippy.py:364`）；三条 restart 测试已改用 `start_paused` 跳过（<0.01s） |
-| `mcu/mod.rs:85` 的 `SYNC_SEND_WAIT` | 1s | 同步 `Mcu::send` 等队列空位的**预算上界**（`mod.rs:597` 的 deadline + `:604` 的 50µs→10ms 退避）；两条全队列测试的 1s 就在这 |
-| `mcu/object.rs:87` 的 `RESET_SETTLE` | 500ms | 复位后重新打开端口前的 settle（`object.rs:956`）；上游对应步骤是 0.100s（`serialhdl.py:357/375-388`），本仓取 5×，待评 |
-| `mcu/object.rs:56` 的 `RECONNECT_DELAY` | 250ms | 重连前等待（`object.rs:543`） |
-| 发送任务的 1ms 合批定时器 | ~1ms × 多次 | `mcu/mod.rs:1866` |
+| `klippy.rs:65` 的 `RESTART_DELAY` | 1s / 每次重启 | 上游同款（`klippy.py:364`）；每次重启睡在 `klippy.rs:220`，三条 restart 测试已改用 `start_paused` 跳过（<0.01s） |
+| `mcu/mod.rs:93` 的 `SYNC_SEND_WAIT` | 1s | 同步 `Mcu::send` 等队列空位的**预算上界**（`mod.rs:613` 的 deadline + `:627` 的 50µs→10ms 退避，睡眠走 `sleep_off_worker`）；两条全队列测试的 1s 就在这 |
+| `mcu/mod.rs:100` 的 `PAYLOAD_ROOM_WAIT` | 1s | 异步生产者（`send_payload` / `send_move_payload`）等队列空位的上界，统一在 `mod.rs:642` 的 `queue_awaiting_room`（2026-10-19）：到点报 `send queue has no free slot within …`，不再是无出口自旋 |
+| `mcu/object.rs:92` 的 `RESET_SETTLE` | 500ms | 复位后重新打开端口前的 settle（`object.rs:1445`）；上游对应步骤是 0.100s（`serialhdl.py:357/375-388`），本仓取 5×，待评 |
+| `mcu/object.rs:61` 的 `RECONNECT_DELAY` | 250ms | 重连前等待（`object.rs:543`） |
+| `extras/virtual_sdcard.rs:84` 的 `PAUSE_DRAIN_TIMEOUT` | 10s | `do_pause`（`:314`）等回放任务退出的上界（2026-10-19）；上游是**无界**的 `while work_timer is not None: reactor.pause(.001)`（`virtual_sdcard.py:123-127`），本仓超时 `warn!` 后返回，签名仍是 `()` |
+| `extras/temperature_probe.rs:94` 的 `DRIFT_SWEEP_WAIT` | 10s | drift sweep 等 `move_times` 排空的上界（`:2065` 的 `wait_for_sweep_drain`，2026-10-19）；上游同款无界（`temperature_probe.py:605`），本仓超时后交给既有的 `incomplete sensor data` 拒绝 |
+| 发送任务的 1ms 合批定时器 | ~1ms × 多次 | `mcu/mod.rs:1908` |
 
 （另有两条 `toolhead.rs` 的归零用例曾各花 13.4s：那是 drip 循环按**真实时钟**推进 ~1200 轮（`DRIP_LOOKAHEAD=0.010`）。它们已改 `#[tokio::test(start_paused = true)]`（`klippy.rs` 的 restart 三条同款）→ **0.01s**，同一份代码路径与同样轮数，未缩规模、未动产品常量。）
 
 实测手段（`waits-mcu` 单元用过、可照做）：`strace -f -tt -e trace=clock_nanosleep,epoll_wait <单测>`
 能把一段 wall time 逐笔拆到「哪个常量、睡了几次」；`SYNC_SEND_WAIT` 那两例就是 200 次 ≥1ms 的
 `clock_nanosleep`，恰在 1.00s deadline 上结束。
+
+### 同步路径要暂停时：`sleep_off_worker`
+
+有些暂停点在**契约上就是同步的**（上游在那里 pause greenlet，本仓对应的是普通 `Fn` 回调或阻塞
+helper），改成 `.await` 会把整条调用链染成 async。这类点一律走
+`crate::core::klippy::sleep_off_worker(delay)`（`src/core/klippy/mod.rs:89`）：
+
+- **多线程 runtime**（`Handle::try_current()` 为 `Ok` 且 `runtime_flavor() == MultiThread`）⇒
+  `tokio::task::block_in_place(|| std::thread::sleep(delay))`，把 worker core 交出去，reactor 照常分发；
+- **current-thread runtime 或根本不在 runtime 里** ⇒ 直接 `std::thread::sleep`。这条分支是**必须**的：
+  `block_in_place` 在 current-thread runtime 上会 panic。
+
+现有四处：桥端口 CAN 指派后的 `CAN_ASSIGN_SETTLE`（`mcu/bridge_attach.rs:477`）、`try_send_bounded` 的
+退避（`mcu/mod.rs:627`）、TMC UART 读错误重试的 `UART_RETRY_DELAY`（`extras/tmc.rs:1347`）与命令间隙
+`COMMAND_GAP`（`extras/tmc_uart.rs:568`）。**新写同步暂停点时不要直接 `std::thread::sleep`**。
+
+### 测试等后台状态：`wait_until`，不要「固定 sleep + 正向断言」
+
+`src/core/klippy/test_util.rs` 的 `wait_until(deadline, interval, pred, what)` 是有界轮询：条件成立就
+返回，到点按 `what` panic。全量闸门满载时调度会漏窗，`sleep(20ms)` 之后紧跟正向断言会假失败——
+`thermocouple` 那条（1 s 有界轮询）是首个例子，`mcu/mod.rs` 的门控/重传系列、`object.rs`、`endstop.rs`、
+`resource/trsync.rs`、`load_cell_probe.rs`、`cmd/debug.rs`、`interface/devices/serial.rs`、
+`flash/bridge_flash.rs`、`klippy-client` 的 `session.rs` 随后跟进（2026-10-19，共 24 处）。
+
+**否定式断言不要改**（窗口拉长只会更成立）；**`mcu/bridge_attach.rs` 的 3 处 `sleep(20ms)` 也不要改**：
+那是两次 `get_clock` 之间「让 50 MHz 计数器走一点」的间隔，没有后台状态可轮询，且上界
+`advanced < 251_000_000` 是 `(5 s + 20 ms) × 50 MHz`——余量 250 倍，只有 sleep 被拉长 >5 s 才会破。
 
 ## 真机测试
 
@@ -619,7 +649,7 @@ git config core.hooksPath .githooks
 | `pwm_tool.rs` | 选项矩阵与默认、prefix 命名错误、`cycle_time` 值域、`maximum_mcu_duration` minval 0.5、配对约束 build 期拒绝（15 测；2026-10-03 +4 队列化：前瞻钉时→flush 落 clocked、后请求覆盖、两条兕底、同构对接） |
 | `temperature_fan.rs` | 6 实例选项矩阵、`max_temp<40` 取目标、pid 选项与上下界、bang-bang 驱动、`SET_TEMPERATURE_FAN_TARGET` 命令与三段错误文案、未知 sensor/非法 control、缺 pin 前缀名（11 测） |
 | `temperature_host.rs` | `sensor_path` 默认/显式解析、开文件错误逐字 `Unable to open temperature file '<path>'`、对象名取末词、临时文件假读数驱动 poll（首采 42.5 → 改写文件 + `advance(1.0)` 恰一次触发 → 43.1 与 `get_status` 形状、回调序列）、读失败置 0 并退役定时器、min/max 越界 shutdown 文案双侧、裸节全链路装载（工厂注册 + 对象 + 不可 query + 消费者 `get_status` 形状）、裸节拒收选项（8 测） |
-| `temperature_probe.rs`（40 测，`f6ea201` + `dfaf418` + `704ee0d` + `0960f44`） | A：`Polynomial2d` 求值/拟合恢复系数/无点无解/上游格式化；选项默认值与 9 条边界措辞、`calibration_position` 的 count 措辞、check_unused 全选项记账；读数平滑同上游、`get_status` 六键形状、`stats` 行、装载按节名注册对象。B（+14）：命令注册/help/`homed` 门（走真实 mux 分发）、无 probe、链接不符、手动探针冲突、TARGET/STEP/样本数文案、临时命令被占、启动+手动探针会话、升温 kick 下一轮、COMPLETE 短样 abort / ≥3 静默完成、ABORT 收尾、初始移动失败回滚、热膨胀累计与清零、加热脚本逐字、ENABLE no-op（C 起接真）。C（+13）：四选项默认与三类拒绝文案、`_check_calibration` 交叉消息、adjust/unadjust 三分支+两闸门+往返+传感器温度、`finish` 无 run / 九段 fit+configfile 写回+交叉拒绝、ENABLE 真开关三态、collect_sample 无/有 helper 分支、状态机 start/finish 接线、SweepState 窗口记账与聚合、接线闸门三态。回环（+1，`0960f44`）：`finish_calibrations_curves_survive_a_save_config_round_trip`。**注**：测试机 `kinematics: none` 恒 unhomed → `_check_homed` 成功分支与门后 `cmd_calibrate` 端到端归真机 |
+| `temperature_probe.rs`（43 测，2026-10-19 实测重核；`f6ea201` + `dfaf418` + `704ee0d` + `0960f44`） | A：`Polynomial2d` 求值/拟合恢复系数/无点无解/上游格式化；选项默认值与 9 条边界措辞、`calibration_position` 的 count 措辞、check_unused 全选项记账；读数平滑同上游、`get_status` 六键形状、`stats` 行、装载按节名注册对象。B（+14）：命令注册/help/`homed` 门（走真实 mux 分发）、无 probe、链接不符、手动探针冲突、TARGET/STEP/样本数文案、临时命令被占、启动+手动探针会话、升温 kick 下一轮、COMPLETE 短样 abort / ≥3 静默完成、ABORT 收尾、初始移动失败回滚、热膨胀累计与清零、加热脚本逐字、ENABLE no-op（C 起接真）。C（+13）：四选项默认与三类拒绝文案、`_check_calibration` 交叉消息、adjust/unadjust 三分支+两闸门+往返+传感器温度、`finish` 无 run / 九段 fit+configfile 写回+交叉拒绝、ENABLE 真开关三态、collect_sample 无/有 helper 分支、状态机 start/finish 接线、SweepState 窗口记账与聚合、接线闸门三态。回环（+1，`0960f44`）：`finish_calibrations_curves_survive_a_save_config_round_trip`。**注**：测试机 `kinematics: none` 恒 unhomed → `_check_homed` 成功分支与门后 `cmd_calibrate` 端到端归真机 |
 | `probe_eddy_current.rs`（10 测，`4caf425`） | 无注册时原表行为不变、`apply_calibration` 过 adjust、`height_to_freq` 过 unadjust、覆盖式注册、越界哨兵不被挪动（`704ee0d` 首现 5 测）；`median` 奇/偶长度、`validate_calibration_data` 干净单调保持 / 频率反转处停 / 噪声处停（2026-10-03 +5 测） |
 | `controller_fan.rs` | 默认值、全选项+覆盖+跟踪器矩阵、缺 pin 前缀名、未知 stepper/heater 上游文案（connect 解析）、运行→怠速→停 tick 状态机（6 测） |
 | `gcode_macro.rs` | 真语料八实例全选项入 access、八个大写命令+帮助、变量 status、畸形节上游文案、`rename_existing` 类型检查 + **连接期换名**（alias 执行宏体、旧命令在 `rename_existing` 名下可调、缺命令上游文案、目标重名报错、`SET_GCODE_VARIABLE` 两种情形都注册、真实 loader+`bring_up` e2e）、裸节认领、宏体渲染→派发 e2e、递归防护、`SET_GCODE_VARIABLE`、未知语句装载报错（14 测；未知语句的 fixture 用 `{% foo %}`——`{% block %}` 现由引擎解析，与 Jinja2 一致）；**宏把参数名带进 `status.gcode.commands`**：扫模板体里的 `params.NAME` / `params['NAME']` / `params["NAME"]`（去重、首次出现序），扫不到则退回 `variable_*` 名，两者都无则不带 `parameters` 键（4 条测试）；**装载期静态命令存在性检查**：`strip_template_tags` 把 `{% %}`/`{# #}`/`{ }` 标签内容置空（保留换行与字面文本，字符串/花括号深度不误闭，且逐字节等长以便与原始行按偏移比对），`static_command_names` 抽出每行字面首词（去重首次序），`klippy:ready` 时逐个查 `GCodeDispatch::command_exists`，未注册者 `respond_info` 告警（不拒绝），动态算出的命令（`{{ cmd }}`）不抽取故不告警，与变量标签黏连的首词（`G9{ 0 if ABSOLUTE else 1 }` 渲染出 `G90`/`G91`，名字不由源码定）不采集故不误报 `G9`/`M8`（6 测） |
@@ -627,7 +657,7 @@ git config core.hooksPath .githooks
 | `led.rs` | 六段选项矩阵与上游文案（`No LED pin definitions found`/`color_order does not match chain_count`/`neopixel chain too long`/同 mcu 约束）、`LEDHelper` 颜色记账与初始值边界、`lookup_display_templates` 惰性单例（`is_queryable=false`）等（21 测） |
 | `extruder_stepper.rs` | 段全选项与步距 28.2/(200·16)、默认 PA `0.`/`0.040` 与越界文案、绑定校验逐字 `'bogus' is not a valid extruder.`、按名挂值与主挤出机槽位隔离、命令值域（7 测） |
 | `exclude_object.rs` | 零选项段+reset、get_status 三键、START/END 跟踪（大写化/隐式 define）、EXCLUDE 按名/当前/RESET+排序、`There is no current object to cancel`、DEFINE CENTER/POLYGON JSON 与 RESET、排除区丢弃/区外转发、四命令 help（9 测） |
-| `virtual_sdcard.rs` | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态（32 测，2026-10-03 实测重核）；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy`；**`do_pause` 同步等待**（2026-10-03 +2 测）：回放中 `do_pause` 等 task 退出后 `work_active==false`、`cmd_from_sd=true` 时不等待避自死锁 |
+| `virtual_sdcard.rs`（33 测，2026-10-19 实测重核） | 选项矩阵与默认 `on_error_gcode`、显式值、缺 `path` 文案；`get_file_list`（顶层 + 递归 + 缺目录）；`M20`/`M21`/`M23`（打开/不存在/大小写不敏感/去前导 `/`）、`M26`、`M27`、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`（子目录）、`M28`–`M30`（`cmd_error`）、`do_cancel`、`get_status` 两态；回放循环：EOF 完成 + `progress`=1.0 + `Done printing file`、`is_active` 随 task、`M25` 暂停 + `note_pause`、错误触发 `note_error` + `on_error_gcode` 渲染运行、`do_resume` 活动时拒 `SD busy`；**`do_pause` 同步等待**（2026-10-03 +2 测）：回放中 `do_pause` 等 task 退出后 `work_active==false`、`cmd_from_sd=true` 时不等待避自死锁；**放弃等待的上界**（2026-10-19 +1 测）：回放任务永不退出时 `PAUSE_DRAIN_TIMEOUT`(10s) 到点 `warn!` 返回而不是挂住（`do_pause_gives_up_on_a_replay_task_that_never_exits`，`start_paused` 虚拟时钟） |
 | `print_stats.rs` | reset 初值、`set_current_file`、`note_start`→`note_pause`→`note_complete` 流转与 duration、`note_error`/`note_cancel`/`note_pause` 不覆盖 error、`SET_PRINT_STATS_INFO` layer 逻辑（0 清空/切换 total 重置/截断/无参保持）、`get_status` standby/printing/paused 三态、命令注册、`ensure` 单例、filament 随 E 累积（19 测） |
 | `display_status.rs` | 裸段+`check_unused`+状态形状（1 测） |
 | `homing_override.rs` | 语料选项矩阵、默认 `XYZ`/无强制位、parse 与 `must be specified` 文案、G28 语句轴掩码=上游 `cmd_G28:33-46`（4 测） |

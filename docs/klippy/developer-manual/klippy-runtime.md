@@ -94,6 +94,19 @@ reactor.run()
 > 两条 runtime，机器侧的串行 dispatcher 保留了「回调互不重叠」的确定性。见
 > [时钟与定时器](reactor.md)与[运行时编排](runtime.md)。
 
+**暂停点的两种写法**（2026-10-19）：能 await 的地方用 `tokio::time::sleep(..).await`（让出的是任务，
+不是线程）；**契约上同步**的点（上游在那里 pause greenlet、本仓对应的是普通 `Fn` 回调或阻塞 helper）
+一律走 `sleep_off_worker`（`src/core/klippy/mod.rs:89`）：多线程 runtime 上它走 `block_in_place` 把 worker
+core 交出去，current-thread runtime 或不在 runtime 里则退化成 `std::thread::sleep`（`block_in_place` 在
+current-thread 上会 **panic**，所以必须先判 `runtime_flavor()`）。**不要**在回调里直接
+`std::thread::sleep`——那会把分发线程钉住。
+
+**没有等待可以无出口**：等 MCU 发送队列空位、等 SD 回放任务退出、等 drift sweep 排空各有上界
+（`SYNC_SEND_WAIT` / `PAYLOAD_ROOM_WAIT` / `PAUSE_DRAIN_TIMEOUT` / `DRIFT_SWEEP_WAIT`，全表与理由见
+[测试 → 已知的「有界等待」基线](testing.md)）。上游那两条（`virtual_sdcard.do_pause` 的
+`while work_timer is not None`、`temperature_probe` 的 `while move_times`）是**无界自旋**，本仓加界属
+有意偏移，见[上游偏移 §2](upstream-deviations.md)。
+
 ## 启动时序
 
 ```

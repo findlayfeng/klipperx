@@ -7,3 +7,4 @@ pub mod logging;
 pub mod scan;
 pub mod stress;
 pub mod ui;
+pub mod version;

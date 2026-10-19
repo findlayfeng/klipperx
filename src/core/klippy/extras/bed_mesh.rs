@@ -26,33 +26,44 @@
 //!   and as the constant `fade_target` once it has phased out — and
 //!   [`BedMesh::position`] removes the same adjustment on the way back.
 //!
+//! The profile family is what a slicer's `PRINT_START` drives:
+//!
+//! - `BED_MESH_CALIBRATE PROFILE=` stores the grid under a name (default
+//!   `default`) and saves it — [`cmd_bed_mesh_profile`]'s `SAVE` path, so a
+//!   `SAVE_CONFIG` writes it into a `[bed_mesh <name>]` block that the next
+//!   start reads back ([`read_profiles`]);
+//! - `BED_MESH_PROFILE LOAD=`/`SAVE=`/`REMOVE=` (`cmd_BED_MESH_PROFILE`,
+//!   `bed_mesh.py:1741-1758`) — a `LOAD` of an unknown name is an error, never a
+//!   silent pass-through;
+//! - `BED_MESH_OUTPUT` (`PGP=` prints the generated points instead of the
+//!   mesh), `BED_MESH_MAP` (the grid as one `mesh_map_output` JSON line) and
+//!   `BED_MESH_OFFSET` (`X=`/`Y=` move the mesh lookup, `ZFADE=` the Z the fade
+//!   measures from).
+//!
 //! **Not implemented yet** (tracked in `TODO.md` H9, next units):
 //!
-//! - the mesh offsets (`BED_MESH_OFFSET`) and the zero reference
-//!   (`ZERO_REFERENCE`) — both are profile-command state, so `calc_z` looks up
-//!   the coordinate as given (`mesh_offsets` stays `[0., 0.]`) and nothing calls
+//! - the zero reference (`ZERO_REFERENCE`): nothing calls
 //!   `set_zero_reference`;
 //! - faulty-region substitution (`_process_faulty_regions`): the regions are
-//!   parsed and probed like any other point;
-//! - the profile commands (`BED_MESH_PROFILE`, `BED_MESH_OUTPUT`, `BED_MESH_MAP`,
-//!   `BED_MESH_OFFSET`): a calibration answers as the default profile and
-//!   nothing is saved across a restart, so `profiles` stays empty.
+//!   parsed and probed like any other point.
 //!
 //! The load side is complete: every option below is claimed, which is what the
 //! corpus needs, and the gaps above are capability gaps, not silent shortcuts —
 //! they are listed in the manual and the task list.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use tracing::info;
 
-use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
+use crate::core::klippy::config::{py_float_str, ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::gcode_move::{self, GCodeMove, MoveTarget, GCODE_MOVE_OBJECT};
 use crate::core::klippy::extras::probe::{lookup_probe_session, PROBE_PARAMS};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
-use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GCODE_OBJECT};
+use crate::core::klippy::gcode::{CommandError, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{Coord, AXES, X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -75,10 +86,17 @@ const FADE_DISABLE: f64 = 0x7FFFFFFF as f64;
 /// `bed_mesh/dump_mesh` looks the stored grid up by.
 pub const BED_MESH_OBJECT: &str = "bed_mesh";
 
-/// The profile a calibration is stored under: upstream's default for
-/// `BED_MESH_CALIBRATE PROFILE=` (`bed_mesh.py:645`), which this unit does not
-/// read yet.
+/// The profile a calibration is stored under when `PROFILE=` is not given —
+/// upstream's default for `BED_MESH_CALIBRATE PROFILE=` (`bed_mesh.py:645`).
+/// `BED_MESH_PROFILE SAVE=default` is refused: the name belongs to the last
+/// calibration (`bed_mesh.py:1751-1753`).
 const DEFAULT_PROFILE: &str = "default";
+
+/// The format version a `[bed_mesh <name>]` section must carry to be read —
+/// upstream's `PROFILE_VERSION` (`bed_mesh.py:6`). A section written by a
+/// different version is logged and skipped, as upstream does at load
+/// (`bed_mesh.py:1661-1666`).
+const PROFILE_VERSION: i64 = 1;
 
 /// One `faulty_region_<N>` rectangle: `(min_x, min_y, max_x, max_y)`.
 type FaultyRegion = (f64, f64, f64, f64);
@@ -509,6 +527,16 @@ impl MeshAlgo {
             _ => None,
         }
     }
+
+    /// The name a saved profile writes back (`mesh_params['algo']`), and the
+    /// one `BED_MESH_OUTPUT` prints.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Lagrange => "lagrange",
+            Self::Bicubic => "bicubic",
+            Self::Direct => "direct",
+        }
+    }
 }
 
 /// The parameters one mesh is sampled from — upstream's `mesh_params`
@@ -578,6 +606,70 @@ impl MeshParams {
                 .expect("`BedMeshOptions::read` stores a verified algorithm name"),
             tension: options.bicubic_tension,
         }
+    }
+
+    /// A profile's parameters, read back from its `[bed_mesh <name>]` section —
+    /// upstream's `PROFILE_OPTIONS` loop (`bed_mesh.py:1672-1681`).
+    ///
+    /// # Errors
+    /// A missing or unparseable option, as upstream's `getfloat`/`getint`/`get`
+    /// without a default raises it; an unknown `algo` is refused with
+    /// `_verify_algorithm`'s wording (`bed_mesh.py:421-423`) rather than being
+    /// left for the sampler.
+    fn from_profile(section: &ConfigWrapper) -> Result<Self, ConfigError> {
+        let algorithm = section.get("algo", None)?;
+        let algo = MeshAlgo::from_name(&algorithm).ok_or_else(|| {
+            ConfigError::new(format!("bed_mesh: Unknown algorithm <{algorithm}>"))
+        })?;
+        Ok(Self {
+            min_x: section.get_float("min_x", None)?,
+            max_x: section.get_float("max_x", None)?,
+            min_y: section.get_float("min_y", None)?,
+            max_y: section.get_float("max_y", None)?,
+            x_count: section.get_int("x_count", None)? as usize,
+            y_count: section.get_int("y_count", None)? as usize,
+            mesh_x_pps: section.get_int("mesh_x_pps", None)? as usize,
+            mesh_y_pps: section.get_int("mesh_y_pps", None)? as usize,
+            algo,
+            tension: section.get_float("tension", None)?,
+        })
+    }
+
+    /// The options a `BED_MESH_PROFILE SAVE` writes under `[bed_mesh <name>]`:
+    /// upstream's `PROFILE_OPTIONS` (`bed_mesh.py:7-13`), each value spelled the
+    /// way Python's `str()` spells it (`configfile.set` writes the value as it
+    /// stands, `configfile.py:311-324`).
+    fn config_values(&self) -> [(&'static str, String); 10] {
+        [
+            ("min_x", py_float_str(self.min_x)),
+            ("max_x", py_float_str(self.max_x)),
+            ("min_y", py_float_str(self.min_y)),
+            ("max_y", py_float_str(self.max_y)),
+            ("x_count", self.x_count.to_string()),
+            ("y_count", self.y_count.to_string()),
+            ("mesh_x_pps", self.mesh_x_pps.to_string()),
+            ("mesh_y_pps", self.mesh_y_pps.to_string()),
+            ("algo", self.algo.name().to_string()),
+            ("tension", py_float_str(self.tension)),
+        ]
+    }
+
+    /// The same parameters as the status report's `mesh_params`: the numbers,
+    /// not their text (`update_status` hands out `z_mesh.get_mesh_params()`,
+    /// `bed_mesh.py:231-249`).
+    fn status_json(&self) -> Value {
+        json!({
+            "min_x": self.min_x,
+            "max_x": self.max_x,
+            "min_y": self.min_y,
+            "max_y": self.max_y,
+            "x_count": self.x_count,
+            "y_count": self.y_count,
+            "mesh_x_pps": self.mesh_x_pps,
+            "mesh_y_pps": self.mesh_y_pps,
+            "algo": self.algo.name(),
+            "tension": self.tension,
+        })
     }
 }
 
@@ -669,6 +761,9 @@ pub struct ZMesh {
     mesh_matrix: Vec<Vec<f64>>,
     /// The grid the values sit on.
     geometry: MeshGeometry,
+    /// How far the lookup is moved, per axis — upstream's `mesh_offsets`
+    /// (`bed_mesh.py:1325`), which `BED_MESH_OFFSET X=`/`Y=` set.
+    mesh_offsets: [f64; 2],
 }
 
 impl ZMesh {
@@ -707,7 +802,32 @@ impl ZMesh {
         Self {
             mesh_matrix,
             geometry,
+            // A fresh mesh looks its own coordinates up unmoved
+            // (`ZMesh.__init__`, `bed_mesh.py:1325`).
+            mesh_offsets: [0.0, 0.0],
         }
+    }
+
+    /// How far the lookup is currently moved, per axis (`mesh_offsets`).
+    pub fn mesh_offsets(&self) -> [f64; 2] {
+        self.mesh_offsets
+    }
+
+    /// Move the lookup, per axis — upstream's `set_mesh_offsets`
+    /// (`bed_mesh.py:1417-1420`): an axis left out keeps its offset.
+    pub fn set_mesh_offsets(&mut self, offsets: [Option<f64>; 2]) {
+        for (axis, offset) in offsets.into_iter().enumerate() {
+            if let Some(offset) = offset {
+                self.mesh_offsets[axis] = offset;
+            }
+        }
+    }
+
+    /// The mesh's dimensions, `[columns, rows]` (`mesh_x_count` /
+    /// `mesh_y_count`, `bed_mesh.py:1350-1354`), which `BED_MESH_OUTPUT`
+    /// reports.
+    pub fn mesh_counts(&self) -> [usize; 2] {
+        [self.geometry.mesh_x_count, self.geometry.mesh_y_count]
     }
 
     /// The sampled grid: `mesh_y_count` rows of `mesh_x_count` values.
@@ -760,12 +880,12 @@ impl ZMesh {
     /// around it — `calc_z` (`bed_mesh.py:1428-1439`).
     ///
     /// A coordinate outside the mesh clamps to its nearest edge, which is what
-    /// `_get_linear_index`'s `constrain` does. Upstream adds `mesh_offsets` to
-    /// the coordinate first; nothing sets those yet (`BED_MESH_OFFSET`), so the
-    /// lookup uses the coordinate as given.
+    /// `_get_linear_index`'s `constrain` does. The lookup adds `mesh_offsets`
+    /// to the coordinate first, so `BED_MESH_OFFSET` can aim the mesh where the
+    /// nozzle actually is.
     pub fn calc_z(&self, x: f64, y: f64) -> f64 {
-        let (t_x, x_idx) = self.linear_index(x, MeshAxis::X);
-        let (t_y, y_idx) = self.linear_index(y, MeshAxis::Y);
+        let (t_x, x_idx) = self.linear_index(x + self.mesh_offsets[0], MeshAxis::X);
+        let (t_y, y_idx) = self.linear_index(y + self.mesh_offsets[1], MeshAxis::Y);
         let table = &self.mesh_matrix;
         let z0 = lerp(t_x, table[y_idx][x_idx], table[y_idx][x_idx + 1]);
         let z1 = lerp(t_x, table[y_idx + 1][x_idx], table[y_idx + 1][x_idx + 1]);
@@ -1058,8 +1178,180 @@ pub struct LoadedMesh {
     /// The probed Z values, one row per Y line, each row X-ascending
     /// (`z_mesh.get_probed_matrix()`).
     pub rows: Vec<Vec<f64>>,
+    /// The parameters `rows` were sampled with (`z_mesh.get_mesh_params()`),
+    /// which a profile save writes back and `BED_MESH_MAP` reports the bounds
+    /// of.
+    pub params: MeshParams,
     /// The interpolation grid sampled from `rows` (`z_mesh`).
     pub z_mesh: ZMesh,
+}
+
+impl LoadedMesh {
+    /// The probed grid rounded to 6 decimals — upstream's `get_probed_matrix`
+    /// (`bed_mesh.py:1365-1369`), which `BED_MESH_MAP` serializes.
+    fn get_probed_matrix(&self) -> Vec<Vec<f64>> {
+        self.rows
+            .iter()
+            .map(|row| row.iter().map(|z| round_six(*z)).collect())
+            .collect()
+    }
+
+    /// `ZMesh.print_probed_matrix` (`bed_mesh.py:1373-1381`) as the text it
+    /// hands `respond_info`.
+    fn print_probed_matrix(&self) -> String {
+        let mut msg = String::from("Mesh Leveling Probed Z positions:\n");
+        for row in &self.rows {
+            for z in row {
+                msg.push_str(&format!(" {z:.6}"));
+            }
+            msg.push('\n');
+        }
+        msg
+    }
+
+    /// `ZMesh.print_mesh` (`bed_mesh.py:1382-1402`) as the text it hands
+    /// `respond_raw`: the mesh's dimensions, the height moves search at, the
+    /// offsets, the Z average and range, the algorithm, and the interpolation
+    /// grid top row first.
+    fn print_mesh(&self, search_height: Option<f64>) -> String {
+        let [x_count, y_count] = self.z_mesh.mesh_counts();
+        let [offset_x, offset_y] = self.z_mesh.mesh_offsets();
+        let (min_z, max_z) = self.z_mesh.z_range();
+        let mut msg = format!("Mesh X,Y: {x_count},{y_count}\n");
+        if let Some(height) = search_height {
+            // `"%d" % move_z` on a float truncates toward zero.
+            msg.push_str(&format!("Search Height: {}\n", height.trunc() as i64));
+        }
+        msg.push_str(&format!("Mesh Offsets: X={offset_x:.4}, Y={offset_y:.4}\n"));
+        msg.push_str(&format!("Mesh Average: {:.2}\n", self.z_mesh.z_average()));
+        msg.push_str(&format!("Mesh Range: min={min_z:.4} max={max_z:.4}\n"));
+        msg.push_str(&format!(
+            "Interpolation Algorithm: {}\n",
+            self.params.algo.name()
+        ));
+        msg.push_str("Measured points:\n");
+        for row in self.z_mesh.get_mesh_matrix().iter().rev() {
+            for z in row {
+                msg.push_str(&format!("  {z:.6}"));
+            }
+            msg.push('\n');
+        }
+        msg
+    }
+}
+
+/// One saved profile: the grid a calibration probed and the parameters it was
+/// sampled with — upstream's `ProfileManager.profiles[name]`
+/// (`bed_mesh.py:1672-1681`).
+#[derive(Debug, Clone, PartialEq)]
+struct MeshProfile {
+    /// The probed grid, one row per Y line.
+    rows: Vec<Vec<f64>>,
+    /// The parameters the grid is sampled with.
+    params: MeshParams,
+}
+
+/// The profiles the config carries — `ProfileManager.__init__`'s read of the
+/// `[bed_mesh <name>]` sections (`bed_mesh.py:1653-1666`), in config order.
+///
+/// A section whose `version` is not [`PROFILE_VERSION`] is logged and skipped,
+/// and so is one whose stored grid does not fill its own parameters: neither
+/// can be loaded, and [`load_profile`] then answers `Unknown profile`.
+///
+/// # Errors
+/// A profile section whose options cannot be read or parsed.
+fn read_profiles(config: &ConfigWrapper) -> Result<Vec<(String, MeshProfile)>, ConfigError> {
+    let mut profiles = Vec::new();
+    for section in config.sibling_prefix_sections(BED_MESH_OBJECT) {
+        let name = section
+            .identifier()
+            .split_once(' ')
+            .map(|(_, name)| name.to_string())
+            .unwrap_or_default();
+        let version = section.get_int("version", Some(0))?;
+        if version != PROFILE_VERSION {
+            info!(
+                "bed_mesh: Profile [{name}] not compatible with this version of bed_mesh.  \
+                 Profile Version: {version} Current Version: {PROFILE_VERSION} "
+            );
+            continue;
+        }
+        let rows = read_points(&section)?;
+        let params = MeshParams::from_profile(&section)?;
+        if params.x_count < 3
+            || params.y_count < 3
+            || rows.len() != params.y_count
+            || rows.iter().any(|row| row.len() != params.x_count)
+        {
+            info!(
+                "bed_mesh: Profile [{name}] does not hold a {}x{} grid, ignoring it",
+                params.x_count, params.y_count
+            );
+            continue;
+        }
+        profiles.push((name, MeshProfile { rows, params }));
+    }
+    Ok(profiles)
+}
+
+/// A profile's `points` — upstream's `getlists('points', seps=(',', '\n'),
+/// parser=float)` (`bed_mesh.py:1669-1670`): one line per row, `,` between the
+/// values, blank lines and empty items dropped.
+///
+/// # Errors
+/// A missing `points` option (`must be specified`) or a value that is not a
+/// number.
+fn read_points(section: &ConfigWrapper) -> Result<Vec<Vec<f64>>, ConfigError> {
+    let text = section.get("points", None)?;
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = Vec::new();
+        for item in line.split(',') {
+            let item = item.trim();
+            if item.is_empty() {
+                continue;
+            }
+            let value = item.parse::<f64>().map_err(|_| {
+                ConfigError::new(format!(
+                    "Option 'points' in section '{}' must be a list of floats",
+                    section.identifier()
+                ))
+            })?;
+            row.push(value);
+        }
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// The `points` value a profile save writes: one indented line per row, every
+/// Z at 6 decimals — `save_profile` (`bed_mesh.py:1689-1695`).
+fn points_value(rows: &[Vec<f64>]) -> String {
+    let mut value = String::new();
+    for row in rows {
+        value.push_str("\n  ");
+        let z_values: Vec<String> = row.iter().map(|z| format!("{z:.6}")).collect();
+        value.push_str(&z_values.join(", "));
+    }
+    value
+}
+
+/// The status report's `profiles` — `update_status` hands out the profile
+/// manager's dict (`bed_mesh.py:236-243`).
+fn profiles_json(profiles: &BTreeMap<String, MeshProfile>) -> Value {
+    let mut out = Map::new();
+    for (name, profile) in profiles {
+        out.insert(
+            name.clone(),
+            json!({
+                "points": profile.rows,
+                "mesh_params": profile.params.status_json(),
+            }),
+        );
+    }
+    Value::Object(out)
 }
 
 /// Group one calibration's results into the grid upstream stores
@@ -1308,9 +1600,14 @@ struct MeshState {
     fade_target: f64,
     /// Whether the fade completion still needs logging (`move`).
     log_fade_complete: bool,
-    /// The `BED_MESH_OFFSET ZFADE` offset (`bed_mesh.py:284-286`); nothing sets
-    /// it yet, so it stays `0.`.
+    /// The `BED_MESH_OFFSET ZFADE` offset (`bed_mesh.py:284-286`): added to the
+    /// Z the fade measures, so an offset bed can fade from the right height.
+    /// `set_mesh` resets it, as upstream does.
     tool_offset: f64,
+    /// The saved profiles, by name — upstream's `ProfileManager.profiles`
+    /// (`bed_mesh.py:1650`), which `BED_MESH_PROFILE` reads and writes and
+    /// `get_status` reports.
+    profiles: BTreeMap<String, MeshProfile>,
     /// The segmented-move traverser.
     splitter: MoveSplitter,
     /// The last position in the un-transformed G-Code space
@@ -1320,8 +1617,9 @@ struct MeshState {
 
 impl MeshState {
     /// The state a freshly read section starts from — upstream's `__init__`
-    /// fade setup (`bed_mesh.py:97-106`).
-    fn new(options: BedMeshOptions) -> Self {
+    /// fade setup (`bed_mesh.py:97-106`) plus the profiles its config carried
+    /// (`bed_mesh.py:1653-1666`).
+    fn new(options: BedMeshOptions, profiles: BTreeMap<String, MeshProfile>) -> Self {
         let fade_start = options.fade_start;
         let fade_end = options.fade_end;
         let fade_dist = fade_end - fade_start;
@@ -1344,6 +1642,7 @@ impl MeshState {
             fade_target: 0.0,
             log_fade_complete: false,
             tool_offset: 0.0,
+            profiles,
             splitter,
             last_position: Coord::default(),
         }
@@ -1424,6 +1723,24 @@ impl MeshState {
         self.splitter.initialize(z_mesh, self.fade_target);
         Ok(())
     }
+
+    /// `BED_MESH_OFFSET`: move the mesh lookup by `offsets` and, when
+    /// `tool_offset` is given, change the Z the fade measures from —
+    /// `cmd_BED_MESH_OFFSET` (`bed_mesh.py:278-289`).
+    ///
+    /// The splitter carries its own copy of the mesh, so it is re-initialized
+    /// after the offsets move: upstream hands the splitter the same `ZMesh`
+    /// object and the offsets are seen through it (`bed_mesh.py:151-153`).
+    fn set_mesh_offsets(&mut self, offsets: [Option<f64>; 2], tool_offset: Option<f64>) {
+        if let Some(mesh) = self.mesh.as_mut() {
+            mesh.z_mesh.set_mesh_offsets(offsets);
+            let z_mesh = mesh.z_mesh.clone();
+            self.splitter.initialize(Some(z_mesh), self.fade_target);
+        }
+        if let Some(tool_offset) = tool_offset {
+            self.tool_offset = tool_offset;
+        }
+    }
 }
 
 /// The toolhead behind the transform: what `position` reads and `move_to`
@@ -1466,7 +1783,11 @@ impl BedMesh {
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` first");
 
-        let state = Arc::new(Mutex::new(MeshState::new(options)));
+        // The profiles the config already carries, read once at load
+        // (`ProfileManager.__init__`, `bed_mesh.py:1653-1666`). They are not
+        // installed: a mesh takes effect on `BED_MESH_PROFILE LOAD=`.
+        let profiles: BTreeMap<String, MeshProfile> = read_profiles(config)?.into_iter().collect();
+        let state = Arc::new(Mutex::new(MeshState::new(options, profiles)));
         let printer_weak = Arc::downgrade(printer);
 
         // BED_MESH_CALIBRATE
@@ -1500,6 +1821,16 @@ impl BedMesh {
                             {
                                 return Err(CommandError::new(
                                     "Must home all axes prior to bed mesh calibration",
+                                ));
+                            }
+
+                            // The profile the calibration answers as —
+                            // `PROFILE=`, defaulting to `default`
+                            // (`bed_mesh.py:645-647`).
+                            let profile_name = gcmd.get_str_default("PROFILE", DEFAULT_PROFILE);
+                            if profile_name.trim().is_empty() {
+                                return Err(CommandError::new(
+                                    "Value for parameter 'PROFILE' must be specified",
                                 ));
                             }
 
@@ -1555,8 +1886,9 @@ impl BedMesh {
                                 let params = MeshParams::from_options(options, &points);
                                 let z_mesh = ZMesh::build(&rows, &params);
                                 LoadedMesh {
-                                    name: DEFAULT_PROFILE.to_string(),
+                                    name: profile_name.clone(),
                                     rows,
+                                    params,
                                     z_mesh,
                                 }
                             };
@@ -1565,11 +1897,15 @@ impl BedMesh {
                                 "Mesh Bed Leveling Complete ({algorithm} mesh stored, {} points)",
                                 points.len()
                             ));
-                            Ok(())
+                            // A finished calibration is also a profile save:
+                            // upstream stores it under `_profile_name`
+                            // (`bed_mesh.py:786-788`), so `PRINT_START`'s
+                            // `BED_MESH_PROFILE LOAD=default` finds it.
+                            save_profile_named(&printer, &state, gcmd, &profile_name)
                         })
                     }),
                     Some("Calibrate the bed mesh"),
-                    PROBE_PARAMS,
+                    &calibrate_params(),
                     false,
                 )
                 .map_err(ConfigError::new)?;
@@ -1603,6 +1939,60 @@ impl BedMesh {
                 .map_err(ConfigError::new)?;
         }
 
+        // The profile family: the commands a slicer's `PRINT_START` drives. One
+        // registration helper, each command passing its own handler and
+        // parameter names — the shape the client's parameter-table scan
+        // resolves to a command list
+        // (`crates/klippy-client/src/gcode_params_scan.rs`).
+        let register = |cmd: &str, handler: MeshCommand, desc: &str, params: &[&str]| {
+            let state = Arc::clone(&state);
+            let printer_weak = printer_weak.clone();
+            gcode.register_command_with_params(
+                cmd,
+                Arc::new(move |gcmd| {
+                    let state = Arc::clone(&state);
+                    let printer_weak = printer_weak.clone();
+                    Box::pin(async move {
+                        let printer = printer_weak
+                            .upgrade()
+                            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+                        handler(&printer, &state, gcmd)
+                    })
+                }),
+                Some(desc),
+                params,
+                false,
+            )
+        };
+        register(
+            "BED_MESH_OUTPUT",
+            cmd_bed_mesh_output,
+            "Retrieve interpolated grid of probed z-points",
+            &["PGP"],
+        )
+        .map_err(ConfigError::new)?;
+        register(
+            "BED_MESH_MAP",
+            cmd_bed_mesh_map,
+            "Serialize mesh and output to terminal",
+            &[],
+        )
+        .map_err(ConfigError::new)?;
+        register(
+            "BED_MESH_OFFSET",
+            cmd_bed_mesh_offset,
+            "Add X/Y offsets to the mesh lookup",
+            &["X", "Y", "ZFADE"],
+        )
+        .map_err(ConfigError::new)?;
+        register(
+            "BED_MESH_PROFILE",
+            cmd_bed_mesh_profile,
+            "Bed Mesh Persistent Storage management",
+            &["LOAD", "SAVE", "REMOVE"],
+        )
+        .map_err(ConfigError::new)?;
+
         let _ = identifier;
         Ok(Self {
             printer: printer_weak,
@@ -1614,9 +2004,7 @@ impl BedMesh {
     /// The state lock, poisoning treated as continued unwinding
     /// (`gcode_move.rs` convention).
     fn lock_state(&self) -> MutexGuard<'_, MeshState> {
-        self.state
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        lock(&self.state)
     }
 
     /// The transform chain below this one, copied out of its lock.
@@ -1706,6 +2094,7 @@ impl BedMesh {
             LoadedMesh {
                 name: name.to_string(),
                 rows,
+                params,
                 z_mesh,
             }
         };
@@ -1716,6 +2105,278 @@ impl BedMesh {
         Self::apply_mesh(&self.state, &printer, Some(loaded))
             .expect("the test section's fade options accept its grid");
     }
+}
+
+// ===========================================================================
+// The profile commands
+// ===========================================================================
+
+/// One of the profile commands' handlers — what `BedMesh::new` registers and
+/// what a test can call directly.
+type MeshCommand =
+    fn(&Arc<Printer>, &Arc<Mutex<MeshState>>, &GcodeCommand) -> Result<(), CommandError>;
+
+/// The declared parameters of `BED_MESH_CALIBRATE`: the probe parameters, then
+/// the profile the result is stored under (`bed_mesh.py:645`).
+fn calibrate_params() -> Vec<&'static str> {
+    let mut params = PROBE_PARAMS.to_vec();
+    params.push("PROFILE");
+    params
+}
+
+/// The state lock, poisoning treated as continued unwinding
+/// (`gcode_move.rs` convention).
+fn lock(state: &Arc<Mutex<MeshState>>) -> MutexGuard<'_, MeshState> {
+    state.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// `BedMeshCalibrate.print_generated_points` (`bed_mesh.py:352-372`) as the
+/// text it hands `respond_info`.
+///
+/// A round bed's rows below the table carry a zero reference and a faulty
+/// region's substitutes; neither is written yet — the reference is not set and
+/// a faulty region is probed like any other point.
+fn print_generated_points(points: &[(f64, f64)], offsets: [f64; 2]) -> String {
+    let mut msg = String::from("bed_mesh: generated points\nIndex |  Tool Adjusted  |   Probe");
+    for (index, (x, y)) in points.iter().enumerate() {
+        let adjusted = format!("({:.1}, {:.1})", x - offsets[0], y - offsets[1]);
+        msg.push_str(&format!(
+            "\n  {:<4}| {:<16}| ({:.1}, {:.1})",
+            index, adjusted, x, y
+        ));
+    }
+    msg
+}
+
+/// `BED_MESH_OUTPUT` (`bed_mesh.py:253-261`): the probed grid and the
+/// interpolation grid, or with `PGP=` the points a calibration would probe.
+fn cmd_bed_mesh_output(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    if gcmd.get_int_default("PGP", 0)? != 0 {
+        let points = generate_points(&lock(state).options)?;
+        // The probe's offsets put the first column where the tool moves and the
+        // second where the probe sits (`bed_mesh.py:353-357`).
+        let offsets = lookup_probe_session(printer)
+            .map(|probe| probe.offsets())
+            .map(|offsets| [offsets.x, offsets.y])
+            .unwrap_or([0.0, 0.0]);
+        gcmd.respond_info(&print_generated_points(&points, offsets));
+        return Ok(());
+    }
+    let printed = {
+        let state = lock(state);
+        state.mesh.as_ref().map(|mesh| {
+            (
+                mesh.print_probed_matrix(),
+                mesh.print_mesh(Some(state.options.horizontal_move_z)),
+            )
+        })
+    };
+    let Some((probed, mesh)) = printed else {
+        gcmd.respond_info("Bed has not been probed");
+        return Ok(());
+    };
+    // Upstream prints the probed grid as an info line and the mesh raw, which
+    // is what a client reads the table out of (`bed_mesh.py:259-260`).
+    gcmd.respond_info(&probed);
+    gcmd.respond_raw(&mesh);
+    Ok(())
+}
+
+/// `BED_MESH_MAP` (`bed_mesh.py:263-272`): the mesh's bounds and the probed
+/// grid as one `mesh_map_output` line.
+///
+/// The payload is upstream's dict; the text differs from Python's `json.dumps`
+/// only in whitespace (compact separators).
+fn cmd_bed_mesh_map(
+    _printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let payload = lock(state).mesh.as_ref().map(|mesh| {
+        json!({
+            "mesh_min": [mesh.params.min_x, mesh.params.min_y],
+            "mesh_max": [mesh.params.max_x, mesh.params.max_y],
+            "z_positions": mesh.get_probed_matrix(),
+        })
+    });
+    match payload {
+        Some(payload) => gcmd.respond_raw(&format!("mesh_map_output {payload}")),
+        None => gcmd.respond_info("Bed has not been probed"),
+    }
+    Ok(())
+}
+
+/// `BED_MESH_OFFSET` (`bed_mesh.py:277-289`): move the mesh lookup by `X=` /
+/// `Y=` and the Z the fade measures by `ZFADE=`, then re-anchor `gcode_move`.
+///
+/// Both halves are state of the **loaded** mesh: with none, the command only
+/// reports `No mesh loaded to offset`.
+fn cmd_bed_mesh_offset(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    {
+        let mut state = lock(state);
+        if state.mesh.is_none() {
+            drop(state);
+            gcmd.respond_info("No mesh loaded to offset");
+            return Ok(());
+        }
+        let mut offsets = [None, None];
+        for (axis, name) in ["X", "Y"].into_iter().enumerate() {
+            if gcmd.get_command_parameters().contains_key(name) {
+                offsets[axis] = Some(gcmd.get_float(name)?);
+            }
+        }
+        let tool_offset = if gcmd.get_command_parameters().contains_key("ZFADE") {
+            Some(gcmd.get_float("ZFADE")?)
+        } else {
+            None
+        };
+        state.set_mesh_offsets(offsets, tool_offset);
+    }
+    // The g-code position was anchored to the old lookup (`bed_mesh.py:288-289`).
+    if let Some(gcode_move) = printer.lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT) {
+        gcode_move.reset_last_position();
+    }
+    Ok(())
+}
+
+/// `BED_MESH_PROFILE` (`bed_mesh.py:1741-1758`): `LOAD=` / `SAVE=` / `REMOVE=`,
+/// the first one the line carries.
+fn cmd_bed_mesh_profile(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    for (key, handler) in [
+        ("LOAD", load_profile as MeshCommand),
+        ("SAVE", save_profile),
+        ("REMOVE", remove_profile),
+    ] {
+        let Some(name) = gcmd.get_command_parameters().get(key) else {
+            continue;
+        };
+        if name.trim().is_empty() {
+            return Err(CommandError::new(format!(
+                "Value for parameter '{key}' must be specified"
+            )));
+        }
+        // A calibration owns the `default` name (`bed_mesh.py:1751-1754`).
+        if key == "SAVE" && name == DEFAULT_PROFILE {
+            gcmd.respond_info("Profile 'default' is reserved, please choose another profile name.");
+            return Ok(());
+        }
+        return handler(printer, state, gcmd);
+    }
+    gcmd.respond_info(&format!("Invalid syntax '{}'", gcmd.commandline()));
+    Ok(())
+}
+
+/// `ProfileManager.load_profile` (`bed_mesh.py:1726-1737`): install a stored
+/// profile's grid.
+///
+/// # Errors
+/// `bed_mesh: Unknown profile [<name>]` — a name the config and this session's
+/// saves do not hold is refused, never silently ignored.
+fn load_profile(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let name = gcmd.get_str("LOAD")?;
+    let stored = lock(state).profiles.get(&name).cloned();
+    let profile =
+        stored.ok_or_else(|| CommandError::new(format!("bed_mesh: Unknown profile [{name}]")))?;
+    let z_mesh = ZMesh::build(&profile.rows, &profile.params);
+    let loaded = LoadedMesh {
+        name,
+        rows: profile.rows,
+        params: profile.params,
+        z_mesh,
+    };
+    BedMesh::apply_mesh(state, printer, Some(loaded))
+}
+
+/// `ProfileManager.save_profile` (`bed_mesh.py:1678-1712`): keep the loaded
+/// grid under `name` for this session and queue it for `SAVE_CONFIG`.
+///
+/// The write-back is the `configfile` object's: one `[bed_mesh <name>]` section
+/// holding `version`, the `points` grid and the mesh parameters. A machine
+/// without that object keeps the session copy only, as every other module that
+/// queues a `SAVE_CONFIG` value does.
+fn save_profile(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let name = gcmd.get_str("SAVE")?;
+    save_profile_named(printer, state, gcmd, &name)
+}
+
+/// As [`save_profile`], for the name the caller already holds — what a
+/// calibration passes its `PROFILE=` (`bed_mesh.py:786-788`).
+fn save_profile_named(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+    name: &str,
+) -> Result<(), CommandError> {
+    let Some(loaded) = lock(state).mesh.clone() else {
+        gcmd.respond_info(&format!(
+            "Unable to save to profile [{name}], the bed has not been probed"
+        ));
+        return Ok(());
+    };
+    if let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+        let section = format!("{BED_MESH_OBJECT} {name}");
+        configfile.set(&section, "version", &PROFILE_VERSION.to_string());
+        configfile.set(&section, "points", &points_value(&loaded.rows));
+        for (option, value) in loaded.params.config_values() {
+            configfile.set(&section, option, &value);
+        }
+    }
+    lock(state).profiles.insert(
+        name.to_string(),
+        MeshProfile {
+            rows: loaded.rows,
+            params: loaded.params,
+        },
+    );
+    gcmd.respond_info(&format!(
+        "Bed Mesh state has been saved to profile [{name}]\n\
+         for the current session.  The SAVE_CONFIG command will\n\
+         update the printer config file and restart the printer."
+    ));
+    Ok(())
+}
+
+/// `ProfileManager.remove_profile` (`bed_mesh.py:1738-1752`): forget a profile
+/// for this session and queue its section's removal.
+fn remove_profile(
+    printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let name = gcmd.get_str("REMOVE")?;
+    if lock(state).profiles.remove(&name).is_none() {
+        gcmd.respond_info(&format!("No profile named [{name}] to remove"));
+        return Ok(());
+    }
+    if let Some(configfile) = printer.lookup_object_as::<PrinterConfig>(CONFIGFILE_OBJECT) {
+        configfile.remove_section(&format!("{BED_MESH_OBJECT} {name}"));
+    }
+    gcmd.respond_info(&format!(
+        "Profile [{name}] removed from storage for this session.\n\
+         The SAVE_CONFIG command will update the printer\n\
+         configuration and restart the printer"
+    ));
+    Ok(())
 }
 
 impl MoveTarget for BedMesh {
@@ -1805,6 +2466,8 @@ impl MoveTarget for BedMesh {
 }
 
 impl PrinterObject for BedMesh {
+    /// Upstream's `update_status` (`bed_mesh.py:231-249`): the loaded profile,
+    /// its bounds and grids, and every saved profile.
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self.lock_state();
         let options = &state.options;
@@ -1813,17 +2476,22 @@ impl PrinterObject for BedMesh {
             .as_ref()
             .map(|mesh| mesh.name.clone())
             .unwrap_or_default();
-        let (probed, mesh) = match &state.mesh {
-            Some(mesh) => (mesh.rows.clone(), mesh.z_mesh.get_mesh_matrix()),
-            None => (Vec::new(), Vec::new()),
+        let (mesh_min, mesh_max, probed, mesh) = match &state.mesh {
+            Some(loaded) => (
+                [loaded.params.min_x, loaded.params.min_y],
+                [loaded.params.max_x, loaded.params.max_y],
+                loaded.rows.clone(),
+                loaded.z_mesh.get_mesh_matrix(),
+            ),
+            None => (options.mesh_min, options.mesh_max, Vec::new(), Vec::new()),
         };
         json!({
             "profile_name": profile_name,
-            "mesh_min": options.mesh_min,
-            "mesh_max": options.mesh_max,
+            "mesh_min": mesh_min,
+            "mesh_max": mesh_max,
             "probed_matrix": probed,
             "mesh_matrix": mesh,
-            "profiles": {},
+            "profiles": profiles_json(&state.profiles),
         })
     }
 }
@@ -2666,7 +3334,7 @@ mod tests {
 
     /// The state a freshly configured `[bed_mesh]` starts from.
     fn mesh_state(written: &[(&str, &str)]) -> MeshState {
-        MeshState::new(options(written))
+        MeshState::new(options(written), BTreeMap::new())
     }
 
     /// A loaded mesh from a probed grid, sampled the way
@@ -2679,6 +3347,7 @@ mod tests {
         LoadedMesh {
             name: "default".to_string(),
             rows,
+            params,
             z_mesh,
         }
     }

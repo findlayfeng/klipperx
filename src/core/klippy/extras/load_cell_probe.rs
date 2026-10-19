@@ -1308,6 +1308,7 @@ mod tests {
     use crate::core::klippy::msg::proto::{ArgValue, Payload};
     use crate::core::klippy::pins::PrinterPins;
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
 
     fn section(name: Option<&str>, options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("load_cell_probe", name);
@@ -1837,7 +1838,16 @@ mod tests {
             .unwrap_or_else(|p| p.into_inner())
             .clear();
         probe.trigger_analog().dispatch().start(0.0).unwrap();
-        sleep(Duration::from_millis(60)).await;
+        // Poll the wire on a bound: the write path has to run before the stop
+        // messages are on it, and a loaded machine can miss a fixed window
+        // that small.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || !stop_on_trigger(&machine.sent, &machine.mcu).is_empty(),
+            "each Z motor stops on the probe's own trsync",
+        )
+        .await;
 
         assert_eq!(
             stop_on_trigger(&machine.sent, &machine.mcu),

@@ -363,8 +363,11 @@ mod tests {
             val: 0xdead_beef,
         })
         .unwrap();
-        // Let the send task flush it as its own frame before the read.
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Flush the write out as its own frame before the read: the mappings
+        // are keyed by frame sequence, so a send task that coalesced the two
+        // into one block would answer the read with the write. `flush` forces
+        // that block boundary; a fixed 5 ms sleep only hoped for it.
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
 
         let result = mcu
             .call_msg::<DebugRead, DebugResult>(
@@ -397,7 +400,9 @@ mod tests {
         let mcu = mcu_with(mappings);
 
         mcu.send_msg(&DebugNop).unwrap();
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // Separate block, same reason as `test_debug_write_reaches_the_wire`:
+        // the mappings are keyed by frame sequence.
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
 
         let result = mcu
             .call_msg::<DebugRead, DebugResult>(

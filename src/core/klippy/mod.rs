@@ -24,6 +24,8 @@ pub mod pins;
 pub mod printer;
 pub mod reactor;
 // pub mod toolhead;
+#[cfg(test)]
+pub(crate) mod test_util;
 
 // Upstream's host test corpus, used as fixtures. Test-only: it reads
 // third_party/klipper and exists to check our behavior against upstream's

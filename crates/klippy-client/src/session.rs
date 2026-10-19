@@ -1174,6 +1174,28 @@ mod tests {
         }
     }
 
+    /// [`settle`], but it keeps reading on a bound until the endpoint's push
+    /// has arrived: the `Subscribe` endpoint pushes 10 ms after it answers, so
+    /// a 50 ms silence window closes early whenever a loaded machine delivers
+    /// the push later than the reply.
+    async fn settle_until_pushed(session: &mut Session, out: &mut Recording) {
+        const PUSH: &str = "< {\"method\":\"klippy:status\"";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline
+            && !out.texts().iter().any(|text| text.starts_with(PUSH))
+        {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left.min(Duration::from_millis(50)), session.receive()).await
+            {
+                Ok(Ok(message)) => out.write(message.into()),
+                // The connection failed: stop reading and let the caller's
+                // assertions report what is missing.
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Typing
     // -----------------------------------------------------------------------
@@ -1671,7 +1693,7 @@ mod tests {
             .handle_line("/subscribe toolhead extruder", &mut out)
             .await
             .unwrap();
-        settle(&mut session, &mut out).await;
+        settle_until_pushed(&mut session, &mut out).await;
 
         let sent = out.sent();
         assert_eq!(sent.len(), 1);

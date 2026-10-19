@@ -650,7 +650,6 @@ fn total_line(total: usize) -> String {
 mod tests {
     use super::*;
     use crate::core::klippy::interface::devices::canserial::{query_unassigned_frame, CanFrame};
-    use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
 
     /// The window the host scan tests listen for: long enough that the firmware
     /// would have answered if it were going to, short enough not to spend the
@@ -674,13 +673,14 @@ mod tests {
         }
     }
 
-    /// The real host library the interface tests load: built from the klipper
-    /// tree by `test-support`, and **not** a mux firmware (the firmware's mux
-    /// device half is still to come), so it answers no scan.
-    fn host_library_path() -> String {
-        klipperx_test_support::klipper_host_lib_path()
-            .display()
-            .to_string()
+    /// A **private copy** of the real host library, so a scan test that has to
+    /// load it does not share the per-path singleton the other library tests
+    /// register (the registry in `interface/devices/host.rs` is per path) and may
+    /// run beside them. Not a mux firmware: the firmware's mux device half is not
+    /// in this build, so it answers no scan.
+    fn private_host_library() -> klipperx_test_support::PrivateCopy {
+        klipperx_test_support::PrivateCopy::of(&klipperx_test_support::klipper_host_lib_path())
+            .expect("the private library copy is made")
     }
 
     /// A CAN answer, as the admin socket would report it.
@@ -916,14 +916,12 @@ mod tests {
         // library has no mux device half — so it pins both that the scan is
         // harmless there (no error, no garbage answer) and that nothing is
         // reported for a device that never answered.
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let copy = private_host_library();
+        let library = copy.path().display().to_string();
         let mut heard = Vec::new();
-        let total = host_query_unassigned(&host_library_path(), None, HOST_SCAN_WINDOW, |node| {
-            heard.push(node)
-        })
-        .expect("a scan runs against the real library");
+        let total =
+            host_query_unassigned(&library, None, HOST_SCAN_WINDOW, |node| heard.push(node))
+                .expect("a scan runs against the real library");
         assert_eq!(total, 0);
         assert_eq!(total_line(total), "Total 0 uuids found");
         assert!(heard.is_empty(), "a device that never answered is listed");
@@ -935,12 +933,11 @@ mod tests {
         // names the device is the same empty scan — and the library that has
         // `klipper_host_set_uuid` is not refused (an identity is only an error
         // for one built without it).
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let copy = private_host_library();
+        let library = copy.path().display().to_string();
         let mut heard = Vec::new();
         let total = host_query_unassigned(
-            &host_library_path(),
+            &library,
             Some(parse_identity("11aa22bb33cc").expect("twelve hex digits")),
             HOST_SCAN_WINDOW,
             |node| heard.push(node),
@@ -955,11 +952,9 @@ mod tests {
         // The command-line wiring, end to end: `--host-library` selects the
         // scan, an all-zero identity is the default the device already has, and
         // an empty window is a successful scan rather than an error.
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let copy = private_host_library();
         let args = ScanArgs {
-            host_library: Some(host_library_path()),
+            host_library: Some(copy.path().display().to_string()),
             host_identity: Some("000000000000".to_string()),
             timeout: HOST_SCAN_WINDOW.as_secs_f64(),
             ..default_args()

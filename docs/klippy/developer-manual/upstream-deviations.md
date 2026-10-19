@@ -159,7 +159,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `KLIPPERX_*` 环境变量族 | [`README.md` → 环境变量](../../../README.md#环境变量开发与测试)、[测试](testing.md) | 构建/测试/诊断开关（语料范围、字典集、TRACE、硬件串口…） |
 | 顶层固件构建（根 `Makefile` / `Kconfig` / `scripts/firmware-config.py`） | `Makefile`、`Kconfig`、`kconfig/katapult.kconfig`、`firmware.config`、[构建 MCU 固件](../user-manual/firmware-build.md) | 一次共享配置编 klipper 与 katapult 两份：根 `Makefile` 只是包装调用两个子模组的 Makefile（`OUT`/`KCONFIG_CONFIG` 外移到 `out/firmware/`，子模组只读），配置由根 `Kconfig`（klipper 树 + katapult 专属菜单）解析后投影/派生。上游只有单目标构建 |
 | 上游语料复用 harness | `src/core/klippy/upstream.rs`、[回归测试](regression-tests.md) | 把上游 `test/klippy/*.test` 当只读 fixture 跑（上游只有自己的 `test_klippy.py`） |
-| `crates/test-support` | [回归测试](regression-tests.md) | 构建期按 `KLIPPERX_ARCHES` 编 `.dict`、解析 klipper 检出位置 |
+| `crates/test-support` | [回归测试](regression-tests.md)、[测试](testing.md) | 构建期按 `KLIPPERX_ARCHES` 编 `.dict`、解析 klipper 检出位置；`PrivateCopy`（把构建产物复制到自己临时路径）：host 库注册表按路径单例，所以不捕 stderr 的用例靠它拿到**自己的库实例**从而免持 `HOST_LIBRARY_TEST_LOCK` |
 | 字典驱动应答机 `SimulatorDevice` | `src/core/klippy/interface/devices/simulator.rs`、[回归测试](regression-tests.md) | test-only 假 MCU：按字典**应答** identify/配置握手/时钟/序号，走真实主机路径（上游回归是 `-d`/`-o` 短路、不回应，语义不同） |
 | `KLIPPERX_TRACE` 的 `SIM-DIAG:` / `MCU DROP` 诊断行 | `src/core/klippy/mod.rs`、[日志与调试](../user-manual/logging.md) | 追模拟器/MCU 拆除时的挂起 |
 

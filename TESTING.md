@@ -137,6 +137,26 @@
 
 ## 已完成真机验证（留档）
 
+### 2026-10-19 自动化 lane 首次跑通（裸 STM32F103，桥固件 / mux 控制台）
+
+配置：`/tmp/kx-hw.cfg`（单 `[mcu]` + 一个桥端口节让主机按 id 寻址；`[stepper_x]` 用空闲 GPIO
+PB4/PB5/`!PB6`，`endstop_pin: ^PB3`，不接任何负载）。`KLIPPERX_HW_CONFIG=<cfg> cargo hwtest`：
+
+| 用例 | 结果 |
+|---|---|
+| R1 帧序同步 | ✅ `connect #1: took_over=true at sequence 10`、`#2 adopted sequence 3`，0.88 s |
+| R2 复位三轮 | ✅ 每轮 `rebooted, identified and answered get_clock`：765 / 763 / 764 ms，共 2.64 s |
+| R5 单轴步数 | ✅ `firmware position: 400 step(s), expected 400`（5 mm @ 10 mm/s，0.96 s） |
+| R11 短时 soak | ✅ `5000 steps/s for 2.0 s` → 10000 步（≈125 mm），无 shutdown，2.70 s |
+| R3 端停电平 | ⏸ **交互式**：读一次电平后停在 `HW-ENDSTOP: change the X endstop's physical state now … press Enter`，需人工短接/断开 PB3 并在终端回车，不能在自动化批次里跑 |
+
+**前置修复（同批）**：这份 lane 以前打不通这块板——`hardware_test`/`stress` 各自只拿到一节就
+`McuConfig::open()`，而"这条 `serial:` 路径按 id 寻址"是**装载期**在整份配置上判定的，于是 lane 用
+独占裸帧对 mux 固件说话、identify 必然超时（日志里 `serial port …` 没有 `shared` 字样）。现在两处都
+调用 `apply_id_addressed_transport`（`serial_ports` 同一分类 + `NODEID_FIRST`），并加了两条单测钉住
+"单 `[mcu]` 仍独占 / 桥端口节按 id"。
+
+
 | 项 | 结果 |
 |---|---|
 | FW5 完整压缩 `--task motion`（单轴） | ✅ 5 mm/10 mm/s、`step_dist=0.01`：500 步压成 3 条命令，`stepper_get_position` 读回 500 |

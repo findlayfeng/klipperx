@@ -444,15 +444,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
-- [ ] **真机 lane（`cargo hwtest`）打不通 mux/桥固件板（2026-10-19 实测 R1 失败）**：
-      `hardware_test::Machine::open_mcu_named` 走 `McuConfig::open()`，而"这条 `serial:` 路径按 id
-      寻址"（`shared_baud`）是**装载期**由 `mcu/object.rs:2058-2069` 的 `serial_ports` 分类写进
-      `McuObject` 的，测试路径没有那段分类 ⇒ 独占裸帧打开 ⇒ 对 mux 固件 `identify_response` 超时
-      （日志：`serial port … open at 250000 baud`，**没有** `shared` 字样；而同一块板用 klippy 主路径
-      连接时打印的是 `shared serial port`）。修法：在 `hardware_test` 里复用同一分类
-      （`SerialPorts::classify(&wrapper)` → `effective_baud`，并带上该节的 node id）再 `open`；
-      另一条路是给板子刷**非 mux** 固件（能跑 lane，但会失去 admin 自恢复通道，回刷只能靠 SWD）。
-      挡住 R1/R2/R3/R5/R11 五条真机证据。
 - [ ] **`MAX_MAINTHREAD_TIME` 护栏在真实加热器上不可达（2026-10-19 真机结论，留作记录）**：
       klipper 的加热器一律软件 PWM（上游 `heaters.py:61` 也写死 `setup_cycle_time(pwm_cycle_time)`），
       每 0.1 s 需要一个新边沿；宿主一停，固件先报 `Missed scheduling of next digital out event`

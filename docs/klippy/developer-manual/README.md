@@ -487,6 +487,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 
 | 文件 | 职责 |
 |------|------|
+| `mod.rs` / `test_util.rs` | 模块根：`trace_enabled()`（`KLIPPERX_TRACE`）与 **`sleep_off_worker(delay)`**——契约上同步的暂停点一律走它（多线程 runtime ⇒ `block_in_place` 交出 worker core，current-thread 或无 runtime ⇒ `std::thread::sleep`；直接 `block_in_place` 在 current-thread 上会 panic），纪律见[测试](testing.md)。`test_util.rs` 是 `#[cfg(test)]` 的测试共用助手：有界轮询 `wait_until(deadline, interval, pred, what)`（替掉「固定 sleep + 正向断言」） |
 | `frame.rs` | `Frame` 与 `FrameStream`：Klipper 的帧格式（长度、序号、载荷、CRC、`0x7e` SYNC）与分包重组——**所有字节流设备共用**，新设备不要自己再实现一遍；另有 `Frame::with_wire_seq`/`encode_wire`（按给定 seq 字节原样出帧，供共享串口的**握手伪帧**使用）；`FrameStream` 不再有指派支路——解析失败即 `skip_to_sync` |
 | `assign.rs` | **MCU id ↔ 仲裁 id 映射**（CAN 与共享串口共用的唯一定义）：`arb_id` = `0x100 + 2*mcu_id`、`reply_arb_id` = 应答方向（`+1`）、`mcu_id_from_arb` 把两个方向解回同一个 id、`is_reply_arb` 定方向；定义域 `1..=MAX_MCU_ID`（`0xff`），越界与 id 0 回 `None`。**传输专有的东西不在这里**：串口侧的 KXID 伪帧、2 字节带校验帧头（10 数据位 + 4 检测位）编解码与分配期同步握手在 `interface/devices/serial.rs`，CAN 侧的 admin 帧（`0x3f0` / `CMD_SET_NODEID`）在 `interface/devices/canserial.rs`，两者都只从本模块取映射 |
 | `error.rs` | 主机错误词汇：`KlippyError`（Connection/Protocol/Request/Parse/Config/Internal）与 `ConfigError`——决定错误把机器带到哪个状态 |

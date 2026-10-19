@@ -273,13 +273,16 @@ pub trait PwmOut: Send + Sync {
     }
 }
 
-/// A batch of ADC samples: `(firmware clock, value)` pairs, oldest first.
+/// A batch of ADC samples: `(print time, value)` pairs, oldest first.
 ///
-/// Upstream dates samples with print time; this callback carries the firmware
-/// clock (the print-time layer landed with C1d, and a sensor that needs print
-/// time converts through `McuChip::clock_to_print_time`). The value is already
-/// scaled to `0.0..=1.0`.
-pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
+/// The times are **print time**, converted in the resource layer from the
+/// firmware's 32-bit report clock — the same shape as upstream's `MCU_adc`,
+/// whose `_handle_analog_in_state` calls `clock32_to_clock64` and then
+/// `clock_to_print_time` before invoking the callback (`klippy/mcu.py:636-646`).
+/// A report that arrives before the MCU's clock mapping exists is dropped whole,
+/// and the first such drop is logged. The value is already scaled to
+/// `0.0..=1.0`.
+pub type AdcCallback = Box<dyn Fn(&[(f64, f64)]) + Send + Sync>;
 
 /// An analog input resource.
 ///
@@ -303,8 +306,8 @@ pub trait Adc: Send + Sync {
     /// Install the callback that receives each batch.
     fn setup_adc_callback(&self, callback: AdcCallback);
 
-    /// The last sample seen, as `(firmware clock, value)`.
-    fn get_last_value(&self) -> Option<(u64, f64)>;
+    /// The last sample seen, as `(print time, value)`.
+    fn get_last_value(&self) -> Option<(f64, f64)>;
 }
 
 /// The chip (MCU) side of pin setup.

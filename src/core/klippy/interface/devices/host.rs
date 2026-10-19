@@ -119,16 +119,24 @@ fn library_registry() -> &'static Mutex<HashMap<PathBuf, Weak<HostLibrary>>> {
     LIBRARIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Serialises the tests that load — or try to load — the real host library.
+/// Serialises the tests that redirect the process-wide stderr while a real host
+/// library runs — and, more generally, any two tests that mean to share one
+/// loaded library.
 ///
 /// The library registry is a per-path process-wide singleton, so two tests
 /// sharing the one `.so` must not overlap: the second would meet — or, at the
 /// end, unload — the first's library mid-handshake. A loaded library's output
 /// mode and identity are fixed too ([`library_for`]), which puts a scan test
-/// and an identify test on the same `.so` in exactly that pair. The lock also
-/// covers the state that is still process-wide even though the libraries are
-/// not: the stderr redirection the `bridge_attach` tests install, and the ptys
-/// they name for a port.
+/// and an identify test on the same `.so` in exactly that pair.
+///
+/// **A test that needs no stderr does not take this lock** (2026-10-19): it loads
+/// its own copy of the `.so` at a path of its own
+/// (`klipperx_test_support::PrivateCopy`), so the registry hands it a library of
+/// its own and it runs beside the locked tests — `mcu/bridge_attach.rs` went from
+/// 44.6 s to 15.2 s that way. The lock survives for the cases a copy cannot
+/// separate: the **stderr redirection** those tests install is one descriptor for
+/// the whole process, and two tests writing into it would read each other's
+/// lines. (The ptys a port is named for are per-test already.)
 #[cfg(test)]
 pub(crate) static HOST_LIBRARY_TEST_LOCK: Mutex<()> = Mutex::new(());
 

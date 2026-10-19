@@ -1248,9 +1248,7 @@ impl McuObject {
             .iter()
             .map(|(_, path)| path.clone())
             .collect();
-        if !bridge_attach::wait_for_port_paths(&paths, bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
-            .await
-        {
+        if !bridge_attach::wait_for_port_paths(&paths, bridge_attach::PORT_RETURN_BUDGET).await {
             return err;
         }
         let Some(printer) = self.printer.upgrade() else {
@@ -1281,9 +1279,7 @@ impl McuObject {
         let Some(path) = bridge_attach::host_bridge_port_path(&printer, config) else {
             return err;
         };
-        if !bridge_attach::wait_for_port_paths(&[path], bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
-            .await
-        {
+        if !bridge_attach::wait_for_port_paths(&[path], bridge_attach::PORT_RETURN_BUDGET).await {
             return err;
         }
         self.restart_for_bridge_port(&printer, config, err)

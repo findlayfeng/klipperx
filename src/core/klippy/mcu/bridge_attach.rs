@@ -592,7 +592,26 @@ pub(crate) fn is_port_open_failure(reason: &str) -> bool {
 /// A USB CDC downstream that just restarted re-enumerates in about a second;
 /// the same 10 s bound is what a power-cycled `rpi_usb` port waits
 /// (`restart.rs`'s `USB_PORT_RETURN_TIMEOUT`).
+///
+/// **This is the production truth and stays 10 s.** What the bring-up actually
+/// passes to [`wait_for_port_paths`] is [`PORT_RETURN_BUDGET`], which is this
+/// value outside test builds and a 300 ms stand-in inside them — the tests that
+/// drive a real bring-up have to *wait out* the whole budget (they assert it was
+/// honoured), and eight of them at 10 s each were over half of the full gate's
+/// wall time. Same precedent as the serial connect retry
+/// (`interface/devices/serial.rs`: 90 s budget, 300 ms in test builds).
 pub(crate) const BRIDGE_PORT_RETURN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The budget the bring-up hands to [`wait_for_port_paths`].
+///
+/// Production: [`BRIDGE_PORT_RETURN_TIMEOUT`]. Test builds: 300 ms, still well
+/// above [`BRIDGE_PORT_POLL`] so the poll loop gets several probes in. The
+/// helper's own test drives it with a *different* budget, so a hardcoded delay
+/// inside the loop cannot pass.
+#[cfg(not(test))]
+pub(crate) const PORT_RETURN_BUDGET: Duration = BRIDGE_PORT_RETURN_TIMEOUT;
+#[cfg(test)]
+pub(crate) const PORT_RETURN_BUDGET: Duration = Duration::from_millis(300);
 
 /// How often a missing port tty is probed while it is away.
 const BRIDGE_PORT_POLL: Duration = Duration::from_millis(100);
@@ -2150,11 +2169,11 @@ mod tests {
         // Bounded: the host waits for the tty it named, and no longer than the
         // bound plus the bring-up around it.
         assert!(
-            waited >= BRIDGE_PORT_RETURN_TIMEOUT,
+            waited >= PORT_RETURN_BUDGET,
             "the host waits for the port tty before reporting: {waited:?}"
         );
         assert!(
-            waited < BRIDGE_PORT_RETURN_TIMEOUT + Duration::from_secs(20),
+            waited < PORT_RETURN_BUDGET + Duration::from_secs(20),
             "the wait for the port tty is bounded: {waited:?}"
         );
         let state = printer.get_state_message();
@@ -2565,7 +2584,12 @@ mod tests {
                 dying,
                 Some((
                     replacement.serial_path().to_path_buf(),
-                    Duration::from_secs(3),
+                    // The tty has to come back **inside** the host's budget, or
+                    // the bring-up reports the original error instead of asking
+                    // for a restart. So the delay is a fraction of that budget,
+                    // not a fixed 3 s: it holds for the production 10 s and for
+                    // the 300 ms test stand-in alike.
+                    PORT_RETURN_BUDGET / 2,
                 )),
             ));
 
@@ -2653,11 +2677,11 @@ mod tests {
             drop(capture);
 
             assert!(
-                waited >= BRIDGE_PORT_RETURN_TIMEOUT,
+                waited >= PORT_RETURN_BUDGET,
                 "the host waits for the port tty before reporting: {waited:?}"
             );
             assert!(
-                waited < BRIDGE_PORT_RETURN_TIMEOUT + Duration::from_secs(20),
+                waited < PORT_RETURN_BUDGET + Duration::from_secs(20),
                 "the wait for the port tty is bounded: {waited:?}"
             );
             let state = printer.get_state_message();
@@ -2755,5 +2779,42 @@ mod tests {
         })
         .await
         .expect("the test finishes within its budget");
+    }
+
+    /// The wait derives its deadline from the budget it is handed — nothing in
+    /// the loop hardcodes a delay.
+    ///
+    /// The budget here (150 ms) is deliberately **not** [`PORT_RETURN_BUDGET`]
+    /// (300 ms under `cfg(test)`): a hardcoded delay would answer 300 ms and the
+    /// lower assertion would fail.
+    #[tokio::test]
+    async fn wait_for_port_paths_honours_the_budget_it_is_given() {
+        let budget = Duration::from_millis(150);
+        let started = Instant::now();
+        let arrived =
+            wait_for_port_paths(&["/nonexistent/klipperx-budget-probe".to_string()], budget).await;
+        let waited = started.elapsed();
+        assert!(!arrived, "a tty that is not there never arrives");
+        assert!(
+            waited >= budget,
+            "the wait runs for its whole budget: {waited:?}"
+        );
+        assert!(
+            waited < budget + Duration::from_secs(5),
+            "and no longer than that: {waited:?}"
+        );
+    }
+
+    /// The production budget is the 10 s USB-return bound that the bring-up
+    /// tests can no longer observe directly: they wait out the (shorter)
+    /// [`PORT_RETURN_BUDGET`] instead.
+    #[test]
+    fn the_production_budget_is_the_usb_return_bound() {
+        assert_eq!(BRIDGE_PORT_RETURN_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(PORT_RETURN_BUDGET, Duration::from_millis(300));
+        assert!(
+            BRIDGE_PORT_POLL < PORT_RETURN_BUDGET,
+            "the loop gets several probes inside the test budget"
+        );
     }
 }

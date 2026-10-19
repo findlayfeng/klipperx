@@ -676,6 +676,39 @@ mod tests {
     }
 
     #[test]
+    fn test_a_report_clock_that_wraps_32_bits_still_dates_samples_forwards() {
+        let state = state(true, 1.0 / 4095.0, 2_000_000);
+        let seen: Arc<Mutex<Vec<(u64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_callback = Arc::clone(&seen);
+        state
+            .lock(|state| &state.callback)
+            .replace(Box::new(move |samples| {
+                seen_for_callback.lock().unwrap().extend_from_slice(samples);
+            }));
+
+        // The 32-bit report clock wraps between the two reports.
+        state.handle(&[
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(0xffff_ff00),
+            ArgValue::UInt16(1),
+        ]);
+        state.handle(&[
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(0x0000_0100),
+            ArgValue::UInt16(1),
+        ]);
+
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            seen[1].0 > seen[0].0,
+            "the second sample is dated before the first: {:?}",
+            *seen
+        );
+        assert_eq!(seen[1].0 - seen[0].0, 0x200);
+    }
+
+    #[test]
     fn test_the_batched_report_dates_each_sample() {
         let state = state(false, 1.0 / 4095.0, 1_000);
         // Two samples, the report clock 1000 later: the first is one period back.

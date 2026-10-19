@@ -200,7 +200,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | ② 去掉一把锁 | 不需要 stderr 的 7 条 bridge 用例各自加载 `PrivateCopy` 私有 `.so`，不再持 `HOST_LIBRARY_TEST_LOCK` | **57.3 s** | 3494 |
 | ③ 内置资产特性 | 构建期嵌入 config/docs + 三级链释放 + `info` 报释放根（`assets.rs` 新增 12 测；嵌入 +6.6 MB 不影响墙钟） | **57.6 s** | 3506 |
 | ④ 传感器时钟域统一 | ADC 样本时间改 print time（含 32 位绕圈修复）+ 加热器 5 s 主线程护栏与 7 s 陈旧压制（+20 测）
-| ⑤ 加热 PWM 按上游排期 | `Sensor::get_report_time_delta` + `Heater::pwm_delay`，修掉真机 `[heater_generic]` 的 `Timer too close`（+2 测） | **57.9 s** | 3519 |
+| ⑤ 加热 PWM 按上游排期 | `Sensor::get_report_time_delta` + `Heater::pwm_delay`，修掉真机 `[heater_generic]` 的 `Timer too close`（+3 测：还要一条「迟到读数按 now 而非 read_time 排期」与一条告警限速） | **57.4 s** | 3521 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。

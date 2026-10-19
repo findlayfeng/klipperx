@@ -350,23 +350,19 @@ impl Heater {
     /// Record that the main thread is alive at print time `print_time`
     /// (upstream's `Heater.stats`, `heaters.py:137-140`).
     ///
-    /// The deadline this sets is what [`Self::temperature_callback`] compares a
-    /// reading's `read_time` against, and both are in the PWM chip's print
-    /// time. The print time usually comes from
-    /// [`Self::pwm_estimated_print_time`]; it is passed in rather than looked up
-    /// here so that "stamp at this print time" stays reachable for a caller that
-    /// holds the chip's clock — the once-a-second timer in [`PrinterHeaters`]
-    /// and the tests, which is the only entry point either side has.
+    /// The print time is passed in rather than looked up here
+    /// ([`Self::pwm_estimated_print_time`] is that lookup) so "stamp at this
+    /// print time" stays reachable for a caller already holding the chip's
+    /// clock — the tests, and the once-a-second timer in [`PrinterHeaters`] that
+    /// combines the two.
     pub fn stamp_mainthread(&self, print_time: f64) {
         self.lock().verify_mainthread_time = print_time + MAX_MAINTHREAD_TIME;
     }
 
     /// The print time this heater's PWM chip is at, at host instant
     /// `eventtime` (upstream's `mcu_pwm.get_mcu().estimated_print_time()`,
-    /// `heaters.py:138`).
-    ///
-    /// `None` when the pin's chip has no clock to answer with, which makes the
-    /// caller skip the stamp and leave the heater's deadline where it was.
+    /// `heaters.py:138`). `None` when the pin's chip has no clock to answer
+    /// with, which makes the caller skip the stamp.
     fn pwm_estimated_print_time(&self, eventtime: f64) -> Option<f64> {
         self.pwm
             .as_ref()
@@ -381,16 +377,16 @@ impl Heater {
     /// gets zero whatever the control computed, and so does one whose reading is
     /// dated past `verify_mainthread_time` — the main thread has not proved
     /// itself alive within [`MAX_MAINTHREAD_TIME`], so the output is dropped
-    /// rather than held. [`PrinterHeaters`]'s once-a-second timer is what pushes
-    /// that deadline forward, in the PWM chip's print time
-    /// ([`Self::stamp_mainthread`]); before its first stamp the deadline is
-    /// upstream's `-999.`, so a reading taken that early sends no power.
+    /// rather than held. [`PrinterHeaters`]'s once-a-second timer pushes that
+    /// deadline forward in the PWM chip's print time; before its first stamp the
+    /// deadline is upstream's `-999.`, so a reading taken that early sends no
+    /// power.
     ///
     /// `read_time` is whatever clock the reading is dated in: print time for the
     /// sensors that map it (`ds18b20`), the raw firmware clock for the ADC ones
-    /// (`AdcTemperatureBridge`'s `handle_adc_report`, `pins.rs`'s
-    /// `AdcCallback`). The deadline is in print time, so these are the same
-    /// clock only for a sensor that reports print time.
+    /// (`AdcTemperatureBridge`'s `handle_adc_report`). The deadline is in print
+    /// time, so the two are the same clock only for a sensor that reports print
+    /// time.
     pub fn temperature_callback(&self, read_time: f64, temp: f64) {
         let mut state = self.lock();
         let time_diff = read_time - state.last_temp_time;
@@ -618,10 +614,9 @@ impl PrinterHeaters {
     ///
     /// Not registered when the protocol goes to a debug file, exactly as
     /// upstream skips `PrinterStats` then (`statistics.py:55-57`): no stamp is
-    /// ever taken, so every heater keeps `verify_mainthread_time`'s `-999.`
-    /// initial value and every reading sends no power — which is what a
-    /// file-output run wants, since nothing answers the temperature queries in
-    /// it.
+    /// ever taken, so every heater keeps `verify_mainthread_time`'s `-999.` and
+    /// every reading sends no power — what a file-output run wants, since
+    /// nothing answers the temperature queries in it.
     fn start_stats_timer(self: &Arc<Self>) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -633,10 +628,9 @@ impl PrinterHeaters {
         // Weak, so the timer — which lives in the reactor's heap until it is
         // cancelled — does not close the loop `reactor → timer →
         // PrinterHeaters → heater → its chip's clock → reactor`. That cycle
-        // outlives `Printer::teardown`: the parts are dropped but the cycle is
-        // not, so the heaters, their `Mcu`s and the reactor's blocked device
-        // read all leak past it. `verify_heater`'s timer carries the same
-        // lesson at length.
+        // outlives `Printer::teardown` and leaks the heaters, their `Mcu`s and
+        // the reactor's blocked device read with it; `verify_heater`'s timer
+        // carries the same lesson at length.
         let weak = Arc::downgrade(self);
         let handle = reactor.register_timer_named(
             "heater_stats",
@@ -685,10 +679,9 @@ impl PrinterHeaters {
         }
     }
 
-    /// Stop the stamp timer (upstream's `PrinterStats` has no shutdown handler;
-    /// the deadline stops moving because the update is gated on
-    /// `is_shutdown()`. Cancelling here is this host's equivalent — the machine
-    /// is down, so nothing is left to keep the timer alive for).
+    /// Stop the stamp timer. Upstream's `PrinterStats` has no shutdown handler
+    /// (its update is gated on `is_shutdown()`); cancelling is this host's
+    /// equivalent — the machine is down, so nothing needs the timer kept alive.
     fn handle_shutdown(&self) {
         if let Some(handle) = self
             .stats_timer
@@ -1438,9 +1431,8 @@ mod tests {
         /// Every `setup_max_duration` limit a PWM from this chip was given.
         pwm_log: Arc<Mutex<Vec<f64>>>,
         /// When set, this chip's PWMs answer `estimated_print_time` with the
-        /// host instant plus this — a stand-in for a chip whose print time has
-        /// drifted from the host's clock. `None` models a chip with no clock,
-        /// the trait's default answer.
+        /// host instant plus this (a chip whose print time has drifted from the
+        /// host's clock); `None` is the trait's no-clock default.
         print_time_offset: Option<f64>,
     }
 
@@ -1819,8 +1811,8 @@ mod tests {
     }
 
     /// The deadline's boundary: a reading exactly at `verify_mainthread_time` is
-    /// still trusted, a hair past it is not (`read_time > verify_mainthread_time`,
-    /// `heaters.py:73`), and a fresh stamp covers the later reading again.
+    /// still trusted, a hair past it is not (`heaters.py:73`), and a fresh stamp
+    /// covers the later reading again.
     #[test]
     fn test_a_reading_past_the_mainthread_deadline_sends_no_power() {
         let printer = ready_printer();
@@ -1839,10 +1831,10 @@ mod tests {
     }
 
     /// `statistics.py:53-73` calls `Heater.stats` once a second, which stamps
-    /// every heater with its PWM chip's `estimated_print_time(eventtime) +
-    /// MAX_MAINTHREAD_TIME` (`heaters.py:137-140`). The chip here runs 100 s
-    /// ahead of the host clock, so a stamp taken from `eventtime` alone would
-    /// leave the deadline short of the readings below.
+    /// every heater with its PWM chip's `estimated_print_time(eventtime) + 5`
+    /// (`heaters.py:137-140`). The chip here runs 100 s ahead of the host clock,
+    /// so a stamp taken from `eventtime` alone would fall short of the readings
+    /// below.
     #[test]
     fn test_the_stats_timer_stamps_every_heater_once_a_second() {
         let (printer, reactor) = printer_with_print_time_offset(100.0);

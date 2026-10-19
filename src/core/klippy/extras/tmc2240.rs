@@ -422,7 +422,11 @@ mod tests {
         let config = machine_config(dict, tmc_body);
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("tmc2240.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "tmc2240.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
         let setup = async {

@@ -912,7 +912,11 @@ mod tests {
             .add_object("mcu", object as Arc<dyn PrinterObject>)
             .unwrap();
         if fileoutput {
-            let mut start_args = StartArgs::collect("tmc_spi.cfg", None);
+            let mut start_args = StartArgs::collect(
+                "tmc_spi.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
             start_args.debug_output = Some("_test_output".to_string());
             printer.set_start_args(Arc::new(start_args));
         }

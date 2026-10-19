@@ -2040,7 +2040,11 @@ mod tests {
         // `start_args['software_version']`), so a host that sets them gets its
         // own version in the reply.
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.software_version = "v9.9.9-test".to_string();
         printer.set_start_args(Arc::new(args));
         let dispatch = GCodeDispatch::new(Arc::clone(&printer));

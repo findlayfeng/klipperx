@@ -64,31 +64,22 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
     .map_err(RegistrationError::Endpoint)
 }
 
-/// The Klipper installation this host does not have.
+/// The sentinel test fixtures pass for `klipper_path`.
 ///
-/// Upstream reports its own checkout (`klippy/webhooks.py:390`); this host is
-/// not Klipper and has none, so it reports a path that does not exist. That is
-/// the treatment [`InfoResponse::python_path`] documents at length, and it holds
-/// for both fields: Moonraker indexes them without a default
-/// (`moonraker/components/klippy_connection.py`, `_save_path_info`), and only
-/// sets up its Klipper updater when both exist
-/// (`components/update_manager/update_manager.py`:
-/// `os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`), so a path
-/// that does not exist leaves that updater a no-op instead of pointing it at a
-/// directory that is not Klipper. Both keys must still be present strings.
-///
-/// # Do not delete these two fields
-///
-/// `TODO.md` E2 lists them as removable Klipper leftovers; deleting either key
-/// breaks the stock Moonraker this host talks to. `_save_path_info` indexes
-/// both without a default (`moonraker/components/klippy_connection.py:352-354`),
-/// and the resulting `KeyError` is not a `ServerError`, so it is not caught by
-/// the `except ServerError` around the initialization task
+/// Both path keys must always be present strings in an `info` response:
+/// Moonraker indexes them without a default
+/// (`moonraker/components/klippy_connection.py`, `_save_path_info`), and the
+/// resulting `KeyError` is not a `ServerError`, so it is not caught by the
+/// `except ServerError` around the initialization task
 /// (`klippy_connection.py:418-427`): that task dies with nobody awaiting it,
 /// the socket stays connected, `klippy_state` stays `startup` forever and no
-/// reconnect follows. External dependency, do not delete — and do not fill
-/// either key with a real path, for the reason below.
-const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
+/// reconnect follows.
+///
+/// In production `klipper_path` is the released asset root the host gathered
+/// at start-up (see [`InfoResponse::klipper_path`]); a test fixture that does
+/// not release one passes this nonexistent path instead.
+#[cfg(test)]
+pub(crate) const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
 
 /// The interpreter this host does not have. See [`NO_KLIPPER_PATH`].
 const NO_PYTHON_PATH: &str = "/nonexistent/python3";
@@ -116,7 +107,7 @@ impl Info {
             state: state.category.as_category().to_string(),
             state_message: state.message,
             hostname: hostname(),
-            klipper_path: NO_KLIPPER_PATH.to_string(),
+            klipper_path: self.start_args.klipper_path.clone(),
             python_path: NO_PYTHON_PATH.to_string(),
             process_id: std::process::id(),
             user_id: current_user_id(),
@@ -235,8 +226,14 @@ pub struct InfoResponse {
     pub state_message: String,
     /// Host name of the machine running klippy.
     pub hostname: String,
-    /// Directory holding the Klipper installation, or a path that does not
-    /// exist when there is none — see [`NO_KLIPPER_PATH`].
+    /// Directory of the Klipper assets this host releases at start-up.
+    ///
+    /// The root the embedded trees were written to ([`crate::assets::release`]):
+    /// `config/` (the upstream configuration examples), `docs/` (this host's
+    /// user manuals plus a generated index) and `docs/klipper/` (the upstream
+    /// documentation, at the subpath Moonraker's documentation lookup expects
+    /// under this path). Upstream reports its own checkout here
+    /// (`klippy/webhooks.py:390`); this host reports what it carries.
     pub klipper_path: String,
     /// Interpreter running the host software, or a path that does not exist.
     ///
@@ -310,6 +307,7 @@ mod tests {
         StartArgs {
             config_file: "/home/pi/printer.cfg".to_string(),
             log_file: None,
+            klipper_path: NO_KLIPPER_PATH.to_string(),
             software_version: "0.1.0".to_string(),
             cpu_info: "4 core ARMv7 Processor rev 4 (v7l)".to_string(),
             apiserver: None,
@@ -386,37 +384,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_two_klipper_paths_are_present_and_do_not_exist() {
-        // See `NO_KLIPPER_PATH`: Moonraker indexes both without a default and
-        // only enables its Klipper updater when both exist, so "present but
-        // nonexistent" is the answer for a host that has neither.
+    async fn test_klipper_path_is_the_start_args_value_and_python_stays_absent() {
+        // See `NO_KLIPPER_PATH`: Moonraker indexes both keys without a default
+        // and only sets up its Klipper updater when both paths exist — which
+        // this host keeps a no-op by reporting no interpreter, while
+        // `klipper_path` is the released asset root the start args carry.
         let (endpoint, _printer) = endpoint();
 
         let response = ask(&endpoint, r#"{"method":"info"}"#).await;
 
-        // Neither may name something this host actually has: a real Klipper
-        // checkout or its interpreter would make Moonraker manage them (see
-        // `InfoResponse::python_path`), so pin that the reported paths are
-        // neither this crate's source tree nor the running binary — the two
-        // "real path" values a future edit is most likely to reach for.
+        assert_eq!(response["klipper_path"], NO_KLIPPER_PATH);
+        // `python_path` may not name something this host actually has: a real
+        // interpreter or a virtualenv would make Moonraker manage it (see
+        // `InfoResponse::python_path`), so pin that it is neither this crate's
+        // source tree nor the running binary — the two "real path" values a
+        // future edit is most likely to reach for.
         let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let executable = std::env::current_exe().expect("the test binary has a path");
-
-        for key in ["klipper_path", "python_path"] {
-            let path = response[key].as_str().expect("a string");
-            assert!(!path.is_empty(), "{key} is empty");
-            assert!(!std::path::Path::new(path).exists(), "{key} exists: {path}");
-            assert_ne!(
-                std::path::Path::new(path),
-                manifest_dir,
-                "{key} is this crate"
-            );
-            assert_ne!(
-                std::path::Path::new(path),
-                executable,
-                "{key} is this binary"
-            );
-        }
+        let path = response["python_path"].as_str().expect("a string");
+        assert!(!path.is_empty(), "python_path is empty");
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "python_path exists: {path}"
+        );
+        assert_ne!(
+            std::path::Path::new(path),
+            manifest_dir,
+            "python_path is this crate"
+        );
+        assert_ne!(
+            std::path::Path::new(path),
+            executable,
+            "python_path is this binary"
+        );
     }
 
     #[tokio::test]

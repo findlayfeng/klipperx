@@ -97,7 +97,11 @@ mod tests {
         assert!(software_version().starts_with(UPSTREAM_KLIPPER_VERSION));
         assert!(software_version().ends_with(&format!("-{crate_version}")));
 
-        let args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         assert_eq!(
             args.software_version,
             software_version(),

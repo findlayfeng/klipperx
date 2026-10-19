@@ -2,8 +2,8 @@
 //! the packaged Mainsail site when the tree carries one.
 //!
 //! Three vocabularies are collected from declarations and written into
-//! `$OUT_DIR`, then `include!`d where they are used, and a fourth table lists
-//! the files of `assets/mainsail/` as `include_bytes!` entries:
+//! `$OUT_DIR`, then `include!`d where they are used, and two more tables list
+//! embedded files as `include_bytes!` entries:
 //!
 //! | Source | Generated into | Included by |
 //! |---|---|---|
@@ -11,6 +11,7 @@
 //! | `section!(...)` in the module owning the section | `section_factories.rs` | `load.rs` |
 //! | `endpoint!(...)` in the endpoint module | `endpoint_installers.rs` | `api/mod.rs` |
 //! | `assets/mainsail/**` (a packaged site) | `mainsail_assets.rs` | `ui/mainsail.rs` |
+//! | the upstream `config/`+`docs/` trees and `docs/klippy/user-manual/` | `assets_tree.rs` | `assets.rs` |
 //!
 //! A `section!`/`endpoint!` declaration names a local item; the full path is the
 //! file's module path plus that name, so a declaration reads the same as any
@@ -44,6 +45,7 @@ fn main() {
     write_generated("section_factories.rs", &render_sections(&sections));
     write_generated("endpoint_installers.rs", &render_endpoints(&endpoints));
     generate_mainsail_assets(&manifest_dir);
+    generate_printer_assets(&manifest_dir);
 }
 
 /// Write one generated file to `$OUT_DIR`.
@@ -702,5 +704,191 @@ fn render_mainsail_assets(assets: &Path, files: &[PathBuf]) -> String {
         ));
     }
     out.push_str("]);\n");
+    out
+}
+
+// ===========================================================================
+// The printer assets (config + docs released for Moonraker)
+// ===========================================================================
+
+/// Embed the config and documentation trees this host releases at start-up.
+///
+/// Three sources become one table of `(relative path, bytes)` pairs in
+/// `$OUT_DIR/assets_tree.rs`, which `src/assets.rs` releases to disk under
+/// `<base>/assets-<fnv64>/` before the API serves anything:
+///
+/// * `<klipper>/config/**` → `config/`;
+/// * `<klipper>/docs/**` → `docs/klipper/` — the subpath Moonraker's Klipper
+///   documentation lookup expects under the reported `klipper_path`;
+/// * `docs/klippy/user-manual/*.md` → `docs/`, plus a generated `docs/README.md`
+///   index over them (the source `README.md` describes the repo's own doc tree
+///   and is not embedded).
+///
+/// The Klipper tree is `KLIPPERX_KLIPPER_DIR` when set — a worktree points it
+/// at the main checkout's submodule — else `third_party/klipper`. The assets
+/// are not optional: a tree without them fails the build.
+fn generate_printer_assets(manifest_dir: &Path) {
+    println!("cargo:rerun-if-env-changed=KLIPPERX_KLIPPER_DIR");
+    let klipper = klipper_tree(manifest_dir);
+    let manual = manifest_dir.join("docs").join("klippy").join("user-manual");
+
+    // (path in the released tree, file on disk), sorted by the released path.
+    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    for (tree, prefix) in [
+        (klipper.join("config"), "config"),
+        (klipper.join("docs"), "docs/klipper"),
+    ] {
+        let mut walked = Vec::new();
+        collect_asset_files(&tree, &mut walked);
+        for path in walked {
+            let relative = path
+                .strip_prefix(&tree)
+                .unwrap_or_else(|_| panic!("{} was walked under its tree", path.display()));
+            let relative = relative
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            files.push((format!("{prefix}/{relative}"), path));
+        }
+    }
+
+    let mut walked = Vec::new();
+    collect_asset_files(&manual, &mut walked);
+    let mut manuals: Vec<(String, PathBuf)> = walked
+        .into_iter()
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "md")
+                && path.file_name().is_some_and(|name| name != "README.md")
+        })
+        .map(|path| {
+            let name = path
+                .file_name()
+                .expect("a walked file has a name")
+                .to_string_lossy()
+                .into_owned();
+            (name, path)
+        })
+        .collect();
+    manuals.sort();
+
+    // The index is driven by the files actually scanned above, so it can never
+    // list a manual that is gone or miss one that exists.
+    let index = render_manual_index(&manuals);
+    let index_path =
+        PathBuf::from(env::var("OUT_DIR").expect("cargo sets this")).join("printer_docs_readme.md");
+    fs::write(&index_path, &index)
+        .unwrap_or_else(|err| panic!("cannot write {}: {err}", index_path.display()));
+
+    for (name, path) in manuals {
+        files.push((format!("docs/{name}"), path));
+    }
+    files.push(("docs/README.md".to_string(), index_path));
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let hash = fnv64(&files);
+    write_generated("assets_tree.rs", &render_printer_assets(&files, &hash));
+}
+
+/// The Klipper source tree the upstream `config/` and `docs/` are read from.
+///
+/// `KLIPPERX_KLIPPER_DIR` names a checkout directly (a worktree has
+/// `third_party/klipper` empty); without it the submodule at
+/// `third_party/klipper` must be filled in. A tree missing either directory —
+/// or the `klippy/klippy.py` marker that it really is Klipper — fails the
+/// build with both ways out spelled out.
+fn klipper_tree(manifest_dir: &Path) -> PathBuf {
+    let configured = env::var("KLIPPERX_KLIPPER_DIR")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let tree = match configured {
+        Some(dir) => PathBuf::from(dir),
+        None => manifest_dir.join("third_party").join("klipper"),
+    };
+    for marker in [
+        tree.join("klippy").join("klippy.py"),
+        tree.join("config"),
+        tree.join("docs"),
+    ] {
+        if !marker.exists() {
+            panic!(
+                "the Klipper tree at {} has no {} — set KLIPPERX_KLIPPER_DIR=<a klipper checkout>, or build from the main checkout, whose third_party/klipper submodule is filled in",
+                tree.display(),
+                marker.display()
+            );
+        }
+    }
+    tree
+}
+
+/// The generated `docs/README.md`: an index over the embedded manuals.
+///
+/// Each entry's text is the manual's own first `# ` heading, falling back to
+/// the file name when there is none.
+fn render_manual_index(manuals: &[(String, PathBuf)]) -> String {
+    let mut out = String::from("# KlipperX 用户手册\n\n");
+    for (name, path) in manuals {
+        let source = fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        let heading = source
+            .lines()
+            .find_map(|line| line.strip_prefix("# "))
+            .map(str::trim)
+            .filter(|heading| !heading.is_empty())
+            .unwrap_or(name);
+        out.push_str(&format!("- [{heading}]({name})\n"));
+    }
+    out.push_str("\n上游 Klipper 文档见 `klipper/`。\n");
+    out
+}
+
+/// The FNV-1a 64 fingerprint of the embedded asset list.
+///
+/// Entries are fed in released-path order; each contributes the path's bytes,
+/// a `0x00` separator, the data length as a u64 little-endian and then the
+/// data bytes — initial value `0xcbf29ce484222325`, per byte
+/// `h ^= b; h *= 0x100000001b3`. Any changed file, path or file set changes the
+/// hash, which names the run-time release directory `assets-<16 hex>`.
+fn fnv64(files: &[(String, PathBuf)]) -> String {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash ^= u64::from(*byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+
+    let mut hash = OFFSET_BASIS;
+    for (relative, path) in files {
+        let data =
+            fs::read(path).unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+        feed(&mut hash, relative.as_bytes());
+        feed(&mut hash, &[0x00]);
+        feed(&mut hash, &data.len().to_le_bytes());
+        feed(&mut hash, &data);
+    }
+    format!("{hash:016x}")
+}
+
+/// The generated table: one `(released path, include_bytes!)` pair per asset,
+/// plus the fingerprint that names the release directory.
+fn render_printer_assets(files: &[(String, PathBuf)], hash: &str) -> String {
+    let mut out = String::from(
+        "// @generated by build.rs. Do not edit.\n\n\
+         /// The printer assets this binary carries: the path in the released tree\n\
+         /// and the bytes of every config, upstream doc and user manual file.\n\
+         pub static ASSET_FILES: &[(&str, &[u8])] = &[\n",
+    );
+    for (relative, path) in files {
+        out.push_str(&format!(
+            "    ({relative:?}, include_bytes!({:?})),\n",
+            path.to_string_lossy()
+        ));
+    }
+    out.push_str("];\n\n");
+    out.push_str(&format!(
+        "/// The FNV-1a 64 fingerprint of `ASSET_FILES`; the release directory's name.\n\
+         pub const ASSETS_FNV64: &str = \"{hash}\";\n"
+    ));
     out
 }

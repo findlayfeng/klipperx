@@ -929,7 +929,11 @@ mod tests {
     async fn test_m109_with_wait_sets_the_target_through_pheaters() {
         let printer = load_ok(&extruder_config(""));
         // File-output mode: `wait_for_temperature` returns immediately.
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         printer.send_event(&KlippyEvent::KlippyReady);

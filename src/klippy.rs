@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+use crate::assets;
 use crate::core::klippy::api::{
     self, AddressError, Api, ApiTarget, RegistrationError, Server, StartArgs, WebhooksStatus,
     WEBHOOKS_OBJECT,
@@ -270,6 +271,13 @@ pub fn run(
         .ok_or("the following required argument was not provided: <CONFIG_FILE>")?;
     debug!("Config file: {config_file}");
 
+    // The config and documentation trees this host carries are released to a
+    // real directory before anything serves them — Moonraker reads both from
+    // disk, and `/printer/info` reports the released root as `klipper_path`.
+    // A configured location that is unusable ends the run here: the report
+    // would name a path Moonraker cannot read, so there is no fallback.
+    let klipper_path = assets::release()?.to_string_lossy().into_owned();
+
     // The log's rollover information goes at the top of the file, so a log a
     // user attaches already says which build and config produced it (upstream's
     // `versions` block, `klippy/klippy.py:345-357`).
@@ -363,7 +371,11 @@ pub fn run(
         // `printer.start_args`, `klippy/klippy.py:30`) so that modules such as
         // `M115` and `error_mcu` can read them, and the API reports the same
         // dictionary.
-        let mut start_args = StartArgs::collect(config_file.clone(), args.log_file.clone());
+        let mut start_args = StartArgs::collect(
+            config_file.clone(),
+            args.log_file.clone(),
+            klipper_path.clone(),
+        );
         start_args.apiserver = Some(args.api_server.clone());
         printer.set_start_args(Arc::new(start_args.clone()));
 

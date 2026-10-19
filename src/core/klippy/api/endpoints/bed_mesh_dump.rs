@@ -308,7 +308,11 @@ mod tests {
         crate::core::klippy::api::register(
             &mut api,
             &printer,
-            StartArgs::collect("/tmp/printer.cfg", None),
+            StartArgs::collect(
+                "/tmp/printer.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            ),
         )
         .unwrap();
 

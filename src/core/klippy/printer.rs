@@ -1585,7 +1585,11 @@ mod tests {
         assert!(printer.start_args().is_none());
         assert!(!printer.is_fileoutput(), "no start args, no file output");
 
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.software_version = "v1.2.3".to_string();
         printer.set_start_args(Arc::new(args));
 
@@ -1599,7 +1603,11 @@ mod tests {
             "start args without `--debugoutput` are an ordinary run"
         );
 
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         assert!(printer.is_fileoutput());

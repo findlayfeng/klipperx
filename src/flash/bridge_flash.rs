@@ -1808,6 +1808,7 @@ mod tests {
     use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::HostMux;
     use crate::core::klippy::mcu::host_libraries::HostLibraries;
+    use crate::core::klippy::test_util::wait_until;
     use crate::flash::bridge_session::{open_bridge, BridgePort, BridgeTarget, PortReset};
     use crate::flash::fake::{FakeBootloader, Quirk};
     use crate::flash::frame::{build_frame, command};
@@ -2226,15 +2227,24 @@ mod tests {
 
         link.reset_port(0, PortReset::Bootloader, None)
             .expect("the bootloader request goes out");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        stop.store(true, Ordering::Relaxed);
-        pump.join().expect("the pump thread");
-
         // The port's flags are the declaration's (legacy), so the bridge
         // forwards the unit without its mux header: the bytes on the port are
         // the KXID frame the host wrote, `[0x02][index]` and nothing else.
         let mut unit = serial::admin_unit(&[serial::CMD_REQUEST_BOOTLOADER, 0]);
         unit.drain(..serial::HEADER_BYTES);
+        // Poll for the bytes instead of giving the pump thread a fixed 300 ms:
+        // it reads the pty in 5 ms polls and stops as soon as `stop` is set, so
+        // a load-delayed thread used to leave `recorded` empty.
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(5),
+            || recorded.lock().unwrap().len() >= unit.len(),
+            "the port carried the firmware's request-bootloader unit",
+        )
+        .await;
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+
         assert_eq!(
             *recorded.lock().unwrap(),
             unit,

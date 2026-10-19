@@ -282,6 +282,7 @@ mod tests {
     use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
     use crate::core::klippy::printer::{Printer, PrinterObject};
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -435,7 +436,16 @@ mod tests {
         );
 
         mcu.set_clock_base(10_000_000 - 100_000 + 1);
-        sleep(std::time::Duration::from_millis(60)).await;
+        // Poll the wire on a bound: the gate's re-poll and the send task both
+        // have to run before the arm is on it, and a loaded machine can miss a
+        // fixed window that small.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || !sent.lock().unwrap().is_empty(),
+            "the arm never left after the window",
+        )
+        .await;
         // The whole arm releases — and the send task may coalesce it into one
         // block, so count messages, not frames.
         let frames = sent.lock().unwrap().clone();

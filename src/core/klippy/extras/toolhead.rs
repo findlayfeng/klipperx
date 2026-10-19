@@ -3576,12 +3576,11 @@ fn settle_halt_position(connected: &mut Connected, haltpos: Coord) {
 /// Upstream asks the firmware for the trigger clock and, in file-output mode,
 /// answers the move's end instead because there is nothing to ask
 /// (`MCU_endstop.home_wait`, `klippy/mcu.py:396-400`). A file-output run here
-/// talks to a fake firmware that *does* answer, but its answer is the move's
-/// first queued step — it models no hardware, which is what keeps a
-/// "triggered prior to movement" probe honest
-/// (`interface/devices/simulator.rs`) — so a position read back at that clock
-/// would say "no travel yet" for every move. Upstream's file-output answer,
-/// `home_end_time`, is the only one that means anything there.
+/// talks to a fake firmware that *does* answer, but with the move's first
+/// queued step — it models no hardware, which is what keeps a "triggered prior
+/// to movement" probe honest (`interface/devices/simulator.rs`) — so a
+/// position read back there would say "no travel yet" for every move.
+/// Upstream's file-output answer is the only one that means anything.
 fn trigger_instant(reported: f64, home_end_time: f64, printer: &Weak<Printer>) -> f64 {
     match printer.upgrade() {
         Some(printer) if printer.is_fileoutput() => home_end_time,
@@ -4043,10 +4042,10 @@ async fn home_axis(
 ///
 /// Returns the position the endstop **triggered** at — the carriage's own
 /// position, not the one the move was aimed at (`StepperPosition.note_home_end`
-/// + `HomingMove.calc_toolhead_pos`, `homing.py:36-40,123-130`, where
-/// `trigpos` is the returned value) — while the toolhead is left where the
-/// steppers came to rest (`haltpos`). The move is always dripped to its end,
-/// so under a file-output run the trigger instant is that end: upstream's
+/// together with `HomingMove.calc_toolhead_pos`, `homing.py:36-40,123-130`,
+/// where `trigpos` is the returned value) — while the toolhead is left where
+/// the steppers came to rest (`haltpos`). The move is always dripped to its
+/// end, so under a file-output run the trigger instant is that end: upstream's
 /// `home_wait` answers `home_end_time` there (`mcu.py:396-397`, see
 /// [`trigger_instant`]), which is also what keeps this host's fake firmware
 /// (it fires the armed endstop at the move's first queued step, so ending the
@@ -5710,19 +5709,15 @@ mod tests {
     }
 
     /// A home whose steppers ran past the trigger leaves the axis that far past
-    /// its endstop (`HomingMove.homing_move`'s non-probe branch,
-    /// `homing.py:135-146`): the carriage is placed where the steppers stopped,
-    /// not where the endstop is nominally.
+    /// its endstop (`homing.py:135-146`): the carriage is placed where the
+    /// steppers stopped, not where the endstop is nominally.
     ///
-    /// The endstop reports its trigger 1 s before the drip's end, and the drip
-    /// ran the full 300 mm force distance at 5 mm/s — so the steppers were
-    /// still walking 5 mm after the trigger when generation stopped. The move
-    /// is in the negative X direction, which makes the overshoot a negative
-    /// step count: this is the sign upstream's `halt_pos - trig_pos` carries
-    /// into `calc_toolhead_pos`.
-    ///
-    /// The paused clock lets the whole 300 mm move drip out in virtual time
-    /// (as in the miss test above).
+    /// The endstop reports its trigger 1 s before the drip's end, and the 300 mm
+    /// force move at 5 mm/s was still walking 5 mm then. It runs in the negative
+    /// X direction, so the overshoot is a negative step count — the sign
+    /// upstream's `halt_pos - trig_pos` carries into `calc_toolhead_pos`. The
+    /// paused clock lets the whole move drip out in virtual time (as in the miss
+    /// test above).
     #[tokio::test(start_paused = true)]
     async fn test_home_axis_places_the_axis_past_its_endstop_by_the_overshoot() {
         let mut toolhead = homed_toolhead();

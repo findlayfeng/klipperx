@@ -29,9 +29,9 @@
 //! The profile family is what a slicer's `PRINT_START` drives:
 //!
 //! - `BED_MESH_CALIBRATE PROFILE=` stores the grid under a name (default
-//!   `default`) and saves it — [`cmd_bed_mesh_profile`]'s `SAVE` path, so a
-//!   `SAVE_CONFIG` writes it into a `[bed_mesh <name>]` block that the next
-//!   start reads back ([`read_profiles`]);
+//!   `default`) and saves it through [`save_profile`] — so a `SAVE_CONFIG`
+//!   writes it into a `[bed_mesh <name>]` block that the next start reads back
+//!   ([`read_profiles`]);
 //! - `BED_MESH_PROFILE LOAD=`/`SAVE=`/`REMOVE=` (`cmd_BED_MESH_PROFILE`,
 //!   `bed_mesh.py:1741-1758`) — a `LOAD` of an unknown name is an error, never a
 //!   silent pass-through;
@@ -2523,7 +2523,7 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::config::{ConfigSection, ConfigValue};
+    use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
 
     fn section(options: &[(&str, &str)]) -> ConfigSection {
         let mut section = ConfigSection::new("bed_mesh", None);
@@ -3760,5 +3760,498 @@ mod tests {
             (last.0.z() - 1.0).abs() < 1e-9,
             "cleared bed mesh still adjusted Z: {last:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The profile commands
+    // -----------------------------------------------------------------------
+
+    /// A machine ready to dispatch the profile commands: `gcode`, the
+    /// `configfile` a save queues its section on, and a `[bed_mesh]` read from
+    /// `text` (which may carry `[bed_mesh <name>]` profile sections too).
+    fn command_machine(
+        text: &str,
+    ) -> (
+        Arc<Printer>,
+        Arc<GCodeDispatch>,
+        Arc<PrinterConfig>,
+        Arc<BedMesh>,
+    ) {
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let configfile = Arc::new(PrinterConfig::new(
+            AccessTracking::shared(),
+            serde_json::Map::new(),
+        ));
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::clone(&configfile) as Arc<dyn PrinterObject>,
+            )
+            .unwrap();
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let bed_mesh = config
+            .get_section("bed_mesh")
+            .expect("a [bed_mesh] section");
+        let wrapper = ConfigWrapper::with_config(
+            bed_mesh,
+            AccessTracking::shared(),
+            Some(Arc::clone(&configfile)),
+            &config,
+        );
+        let bed = load_config(&wrapper, &printer).expect("the section loads");
+        printer.add_object(BED_MESH_OBJECT, bed).unwrap();
+        let bed = printer
+            .lookup_object_as::<BedMesh>(BED_MESH_OBJECT)
+            .unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        // Only a ready printer offers the non-built-in commands.
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
+        (printer, gcode, configfile, bed)
+    }
+
+    /// A 0–100mm, 3×3, direct `[bed_mesh]` section: `calc_z` is the probed
+    /// grid's bilinear lookup, and the mesh is the probed grid itself.
+    const MESH: &str = "[bed_mesh]\nmesh_min: 0,0\nmesh_max: 100,100\n\
+                       probe_count: 3,3\nmesh_pps: 0\n";
+
+    /// `z = x / 100` over that section, so a lookup's answer names the X it
+    /// read.
+    fn ramp_rows() -> Vec<Vec<f64>> {
+        vec![
+            vec![0.0, 0.5, 1.0],
+            vec![0.0, 0.5, 1.0],
+            vec![0.0, 0.5, 1.0],
+        ]
+    }
+
+    /// Capture every line the dispatcher emits.
+    fn capture(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        log
+    }
+
+    /// The lines emitted since the last call, drained.
+    fn lines(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain(..)
+            .collect()
+    }
+
+    /// The pending `SAVE_CONFIG` items, which is what a save writes back.
+    fn pending(configfile: &Arc<PrinterConfig>) -> Value {
+        configfile.get_status(0.0)["save_config_pending_items"].clone()
+    }
+
+    /// The four commands the slicer's `PRINT_START` drives are registered with
+    /// upstream's help text and declared parameter names
+    /// (`bed_mesh.py:253-289`, `bed_mesh.py:1741`).
+    #[test]
+    fn the_profile_commands_are_registered_with_upstreams_wording() {
+        let (_printer, gcode, _configfile, _bed) = command_machine(MESH);
+
+        let help = gcode.command_help();
+        assert_eq!(
+            help["BED_MESH_OUTPUT"],
+            "Retrieve interpolated grid of probed z-points"
+        );
+        assert_eq!(
+            help["BED_MESH_MAP"],
+            "Serialize mesh and output to terminal"
+        );
+        assert_eq!(
+            help["BED_MESH_OFFSET"],
+            "Add X/Y offsets to the mesh lookup"
+        );
+        assert_eq!(
+            help["BED_MESH_PROFILE"],
+            "Bed Mesh Persistent Storage management"
+        );
+
+        let status = gcode.get_status(0.0);
+        let parameters = |cmd: &str| status["commands"][cmd]["parameters"].clone();
+        assert_eq!(parameters("BED_MESH_OUTPUT"), json!(["PGP"]));
+        assert_eq!(parameters("BED_MESH_OFFSET"), json!(["X", "Y", "ZFADE"]));
+        assert_eq!(
+            parameters("BED_MESH_PROFILE"),
+            json!(["LOAD", "SAVE", "REMOVE"])
+        );
+        // A calibration stores its result under `PROFILE=` (`bed_mesh.py:645`).
+        assert!(status["commands"]["BED_MESH_CALIBRATE"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|param| param == "PROFILE"));
+    }
+
+    /// `BED_MESH_PROFILE SAVE=` queues a `[bed_mesh <name>]` block and keeps the
+    /// grid for the session; `LOAD=` installs it again after the mesh is gone
+    /// (`bed_mesh.py:1678-1737`).
+    #[test]
+    fn saving_a_profile_writes_its_section_and_a_load_restores_the_grid() {
+        let (_printer, gcode, configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+        bed.store_mesh_for_test(
+            "default",
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+
+        gcode.run_script_sync("BED_MESH_PROFILE SAVE=shop").unwrap();
+
+        // The section `SAVE_CONFIG` writes back, with the parameters upstream's
+        // `PROFILE_OPTIONS` names (`bed_mesh.py:7-13`).
+        let saved = pending(&configfile)["bed_mesh shop"].clone();
+        assert_eq!(saved["version"], "1");
+        assert_eq!(
+            saved["points"],
+            "\n  0.100000, 0.200000, 0.300000\n  0.400000, 0.500000, 0.600000\n  0.700000, 0.800000, 0.900000"
+        );
+        assert_eq!(saved["min_x"], "0.0");
+        assert_eq!(saved["max_y"], "100.0");
+        assert_eq!(saved["x_count"], "3");
+        assert_eq!(saved["mesh_x_pps"], "0");
+        assert_eq!(saved["algo"], "direct");
+        assert_eq!(saved["tension"], "0.2");
+        // The session copy the status reports has the grid as data.
+        assert_eq!(
+            bed.get_status(0.0)["profiles"]["shop"]["points"],
+            json!([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+        );
+        assert_eq!(
+            bed.get_status(0.0)["profiles"]["shop"]["mesh_params"]["algo"],
+            "direct"
+        );
+        assert_eq!(
+            lines(&log),
+            vec!["// Bed Mesh state has been saved to profile [shop]\n\
+                 // for the current session.  The SAVE_CONFIG command will\n\
+                 // update the printer config file and restart the printer."
+                .to_string()]
+        );
+
+        // Clear the bed, then load the saved profile back.
+        gcode.run_script_sync("BED_MESH_CLEAR").unwrap();
+        assert!(bed.loaded_mesh().is_none());
+        gcode.run_script_sync("BED_MESH_PROFILE LOAD=shop").unwrap();
+
+        let loaded = bed.loaded_mesh().expect("the profile is loaded");
+        assert_eq!(loaded.name, "shop");
+        assert_eq!(
+            loaded.rows,
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9]
+            ]
+        );
+        assert!((bed.lock_state().calc_z(50.0, 50.0) - 0.5).abs() < 1e-9);
+    }
+
+    /// `REMOVE=` drops the session copy and queues the section's removal; a
+    /// second remove has nothing to drop and says so (`bed_mesh.py:1738-1752`).
+    #[test]
+    fn removing_a_profile_queues_its_section_and_reports_an_unknown_name() {
+        let (_printer, gcode, configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+        bed.store_mesh_for_test("default", ramp_rows());
+        gcode.run_script_sync("BED_MESH_PROFILE SAVE=shop").unwrap();
+        lines(&log);
+
+        gcode
+            .run_script_sync("BED_MESH_PROFILE REMOVE=shop")
+            .unwrap();
+
+        assert_eq!(pending(&configfile)["bed_mesh shop"], Value::Null);
+        assert_eq!(bed.get_status(0.0)["profiles"], json!({}));
+        assert_eq!(
+            lines(&log),
+            vec!["// Profile [shop] removed from storage for this session.\n\
+                 // The SAVE_CONFIG command will update the printer\n\
+                 // configuration and restart the printer"
+                .to_string()]
+        );
+
+        gcode
+            .run_script_sync("BED_MESH_PROFILE REMOVE=shop")
+            .unwrap();
+        assert_eq!(lines(&log), vec!["// No profile named [shop] to remove"]);
+    }
+
+    /// An unknown profile is an error, and the two syntax mistakes answer with
+    /// upstream's words (`bed_mesh.py:1742-1758`).
+    #[test]
+    fn an_unknown_profile_and_the_syntax_mistakes_keep_upstreams_words() {
+        let (_printer, gcode, _configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+        bed.store_mesh_for_test("default", ramp_rows());
+
+        let error = gcode
+            .run_script_sync("BED_MESH_PROFILE LOAD=nope")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "bed_mesh: Unknown profile [nope]");
+        // The dispatcher reports the failure to the client as well.
+        assert_eq!(lines(&log), vec!["!! bed_mesh: Unknown profile [nope]"]);
+
+        // `default` belongs to a calibration.
+        gcode
+            .run_script_sync("BED_MESH_PROFILE SAVE=default")
+            .unwrap();
+        assert_eq!(
+            lines(&log),
+            vec!["// Profile 'default' is reserved, please choose another profile name."]
+        );
+        assert_eq!(pending(&_configfile)["bed_mesh default"], Value::Null);
+
+        let error = gcode
+            .run_script_sync("BED_MESH_PROFILE LOAD=   ")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Value for parameter 'LOAD' must be specified"
+        );
+        lines(&log);
+
+        gcode.run_script_sync("BED_MESH_PROFILE").unwrap();
+        assert_eq!(lines(&log), vec!["// Invalid syntax 'BED_MESH_PROFILE'"]);
+    }
+
+    /// `BED_MESH_OUTPUT`: the probed grid as an info line, the interpolation
+    /// grid raw, and with `PGP=1` the points a calibration would probe instead
+    /// (`bed_mesh.py:253-261`).
+    #[test]
+    fn output_prints_the_probed_grid_and_the_generated_points() {
+        let (_printer, gcode, _configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("BED_MESH_OUTPUT").unwrap();
+        assert_eq!(lines(&log), vec!["// Bed has not been probed"]);
+
+        bed.store_mesh_for_test(
+            "default",
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+        gcode.run_script_sync("BED_MESH_OUTPUT").unwrap();
+
+        let printed = lines(&log);
+        assert_eq!(printed.len(), 2, "an info line and the raw mesh");
+        // The probed grid, 6 decimals, one line per row.
+        assert_eq!(
+            printed[0],
+            "// Mesh Leveling Probed Z positions:\n// 0.100000 0.200000 0.300000\n\
+             // 0.400000 0.500000 0.600000\n// 0.700000 0.800000 0.900000"
+        );
+        // The mesh: its dimensions, the search height, the offsets, the Z
+        // statistics and the grid top row first (`bed_mesh.py:1382-1402`).
+        assert_eq!(
+            printed[1],
+            concat!(
+                "Mesh X,Y: 3,3\n",
+                "Search Height: 5\n",
+                "Mesh Offsets: X=0.0000, Y=0.0000\n",
+                "Mesh Average: 0.50\n",
+                "Mesh Range: min=0.1000 max=0.9000\n",
+                "Interpolation Algorithm: direct\n",
+                "Measured points:\n",
+                "  0.700000  0.800000  0.900000\n",
+                "  0.400000  0.500000  0.600000\n",
+                "  0.100000  0.200000  0.300000\n",
+            )
+        );
+
+        // `PGP=` prints the generated points, with the probe's offsets applied
+        // to the first column (there is no probe on this machine, so they are
+        // zero).
+        gcode.run_script_sync("BED_MESH_OUTPUT PGP=1").unwrap();
+        let points = lines(&log);
+        assert_eq!(points.len(), 1);
+        let text = &points[0];
+        assert!(
+            text.starts_with("// bed_mesh: generated points\n// Index |  Tool Adjusted  |   Probe"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("\n// 0   | (0.0, 0.0)      | (0.0, 0.0)"),
+            "got {text}"
+        );
+        assert!(
+            text.contains("\n// 8   | (100.0, 100.0)  | (100.0, 100.0)"),
+            "got {text}"
+        );
+        // Nine points: a 3×3 grid, in probing order.
+        assert_eq!(text.lines().count(), 2 + 9, "got {text}");
+    }
+
+    /// `BED_MESH_MAP`: the bounds and the probed grid as one `mesh_map_output`
+    /// line (`bed_mesh.py:263-272`).
+    #[test]
+    fn map_serializes_the_bounds_and_the_probed_grid() {
+        let (_printer, gcode, _configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+
+        gcode.run_script_sync("BED_MESH_MAP").unwrap();
+        assert_eq!(lines(&log), vec!["// Bed has not been probed"]);
+
+        bed.store_mesh_for_test(
+            "default",
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+        gcode.run_script_sync("BED_MESH_MAP").unwrap();
+
+        let printed = lines(&log);
+        assert_eq!(printed.len(), 1);
+        let payload = printed[0]
+            .strip_prefix("mesh_map_output ")
+            .unwrap_or_else(|| panic!("got {}", printed[0]));
+        assert_eq!(
+            serde_json::from_str::<Value>(payload).unwrap(),
+            json!({
+                "mesh_min": [0.0, 0.0],
+                "mesh_max": [100.0, 100.0],
+                "z_positions": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+            })
+        );
+    }
+
+    /// `BED_MESH_OFFSET X=`/`Y=` move the lookup, and a move through the
+    /// transform answers from the offset grid (`bed_mesh.py:277-289`).
+    #[test]
+    fn offset_moves_the_lookup_and_the_transform_follows_it() {
+        let (_printer, gcode, _configfile, bed) = command_machine(MESH);
+        let log = capture(&gcode);
+        let fake = Arc::new(FakeTarget::new(Coord::default()));
+        *bed.target.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+        bed.store_mesh_for_test("default", ramp_rows());
+
+        // A move to X=50 reads the mesh at 50, which the ramp puts at 0.5.
+        gcode.run_script_sync("G1 X50 F600").unwrap();
+        let last = fake.moves().last().cloned().unwrap();
+        assert!((last.0.z() - 0.5).abs() < 1e-9, "got {last:?}");
+
+        // Offset by 25: the same 30mm move reads the mesh 25 further along,
+        // and the ramp puts x = 55 at 0.55. The g-code Z is pinned to 0 so the
+        // toolhead's Z is the adjustment alone.
+        gcode.run_script_sync("BED_MESH_OFFSET X=25").unwrap();
+        assert_eq!(
+            bed.loaded_mesh().unwrap().z_mesh.mesh_offsets(),
+            [25.0, 0.0]
+        );
+        gcode.run_script_sync("G1 X30 Z0 F600").unwrap();
+        let last = fake.moves().last().cloned().unwrap();
+        assert!((last.0.z() - 0.55).abs() < 1e-9, "got {last:?}");
+
+        // An axis left out keeps its offset; `Y=` moves the other one.
+        gcode.run_script_sync("BED_MESH_OFFSET Y=-25").unwrap();
+        assert_eq!(
+            bed.loaded_mesh().unwrap().z_mesh.mesh_offsets(),
+            [25.0, -25.0]
+        );
+
+        // With no mesh there is nothing to offset.
+        gcode.run_script_sync("BED_MESH_CLEAR").unwrap();
+        lines(&log);
+        gcode.run_script_sync("BED_MESH_OFFSET X=1").unwrap();
+        assert_eq!(lines(&log), vec!["// No mesh loaded to offset"]);
+    }
+
+    /// `BED_MESH_OFFSET ZFADE=` changes the Z the fade measures from, which is
+    /// what a machine with a probe/nozzle offset needs; a new mesh resets it
+    /// (`bed_mesh.py:284-286`, `bed_mesh.py:164`).
+    #[test]
+    fn offset_sets_the_z_the_fade_measures_from() {
+        let (_printer, gcode, _configfile, bed) = command_machine(
+            "[bed_mesh]\nmesh_min: 0,0\nmesh_max: 100,100\nprobe_count: 3,3\n\
+             mesh_pps: 0\nfade_start: 1\nfade_end: 5\n",
+        );
+        bed.store_mesh_for_test("default", ramp_rows());
+
+        // The mesh holds Z 0…1, so a move at Z=0 is below `fade_start` and gets
+        // the full adjustment.
+        assert_eq!(bed.lock_state().get_z_factor(0.0), 1.0);
+
+        gcode.run_script_sync("BED_MESH_OFFSET ZFADE=10").unwrap();
+        assert_eq!(bed.lock_state().tool_offset, 10.0);
+        // The fade now measures from 10, which is past `fade_end`.
+        assert_eq!(bed.lock_state().get_z_factor(0.0), 0.0);
+
+        // Loading a mesh resets the offset (`set_mesh`, `bed_mesh.py:164`).
+        gcode.run_script_sync("BED_MESH_CLEAR").unwrap();
+        assert_eq!(bed.lock_state().tool_offset, 0.0);
+    }
+
+    /// A `[bed_mesh <name>]` section the config carries is read at load and
+    /// installed by `LOAD=`, which is how a profile survives a restart
+    /// (`bed_mesh.py:1653-1666`); a section of another version is skipped.
+    #[test]
+    fn a_stored_profile_section_is_read_at_load_and_loaded_on_demand() {
+        let (_printer, gcode, _configfile, bed) = command_machine(
+            "[bed_mesh]\nmesh_min: 0,0\nmesh_max: 100,100\nprobe_count: 3,3\n\
+             mesh_pps: 0\n\
+             [bed_mesh default]\nversion: 1\npoints:\n\
+             \x20 0.100000, 0.200000, 0.300000\n\
+             \x20 0.400000, 0.500000, 0.600000\n\
+             \x20 0.700000, 0.800000, 0.900000\n\
+             min_x: 0.0\nmax_x: 100.0\nmin_y: 0.0\nmax_y: 100.0\n\
+             x_count: 3\ny_count: 3\nmesh_x_pps: 0\nmesh_y_pps: 0\n\
+             algo: direct\ntension: 0.2\n\
+             [bed_mesh ancient]\nversion: 0\n",
+        );
+
+        // The stored profiles are known, but none is installed: a mesh takes
+        // effect on `LOAD=`.
+        let status = bed.get_status(0.0);
+        assert!(bed.loaded_mesh().is_none());
+        assert_eq!(
+            status["profiles"]["default"]["points"],
+            json!([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+        );
+        assert_eq!(status["profiles"]["default"]["mesh_params"]["min_x"], 0.0);
+        assert_eq!(
+            status["profiles"]["default"]["mesh_params"]["mesh_x_pps"],
+            0
+        );
+        // A section of another version was logged and skipped.
+        assert!(status["profiles"].get("ancient").is_none());
+
+        gcode
+            .run_script_sync("BED_MESH_PROFILE LOAD=default")
+            .unwrap();
+        let loaded = bed.loaded_mesh().expect("the stored profile loads");
+        assert_eq!(loaded.name, "default");
+        assert_eq!(bed.get_status(0.0)["profile_name"], "default");
+        assert!((bed.lock_state().calc_z(50.0, 50.0) - 0.5).abs() < 1e-9);
+
+        let error = gcode
+            .run_script_sync("BED_MESH_PROFILE LOAD=ancient")
+            .unwrap_err();
+        assert_eq!(error.to_string(), "bed_mesh: Unknown profile [ancient]");
     }
 }

@@ -2237,6 +2237,10 @@ mod tests {
         fn setup_callback(&self, callback: heaters::SensorCallback) {
             *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
         }
+
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
     impl ScriptedSensor {

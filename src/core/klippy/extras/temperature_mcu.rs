@@ -231,6 +231,10 @@ impl Sensor for TemperatureMCUSensor {
     fn setup_callback(&self, callback: SensorCallback) {
         *self.callback.lock().unwrap() = Some(callback);
     }
+
+    fn get_report_time_delta(&self) -> f64 {
+        REPORT_TIME
+    }
 }
 
 impl std::fmt::Debug for TemperatureMCUSensor {

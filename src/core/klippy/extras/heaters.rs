@@ -109,6 +109,15 @@ pub trait Sensor: Send + Sync + std::fmt::Debug {
 
     /// Where readings are delivered.
     fn setup_callback(&self, callback: SensorCallback);
+
+    /// How far apart this sensor's reports are, in seconds (upstream's
+    /// `get_report_time_delta`, `heaters.py:32`).
+    ///
+    /// The heater dates every PWM change one report period after the reading it
+    /// came from ([`Heater::pwm_delay`]), so the change lands before the next
+    /// reading and never in the past — a clock already behind the firmware reads
+    /// as its `Timer too close` shutdown.
+    fn get_report_time_delta(&self) -> f64;
 }
 
 /// What the M105 g-code-id table stores — any object that can report its
@@ -264,6 +273,15 @@ pub struct Heater {
     max_power: f64,
     /// `1 / smooth_time`, for the smoothed temperature.
     inv_smooth_time: f64,
+    /// How far after a reading this heater may date its PWM change (upstream's
+    /// `pwm_delay`, `heaters.py:32`): one report period of the sensor that
+    /// produced the reading.
+    ///
+    /// This is what keeps the change in the future. An immediate change is dated
+    /// with the host's clock estimate, which the firmware can already be past —
+    /// and a change dated at or before the pin's outstanding auto-off timer
+    /// (`MAX_HEAT_TIME`) is what it reports as `Timer too close`.
+    pwm_delay: f64,
     state: Mutex<HeaterState>,
 }
 
@@ -409,10 +427,19 @@ impl Heater {
         } else {
             value
         };
-        // Upstream schedules the change at `read_time + pwm_delay`; print-time
-        // scheduling is C1d, so the output goes out immediately.
+        // Upstream dates the change at `read_time + pwm_delay` so it lands in
+        // the future, before the next reading (`heaters.py:79`). A pin whose
+        // chip has no print-time mapping (the file-output stand-ins) keeps the
+        // immediate path.
         if let Some(pwm) = &self.pwm {
-            let _ = pwm.update_pwm(value);
+            match pwm.print_time_to_clock(read_time + self.pwm_delay) {
+                Some(clock) => {
+                    let _ = pwm.set_pwm(clock as u32, value);
+                }
+                None => {
+                    let _ = pwm.update_pwm(value);
+                }
+            }
         }
         let temp_diff = temp - state.smoothed_temp;
         let adj_time = (time_diff * self.inv_smooth_time).min(1.0);
@@ -1074,6 +1101,7 @@ impl PrinterHeaters {
 
         sensor.setup_minmax(min_temp, max_temp);
 
+        let pwm_delay = sensor.get_report_time_delta();
         let heater = Arc::new(Heater {
             name: short_name.clone(),
             section_name: identifier,
@@ -1084,6 +1112,7 @@ impl PrinterHeaters {
             min_extrude_temp,
             max_power,
             inv_smooth_time: 1.0 / smooth_time,
+            pwm_delay,
             state: Mutex::new(HeaterState {
                 target_temp: 0.0,
                 last_temp: 0.0,
@@ -1367,6 +1396,9 @@ mod tests {
     impl Sensor for FakeSensor {
         fn setup_minmax(&self, _min_temp: f64, _max_temp: f64) {}
         fn setup_callback(&self, _callback: SensorCallback) {}
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
     /// A sensor whose readings the test delivers by hand.
@@ -1397,6 +1429,10 @@ mod tests {
         fn setup_callback(&self, callback: SensorCallback) {
             *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
         }
+
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
     /// A PWM that accepts everything, and records the `max_duration` limits it
@@ -1407,6 +1443,10 @@ mod tests {
         /// When set, this PWM's chip dates its print time this much ahead of the
         /// host instant — see [`NoopChip::print_time_offset`].
         print_time_offset: Option<f64>,
+        /// When set, this PWM dates changes by print time instead of sending
+        /// them immediately: `print_time_to_clock` answers `print_time * freq`
+        /// and `set_pwm` records `(clock, value)` here.
+        clocked: Option<(f64, Arc<Mutex<Vec<(u32, f64)>>>)>,
     }
 
     impl PwmOut for FakePwm {
@@ -1418,7 +1458,12 @@ mod tests {
         }
         fn setup_cycle_time(&self, _cycle_time: f64, _hardware: bool) {}
         fn setup_start_value(&self, _start: f64, _shutdown: f64) {}
-        fn set_pwm(&self, _clock: u32, _value: f64) -> Result<(), McuError> {
+        fn set_pwm(&self, clock: u32, value: f64) -> Result<(), McuError> {
+            if let Some((_, log)) = &self.clocked {
+                log.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((clock, value));
+            }
             Ok(())
         }
         fn update_pwm(&self, _value: f64) -> Result<(), McuError> {
@@ -1426,6 +1471,10 @@ mod tests {
         }
         fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
             Ok(clock)
+        }
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            let (freq, _) = self.clocked.as_ref()?;
+            Some((print_time * freq).max(0.0) as u64)
         }
         fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
             self.print_time_offset.map(|offset| eventtime + offset)
@@ -1442,6 +1491,11 @@ mod tests {
         /// host instant plus this (a chip whose print time has drifted from the
         /// host's clock); `None` is the trait's no-clock default.
         print_time_offset: Option<f64>,
+        /// When set, this chip's PWMs date changes by print time at this
+        /// frequency, and record them in [`Self::pwm_calls`].
+        clock_freq: Option<f64>,
+        /// Every `(clock, value)` a print-time-dated PWM change carried.
+        pwm_calls: Arc<Mutex<Vec<(u32, f64)>>>,
     }
 
     impl PinChip for NoopChip {
@@ -1453,6 +1507,9 @@ mod tests {
             Ok(Arc::new(FakePwm {
                 max_durations: Arc::clone(&self.pwm_log),
                 print_time_offset: self.print_time_offset,
+                clocked: self
+                    .clock_freq
+                    .map(|freq| (freq, Arc::clone(&self.pwm_calls))),
             }))
         }
     }
@@ -1509,6 +1566,17 @@ mod tests {
         };
         let printer = ready_printer_with(chip, Arc::clone(&reactor) as Arc<dyn Reactor>);
         (printer, reactor)
+    }
+
+    /// As [`ready_printer`], over a chip whose PWM dates changes by print time,
+    /// also returning the `(clock, value)` pairs those changes carried.
+    fn printer_with_dated_pwm(freq: f64) -> (Arc<Printer>, Arc<Mutex<Vec<(u32, f64)>>>) {
+        let chip = NoopChip {
+            clock_freq: Some(freq),
+            ..NoopChip::default()
+        };
+        let calls = Arc::clone(&chip.pwm_calls);
+        (ready_printer_with(chip, ManualReactor::shared()), calls)
     }
 
     #[test]
@@ -1877,6 +1945,40 @@ mod tests {
         heater.temperature_callback(1.0, 210.0);
 
         assert_eq!(heater.get_temp(1_000.0), (210.0, 200.0));
+    }
+
+    /// `heaters.py:32,79`: a PWM change is dated one **report period** after the
+    /// reading it came from, never at "now". An immediate change is dated with
+    /// the host's clock estimate, and a clock the firmware is already past is
+    /// its `Timer too close` shutdown (measured on a real F103 with
+    /// `[heater_generic]`: shutdown at 3.28 s, the pin's `MAX_HEAT_TIME`
+    /// auto-off).
+    #[test]
+    fn test_a_pwm_change_is_dated_one_report_period_ahead() {
+        // The chip counts 1e6 ticks per second, so print time maps to a clock
+        // by multiplying.
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(1.0);
+        heater.temperature_callback(1.0, 20.0);
+
+        let calls = calls.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(calls.len(), 1, "one change per reading: {:?}", *calls);
+        // `FakeSensor`'s report period is 0.3 s: 1.0 + 0.3 at 1e6 ticks/s.
+        assert_eq!(calls[0].0, 1_300_000);
+        // A cold heater with a target: the control asks for full power.
+        assert_eq!(calls[0].1, 1.0);
+    }
+
+    /// The delay is the sensor's, not a constant: a heater over a slower sensor
+    /// dates its change further ahead (`heaters.py:32` reads
+    /// `sensor.get_report_time_delta()`).
+    #[test]
+    fn test_the_pwm_delay_is_the_sensors_report_period() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+
+        assert_eq!(heater.pwm_delay, 0.3);
     }
 
     /// `statistics.py:53-73` calls `Heater.stats` once a second, which stamps

@@ -210,13 +210,13 @@ pub struct TemperatureMCUSensor {
 
 impl TemperatureMCUSensor {
     /// Forward one ADC report as a temperature.
-    fn handle_adc_report(&self, samples: &[(u64, f64)]) {
+    fn handle_adc_report(&self, samples: &[(f64, f64)]) {
         let (read_time, read_value) = samples[samples.len() - 1];
         let Some(calibration) = *self.calibration.lock().unwrap() else {
             return;
         };
         let temp = calibration.calc_temp(read_value);
-        let time = read_time as f64 + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
+        let time = read_time + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
         if let Some(cb) = self.callback.lock().unwrap().as_mut() {
             cb(time, temp);
         }

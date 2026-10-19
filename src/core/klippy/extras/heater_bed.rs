@@ -212,7 +212,7 @@ mod tests {
         // `M140` returns at once: the target is set but the bed is still cold.
         gcode.run_script("M140 S60").await.unwrap();
         assert_eq!(bed.heater().get_status()["target"], 60.0);
-        assert!(bed.heater().get_temp().0 < 58.0);
+        assert!(bed.heater().get_temp(0.0).0 < 58.0);
 
         // `M190` waits: the call does not return until the feeder has brought
         // the bed within `max_delta` of the target.  The wait is bounded so a
@@ -227,6 +227,6 @@ mod tests {
         assert_eq!(bed.heater().get_status()["target"], 60.0);
         // The wait loop ran: the bed heated to within `max_delta` (2 °C) of
         // the target.
-        assert!(bed.heater().get_temp().0 >= 58.0);
+        assert!(bed.heater().get_temp(0.0).0 >= 58.0);
     }
 }

@@ -67,6 +67,14 @@ const MAX_HEAT_TIME: f64 = 3.0;
 /// [`MAX_HEAT_TIME`] covers the host that exits; this one covers the host that
 /// hangs.
 const MAX_MAINTHREAD_TIME: f64 = 5.0;
+/// How long a reading stays trusted after it was taken (upstream
+/// `QUELL_STALE_TIME`, `heaters.py:18`).
+///
+/// A sensor that stopped reporting leaves its last reading behind; past this
+/// age [`Heater::get_temp`] answers `0` instead of that reading, so
+/// `verify_heater` sees a cold, unresponsive heater rather than a warm one that
+/// merely froze (`heaters.py:116-122`).
+const QUELL_STALE_TIME: f64 = 7.0;
 /// The temperature the PID's first derivative is measured against
 /// (upstream `AMBIENT_TEMP`, `heaters.py:15`).
 const AMBIENT_TEMP: f64 = 25.0;
@@ -115,11 +123,8 @@ pub trait GcodeTempSensor: Send + Sync {
 }
 
 impl GcodeTempSensor for Heater {
-    fn get_temp(&self, _eventtime: f64) -> (f64, f64) {
-        // The existing `Heater::get_temp` does not take `eventtime` — the
-        // stale-reading check upstream does (`QUELL_STALE_TIME`) needs a
-        // print-time clock this host does not have (see `Heater::get_temp`).
-        self.get_temp()
+    fn get_temp(&self, eventtime: f64) -> (f64, f64) {
+        self.get_temp(eventtime)
     }
 }
 
@@ -427,19 +432,22 @@ impl Heater {
         state.control.check_busy(state.smoothed_temp, target)
     }
 
-    /// What `verify_heater` reads each second (`Heater.get_temp`).
+    /// What `verify_heater` reads each second (`Heater.get_temp`,
+    /// `heaters.py:116-122`).
     ///
-    /// Upstream returns `(0., target)` when the newest reading is older than
-    /// `QUELL_STALE_TIME` (7 s), so a sensor that went quiet counts as a cold
-    /// heater (`heaters.py:18,116-122`). That comparison needs the reading's
-    /// time and `estimated_print_time(eventtime)` on one clock, which this host
-    /// does not have: the ADC sensors pass the raw firmware clock through
-    /// (`pins.rs:220-225`, `adc_temperature.rs:710`) while the serial ones map
-    /// theirs with `clock_to_print_time` (`ds18b20.rs:250`). The smoothed
-    /// temperature is returned as it stands; see the `verify_heater` module
-    /// docs for what that changes.
-    pub fn get_temp(&self) -> (f64, f64) {
+    /// A reading older than [`QUELL_STALE_TIME`] reports as `(0., target)`: a
+    /// sensor that went quiet must look like a cold heater, not like a warm one
+    /// holding its last value. The age is measured in the PWM chip's print time
+    /// — the same clock the readings are dated in since the ADC layer converted
+    /// its samples — so a heater whose pin has no chip clock to answer with
+    /// keeps the reading it has (there is no clock to age it against).
+    pub fn get_temp(&self, eventtime: f64) -> (f64, f64) {
         let state = self.lock();
+        if let Some(print_time) = self.pwm_estimated_print_time(eventtime) {
+            if state.last_temp_time < print_time - QUELL_STALE_TIME {
+                return (0.0, state.target_temp);
+            }
+        }
         (state.smoothed_temp, state.target_temp)
     }
 
@@ -1208,7 +1216,7 @@ impl WaitSensor {
     /// `lookup_object` has.
     fn get_temp(&self, eventtime: f64) -> Result<f64, CommandError> {
         match self {
-            Self::Heater(heater) => Ok(heater.get_temp().0),
+            Self::Heater(heater) => Ok(heater.get_temp(eventtime).0),
             Self::Object { name, object } => object
                 .get_status(eventtime)
                 .get("temperature")
@@ -1830,6 +1838,47 @@ mod tests {
         assert_eq!(heater.get_status()["power"], 1.0);
     }
 
+    /// `heaters.py:18`: a reading is trusted for upstream's 7 s.
+    #[test]
+    fn test_the_quell_age_is_upstreams_seven_seconds() {
+        assert_eq!(QUELL_STALE_TIME, 7.0);
+    }
+
+    /// `heaters.py:116-122`: a sensor that went quiet reports `(0., target)` —
+    /// exactly seven seconds old is still trusted, a hair older is not, and the
+    /// target survives the quell so `verify_heater` keeps checking the same
+    /// heater.
+    #[test]
+    fn test_a_quiet_sensor_quells_to_zero_after_seven_seconds() {
+        // The chip's print time is the host instant, so the ages below are the
+        // eventtime differences.
+        let (printer, _reactor) = printer_with_print_time_offset(0.0);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(10.0);
+        heater.temperature_callback(10.0, 210.0);
+
+        // Exactly `QUELL_STALE_TIME` old: still the reading.
+        assert_eq!(heater.get_temp(17.0), (210.0, 200.0));
+        // A hair past it: the reading is quelled, the target is not.
+        assert_eq!(heater.get_temp(17.000_001), (0.0, 200.0));
+        // A fresh reading is trusted again.
+        heater.temperature_callback(18.0, 205.0);
+        assert_eq!(heater.get_temp(18.5), (205.0, 200.0));
+    }
+
+    /// Without a chip clock there is no age to judge, so the reading stands.
+    /// Upstream has no such heater (its `mcu_pwm.get_mcu()` always answers);
+    /// this host's no-clock stand-ins do, and a quell invented from `eventtime`
+    /// would compare two different clocks.
+    #[test]
+    fn test_a_heater_without_a_chip_clock_keeps_its_reading() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+        heater.temperature_callback(1.0, 210.0);
+
+        assert_eq!(heater.get_temp(1_000.0), (210.0, 200.0));
+    }
+
     /// `statistics.py:53-73` calls `Heater.stats` once a second, which stamps
     /// every heater with its PWM chip's `estimated_print_time(eventtime) + 5`
     /// (`heaters.py:137-140`). The chip here runs 100 s ahead of the host clock,
@@ -1943,11 +1992,11 @@ mod tests {
             .unwrap();
 
         // Nothing read yet, nothing asked for.
-        assert_eq!(heater.get_temp(), (0.0, 0.0));
+        assert_eq!(heater.get_temp(0.0), (0.0, 0.0));
         // One reading smooths to itself (`smooth_time` 1 s).
         heater.temperature_callback(1.0, 20.0);
         heater.set_temp(200.0).unwrap();
-        assert_eq!(heater.get_temp(), (20.0, 200.0));
+        assert_eq!(heater.get_temp(0.0), (20.0, 200.0));
     }
 
     /// A bed plus an option-less `[verify_heater heater_bed]`.

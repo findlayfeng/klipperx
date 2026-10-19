@@ -313,19 +313,25 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 - [ ] **现状**：`info` 里这个字段只被 Moonraker 使用，且它把它当 Klipper 的
       virtualenv 解释器（`update_manager/app_deploy.py` 的 `_configure_virtualenv`），
-      因此我们的主机目前只能报一个**不存在的路径**（让它的 Klipper 更新项退化为
-      no-op），不能报自己的二进制（会让 Moonraker 报 `Invalid virtualenv` 而起不来）。
+      因此 `python_path` 目前只能报一个**不存在的路径**（让它的 Klipper 更新项退化为
+      no-op），不能报自己的二进制（会让 Moonraker 报 `Invalid virtualenv` 起不来）。
       字段本身还必须存在：它直接下标取 `self._klippy_info["python_path"]`
-      （`klippy_connection.py` 的 `_save_path_info`）。
+      （`klippy_connection.py` 的 `_save_path_info`）。姊妹字段 `klipper_path` 已于
+      2026-10-19 起报**真实存在的释放根**（`src/assets.rs`，见 api-reference）。
 - [ ] **想做的**：这是一个 Klipper 实现细节，本主机没有解释器也没有 Klipper 源码树，
       报一个不存在（或任何）路径都是在编数据；理想是**取消**这个字段。
-- [x] **（2026-10-18 对 Moonraker 源码复核后的结论：现在是「不要做」）** 两个路径字段
-      （`klipper_path` **与** `python_path`）都不能删、也不能填真路径：`_save_path_info` 对两个键
-      都是**无默认下标**（`klippy_connection.py:352-354`），`KeyError` 不在 `:418-427` 的
-      `except ServerError` 内 → 初始化任务静默死、socket 连着但 `klippy_state` 永远 `startup`、
-      **不重连**；报真的 venv 则 `update_manager/app_deploy.py:96-113` 抛 `Invalid virtualenv`
-      直接起不来。现有「两个不存在的路径」是唯一正确取值，已加回归守卫钉住
-      （`info.rs` 的 `test_the_two_klipper_paths_are_present_and_do_not_exist`，并断言不得等于
+- [x] **（2026-10-18 对 Moonraker 源码复核；2026-10-19 随内置资产特性修订）** 两个键都**不能删**：
+      `_save_path_info` 对两个键都是**无默认下标**（`klippy_connection.py:352-354`），`KeyError`
+      不在 `:418-427` 的 `except ServerError` 内 → 初始化任务静默死、socket 连着但
+      `klippy_state` 永远 `startup`、**不重连**。填真值的边界现在**分字段**：`python_path`
+      **不能**填真值（真 venv 形状 → `update_manager/app_deploy.py:96-113` 抛
+      `Invalid virtualenv` 起不来，非 venv 真解释器同理）；`klipper_path` **可以**填真值，
+      但必须是**非 git 的释放根**——`_set_klipper_repo` 的 `AppType.detect` 只看
+      `<path>/.git` 且**不看 env**，指向真源码检出会把更新项升成 `GitDeploy`（真
+      fetch/reset/重启服务），而 `assets.rs` 释放的根恒无 `.git` ⇒ 仍是 `BaseDeploy`。
+      回归守卫已随实现改名（`info.rs` 的
+      `test_klipper_path_is_the_start_args_value_and_python_stays_absent`：`klipper_path`
+      等于 `StartArgs` 携带的释放根、`python_path` 断言不得等于
       `CARGO_MANIFEST_DIR`/`current_exe()`）。只有当上游把那两处下标改成 `.get()` 时才能动。
 - [ ] **阻塞在外部**：取消会让 Moonraker 的 `_save_path_info` 抛 `KeyError`（不在它的
       `except ServerError` 里），连接任务出错、它反复重连。上游把下标取值改成

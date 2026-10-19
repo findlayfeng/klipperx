@@ -95,10 +95,14 @@ $ klipperx klippy ~/printer_data/config/printer.cfg \
 | `--logfile <data_path>/logs/klippy.log` | **不给就 `info.log_file = null`**，`/server/files/klippy.log` 会 404，Mainsail 的日志页空着（日志同时不落盘） |
 | `[virtual_sdcard] path: <data_path>/gcodes` | 与 Moonraker 的 `gcodes` 根不一致只加一条 `gcode_path` 警告，不阻功能；但两边不一致时上传的文件本机看不到 |
 
-`info` 里的 `klipper_path` / `python_path` 报的是两个**不存在**的路径，这是**故意的**、不要“修”：
+`info` 的 `python_path` 报的是**不存在**的路径，这是**故意的**、不要“修”：
 Moonraker 对这两个键无默认下标（`klippy_connection.py:352-354`），缺了会静默卡在 `startup` 且不重连；
 而报真的 venv 会让它的 Klipper 更新项直接报 `Invalid virtualenv` 起不来了（上游 `app_deploy.py:96-113`）。
 代价只是 Moonraker 的「更新」面板对 Klipper 一项退化为 no-op（已登记 `TODO.md` E2）。
+`klipper_path` 则是**真实存在的释放根**（2026-10-19 起）：构建期把上游 `config/`、本项目用户手册与上游文档
+（放 `docs/klipper/` 子路径）嵌进二进制，启动时按 `$RUNTIME_DIRECTORY` → `$XDG_RUNTIME_DIR/klipperx` →
+`/tmp/klipperx-<uid>` 三级链释放（**回落只因未配置；前两级配置了却不可写 ⇒ 启动报错退出**）；Moonraker 的
+「示例配置」与「文档」两个静态目录就注册自这个根。项目路径约定：需持久化的放 home、不需持久化的走这条释放链。
 
 本仓不实现行协议输入，连带没有：`ok` 应答行、`gcode:debuginput_exit` 事件、`stats`/`gcodein`
 计数。逐条登记见开发手册的[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
@@ -141,7 +145,7 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
 - 这个选项属于 `klipperx`，**独立二进制 `klippy` 没有它**：窗口是客户端，会带进
   一整套终端界面库，而只负责提供 API 的 `klippy` 用不到 —— 不装它的 `klippy`
-  因此小一号（release 16.1 MB，带窗口的 `klipperx` 是 18.3 MB，2026-10-03 实测）。要在独立主机上加
+  因此小一号（release 24.3 MB，带窗口的 `klipperx` 是 27.5 MB，2026-10-19 实测）。要在独立主机上加
   窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在

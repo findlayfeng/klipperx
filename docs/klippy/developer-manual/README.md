@@ -125,7 +125,7 @@ klipperx（bin，src/main.rs）
 - **终端还原放在 `TerminalGuard` 的 Drop 里**：窗口任务是被 abort 的（主机先退出
   时），futures 被丢弃不会执行后面的清理。
 
-它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 63.5 MB / release 3.9 MB，而 `klipperx` 是 debug 242.4 MB / release 18.3 MB（2026-10-03 实测）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
+它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 72.4 MB / release 4.1 MB，而 `klipperx` 是 debug 290.5 MB / release 27.5 MB（2026-10-19 实测；两个主机二进制含 build.rs 嵌入的 config/docs 资产 6.6 MB，`klippy-client` 不含）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构
 
@@ -495,20 +495,21 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
 | `ui/` | 便利启动的两个服务：`klipperx mainsail`（静态托管；站点三层 `--dir` → **编进二进制的那份** → `third_party/mainsail/dist`，**不在本机编译前端**；`build.rs` 扫 `assets/mainsail/` 生成 `EMBEDDED_MAINSAIL`（`include_bytes!` 静态表，目录缺失或为空即 `None`））与 `klipperx moonraker`（自管 venv：`<venv>/klipperx-requirements.sha256` 记依赖表哈希，缺失或不一致才 `pip install`；源码解析 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ 子模块）。HTTP 静态服务用现有 tokio 手写（不引入 crate）。**这是快速起环境的便利通道，不是生产部署路径**；发布时 `cp -r third_party/mainsail/dist/. assets/mainsail/ && cargo build --release`（`assets/mainsail/` 不入库） |
 | `version.rs` | 本机上报的版本串 `version::software_version()` = **编译期钉死的上游基线** `UPSTREAM_KLIPPER_VERSION`（`v0.13.0-734-gfe4eb86`，上游 `git describe --tags --long` 的形状：标签 `v0.13.0` + 自标签起 **734** 个上游提交 + 基线提交 `fe4eb86`）+ `-` + `CARGO_PKG_VERSION`（暂不管理，`0.1.0`）。上游是运行时 `git describe --always --tags --long --dirty` 算出来的（`klippy/klippy.py:310-335`、`klippy/util.py:195-225`），本仓 worktree 里子模组是空目录、且本地克隆**一个标签都没有**（本地 describe 只会退回裸 sha），所以改为编译期钉死——重算步骤（基线提交、标签、计数双源核对）写在常量注释里。消费方：`api/start_args.rs`（`info` 的 `software_version`）、`printer.rs` 的默认值、`gcode.rs` 的 `M115` 兜底；启动横幅 `Versions: klipperx …` 仍报 crate 版本（那是 klipperx 自己的版本，不是被复刻的 klipper） |
+| `assets.rs` | 内置资产的构建期嵌入与启动释放：`build.rs` 扫三棵树（上游 `config/` → `config/`、本项目用户手册 → `docs/`、上游 `docs/` → `docs/klipper/`；索引 `docs/README.md` 由构建期生成、顶替源 README）生成 `$OUT_DIR/assets_tree.rs`（`ASSET_FILES` + `ASSETS_FNV64`）；`release()` 按 **`$RUNTIME_DIRECTORY`（取 `:` 首段、原样使用）→ `$XDG_RUNTIME_DIR/klipperx` → `/tmp/klipperx-<uid>`** 三级链找释放基址（**回落只因「未配置」；配置了却不可写 ⇒ `ReleaseError`，`klippy` 启动报错退出，不回退**），幂等（`assets-<fnv64>` 已完整即零 IO）、原子写（`.assets-tmp-<pid>` + `rename`，争抢=采纳、空树=治愈重试一次）、权限显式 0755/0644（不靠 umask）、GC 只清 mtime>1h 的旧树。释放根即 `info` 的 `klipper_path`（`StartArgs` 第三参；生产唯一调用点 `src/klippy.rs` 在 reactor/UDS 之前）；`python_path` 仍报假值，释放根**永不带 `.git`**（双保险：Moonraker 的 Klipper 更新项恒为 `BaseDeploy`）。12 测 |
 
 ## 二进制
 
 | 二进制 | 入口 | 是什么 |
 |--------|------|--------|
 | `klipperx` | `src/main.rs` | 项目的 CLI：跑主机（默认，也写作 `klippy`）、`api`、`console` |
-| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`）；没有 `--tui`，不链接客户端与终端库（release 16.1 MB vs `klipperx` 18.3 MB，2026-10-03 实测） |
+| `klippy` | `src/bin/klippy/main.rs` | 只有主机，等价于 `klipperx klippy`（名字取自上游的 `klippy.py`）；没有 `--tui`，不链接客户端与终端库（release 24.3 MB vs `klipperx` 27.5 MB，2026-10-19 实测，两者都含嵌入的 config/docs 资产 6.6 MB） |
 | `klippy-client` | `crates/klippy-client/src/main.rs` | 只有客户端，等价于 `klipperx api` / `klipperx console`；**自成一个包**，不编主机 |
 
 `klipperx` 的顶层参数里嵌着一份 `AppArgs`（`Option<AppArgs>`，与 `klippy` 子命令同一类型、`args_conflicts_with_subcommands` 保证两者不能混用），所以不带子命令时 `klipperx printer.cfg` 就是 `klipperx klippy printer.cfg`。那个 `Option` 不是为了可空：clap 只有在整组参数可选时才会放过组内必填项（配置文件），否则 `klipperx api …` 会来要一个它根本不需要的配置文件。
 
 参数定义全在库里（`klippy::AppArgs`、`klippy_client::{ApiArgs, ConsoleArgs}`），二进制只做三件事：解析命令行、装日志、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
 
-`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 63.5 MB vs 242.4 MB、release 3.9 MB vs 18.3 MB，2026-10-03）。
+`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 72.4 MB vs 290.5 MB、release 4.1 MB vs 27.5 MB，2026-10-19）。
 
 ## 目录
 

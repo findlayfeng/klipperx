@@ -130,6 +130,11 @@ Printer.__init__          _connect（reactor 回调）                 对象图
 
 任一步失败都按异常类型写入状态；进程随后退出或等待重启。出处：`klippy/klippy.py:128-168`。
 
+进程进入这套时序**之前**还有一道本仓的自检：`src/klippy.rs` 先 `assets::release()`（见[零散顶层文件](README.md)
+的 `assets.rs`）——把构建期嵌入的 config/docs 资产按 `$RUNTIME_DIRECTORY` → `$XDG_RUNTIME_DIR/klipperx` →
+`/tmp/klipperx-<uid>` 释放到磁盘，供 `info` 的 `klipper_path` 上报；**配置了的路径不可写在这里就报错退出**，
+不会带病跑到 Moonraker 去弹 warning。
+
 ## 配置装载与对象模型
 
 ```

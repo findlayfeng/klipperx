@@ -270,7 +270,6 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 - [ ] 固件 **buttons 查询**（`config_buttons` / `buttons_add` / `buttons_query` / `buttons_ack`）——
       宿主注册表已在，没有发送方。
-- [ ] `tmcuart`（`src/tmcuart.c`）——宿主资源层与 `extras/tmc_uart.rs` 已在，按 H5 余项接。
 - [ ] `sdcard` / `sdio`、`lcd_hd44780` / `lcd_st7920`、`initial_pins`。
 - 这些是 extras，不阻塞运动；消费者见 H5（TMC/tmcuart）、H6（加速度计）、
       H7（buttons/trigger_analog）、H8（lcd）。
@@ -642,8 +641,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       有意偏离一处（已登记）：注册中途失败时本仓收回半组命令并复位，上游会留下半个命令组（`upstream-deviations.md`）。
 - [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、
       `z_thermal_adjust`、`tuning_tower`（三者无文件、无 section，语料不覆盖）。
-- [x] 回零周边：`homing_override`（`extras/homing_override.rs`）与 `homing_heaters`（批 #31）均已落地；
-      事件 `probe:update_results` 已带载荷并触发（批 #36），`homing:*` 四个已随 toolhead 产线触发（见事件清单）。
+- [x] 回零周边：`homing_heaters`（批 #31）已落地；事件 `probe:update_results` 已带载荷并触发（批 #36），`homing:*` 四个已随 toolhead 产线触发（见事件清单）。
+- [ ] `homing_override` 的 **`G28` 包装未安装**：`extras/homing_override.rs` 只解析 `axes`/
+      `set_position_x/y/z`/`gcode` 三个选项（文件头已自陈），脚本体是宏模板、暂不渲染、
+      也不捕获 `G28`——**写了该节 `G28` 仍走正常归零**（`config.md` 同口径，H9 共担）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 
 ### H10 运动相关 extras
@@ -729,16 +730,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
         但在本仓 `BUFFER_TIME_START = 0.250` 远大于 `MIN_KIN_TIME + KIN_FLUSH_DELAY = 0.101` 的前提下
         **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
       **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
-
-- [ ] **Q12 rail 归零漏报「端停未触发」——安全相关（2026-10-06 真机用例 R4 暴露）**：
-      `extras/toolhead.rs` 的 `home_axis`（`home_wait` 在 `:3216`）与 `home_unified`（`:3110`）拿到 `trigger_time`
-      却**从不判断“有没有触发”**（只拿它记触发位置），于是端停坏掉/接错时 `G28` 会**走到 1.5× 强迫距离
-      撞进机械限位，然后报告成功并把轴标为已归零**。对照：**探针路径已做对**——`:3373-3376` 用
-      `trigger_time <= 0.0` 作哨兵并报 `No trigger on probe after full movement`；上游对轨道报
-      `homing.py:119` 的 `No trigger on <name> after full movement`。
-      **影响**：真机用例 R4 的「触碰即停 / 不撞机」半边只能人工看，正是因这条缺失；也是 R4 用例 doc 里
-      要求「建议临时调小 `homing_speed`」的原因。**已在修**（`agents/fix-homing-no-trigger`：两处加同一检查 +
-      先红后绿 + 正向对照）。
 
 - [x] **Q11 断环：已修（2026-10-06）** —— `VirtualSdCard` 与 `GCodeButton` 都持 `Arc<GCodeDispatch>`、
       又把**捕获 `Arc<Self>`** 的 handler 注册回它的命令/mux 表，于是命令表反向钉住部件：

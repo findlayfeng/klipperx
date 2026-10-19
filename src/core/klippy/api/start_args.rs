@@ -31,7 +31,8 @@ pub struct StartArgs {
     /// `None` until a `--logfile` exists: the host logs to stdout, and upstream
     /// reports `null` for exactly this case.
     pub log_file: Option<String>,
-    /// Version of the host software.
+    /// Version of the host software: the pinned upstream baseline plus this
+    /// crate's version ([`crate::version::software_version`]).
     pub software_version: String,
     /// CPU description, e.g. `"4 core ARMv7 Processor rev 4 (v7l)"`.
     pub cpu_info: String,
@@ -62,7 +63,7 @@ impl StartArgs {
         Self {
             config_file: config_file.into(),
             log_file,
-            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            software_version: crate::version::software_version(),
             cpu_info: cpu_info(),
             apiserver: None,
             start_reason: "startup".to_string(),
@@ -157,7 +158,7 @@ model name\t: ARMv7 Processor rev 4 (v7l)
 
         assert_eq!(args.config_file, "/tmp/printer.cfg");
         assert_eq!(args.log_file, None);
-        assert_eq!(args.software_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(args.software_version, crate::version::software_version());
         // The CPU description depends on the machine, so only its shape is
         // pinned here; `parse_cpu_info` above covers the text.
         assert!(args.cpu_info.contains("core"), "{}", args.cpu_info);

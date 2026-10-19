@@ -35,7 +35,7 @@
 //!     "group_id": 1000,
 //!     "log_file": null,
 //!     "config_file": "/home/pi/printer.cfg",
-//!     "software_version": "0.1.0",
+//!     "software_version": "v0.13.0-734-gfe4eb86-0.1.0",
 //!     "cpu_info": "4 core ARMv7 Processor rev 4 (v7l)"
 //!   }
 //! }
@@ -271,7 +271,8 @@ pub struct InfoResponse {
     pub log_file: Option<String>,
     /// Configuration file the host software was started with.
     pub config_file: String,
-    /// Version of the host software.
+    /// Version of the host software: the pinned upstream baseline plus this
+    /// crate's version ([`crate::version::software_version`]).
     pub software_version: String,
     /// CPU description, e.g. `"4 core ARMv7 Processor rev 4 (v7l)"`.
     ///

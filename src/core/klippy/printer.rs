@@ -363,7 +363,7 @@ impl Printer {
                 host_objects: None,
                 start_reason: None,
                 restart_hooks: None,
-                software_version: env!("CARGO_PKG_VERSION").to_string(),
+                software_version: crate::version::software_version(),
                 start_args: None,
             }),
             exit_requested: Condvar::new(),
@@ -462,7 +462,8 @@ impl Printer {
     ///
     /// Upstream reads `start_args['software_version']`; the host sets it from
     /// its [`crate::core::klippy::api::StartArgs`] at startup, and it defaults
-    /// to this crate's version so tests and the `M115` reply agree.
+    /// to [`crate::version::software_version`] — the pinned upstream baseline
+    /// plus this crate's version — so tests and the `M115` reply agree.
     pub fn software_version(&self) -> String {
         self.lock().software_version.clone()
     }
@@ -1577,7 +1578,10 @@ mod tests {
         // (`klippy/klippy.py:30`), where modules read them; the software version
         // inside is the one `M115` and `error_mcu` report.
         let printer = new_printer();
-        assert_eq!(printer.software_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            printer.software_version(),
+            crate::version::software_version()
+        );
         assert!(printer.start_args().is_none());
         assert!(!printer.is_fileoutput(), "no start args, no file output");
 

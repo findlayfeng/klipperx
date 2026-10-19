@@ -73,7 +73,7 @@ M112
 M115
 ```
 
-返回主机自己的版本号（启动参数 `software_version`，主机尚未设置时回退到 crate 版本）：
+返回主机自己的版本号（启动参数 `software_version`，主机尚未设置时回退到 `version.rs` 的同一串——上游基线 + `-` + crate 版本）：
 
 ```
 // FIRMWARE_NAME:Klipper FIRMWARE_VERSION:<version>

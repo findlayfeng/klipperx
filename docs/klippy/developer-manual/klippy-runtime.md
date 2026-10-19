@@ -26,7 +26,7 @@ main():
 ```
 
 `start_args` 携带 `config_file`、`apiserver`、`start_reason`、`debugoutput`，
-以及 `software_version`、`cpu_info`、`device`、`linux_version`（上游另有 `debuginput` 与每 MCU 的
+以及 `software_version`（值见 `src/version.rs`：编译期钉死的上游基线 + `-` + crate 版本）、`cpu_info`、`device`、`linux_version`（上游另有 `debuginput` 与每 MCU 的
 字典路径；本仓不实现文件输入与 `-d`，故两者都没有，见[本项目与上游的偏移](upstream-deviations.md)）。
 `RESTART` 与 `FIRMWARE_RESTART` 因此不是重启进程，而是换一个新的对象图在同一个进程里继续
 运行；每一轮（含每次 `RESTART`）都重新从磁盘读配置文件（`_connect` → `_read_config` →

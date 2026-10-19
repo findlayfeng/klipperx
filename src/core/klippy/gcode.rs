@@ -847,12 +847,13 @@ impl GCodeDispatch {
                     let printer = self.inner.printer.clone();
                     sync(move |gcmd: &GcodeCommand| {
                         // The host's own version, from the start arguments
-                        // (`start_args['software_version']`); the crate version
-                        // is the fallback before the host sets them.
+                        // (`start_args['software_version']`); the composed
+                        // upstream-plus-crate version is the fallback before
+                        // the host sets them.
                         let version = printer
                             .upgrade()
                             .map(|printer| printer.software_version())
-                            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                            .unwrap_or_else(crate::version::software_version);
                         let msg = format!("FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{version}");
                         gcmd.respond_info(&msg);
                         Ok(())

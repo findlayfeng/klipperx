@@ -410,7 +410,7 @@ identify 的命令**定义**（名称、参数、解码）与其它命令一样�
 | `mod.rs` | 说明主机侧与 API 的分界，把 `klippy-api` 的四个模块转出，并提供 `register`：一次把服务器这一侧（`webhooks` + 端点）装到机器上。端点来自各模块 `endpoint!` 声明生成的安装函数表（[声明式表生成](codegen.md)），`register` 只负责先装 `webhooks` 再遍历该表；mux 注册在建表这一刻从 `webhooks` 的 pending **抽干一次**（此后模块直连表）——所以 `register` 每进程只调一次，`Api`/`Server` 不重建 |
 | `endpoints/` | 一个端点一个文件：`info.rs`、`emergency_stop.rs`、`objects_list.rs`、`objects_query.rs`、`objects_subscribe.rs`、`gcode.rs`、`query_endstops.rs`、`register_remote_method.rs`、`pause_resume.rs`、`bed_mesh_dump.rs`（共 16 条注册路径 + 内建 `list_endpoints` = 17 条，见 `api/mod.rs` 的测试断言）；参数、响应形状、handler 与安装函数都在各文件里。`objects/query` 与 `objects/subscribe` 共用字段选择（`select_fields` / `status_object`），`gcode/*` 按请求从 `printer` 里取 `gcode`（例外：`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时直接 `request_exit`，让配置没装载成功时仍能重启）。未实现的表面（其余 `*/dump_*`）见 `endpoints/mod.rs` 的状态表 |
 | `webhooks.rs` | 服务器自己的打印机对象：名字与字段对齐上游 `webhooks.get_status`，读的是机器状态；同时是 mux 表的生命周期驱动者——初始装载缓冲 `pending`、`api::register` 只抽干一次、`set_api` 后直连注册、`release_cycles`（teardown）时 `clear_mux()`，两条路径共用 `check_mux_conflict` 的检查与文案 |
-| `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者 |
+| `start_args.rs` | 主机启动参数（`config_file` / `log_file` / `software_version` / `cpu_info`）：上游放在 printer 上（29 处 `get_start_args`），这里归主机侧，`info` 是第一个消费者；`software_version` 的值取自 `version.rs`（编译期钉死的上游基线 + `-` + crate 版本） |
 
 API 本身在 `crates/klippy-api/src/`：
 
@@ -493,6 +493,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 | `mathutil.rs` | 运动栈共用的数值帮助（`Coord` 等，上游散在 `gcode.py`），以及 `coordinate_descent`（上游 `mathutil.py:16-49` 的近似最小二乘：步长 `1.0` 起、`>1e-5` 与万轮上限、改善 `*1.1`/不改善 `*0.9`）——H9 调平族 `z_tilt`/`bed_tilt` 平面拟合的依赖 |
 | `upstream.rs` | 上游 `.test` 语料的 harness（`#[cfg(test)]`）：语料解析、缺口报告、`IGNORED` 守卫、端到端运行，见[回归测试](regression-tests.md) |
 | `ui/` | 便利启动的两个服务：`klipperx mainsail`（静态托管；站点三层 `--dir` → **编进二进制的那份** → `third_party/mainsail/dist`，**不在本机编译前端**；`build.rs` 扫 `assets/mainsail/` 生成 `EMBEDDED_MAINSAIL`（`include_bytes!` 静态表，目录缺失或为空即 `None`））与 `klipperx moonraker`（自管 venv：`<venv>/klipperx-requirements.sha256` 记依赖表哈希，缺失或不一致才 `pip install`；源码解析 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ 子模块）。HTTP 静态服务用现有 tokio 手写（不引入 crate）。**这是快速起环境的便利通道，不是生产部署路径**；发布时 `cp -r third_party/mainsail/dist/. assets/mainsail/ && cargo build --release`（`assets/mainsail/` 不入库） |
+| `version.rs` | 本机上报的版本串 `version::software_version()` = **编译期钉死的上游基线** `UPSTREAM_KLIPPER_VERSION`（`v0.13.0-734-gfe4eb86`，上游 `git describe --tags --long` 的形状：标签 `v0.13.0` + 自标签起 **734** 个上游提交 + 基线提交 `fe4eb86`）+ `-` + `CARGO_PKG_VERSION`（暂不管理，`0.1.0`）。上游是运行时 `git describe --always --tags --long --dirty` 算出来的（`klippy/klippy.py:310-335`、`klippy/util.py:195-225`），本仓 worktree 里子模组是空目录、且本地克隆**一个标签都没有**（本地 describe 只会退回裸 sha），所以改为编译期钉死——重算步骤（基线提交、标签、计数双源核对）写在常量注释里。消费方：`api/start_args.rs`（`info` 的 `software_version`）、`printer.rs` 的默认值、`gcode.rs` 的 `M115` 兜底；启动横幅 `Versions: klipperx …` 仍报 crate 版本（那是 klipperx 自己的版本，不是被复刻的 klipper） |
 
 ## 二进制
 

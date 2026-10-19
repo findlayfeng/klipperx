@@ -444,13 +444,20 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 - [x] **`TURN_OFF_HEATERS` 与固件加热看门狗（2026-10-18）**：`TURN_OFF_HEATERS` 已注册（ready 表，文案同上游 `heaters.py:319`），遍历全部 heater 置 0；`setup_max_duration` 改回上游的 `MAX_HEAT_TIME = 3.0`（此前是 0.0，宿主挂住时固件不拿口）。**`set_pwm` 的两半已于 2026-10-19 全部到位**：`target_temp <= 0 ⇒ 0` 与 `read_time > verify_mainthread_time ⇒ 0`（截止戳 = 1 s 定时器打的 PWM 芯片 print time + 5 s），另补了 `get_temp` 的 7 s 陈旧压制（`QUELL_STALE_TIME`）——两者都要求读数与 print time 同域，由同批的 ADC 样本时间统一解锁。
 
-- [ ] **会话中途 MCU 复位后 `serial::attach` 不重试 EIO（2026-10-19 实测）**：
-      真机 R3（`endstop` lane）在"固件带着另一套配置"时会 `reset` 掉 MCU 再重连，而 USB-CDC 板
-      复位即**重新枚举**（`ttyACM0 → ttyACM1`），此时 `serial::attach` 的 SET_NODEID 握手写进旧节点，
-      直接以 `serial write … Input/output error (os error 5)` 失败，而不是像 `SerialDevice::open_retrying`
-      那样把 EIO 当"端口走了"继续等到超时。影响所有走共享/mux 路径的 USB 板（桥固件尤甚）。
-      修法：附件握手期间的 I/O 错误按 `ASSIGN_ATTACH_TIMEOUT` 重试（按路径重新解析 by-id 软链）。
-      现场：R1/R2/R5/R11 不受影响（它们不重配板子）；R3 的 `configure_taking_over` 会。
+- [ ] **共享/mux 串口在"复位后重新枚举"下有两处缺口（2026-10-19 核实到行号）**：
+      现场：真机 R3 在"固件带着另一套配置"时 `reset` 掉 MCU 再重连，USB-CDC 板随即重新枚举
+      （`ttyACM0 → ttyACM1`），重连以 `serial write … Input/output error (os error 5)` 失败。
+      核实（读码，不是推断）：
+      ① `serial.rs:2631-2633` 的 SET_NODEID 只写**一次**，`write_unit(..)?` 把写错误直接抛出；
+         `:2642-2657` 的 assign 请求虽然重试 `ASSIGN_ATTACH_ATTEMPTS` 次，但**重试只覆盖"没应答"**
+         （超时），`write_unit(..)?` 的写错误同样立刻失败 ⇒ EIO 没有任何重试；
+      ② `serial.rs:1920-1927` `port_for` 的复用判据只有 `!stopped`，**不检查 tty 是否已被重新枚举**
+         （`devices/shared.rs` 文档里描述的 `usable` 谓词在串口上没有实现）⇒ 旧 fd 被复用。
+      **一个待确认的差异**（修之前先验）：klippy 主路径连续复位三次是通的（R2：763/763/765 ms），
+      因为它先 `previous.close()` 让最后一个 handle 归还 port、再重新 `open`（`object.rs:950-958`）；
+      而 lane 的 reopen 在旧 handle 还活着时就再 attach，可能因此命中缓存的失效 port。
+      修法：①写错误按 `ASSIGN_ATTACH_TIMEOUT` 重试（每次重新解析路径）；②`port_for` 的 usable
+      加"底层 fd 仍指向当前节点"判据。先做差异实验再改，避免修错层。
 
 - [ ] **`MAX_MAINTHREAD_TIME` 护栏在真实加热器上不可达（2026-10-19 真机结论，留作记录）**：
       klipper 的加热器一律软件 PWM（上游 `heaters.py:61` 也写死 `setup_cycle_time(pwm_cycle_time)`），

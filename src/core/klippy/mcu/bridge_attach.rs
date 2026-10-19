@@ -68,6 +68,7 @@ use crate::core::klippy::interface::devices::host::HostDevice;
 use crate::core::klippy::interface::devices::serial::{self, MUX_PORT_UNITS};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::printer::Printer;
+use crate::core::klippy::sleep_off_worker;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -473,7 +474,7 @@ pub(crate) fn open(
                 // next frame it sends is addressed to the new id. So this is a
                 // bounded grace the host cannot verify, exactly as the flash
                 // run's `ASSIGN_SETTLE` is after the assignment it makes.
-                std::thread::sleep(CAN_ASSIGN_SETTLE);
+                sleep_off_worker(CAN_ASSIGN_SETTLE);
             }
         }
     }

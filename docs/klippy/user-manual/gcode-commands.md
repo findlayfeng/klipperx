@@ -800,6 +800,21 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 
 ---
 
+### BED_MESH_CALIBRATE / PROFILE / OUTPUT / MAP / OFFSET — 网格床面（`[bed_mesh]`，2026-10-19）
+
+`BED_MESH_CALIBRATE` 探测网格并装载（`PROBE_PARAMS` 透传，外加 `PROFILE=`，默认 `default`：
+标定结束自动存该 profile）。其余四条是 profile 与网格输出的管理面，参数/文案对上游
+`bed_mesh.py:1741-286`：
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `BED_MESH_PROFILE` | `LOAD` / `SAVE` / `REMOVE` | 取第一个出现的参数；`SAVE=default` 报 `Profile 'default' is reserved, please choose another profile name.`；存于 `[bed_mesh <name>]`（`version: 1` + `points` + 网格参数），启动时读回但**不自动装载**，`SAVE_CONFIG` 才落盘 |
+| `BED_MESH_OUTPUT` | `PGP` | `PGP=1` 打探针点表（含 offset 调整列），否则打插值网格；无网格报 `Bed has not been probed` |
+| `BED_MESH_MAP` | — | `mesh_map_output <紧凑 JSON>`，payload `{mesh_min, mesh_max, z_positions}` |
+| `BED_MESH_OFFSET` | `X` / `Y` / **`ZFADE`** | 写进网格查找偏移（`ZFADE` 是 z 淡出偏移）；之后重锚 G-Code 坐标；无网格报 `No mesh loaded to offset` |
+
+> 注意 `BED_MESH_OFFSET` 的第三轴参数名是 **`ZFADE`**（上游同名），不是 `Z`。
+
 ### BED_TILT_CALIBRATE — 床面倾斜校准（`[bed_tilt]` 且写了 `points` 时才注册）
 
 逐点探测（或手动测点）拟合床面倾斜平面并应用到当前会话：更新 `x_adjust`/`y_adjust`/`z_adjust`

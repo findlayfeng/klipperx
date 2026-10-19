@@ -57,11 +57,10 @@
 //! `GCODE_AXIS` manual stepper does not yet (its module docs register that
 //! gap).
 //!
-//! # What is not here
-//!
-//! * `set_move_transform` is written and both `bed_tilt` (`bed_tilt.rs:376`) and
-//!   `exclude_object` (`exclude_object.rs:212`) already swap the target through
-//!   it; what is missing is upstream's `bed_mesh` itself.
+//! The move-transform slot itself is complete: `bed_mesh`
+//! (`bed_mesh.rs:1851`), `bed_tilt` (`bed_tilt.rs:376`) and `exclude_object`
+//! all take it through [`GCodeMove::set_move_transform`], and the last one
+//! chains over whatever it displaced.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -324,16 +323,24 @@ impl GCodeMove {
         Ok(object)
     }
 
-    /// Upstream's `set_move_transform`: take the slot `bed_mesh` fills, so
-    /// moves go through a transform instead of the toolhead.
+    /// Upstream's `set_move_transform` (`gcode_move.py:83-93`): take the slot
+    /// `bed_mesh` fills, so moves go through a transform instead of the
+    /// toolhead, and hand back the transform it displaced.
+    ///
+    /// The displaced occupant is what a chaining transform forwards to
+    /// (`exclude_object`'s `next_transform`, `exclude_object.py:38-57`).
+    /// Upstream returns the toolhead when the slot was still empty; here the
+    /// empty slot stays `None`, because a caller that chains already holds the
+    /// toolhead it captured at `klippy:connect`.
     ///
     /// # Errors
-    /// When something already took the slot and `force` is not set.
+    /// When something already took the slot and `force` is not set; the
+    /// occupant then stays put.
     pub fn set_move_transform(
         &self,
         target: Arc<dyn MoveTarget>,
         force: bool,
-    ) -> Result<(), ConfigError> {
+    ) -> Result<Option<Arc<dyn MoveTarget>>, ConfigError> {
         let mut slot = self
             .target
             .lock()
@@ -341,8 +348,7 @@ impl GCodeMove {
         if slot.is_some() && !force {
             return Err(ConfigError::new("G-Code move transform already specified"));
         }
-        *slot = Some(target);
-        Ok(())
+        Ok(slot.replace(target))
     }
 
     /// Upstream's `_handle_ready` (`gcode_move.py:58-64`): resolve the move
@@ -1580,9 +1586,45 @@ mod tests {
         let (_printer, _gcode, object, _target) = machine(Coord::default());
 
         let second = Arc::new(FakeTarget::new(Coord::default()));
-        let err = object.set_move_transform(second, false).unwrap_err();
+        let err = object
+            .set_move_transform(second, false)
+            .err()
+            .expect("the slot is taken");
 
         assert_eq!(err.to_string(), "G-Code move transform already specified");
+    }
+
+    /// Upstream's `set_move_transform` returns the occupant it displaced
+    /// (`gcode_move.py:83-93`) — `exclude_object` chains on that value — and a
+    /// refused (`force = false`) registration leaves the occupant in place.
+    #[test]
+    fn test_set_move_transform_returns_the_displaced_occupant() {
+        let (_printer, _gcode, object) = printer();
+
+        let first = Arc::new(FakeTarget::new(Coord::default()));
+        assert!(
+            object
+                .set_move_transform(Arc::clone(&first) as Arc<dyn MoveTarget>, false)
+                .unwrap()
+                .is_none(),
+            "an empty slot displaces nothing"
+        );
+
+        let second = Arc::new(FakeTarget::new(Coord::default()));
+        assert!(
+            object
+                .set_move_transform(Arc::clone(&second) as Arc<dyn MoveTarget>, false)
+                .is_err(),
+            "the slot is taken"
+        );
+        let displaced = object
+            .set_move_transform(Arc::clone(&second) as Arc<dyn MoveTarget>, true)
+            .unwrap()
+            .expect("the refused call left the first occupant in place");
+        assert!(Arc::ptr_eq(
+            &displaced,
+            &(Arc::clone(&first) as Arc<dyn MoveTarget>)
+        ));
     }
 
     #[test]

@@ -198,6 +198,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | 稳定化（**不动墙钟**） | 24 处固定 sleep → `wait_until`；2 条测试挂死面加 `timeout`；4 处 `thread::sleep` → `sleep_off_worker`；4 处无出口自旋加界 | 127.9 s | 3492 |
 | ① 预算缩短 | `PORT_RETURN_BUDGET`：等桥端口回来的预算在测试构建下 300 ms（生产仍 10 s） | **87.7 s** | 3494 |
 | ② 去掉一把锁 | 不需要 stderr 的 7 条 bridge 用例各自加载 `PrivateCopy` 私有 `.so`，不再持 `HOST_LIBRARY_TEST_LOCK` | **57.3 s** | 3494 |
+| ③ 内置资产特性 | 构建期嵌入 config/docs + 三级链释放 + `info` 报释放根（`assets.rs` 新增 12 测；嵌入 +6.6 MB 不影响墙钟） | **57.6 s** | 3506 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。
@@ -609,9 +610,10 @@ git config core.hooksPath .githooks
 | `registry.rs` | 路径唯一（普通端点与 mux 路径同一命名空间）、mux 各实例的 key 必须一致且 value 不重复、`list_endpoints` 排序并含 mux 路径、按名分发与未知方法报错、端点拿得到自己的连接、mux 按 key 选实例 / 缺 key / 未知值 / 非字符串值、注册 `None` 时 key 可省略；**运行期可变 mux 表**：建表后仍可 `register_mux`（`test_a_mux_endpoint_can_be_registered_after_the_registry_is_built`）、`clear_mux` 清空路径（`test_clear_mux_drops_every_instance`）并对每个实例调 `detach`（`test_clear_mux_detaches_every_instance`）、清空后同 `(path,value)` 换新 handler 再注册且分派到新的（`test_a_cleared_path_can_be_registered_again_with_a_new_handler`）、`mux_registrations` 报路径当前的 key 与实例值（`test_mux_registrations_reports_what_a_path_has`）；remote method 的模板合并推送、多连接、重复注册替换模板、已断开连接被清理、无活动连接与未注册两种错误 |
 | `server.rs` | **真 socket**：Unix 与 TCP 各一个往返、TCP 上报的 target 是绑定后的地址（不是 `:0`）、未知方法与 handler 失败都回 `error`、一次写里两条请求按序应答、跨 TCP 分段的消息只应答一次、两个客户端同时被服务。**socket 文件**：遗留文件名被 bind 替换成真 socket、server 被 abort 后文件消失。**单连接**（无 socket）：应答字段顺序（`id` 在前，靠不经 `Value` 直接序列化保证）、无 `id` 不应答、畸形消息被跳过而连接继续可用、推送与应答同样入队、连接关闭后不再入队、`push` 能唤醒等待方（用 `Notify`，带超时断言）、空发件箱 flush 直接成功、写不进去的客户端被 5 秒超时切断（用 `start_paused` 让暂停时钟直接跳过这 5 秒，无需真等） |
 | `error.rs` | `Bind` / `Connect` / `Io` 的 Display 直接给出调用处拼好的文本，`Closed` 给出固定文案 |
-| （主机侧）`endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`；**handler**：状态跟着机器（`startup`→`shutdown`）、四个 start args 与 `process_id` 真的进响应、`klipper_path` / `python_path` 非空且确实不存在 |
+| （主机侧）`endpoints/info.rs` | 端点路径、`client_info` 可省略且必须是对象、响应 12 个字段与文档逐个对齐、`log_file` 为 `None` 时是 `null` 而非缺字段、响应不回显 `client_info`；**handler**：状态跟着机器（`startup`→`shutdown`）、四个 start args 与 `process_id` 真的进响应、`klipper_path` 是真实释放根、`python_path` 非空且确实不存在 |
 | （主机侧）`api/start_args.rs` | CPU 描述的解析（processor 计数 + model name、缺 model 时问号）、`collect` 带上配置路径 / 版本、`log_file` 为 `None` |
 | （主机侧）`version.rs` | 上游半串是 `git describe --tags --long` 的形状（`<v标签>-<提交数>-g<7 位十六进制>`，提交数必须是数字）、报告串 = 上游基线 + `-` + `CARGO_PKG_VERSION` 且与 `StartArgs::collect` 收到的逐字相同（即 `info` 报的那份）（2 测） |
+| （主机侧）`assets.rs` | 释放链：RUNTIME_DIRECTORY 首段 / `XDG/klipperx` / `/tmp/klipperx-<uid>` 三级解析（空串=未配、相对路径→`ConfiguredInvalid`）、配置了不可写即 Err（0555 目录，root 自动跳过）、端到端释放布局（`config/`、`docs/` 手册 6 件齐全、`docs/klipper/`、生成的 README 含 `klipper/` 指路且与源 README 不同）、幂等且无 tmp 残留、并发完整树采纳 / 空树治愈、GC 删旧留新（12 测） |
 | （主机侧）`api/webhooks.rs` | 对象名是 `webhooks`、对象报的就是打印机状态（`startup` / `ready` / `shutdown` 三种都跟得上，因为它是读状态而不是存状态）；**mux 表生命周期**：`set_api` 后注册直连 `Api`（无需 drain）、`Printer::teardown` 经 `release_cycles` 清表并 `detach`，随后同 `(path, value)` 可重新注册（`test_a_registration_after_set_api_reaches_the_table_and_teardown_clears_it`）；两条装载路径的冲突检查与文案一致（`test_a_conflict_after_set_api_uses_the_same_message`） |
 | （主机侧）`api/mod.rs` | `register` 一次装完服务器这一侧：装完 `objects/list` 含 `webhooks`、端点表含 17 条路径（`info` / `emergency_stop` / `list_endpoints` / `objects/*` / 五个 `gcode/*` / `query_endstops/status` / `register_remote_method` / `pause_resume/*` / `bed_mesh/dump_mesh`）；装完后客户端能按名查到 `info`、能按名查到 `webhooks` 并跟着状态变；**重复注册报错**且归为「自己接错线」的 `RegistrationError`（不是客户端能引起的错误） |
 | （主机侧）`endpoints/pause_resume.rs` | 三条路径名与文档一致（`test_the_paths_are_the_documented_ones`）、`install` 注册三端点、`pause`/`resume`/`cancel` 各自跑对应命令并回 `{}`、`gcode` 分发器未注册时报告打印机状态、未装载 `[pause_resume]` 节时以 `// Unknown command:…` 输出行安静应答且端点仍回 `{}`（共 7 测） |
@@ -768,7 +770,7 @@ git config core.hooksPath .githooks
 | `heaters.rs` | `TURN_OFF_HEATERS` 把三种 heater 的 target 归零且 `M105` 报 `0.0`；help 文案与 ready 表注册时机同上游；`setup_max_duration` 收到 `MAX_HEAT_TIME`；`target<=0` 时输出 0 |
 | `mcu/object.rs` | 未答时钟查询 > 4 ⇒ `Lost communication with MCU '<name>'` 且每 MCU 只报一次；正常应答不误报；file-output 不判；失联后 `M112`/`RESTART` 仍可用 |
 | `interface/devices/serial.rs` | 打开重试：预算耗尽报错（含路径与尝试次数）、首次失败次次成功、退出请求在切片内结束等待、一次成功不多发尝试；另 `mcu/object.rs` 一条「重试不阻塞运行时」（current-thread 运行时里 20 ms 节拍仍推进） |
-| `info.rs` / `printer.rs` / `print_stats.rs` | Moonraker 契约守卫：`klipper_path`/`python_path` 必须在且不是真路径、`state` 只能四态且 info 与 webhooks 一致、`print_stats` 首帧必带 `state` |
+| `info.rs` / `printer.rs` / `print_stats.rs` | Moonraker 契约守卫：两键必须在——`klipper_path` 是真实释放根、`python_path` 不是真路径、`state` 只能四态且 info 与 webhooks 一致、`print_stats` 首帧必带 `state` |
 | `extras/toolhead.rs` | `get_status` 报 `axis_minimum`/`axis_maximum`（四轴、等于配置）与 `estimated_print_time`；未连接仍 `{}` |
 | `extras/stepper.rs` / `mcu/resource/trsync.rs` | 三电机 Z 轨的端停 dispatch 报 `["stepper_z","stepper_z1","stepper_z2"]`；单电机轨不变；跨 MCU 仍拒绝；`add_stepper` 幂等 |
 | `logging.rs` / `klippy.rs` | 注入时钟跨午夜轮转一次、保留 5 份、新文件带 `rollover_info` 与 `Log rollover at …`、`--logfile` 缺省零副作用；配置块取装载结果（含 `SAVE_CONFIG` 值）并带围栏 |

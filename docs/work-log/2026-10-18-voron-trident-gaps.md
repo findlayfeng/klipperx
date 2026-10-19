@@ -54,7 +54,7 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 | # | 项 | 现状 | 证据 | 本阶段判定 |
 |---|---|---|---|---|
 | A-1 | **`toolhead` 缺 `axis_minimum`/`axis_maximum`** | 未实现 | ✅复核 `extras/toolhead.rs:1182-1210` 只回 8 个键（`position`/`homed_axes`/`print_time`/`extruder`/四个速度限）；上游 `toolhead.py:502-515` | **P0（UI）**：Mainsail 的床尺寸/软限位/剩余时间直接读这两个键，缺失就是空/0。调试时不致命但会一直误判「床多大」。（**定级已错**：Moonraker 不读这两个字段，实际是 P2——见 §9） |
-| A-2 | `info` 握手 | 可用 | ✅复核 `api/endpoints/info.rs:59-63`；`python_path`/`klipper_path` 报不存在的路径（Moonraker 更新面板会是空壳，已登记 E2） | 可用；**需实测** Moonraker 是否能起（它对这两个字段的下标访问是硬依赖） |
+| A-2 | `info` 握手 | 可用 | ✅复核 `api/endpoints/info.rs:59-63`；`python_path` 仍报不存在的路径（Moonraker 更新面板对 Klipper 一项是空壳，已登记 E2）；`klipper_path` 2026-10-19 起改为真实释放根（见 api-reference） | ✅实测 Moonraker 能起、能连、`_save_path_info` 正常 |
 | A-3 | `webhooks` 状态（`ready`/`error`/`shutdown`） | 可用 | ◻侦察 `api/webhooks.rs:256-263` | 阶段一**关键**：停机/掉线要在 UI 上直接可见，否则 P0-3 那种幽灵运行连界面都看不出来 |
 | A-4 | `objects/{list,query,subscribe}`（0.25 s） | 可用 | ✅复核 三端点存在；`objects_subscribe.rs:68,75` | 温度曲线 + 位置就靠它 —— 阶段一的主界面 |
 | A-5 | `gcode/{script,help,subscribe_output}` | 可用 | ✅复核 形状与文档逐条一致 | 控制台敲 G-code 与看回显 |

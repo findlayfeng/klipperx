@@ -90,8 +90,8 @@
   "state": "ready",
   "state_message": "Printer is ready",
   "hostname": "klipper",
-  "klipper_path": "/home/pi/klipper",
-  "python_path": "/usr/bin/python3",
+  "klipper_path": "/run/user/1000/klipperx/assets-3f9a01c4b2d5e6a7",
+  "python_path": "/nonexistent/python3",
   "process_id": 12345,
   "user_id": 1000,
   "group_id": 1000,
@@ -107,7 +107,7 @@
 | `state` | string | 打印机状态：`startup` / `ready` / `shutdown` / `error` |
 | `state_message` | string | 状态描述信息 |
 | `hostname` | string | 主机名 |
-| `klipper_path` | string | Klipper 安装路径；本主机没有 Klipper 源码树，报一个**不存在的路径**，理由见下 |
+| `klipper_path` | string | **真实存在的释放根**：构建期嵌入的 config/docs 资产在启动时按三级环境变量链释放到磁盘，Moonraker 的示例配置与文档两个目录注册自它，理由见下 |
 | `python_path` | string | 解释型主机就报自己的解释器路径；本主机不是解释型的，报一个**不存在的路径**，理由见下 |
 | `process_id` | int | 进程 ID |
 | `user_id` / `group_id` | int | 运行用户/组 ID |
@@ -116,7 +116,9 @@
 | `software_version` | string | Klipper 软件版本：**上游基线 `v0.13.0-734-gfe4eb86`**（上游 `git describe --tags --long` 形状：标签 `v0.13.0` + 自该标签起 734 个提交 + 基线提交 `fe4eb86`）+ `-` + 本仓 crate 版本 `0.1.0`，编译期钉死在 `src/version.rs` |
 | `cpu_info` | string | CPU 描述字符串，如 `"4 core ARMv7 Processor rev 4 (v7l)"`（非对象，客户端直接展示） |
 
-> **`klipper_path` / `python_path` 为什么是不存在的路径**：这两个键 Moonraker 都在 `_save_path_info` 里直接下标取值（缺了会 `KeyError`），而它只在 `klipper_path` 与 `python_path` 的父目录**都存在**时才给 Klipper 更新项装上真正的 deploy 类（`components/update_manager/update_manager.py`：`os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`），否则退回 `BaseDeploy`（no-op）。本主机没有 Klipper 源码树也没有解释器，报不存在的路径正好让它退化为 no-op。`python_path` 另有一层约束：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在）—— 这正是不能报本主机自己二进制的原因。
+> **`klipper_path` / `python_path` 与 Moonraker 的耦合**：这两个键 Moonraker 都在 `_save_path_info` 里直接下标取值（缺了会 `KeyError`），**键必须在**。
+> `klipper_path` 是**真实存在的释放根**（2026-10-19 起）：`build.rs` 把上游 `config/`、本项目用户手册与上游 `docs/`（放 `docs/klipper/` 子路径，索引 README 构建期生成）嵌进二进制，`src/klippy.rs` 在 reactor/UDS 之前释放——优先 `$RUNTIME_DIRECTORY`（守护进程给的专用目录，原样使用，多值取 `:` 首段），其次 `$XDG_RUNTIME_DIR/klipperx`，再退 `/tmp/klipperx-<uid>`；**回落只因「未配置」，前两级配置了却不可写 ⇒ 启动报错退出**。Moonraker 用它注册两个静态目录：`<root>/config` → 示例配置、`<root>/docs` → 文档（本项目用户手册在顶层，上游文档在 `docs/klipper/`）。至于更新项：虽然 `path` 存在了，`os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`（`update_manager.py`）的第二个条件仍被假的 `python_path` 挡死，且 `_set_klipper_repo` 的 `AppType.detect(释放根)` 因根内没有 `.git` 恒为 `NONE` ⇒ Klipper 更新项仍是 `BaseDeploy`（no-op）——**释放根里永远不放 `.git`**。
+> `python_path` 维持**不存在的路径**：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在）—— 这正是不能报本主机自己二进制的原因。
 
 ---
 

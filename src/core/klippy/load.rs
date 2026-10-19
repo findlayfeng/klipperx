@@ -491,7 +491,6 @@ mod tests {
                 "gcode_macro",
                 "heater_fan",
                 "homing_heaters",
-                "homing_override",
                 "idle_timeout",
                 "input_shaper",
                 "manual_probe",
@@ -578,8 +577,9 @@ mod tests {
                 "endstop_phase",
                 "stepper",
                 "printer",
-                // The G28 wrapper takes the toolhead's handler away, so it has
-                // to load after `[printer]` (`order = 70` against `60`).
+                // The G28 wrappers take the toolhead's handler away, so they
+                // have to load after `[printer]` (`order = 70` against `60`).
+                "homing_override",
                 "safe_z_home"
             ]
         );
@@ -637,6 +637,9 @@ mod tests {
         assert_eq!(by_id("stepper").phase, Phase::Generic);
         assert_eq!(by_id("printer").phase, Phase::Late);
         assert_eq!(by_id("printer").object, Some("toolhead"));
+        // Both `G28` wrappers are late: they displace the toolhead's handler.
+        assert_eq!(by_id("homing_override").phase, Phase::Late);
+        assert_eq!(by_id("safe_z_home").phase, Phase::Late);
         // Two sections rename the object they register: `[printer]` → `toolhead`
         // and the historical `[canbus_ids]` → `mcu_ids` (one allocator under
         // two spellings, `mcu/ids.rs`); no other section does.

@@ -3571,6 +3571,144 @@ fn settle_halt_position(connected: &mut Connected, haltpos: Coord) {
     connected.toolhead.wipe_trapq();
 }
 
+/// The print time an endstop's trigger is read back at.
+///
+/// Upstream asks the firmware for the trigger clock and, in file-output mode,
+/// answers the move's end instead because there is nothing to ask
+/// (`MCU_endstop.home_wait`, `klippy/mcu.py:396-400`). A file-output run here
+/// talks to a fake firmware that *does* answer, but its answer is the move's
+/// first queued step — it models no hardware, which is what keeps a
+/// "triggered prior to movement" probe honest
+/// (`interface/devices/simulator.rs`) — so a position read back at that clock
+/// would say "no travel yet" for every move. Upstream's file-output answer,
+/// `home_end_time`, is the only one that means anything there.
+fn trigger_instant(reported: f64, home_end_time: f64, printer: &Weak<Printer>) -> f64 {
+    match printer.upgrade() {
+        Some(printer) if printer.is_fileoutput() => home_end_time,
+        _ => reported,
+    }
+}
+
+/// Every motion stepper's firmware step position now
+/// (`MCU_stepper.get_mcu_position`: the step compressor's own counter, which
+/// keeps counting across a `set_position` jump — upstream's
+/// `_mcu_position_offset`).
+fn mcu_step_positions(connected: &mut Connected) -> HashMap<String, i64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers_mut()
+        .iter_mut()
+        .map(|stepper| {
+            let position = stepper.compressor_mut().last_position();
+            (stepper.name().to_string(), position)
+        })
+        .collect()
+}
+
+/// Every motion stepper's commanded position (mm), keyed by name
+/// (`MCU_stepper.get_commanded_position`).
+fn commanded_positions(connected: &mut Connected) -> HashMap<String, f64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .map(|stepper| (stepper.name().to_string(), stepper.commanded_position()))
+        .collect()
+}
+
+/// How far each stepper had travelled (mm) from `start_steps` at a past print
+/// time (`homing.py:36-40`'s `trig_pos - start_pos`, scaled by `step_dist`).
+fn travel_at(
+    connected: &mut Connected,
+    start_steps: &HashMap<String, i64>,
+    print_time: f64,
+) -> HashMap<String, f64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .map(|stepper| {
+            let start = start_steps.get(stepper.name()).copied().unwrap_or(0);
+            (
+                stepper.name().to_string(),
+                (stepper.past_mcu_position(print_time) - start) as f64 * stepper.step_dist(),
+            )
+        })
+        .collect()
+}
+
+/// How far (mm) each stepper ran **past** its trigger
+/// (`homing.py:141-142`'s `sp.halt_pos - sp.trig_pos`).
+///
+/// `halt_time` is where step generation stopped. A stepper whose halt is
+/// *behind* its trigger reports no overshoot: hardware cannot do that — the
+/// trigger stops the stepper — and a file-output run's fake firmware can (its
+/// trigger is the move's end while the host's drip stopped earlier).
+fn overshoot_after_trigger(
+    connected: &mut Connected,
+    start_steps: &HashMap<String, i64>,
+    trigger_time: f64,
+    halt_time: f64,
+) -> HashMap<String, f64> {
+    let trigger = travel_at(connected, start_steps, trigger_time);
+    travel_at(connected, start_steps, halt_time)
+        .into_iter()
+        .filter_map(|(name, travelled)| {
+            let over = travelled - trigger.get(&name).copied().unwrap_or(0.0);
+            (over > 0.0).then_some((name, over))
+        })
+        .collect()
+}
+
+/// The toolhead position a set of travelled distances implies
+/// (`HomingMove.calc_toolhead_pos`, `homing.py:63-71`).
+///
+/// `kin_spos` is where each stepper stood when the move began and `travel` how
+/// far each one went; an axis the kinematics cannot solve keeps the toolhead's
+/// current value and the extruder coordinate is untouched, as upstream's
+/// `None` fill and its `thpos[3:]` do.
+fn calc_toolhead_pos(
+    connected: &mut Connected,
+    kin_spos: &HashMap<String, f64>,
+    travel: &HashMap<String, f64>,
+) -> Coord {
+    let mut positions = kin_spos.clone();
+    for (name, distance) in travel {
+        *positions.entry(name.clone()).or_insert(0.0) += distance;
+    }
+    let solved = connected
+        .toolhead
+        .kinematics()
+        .map(|kinematics| kinematics.calc_position(&positions))
+        .unwrap_or([None; 3]);
+    let mut result = connected.toolhead.commanded_pos();
+    for (axis, value) in solved.iter().enumerate() {
+        if let Some(value) = value {
+            result.set_axis(axis, *value);
+        }
+    }
+    result
+}
+
+/// Place the toolhead where the steppers stopped: the position the driver just
+/// set, plus the distance each stepper ran past its trigger
+/// (`HomingMove.homing_move`'s non-probe branch, `homing.py:135-146`).
+///
+/// The caller has already set the position to the endstop coordinate, so the
+/// steppers' commanded positions are that position in their own coordinates —
+/// upstream's `halt_kin_spos`, read right after its `set_position(movepos)`.
+fn apply_home_overshoot(connected: &mut Connected, overshoot: &HashMap<String, f64>) {
+    if overshoot.is_empty() {
+        return;
+    }
+    let kin_spos = commanded_positions(connected);
+    let haltpos = calc_toolhead_pos(connected, &kin_spos, overshoot);
+    connected.toolhead.set_position(haltpos, &[]);
+}
+
 /// Home every rail in one multi-endstop move, as delta does
 /// (`Homing._do_home_rails` + `HomingMove.homing_move` with every endstop
 /// armed; upstream's retract + second pass is the gap
@@ -3607,6 +3745,9 @@ async fn home_unified(
     // homed (`Homing._set_start_position`), which is what lets the homing move
     // through its `check_move`.
     connected.toolhead.set_position(force, homing_axes);
+    // Where the steppers stand before the move: the trigger and stop
+    // positions are read as distances from it (`StepperPosition.start_pos`).
+    let start_steps = mcu_step_positions(connected);
 
     // The endstops all start sampling before the move and each is paced by
     // its own rail's travel (`HomingMove._calc_endstop_rate`).
@@ -3683,6 +3824,9 @@ async fn home_unified(
     // Prepare for a miss: upstream checks every rail's `home_wait` and raises
     // the first miss it finds, after the move-end event (`homing.py:109-119`).
     let mut missed: Option<CommandError> = None;
+    // What each rail's steppers ran past their own trigger, which moves the
+    // carriage past the endstop coordinate (`homing.py:135-146`).
+    let mut overshoot: HashMap<String, f64> = HashMap::new();
     for rail in rails {
         // A rail whose endstop never fired comes back as `0.0`
         // (`mcu/resource/endstop.rs`); `home_axis` below reads the same value.
@@ -3715,16 +3859,26 @@ async fn home_unified(
             continue;
         }
         // Note each of the rail's steppers' trigger position
-        // (`StepperPosition.note_home_end`).
-        let steppers = connected.toolhead.motion_queuing_mut().steppers();
-        let mut state = homing.lock();
-        for (index, stepper) in rail.steppers().iter().enumerate() {
-            if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
-                state.set_trigger_position(
-                    stepper.name(),
-                    host.past_mcu_position(trigger_time) as f64,
-                );
-                state.set_primary(stepper.name(), index == 0);
+        // (`StepperPosition.note_home_end`), each at its own rail's trigger.
+        let instant = trigger_instant(trigger_time, end, printer);
+        {
+            let steppers = connected.toolhead.motion_queuing_mut().steppers();
+            let mut state = homing.lock();
+            for (index, stepper) in rail.steppers().iter().enumerate() {
+                if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
+                    state.set_trigger_position(
+                        stepper.name(),
+                        host.past_mcu_position(instant) as f64,
+                    );
+                    state.set_primary(stepper.name(), index == 0);
+                }
+            }
+        }
+        for (name, distance) in
+            overshoot_after_trigger(connected, &start_steps, instant, flush_time)
+        {
+            if rail.steppers().iter().any(|stepper| stepper.name() == name) {
+                overshoot.insert(name, distance);
             }
         }
     }
@@ -3734,8 +3888,9 @@ async fn home_unified(
         return Err(error);
     }
     // The carriage is now at its home position, with the kinematics' homed
-    // flags set.
+    // flags set — plus whatever the steppers ran past their triggers.
     connected.toolhead.set_position(target, homing_axes);
+    apply_home_overshoot(connected, &overshoot);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -3764,6 +3919,9 @@ async fn home_axis(
     let force = fill_coord(forcepos, current);
     let home = fill_coord(movepos, current);
     connected.toolhead.set_position(force, homing_axes);
+    // Where the steppers stand before the move: the trigger and stop positions
+    // are read as distances from it (`StepperPosition.start_pos`).
+    let start_steps = mcu_step_positions(connected);
 
     // Poll the endstop about once per step so a trigger is seen promptly.
     let move_t = move_distance(force, home) / info.speed;
@@ -3847,6 +4005,7 @@ async fn home_axis(
     }
     // Note each stepper's trigger position (`StepperPosition.note_home_end`)
     // before `set_position` moves the solver to the endstop position.
+    let trigger_time = trigger_instant(trigger_time, end, printer);
     {
         let steppers = connected.toolhead.motion_queuing_mut().steppers();
         let mut state = homing.lock();
@@ -3857,9 +4016,14 @@ async fn home_axis(
             }
         }
     }
+    // Read before `set_position` moves the solver: this is what the steppers
+    // ran past the trigger, and the axis ends up that much past its endstop
+    // (`homing.py:135-146`).
+    let overshoot = overshoot_after_trigger(connected, &start_steps, trigger_time, flush_time);
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
     connected.toolhead.set_position(home, homing_axes);
+    apply_home_overshoot(connected, &overshoot);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -3874,15 +4038,17 @@ async fn home_axis(
 /// Events follow upstream order: `homing_move_begin` **before** any
 /// sampling or movement, `homing_move_end` after.
 ///
-/// Returns the position the move stopped at: the move is always dripped to
-/// its end, and that end position is what it reports (and what the
-/// toolhead's commanded position is set to). This matches upstream's
-/// file-output mode, which completes the trigger only after the drip move
-/// ended (`mcu.py:TriggerDispatch.wait_end`) and takes `trigpos` at
-/// `home_end_time` (`homing.py`). This host's fake firmware fires the armed
-/// endstop at the move's first queued step, so ending the drip on that early
-/// clock would walk each repeated probe up by its retract distance and fail
-/// `samples_tolerance`.
+/// Returns the position the endstop **triggered** at — the carriage's own
+/// position, not the one the move was aimed at (`StepperPosition.note_home_end`
+/// + `HomingMove.calc_toolhead_pos`, `homing.py:36-40,123-130`, where
+/// `trigpos` is the returned value) — while the toolhead is left where the
+/// steppers came to rest (`haltpos`). The move is always dripped to its end,
+/// so under a file-output run the trigger instant is that end: upstream's
+/// `home_wait` answers `home_end_time` there (`mcu.py:396-397`, see
+/// [`trigger_instant`]), which is also what keeps this host's fake firmware
+/// (it fires the armed endstop at the move's first queued step, so ending the
+/// drip on that early clock would walk each repeated probe up by its retract
+/// distance and fail `samples_tolerance`) from reporting the move's start.
 ///
 /// # Errors
 /// - `"No trigger on probe after full movement"` when the move completed
@@ -3947,6 +4113,12 @@ async fn probing_move(
     // Kept only for its side effect (arming the endstop); `home_wait` awaits
     // the same completion through the dispatch that owns it, and the drip
     // loop below deliberately does not poll it.
+    //
+    // The move's start, taken once the backlog is out: the trigger and stop
+    // positions below are read as distances from it (`HomingMove.homing_move`
+    // snapshots `kin_spos` here too, `homing.py:88-92`).
+    let kin_spos = commanded_positions(connected);
+    let start_steps = mcu_step_positions(connected);
     let _completion = endstop
         .home_start(
             print_time,
@@ -4016,45 +4188,24 @@ async fn probing_move(
         return Err(CommandError::new("No trigger on probe after full movement"));
     }
 
-    // Where the move stopped: the drip loop above just ran to
-    // `flush_time = end`, so the newest queued segment's position there is
-    // the move's end — the target. That is upstream's file-output `trigpos`
-    // (the stepper position at `home_end_time`); on real hardware upstream
-    // would read the firmware's trigger clock instead, which the corpus's
-    // fake MCUs cannot model (no step model: `stepper_get_position` answers
-    // zero). A following probe still has room to move down because every
-    // consumer lifts first — each sample retracts (`run_with`) and each
-    // point is preceded by a raise (`ProbePointsHelper`) — so the corpus
-    // never probes twice from the target into "Probe triggered prior to
-    // movement".
-    let stopped = {
-        let trapq = connected.toolhead.trapq();
-        let moves = trapq.moves();
-        // The newest segment that has started by `flush_time` is the one the
-        // carriage is in; a plain forward scan stops at the position marker
-        // `set_position` left behind, which sits at the origin.
-        let mut found = None;
-        for segment in moves.iter().rev() {
-            if segment.print_time <= flush_time {
-                let into = if flush_time <= segment.end_time() {
-                    flush_time - segment.print_time
-                } else {
-                    segment.move_t
-                };
-                found = Some(segment.coord(into));
-                break;
-            }
-        }
-        found
-    };
-    let mut result = connected.toolhead.commanded_pos();
-    if let Some(stopped) = stopped {
-        result.set_axis(0, stopped.x());
-        result.set_axis(1, stopped.y());
-        result.set_axis(Z_AXIS, stopped.z());
-        connected.toolhead.set_position(result, &[Z_AXIS]);
-    }
-    Ok(result)
+    // Where the endstop fired, and where the steppers stopped
+    // (`StepperPosition.note_home_end` + `HomingMove.calc_toolhead_pos`,
+    // `homing.py:36-40,123-134`): the probe **reports** the trigger position —
+    // a probe is asking where the bed is, which the endstop answered when it
+    // fired, not where the move was aimed — while the toolhead is left where
+    // the steppers came to rest, so the next probe starts from the same place
+    // every time.
+    let trigger_time = trigger_instant(trigger_time, end, printer);
+    let trigger_travel = travel_at(connected, &start_steps, trigger_time);
+    let trigpos = calc_toolhead_pos(connected, &kin_spos, &trigger_travel);
+    let halt_travel = travel_at(connected, &start_steps, end);
+    let haltpos = calc_toolhead_pos(connected, &kin_spos, &halt_travel);
+    // A following probe still has room to move down because every consumer
+    // lifts first — each sample retracts (`run_with`) and each point is
+    // preceded by a raise (`ProbePointsHelper`) — so it never probes twice
+    // from the stop position into "Probe triggered prior to movement".
+    connected.toolhead.set_position(haltpos, &[Z_AXIS]);
+    Ok(trigpos)
 }
 
 fn command_error(err: McuError) -> CommandError {

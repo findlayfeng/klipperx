@@ -452,7 +452,7 @@ git config core.hooksPath .githooks
 | `debug.rs` | `debug_read` / `debug_write` / `debug_ping` / `debug_nop` 与固件格式一致；`debug_result` / `pong` 解码（缺参数报错）；读/写/ping/nop 各自走虚拟 MCU 的整条往返与上线 |
 | `spi.rs` | `config_spi`（含 active-high、无片选两变体）/ `spi_set_bus` / `spi_set_sw_bus` 编码；新旧软件总线命令的优先选择（这三例是 async 真调，`mcu_with` + `FrameMock`）、两个都没有时报错；`spi_send` / `spi_transfer` 的编码与 `spi_transfer` 响应解码；`config_spi_shutdown` |
 | `i2c.rs` | `config_i2c` / `i2c_set_bus` / `i2c_set_software_bus` 编码；新旧软件总线命令选择（async 真调）；`i2c_transfer` / `i2c_write` / `i2c_read` 的编码与响应解码（`i2c_response` / `i2c_read_response` / `i2c_bus_status`） |
-| `thermocouple.rs` | 命令与固件格式一致；芯片类型号与固件枚举对齐；`thermocouple_result` 解码；整条经虚拟 MCU 的往返 |
+| `thermocouple.rs` | 命令与固件格式一致；芯片类型号与固件枚举对齐；`thermocouple_result` 解码；整条经虚拟 MCU 的往返（等回调用 **1 s 有界轮询**，不再固定睡 20 ms——那个固定窗口在全量闸门满载下会被错过，让本来能过的测试假失败） |
 | `stepper.rs` | `config_stepper` / `queue_step` 的 `args()` 与固件参数序一致（编码后解码回同一组值） |
 | `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零；`home_wait` 的 32 位触发时钟以**本次 move 的 arm clock** 为纪元参考（打印时间远超 MCU 自报时钟时会差一整圈：2³²/16 MHz = 268.44 s）；时钟门控：`test_home_start_waits_for_its_reqclock_window`、`test_query_endstop_holds_until_its_minclock` |
 | `trsync.rs`（22 测，2026-10-18 重核） | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐；`raw_failure_classification` 覆盖 typed 与 trigger_analog 码（1-3 非失败、4 与 5-8 失败且 5-8 无 typed 变体）。**2026-10-18 新增/补强**：会话 `attach` 即装路由器（武装前就有处理器 → 陈旧报告不刷 WARN，去掉 attach 绑定即转红）、被替换会话在武装时重绑（去掉武装绑定即「报告被丢弃 + 等超时」转红）、`restart` 列表恰有 `trsync_start(oid,0,0,0)`（杀进程后重连即刻断流）、注册表按 oid 路由且**无主 oid 静默**、真实板字典（`stm32f446.dict`）能绑上 `trsync_state`；归零 5 s 兜底：丢报告时 dispatching 失败 + 收尾 + **机器仍可继续执行命令** |

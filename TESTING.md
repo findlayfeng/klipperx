@@ -107,13 +107,24 @@
   `[gcode_button]` 的 cfg 在 `-o` 下同样泄漏，代价是那两条各 5.25s 的收尾；根因是命令表反向钉住
   部件的强引用环，2026-10-06 已断——现在这两条收尾回到毫秒级、且探针会点名泄漏的 cfg。）
 
-- [ ] **R12 加热的时钟域与主线程护栏** —— 真实测试（**尚无上板证据**，2026-10-19 代码落地）：
-  ① 加热到 200 ℃ 连续跑 **>2 分钟**（跨过 F446 的 23.9 s 32 位时钟绕圈），`M105` / `objects/query` 的
-  `temperature` 不跳变、`power` 正常——验 ADC 样本时间已统一到 print time；
-  ② 加热中 `kill -STOP` 宿主 6 s：`power` 应归 0（超 `MAX_MAINTHREAD_TIME` 5 s），`kill -CONT` 后 ≤1 s 恢复——
-  验第二重保护真的挂在 print time 上；
-  ③ 拔掉热敏电阻信号线（或断传感器电源）>7 s：`get_temp` 报 0、`verify_heater` 按上游行为动作——验 `QUELL_STALE_TIME`。
-  判定：三条都不造成实际加热失控；任何一条行为相反都说明时钟域没真正对齐。
+- [ ] **R12 加热的时钟域与主线程护栏** —— 真机部分验过（2026-10-19，裸 STM32F103 +
+  `[heater_generic]` 软件 PWM 脚 + 板载 LED + `temperature_mcu`）：
+  **① 跨 32 位时钟绕圈 ✅ 通过**：`power` 恒 1.0 连跑 180 s（F103 72 MHz ⇒ 59.6 s 一圈，跨 3 圈），
+  每 2 s 采一次共 90 样本 —— 温度 min 36.24 / max 36.51 / **极差 0.27 ℃**、`power` **90/90 全 1.0**、
+  分段均值 36.31→36.36→36.45 单调微升、会话全程 `ready`。改动前（ADC 样本时间是裸 tick）绕圈后
+  `time_diff` 变负巨值 ⇒ 平滑温度乱跳 ⇒ watermark 把占空比打 0（LED 会每 ~60 s 闪一下）。
+  **② 6 s 进程级停顿测不出护栏**（负结果，记录在此而不是当通过）：`SIGSTOP` 6 s 后 `SIGCONT`，
+  立刻以 ~30 ms 间隔连采 40 次 `power` —— **40/40 仍是 1.0**。原因：恢复时 1 s 的 `heater_stats`
+  定时器先跑、把截止戳推到 `now + 5`，而排队中的读数时间戳都早于 `now` ⇒ `read_time > 截止`
+  不成立。也就是说这条护栏只在「读数在跑、而打戳路径被卡住」时才会咬人，进程级 SIGSTOP 构造不出来；
+  要用真机证明它，需要在它归零时留一条 debug 日志（或构造长阻塞段占住打戳任务）。
+  **③ 7 s 陈旧压制同样未被真机观测**：`SIGSTOP` 之后第一条恢复的读数就刷新了 `last_temp_time`，
+  压制窗口只有那几毫秒；且 `M105` 的文本不经 `gcode/script` 的应答回传，CLI 侧抓不到。
+  ②③ 的边界现由单测钉住（`test_a_reading_past_the_mainthread_deadline_sends_no_power`、
+  `test_a_quiet_sensor_quells_to_zero_after_seven_seconds`）。
+  **前置修复（同批）**：真机首次跑时 `[heater_generic]` 一连接就 `Timer too close`（上电 3.28 s），
+  首因是 PWM 变更走无时钟即时路径、撞上固件的 `MAX_HEAT_TIME` auto-off；改成上游的
+  `set_pwm(read_time + pwm_delay)` 排期后 `state: ready`、`power 1.0`。
 
 ## 已完成真机验证（留档）
 

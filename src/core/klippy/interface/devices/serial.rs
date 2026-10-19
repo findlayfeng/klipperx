@@ -6636,11 +6636,17 @@ mod hw_mux_device_tests {
         //    are transported as units addressed to it, so there is nothing to
         //    send if it never adopted the id.
         bind(&mut port, 5);
-        assert!(
-            alive_on(&mut port, &mut pending, 5, window),
-            "the board holds node id 5 after the assignment"
-        );
-        eprintln!("0. bound: the board answers on id 5's reply header");
+        // The board adopts the id asynchronously, so probe it on a bound instead
+        // of betting that one frame lands after the settle `bind` sleeps for:
+        // a missed single probe used to fail the test outright.
+        let mut probes = 0;
+        let mut answered = false;
+        while !answered && probes < 4 {
+            probes += 1;
+            answered = alive_on(&mut port, &mut pending, 5, window);
+        }
+        assert!(answered, "the board holds node id 5 after the assignment");
+        eprintln!("0. bound: the board answers on id 5's reply header (after {probes} probes)");
 
         // 1. `RESTART_DEVICE` reboots the firmware. The node id does not survive
         //    a reset (it is the host's to hand out), so the rebooted board must

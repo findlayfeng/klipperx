@@ -124,7 +124,7 @@ impl HomingHeaters {
             let Ok(heater) = self.pheaters.lookup_heater(&name) else {
                 continue;
             };
-            save.insert(name, heater.get_temp().1);
+            save.insert(name, heater.get_temp(0.0).1);
             let _ = heater.set_temp(0.0);
         }
     }
@@ -369,13 +369,13 @@ mod tests {
         block_on(object.connect()).unwrap();
 
         heater.set_temp(200.0).unwrap();
-        assert_eq!(heater.get_temp().1, 200.0);
+        assert_eq!(heater.get_temp(0.0).1, 200.0);
 
         printer.send_event(&KlippyEvent::HomingHomingMoveBegin);
-        assert_eq!(heater.get_temp().1, 0.0);
+        assert_eq!(heater.get_temp(0.0).1, 0.0);
 
         printer.send_event(&KlippyEvent::HomingHomingMoveEnd);
-        assert_eq!(heater.get_temp().1, 200.0);
+        assert_eq!(heater.get_temp(0.0).1, 200.0);
     }
 
     /// With no `heaters` option every registered heater is switched off
@@ -392,9 +392,9 @@ mod tests {
 
         heater.set_temp(150.0).unwrap();
         printer.send_event(&KlippyEvent::HomingHomingMoveBegin);
-        assert_eq!(heater.get_temp().1, 0.0);
+        assert_eq!(heater.get_temp(0.0).1, 0.0);
         printer.send_event(&KlippyEvent::HomingHomingMoveEnd);
-        assert_eq!(heater.get_temp().1, 150.0);
+        assert_eq!(heater.get_temp(0.0).1, 150.0);
     }
 
     /// A heater that had no target comes back to `0`, not to whatever it was
@@ -411,9 +411,9 @@ mod tests {
 
         // No target set: the move both begins and ends at 0.
         printer.send_event(&KlippyEvent::HomingHomingMoveBegin);
-        assert_eq!(heater.get_temp().1, 0.0);
+        assert_eq!(heater.get_temp(0.0).1, 0.0);
         printer.send_event(&KlippyEvent::HomingHomingMoveEnd);
-        assert_eq!(heater.get_temp().1, 0.0);
+        assert_eq!(heater.get_temp(0.0).1, 0.0);
     }
 
     /// A `heaters` name that is not registered is refused at connect, with

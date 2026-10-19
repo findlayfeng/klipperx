@@ -174,6 +174,70 @@ impl TrsyncChip {
     }
 }
 
+/// The clock facts an ADC input needs to date a report.
+///
+/// Deliberately **not** a whole [`McuChip`]: the chip owns the [`AdcRegistry`]
+/// that owns each input's state, so a chip stored in that state would make
+/// `registry ↔ state` a strong cycle — and through the chip's `mcu` slot it
+/// would keep the connected `Mcu` alive after teardown, whose parked blocking
+/// device read then hangs runtime shutdown. [`TrsyncChip`] avoids the same trap
+/// for the trsync layer; this is the ADC's narrower version of it.
+#[derive(Clone)]
+pub struct AdcClock {
+    clock: Arc<Mutex<Option<Arc<McuClock>>>>,
+    print_time_offset: Arc<Mutex<f64>>,
+    print_time_freq: Arc<Mutex<f64>>,
+}
+
+impl AdcClock {
+    /// Extend a 32-bit reading into this MCU's 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
+        Some(self.clock()?.clock32_to_clock64(clock32))
+    }
+
+    /// The print-time mapping, once this MCU has connected.
+    ///
+    /// A report carries the firmware's clock, and the mapping is filled at
+    /// connect (`McuChip::set_clock`), so a sample that arrives earlier cannot
+    /// be dated. There is no estimate step in between: the mapping's frequency
+    /// is what converts, seeded or not.
+    pub fn mapping(&self) -> Option<ClockMapping> {
+        let freq = *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if freq <= 0.0 {
+            return None;
+        }
+        let offset = *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Some(ClockMapping { offset, freq })
+    }
+
+    fn clock(&self) -> Option<Arc<McuClock>> {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+/// The `(offset, freq)` an [`AdcClock`] maps an MCU clock with.
+#[derive(Clone, Copy)]
+pub struct ClockMapping {
+    offset: f64,
+    freq: f64,
+}
+
+impl ClockMapping {
+    /// This MCU's clock as an absolute print time.
+    pub fn print_time(&self, clock: i64) -> f64 {
+        clock as f64 / self.freq + self.offset
+    }
+}
+
 impl McuChip {
     /// A chip for `name`, not yet connected.
     pub fn new(name: String, config: Arc<ConfigBuilder>, pins: Arc<PrinterPins>) -> Self {
@@ -339,6 +403,16 @@ impl McuChip {
         TrsyncChip {
             name: self.name.clone(),
             mcu: Arc::clone(&self.mcu),
+            clock: Arc::clone(&self.clock),
+            print_time_offset: Arc::clone(&self.print_time_offset),
+            print_time_freq: Arc::clone(&self.print_time_freq),
+        }
+    }
+
+    /// The [`AdcClock`] view of this chip: what an ADC input dates a report
+    /// with, **without** the registry that owns the input.
+    pub fn adc_clock(&self) -> AdcClock {
+        AdcClock {
             clock: Arc::clone(&self.clock),
             print_time_offset: Arc::clone(&self.print_time_offset),
             print_time_freq: Arc::clone(&self.print_time_freq),
@@ -530,6 +604,7 @@ impl PinChip for McuChip {
             self.name.clone(),
             Arc::clone(&self.adc_registry),
             params.clone(),
+            self.adc_clock(),
         )))
     }
 

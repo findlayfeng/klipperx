@@ -89,9 +89,8 @@ const DRIFT_SAMPLE_COUNT: usize = 9;
 /// sample windows before it reports the stream as stalled.
 ///
 /// Upstream polls the same list from `reactor.pause` with no bound
-/// (`temperature_probe.py:626-628`), so a sensor that stops delivering waits
-/// forever; past this bound the sweep goes on to `into_samples`, which already
-/// refuses a window the stream left empty.
+/// (`temperature_probe.py:626-628`); past this one the sweep goes on to
+/// `into_samples`, which already refuses a window the stream left empty.
 const DRIFT_SWEEP_WAIT: Duration = Duration::from_secs(10);
 
 // ===========================================================================
@@ -2062,7 +2061,7 @@ impl SweepState {
 
 /// Wait for one drift sweep's window list to empty, bounded by `timeout` — the
 /// condition upstream polls from its reactor without a bound (`:626-628`).
-/// Returns whether the list emptied; `false` is the stall the caller reports.
+/// `false` is the stall the caller reports.
 async fn wait_for_sweep_drain(sweep: &Mutex<SweepState>, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -3972,13 +3971,12 @@ calibration_bed_temp: 60
     #[tokio::test(start_paused = true)]
     async fn the_sweep_drain_wait_gives_up_on_a_stalled_stream() {
         // No client is registered, so nothing will ever retire this window.
-        let mut sweep = SweepState::default();
-        sweep.move_times.push((0, 10., 10.1));
-        let sweep = Mutex::new(sweep);
+        let mut state = SweepState::default();
+        state.move_times.push((0, 10., 10.1));
+        let sweep = Mutex::new(state);
 
+        // Virtual clock: the timeout catches a missing deadline, not a hang.
         let started = tokio::time::Instant::now();
-        // The virtual clock, so the bound costs no real time; the timeout is the
-        // backstop that turns a missing deadline into a failure.
         let drained = tokio::time::timeout(
             DRIFT_SWEEP_WAIT * 3,
             wait_for_sweep_drain(&sweep, DRIFT_SWEEP_WAIT),
@@ -3987,17 +3985,12 @@ calibration_bed_temp: 60
         .expect("the wait is bounded");
 
         assert!(!drained, "a stream that never arrives reports the stall");
-        let waited = started.elapsed();
         assert!(
-            waited >= DRIFT_SWEEP_WAIT,
-            "it waited the bound: {waited:?}"
+            started.elapsed() >= DRIFT_SWEEP_WAIT,
+            "the bound was waited out"
         );
-        let left = sweep
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .move_times
-            .len();
-        assert_eq!(left, 1, "the window stays where the stream left it");
+        let sweep = sweep.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(sweep.move_times.len(), 1, "left as the stream left it");
     }
 
     /// The sweep's results (`:617-624`): the averaged temperature over all

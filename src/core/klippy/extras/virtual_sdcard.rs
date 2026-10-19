@@ -31,7 +31,8 @@
 //!   method, so this is omitted; `stats` is a reactor scheduling hint, not
 //!   user-visible.
 //! - **`do_pause` now waits** for the replay task to exit, matching
-//!   upstream's synchronous spin (`virtual_sdcard.py:123-127`). The wait is
+//!   upstream's synchronous spin (`virtual_sdcard.py:123-127`) — but bounded
+//!   by `PAUSE_DRAIN_TIMEOUT`, where upstream's spin has no bound. The wait is
 //!   async (`tokio::time::sleep` polling `work_active`) so the replay task
 //!   can run to completion on the same runtime; the `cmd_from_sd` guard
 //!   skips the wait when `do_pause` is called from a replayed line (avoiding
@@ -73,6 +74,16 @@ const DEFAULT_ERROR_GCODE: &str = "
    TURN_OFF_HEATERS
 {% endif %}
 ";
+
+/// How long `do_pause` waits for the replay task to exit before it reports the
+/// stall and returns anyway.
+///
+/// Upstream spins on its reactor until the work timer is gone
+/// (`virtual_sdcard.py:123-127`) with no bound at all, so a replay task that
+/// never observes `must_pause_work` wedges every caller — `M25`, `M0`,
+/// `do_cancel` and `reset_file` all wait here. One replay iteration is a g-code
+/// line plus a yield, so ten seconds is a stall, not a slow line.
+const PAUSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 section!("virtual_sdcard", order = 30, load = load_config);
 
@@ -297,12 +308,24 @@ impl VirtualSdCard {
     /// the replay task is the caller and cannot exit while `do_pause` is
     /// blocking it.
     ///
+    /// The wait is bounded by [`PAUSE_DRAIN_TIMEOUT`]: a replay task that never
+    /// exits is reported (a `warn!`) and `do_pause` returns anyway, where
+    /// upstream's spin would wait forever.
+    ///
     /// `pub(crate)` for the `pause_resume` SD seam (`extras/pause_resume.rs`).
     pub(crate) async fn do_pause(&self) {
         *self.must_pause_work.lock().unwrap() = true;
         // Upstream: `while self.work_timer is not None and not
         // self.cmd_from_sd: reactor.pause(monotonic()+.001)`.
+        let deadline = tokio::time::Instant::now() + PAUSE_DRAIN_TIMEOUT;
         while *self.work_active.lock().unwrap() && !*self.cmd_from_sd.lock().unwrap() {
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "virtual_sdcard: the replay task did not exit within \
+                     {PAUSE_DRAIN_TIMEOUT:?}; pausing anyway"
+                );
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
@@ -1536,6 +1559,33 @@ mod tests {
 
         assert!(result.is_ok(), "do_pause did not hang (cmd_from_sd guard)");
         assert!(object.is_active(), "work_active is unchanged (no wait)");
+        assert!(*object.must_pause_work.lock().unwrap(), "pause flag is set");
+    }
+
+    /// The bounded wait: a replay task that never clears `work_active` cannot
+    /// wedge `do_pause` — the deadline fires, `do_pause` warns and returns,
+    /// and the flag is left as it was (nothing exited to clear it).
+    #[tokio::test(start_paused = true)]
+    async fn do_pause_gives_up_on_a_replay_task_that_never_exits() {
+        let (_dir, _printer, object, _gcode) = machine();
+        // No replay task is running here, so nothing will ever clear the flag.
+        *object.work_active.lock().unwrap() = true;
+
+        let started = tokio::time::Instant::now();
+        // The virtual clock, so the whole bound costs no real time; the timeout
+        // is the backstop that turns a missing deadline into a failure.
+        let result = tokio::time::timeout(PAUSE_DRAIN_TIMEOUT * 3, object.do_pause()).await;
+
+        assert!(result.is_ok(), "do_pause returned at its deadline");
+        assert!(
+            started.elapsed() >= PAUSE_DRAIN_TIMEOUT,
+            "it waited the whole bound: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            object.is_active(),
+            "work_active is untouched (no task exited)"
+        );
         assert!(*object.must_pause_work.lock().unwrap(), "pause flag is set");
     }
 

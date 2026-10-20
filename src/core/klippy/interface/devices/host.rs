@@ -447,6 +447,28 @@ impl Router {
         self.slots.lock().unwrap().insert(mcu_id, sender);
         receiver
     }
+
+    /// Take `mcu_id`'s slot out of the map, so the reader stops feeding it.
+    ///
+    /// The one place a slot is taken down: `HostDevice::shutdown` (the thread
+    /// stopping that reference). It is the muxed host path's counterpart of
+    /// `SharedSerialHandle`'s `unregister` — once the entry is gone,
+    /// [`push_unit`] finds no slot for this id and drops its units, which is the
+    /// serial side's failed-`Sender` behaviour for a shut-down handle.
+    ///
+    /// What it prevents is the same thing there: a stopped reference never reads
+    /// its slot again, and the map cannot tell an abandoned slot from a live one,
+    /// so a slot left behind collects this id's units in an unbounded queue
+    /// nobody drains — for as long as any **other** reference keeps the library
+    /// up. A reference that is merely **dropped** needs nothing: its receiver
+    /// goes with it, so `push_unit`'s send fails and the unit is dropped instead
+    /// of stored.
+    ///
+    /// Removal is by id alone, unlike the serial handle's `ptr_eq` check: the map
+    /// holds the `Sender` itself, not a slot a handle could compare against.
+    fn close_slot(&self, mcu_id: u32) {
+        self.slots.lock().unwrap().remove(&mcu_id);
+    }
 }
 
 impl HostLibrary {
@@ -1550,6 +1572,15 @@ impl Device for HostDevice {
     fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return; // already shut down
+        }
+        // A muxed reference's slot goes with it: nothing reads it any more, and
+        // the reader would keep pushing this id's units into an unbounded queue
+        // nobody drains, for as long as the library stays up for its other
+        // references — the serial handle's `unregister`, for the same reason.
+        // Units for this id are dropped from here on. A bare reference has no
+        // slot to close: it reads the library's one output queue.
+        if let Some(mux) = &self.mux {
+            self.library.router.close_slot(mux.mcu_id);
         }
         // The reader keeps running — this only stops this reference: its
         // `receive` loop notices `stopped` within one wait interval, and the
@@ -4264,6 +4295,170 @@ mod host_tests {
         // Same invariant as the other library tests: leave this path unloaded.
         drop(first);
         drop(second);
+        wait_for_unload_blocking(&mux_library_path());
+    }
+
+    /// A shut-down muxed reference leaves no slot in the router: its units are
+    /// dropped, not queued.
+    ///
+    /// `Device::shutdown` stops **this** reference only — the library keeps its
+    /// one reader and one stream, and goes on routing for every other reference
+    /// on it. A slot left in the map after its reference stopped is still fed by
+    /// [`push_unit`] (the map cannot tell an abandoned slot from a live one),
+    /// into an unbounded queue nobody will ever read: growth without bound for as
+    /// long as any other reference keeps the library up. The serial side stopped
+    /// that with the `unregister` in `SharedSerialHandle::shutdown`; this is the
+    /// same guarantee on the muxed host path.
+    ///
+    /// The stopped id's units are put on the wire **after** the stop, through the
+    /// bridge's port, and the stopped reference's own receiver is held open by
+    /// the test — so a slot still in the map would have a live place to put them.
+    /// Nothing may land in it, and the other reference's unit, written behind
+    /// them on the same stream, must still arrive: that ordering is what proves
+    /// the reader ran [`push_unit`] for the stopped id's units too.
+    #[test]
+    fn test_a_shut_down_muxed_reference_leaves_no_slot_and_is_not_fed() {
+        let _serial = HOST_LIBRARY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        // The bridge opens its port during init, so its tty has to exist first.
+        let pty = Pty::new();
+
+        let identity = [0x22, 0xbb, 0x33, 0xcc, 0x44, 0xdd];
+        let stopped_id = 7u32;
+        let live_id = 9u32;
+
+        // The reference that will be stopped, and the port its id is routed to.
+        let mut stopped = HostDevice::load_downstream_with_ports(
+            mux_library_path(),
+            identity,
+            stopped_id,
+            &port_zero(&pty),
+        )
+        .expect("a downstream reference loads without a handshake");
+        configure_port_zero(Arc::get_mut(&mut stopped).expect("the test holds the only reference"));
+        stopped
+            .send_set_port_node_id(0, stopped_id as u8, MUX_PORT_UNITS)
+            .expect("SET_PORT_NODEID goes in");
+
+        // A second reference on the **same** library: the one that keeps it up
+        // after the first stops.
+        let live = HostDevice::load_downstream(mux_library_path(), identity, live_id)
+            .expect("a second reference shares the loaded library");
+        let library = library_registry()
+            .lock()
+            .unwrap()
+            .get(mux_library_path().as_path())
+            .and_then(Weak::upgrade)
+            .expect("the library the references share is loaded");
+        assert_eq!(
+            library.router.slots.lock().unwrap().len(),
+            2,
+            "each live reference has a slot of its own"
+        );
+
+        // Stop the first reference: its slot goes, the other's stays.
+        stopped.shutdown();
+        {
+            let slots = library.router.slots.lock().unwrap();
+            assert!(
+                !slots.contains_key(&stopped_id),
+                "a shut-down reference takes its slot out of the router"
+            );
+            assert!(
+                slots.contains_key(&live_id),
+                "the other reference's slot stays: only this reference was stopped"
+            );
+        }
+        assert!(
+            stopped.stopped.load(Ordering::Relaxed),
+            "the stopped reference keeps its own stopped flag"
+        );
+
+        // Units for the stopped id, then one for the live reference behind them
+        // — one stream, in order.
+        let dropped_frame = Frame::new(0, b"nobody-drains-this".to_vec());
+        let window = Duration::from_secs(10);
+        // The port is opened by the library's own thread when it gets to
+        // `config_uart`, so a unit written before that meets a tty still in its
+        // default line discipline, where 0x11 and 0x17 are XON and word-erase and
+        // a unit carrying one is mangled into junk. A unit of ours coming back is
+        // the proof the port is open and raw, so the probe is retried until one
+        // does.
+        let deadline = Instant::now() + window;
+        loop {
+            let mut probe =
+                encode_header(assign::reply_arb_id(live_id).expect("an addressable id"));
+            probe.extend_from_slice(&Frame::new(0, b"port-up".to_vec()).raw_bytes());
+            (&pty.master)
+                .write_all(&probe)
+                .expect("the port unit goes in");
+            if live.input.recv_timeout(Duration::from_millis(200)).is_ok() {
+                break; // the port took a unit and the reader routed it
+            }
+            assert!(Instant::now() < deadline, "the bridge's port never came up");
+        }
+        while live.input.try_recv().is_ok() {} // nothing of the probe's left over
+
+        for _ in 0..4 {
+            let mut unit =
+                encode_header(assign::reply_arb_id(stopped_id).expect("an addressable id"));
+            unit.extend_from_slice(&dropped_frame.raw_bytes());
+            (&pty.master)
+                .write_all(&unit)
+                .expect("the port unit goes in");
+        }
+        let live_frame = Frame::new(0, b"still-routed".to_vec());
+        let mut unit = encode_header(assign::reply_arb_id(live_id).expect("an addressable id"));
+        unit.extend_from_slice(&live_frame.raw_bytes());
+        (&pty.master)
+            .write_all(&unit)
+            .expect("the port unit goes in");
+
+        // The live reference's unit is the reader's progress marker: the stopped
+        // id's units were written ahead of it on the same stream, so `push_unit`
+        // has run for every one of them by the time it lands. A probe still in
+        // flight is skipped by the payload test.
+        let live_arb = assign::reply_arb_id(live_id).expect("an addressable id");
+        let deadline = Instant::now() + window;
+        loop {
+            let now = Instant::now();
+            assert!(now < deadline, "the surviving reference was never fed");
+            let queued = live
+                .input
+                .recv_timeout(deadline.saturating_duration_since(now))
+                .expect("the surviving reference was never fed");
+            let (arb, raw) = unit_parts(&queued);
+            assert_eq!(arb, live_arb, "only the surviving reference's own unit");
+            if Frame::parse(raw) == Some(live_frame.clone()) {
+                break;
+            }
+        }
+
+        // And nothing landed in the stopped reference's queue: with its slot
+        // still in the router those four units would be sitting here (the channel
+        // is unbounded and this receiver is alive) — the growth the slot close
+        // rules out.
+        assert_eq!(
+            stopped.input.len(),
+            0,
+            "units for a shut-down reference are dropped, not queued in its slot"
+        );
+        assert!(
+            !library
+                .router
+                .slots
+                .lock()
+                .unwrap()
+                .contains_key(&stopped_id),
+            "and none of those units put the slot back"
+        );
+
+        // Same invariant as the other library tests: leave this path unloaded.
+        drop(stopped);
+        drop(live);
+        drop(library);
         wait_for_unload_blocking(&mux_library_path());
     }
 

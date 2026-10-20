@@ -813,15 +813,22 @@ impl CanSerialDevice {
     ///   unit ([`set_port_node_id`] is the builder all three call).
     ///
     /// # Errors
-    /// The same as [`Device::send`]: a stopped device is a lost connection, and a
-    /// failed socket write is an [`InterfaceError::SendError`].
+    /// The same as [`Device::send`], plus [`InterfaceError::Other`] for an id
+    /// `0`: it names no address, so the bridge would drop the unit without a
+    /// word ([`set_port_node_id`] answers `None` for it) and this writes
+    /// nothing.
     pub fn send_set_port_node_id(
         &self,
         index: u8,
         mcu_id: u8,
         flags: u8,
     ) -> Result<(), InterfaceError> {
-        self.send_bytes(&set_port_node_id(index, mcu_id, flags))
+        let unit = set_port_node_id(index, mcu_id, flags).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} names no mux address; SET_PORT_NODEID was not sent"
+            ))
+        })?;
+        self.send_bytes(&unit)
     }
 
     /// Ask the device behind bridge port `index` to restart its firmware:
@@ -2290,7 +2297,7 @@ mod tests {
         let (device, mut wire) = CanSerialDevice::test_wire(3);
 
         // SET_PORT_NODEID (0x03): names the device behind port 1.
-        let set_port = set_port_node_id(1, 2, MUX_PORT_UNITS);
+        let set_port = set_port_node_id(1, 2, MUX_PORT_UNITS).expect("id 2 is addressable");
         device.send_set_port_node_id(1, 2, MUX_PORT_UNITS).unwrap();
         assert_unit_on_the_wire(&device, &mut wire, &set_port);
 
@@ -2322,7 +2329,7 @@ mod tests {
         // A unit is 15 bytes here, so it does not fit one CAN frame: the cut at
         // eight bytes lands *inside* the `KXID` block (the mux header shifts it),
         // six bytes into the block rather than between units.
-        let unit = set_port_node_id(1, 2, MUX_PORT_UNITS);
+        let unit = set_port_node_id(1, 2, MUX_PORT_UNITS).expect("id 2 is addressable");
         assert_eq!(unit.len(), 15, "the boundary case this test is for");
 
         let link = CanSerialLink::for_node(3).unwrap();

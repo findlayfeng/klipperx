@@ -38,8 +38,8 @@
 use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{
-    Frame, FrameStream, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_POS_LEN,
-    MESSAGE_POS_SEQ, MESSAGE_SYNC, MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
+    Frame, FrameStream, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_PAYLOAD_MAX,
+    MESSAGE_POS_LEN, MESSAGE_POS_SEQ, MESSAGE_SYNC, MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -146,9 +146,14 @@ impl SerialDevice {
     /// they are a protocol conversation with a device that answered an open, and
     /// a retry there would turn a real protocol error into a slow one.
     ///
-    /// `stop` is polled before every attempt and between sleep slices, so an
-    /// exit request ends the wait instead of holding the process for the whole
-    /// budget.
+    /// `stop` is polled after every failed attempt and between sleep slices —
+    /// never before an attempt, so an open that succeeds first time costs no
+    /// poll — which is what ends the wait on an exit request instead of
+    /// holding the process for the whole budget.
+    ///
+    /// Every failed attempt logs a warning naming the port and the OS's reason,
+    /// so a wait on a board that is not plugged in is visible while it lasts
+    /// rather than only in the error the budget ends with.
     ///
     /// # Errors
     /// Returns the last attempt's error, with the attempt count appended, when
@@ -161,7 +166,7 @@ impl SerialDevice {
         stop: &dyn Fn() -> bool,
     ) -> Result<Self, InterfaceError> {
         let path = path.as_ref();
-        retry_open(budget, interval, || Self::open_once(path, baud), stop)
+        retry_open(path, budget, interval, || Self::open_once(path, baud), stop)
     }
 
     /// One attempt: open the port and put the line into raw mode.
@@ -253,10 +258,13 @@ impl SerialDevice {
 ///
 /// A failed exit keeps the last attempt's error — it is the one that names the
 /// port and the OS's reason — and appends the attempt count, so the log says
-/// how hard the open tried. `stop` is the exit request: it is polled after every
-/// failed attempt and between sleep slices, which is what keeps a shutdown from
-/// waiting out the budget.
+/// how hard the open tried. Each failed attempt is logged with `path` and the
+/// reason as it happens: the error alone only surfaces once the budget is spent,
+/// which on a board that is not plugged in is the whole minute and a half. `stop`
+/// is the exit request: it is polled after every failed attempt and between
+/// sleep slices, which is what keeps a shutdown from waiting out the budget.
 fn retry_open<T>(
+    path: &Path,
     budget: Duration,
     interval: Duration,
     mut try_open: impl FnMut() -> Result<T, InterfaceError>,
@@ -268,7 +276,13 @@ fn retry_open<T>(
         attempts += 1;
         let last = match try_open() {
             Ok(value) => return Ok(value),
-            Err(err) => err,
+            Err(err) => {
+                warn!(
+                    "serial port {} is not open yet (attempt {attempts}): {err}",
+                    path.display()
+                );
+                err
+            }
         };
         if stop() {
             return Err(open_retry_error(last, attempts, "aborted"));
@@ -710,6 +724,7 @@ mod tests {
         let (opened, attempts) = bounded(|| {
             let attempts = AtomicUsize::new(0);
             let opened = retry_open(
+                Path::new("/dev/ttyUSB0"),
                 Duration::from_secs(1),
                 Duration::from_millis(10),
                 || {
@@ -740,6 +755,7 @@ mod tests {
             let polls = AtomicUsize::new(0);
             let start = Instant::now();
             let err = retry_open::<()>(
+                Path::new("/dev/ttyUSB0"),
                 Duration::from_secs(60),
                 Duration::from_millis(20),
                 || {
@@ -1331,7 +1347,22 @@ const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
 /// broadcast and the node-id assignment below ride the same self-delimiting
 /// frame with one opcode byte — [`CMD_QUERY_UNASSIGNED`] /
 /// [`CMD_SET_KLIPPER_NODEID`] — after the marker.
+///
+/// # Panics
+///
+/// Panics if the marker plus `payload` does not fit one frame's payload
+/// ([`MESSAGE_PAYLOAD_MAX`]): the firmware refuses a `KXID` frame over
+/// `MESSAGE_MAX` rather than spelling it (`mux_kxid_frame` in
+/// `third_party/klipper/src/mux.c` returns 0), and a length that overflows here
+/// would go on the wire as a frame no receiver accepts. Every caller passes a
+/// fixed-length command body, so this is a programming error.
 fn kxid_unit(payload: &[u8]) -> Vec<u8> {
+    assert!(
+        MAGIC.len() + payload.len() <= MESSAGE_PAYLOAD_MAX,
+        "KXID payload of {} bytes with a {}-byte marker does not fit a {MESSAGE_MAX}-byte frame",
+        payload.len(),
+        MAGIC.len()
+    );
     let mut body = MAGIC.to_vec();
     body.extend_from_slice(payload);
     Frame::with_wire_seq(ASSIGN_SEQ_BYTE, body).raw_bytes()
@@ -1408,11 +1439,19 @@ pub const MUX_PORT_UNITS: u8 = 0x01;
 ///
 /// The bridge builds its port tables from it and consumes it — no receipt, no
 /// copy downstream, and a repeat simply writes the same values again (`mux.h`
-/// in the firmware's serial mux). An index that names no port, or an id the
-/// wire cannot address, is dropped in silence there, so this builder validates
-/// nothing: it only spells the four payload bytes.
-pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Vec<u8> {
-    admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags])
+/// in the firmware's serial mux). An index that names no port is dropped in
+/// silence there, so this builder does not judge it: the port a config names is
+/// the caller's to know.
+///
+/// The id is checked, though: `0` names no address — a mapping entry the bridge
+/// cannot build, dropped without a word (`bridge_set_port_nodeid` skips it when
+/// `mux_arb_id` refuses the id, `third_party/klipper/src/bridge.c`) — so the
+/// builder answers `None` for it, exactly as [`set_node_id_for`] does for an id
+/// outside `1..=MAX_MCU_ID`. Every other `u8` is addressable, since
+/// `MAX_MCU_ID` is `0xff`.
+pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Option<Vec<u8>> {
+    assign::arb_id(u32::from(mcu_id))?;
+    Some(admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags]))
 }
 
 // ===========================================================================
@@ -2775,16 +2814,25 @@ impl SharedSerialHandle {
     /// command and writes it.
     ///
     /// # Errors
-    /// The same as [`SharedSerialHandle::send_unit`].
+    /// The same as [`SharedSerialHandle::send_unit`], plus
+    /// [`InterfaceError::Other`] for an id `0`, which names no address: the
+    /// bridge would drop the unit without a word
+    /// ([`set_port_node_id`] answers `None` for it), so nothing is written and
+    /// the caller is told instead of waiting on a route that never exists.
     pub fn send_set_port_node_id(
         &self,
         index: u8,
         mcu_id: u8,
         flags: u8,
     ) -> Result<(), InterfaceError> {
+        let unit = set_port_node_id(index, mcu_id, flags).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} names no mux address; SET_PORT_NODEID was not sent"
+            ))
+        })?;
         // The builder spells the whole admin unit (header + frame); `send_admin`
         // writes the header, so only the frame behind it goes to it.
-        self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
+        self.send_admin(&unit[HEADER_BYTES..])
     }
 
     /// Ask the device behind port `index` to restart its firmware:
@@ -3385,12 +3433,21 @@ mod mux_tests {
 
         // The admin unit for the bridge goes out exactly as the builder spells
         // it: the ADMIN_LISTEN header, the KXID frame and its trailing SYNC.
-        let command = set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        let command =
+            set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS).expect("the mcu's id is addressable");
         assert_eq!(*command.last().expect("a whole unit"), MESSAGE_SYNC);
         handle
             .send_set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
             .expect("the admin unit goes out");
         assert_eq!(read_n(&pty.master, command.len()), command);
+
+        // An id of `0` names no address: the bridge would drop the unit without
+        // a word, so nothing goes on the wire and the caller is told instead.
+        let refused = handle.send_set_port_node_id(0, 0, MUX_PORT_UNITS);
+        assert!(
+            matches!(refused, Err(InterfaceError::Other(_))),
+            "{refused:?}"
+        );
 
         // The device-address commands of the same family: the restart a named
         // bridge-port device's `admin` method sends, and the bootloader request
@@ -3714,7 +3771,7 @@ mod mux_tests {
             let pty = Pty::new();
             let port = SharedSerialPort::open(&pty.path, DEFAULT_BAUD).unwrap();
             // A full-size unit, so the buffer fills in a second or so of loop.
-            let unit = admin_unit(&[0u8; MESSAGE_MAX]);
+            let unit = admin_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len()]);
             let start = Instant::now();
             let mut failure = None;
             for _ in 0..4_000 {
@@ -5234,6 +5291,28 @@ mod mux_tests {
         );
     }
 
+    /// The frame the `KXID` marker rides in is bounded exactly like the
+    /// firmware's: a payload that fills the frame to `MESSAGE_MAX` goes out, one
+    /// byte more panics instead of spelling a length no receiver accepts.
+    #[test]
+    fn a_kxid_frame_is_bounded_by_the_message_max() {
+        let full = kxid_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len()]);
+        assert_eq!(
+            full[0] as usize, MESSAGE_MAX,
+            "the length byte counts the whole frame"
+        );
+        assert_eq!(full.len(), MESSAGE_MAX, "the frame is the whole unit body");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit a 64-byte frame")]
+    fn a_kxid_payload_over_the_message_max_is_refused() {
+        // `mux_kxid_frame` answers 0 for this and sends nothing; the host side
+        // refuses it in the builder rather than writing a frame whose length
+        // byte the far end drops.
+        kxid_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len() + 1]);
+    }
+
     /// `RESTART_DEVICE` (0x05) is what a named bridge-port device's
     /// `restart_method: admin` sends: the device restarts its firmware rather
     /// than entering a bootloader.
@@ -5263,7 +5342,7 @@ mod mux_tests {
         // the firmware's mux.h command table (SET_PORT_NODEID, payload
         // [0x03][index][id][flags]) spelled inside the stream frame.
         assert_eq!(
-            set_port_node_id(0, 7, 0),
+            set_port_node_id(0, 7, 0).expect("id 7 is addressable"),
             [
                 0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x07, 0x00, 0x53, 0xc7,
                 0x7e
@@ -5272,13 +5351,16 @@ mod mux_tests {
         // The flags byte is the port's own: MUX_PORT_UNITS turns the port to
         // unit mode, and the reserved bits the firmware masks off are ignored.
         assert_eq!(
-            set_port_node_id(0, 8, MUX_PORT_UNITS),
+            set_port_node_id(0, 8, MUX_PORT_UNITS).expect("id 8 is addressable"),
             [
                 0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x08, 0x01, 0xc1, 0x86,
                 0x7e
             ]
         );
-        let unit = set_port_node_id(1, 0xff, MUX_PORT_UNITS);
+        // An id of `0` names no address, so there is no unit to spell: the
+        // bridge would drop it without a word, and the builder says so up front.
+        assert_eq!(set_port_node_id(0, 0, MUX_PORT_UNITS), None);
+        let unit = set_port_node_id(1, 0xff, MUX_PORT_UNITS).expect("id 0xff is addressable");
         assert_eq!(
             unit.iter().filter(|&&b| b == MESSAGE_SYNC).count(),
             1,

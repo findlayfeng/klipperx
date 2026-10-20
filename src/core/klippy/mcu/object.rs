@@ -3227,7 +3227,7 @@ mod tests {
     }
 
     /// The line's own round trip is in `last_stats`, in the seconds upstream
-    /// reports (`serialqueue.c:1042-1043`).
+    /// reports (`serialqueue.c:1043`).
     ///
     /// A report may arrive before the send task has folded the ack that
     /// measured its round trip, so the test takes one exchange first, waits for

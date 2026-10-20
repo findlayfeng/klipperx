@@ -190,10 +190,10 @@ impl LastStats {
 
     /// The load, the traffic and the round trip as `last_stats`.
     ///
-    /// Every value is a number `serde_json` renders without an exponent and,
-    /// for the second-denominated ones, with a decimal point — the shape
-    /// upstream's `{float(v) if '.' in v else int(v)}` parse assumes
-    /// (`klippy/mcu.py:974`): `srtt=%.3f` there, the same seconds here.
+    /// Every value is a JSON number, never a string, and the second-denominated
+    /// ones are seconds — the unit upstream's own report uses
+    /// (`mcu_awake=%.03f mcu_task_avg=%.06f` at `klippy/mcu.py:969`,
+    /// `srtt=%.3f rttvar=%.3f rto=%.3f` at `serialqueue.c:1043`).
     /// `srtt`/`rttvar`/`rto` are absent until a round trip has been measured,
     /// which is also how upstream's report reads (`serialqueue.c:222`).
     pub fn to_json(&self) -> serde_json::Value {
@@ -505,7 +505,7 @@ mod tests {
     }
 
     /// The round trip is reported in **seconds**, the unit upstream prints
-    /// (`serialqueue.c:1042-1043`, with `MIN_RTO 0.025` / `MAX_RTO 5.000` for
+    /// (`serialqueue.c:1043`, with `MIN_RTO 0.025` / `MAX_RTO 5.000` for
     /// scale at `:107-108`) — not in milliseconds or microseconds.
     #[test]
     fn test_last_stats_publishes_the_round_trip_in_seconds() {
@@ -527,7 +527,8 @@ mod tests {
         assert_eq!(json["srtt"], 0.025);
         assert_eq!(json["rttvar"], 0.0025);
         assert_eq!(json["rto"], 0.035);
-        // A dotted number, which is what upstream's `'.' in v` parse keys off
+        // A fractional JSON number, not an integer and not a string: the shape
+        // a reader takes as a float, as upstream's `'.' in v` parse does
         // (`klippy/mcu.py:974`).
         for key in ["srtt", "rttvar", "rto"] {
             let text = json[key].to_string();

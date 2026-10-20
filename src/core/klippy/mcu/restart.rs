@@ -1082,7 +1082,8 @@ mod tests {
         let interface = open_bridge_link(&printer, &link, 9).expect("the bridge link opens");
         device_reset(&interface, &link, 9).expect("the device restart goes out");
 
-        let mut expected = set_port_node_id(link.index, 9, MUX_PORT_UNITS);
+        let mut expected =
+            set_port_node_id(link.index, 9, MUX_PORT_UNITS).expect("id 9 is addressable");
         expected.extend_from_slice(&admin_unit(&[CMD_RESTART_DEVICE, link.index]));
         assert_eq!(
             read_pty(&pty.master, expected.len(), Duration::from_secs(3)),

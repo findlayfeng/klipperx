@@ -1439,11 +1439,19 @@ pub const MUX_PORT_UNITS: u8 = 0x01;
 ///
 /// The bridge builds its port tables from it and consumes it — no receipt, no
 /// copy downstream, and a repeat simply writes the same values again (`mux.h`
-/// in the firmware's serial mux). An index that names no port, or an id the
-/// wire cannot address, is dropped in silence there, so this builder validates
-/// nothing: it only spells the four payload bytes.
-pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Vec<u8> {
-    admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags])
+/// in the firmware's serial mux). An index that names no port is dropped in
+/// silence there, so this builder does not judge it: the port a config names is
+/// the caller's to know.
+///
+/// The id is checked, though: `0` names no address — a mapping entry the bridge
+/// cannot build, dropped without a word (`bridge_set_port_nodeid` skips it when
+/// `mux_arb_id` refuses the id, `third_party/klipper/src/bridge.c`) — so the
+/// builder answers `None` for it, exactly as [`set_node_id_for`] does for an id
+/// outside `1..=MAX_MCU_ID`. Every other `u8` is addressable, since
+/// `MAX_MCU_ID` is `0xff`.
+pub fn set_port_node_id(index: u8, mcu_id: u8, flags: u8) -> Option<Vec<u8>> {
+    assign::arb_id(u32::from(mcu_id))?;
+    Some(admin_unit(&[CMD_SET_PORT_NODEID, index, mcu_id, flags]))
 }
 
 // ===========================================================================
@@ -2806,16 +2814,25 @@ impl SharedSerialHandle {
     /// command and writes it.
     ///
     /// # Errors
-    /// The same as [`SharedSerialHandle::send_unit`].
+    /// The same as [`SharedSerialHandle::send_unit`], plus
+    /// [`InterfaceError::Other`] for an id `0`, which names no address: the
+    /// bridge would drop the unit without a word
+    /// ([`set_port_node_id`] answers `None` for it), so nothing is written and
+    /// the caller is told instead of waiting on a route that never exists.
     pub fn send_set_port_node_id(
         &self,
         index: u8,
         mcu_id: u8,
         flags: u8,
     ) -> Result<(), InterfaceError> {
+        let unit = set_port_node_id(index, mcu_id, flags).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} names no mux address; SET_PORT_NODEID was not sent"
+            ))
+        })?;
         // The builder spells the whole admin unit (header + frame); `send_admin`
         // writes the header, so only the frame behind it goes to it.
-        self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
+        self.send_admin(&unit[HEADER_BYTES..])
     }
 
     /// Ask the device behind port `index` to restart its firmware:
@@ -3416,12 +3433,21 @@ mod mux_tests {
 
         // The admin unit for the bridge goes out exactly as the builder spells
         // it: the ADMIN_LISTEN header, the KXID frame and its trailing SYNC.
-        let command = set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        let command =
+            set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS).expect("the mcu's id is addressable");
         assert_eq!(*command.last().expect("a whole unit"), MESSAGE_SYNC);
         handle
             .send_set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
             .expect("the admin unit goes out");
         assert_eq!(read_n(&pty.master, command.len()), command);
+
+        // An id of `0` names no address: the bridge would drop the unit without
+        // a word, so nothing goes on the wire and the caller is told instead.
+        let refused = handle.send_set_port_node_id(0, 0, MUX_PORT_UNITS);
+        assert!(
+            matches!(refused, Err(InterfaceError::Other(_))),
+            "{refused:?}"
+        );
 
         // The device-address commands of the same family: the restart a named
         // bridge-port device's `admin` method sends, and the bootloader request
@@ -5316,7 +5342,7 @@ mod mux_tests {
         // the firmware's mux.h command table (SET_PORT_NODEID, payload
         // [0x03][index][id][flags]) spelled inside the stream frame.
         assert_eq!(
-            set_port_node_id(0, 7, 0),
+            set_port_node_id(0, 7, 0).expect("id 7 is addressable"),
             [
                 0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x07, 0x00, 0x53, 0xc7,
                 0x7e
@@ -5325,13 +5351,16 @@ mod mux_tests {
         // The flags byte is the port's own: MUX_PORT_UNITS turns the port to
         // unit mode, and the reserved bits the firmware masks off are ignored.
         assert_eq!(
-            set_port_node_id(0, 8, MUX_PORT_UNITS),
+            set_port_node_id(0, 8, MUX_PORT_UNITS).expect("id 8 is addressable"),
             [
                 0xe8, 0x3f, 0x0d, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x03, 0x00, 0x08, 0x01, 0xc1, 0x86,
                 0x7e
             ]
         );
-        let unit = set_port_node_id(1, 0xff, MUX_PORT_UNITS);
+        // An id of `0` names no address, so there is no unit to spell: the
+        // bridge would drop it without a word, and the builder says so up front.
+        assert_eq!(set_port_node_id(0, 0, MUX_PORT_UNITS), None);
+        let unit = set_port_node_id(1, 0xff, MUX_PORT_UNITS).expect("id 0xff is addressable");
         assert_eq!(
             unit.iter().filter(|&&b| b == MESSAGE_SYNC).count(),
             1,

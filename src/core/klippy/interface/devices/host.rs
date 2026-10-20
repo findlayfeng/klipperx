@@ -1229,16 +1229,24 @@ impl HostDevice {
     /// The caller decides **when**; this only spells the command and writes it.
     ///
     /// # Errors
-    /// The same as [`HostDevice::send_admin`].
+    /// The same as [`HostDevice::send_admin`], plus [`InterfaceError::Other`] for
+    /// an id `0`: it names no address, so the bridge would drop the unit
+    /// without a word ([`set_port_node_id`] answers `None` for it) and this
+    /// writes nothing.
     pub fn send_set_port_node_id(
         &self,
         index: u8,
         mcu_id: u8,
         flags: u8,
     ) -> Result<(), InterfaceError> {
+        let unit = set_port_node_id(index, mcu_id, flags).ok_or_else(|| {
+            InterfaceError::Other(format!(
+                "mcu id {mcu_id} names no mux address; SET_PORT_NODEID was not sent"
+            ))
+        })?;
         // The builder spells the whole admin unit (header + frame); `send_admin`
         // writes the header, so only the frame behind it goes to it.
-        self.send_admin(&set_port_node_id(index, mcu_id, flags)[HEADER_BYTES..])
+        self.send_admin(&unit[HEADER_BYTES..])
     }
 
     /// Ask the device behind port `index` to restart its firmware:
@@ -3058,7 +3066,7 @@ mod host_tests {
         //    the bridge's own business: no receipt comes back upstream and
         //    nothing is written to the port.
         device
-            .write(&set_port_node_id(0, 7, 0))
+            .write(&set_port_node_id(0, 7, 0).expect("id 7 is addressable"))
             .expect("SET_PORT_NODEID goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
@@ -3104,7 +3112,7 @@ mod host_tests {
         //    a unit for the port's new id travels whole — header and all — both
         //    ways.
         device
-            .write(&set_port_node_id(0, 8, MUX_PORT_UNITS))
+            .write(&set_port_node_id(0, 8, MUX_PORT_UNITS).expect("id 8 is addressable"))
             .expect("SET_PORT_NODEID goes in");
         let unit_frame = command_frame(&parser, "get_clock", MESSAGE_DEST);
         let mut headed_down = encode_header(assign::arb_id(8).expect("id 8"));
@@ -3175,7 +3183,7 @@ mod host_tests {
         // index and a short payload are consumed without reaching any port and
         // without a receipt.
         device
-            .write(&set_port_node_id(99, 7, MUX_PORT_UNITS))
+            .write(&set_port_node_id(99, 7, MUX_PORT_UNITS).expect("id 7 is addressable"))
             .expect("an out-of-range SET_PORT_NODEID goes in");
         assert!(
             read_pty(&pty.master, 1, quiet).is_empty(),
@@ -3278,7 +3286,7 @@ mod host_tests {
                 .expect("the mux host library opens");
         configure_port_zero(&mut device);
         device
-            .write(&set_port_node_id(0, TUNNEL_PORT_ID, 0))
+            .write(&set_port_node_id(0, TUNNEL_PORT_ID, 0).expect("the port's id is addressable"))
             .expect("SET_PORT_NODEID goes in");
         (device, pty)
     }
@@ -3649,7 +3657,7 @@ mod host_tests {
                 .expect("the mux host library opens");
         configure_port_zero(&mut device);
         device
-            .write(&set_port_node_id(0, UNITS_PORT_ID, MUX_PORT_UNITS))
+            .write(&set_port_node_id(0, UNITS_PORT_ID, MUX_PORT_UNITS).expect("the port's id"))
             .expect("SET_PORT_NODEID goes in");
         device
             .send_set_port_tunnel(0)

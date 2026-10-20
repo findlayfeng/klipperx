@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(
             sent,
             [
-                set_port_node_id(1, 2, MUX_PORT_UNITS),
+                set_port_node_id(1, 2, MUX_PORT_UNITS).expect("id 2 is addressable"),
                 admin_unit(&[CMD_RESTART_DEVICE, 1]),
                 admin_unit(&[CMD_RESET_PORT, 1]),
             ]

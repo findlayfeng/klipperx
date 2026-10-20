@@ -1875,7 +1875,8 @@ mod tests {
             "the pty never answers the assignment, so the handshake times out"
         );
 
-        let mut expected = serial::set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        let mut expected = serial::set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
+            .expect("the mcu's id is addressable");
         expected.extend_from_slice(
             &serial::set_node_id_for(named, mcu_id).expect("id 7 is addressable"),
         );
@@ -1925,7 +1926,8 @@ mod tests {
         // Silence is success on a CAN port: no answer is expected at all.
         open(&printer, &link, mcu_id).expect("a silent CAN device is still named");
 
-        let mut expected = serial::set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS);
+        let mut expected = serial::set_port_node_id(0, mcu_id as u8, MUX_PORT_UNITS)
+            .expect("the mcu's id is addressable");
         expected.extend_from_slice(
             &serial::set_node_id_for(named, mcu_id).expect("id 7 is addressable"),
         );

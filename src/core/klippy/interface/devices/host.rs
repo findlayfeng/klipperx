@@ -842,8 +842,9 @@ pub struct HostDevice {
     /// and the poll loop. This is per-handle: the library's own `stopped` is
     /// set only by the final teardown.
     stopped: AtomicBool,
-    /// Bytes [`Device::receive`] took out of `input` since this reference was
-    /// opened.
+    /// Bytes this reference has read since it was opened: what
+    /// [`Device::receive`] took out of `input`, and what the raw
+    /// [`HostDevice::read`] handed a bench scan.
     bytes_read: AtomicU64,
     /// Bytes [`HostDevice::write_raw`] handed the library, mux unit headers
     /// included — that is what goes on the wire.

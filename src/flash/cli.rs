@@ -1216,12 +1216,12 @@ fn run_bridge_flash(
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
 
         // The plan the firmware numbers by arrival order: one entry per port up
-        // to and including the target. Only the target's entry is reset — a
-        // session resets the target's port alone
-        // ([`super::bridge_session::reset_ports`]) — while the ports below it
-        // are here for the declaration, which is what makes the target's port
-        // exist at all. Their reset is unused, and a line pulse to a device the
-        // caller never named is exactly what this plan must not produce.
+        // to and including the target. Only the target's entry is reset — the
+        // session's reset step takes the target's port alone — while the ports
+        // below it are here for the declaration, which is what makes the
+        // target's port exist at all. Their reset is unused, and a line pulse
+        // to a device the caller never named is exactly what this plan must not
+        // produce.
         let ports: Vec<BridgePort> = (0..=target.port)
             .map(|index| BridgePort {
                 baud: target.baud,
@@ -1613,9 +1613,9 @@ fn port_bounds_error(index: u8, count: Option<u8>) -> Option<String> {
         return None;
     }
     Some(format!(
-        "--port {index} names a port the bridge does not have: its firmware numbers \
-         {count} port(s) (0..{last}), and it drops a port-level command that names a port \
-         it does not have, in silence. Nothing was sent.",
+        "--port {index} names no port the bridge has: it numbers {count} port(s), \
+         0..{last}, and drops a port-level command naming a port it does not have, in \
+         silence. Nothing was sent.",
         last = count.saturating_sub(1),
     ))
 }
@@ -3313,5 +3313,63 @@ mod tests {
             sent(&wire, &admin_unit(&[CMD_RESTART_DEVICE, BRIDGE_INDEX])),
             "the restart unit crossed the line: {wire:02x?}"
         );
+    }
+
+    /// A `--port` index the bridge cannot have is **refused** before anything is
+    /// sent: the firmware drops a port-level unit that names a port it does not
+    /// have, in silence, so reporting "sent with no receipt" would be a lie
+    /// about a write nothing received.
+    #[test]
+    fn test_a_port_index_past_the_bridges_slots_is_refused() {
+        assert_eq!(port_bounds_error(0, Some(4)), None);
+        assert_eq!(port_bounds_error(3, Some(4)), None, "3 is the last of four");
+        let message = port_bounds_error(4, Some(4)).expect("four slots cannot hold port 4");
+        assert!(message.contains("--port 4"), "{message}");
+        assert!(
+            message.contains("4 port(s)"),
+            "the bridge's own count: {message}"
+        );
+        assert!(
+            port_bounds_error(4, None).is_none(),
+            "a bridge that publishes no count (no dictionary, or a firmware that predates \
+             the constant) is held to nothing"
+        );
+    }
+
+    /// The same refusal through a real bridge: the host library publishes its
+    /// slot count (`BRIDGE_UART_COUNT`, one slot per tty its host could name),
+    /// so `--port 4` on a bridge that numbers four ports stops the run instead of
+    /// printing `sent` and exiting 0.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share.
+    #[test]
+    fn test_a_port_past_a_real_bridges_slots_is_refused_before_it_is_sent() {
+        let port = Pty::new();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().display().to_string();
+        let tty = format!("0:{}", port.path.display());
+        let args = parse_reset(&[
+            "--bridge-library",
+            &library,
+            "--port-tty",
+            &tty,
+            "--port",
+            "4",
+        ])
+        .expect("a port reset line");
+
+        let err = run_reset(args).expect_err("the bridge numbers four ports, not five");
+        let text = err.to_string();
+        assert!(text.contains("--port 4"), "{text}");
+        assert!(
+            text.contains("4 port(s)"),
+            "the refusal names the bridge's own count: {text}"
+        );
+        assert!(text.contains("Nothing was sent"), "{text}");
     }
 }

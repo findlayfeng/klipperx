@@ -9,7 +9,8 @@
 //! command, a two-second read window per try, 0.5 s between tries and 1.5 s
 //! after a busy response. Every knob lives in [`SessionConfig`] so tests can
 //! run on millisecond budgets, and every path is bounded: tries are counted,
-//! each read waits at most `read_timeout`, and all failures are `Result`s.
+//! each read waits at most `read_timeout`, each frame write must be taken
+//! inside that same window, and all failures are `Result`s.
 
 use std::io::{ErrorKind, Read, Write};
 use std::thread;
@@ -33,7 +34,9 @@ pub struct SessionConfig {
     /// Tries per command (a try ends on timeout, NACK, busy or a wrong
     /// acknowledged command).
     pub tries: u32,
-    /// Read window per try.
+    /// Window per try, both directions: a read waits at most this long, and a
+    /// frame the transport will not take whole inside it fails the write (see
+    /// [`write_frame`]).
     pub read_timeout: Duration,
     /// Sleep between two tries.
     pub retry_delay: Duration,
@@ -134,18 +137,77 @@ enum Outcome {
     Retry(&'static str),
 }
 
+/// Classify one response frame, dispatching on its code first.
+///
+/// The bootloader answers NACK (0xF1), command error (0xF2) and busy (0xF3)
+/// with a **zero-word** frame: `command_respond(out, RESPONSE_*, ARRAY_SIZE(out))`
+/// with `out[2]`, i.e. `(2 - 2) << 24` payload words (`third_party/katapult/src/command.c`).
+/// Only `ACK_SUCCESS` carries words, the first of them the command it
+/// acknowledges — so requiring a payload word before looking at the code
+/// would report every one of those three answers as a short response and make
+/// `Device`/`Busy` unreachable.
 fn classify(cmd: u8, frame: Frame) -> Outcome {
-    let Some(resp) = frame.as_response() else {
-        return Outcome::Retry("response shorter than one word");
-    };
-    match resp.ack {
+    match frame.code {
         frame::ACK_ERROR => Outcome::Abort(FlashError::Device { cmd }),
         frame::ACK_BUSY => Outcome::Busy,
         frame::NACK => Outcome::Retry("nack"),
-        frame::ACK_SUCCESS if resp.orig_cmd == u32::from(cmd) => Outcome::Success(resp.data),
-        frame::ACK_SUCCESS => Outcome::Retry("acknowledged a different command"),
+        frame::ACK_SUCCESS => match frame.as_response() {
+            None => Outcome::Retry("acknowledged without a command word"),
+            Some(resp) if resp.orig_cmd == u32::from(cmd) => Outcome::Success(resp.data),
+            Some(_) => Outcome::Retry("acknowledged a different command"),
+        },
         _ => Outcome::Retry("unexpected response code"),
     }
+}
+
+/// Send one frame, bounded by `timeout`.
+///
+/// A transport that takes the bytes in slices, or reports `WouldBlock`/
+/// `TimedOut` for a queue with no room yet (the tunnel writer in
+/// [`super::bridge`], a non-blocking socket), is retried in [`READ_POLL`]
+/// slices; when the window closes the write fails with [`ErrorKind::TimedOut`]
+/// wrapped in [`FlashError::Io`] instead of letting the session sit in a write
+/// forever. Anything else the transport reports is passed through as its own
+/// I/O error. One blocking `write` on a tty is indivisible, which is why the
+/// deadline for that transport is enforced here, around the whole frame, and
+/// not inside the port.
+pub(super) fn write_frame<W: Write>(
+    writer: &mut W,
+    bytes: &[u8],
+    timeout: Duration,
+) -> Result<(), FlashError> {
+    let deadline = Instant::now() + timeout;
+    let mut sent = 0;
+    while sent < bytes.len() {
+        let stalled = match writer.write(&bytes[sent..]) {
+            Ok(0) => true,
+            Ok(n) => {
+                sent += n;
+                false
+            }
+            Err(e)
+                if e.kind() == ErrorKind::Interrupted
+                    || e.kind() == ErrorKind::WouldBlock
+                    || e.kind() == ErrorKind::TimedOut =>
+            {
+                true
+            }
+            Err(e) => return Err(FlashError::Io(e)),
+        };
+        if stalled {
+            if Instant::now() >= deadline {
+                return Err(FlashError::Io(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!(
+                        "transport took {sent} of {} bytes within {timeout:?}",
+                        bytes.len()
+                    ),
+                )));
+            }
+            thread::sleep(READ_POLL);
+        }
+    }
+    writer.flush().map_err(FlashError::Io)
 }
 
 /// Send one command and wait for its ack: write the frame, scan replies until
@@ -169,8 +231,7 @@ pub fn command<R: Read, W: Write>(
             // `flashtool.py` clears its read buffer before every retry.
             scanner.clear();
         }
-        writer.write_all(&frame)?;
-        writer.flush()?;
+        write_frame(writer, &frame, cfg.read_timeout)?;
         let deadline = Instant::now() + cfg.read_timeout;
         let mut reason: Option<&'static str> = None;
         loop {

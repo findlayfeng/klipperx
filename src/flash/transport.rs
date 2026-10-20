@@ -52,6 +52,11 @@ const PRIME_CMD: u8 = 0x90;
 /// over from there.
 const PRIME_DRAIN: Duration = Duration::from_secs(1);
 
+/// How long the prime frame has to be taken by the port — the write window of
+/// [`SessionConfig::default`], which is the one the session that follows the
+/// prime runs on.
+const PRIME_WRITE_WINDOW: Duration = Duration::from_secs(2);
+
 /// The admin channel every board listens on before it has a node id
 /// (`flashtool.py` `CANBUS_ID_ADMIN`).
 const ADMIN_ID: u32 = 0x3f0;
@@ -163,6 +168,11 @@ impl Read for TtyPort<'_> {
 
 impl Write for TtyPort<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // One pass-through write. The port is in blocking mode, so a `write`
+        // is indivisible; the deadline for the frame lives one level up, in
+        // `session::write_frame`, which bounds the whole frame by the try's
+        // window and fails with `TimedOut` when the transport stops taking
+        // bytes between slices.
         self.dev.borrow_mut().write(buf)
     }
 
@@ -205,7 +215,9 @@ pub fn open_tty(device: &str, baud: u32) -> Result<TtyLink, TransportError> {
 /// session will answer this too, inside the session's own read windows.
 fn prime(link: &TtyLink) -> Result<(), TransportError> {
     let prime = frame::build_frame(PRIME_CMD, &[]);
-    link.dev.borrow_mut().write_all(&prime)?;
+    // The prime goes out under the same write window the session gives its own
+    // frames, so a port that stops draining cannot stall the open.
+    session::write_frame(&mut *link.dev.borrow_mut(), &prime, PRIME_WRITE_WINDOW)?;
 
     let deadline = Instant::now() + PRIME_DRAIN;
     let mut scanner = FrameScanner::new();

@@ -2495,7 +2495,7 @@ mod tests {
         //    has not reported within the bound gets a note.
         match wait_for_last_stats(printer, &api) {
             Some(last_stats) => {
-                for field in ["mcu_tick_avg", "mcu_tick_stddev", "mcu_tick_awake"] {
+                for field in ["mcu_task_avg", "mcu_task_stddev", "mcu_awake"] {
                     let value = last_stats[field].as_f64().unwrap_or_else(|| {
                         panic!("{TEST_NAME}: mcu.last_stats.{field} is a number: {last_stats}")
                     });

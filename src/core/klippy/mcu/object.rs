@@ -2910,20 +2910,24 @@ mod tests {
         assert!(object.get_status(0.0).get("last_stats_time").is_none());
 
         *object.last_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastStats {
-            mcu_tick_avg: 1.5e-6,
-            mcu_tick_stddev: 2.5e-7,
-            mcu_tick_awake: 0.25,
+            mcu_task_avg: 1.5e-6,
+            mcu_task_stddev: 2.5e-7,
+            mcu_awake: 0.25,
             eventtime: 12.5,
             bytes_read: 1_024,
             bytes_write: 2_048,
+            round_trip: None,
         });
 
         let status = object.get_status(0.0);
-        assert_eq!(status["last_stats"]["mcu_tick_awake"], 0.25);
-        assert_eq!(status["last_stats"]["mcu_tick_avg"], 1.5e-6);
+        assert_eq!(status["last_stats"]["mcu_awake"], 0.25);
+        assert_eq!(status["last_stats"]["mcu_task_avg"], 1.5e-6);
         assert_eq!(status["last_stats"]["bytes_read"], 1_024);
         assert_eq!(status["last_stats"]["bytes_write"], 2_048);
         assert_eq!(status["last_stats_time"], 12.5);
+        // No round trip measured in this report: the keys are absent rather
+        // than zero (`serialqueue.c:222`).
+        assert!(status["last_stats"].get("srtt").is_none(), "{status}");
     }
 
     /// Frame carrying one `stats` report: id -1 (the id the firmware's own
@@ -2968,6 +2972,40 @@ mod tests {
                 outputs: vec![stats_frame(seq as u8, count, sum, sumsq)],
             })
             .collect();
+        attached_with_mappings(object, printer, mappings)
+    }
+
+    /// The same, but every report comes with the frame a real firmware sends
+    /// after it: the report stamped one past the block it answers
+    /// (`src/command.c:16`, `:301-305`), then the empty ack carrying the same
+    /// number. Only that empty frame tells the send task the block was taken
+    /// (`serialqueue.c:254-268`), and the round-trip sample closes on it.
+    fn attached_with_acked_stats(
+        object: &McuObject,
+        printer: &Arc<Printer>,
+        reports: &[(u32, u32, u32)],
+    ) -> Arc<Mcu> {
+        let mappings = reports
+            .iter()
+            .enumerate()
+            .map(|(seq, &(count, sum, sumsq))| MappingEntry {
+                input: Frame::new(seq as u8, vec![4]),
+                outputs: vec![
+                    stats_frame(seq as u8 + 1, count, sum, sumsq),
+                    Frame::new(seq as u8 + 1, Vec::new()),
+                ],
+            })
+            .collect();
+        attached_with_mappings(object, printer, mappings)
+    }
+
+    /// An MCU whose device answers from `mappings`, attached to `object`'s chip
+    /// with [`register_stats`] keeping the latest report.
+    fn attached_with_mappings(
+        object: &McuObject,
+        printer: &Arc<Printer>,
+        mappings: Vec<MappingEntry>,
+    ) -> Arc<Mcu> {
         let mcu = Arc::new(Mcu::for_test(
             "mcu",
             Interface::new(FrameMock::new(mappings)),
@@ -3033,11 +3071,11 @@ mod tests {
         let last = last_report_at(&object, 2.5).await;
 
         assert_eq!(last.eventtime, 2.5, "stamped with the machine's clock");
-        assert!((last.mcu_tick_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
+        assert!((last.mcu_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
         let status = object.get_status(0.0);
         assert_eq!(status["last_stats_time"], 2.5);
         assert_eq!(
-            status["last_stats"]["mcu_tick_awake"].as_f64().unwrap(),
+            status["last_stats"]["mcu_awake"].as_f64().unwrap(),
             3000.0 / 72_000_000.0
         );
     }
@@ -3064,7 +3102,7 @@ mod tests {
             second.eventtime, 7.5,
             "the later report is the one reported"
         );
-        assert!((second.mcu_tick_awake - 8000.0 / 72_000_000.0).abs() < 1e-18);
+        assert!((second.mcu_awake - 8000.0 / 72_000_000.0).abs() < 1e-18);
     }
 
     /// An MCU on `pty`'s line, with [`register_stats`] keeping its reports in
@@ -3141,15 +3179,11 @@ mod tests {
         assert_eq!(second_status["last_stats"]["bytes_write"], 0);
         // Each line's own load, from its own report.
         assert_eq!(
-            first_status["last_stats"]["mcu_tick_awake"]
-                .as_f64()
-                .unwrap(),
+            first_status["last_stats"]["mcu_awake"].as_f64().unwrap(),
             3000.0 / 72_000_000.0
         );
         assert_eq!(
-            second_status["last_stats"]["mcu_tick_awake"]
-                .as_f64()
-                .unwrap(),
+            second_status["last_stats"]["mcu_awake"].as_f64().unwrap(),
             100.0 / 72_000_000.0
         );
     }
@@ -3178,10 +3212,10 @@ mod tests {
 
         let freq = 72_000_000.0;
         let c = 1.0 / (100.0 * freq);
-        assert!((last.mcu_tick_avg - 3000.0 * c).abs() < 1e-18);
+        assert!((last.mcu_task_avg - 3000.0 * c).abs() < 1e-18);
         let variance = 100.0 * 250_000.0 * 4.0 - 3000.0f64.powi(2);
-        assert!((last.mcu_tick_stddev - c * variance.sqrt()).abs() < 1e-18);
-        assert!((last.mcu_tick_awake - 3000.0 / freq).abs() < 1e-18);
+        assert!((last.mcu_task_stddev - c * variance.sqrt()).abs() < 1e-18);
+        assert!((last.mcu_awake - 3000.0 / freq).abs() < 1e-18);
         assert_eq!(last.eventtime, 2.5, "dated with the machine's clock");
         assert_eq!(last.bytes_read, report.len() as u64);
         assert!(
@@ -3190,6 +3224,71 @@ mod tests {
             last.bytes_write
         );
         assert_eq!(object.get_status(0.0)["last_stats_time"], 2.5);
+    }
+
+    /// The line's own round trip is in `last_stats`, in the seconds upstream
+    /// reports (`serialqueue.c:1042-1043`).
+    ///
+    /// A report may arrive before the send task has folded the ack that
+    /// measured its round trip, so the test takes one exchange first, waits for
+    /// the estimate to exist, and only then reads a report.
+    #[tokio::test]
+    async fn test_last_stats_reports_the_round_trip_of_its_own_line() {
+        let (printer, clock) = printer_with_clock();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let mcu = attached_with_acked_stats(
+            &object,
+            &printer,
+            &[(100, 3000, 250_000), (200, 8000, 400_000)],
+        );
+
+        // The fake device's answer to the block is also its ack, so this one
+        // exchange is what gives the line a round trip to report.
+        clock.advance(2.5);
+        mcu.send_msg(&GetUptime).unwrap();
+        last_report_at(&object, 2.5).await;
+        let measured = wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || mcu.wire_round_trip().is_some(),
+            "a round trip must be measured",
+        );
+        timeout(Duration::from_secs(5), measured)
+            .await
+            .expect("the wait is bounded");
+
+        clock.advance(5.0);
+        mcu.send_msg(&GetUptime).unwrap();
+        let last = last_report_at(&object, 7.5).await;
+
+        let stamped = last
+            .round_trip
+            .expect("the line had measured a round trip before this report");
+        let status = object.get_status(0.0);
+        let stats = &status["last_stats"];
+        // Seconds: `rto` is clamped to 25 ms..=5 s upstream, so a millisecond or
+        // microsecond rendering would land far outside that range.
+        assert!(
+            (0.025..=5.0).contains(&stamped.rto.as_secs_f64()),
+            "rto {:?} is a wait in seconds",
+            stamped.rto
+        );
+        for (key, value) in [
+            ("srtt", stamped.srtt),
+            ("rttvar", stamped.rttvar),
+            ("rto", stamped.rto),
+        ] {
+            assert_eq!(
+                stats[key].as_f64().unwrap(),
+                value.as_secs_f64(),
+                "{key} is the measured duration in seconds: {stats}"
+            );
+        }
+        // The task keys are the upstream ones, and only those.
+        assert!(stats["mcu_awake"].as_f64().unwrap() > 0.0);
+        for stale in ["mcu_tick_avg", "mcu_tick_stddev", "mcu_tick_awake"] {
+            assert!(stats.get(stale).is_none(), "{stale}: {stats}");
+        }
     }
 
     #[tokio::test]
@@ -3214,17 +3313,13 @@ mod tests {
         let first_status = first.get_status(0.0);
         assert_eq!(first_status["last_stats_time"], 2.5);
         assert_eq!(
-            first_status["last_stats"]["mcu_tick_awake"]
-                .as_f64()
-                .unwrap(),
+            first_status["last_stats"]["mcu_awake"].as_f64().unwrap(),
             3000.0 / 72_000_000.0
         );
         let second_status = second.get_status(0.0);
         assert_eq!(second_status["last_stats_time"], 7.5);
         assert_eq!(
-            second_status["last_stats"]["mcu_tick_awake"]
-                .as_f64()
-                .unwrap(),
+            second_status["last_stats"]["mcu_awake"].as_f64().unwrap(),
             1000.0 / 72_000_000.0
         );
     }

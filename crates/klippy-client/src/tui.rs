@@ -49,9 +49,11 @@
 //! needs nothing but the counters, and a reader who knows their wire can divide
 //! by it themselves.
 //!
-//! `srtt`/`rto` and `bytes_retransmit` are shown when the printer reports them
-//! (this host's `mcu` object does not, yet); a field it never sends is asked
-//! for anyway and simply never arrives. The row is one line: a narrow window
+//! `srtt`/`rttvar`/`rto` are shown once the line has measured a round trip (the
+//! printer leaves them out until its first sample lands, and this host's `mcu`
+//! object does too), and `bytes_retransmit` when the printer counts retransmits
+//! — which this host does not. A field the printer never sends is asked for
+//! anyway and simply never arrives. The row is one line: a narrow window
 //! cuts the tail off rather than wrapping, because the log's rows are the
 //! reason the window exists. The pushes behind it are read and not reprinted —
 //! they arrive every 5 s, and a window that showed them would spend its log on
@@ -427,8 +429,10 @@ impl Render {
 ///
 /// The counters are cumulative, so they are kept only as the baseline the next
 /// report is differenced against (see [`RateMeter`]); what the row shows is the
-/// rates. `srtt`/`rto`/`bytes_retransmit` are `Option` because the printer may
-/// not report them at all — this host's `mcu` object does not, yet.
+/// rates. `bytes_retransmit` is an `Option` because the printer may not report
+/// it at all — this host's `mcu` object does not — while `srtt`/`rto` are one
+/// only because the report leaves them out until the line has measured a round
+/// trip (`serialqueue.c:222`).
 #[derive(Debug, Default, Clone)]
 struct McuStats {
     /// The object's name as the printer lists it: `mcu`, `mcu zboard`.
@@ -5896,9 +5900,9 @@ mod tests {
     fn stats_report(time: f64, read: u64, write: u64) -> Value {
         serde_json::json!({
             "last_stats": {
-                "mcu_tick_avg": 1.5e-6,
-                "mcu_tick_stddev": 2.0e-7,
-                "mcu_tick_awake": 0.25,
+                "mcu_task_avg": 1.5e-6,
+                "mcu_task_stddev": 2.0e-7,
+                "mcu_awake": 0.25,
                 "bytes_read": read,
                 "bytes_write": write
             },
@@ -6000,6 +6004,31 @@ mod tests {
         // facts the printer did report.
         let row = traffic_text(&[mcu], 200);
         assert_eq!(row, "mcu  read —  write —  retx 3  srtt 0.4ms  rto 25.0ms");
+    }
+
+    /// The round trip arrives inside `last_stats`, which is where the printer
+    /// puts it (`serialqueue_get_stats` folded into `mcu.stats()`,
+    /// `klippy/mcu.py:968-975`), and the row reads it out of there.
+    #[test]
+    fn test_the_traffic_row_reads_the_round_trip_out_of_last_stats() {
+        let mut mcu = McuStats::new("mcu");
+        mcu.update(&stats_report(1.0, 10, 20));
+        mcu.update(&serde_json::json!({
+            "last_stats": {
+                "mcu_task_avg": 1.5e-6,
+                "mcu_task_stddev": 2.0e-7,
+                "mcu_awake": 0.25,
+                "bytes_read": 10,
+                "bytes_write": 20,
+                "srtt": 0.00042,
+                "rttvar": 0.0001,
+                "rto": 0.025
+            },
+            "last_stats_time": 1.0
+        }));
+
+        let row = traffic_text(&[mcu], 200);
+        assert_eq!(row, "mcu  read —  write —  srtt 0.4ms  rto 25.0ms");
     }
 
     #[test]

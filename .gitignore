@@ -24,3 +24,6 @@
 src/core/klippy/upstream_generated/cases/
 src/core/klippy/upstream_generated/fixtures/
 src/core/klippy/upstream_generated/mod.rs
+
+# Local Cargo examples: not shipped, kept out of the tree on purpose.
+/examples/

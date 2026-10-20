@@ -703,13 +703,10 @@ mod tests {
         admin_unit(command)[HEADER_BYTES..].to_vec()
     }
 
-    /// The plan's steps in the order the firmware needs them: the declaration
-    /// pairs in index order, then the **target's** port reset the way its plan
-    /// entry says, then the target named **legacy** and its tunnel opened.
-    ///
-    /// The plan behind it ([`expected_ports`]) asks for a different reset on the
-    /// port below the target (`RestartDevice`), and none of it is sent: the
-    /// reset step takes the target's entry alone.
+    /// [`expected_steps`] is the plan `test_open_bridge_declares_resets_and_opens_the_tunnel_in_order`
+    /// runs: two ports, the target at index 0 and port 1 asking for
+    /// `RestartDevice`. The declaration pairs come in index order, then the
+    /// target's reset, then the target named **legacy** and its tunnel opened.
     fn expected_steps(target_node_id: u8) -> Vec<Step> {
         vec![
             Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(4)]),

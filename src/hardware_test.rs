@@ -173,9 +173,11 @@
 //!   of [`Machine::bring_up`].
 //! * **Its failures are failures.** A config that names a board which cannot be
 //!   opened, or a bring-up that does not reach `Ready`, is an `Err` — the config
-//!   said that hardware was there, so it was there to run. Only an unmet
-//!   [`Requires`] and an unset [`HW_CONFIG_ENV`] are skips, and `bring_up` is
-//!   never reached in either case.
+//!   said that hardware was there, so it was there to run. A [`HW_CONFIG_ENV`]
+//!   that is set but names a config that cannot be read or parsed is a failure
+//!   too ([`acquire`] panics): the variable said there was a config to test
+//!   against. Only an unmet [`Requires`] and an unset [`HW_CONFIG_ENV`] are
+//!   skips, and `bring_up` is never reached in either case.
 //!
 //! # The live shape, not the corpus' file-output shape
 //!
@@ -234,8 +236,11 @@
 //! here is `#[ignore]`d. Asking for the ignored ones on a machine with no
 //! `KLIPPERX_HW_CONFIG` prints `HW-IGNORED: <test>: <why>` and **passes** —
 //! "this machine has no board for that" is a skip, and a green run must say so
-//! rather than test nothing quietly. A config that is there and names a device
-//! which then refuses to open is a real failure: it was there to run.
+//! rather than test nothing quietly. The same line is printed when the config is
+//! there but does not provide what the test declared it needs. A config that is
+//! named but unreadable or unparsable is not a skip: it is a failure, because the
+//! variable promised a config. A config that is there and names a device which
+//! then refuses to open is a real failure too: it was there to run.
 //!
 //! # Serialised on the board
 //!
@@ -832,13 +837,19 @@ fn run_line(test_name: &str) -> String {
 ///
 /// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
 /// decides what it offers. Returns `None` — and prints one
-/// `HW-IGNORED: <test>: <why>` line — when the variable is unset, the file is
-/// missing or unparsable, or the config does not provide `requires`; a skipped
-/// test touches no device and takes no lock.
+/// `HW-IGNORED: <test>: <why>` line — in the two skip cases: the variable is
+/// unset, or the config does not provide `requires`. A skipped test touches no
+/// device and takes no lock.
 ///
 /// Returns `Some(machine)` with the board locked exclusively when everything is
 /// in place, printing the [`run_line`] first. The lock is held until the machine
 /// is dropped, so the test body and its cleanup are one session on the board.
+///
+/// # Panics
+/// When the variable is set but names a config that cannot be used (missing
+/// file, parser error), or the board cannot be locked: the variable said the
+/// machine had a config, so "there was nothing to test" is a failure, not a
+/// skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
     acquire_at(path.as_deref().map(Path::new), test_name, requires)
@@ -856,8 +867,12 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
             None
         }
         Decision::Unreadable(reason) => {
-            println!("HW-IGNORED: {test_name}: {reason}");
-            None
+            // The variable named a config, so this machine was supposed to have
+            // one. Only an unset variable and an unmet `Requires` are skips; a
+            // path that does not exist or a file that does not parse is a
+            // failure — a green run must not report "nothing to test" for a
+            // config the user told it to use.
+            panic!("{test_name}: {HW_CONFIG_ENV} is set but its config cannot be used: {reason}")
         }
         Decision::Missing(missing) => {
             let reasons: Vec<String> = missing.iter().map(ToString::to_string).collect();
@@ -1783,5 +1798,54 @@ mod tests {
         );
         // A skipped test took no lock: the board is free for whoever comes next.
         let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
+    }
+
+    /// The message a caught panic carried.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_else(|| "a panic with no message".to_string())
+    }
+
+    /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,
+    /// not a skip: the variable said the machine had a config to test against.
+    /// Only an unset variable and an unmet [`Requires`] are skips.
+    #[test]
+    fn test_a_named_config_that_does_not_parse_fails_instead_of_skipping() {
+        let fixture = TempConfig::new("serial: /dev/ttyACM0\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new())
+        })) {
+            Ok(_) => panic!("a config that does not parse is a failure, not a skip"),
+            Err(payload) => payload,
+        };
+
+        let message = panic_message(payload.as_ref());
+        assert!(message.contains("cannot be used"), "{message}");
+        // The parser's own reason travels with it.
+        assert!(
+            message.contains("Parameter outside of section"),
+            "{message}"
+        );
+    }
+
+    /// The same for a path that does not exist: a set variable is a promise.
+    #[test]
+    fn test_a_named_config_that_does_not_exist_fails_instead_of_skipping() {
+        let absent = std::env::temp_dir().join("klipperx-hwtest-does-not-exist/printer.cfg");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(&absent), "self-test", &Requires::new())
+        })) {
+            Ok(_) => panic!("a config path that does not exist is a failure, not a skip"),
+            Err(payload) => payload,
+        };
+
+        let message = panic_message(payload.as_ref());
+        assert!(message.contains("cannot be used"), "{message}");
+        assert!(message.contains("printer.cfg"), "{message}");
     }
 }

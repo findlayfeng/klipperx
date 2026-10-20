@@ -16,7 +16,6 @@ make                  # 两份都编：klipper.bin + katapult.bin（+ deployer.b
 make klipper          # 只编应用
 make katapult         # 只编引导（含 deployer）
 make menuconfig       # 合并菜单：共享目标 + klipper 选项 + katapult 专属项
-make defconfig        # 用 firmware.config 覆盖工作配置 .config
 make olddefconfig     # 只重解配置、派生两份构建配置（不编译）
 make clean            # 删 out/firmware
 make distclean        # 连工作配置 .config 一起删
@@ -34,22 +33,23 @@ make help             # 命令一览
 | `out/firmware/klipper.config`、`out/firmware/katapult.config` | 从共享配置派生出的两份构建配置（可当证据看） |
 | `out/firmware/katapult/canboot.bin` | katapult 构建自带的旧名副本（兼容上游脚本） |
 
-`out/`、`.config` 都在 `.gitignore` 里；提交的是种子配置 `firmware.config`。同一份文件只有一个位置：
+`out/`、`.config` 都在 `.gitignore` 里——**仓库不带任何 `.config` 种子**（同上游：种子只能对应某一台板）。同一份文件只有一个位置：
 `make klipper` / `make katapult` / `make` 产出的路径完全一样。
 
 ## 配置文件从哪来
 
 ```
-firmware.config   提交的种子（参考板的选择）      ──make defconfig──▶  .config
+（无种子）标板的开关见本文末「参考板的选择」 ──make menuconfig──▶  .config
 .config           工作配置（menuconfig 改这个）   ──make / olddefconfig──▶  out/firmware/klipper.config
                                                                       └▶  out/firmware/katapult.config
 ```
 
-- 首次 `make` 发现没有 `.config` 时从 `firmware.config` 播种，之后不再覆盖；改配置用 `make menuconfig`。
+- **新检出没有 `.config`**：`make` 会停下并提示 `run 'make menuconfig'`（不会替你写一份）。照着本文末
+  「参考板的选择」那张表在 `menuconfig` 里选一遍即可；换板子也只是换这几项。
 - `make` 每次都会重解配置（kconfig 解析很便宜）；工作配置 `.config` 会按 kconfig 的规范形式重写
   （首次会把注释与无效行规范化），而派生出的 `out/firmware/*.config` **只在与上次内容不同时**才改写，
   所以两个子模组的增量构建不受打扰。
-- 想回到种子状态：`make defconfig`；想从零开始：`make distclean && make`。
+- 想推翻重来：`make distclean && make menuconfig`（`distclean` 连 `.config` 一起删）。
 
 共享配置由根 `Kconfig` 描述：目标选择（架构、处理器型号、时钟、通信接口、引导偏移）直接取自
 `third_party/klipper/src/Kconfig`（katapult 的 Kconfig 对这些符号用同样的名字和取值），
@@ -107,11 +107,22 @@ katapult 侧的 `SERIAL_BAUD` 同样是默认 250 k（同样的 prompt 规则）
   没有默认值，这个接口选项在它的树里不可见，所以两份一起编时会在配置阶段被拒；
   只要应用的话用 `make klipper`。
 
-## 参考板的种子配置
+## 参考板的选择（在 `make menuconfig` 里照这张表选）
 
-`firmware.config` 描述台面上的 STM32F103ZE：USB CDC（PA11/PA12）、8 KiB 引导偏移
-（应用在 `0x8002000`）、8 MHz 晶振、应用侧开 mux、引导侧开双击复位与 PC13 状态灯。
-换板子就 `make menuconfig`，或改种子后 `make defconfig` 再编。
+台面板是 STM32F103ZE，`menuconfig` 里对应这几项（其余项保持默认）：
+
+| 菜单项 | 取值 |
+|---|---|
+| Micro-controller Architecture | STMicroelectronics STM32 |
+| Processor model | STM32F103 |
+| Clock reference | 8 MHz crystal |
+| Communication interface | USB (on PA11/PA12) |
+| Bootloader offset | 8 KiB bootloader（应用在 `0x8002000`） |
+| `CONFIG_MUX_SERIAL`（klipperx 自有项） | 开（宿主按 id 寻址、可被 `admin` 扫描） |
+| `CONFIG_ENABLE_DOUBLE_RESET`（katapult 侧） | 开 |
+| `CONFIG_ENABLE_LED` / `CONFIG_STATUS_LED_PIN` | 开 / `PC13` |
+
+换板子就是换这张表里的项——**没有种子文件可改**（同上游：种子只能对应一台板）。
 
 ## 在 worktree 里构建
 

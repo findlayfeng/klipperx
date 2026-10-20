@@ -13,8 +13,8 @@
 
 - **板子**：STM32F103xe（72 MHz，USB `usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00`
   → `/dev/ttyACM0`），固件 `out/firmware/klipper/klipper.bin`（仓库根 `make klipper` 产出；
-  目标板与引导偏移由 `firmware.config` / `make menuconfig` 决定，见
-  [构建 MCU 固件](docs/klippy/user-manual/firmware-build.md)；含 `config_stepper` 等）。
+  目标板与引导偏移由 `make menuconfig` 决定（**仓库不带种子配置**，台面板的选法见
+  [构建 MCU 固件](docs/klippy/user-manual/firmware-build.md) 末节；含 `config_stepper` 等）。
 - **最小接线**：X 与 Y 的 `step_pin`/`dir_pin`、X 的 `endstop_pin`、挤出机步进（E 轴）、
   加热棒 + 热敏电阻（`[extruder]`）。**引脚尚未定论**：本节此前写 X = `PB0`/`PB1`，而
   `config.cfg` 的注释写 `PB4`/`PB5`（且那组注释与 `[output_pin] motor_in1..4` 的

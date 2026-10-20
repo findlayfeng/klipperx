@@ -63,7 +63,8 @@ printf 'halt\nread32 0x1FFFF7E8\nread32 0x08000000\nreset\nquit\n' | \
 ## 构建（本仓）
 
 - 固件在**仓库根**构建（一次共享配置出两份）：`make`（klipper + katapult）、`make klipper`、
-  `make katapult`；配置用 `make menuconfig`（种子 `firmware.config`，工作配置 `.config`），
+  `make katapult`；配置用 `make menuconfig`（**仓库不带种子**，工作配置 `.config`；台面板的选项照
+  `docs/klippy/user-manual/firmware-build.md` 末节的表选），
   细则见 [构建 MCU 固件](../../../docs/klippy/user-manual/firmware-build.md)。
   产物：`out/firmware/klipper/klipper.{bin,elf}`、`out/firmware/katapult/{katapult,deployer}.{bin,elf}`。
 - **改了子模组的 `Makefile`/`Kconfig`/源文件后先 `make clean` 再 `make`**：`src-y` 顺序变化不会让

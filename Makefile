@@ -12,6 +12,11 @@
 # at the main checkout (the same variables the tests use) and each worktree
 # keeps its own config and artifacts.
 #
+# There is **no committed seed** for `.config`: upstream ships none either, and
+# a seed would have to name one particular board.  A machine without `.config`
+# is told to run `make menuconfig`; the bench board's choices are written out in
+# docs/klippy/user-manual/firmware-build.md.
+#
 # Variable names are deliberately not OUT/KCONFIG_CONFIG: those are the
 # submodules' variables, and a value left in the environment must not redirect
 # this build.
@@ -21,7 +26,6 @@ KATAPULT_DIR ?= $(if $(KLIPPERX_KATAPULT_DIR),$(KLIPPERX_KATAPULT_DIR),$(CURDIR)
 
 FIRMWARE_OUT ?= out/firmware
 FIRMWARE_CONFIG ?= .config
-FIRMWARE_DEFCONFIG ?= firmware.config
 
 KLIPPER_OUT := $(FIRMWARE_OUT)/klipper
 KATAPULT_OUT := $(FIRMWARE_OUT)/katapult
@@ -37,7 +41,7 @@ define require_tree
 test -f $(1)/Makefile || { echo "firmware: $(1) has no build system (submodule not checked out)." >&2; echo "firmware: set KLIPPERX_KLIPPER_DIR / KLIPPERX_KATAPULT_DIR to a checked-out main tree." >&2; exit 1; }
 endef
 
-.PHONY: all firmware klipper katapult config olddefconfig menuconfig defconfig clean distclean help
+.PHONY: all firmware klipper katapult config olddefconfig menuconfig clean distclean help
 
 all: firmware
 
@@ -82,13 +86,15 @@ config: $(FIRMWARE_CONFIG)
 
 olddefconfig: config
 
+# A missing `.config` is the normal state of a fresh clone: upstream ships no
+# seed, and this repository does not either (a seed names one board).  Say so
+# instead of writing a configuration nobody asked for.
 $(FIRMWARE_CONFIG):
-	@cp $(FIRMWARE_DEFCONFIG) $@
-	@echo "firmware: seeded $@ from $(FIRMWARE_DEFCONFIG) (change it with 'make menuconfig')"
-
-defconfig:
-	@cp $(FIRMWARE_DEFCONFIG) $(FIRMWARE_CONFIG)
-	@echo "firmware: $(FIRMWARE_CONFIG) restored from $(FIRMWARE_DEFCONFIG)"
+	@echo "firmware: no $@ in $(CURDIR)" >&2
+	@echo "firmware: run 'make menuconfig' and pick your board and console;" >&2
+	@echo "firmware: the bench board's choices are listed in" >&2
+	@echo "firmware:   docs/klippy/user-manual/firmware-build.md" >&2
+	@exit 1
 
 # The merged menu: the Klipper tree plus kconfig/katapult.kconfig.  `source`
 # lines resolve against $srctree, which is the Klipper checkout.
@@ -109,7 +115,6 @@ help:
 		'make klipper       build only the application (any klipper target)' \
 		'make katapult      build only the bootloader (+ deployer when configured)' \
 		'make menuconfig    edit the shared target and both option sets' \
-		'make defconfig     restore the working config from firmware.config' \
 		'make olddefconfig  resolve the shared config and derive both build configs' \
 		'make clean         remove out/firmware' \
 		'make distclean     also remove the working .config'

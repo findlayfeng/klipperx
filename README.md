@@ -186,7 +186,6 @@ docs/                    文档（见下）
 third_party/klipper/     上游 Klipper（git 子模组：语料 + 上游 config + 固件源码）
 third_party/katapult/    Katapult 引导加载程序（git 子模组：katapult 协议 + bootloader 固件 + 刷写脚本）
 Makefile, Kconfig        顶层固件构建：一次共享配置编 katapult 与 klipper 两份固件
-firmware.config          固件种子配置（`make` 的默认目标板/接口/引导偏移）
 kconfig/                 katapult 专属的 Kconfig 片段（引导侧选项）
 out/firmware/            固件产物与派生配置（gitignore）
 ```

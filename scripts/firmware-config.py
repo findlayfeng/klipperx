@@ -363,7 +363,7 @@ def main():
     kconfiglib = import_kconfiglib(args.klipper)
 
     if not os.path.exists(args.config):
-        sys.exit(f"firmware: {args.config} does not exist; run 'make defconfig' first")
+        sys.exit(f"firmware: {args.config} does not exist; run 'make menuconfig' first")
 
     # The merged UI: Klipper's tree for the shared target, plus the
     # bootloader-only menu from kconfig/katapult.kconfig.

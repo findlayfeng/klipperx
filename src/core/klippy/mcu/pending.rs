@@ -82,8 +82,19 @@ impl PendingCalls {
     /// (`serial.register_response(cb, name, oid)`), so an answer nobody on this
     /// connection asked for is not handed to the next caller in line — that
     /// would be another peripheral's data.
+    ///
+    /// A registration whose receiver is gone goes first: a [`Mcu::call`] whose
+    /// future was dropped — the caller was cancelled, its task aborted — leaves
+    /// its registration behind, and nobody will ever read the answer. Matching
+    /// it would spend the next caller's answer on a waiter that is not there
+    /// any more, so such registrations are dropped here, before anything is
+    /// matched. Their message then takes the ordinary path (nobody is waiting
+    /// for it), which is what the caller that left asked for by leaving.
+    ///
+    /// [`Mcu::call`]: super::Mcu::call
     pub(crate) async fn resolve(&self, response_name: &str, params: &[ArgValue]) -> bool {
         let mut calls = self.calls.lock().await;
+        calls.retain(|call| !call.response_tx.is_closed());
         let mut waiting = false;
         let mut matched = None;
         for (idx, call) in calls.iter().enumerate() {
@@ -249,14 +260,43 @@ mod tests {
         assert_eq!(calls.len().await, 1);
     }
 
+    /// A registration whose receiver is gone is no waiter at all: it is
+    /// dropped before anything is matched, so its message takes the ordinary
+    /// path instead of being spent on a call that already left.
     #[tokio::test]
-    async fn test_resolve_after_receiver_dropped_is_not_an_error() {
+    async fn test_a_dropped_receiver_leaves_no_waiter_behind() {
         let calls = PendingCalls::new();
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
         drop(rx);
 
         calls.register("clock".to_string(), None, tx).await;
+        assert!(
+            !calls.resolve("clock", &params()).await,
+            "nobody is waiting: the registration's caller left"
+        );
+        assert_eq!(calls.len().await, 0, "and it is not kept either");
+    }
+
+    /// The shape the rule guards: a [`Mcu::call`](super::Mcu::call) whose
+    /// future was dropped (its task cancelled) leaves its registration behind,
+    /// and the next caller's answer has to reach that caller — not the departed
+    /// one, whose answer nobody will ever read.
+    #[tokio::test]
+    async fn test_the_next_call_takes_the_answer_past_a_dropped_one() {
+        let calls = PendingCalls::new();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        drop(dropped_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+
+        calls.register("clock".to_string(), None, dropped_tx).await;
+        calls.register("clock".to_string(), None, live_tx).await;
+
         assert!(calls.resolve("clock", &params()).await);
+        assert_eq!(
+            live_rx.await.unwrap(),
+            params(),
+            "the caller still waiting is the one that gets it"
+        );
         assert_eq!(calls.len().await, 0);
     }
 

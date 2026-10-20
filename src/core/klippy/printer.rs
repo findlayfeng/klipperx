@@ -62,7 +62,13 @@ pub enum PrinterState {
 impl PrinterState {
     /// Get the state category string ("startup", "ready", "shutdown", "error").
     ///
-    /// These are the four values the `info` endpoint may report as `state`.
+    /// These are the four values the `info` endpoint may report as `state`, and
+    /// the only four Moonraker accepts: `KlippyState.from_string`
+    /// (`moonraker/common.py:137-151`) raises `ValueError` for any other
+    /// spelling, at call sites with no `ServerError` guard around them
+    /// (`klippy_connection.py:456,583`), leaving the host silently in
+    /// `startup`. External dependency, do not rename — a new variant also has
+    /// to be added to `ALL_PRINTER_STATES` in this module's tests.
     pub fn as_category(&self) -> &'static str {
         match self {
             PrinterState::Startup => "startup",
@@ -357,7 +363,7 @@ impl Printer {
                 host_objects: None,
                 start_reason: None,
                 restart_hooks: None,
-                software_version: env!("CARGO_PKG_VERSION").to_string(),
+                software_version: crate::version::software_version(),
                 start_args: None,
             }),
             exit_requested: Condvar::new(),
@@ -456,7 +462,8 @@ impl Printer {
     ///
     /// Upstream reads `start_args['software_version']`; the host sets it from
     /// its [`crate::core::klippy::api::StartArgs`] at startup, and it defaults
-    /// to this crate's version so tests and the `M115` reply agree.
+    /// to [`crate::version::software_version`] — the pinned upstream baseline
+    /// plus this crate's version — so tests and the `M115` reply agree.
     pub fn software_version(&self) -> String {
         self.lock().software_version.clone()
     }
@@ -912,6 +919,15 @@ impl Printer {
         self.exit_requested.notify_all();
     }
 
+    /// Whether [`Printer::request_exit`] has already been called.
+    ///
+    /// A wait that belongs to the bring-up polls this instead of blocking: an
+    /// open that is waiting for a port to come back has to end when the process
+    /// is asked to (`mcu/object.rs`, `McuConfig::open_retrying`).
+    pub fn exit_requested(&self) -> bool {
+        self.lock().run_result.is_some()
+    }
+
     /// Idle until the printer is asked to exit, and return what it was asked
     /// with.
     ///
@@ -1197,6 +1213,41 @@ mod tests {
         assert_eq!(PrinterState::Error.as_category(), "error");
     }
 
+    /// Every variant, for [`test_every_state_category_is_one_moonraker_accepts`].
+    /// Included via the array rather than through introspection (the crate has no
+    /// `strum`), so a variant added to the enum has to be added here too — the
+    /// exhaustive `match` in `as_category` makes that visible.
+    const ALL_PRINTER_STATES: [PrinterState; 4] = [
+        PrinterState::Startup,
+        PrinterState::Ready,
+        PrinterState::Shutdown,
+        PrinterState::Error,
+    ];
+
+    #[test]
+    fn test_every_state_category_is_one_moonraker_accepts() {
+        // `info` and `webhooks` both put this string on the wire, and Moonraker
+        // feeds it straight to `KlippyState.from_string`
+        // (`moonraker/common.py:137-151`): an unrecognised name is a
+        // `ValueError` and a frontend that never leaves `startup`.
+        const ACCEPTED: [&str; 4] = ["startup", "ready", "error", "shutdown"];
+
+        for state in ALL_PRINTER_STATES {
+            let name = state.as_category();
+            assert!(ACCEPTED.contains(&name), "{state:?} reports {name}");
+        }
+
+        // Four distinct names: a new variant reusing an existing one would slip
+        // past the check above and confuse Moonraker's state transitions.
+        let mut names: Vec<&str> = ALL_PRINTER_STATES
+            .iter()
+            .map(PrinterState::as_category)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), ALL_PRINTER_STATES.len());
+    }
+
     #[test]
     fn test_event_names_are_the_wire_names() {
         assert_eq!(KlippyEvent::KlippyMcuIdentify.name(), "klippy:mcu_identify");
@@ -1293,6 +1344,16 @@ mod tests {
                 "klippy:disconnect",
             ]
         );
+    }
+
+    #[test]
+    fn test_exit_requested_reports_an_exit_that_was_asked_for() {
+        // A bring-up waits on this instead of blocking: a port that is not there
+        // yet must stop being waited for as soon as the process is asked to go.
+        let printer = new_printer();
+        assert!(!printer.exit_requested());
+        printer.request_exit("exit");
+        assert!(printer.exit_requested());
     }
 
     #[test]
@@ -1517,11 +1578,18 @@ mod tests {
         // (`klippy/klippy.py:30`), where modules read them; the software version
         // inside is the one `M115` and `error_mcu` report.
         let printer = new_printer();
-        assert_eq!(printer.software_version(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            printer.software_version(),
+            crate::version::software_version()
+        );
         assert!(printer.start_args().is_none());
         assert!(!printer.is_fileoutput(), "no start args, no file output");
 
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.software_version = "v1.2.3".to_string();
         printer.set_start_args(Arc::new(args));
 
@@ -1535,7 +1603,11 @@ mod tests {
             "start args without `--debugoutput` are an ordinary run"
         );
 
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         assert!(printer.is_fileoutput());

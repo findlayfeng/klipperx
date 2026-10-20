@@ -11,6 +11,11 @@
 //! and its [`HeaterControl`] takeover come from
 //! (`crate::core::klippy::extras::pid_calibrate`).
 //!
+//! The registry also registers `TURN_OFF_HEATERS`
+//! (`PrinterHeaters.turn_off_all_heaters`), which is the first line of
+//! `[idle_timeout]`'s default script — without it an idle machine keeps the bed
+//! and hotend at their targets.
+//!
 //! The object has no `[heaters]` section of its own — upstream loads it by name
 //! (`printer.load_object(config, 'heaters')`) and so does [`ensure`], which is
 //! also where the built-in sensor modules are brought in (upstream reads
@@ -39,14 +44,56 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::pins::{PrinterPins, PwmOut, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject, PrinterState};
+use crate::core::klippy::reactor::TimerHandle;
+use tracing::warn;
 
 /// The name other modules look the registry up by.
 pub const HEATERS_OBJECT: &str = "heaters";
 
-/// The longest a heater PWM change may sit before the firmware falls back
-/// (upstream `MAX_HEAT_TIME`, `heaters.py:14`).
-#[allow(dead_code)]
+/// The longest a heater PWM change may sit before the firmware falls back to
+/// the pin's shutdown value (upstream `MAX_HEAT_TIME`, `heaters.py:14`).
+///
+/// This is the firmware's watchdog: a host that hangs (rather than exits) stops
+/// sending readings, and after this long the MCU takes the heater pin down
+/// itself instead of holding the last duty cycle.
 const MAX_HEAT_TIME: f64 = 3.0;
+/// How long a heater trusts its own output after the main thread last proved
+/// it was running (upstream `MAX_MAINTHREAD_TIME`, `heaters.py:17`).
+///
+/// [`PrinterHeaters`] stamps every heater once a second with "the main thread is
+/// alive at this print time, plus this"; a reading dated past that stamp means
+/// the host stopped running (a deadlock, a stuck g-code loop) while the
+/// firmware is still answering, and [`Heater::temperature_callback`] drops the
+/// output to zero instead of holding whatever the control loop last computed.
+/// [`MAX_HEAT_TIME`] covers the host that exits; this one covers the host that
+/// hangs.
+const MAX_MAINTHREAD_TIME: f64 = 5.0;
+/// How long a reading stays trusted after it was taken (upstream
+/// `QUELL_STALE_TIME`, `heaters.py:18`).
+///
+/// A sensor that stopped reporting leaves its last reading behind; past this
+/// age [`Heater::get_temp`] answers `0` instead of that reading, so
+/// `verify_heater` sees a cold, unresponsive heater rather than a warm one that
+/// merely froze (`heaters.py:116-122`).
+const QUELL_STALE_TIME: f64 = 7.0;
+/// The share of full power a duty-cycle change must reach to be sent inside the
+/// send window (upstream `MIN_PWM_CHANGE_RATIO`, `heaters.py:19`).
+///
+/// A heater that resent on every reading would put the *reading's* age on the
+/// wire; a batch of readings that reached the host late would then date a change
+/// in the firmware's past (`Rescheduled timer in the past`). Upstream sends at
+/// most one new duty per window (see [`HeaterState::next_pwm_time`]) and skips
+/// the small changes in between.
+const MIN_PWM_CHANGE_RATIO: f64 = 0.05;
+
+/// Whether a stalled-main-thread drop is worth a log line now.
+///
+/// `last_reported_at` is the print time of the previous line; a host that just
+/// came out of a stall produces a reading every report period, so without this
+/// bound one stall would write tens of identical lines.
+fn stall_report_due(last_reported_at: f64, read_time: f64) -> bool {
+    read_time - last_reported_at >= STALL_REPORT_INTERVAL
+}
 /// The temperature the PID's first derivative is measured against
 /// (upstream `AMBIENT_TEMP`, `heaters.py:15`).
 const AMBIENT_TEMP: f64 = 25.0;
@@ -63,6 +110,8 @@ const PID_SETTLE_DELTA: f64 = 1.0;
 const PID_SETTLE_SLOPE: f64 = 0.1;
 /// `cmd_TEMPERATURE_WAIT_help` (`heaters.py:366`).
 const TEMPERATURE_WAIT_HELP: &str = "Wait for a temperature on a sensor";
+/// `cmd_TURN_OFF_HEATERS_help` (`heaters.py:319`).
+const TURN_OFF_HEATERS_HELP: &str = "Turn off all heaters";
 
 /// The toolhead a `set_temperature` wait flushes through, upstream's
 /// `lookup_object("toolhead")` (`heaters.py:352,361`).
@@ -79,6 +128,15 @@ pub trait Sensor: Send + Sync + std::fmt::Debug {
 
     /// Where readings are delivered.
     fn setup_callback(&self, callback: SensorCallback);
+
+    /// How far apart this sensor's reports are, in seconds (upstream's
+    /// `get_report_time_delta`, `heaters.py:32`).
+    ///
+    /// The heater dates every PWM change one report period after the reading it
+    /// came from ([`Heater::pwm_delay`]), so the change lands before the next
+    /// reading and never in the past — a clock already behind the firmware reads
+    /// as its `Timer too close` shutdown.
+    fn get_report_time_delta(&self) -> f64;
 }
 
 /// What the M105 g-code-id table stores — any object that can report its
@@ -93,11 +151,8 @@ pub trait GcodeTempSensor: Send + Sync {
 }
 
 impl GcodeTempSensor for Heater {
-    fn get_temp(&self, _eventtime: f64) -> (f64, f64) {
-        // The existing `Heater::get_temp` does not take `eventtime` — the
-        // stale-reading check upstream does (`QUELL_STALE_TIME`) needs a
-        // print-time clock this host does not have (see `Heater::get_temp`).
-        self.get_temp()
+    fn get_temp(&self, eventtime: f64) -> (f64, f64) {
+        self.get_temp(eventtime)
     }
 }
 
@@ -237,6 +292,22 @@ pub struct Heater {
     max_power: f64,
     /// `1 / smooth_time`, for the smoothed temperature.
     inv_smooth_time: f64,
+    /// The machine, for the reactor instant a reading's delay is measured
+    /// from: a batch of readings that reached the host late must not date its
+    /// PWM change behind the firmware's clock.
+    printer: Weak<Printer>,
+    /// The smallest duty change worth sending inside the send window
+    /// (`max_power * MIN_PWM_CHANGE_RATIO`, upstream `heaters.py:41`).
+    min_pwm_change: f64,
+    /// How far after a reading this heater may date its PWM change (upstream's
+    /// `pwm_delay`, `heaters.py:32`): one report period of the sensor that
+    /// produced the reading.
+    ///
+    /// This is what keeps the change in the future. An immediate change is dated
+    /// with the host's clock estimate, which the firmware can already be past —
+    /// and a change dated at or before the pin's outstanding auto-off timer
+    /// (`MAX_HEAT_TIME`) is what it reports as `Timer too close`.
+    pwm_delay: f64,
     state: Mutex<HeaterState>,
 }
 
@@ -246,10 +317,31 @@ struct HeaterState {
     last_temp: f64,
     smoothed_temp: f64,
     last_temp_time: f64,
+    /// Upstream's `verify_mainthread_time` (`heaters.py:44`): the print time the
+    /// main thread last proved it was alive at, plus [`MAX_MAINTHREAD_TIME`].
+    /// Upstream's `-999.` initial value, so a reading that arrives before the
+    /// first stamp counts as stale.
+    verify_mainthread_time: f64,
     can_extrude: bool,
     last_pwm_value: f64,
+    /// Print time of the last `output dropped` line, so a stall cannot flood
+    /// the log. `NEG_INFINITY` until the first drop.
+    stall_reported_at: f64,
+    /// The next print time at which a new duty may be sent (upstream's
+    /// `next_pwm_time`, `heaters.py:80`): the previous change plus
+    /// `MAX_HEAT_TIME`, minus three report periods so the pin's auto-off never
+    /// expires between two changes.
+    next_pwm_time: f64,
     control: Box<dyn HeaterControl>,
 }
+
+/// How often a stalled-main-thread drop may be logged, in seconds of reading
+/// time.
+///
+/// A stalled host produces readings faster than it produces log lines, and the
+/// condition repeats for as long as the stall lasts, so the report is bounded
+/// to one line a second — enough to date the stall, not enough to bury the log.
+const STALL_REPORT_INTERVAL: f64 = 1.0;
 
 impl Heater {
     /// The heater's short name (`extruder`, `heater_bed`).
@@ -320,8 +412,46 @@ impl Heater {
         old
     }
 
+    /// Record that the main thread is alive at print time `print_time`
+    /// (upstream's `Heater.stats`, `heaters.py:137-140`).
+    ///
+    /// The print time is passed in rather than looked up here
+    /// ([`Self::pwm_estimated_print_time`] is that lookup) so "stamp at this
+    /// print time" stays reachable for a caller already holding the chip's
+    /// clock — the tests, and the once-a-second timer in [`PrinterHeaters`] that
+    /// combines the two.
+    pub fn stamp_mainthread(&self, print_time: f64) {
+        self.lock().verify_mainthread_time = print_time + MAX_MAINTHREAD_TIME;
+    }
+
+    /// The print time this heater's PWM chip is at, at host instant
+    /// `eventtime` (upstream's `mcu_pwm.get_mcu().estimated_print_time()`,
+    /// `heaters.py:138`). `None` when the pin's chip has no clock to answer
+    /// with, which makes the caller skip the stamp.
+    fn pwm_estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        self.pwm
+            .as_ref()
+            .and_then(|pwm| pwm.estimated_print_time(eventtime))
+    }
+
     /// One sensor reading: run the control loop and update the smoothed
     /// temperature (`Heater.temperature_callback`).
+    ///
+    /// The value the control asks for goes through upstream's `Heater.set_pwm`
+    /// guard (`heaters.py:72-74`): a heater with no target (`target_temp <= 0`)
+    /// gets zero whatever the control computed, and so does one whose reading is
+    /// dated past `verify_mainthread_time` — the main thread has not proved
+    /// itself alive within [`MAX_MAINTHREAD_TIME`], so the output is dropped
+    /// rather than held. [`PrinterHeaters`]'s once-a-second timer pushes that
+    /// deadline forward in the PWM chip's print time; before its first stamp the
+    /// deadline is upstream's `-999.`, so a reading taken that early sends no
+    /// power.
+    ///
+    /// `read_time` is whatever clock the reading is dated in: print time for the
+    /// sensors that map it (`ds18b20`), the raw firmware clock for the ADC ones
+    /// (`AdcTemperatureBridge`'s `handle_adc_report`). The deadline is in print
+    /// time, so the two are the same clock only for a sensor that reports print
+    /// time.
     pub fn temperature_callback(&self, read_time: f64, temp: f64) {
         let mut state = self.lock();
         let time_diff = read_time - state.last_temp_time;
@@ -330,19 +460,66 @@ impl Heater {
         let HeaterState {
             control,
             target_temp,
+            verify_mainthread_time,
             ..
         } = &mut *state;
         let value = control.update(read_time, temp, target_temp, self.max_power);
-        // Upstream schedules the change at `read_time + pwm_delay`; print-time
-        // scheduling is C1d, so the output goes out immediately.
-        if let Some(pwm) = &self.pwm {
-            let _ = pwm.update_pwm(value);
+        let stalled = *target_temp > 0.0 && read_time > *verify_mainthread_time;
+        let deadline = *verify_mainthread_time;
+        let value = if *target_temp <= 0.0 || stalled {
+            0.0
+        } else {
+            value
+        };
+        if stalled && stall_report_due(state.stall_reported_at, read_time) {
+            state.stall_reported_at = read_time;
+            warn!(
+                "Heater {}: output dropped, the main thread has not proved itself alive since print time {:.3} \
+                 (reading dated {:.3}, {:.1}s later); a stalled host is the usual cause",
+                self.name,
+                deadline,
+                read_time,
+                read_time - deadline
+            );
+        }
+        // Upstream dates the change at `read_time + pwm_delay` so it lands in
+        // the future, before the next reading (`heaters.py:79`). A pin whose
+        // chip has no print-time mapping (the file-output stand-ins) keeps the
+        // immediate path.
+        // A reading that reached the host late would otherwise date its change
+        // behind the firmware's clock ("Rescheduled timer in the past"), so the
+        // delay is measured from whichever is later: the reading, or the chip's
+        // print time now.
+        let now_print = self
+            .printer
+            .upgrade()
+            .and_then(|printer| self.pwm.as_ref()?.estimated_print_time(printer.eventtime()));
+        let base = now_print.map_or(read_time, |now| read_time.max(now));
+        let pwm_time = base + self.pwm_delay;
+        // Upstream's update ratchet (`heaters.py:73-81`): inside the send window
+        // a change smaller than `min_pwm_change` is dropped, and only a sent
+        // change opens the next window. This is what keeps the wire from
+        // carrying one date per reading.
+        let suppressed = (read_time < state.next_pwm_time || state.last_pwm_value == 0.0)
+            && (value - state.last_pwm_value).abs() < self.min_pwm_change;
+        if !suppressed {
+            if let Some(pwm) = &self.pwm {
+                match pwm.print_time_to_clock(pwm_time) {
+                    Some(clock) => {
+                        let _ = pwm.set_pwm(clock as u32, value);
+                    }
+                    None => {
+                        let _ = pwm.update_pwm(value);
+                    }
+                }
+            }
+            state.last_pwm_value = value;
+            state.next_pwm_time = pwm_time + MAX_HEAT_TIME - (3.0 * self.pwm_delay + 0.001);
         }
         let temp_diff = temp - state.smoothed_temp;
         let adj_time = (time_diff * self.inv_smooth_time).min(1.0);
         state.smoothed_temp += temp_diff * adj_time;
         state.can_extrude = state.smoothed_temp >= self.min_extrude_temp;
-        state.last_pwm_value = value;
     }
 
     /// Whether a `target` has not settled yet (`Heater.check_busy`).
@@ -356,19 +533,22 @@ impl Heater {
         state.control.check_busy(state.smoothed_temp, target)
     }
 
-    /// What `verify_heater` reads each second (`Heater.get_temp`).
+    /// What `verify_heater` reads each second (`Heater.get_temp`,
+    /// `heaters.py:116-122`).
     ///
-    /// Upstream returns `(0., target)` when the newest reading is older than
-    /// `QUELL_STALE_TIME` (7 s), so a sensor that went quiet counts as a cold
-    /// heater (`heaters.py:18,116-122`). That comparison needs the reading's
-    /// time and `estimated_print_time(eventtime)` on one clock, which this host
-    /// does not have: the ADC sensors pass the raw firmware clock through
-    /// (`pins.rs:220-225`, `adc_temperature.rs:710`) while the serial ones map
-    /// theirs with `clock_to_print_time` (`ds18b20.rs:250`). The smoothed
-    /// temperature is returned as it stands; see the `verify_heater` module
-    /// docs for what that changes.
-    pub fn get_temp(&self) -> (f64, f64) {
+    /// A reading older than [`QUELL_STALE_TIME`] reports as `(0., target)`: a
+    /// sensor that went quiet must look like a cold heater, not like a warm one
+    /// holding its last value. The age is measured in the PWM chip's print time
+    /// — the same clock the readings are dated in since the ADC layer converted
+    /// its samples — so a heater whose pin has no chip clock to answer with
+    /// keeps the reading it has (there is no clock to age it against).
+    pub fn get_temp(&self, eventtime: f64) -> (f64, f64) {
         let state = self.lock();
+        if let Some(print_time) = self.pwm_estimated_print_time(eventtime) {
+            if state.last_temp_time < print_time - QUELL_STALE_TIME {
+                return (0.0, state.target_temp);
+            }
+        }
         (state.smoothed_temp, state.target_temp)
     }
 
@@ -418,6 +598,10 @@ pub struct PrinterHeaters {
     /// Upstream's `has_started` (`heaters.py:251`): set on `klippy:ready`,
     /// gates `_get_temp` so M105 before ready reports `T:0`.
     has_started: AtomicBool,
+    /// The once-a-second main-thread stamp timer — upstream's `PrinterStats`
+    /// (`statistics.py:53-73`) calling `Heater.stats` on every heater. `None`
+    /// before `klippy:ready`, and again once a shutdown has cancelled it.
+    stats_timer: Mutex<Option<TimerHandle>>,
 }
 
 impl PrinterHeaters {
@@ -430,6 +614,7 @@ impl PrinterHeaters {
             heaters: Mutex::new(BTreeMap::new()),
             gcode_id_to_sensor: Mutex::new(BTreeMap::new()),
             has_started: AtomicBool::new(false),
+            stats_timer: Mutex::new(None),
         }
     }
 
@@ -459,15 +644,27 @@ impl PrinterHeaters {
         }
     }
 
-    /// Register the M105 command and wire `klippy:ready` to set `has_started`
-    /// (upstream's `PrinterHeaters.__init__`, `heaters.py:243-259,329-330`).
+    /// Register the M105 command, wire `klippy:ready` to set `has_started` and
+    /// start the main-thread stamps, and cancel the stamps on shutdown
+    /// (upstream's `PrinterHeaters.__init__`, `heaters.py:243-259,329-330`;
+    /// upstream's `PrinterStats`, `statistics.py:53-73`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) {
         let weak_heaters = Arc::downgrade(self);
         printer.register_event_handler(
             KlippyEvent::KlippyReady,
             Box::new(move |_| {
                 if let Some(heaters) = weak_heaters.upgrade() {
-                    heaters.has_started.store(true, Ordering::SeqCst);
+                    heaters.handle_ready();
+                }
+            }),
+        );
+
+        let weak_heaters = Arc::downgrade(self);
+        printer.register_event_handler(
+            KlippyEvent::KlippyShutdown,
+            Box::new(move |_| {
+                if let Some(heaters) = weak_heaters.upgrade() {
+                    heaters.handle_shutdown();
                 }
             }),
         );
@@ -495,6 +692,134 @@ impl PrinterHeaters {
                     true,
                 )
                 .expect("M105 is a valid, unique command name");
+
+            let weak_heaters = Arc::downgrade(self);
+            gcode
+                .register_command(
+                    "TURN_OFF_HEATERS",
+                    sync(move |_gcmd: &GcodeCommand| {
+                        if let Some(heaters) = weak_heaters.upgrade() {
+                            heaters.turn_off_all_heaters();
+                        }
+                        Ok(())
+                    }),
+                    Some(TURN_OFF_HEATERS_HELP),
+                    false,
+                )
+                .expect("TURN_OFF_HEATERS is a valid, unique command name");
+        }
+    }
+
+    /// `klippy:ready`: M105 may report from now on, and the main-thread stamps
+    /// start (upstream's `has_started`, `heaters.py:329-330`; upstream's
+    /// `PrinterStats`, which registers its 1 s timer on the same event,
+    /// `statistics.py:53-73`).
+    fn handle_ready(self: &Arc<Self>) {
+        self.has_started.store(true, Ordering::SeqCst);
+        self.start_stats_timer();
+    }
+
+    /// Register the once-a-second stamp over every heater.
+    ///
+    /// Not registered when the protocol goes to a debug file, exactly as
+    /// upstream skips `PrinterStats` then (`statistics.py:55-57`): no stamp is
+    /// ever taken, so every heater keeps `verify_mainthread_time`'s `-999.` and
+    /// every reading sends no power — what a file-output run wants, since
+    /// nothing answers the temperature queries in it.
+    fn start_stats_timer(self: &Arc<Self>) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if printer.is_fileoutput() {
+            return;
+        }
+        let reactor = printer.reactor();
+        // Weak, so the timer — which lives in the reactor's heap until it is
+        // cancelled — does not close the loop `reactor → timer →
+        // PrinterHeaters → heater → its chip's clock → reactor`. That cycle
+        // outlives `Printer::teardown` and leaks the heaters, their `Mcu`s and
+        // the reactor's blocked device read with it; `verify_heater`'s timer
+        // carries the same lesson at length.
+        let weak = Arc::downgrade(self);
+        let handle = reactor.register_timer_named(
+            "heater_stats",
+            Box::new(move |eventtime| {
+                let Some(heaters) = weak.upgrade() else {
+                    return None;
+                };
+                heaters.stamp_all(eventtime);
+                Some(eventtime + 1.0)
+            }),
+            reactor.monotonic(),
+        );
+        *self.stats_timer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    }
+
+    /// One pass of upstream's `Heater.stats` over every registered heater.
+    ///
+    /// Upstream skips the update while the printer is shut down, so a dead host
+    /// stops pushing the deadline out and every reading goes stale
+    /// (`heaters.py:137-140`). A heater whose pin has no chip clock to answer
+    /// with is left alone.
+    fn stamp_all(&self, eventtime: f64) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if matches!(
+            printer.get_state_message().category,
+            PrinterState::Shutdown | PrinterState::Error
+        ) {
+            return;
+        }
+        // Cloned out of the table first: the stamp takes the heater's own lock
+        // and then its chip's, and holding the registry's lock across those
+        // would couple them for no reason.
+        let heaters: Vec<Arc<Heater>> = self
+            .heaters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for heater in heaters {
+            if let Some(print_time) = heater.pwm_estimated_print_time(eventtime) {
+                heater.stamp_mainthread(print_time);
+            }
+        }
+    }
+
+    /// Stop the stamp timer. Upstream's `PrinterStats` has no shutdown handler
+    /// (its update is gated on `is_shutdown()`); cancelling is this host's
+    /// equivalent — the machine is down, so nothing needs the timer kept alive.
+    fn handle_shutdown(&self) {
+        if let Some(handle) = self
+            .stats_timer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
+            handle.cancel();
+        }
+    }
+
+    /// Give every registered heater a target of zero
+    /// (`PrinterHeaters.turn_off_all_heaters`, `heaters.py:283-285,319-321`).
+    ///
+    /// What upstream's `cmd_TURN_OFF_HEATERS` runs, and what the default
+    /// `[idle_timeout]` script's first line reaches. Upstream also calls it from
+    /// `gcode:request_restart`; this host raises no such event handler here.
+    fn turn_off_all_heaters(&self) {
+        let heaters: Vec<Arc<Heater>> = self
+            .heaters
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for heater in heaters {
+            // Zero is never range-checked: upstream's `set_temp` guards with
+            // `if degrees and ...` (`heaters.py:109`).
+            let _ = heater.set_temp(0.0);
         }
     }
 
@@ -797,8 +1122,12 @@ impl PrinterHeaters {
             config.get_float_bounded("pwm_cycle_time", Some(0.100), None, None, Some(0.0), None)?;
 
         // Set up the heater pin as a PWM output, as upstream does
-        // (`heaters.py:56-61`). The `max_duration` limit is off: the host
-        // drives the pin immediately, not on a print-time schedule (C1d).
+        // (`heaters.py:56-62`). The maximum duration is upstream's
+        // `MAX_HEAT_TIME`: the firmware takes the pin down if the host stops
+        // refreshing it, which covers a host that hangs rather than exits.
+        // The host drives the pin immediately rather than on a print-time
+        // schedule (C1d), so every sensor reading re-sends the value and keeps
+        // the deadline pushed out.
         let heater_pin = config.get("heater_pin", None)?;
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -807,7 +1136,7 @@ impl PrinterHeaters {
             .setup_pwm(&heater_pin, None)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
         pwm.setup_cycle_time(pwm_cycle_time, false);
-        pwm.setup_max_duration(0.0);
+        pwm.setup_max_duration(MAX_HEAT_TIME);
         pwm.setup_start_value(0.0, 0.0);
 
         // Build the control algorithm.
@@ -846,6 +1175,7 @@ impl PrinterHeaters {
 
         sensor.setup_minmax(min_temp, max_temp);
 
+        let pwm_delay = sensor.get_report_time_delta();
         let heater = Arc::new(Heater {
             name: short_name.clone(),
             section_name: identifier,
@@ -856,17 +1186,23 @@ impl PrinterHeaters {
             min_extrude_temp,
             max_power,
             inv_smooth_time: 1.0 / smooth_time,
+            printer: Arc::downgrade(printer),
+            min_pwm_change: max_power * MIN_PWM_CHANGE_RATIO,
+            pwm_delay,
             state: Mutex::new(HeaterState {
                 target_temp: 0.0,
                 last_temp: 0.0,
                 smoothed_temp: 0.0,
                 last_temp_time: 0.0,
+                verify_mainthread_time: -999.0,
                 // Upstream: `min_extrude_temp <= 0. or is_fileoutput`
                 // (`heaters.py:37-39`). File-output mode is how upstream runs
                 // its own cases, where the temperature queries are never
                 // answered and so no reading ever flips this on again.
                 can_extrude: min_extrude_temp <= 0.0 || printer.is_fileoutput(),
                 last_pwm_value: 0.0,
+                stall_reported_at: f64::NEG_INFINITY,
+                next_pwm_time: 0.0,
                 control: Box::new(control),
             }),
         });
@@ -987,7 +1323,7 @@ impl WaitSensor {
     /// `lookup_object` has.
     fn get_temp(&self, eventtime: f64) -> Result<f64, CommandError> {
         match self {
-            Self::Heater(heater) => Ok(heater.get_temp().0),
+            Self::Heater(heater) => Ok(heater.get_temp(eventtime).0),
             Self::Object { name, object } => object
                 .get_status(eventtime)
                 .get("temperature")
@@ -1138,6 +1474,9 @@ mod tests {
     impl Sensor for FakeSensor {
         fn setup_minmax(&self, _min_temp: f64, _max_temp: f64) {}
         fn setup_callback(&self, _callback: SensorCallback) {}
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
     /// A sensor whose readings the test delivers by hand.
@@ -1168,17 +1507,41 @@ mod tests {
         fn setup_callback(&self, callback: SensorCallback) {
             *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
         }
+
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
-    /// A PWM that accepts everything.
+    /// A PWM that accepts everything, and records the `max_duration` limits it
+    /// was set up with, in call order.
     #[derive(Debug)]
-    struct FakePwm;
+    struct FakePwm {
+        max_durations: Arc<Mutex<Vec<f64>>>,
+        /// When set, this PWM's chip dates its print time this much ahead of the
+        /// host instant — see [`NoopChip::print_time_offset`].
+        print_time_offset: Option<f64>,
+        /// When set, this PWM dates changes by print time instead of sending
+        /// them immediately: `print_time_to_clock` answers `print_time * freq`
+        /// and `set_pwm` records `(clock, value)` here.
+        clocked: Option<(f64, Arc<Mutex<Vec<(u32, f64)>>>)>,
+    }
 
     impl PwmOut for FakePwm {
-        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_max_duration(&self, max_duration: f64) {
+            self.max_durations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(max_duration);
+        }
         fn setup_cycle_time(&self, _cycle_time: f64, _hardware: bool) {}
         fn setup_start_value(&self, _start: f64, _shutdown: f64) {}
-        fn set_pwm(&self, _clock: u32, _value: f64) -> Result<(), McuError> {
+        fn set_pwm(&self, clock: u32, value: f64) -> Result<(), McuError> {
+            if let Some((_, log)) = &self.clocked {
+                log.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((clock, value));
+            }
             Ok(())
         }
         fn update_pwm(&self, _value: f64) -> Result<(), McuError> {
@@ -1187,11 +1550,31 @@ mod tests {
         fn next_aligned_clock(&self, clock: u32, _allow_early: f64) -> Result<u32, McuError> {
             Ok(clock)
         }
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            let (freq, _) = self.clocked.as_ref()?;
+            Some((print_time * freq).max(0.0) as u64)
+        }
+        fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+            self.print_time_offset.map(|offset| eventtime + offset)
+        }
     }
 
-    /// A chip that only exists so a pin description resolves.
-    #[derive(Debug)]
-    struct NoopChip;
+    /// A chip that only exists so a pin description resolves. The PWM it hands
+    /// out logs into [`Self::pwm_log`].
+    #[derive(Debug, Default)]
+    struct NoopChip {
+        /// Every `setup_max_duration` limit a PWM from this chip was given.
+        pwm_log: Arc<Mutex<Vec<f64>>>,
+        /// When set, this chip's PWMs answer `estimated_print_time` with the
+        /// host instant plus this (a chip whose print time has drifted from the
+        /// host's clock); `None` is the trait's no-clock default.
+        print_time_offset: Option<f64>,
+        /// When set, this chip's PWMs date changes by print time at this
+        /// frequency, and record them in [`Self::pwm_calls`].
+        clock_freq: Option<f64>,
+        /// Every `(clock, value)` a print-time-dated PWM change carried.
+        pwm_calls: Arc<Mutex<Vec<(u32, f64)>>>,
+    }
 
     impl PinChip for NoopChip {
         fn setup_digital_out(&self, _params: &PinParams) -> Result<Arc<dyn DigitalOut>, PinError> {
@@ -1199,7 +1582,13 @@ mod tests {
         }
 
         fn setup_pwm(&self, _params: &PinParams) -> Result<Arc<dyn PwmOut>, PinError> {
-            Ok(Arc::new(FakePwm))
+            Ok(Arc::new(FakePwm {
+                max_durations: Arc::clone(&self.pwm_log),
+                print_time_offset: self.print_time_offset,
+                clocked: self
+                    .clock_freq
+                    .map(|freq| (freq, Arc::clone(&self.pwm_calls))),
+            }))
         }
     }
 
@@ -1219,6 +1608,11 @@ mod tests {
 
     /// As [`ready_printer`], on a clock the test can step.
     fn ready_printer_on(reactor: Arc<dyn Reactor>) -> Arc<Printer> {
+        ready_printer_with(NoopChip::default(), reactor)
+    }
+
+    /// As [`ready_printer`], over the given chip.
+    fn ready_printer_with(chip: NoopChip, reactor: Arc<dyn Reactor>) -> Arc<Printer> {
         let printer = Arc::new(Printer::new(reactor));
         printer
             .add_object(
@@ -1227,9 +1621,40 @@ mod tests {
             )
             .unwrap();
         let pins = Arc::new(PrinterPins::new());
-        pins.register_chip("mcu", Arc::new(NoopChip)).unwrap();
+        pins.register_chip("mcu", Arc::new(chip)).unwrap();
         printer.add_object(PINS_OBJECT, pins).unwrap();
         printer
+    }
+
+    /// As [`ready_printer`], also returning the `setup_max_duration` limits the
+    /// heater pins' PWMs were given, in call order.
+    fn ready_printer_logging_pwm() -> (Arc<Printer>, Arc<Mutex<Vec<f64>>>) {
+        let chip = NoopChip::default();
+        let log = Arc::clone(&chip.pwm_log);
+        (ready_printer_with(chip, ManualReactor::shared()), log)
+    }
+
+    /// A printer whose PWM chips date their print time `offset` ahead of the
+    /// host instant, over a reactor the test steps.
+    fn printer_with_print_time_offset(offset: f64) -> (Arc<Printer>, Arc<ManualReactor>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let chip = NoopChip {
+            print_time_offset: Some(offset),
+            ..NoopChip::default()
+        };
+        let printer = ready_printer_with(chip, Arc::clone(&reactor) as Arc<dyn Reactor>);
+        (printer, reactor)
+    }
+
+    /// As [`ready_printer`], over a chip whose PWM dates changes by print time,
+    /// also returning the `(clock, value)` pairs those changes carried.
+    fn printer_with_dated_pwm(freq: f64) -> (Arc<Printer>, Arc<Mutex<Vec<(u32, f64)>>>) {
+        let chip = NoopChip {
+            clock_freq: Some(freq),
+            ..NoopChip::default()
+        };
+        let calls = Arc::clone(&chip.pwm_calls);
+        (ready_printer_with(chip, ManualReactor::shared()), calls)
     }
 
     #[test]
@@ -1317,7 +1742,11 @@ mod tests {
             "Fake",
             Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
         );
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
 
@@ -1378,6 +1807,9 @@ mod tests {
         assert!(!heater.can_extrude());
 
         heater.set_temp(100.0).unwrap();
+        // The main thread is alive at print time 0, so the output is not
+        // dropped as stale (`heaters.py:72-74`).
+        heater.stamp_mainthread(0.0);
         // 90 is below target - max_delta, so the heater turns on.
         heater.temperature_callback(1.0, 90.0);
         assert_eq!(heater.get_status()["power"], 1.0);
@@ -1410,12 +1842,419 @@ mod tests {
             .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
             .unwrap();
         heater.set_temp(200.0).unwrap();
+        heater.stamp_mainthread(0.0);
 
         heater.temperature_callback(0.0, 25.0);
         let power = heater.get_status()["power"].as_f64().unwrap();
         assert!((0.0..=1.0).contains(&power), "{power}");
         // Far below target, the PID output should be saturated high.
         assert!(power > 0.5, "{power}");
+    }
+
+    /// `heaters.py:62`: a heater pin's firmware maximum duration is upstream's
+    /// `MAX_HEAT_TIME`, so a host that stops sending readings lets the firmware
+    /// take the pin down instead of holding the last duty cycle.
+    #[test]
+    fn test_a_heater_gives_its_pin_the_upstream_max_duration() {
+        let (printer, max_durations) = ready_printer_logging_pwm();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+        ]);
+        heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        assert_eq!(
+            *max_durations.lock().unwrap_or_else(|p| p.into_inner()),
+            [MAX_HEAT_TIME]
+        );
+    }
+
+    /// `heaters.py:72-74`: a heater with no target sends no power, however cold
+    /// the reading is — a bang-bang control below `target - max_delta` arms
+    /// itself, and must not reach the pin while nothing asked for heat.
+    #[test]
+    fn test_a_heater_with_no_target_sends_no_power() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "-50"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+            ("max_delta", "2"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), &printer, None)
+            .unwrap();
+
+        // `target - max_delta` is -2, so -5 is a reading bang-bang would heat
+        // for if the target were anything but zero.
+        heater.temperature_callback(1.0, -5.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+
+        // With a target it still heats as before — as long as the main thread
+        // has proved it is alive (`heaters.py:72-74`).
+        heater.set_temp(200.0).unwrap();
+        heater.stamp_mainthread(0.0);
+        heater.temperature_callback(2.0, -5.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+    }
+
+    /// A watermark heater already given a target of 200 — far above every
+    /// reading the main-thread tests below deliver, so the control asks for the
+    /// full `max_power` on each of them.
+    fn hot_heater(printer: &Arc<Printer>) -> Arc<Heater> {
+        let heaters = ensure(printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("control", "watermark"),
+            ("max_delta", "2"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), printer, None)
+            .unwrap();
+        heater.set_temp(200.0).unwrap();
+        heater
+    }
+
+    /// `heaters.py:17`: the deadline a heater's output survives a stopped main
+    /// thread for is upstream's 5 s. Pinned here so the production value cannot
+    /// drift with the tests.
+    #[test]
+    fn test_the_mainthread_deadline_is_upstreams_five_seconds() {
+        assert_eq!(MAX_MAINTHREAD_TIME, 5.0);
+    }
+
+    /// `heaters.py:72-74`: before the main thread's first stamp the deadline is
+    /// upstream's `-999.`, so a reading that arrives that early is zeroed even
+    /// with a target; the first stamp brings the output back.
+    #[test]
+    fn test_a_reading_before_the_first_mainthread_stamp_sends_no_power() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+
+        heater.temperature_callback(1.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+
+        heater.stamp_mainthread(1.0);
+        heater.temperature_callback(2.0, 20.0);
+        // `max_power` is the default 1.0 (the section sets no `max_power`).
+        assert_eq!(heater.get_status()["power"], 1.0);
+    }
+
+    /// The deadline's boundary: a reading exactly at `verify_mainthread_time` is
+    /// still trusted, a hair past it is not (`heaters.py:73`), and a fresh stamp
+    /// covers the later reading again.
+    #[test]
+    fn test_a_reading_past_the_mainthread_deadline_sends_no_power() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+        // The deadline is now 0.0 + MAX_MAINTHREAD_TIME.
+        heater.stamp_mainthread(0.0);
+
+        heater.temperature_callback(5.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+        heater.temperature_callback(5.000_001, 20.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+
+        heater.stamp_mainthread(5.000_001);
+        heater.temperature_callback(5.000_002, 20.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+    }
+
+    /// A PID heater, whose output can sit between 0 and 1, so the `5% of full
+    /// power` threshold is reachable.
+    fn pid_heater(printer: &Arc<Printer>) -> Arc<Heater> {
+        let heaters = ensure(printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        let section = heater_section(&[
+            ("sensor_type", "Fake"),
+            ("heater_pin", "PA0"),
+            ("min_temp", "0"),
+            ("max_temp", "250"),
+            ("min_extrude_temp", "0"),
+            ("control", "pid"),
+            ("pid_kp", "64"),
+            ("pid_ki", "1.4"),
+            ("pid_kd", "128"),
+        ]);
+        let heater = heaters
+            .setup_heater(&ConfigWrapper::untracked(&section), printer, None)
+            .unwrap();
+        heater.set_temp(200.0).unwrap();
+        heater
+    }
+
+    /// `heaters.py:73-77`: inside the send window, a duty change smaller than
+    /// `max_power * 0.05` is dropped — this is what keeps the wire from carrying
+    /// one dated event per reading.
+    #[test]
+    fn test_a_small_change_inside_the_window_is_suppressed() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        // First reading: the ratchet always speaks once (`not last_pwm_value`).
+        heater.temperature_callback(0.0, 25.0);
+        let sent = calls.lock().unwrap_or_else(|p| p.into_inner()).len();
+        assert_eq!(sent, 1);
+
+        // A reading one report period later, still inside the window, with a
+        // duty change below the threshold: nothing goes out.
+        let before = heater.get_status()["power"].as_f64().unwrap();
+        heater.temperature_callback(0.3, 25.0);
+        assert_eq!(
+            calls.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            sent,
+            "a change below {} must not be sent",
+            heater.min_pwm_change
+        );
+        // `power` keeps reporting what was actually sent (upstream semantics).
+        assert_eq!(heater.get_status()["power"].as_f64().unwrap(), before);
+    }
+
+    /// The window: past `next_pwm_time` a change goes out however small, which
+    /// is how the loop keeps the pin's auto-off from expiring.
+    #[test]
+    fn test_a_change_past_the_window_is_always_sent() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        heater.temperature_callback(0.0, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+
+        // `MAX_HEAT_TIME - (3 * pwm_delay + 0.001)` after the change: the
+        // window reopens, so even a below-threshold change is delivered.
+        heater.temperature_callback(2.5, 25.0);
+        assert_eq!(
+            calls.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            2,
+            "past the window the change must be sent"
+        );
+    }
+
+    /// `heaters.py:80`: the next window opens `MAX_HEAT_TIME` minus three report
+    /// periods after the change that was sent.
+    #[test]
+    fn test_the_send_window_is_upstreams_three_seconds_less_three_reports() {
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = pid_heater(&printer);
+        heater.stamp_mainthread(0.0);
+        heater.temperature_callback(0.0, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+
+        // The change was dated at 0.0 + pwm_delay; the window is that plus
+        // MAX_HEAT_TIME - (3 * pwm_delay + 0.001).
+        let expected = 0.3 + MAX_HEAT_TIME - (3.0 * 0.3 + 0.001);
+        // 0.3 + 3.0 - (0.9 + 0.001) = 2.399, i.e. a send about every 2.1 s.
+        assert!((expected - 2.399).abs() < 1e-9, "{expected}");
+        // A reading just inside the window is suppressed, just outside it is not.
+        heater.temperature_callback(expected - 0.01, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+        heater.temperature_callback(expected + 0.01, 25.0);
+        assert_eq!(calls.lock().unwrap_or_else(|p| p.into_inner()).len(), 2);
+    }
+
+    /// A stall is reported at most once a second of reading time, so one stall
+    /// cannot bury the log in identical lines.
+    #[test]
+    fn test_a_stall_is_reported_at_most_once_a_second() {
+        // Nothing reported yet: the first drop always speaks.
+        assert!(stall_report_due(f64::NEG_INFINITY, 12.0));
+        // Reported at 12.0: the next line waits a second of reading time.
+        assert!(!stall_report_due(12.0, 12.0));
+        assert!(!stall_report_due(12.0, 12.999));
+        assert!(stall_report_due(12.0, 13.0));
+    }
+
+    /// `heaters.py:18`: a reading is trusted for upstream's 7 s.
+    #[test]
+    fn test_the_quell_age_is_upstreams_seven_seconds() {
+        assert_eq!(QUELL_STALE_TIME, 7.0);
+    }
+
+    /// `heaters.py:116-122`: a sensor that went quiet reports `(0., target)` —
+    /// exactly seven seconds old is still trusted, a hair older is not, and the
+    /// target survives the quell so `verify_heater` keeps checking the same
+    /// heater.
+    #[test]
+    fn test_a_quiet_sensor_quells_to_zero_after_seven_seconds() {
+        // The chip's print time is the host instant, so the ages below are the
+        // eventtime differences.
+        let (printer, _reactor) = printer_with_print_time_offset(0.0);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(10.0);
+        heater.temperature_callback(10.0, 210.0);
+
+        // Exactly `QUELL_STALE_TIME` old: still the reading.
+        assert_eq!(heater.get_temp(17.0), (210.0, 200.0));
+        // A hair past it: the reading is quelled, the target is not.
+        assert_eq!(heater.get_temp(17.000_001), (0.0, 200.0));
+        // A fresh reading is trusted again.
+        heater.temperature_callback(18.0, 205.0);
+        assert_eq!(heater.get_temp(18.5), (205.0, 200.0));
+    }
+
+    /// Without a chip clock there is no age to judge, so the reading stands.
+    /// Upstream has no such heater (its `mcu_pwm.get_mcu()` always answers);
+    /// this host's no-clock stand-ins do, and a quell invented from `eventtime`
+    /// would compare two different clocks.
+    #[test]
+    fn test_a_heater_without_a_chip_clock_keeps_its_reading() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+        heater.temperature_callback(1.0, 210.0);
+
+        assert_eq!(heater.get_temp(1_000.0), (210.0, 200.0));
+    }
+
+    /// `heaters.py:32,79`: a PWM change is dated one **report period** after the
+    /// reading it came from, never at "now". An immediate change is dated with
+    /// the host's clock estimate, and a clock the firmware is already past is
+    /// its `Timer too close` shutdown (measured on a real F103 with
+    /// `[heater_generic]`: shutdown at 3.28 s, the pin's `MAX_HEAT_TIME`
+    /// auto-off).
+    #[test]
+    fn test_a_pwm_change_is_dated_one_report_period_ahead() {
+        // The chip counts 1e6 ticks per second, so print time maps to a clock
+        // by multiplying.
+        let (printer, calls) = printer_with_dated_pwm(1_000_000.0);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(1.0);
+        heater.temperature_callback(1.0, 20.0);
+
+        let calls = calls.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(calls.len(), 1, "one change per reading: {:?}", *calls);
+        // `FakeSensor`'s report period is 0.3 s: 1.0 + 0.3 at 1e6 ticks/s.
+        assert_eq!(calls[0].0, 1_300_000);
+        // A cold heater with a target: the control asks for full power.
+        assert_eq!(calls[0].1, 1.0);
+    }
+
+    /// A reading that reached the host late must not date its PWM change behind
+    /// the chip's clock: the delay is measured from the later of the reading and
+    /// "print time now" (the firmware reports `Rescheduled timer in the past`
+    /// otherwise).
+    #[test]
+    fn test_a_late_reading_is_dated_from_now_not_from_the_reading() {
+        // The chip's print time runs 5 s ahead of the host instant, which is
+        // what a batch of readings that reached the host late looks like.
+        let reactor = Arc::new(ManualReactor::new());
+        let chip = NoopChip {
+            clock_freq: Some(1_000_000.0),
+            print_time_offset: Some(5.0),
+            ..NoopChip::default()
+        };
+        let calls = Arc::clone(&chip.pwm_calls);
+        let printer = ready_printer_with(chip, Arc::clone(&reactor) as Arc<dyn Reactor>);
+        let heater = hot_heater(&printer);
+        heater.stamp_mainthread(100.0);
+        reactor.advance(10.0);
+        // The reading is dated 1.0, but print time now is 15.0.
+        heater.temperature_callback(1.0, 20.0);
+
+        let calls = calls.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(calls.len(), 1, "{:?}", *calls);
+        // max(1.0, 15.0) + 0.3 s, at 1e6 ticks/s.
+        assert_eq!(calls[0].0, 15_300_000);
+    }
+
+    /// The delay is the sensor's, not a constant: a heater over a slower sensor
+    /// dates its change further ahead (`heaters.py:32` reads
+    /// `sensor.get_report_time_delta()`).
+    #[test]
+    fn test_the_pwm_delay_is_the_sensors_report_period() {
+        let printer = ready_printer();
+        let heater = hot_heater(&printer);
+
+        assert_eq!(heater.pwm_delay, 0.3);
+    }
+
+    /// `statistics.py:53-73` calls `Heater.stats` once a second, which stamps
+    /// every heater with its PWM chip's `estimated_print_time(eventtime) + 5`
+    /// (`heaters.py:137-140`). The chip here runs 100 s ahead of the host clock,
+    /// so a stamp taken from `eventtime` alone would fall short of the readings
+    /// below.
+    #[test]
+    fn test_the_stats_timer_stamps_every_heater_once_a_second() {
+        let (printer, reactor) = printer_with_print_time_offset(100.0);
+        let heater = hot_heater(&printer);
+        printer.send_event(&KlippyEvent::KlippyReady);
+        // Registered at the reactor's clock, so the first pass is due now.
+        assert_eq!(reactor.run_due(), 1);
+
+        // Deadline: the chip's print time 100 at host instant 0, plus 5.
+        heater.temperature_callback(105.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+        heater.temperature_callback(105.001, 20.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+
+        // One second on the timer runs again: 101 + 5.
+        assert_eq!(reactor.advance(1.0), 1);
+        heater.temperature_callback(106.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 1.0);
+    }
+
+    /// A shutdown cancels the stamp timer, so nothing pushes the deadline out
+    /// any more and the next reading past it sends no power.
+    #[test]
+    fn test_a_shutdown_stops_the_mainthread_stamps() {
+        let (printer, reactor) = printer_with_print_time_offset(0.0);
+        let heater = hot_heater(&printer);
+        printer.send_event(&KlippyEvent::KlippyReady);
+        assert_eq!(reactor.run_due(), 1);
+
+        printer.send_event(&KlippyEvent::KlippyShutdown);
+        // A live timer would have stamped 1.0 + 5.0 here, which the reading
+        // below would pass.
+        assert_eq!(reactor.advance(10.0), 0);
+        heater.temperature_callback(6.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
+    }
+
+    /// A debug-output run registers no stamp timer, as upstream's
+    /// `PrinterStats` is not started (`statistics.py:55-57`); with no stamp ever
+    /// taken, every reading sends no power.
+    #[test]
+    fn test_file_output_registers_no_mainthread_stamp() {
+        let (printer, reactor) = printer_with_print_time_offset(0.0);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(args));
+        let heater = hot_heater(&printer);
+
+        printer.send_event(&KlippyEvent::KlippyReady);
+        assert_eq!(reactor.advance(10.0), 0);
+        heater.temperature_callback(1.0, 20.0);
+        assert_eq!(heater.get_status()["power"], 0.0);
     }
 
     /// `PrinterHeaters.lookup_heater` (`heaters.py:288-292`).
@@ -1468,11 +2307,11 @@ mod tests {
             .unwrap();
 
         // Nothing read yet, nothing asked for.
-        assert_eq!(heater.get_temp(), (0.0, 0.0));
+        assert_eq!(heater.get_temp(0.0), (0.0, 0.0));
         // One reading smooths to itself (`smooth_time` 1 s).
         heater.temperature_callback(1.0, 20.0);
         heater.set_temp(200.0).unwrap();
-        assert_eq!(heater.get_temp(), (20.0, 200.0));
+        assert_eq!(heater.get_temp(0.0), (20.0, 200.0));
     }
 
     /// A bed plus an option-less `[verify_heater heater_bed]`.
@@ -1773,7 +2612,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_temperature_wait_returns_in_file_output_mode() {
         let (printer, gcode, _sensor) = temperature_sensor_printer();
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         gcode
@@ -1933,6 +2776,107 @@ mod tests {
             .expect("the wait ends once the reading reaches the minimum");
         // Each poll reports the real table: `T0:20.0 /200.0` at t=0 and t=1 s.
         assert_eq!(emitted(&lines), ["T0:20.0 /200.0", "T0:20.0 /200.0"]);
+    }
+
+    /// `PrinterHeaters.turn_off_all_heaters` (`heaters.py:283-285,319-321`):
+    /// every registered heater loses its target — a bed, an extruder and a
+    /// `heater_generic` — and M105 reports the zero.
+    #[tokio::test]
+    async fn test_turn_off_heaters_zeroes_every_heater_target() {
+        let printer = ready_printer();
+        let heaters = ensure(&printer).unwrap();
+        heaters.add_sensor_factory(
+            "Fake",
+            Arc::new(|_config, _printer| Ok(Arc::new(FakeSensor) as Arc<dyn Sensor>)),
+        );
+        // One section per heater kind, each on its own pin.
+        let build = |id: &str, sub: Option<&str>, pin: &str| {
+            let mut section = ConfigSection::new(id, sub);
+            for (key, value) in [
+                ("sensor_type", "Fake"),
+                ("heater_pin", pin),
+                ("min_temp", "0"),
+                ("max_temp", "250"),
+                ("min_extrude_temp", "0"),
+                ("control", "watermark"),
+            ] {
+                section
+                    .parameters
+                    .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+            }
+            section
+        };
+        let extruder = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("extruder", None, "PA0")),
+                &printer,
+                Some("T0"),
+            )
+            .unwrap();
+        let bed = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("heater_bed", None, "PA1")),
+                &printer,
+                Some("B"),
+            )
+            .unwrap();
+        let generic = heaters
+            .setup_heater(
+                &ConfigWrapper::untracked(&build("heater_generic", Some("extra"), "PA2")),
+                &printer,
+                None,
+            )
+            .unwrap();
+        for (heater, target) in [(&extruder, 200.0), (&bed, 60.0), (&generic, 100.0)] {
+            heater.set_temp(target).unwrap();
+        }
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let lines = captured_lines(&gcode);
+
+        gcode
+            .run_script("TURN_OFF_HEATERS")
+            .await
+            .expect("TURN_OFF_HEATERS runs");
+
+        for heater in [&extruder, &bed, &generic] {
+            assert_eq!(
+                heater.target_temp(),
+                0.0,
+                "{} keeps a target",
+                heater.name()
+            );
+        }
+        gcode.run_script("M105").await.expect("M105 runs");
+        assert_eq!(emitted(&lines), ["B:0.0 /0.0 T0:0.0 /0.0"]);
+    }
+
+    /// The command is upstream's: help `"Turn off all heaters"`, and the ready
+    /// table only — upstream registers it without `when_not_ready`
+    /// (`heaters.py:255-256`), unlike M105 next to it.
+    #[test]
+    fn test_turn_off_heaters_is_registered_with_upstreams_help() {
+        let printer = ready_printer();
+        let _heaters = ensure(&printer).unwrap();
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+
+        let before_ready = gcode.get_status(0.0);
+        assert_eq!(before_ready["commands"]["M105"], json!({}));
+        assert!(
+            before_ready["commands"].get("TURN_OFF_HEATERS").is_none(),
+            "{before_ready}"
+        );
+
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let ready = gcode.get_status(0.0);
+        assert_eq!(
+            ready["commands"]["TURN_OFF_HEATERS"]["help"],
+            "Turn off all heaters"
+        );
     }
 
     // ------------------------------------------------------------------

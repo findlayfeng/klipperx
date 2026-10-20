@@ -32,17 +32,11 @@
 //!   `handle_connect` when `start_args['debugoutput']` is set
 //!   (`verify_heater.py:34-37`), which is [`Printer::is_fileoutput`]: every
 //!   upstream test case runs that way, and so does this host's corpus.
-//! * **The 7 s staleness quell is not implemented.** Upstream's `Heater.get_temp`
-//!   reports `(0., target)` when the newest reading is older than
-//!   `QUELL_STALE_TIME` (`heaters.py:18,116-122`), comparing the reading's time
-//!   against `estimated_print_time(eventtime)`. Readings have no single clock to
-//!   compare here: the ADC sensors pass the raw firmware clock through
-//!   (`pins.rs:220-225`, `adc_temperature.rs:710`) while the serial ones map
-//!   theirs with `clock_to_print_time` (`ds18b20.rs:250`), and
-//!   `estimated_print_time` is print time. [`Heater::get_temp`](crate::core::klippy::extras::heaters::Heater::get_temp)
-//!   therefore returns the smoothed temperature as it stands. The difference shows only when a
-//!   sensor goes quiet for more than 7 s with a target set: upstream would read
-//!   that as `0` and fault, this host keeps checking the last reading.
+//! * **A heater whose pin has no chip clock keeps its reading.** The 7 s quell
+//!   below is measured in the PWM chip's print time; a no-clock stand-in has
+//!   none, and inventing one from the host clock would compare two different
+//!   clocks (upstream's `mcu_pwm.get_mcu()` always answers, so it has no such
+//!   case).
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -254,7 +248,7 @@ impl HeaterCheck {
                 let Some(heater) = weak_heater.upgrade() else {
                     return None;
                 };
-                let (temp, target) = heater.get_temp();
+                let (temp, target) = heater.get_temp(eventtime);
                 this.check(eventtime, temp, target)
             }),
             reactor.monotonic(),
@@ -599,7 +593,11 @@ mod tests {
     fn test_a_file_output_run_starts_no_timer() {
         let reactor = Arc::new(ManualReactor::new());
         let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
-        let mut args = StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(args));
         let check = check_from(

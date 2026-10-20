@@ -200,6 +200,10 @@ mod tests {
                 let power = feed.get_status()["power"].as_f64().unwrap();
                 time += 0.1;
                 temp += (power * 120.0 - (temp - 20.0) * 0.5) * 0.1;
+                // This feeder is the test stand-in for the 1 s main-thread
+                // stamp the production timer takes: every reading it delivers
+                // comes from a main thread that is alive.
+                feed.stamp_mainthread(time);
                 feed.temperature_callback(time, temp);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -208,16 +212,21 @@ mod tests {
         // `M140` returns at once: the target is set but the bed is still cold.
         gcode.run_script("M140 S60").await.unwrap();
         assert_eq!(bed.heater().get_status()["target"], 60.0);
-        assert!(bed.heater().get_temp().0 < 58.0);
+        assert!(bed.heater().get_temp(0.0).0 < 58.0);
 
         // `M190` waits: the call does not return until the feeder has brought
-        // the bed within `max_delta` of the target.
-        gcode.run_script("M190 S60").await.unwrap();
+        // the bed within `max_delta` of the target.  The wait is bounded so a
+        // model that never reaches the target fails here instead of hanging.
+        let wait = gcode.run_script("M190 S60");
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
+            .await
+            .expect("M190 returned once the bed reached the target: the wait timed out")
+            .unwrap();
         feeder.abort();
 
         assert_eq!(bed.heater().get_status()["target"], 60.0);
         // The wait loop ran: the bed heated to within `max_delta` (2 °C) of
         // the target.
-        assert!(bed.heater().get_temp().0 >= 58.0);
+        assert!(bed.heater().get_temp(0.0).0 >= 58.0);
     }
 }

@@ -11,12 +11,11 @@
 //!
 //! # What is not here
 //!
-//! The `heaters.register_monitor` call upstream makes for `adc_temp`
-//! (`tmc.py:128-131`, so the `[heaters]` status lists the section among its
-//! `available_monitors`) is not made: [`TmcErrorCheck`] does not read the
-//! temperature register, so nothing registers the monitor. The
-//! `tmc/stallguard_dump` bulk endpoint (`tmc.TMCStallguardDump`) is likewise
-//! absent, as it is for every driver in this host.
+//! `adc_temp` is live like the rest of the chip: [`TmcErrorCheck`] reads it on
+//! its 1 s check and registers the section as a `heaters` monitor, as upstream
+//! does (`tmc.py:128-131`). The `tmc/stallguard_dump` endpoint is registered
+//! too, streaming `DRV_STATUS.sg_result` — or `SG4_RESULT` when the driver is in
+//! stealthchop, which is the one chip that has both.
 //!
 //! [`TmcErrorCheck`]: crate::core::klippy::extras::tmc::TmcErrorCheck
 
@@ -423,7 +422,11 @@ mod tests {
         let config = machine_config(dict, tmc_body);
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("tmc2240.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "tmc2240.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
         let setup = async {

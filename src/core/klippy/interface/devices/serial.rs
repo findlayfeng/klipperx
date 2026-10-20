@@ -62,6 +62,34 @@ pub const DEFAULT_BAUD: u32 = 250_000;
 /// `VTIME` is in tenths of a second, and only applies while `VMIN` is 0.
 const READ_TIMEOUT_TENTHS: u8 = 1;
 
+/// How long a connect-time open waits before it tries the port again.
+///
+/// Upstream's connect loop retries the open on a fixed pause: `os.open` fails,
+/// it logs `Unable to open port`, pauses five seconds and comes round again
+/// (`klippy/serialhdl.py:173-193`). The value is upstream's.
+pub const OPEN_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a connect-time open keeps retrying before it reports the failure.
+///
+/// Upstream gives the loop a wall-clock budget and raises `Unable to connect`
+/// once it is gone — `start_time + 90.` in the same loop
+/// (`klippy/serialhdl.py:171-178`). The value is upstream's.
+#[cfg(not(test))]
+pub const OPEN_RETRY_BUDGET: Duration = Duration::from_secs(90);
+
+/// [`OPEN_RETRY_BUDGET`] in a test build.
+///
+/// A unit test that connects a port which is not there has to report in its own
+/// time, not the real budget's: 90 s per test would make the suite a trap. The
+/// retry loop's own tests pass the budget they mean, so nothing here depends on
+/// this value — only connect-time opens the tests do not mean to measure.
+#[cfg(test)]
+pub const OPEN_RETRY_BUDGET: Duration = Duration::from_millis(300);
+
+/// One sleep slice of a retry wait: a shutdown check runs between slices, so an
+/// exit request ends the wait well inside [`OPEN_RETRY_INTERVAL`].
+const OPEN_RETRY_SLICE: Duration = Duration::from_millis(50);
+
 /// A [`Device`] backed by a serial port.
 pub struct SerialDevice {
     port: File,
@@ -81,10 +109,46 @@ impl SerialDevice {
 
     /// Open `path` at `baud` and put the line into raw mode.
     ///
+    /// One attempt: a caller that has to wait for a port to come back uses
+    /// [`SerialDevice::open_retrying`].
+    ///
     /// # Errors
     /// Returns [`InterfaceError`] when the port cannot be opened or configured.
     pub fn open(path: impl AsRef<Path>, baud: u32) -> Result<Self, InterfaceError> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_once(path.as_ref(), baud)
+    }
+
+    /// Open `path` at `baud`, retrying while the port is not there yet.
+    ///
+    /// A board that was just reset re-enumerates and a host that starts before
+    /// the kernel has created the tty has nothing to open, so the **open alone**
+    /// is retried every `interval` until `budget` is spent — the connect-time
+    /// behaviour of upstream's `connect_uart` (`klippy/serialhdl.py:181-204`).
+    /// The handshake and the configuration that follow are not retried here:
+    /// they are a protocol conversation with a device that answered an open, and
+    /// a retry there would turn a real protocol error into a slow one.
+    ///
+    /// `stop` is polled before every attempt and between sleep slices, so an
+    /// exit request ends the wait instead of holding the process for the whole
+    /// budget.
+    ///
+    /// # Errors
+    /// Returns the last attempt's error, with the attempt count appended, when
+    /// the budget runs out or `stop` asks for the wait to end.
+    pub fn open_retrying(
+        path: impl AsRef<Path>,
+        baud: u32,
+        budget: Duration,
+        interval: Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Self, InterfaceError> {
+        let path = path.as_ref();
+        retry_open(budget, interval, || Self::open_once(path, baud), stop)
+    }
+
+    /// One attempt: open the port and put the line into raw mode.
+    fn open_once(path: &Path, baud: u32) -> Result<Self, InterfaceError> {
+        let path = path.to_path_buf();
         let port = OpenOptions::new()
             .read(true)
             .write(true)
@@ -152,6 +216,55 @@ impl SerialDevice {
     pub fn set_rts(&self, asserted: bool) -> Result<(), InterfaceError> {
         set_modem_line(&self.port, libc::TIOCM_RTS, asserted)
     }
+}
+
+/// Run `try_open` until it succeeds, waiting `interval` between attempts and
+/// giving up `budget` after the first one.
+///
+/// A failed exit keeps the last attempt's error — it is the one that names the
+/// port and the OS's reason — and appends the attempt count, so the log says
+/// how hard the open tried. `stop` is the exit request: it is polled after every
+/// failed attempt and between sleep slices, which is what keeps a shutdown from
+/// waiting out the budget.
+fn retry_open<T>(
+    budget: Duration,
+    interval: Duration,
+    mut try_open: impl FnMut() -> Result<T, InterfaceError>,
+    stop: &dyn Fn() -> bool,
+) -> Result<T, InterfaceError> {
+    let start = Instant::now();
+    let mut attempts = 0usize;
+    loop {
+        attempts += 1;
+        let last = match try_open() {
+            Ok(value) => return Ok(value),
+            Err(err) => err,
+        };
+        if stop() {
+            return Err(open_retry_error(last, attempts, "aborted"));
+        }
+        let waited = start.elapsed();
+        if waited >= budget {
+            return Err(open_retry_error(last, attempts, "gave up"));
+        }
+        // Wait the interval, or what is left of the budget, whichever is
+        // shorter — and sleep it in slices, so a shutdown is noticed inside a
+        // slice rather than after the interval.
+        let mut left = interval.min(budget - waited);
+        while !left.is_zero() {
+            let slice = left.min(OPEN_RETRY_SLICE);
+            std::thread::sleep(slice);
+            left -= slice;
+            if stop() {
+                return Err(open_retry_error(last, attempts, "aborted"));
+            }
+        }
+    }
+}
+
+/// The error a retry loop ends with: the last attempt's, plus how it ended.
+fn open_retry_error(last: InterfaceError, attempts: usize, reason: &str) -> InterfaceError {
+    InterfaceError::Other(format!("{last} ({reason} after {attempts} attempts)"))
 }
 
 impl fmt::Debug for SerialDevice {
@@ -396,16 +509,181 @@ pub(crate) fn last_error(call: &str) -> InterfaceError {
 
 #[cfg(test)]
 mod tests {
+    /// A path that names a different file than the open descriptor is what a
+    /// USB board's re-enumeration looks like from here: the port must not be
+    /// handed out again.
+    #[test]
+    fn test_a_path_that_names_another_file_does_not_match_the_opened_one() {
+        use std::io::Write;
+
+        let dir = std::env::temp_dir().join(format!("kx-same-file-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let first = dir.join("first");
+        let second = dir.join("second");
+        let link = dir.join("path");
+        std::fs::write(&first, b"a").expect("the first file");
+        std::fs::write(&second, b"b").expect("the second file");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&first, &link).expect("the symlink");
+
+        let mut opened = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&link)
+            .expect("the link opens");
+        assert!(same_file(&opened, &link), "the path names what was opened");
+        opened.write_all(b"x").expect("the descriptor writes");
+
+        // Repoint the link: this is the re-enumeration, seen from the host.
+        std::fs::remove_file(&link).expect("the old link goes");
+        std::os::unix::fs::symlink(&second, &link).expect("the new symlink");
+        assert!(
+            !same_file(&opened, &link),
+            "the path moved to another node, so the held descriptor is stale"
+        );
+
+        // And a path that vanished entirely is stale too.
+        std::fs::remove_file(&link).expect("the link goes");
+        assert!(!same_file(&opened, &link));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use super::*;
     use crate::core::klippy::interface::pty::Pty;
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
+
+    /// Run `body` on a thread of its own, and fail if it has not returned in
+    /// five seconds.
+    ///
+    /// Every retry test sets a budget of its own; this is the bound that catches
+    /// a loop which ignores it and would otherwise sit in the test harness.
+    fn bounded<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(body());
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the retry returns within its budget")
+    }
+
+    /// The attempt count a retry appends to the error it ends with.
+    fn attempts_in(text: &str) -> usize {
+        text.split("after ")
+            .nth(1)
+            .and_then(|tail| tail.split_whitespace().next())
+            .and_then(|count| count.parse().ok())
+            .expect("the message counts the attempts")
+    }
 
     #[test]
     fn test_open_reports_a_missing_port() {
         let err = SerialDevice::open("/dev/not-a-serial-port", DEFAULT_BAUD).unwrap_err();
         assert!(matches!(err, InterfaceError::Other(_)), "{err:?}");
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    #[test]
+    fn test_a_port_that_never_opens_is_retried_until_the_budget_runs_out() {
+        // A real missing device, the way a start-up races the kernel's
+        // re-enumeration. The message still names the port — it is the last
+        // attempt's — and the count shows the open was tried again rather than
+        // accepted as final.
+        let err = bounded(|| {
+            SerialDevice::open_retrying(
+                "/dev/not-a-serial-port",
+                DEFAULT_BAUD,
+                Duration::from_millis(200),
+                Duration::from_millis(20),
+                &|| false,
+            )
+            .unwrap_err()
+        });
+        assert!(matches!(err, InterfaceError::Other(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("/dev/not-a-serial-port"), "{text}");
+        assert!(text.contains("gave up"), "{text}");
+        assert!(attempts_in(&text) > 1, "{text}");
+    }
+
+    #[test]
+    fn test_a_port_that_opens_on_a_later_attempt_still_opens() {
+        // The board comes back between two attempts: the retry hands back the
+        // success instead of the first failure.
+        let (opened, attempts) = bounded(|| {
+            let attempts = AtomicUsize::new(0);
+            let opened = retry_open(
+                Duration::from_secs(1),
+                Duration::from_millis(10),
+                || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if attempt == 1 {
+                        Err(InterfaceError::Other(
+                            "failed to open serial port /dev/ttyUSB0: no such file".to_string(),
+                        ))
+                    } else {
+                        Ok(attempt)
+                    }
+                },
+                &|| false,
+            )
+            .expect("the second attempt opens the port");
+            (opened, attempts.load(Ordering::SeqCst))
+        });
+        assert_eq!(opened, 2, "the port that came back is the one returned");
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn test_an_exit_request_ends_the_retry_without_waiting_out_the_budget() {
+        // The budget is a minute and the port never opens: without the stop
+        // check this test would sit here for it. The exit request lands after
+        // three polls, and the wait has to end within a slice of that.
+        let (err, elapsed) = bounded(|| {
+            let polls = AtomicUsize::new(0);
+            let start = Instant::now();
+            let err = retry_open::<()>(
+                Duration::from_secs(60),
+                Duration::from_millis(20),
+                || {
+                    Err(InterfaceError::Other(
+                        "failed to open serial port /dev/ttyUSB0: no such file".to_string(),
+                    ))
+                },
+                &|| polls.fetch_add(1, Ordering::SeqCst) >= 3,
+            )
+            .unwrap_err();
+            (err, start.elapsed())
+        });
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn test_a_port_that_opens_first_time_is_not_tried_again() {
+        // The successful case pays for no retry: the open is the whole attempt,
+        // and nothing polls the stop check — so nothing slept either.
+        let pty = Pty::new();
+        let path = pty.path.clone();
+        let (device, elapsed, polls) = bounded(move || {
+            let polls = AtomicUsize::new(0);
+            let start = Instant::now();
+            let device = SerialDevice::open_retrying(
+                &path,
+                DEFAULT_BAUD,
+                Duration::from_secs(1),
+                Duration::from_millis(500),
+                &|| {
+                    polls.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            )
+            .expect("the pty opens");
+            (device, start.elapsed(), polls.load(Ordering::SeqCst))
+        });
+        assert_eq!(device.baud(), DEFAULT_BAUD);
+        assert_eq!(polls, 0, "a first-try open polls nothing");
+        assert!(elapsed < Duration::from_millis(200), "took {elapsed:?}");
     }
 
     #[test]
@@ -537,11 +815,20 @@ mod tests {
 
 pub const ASSIGN_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How many times [`attach`] reopens a path whose device node moved under it.
+///
+/// A board that resets on a USB link re-enumerates; the wait below covers the
+/// re-plug, and four rounds is about a second — far more than a re-enumeration
+/// takes, and short enough that a genuinely broken path still fails promptly.
+const ATTACH_REOPEN_ATTEMPTS: u32 = 4;
+/// How long [`attach`] waits between those reopens.
+const ATTACH_REOPEN_DELAY: Duration = Duration::from_millis(250);
+
 /// How many times `attach` re-sends the request before giving up.
 ///
 /// A lost or ignored frame must not cost the whole session: each retry re-sends
 /// the request and waits another `ASSIGN_ATTACH_TIMEOUT`.
-pub const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
+pub(crate) const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
 
 /// How long a device behind a **CAN** port is given to answer its assignment
 /// ([`SharedSerialHandle::name_can_device`]), at most.
@@ -889,7 +1176,7 @@ pub fn discovery_query() -> Vec<u8> {
 /// The uuid is what makes the request reach a device whose own byte stream is
 /// not slices: a CAN port translates a uuid-carrying request into the bus's
 /// single admin frame (`0x3f0 [0x02][uuid]`, `generic/canserial.c`), which a
-/// device reads whatever carrier it speaks — an ISO-TP application included.
+/// device reads whatever carrier it speaks.
 /// Without it the request can only travel as the mux unit itself, which needs a
 /// device that reads units. `None` keeps that older, unit-only shape.
 pub(crate) fn request_bootloader_unit(index: u8, uuid: Option<[u8; 6]>) -> Vec<u8> {
@@ -1592,6 +1879,24 @@ pub fn serial_query_unassigned(
 }
 
 /// A physical serial port, its one reader thread, and a slot per attached MCU.
+/// Whether the file `opened` still is the one `path` names now.
+///
+/// A USB CDC board that resets re-enumerates: `path` (a `by-id` symlink, say)
+/// resolves to a **new** device node while the descriptor we hold belongs to the
+/// old one, where writes fail with `EIO`. Comparing the path's current
+/// `(device, inode)` with the open descriptor's is how a port tells "still the
+/// port I opened" from "the tty went away under me".
+pub(crate) fn same_file(opened: &std::fs::File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(current) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(held) = opened.metadata() else {
+        return false;
+    };
+    current.dev() == held.dev() && current.ino() == held.ino()
+}
+
 pub struct SharedSerialPort {
     path: PathBuf,
     baud: u32,
@@ -1681,7 +1986,10 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
     resource_for(
         port_registry(),
         path,
-        |port| !port.stopped.load(Ordering::SeqCst),
+        // A registry entry is the port for `path` only while it is running **and**
+        // the tty it opened is still what `path` names: a board that reset
+        // re-enumerates, and the descriptor left behind fails every write.
+        |port| !port.stopped.load(Ordering::SeqCst) && same_file(&port.port, path),
         |path| SharedSerialPort::open(path, baud),
     )
 }
@@ -1714,31 +2022,45 @@ pub fn attach(
         )));
     }
 
-    let port = port_for(path, baud)?;
-    let slot = Arc::new(McuSlot::new());
-    port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
-    let handle = Arc::new(SharedSerialHandle {
-        port: Arc::clone(&port),
-        mcu_id,
-        slot,
-        stopped: AtomicBool::new(false),
-    });
+    let mut reopened = 0u32;
+    loop {
+        let port = port_for(path, baud)?;
+        let slot = Arc::new(McuSlot::new());
+        port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+        let handle = Arc::new(SharedSerialHandle {
+            port: Arc::clone(&port),
+            mcu_id,
+            slot,
+            stopped: AtomicBool::new(false),
+        });
 
-    // The handshake is the one `handshake` runs; `attach` only registers the
-    // slot in front of it. A failure takes the slot down again — a port that
-    // never answered is left as `attach` found it.
-    let handshake = match uuid {
-        Some(uuid) => handle.handshake(uuid, timeout),
-        None => handle.run_handshake(None, timeout),
-    };
-    if let Err(e) = handshake {
-        // The slot this attach opened goes down through the same guarded
-        // unregister the teardown paths use; the `ptr_eq` check only removes
-        // the slot this handle registered.
-        handle.unregister();
-        return Err(e);
+        // The handshake is the one `handshake` runs; `attach` only registers the
+        // slot in front of it. A failure takes the slot down again — a port that
+        // never answered is left as `attach` found it.
+        let handshake = match uuid {
+            Some(uuid) => handle.handshake(uuid, timeout),
+            None => handle.run_handshake(None, timeout),
+        };
+        if let Err(e) = handshake {
+            // The slot this attach opened goes down through the same guarded
+            // unregister the teardown paths use; the `ptr_eq` check only removes
+            // the slot this handle registered.
+            handle.unregister();
+            // A **stale** port is worth one more open: the descriptor belongs to
+            // a device node the path no longer names (the board reset and
+            // re-enumerated), so every write to it fails and waiting on the same
+            // handle cannot help. The port this attempt held goes with it — the
+            // registry keeps only a `Weak`, and `port_for` refuses an entry whose
+            // tty moved — so the next round opens the node that exists now.
+            if reopened < ATTACH_REOPEN_ATTEMPTS && !same_file(&port.port, path) {
+                reopened += 1;
+                std::thread::sleep(ATTACH_REOPEN_DELAY);
+                continue;
+            }
+            return Err(e);
+        }
+        return Ok(handle);
     }
-    Ok(handle)
 }
 
 /// Register a **downstream** device on the shared serial port at `path`,
@@ -6037,8 +6359,8 @@ mod katapult_dual_encap_tests {
 // ===========================================================================
 //
 // Drives a board that runs the firmware's serial-mux device half over its own
-// tty, **with no bridge in the path** (the staging in
-// `docs/work-log/2026-10-16-katapult-flash-task.md`, "真机测试分阶段口径"): every
+// tty, **with no bridge in the path** (the staging is the developer manual's
+// hardware-test table plus `TESTING.md`'s "mux 设备半直连" record): every
 // step sends one unit and reads what comes back, so each answer of the device
 // half is pinned against real bytes instead of a pty fixture.
 //
@@ -6141,8 +6463,10 @@ mod hw_mux_device_tests {
     /// Drop bytes up to and including the next frame sync — the device layer's
     /// resynchronisation policy ([`drop_to_sync`]), which a probe needs for the
     /// same reason the reader does: a board also sends its own traffic (the
-    /// firmware's once-a-second `stats` frame), and those bytes sit in front of
-    /// the unit a probe is waiting for.
+    /// firmware's once-a-second `stats` frame, message id `-12` in the
+    /// dictionary, whose encoding starts with `0x74`), and a previous run's
+    /// late answers may still be ahead of it — a blind read of "the first unit"
+    /// glues those two together and misreads both.
     fn skip_to_sync(pending: &mut Vec<u8>) {
         match pending.iter().position(|b| *b == MESSAGE_SYNC) {
             Some(idx) => {
@@ -6394,11 +6718,17 @@ mod hw_mux_device_tests {
         //    are transported as units addressed to it, so there is nothing to
         //    send if it never adopted the id.
         bind(&mut port, 5);
-        assert!(
-            alive_on(&mut port, &mut pending, 5, window),
-            "the board holds node id 5 after the assignment"
-        );
-        eprintln!("0. bound: the board answers on id 5's reply header");
+        // The board adopts the id asynchronously, so probe it on a bound instead
+        // of betting that one frame lands after the settle `bind` sleeps for:
+        // a missed single probe used to fail the test outright.
+        let mut probes = 0;
+        let mut answered = false;
+        while !answered && probes < 4 {
+            probes += 1;
+            answered = alive_on(&mut port, &mut pending, 5, window);
+        }
+        assert!(answered, "the board holds node id 5 after the assignment");
+        eprintln!("0. bound: the board answers on id 5's reply header (after {probes} probes)");
 
         // 1. `RESTART_DEVICE` reboots the firmware. The node id does not survive
         //    a reset (it is the host's to hand out), so the rebooted board must

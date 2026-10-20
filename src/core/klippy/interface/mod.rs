@@ -8,7 +8,6 @@ pub use devices::canserial::{CanSerialDevice, CanWire};
 #[cfg(test)]
 pub use devices::frame_mock::{FrameMock, MappingEntry};
 pub use devices::host::{HostDevice, HostMux};
-pub use devices::isotp::IsotpDevice;
 pub use devices::serial::SerialDevice;
 use devices::serial::SharedSerialHandle;
 #[cfg(test)]
@@ -58,8 +57,6 @@ pub struct Interface {
 /// - `CanSerial(CanSerialDevice)` — a real MCU reached over CAN, using Klipper's
 ///   can-serial link (`uuid:` + `canbus_interface:`; `canbus_nodeid:` is
 ///   the Klipper-named key that explicitly overrides the MCU's layer id)
-/// - `Isotp(IsotpDevice)` — a real MCU reached over CAN, carrying Klipper's
-///   blocks as ISO-TP messages (ISO 15765-2) instead of a chopped byte stream
 /// - `Host(HostDevice)` — klipper's host library, loaded from a shared object
 ///   (`host_library:`)
 /// - `FrameMock(FrameMock)` — a frame-level mock for tests (built in code)
@@ -76,7 +73,6 @@ enum Transport {
     /// stream by arbitration id, and `shutdown` stops only this handle.
     SharedSerial(Arc<SharedSerialHandle>),
     CanSerial(Arc<CanSerialDevice>),
-    Isotp(Arc<IsotpDevice>),
     Host(Arc<HostDevice>),
     #[cfg(test)]
     FrameMock(Arc<FrameMock>),
@@ -203,31 +199,6 @@ impl Interface {
         ))))
     }
 
-    /// Create an interface for the MCU `uuid` on the CAN interface `name`,
-    /// brought up as node `nodeid` and carried over **ISO-TP** on `wire`.
-    ///
-    /// The node id and the way it is handed over are the can-serial link's (same
-    /// admin frame, same socket recipe); what differs is how Klipper's blocks
-    /// travel — one ISO-TP message per block, segmented and flow controlled,
-    /// rather than a byte stream cut every frame. A block that fits one frame is
-    /// unaffected; a longer one costs a flow control frame and a round trip per
-    /// message (see the CAN ISO-TP notes).
-    ///
-    /// # Errors
-    /// Returns [`InterfaceError`] if the interface does not exist, the socket
-    /// cannot be set up, CAN FD cannot be enabled on it, or the node id is
-    /// outside `1..=255`.
-    pub fn isotp(
-        name: &str,
-        uuid: [u8; 6],
-        nodeid: u32,
-        wire: CanWire,
-    ) -> Result<Self, InterfaceError> {
-        Ok(Self::with_transport(Transport::Isotp(Arc::new(
-            IsotpDevice::open(name, uuid, nodeid, wire)?,
-        ))))
-    }
-
     /// Create an interface running klipper's host library from `path`.
     ///
     /// # Errors
@@ -258,11 +229,9 @@ impl Interface {
     /// bridge's **admin** channel, so only a link that carries port mux units
     /// can carry it: a shared serial port, a muxed host library, or a
     /// can-serial CAN link (the node behind it is the bridge, and the channel is
-    /// the mux unit inside the byte stream). An ISO-TP link is a CAN link as
-    /// well, but it carries blocks rather than mux units, so it has no
-    /// port-level channel either. Every other transport has no bridge to tell,
-    /// and the message says so rather than writing the unit on a link nobody
-    /// listens to.
+    /// the mux unit inside the byte stream). Every other transport has no bridge
+    /// to tell, and the message says so rather than writing the unit on a link
+    /// nobody listens to.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -289,8 +258,7 @@ impl Interface {
             }
             _ => Err(InterfaceError::Other(
                 "SET_PORT_NODEID needs a link that carries port mux units (a shared serial port, \
-                 a muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 a muxed host library, or a can-serial link); this interface is not one"
                     .to_string(),
             )),
         }
@@ -304,7 +272,7 @@ impl Interface {
     /// mux itself, so it has an admin channel to receive this. Like
     /// `SET_PORT_NODEID` the command travels that channel, so only a link that
     /// carries port mux units does: a shared serial port, a muxed host library,
-    /// or a can-serial CAN link (an ISO-TP link carries blocks, not mux units).
+    /// or a can-serial CAN link.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -326,8 +294,7 @@ impl Interface {
             }
             _ => Err(InterfaceError::Other(
                 "RESTART_DEVICE needs a link that carries port mux units (a shared serial port, \
-                 a muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 a muxed host library, or a can-serial link); this interface is not one"
                     .to_string(),
             )),
         }
@@ -340,8 +307,7 @@ impl Interface {
     /// its own, so its bridge's port is the only thing that can reset it. Like
     /// `SET_PORT_NODEID` the command travels the bridge's admin channel, so only
     /// a link that carries port mux units does: a shared serial port, a muxed
-    /// host library, or a can-serial CAN link (an ISO-TP link carries blocks,
-    /// not mux units).
+    /// host library, or a can-serial CAN link.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -363,8 +329,7 @@ impl Interface {
             }
             _ => Err(InterfaceError::Other(
                 "RESET_PORT needs a link that carries port mux units (a shared serial port, a \
-                 muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 muxed host library, or a can-serial link); this interface is not one"
                     .to_string(),
             )),
         }
@@ -382,8 +347,7 @@ impl Interface {
     /// ([`BridgeLink::flash`](crate::flash::bridge_flash::BridgeLink::flash)).
     /// Like `SET_PORT_NODEID` the command travels the bridge's admin channel,
     /// so only a link that carries port mux units does: a shared serial port, a
-    /// muxed host library, or a can-serial CAN link (an ISO-TP link carries
-    /// blocks, not mux units).
+    /// muxed host library, or a can-serial CAN link.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -392,7 +356,7 @@ impl Interface {
     /// `uuid` names the board the request is for. A CAN port turns a
     /// uuid-carrying request into the bus's single admin frame
     /// (`0x3f0 [0x02][uuid]`), which the device reads whatever carrier its own
-    /// stream uses — an ISO-TP application included — and *also* sends the mux
+    /// stream uses, and *also* sends the mux
     /// unit for a device that reads units. Without it only the unit travels.
     pub(crate) fn send_request_bootloader(
         &self,
@@ -415,8 +379,7 @@ impl Interface {
             }
             _ => Err(InterfaceError::Other(
                 "REQUEST_BOOTLOADER needs a link that carries port mux units (a shared serial \
-                 port, a muxed host library, or a can-serial link); this interface is not one \
-                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 port, a muxed host library, or a can-serial link); this interface is not one"
                     .to_string(),
             )),
         }
@@ -432,8 +395,7 @@ impl Interface {
     /// repeat flips the mode back and the caller tracks the state it asked for.
     /// Like `SET_PORT_NODEID` the command travels the bridge's admin channel, so
     /// only a link that carries port mux units does: a shared serial port, a
-    /// muxed host library, or a can-serial CAN link (an ISO-TP link carries
-    /// blocks, not mux units).
+    /// muxed host library, or a can-serial CAN link.
     ///
     /// # Errors
     /// The device's own error, or [`InterfaceError::Other`] when this interface
@@ -455,8 +417,7 @@ impl Interface {
             }
             _ => Err(InterfaceError::Other(
                 "SET_PORT_TUNNEL needs a link that carries port mux units (a shared serial \
-                 port, a muxed host library, or a can-serial link); this interface is not one \
-                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 port, a muxed host library, or a can-serial link); this interface is not one"
                     .to_string(),
             )),
         }
@@ -525,12 +486,6 @@ impl Interface {
                     .await
                     .unwrap_or(Err(InterfaceError::ConnectionLost))
             }
-            Transport::Isotp(device) => {
-                let device = Arc::clone(device);
-                self.off_runtime(move || device.send(&frame))
-                    .await
-                    .unwrap_or(Err(InterfaceError::ConnectionLost))
-            }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.send(&frame))
@@ -575,10 +530,6 @@ impl Interface {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
             }
-            Transport::Isotp(device) => {
-                let device = Arc::clone(device);
-                self.off_runtime(move || device.receive()).await.flatten()
-            }
             Transport::Host(device) => {
                 let device = Arc::clone(device);
                 self.off_runtime(move || device.receive()).await.flatten()
@@ -607,7 +558,6 @@ impl Interface {
             Transport::Serial(device) => device.shutdown(),
             Transport::SharedSerial(device) => device.shutdown(),
             Transport::CanSerial(device) => device.shutdown(),
-            Transport::Isotp(device) => device.shutdown(),
             Transport::Host(device) => device.shutdown(),
             #[cfg(test)]
             Transport::FrameMock(device) => device.shutdown(),
@@ -749,7 +699,6 @@ mod tests {
     use super::*;
     use crate::core::klippy::interface::devices::canserial::read_wire;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
-    use crate::core::klippy::interface::devices::isotp::read_wire_on;
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, set_port_node_id, CMD_RESET_PORT, CMD_RESTART_DEVICE,
         CMD_SET_PORT_TUNNEL, DEFAULT_BAUD, MUX_PORT_UNITS,
@@ -1119,38 +1068,15 @@ mod tests {
         );
     }
 
-    /// An ISO-TP link is wired into the interface like every other transport: a
-    /// send reaches the socket, and a shutdown is what ends a receive with
-    /// nothing to return. Measured off the wire the device writes.
-    #[tokio::test]
-    async fn test_an_isotp_link_sends_and_stops_through_the_interface() {
-        let (device, mut wire) = IsotpDevice::test_wire_on(3, CanWire::Classical);
-        let interface = Interface::with_transport(Transport::Isotp(Arc::new(device)));
-
-        interface.send(make_frame(1, &[0xab; 11])).await.unwrap();
-
-        // Eleven payload bytes are a sixteen byte block, which one classical CAN
-        // frame cannot carry: the first frame goes out and the rest waits for a
-        // flow control frame nobody is there to send.
-        let sent = read_wire_on(&mut wire, CanWire::Classical);
-        assert_eq!(sent.len(), 1, "the first frame of a segmented block");
-        assert_eq!(sent[0].id(), 0x106);
-        assert_eq!(&sent[0].data()[..2], &[0x10, 16]);
-
-        interface.shutdown();
-        assert_eq!(interface.receive().await, None);
-    }
-
     /// The bridge commands travel a bridge's admin channel; an interface with no
     /// such link says so (`_` arm of each `send_*`) instead of writing a unit
     /// nobody listens to — the message is asserted verbatim.
     ///
     /// A can-serial CAN link is one of the links that do carry them (its node is
     /// the bridge, see [`test_a_can_link_carries_the_bridge_commands`]), so this
-    /// pins the wording for the transports with no port-level channel at all. It
+    /// pins the wording for the transports with no port-level channel at all: it
     /// names what such a link needs instead of calling the interface "none of
-    /// them": an ISO-TP link is a CAN link too, it just carries blocks rather
-    /// than mux units, so the old phrasing misread as "not CAN".
+    /// them".
     #[tokio::test]
     async fn test_bridge_commands_need_a_bridge_link() {
         let interface = Interface::new(FrameMock::new(vec![]));
@@ -1159,8 +1085,7 @@ mod tests {
             interface.send_set_port_node_id(1, 2, 0).unwrap_err(),
             InterfaceError::Other(
                 "SET_PORT_NODEID needs a link that carries port mux units (a shared serial port, \
-                 a muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 a muxed host library, or a can-serial link); this interface is not one"
                     .to_string()
             )
         );
@@ -1168,8 +1093,7 @@ mod tests {
             interface.send_restart_device(1).unwrap_err(),
             InterfaceError::Other(
                 "RESTART_DEVICE needs a link that carries port mux units (a shared serial port, \
-                 a muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 a muxed host library, or a can-serial link); this interface is not one"
                     .to_string()
             )
         );
@@ -1177,8 +1101,7 @@ mod tests {
             interface.send_reset_port(1).unwrap_err(),
             InterfaceError::Other(
                 "RESET_PORT needs a link that carries port mux units (a shared serial port, a \
-                 muxed host library, or a can-serial link); this interface is not one — an \
-                 ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 muxed host library, or a can-serial link); this interface is not one"
                     .to_string()
             )
         );
@@ -1186,8 +1109,7 @@ mod tests {
             interface.send_set_port_tunnel(1).unwrap_err(),
             InterfaceError::Other(
                 "SET_PORT_TUNNEL needs a link that carries port mux units (a shared serial \
-                 port, a muxed host library, or a can-serial link); this interface is not one \
-                 — an ISO-TP link is a CAN link too, but it carries blocks, not mux units"
+                 port, a muxed host library, or a can-serial link); this interface is not one"
                     .to_string()
             )
         );

@@ -35,7 +35,7 @@
 //!     "group_id": 1000,
 //!     "log_file": null,
 //!     "config_file": "/home/pi/printer.cfg",
-//!     "software_version": "0.1.0",
+//!     "software_version": "v0.13.0-734-gfe4eb86-0.1.0",
 //!     "cpu_info": "4 core ARMv7 Processor rev 4 (v7l)"
 //!   }
 //! }
@@ -64,19 +64,22 @@ pub(crate) fn install(api: &mut Api, wiring: &ApiWiring<'_>) -> Result<(), Regis
     .map_err(RegistrationError::Endpoint)
 }
 
-/// The Klipper installation this host does not have.
+/// The sentinel test fixtures pass for `klipper_path`.
 ///
-/// Upstream reports its own checkout (`klippy/webhooks.py:390`); this host is
-/// not Klipper and has none, so it reports a path that does not exist. That is
-/// the treatment [`InfoResponse::python_path`] documents at length, and it holds
-/// for both fields: Moonraker indexes them without a default
-/// (`moonraker/components/klippy_connection.py`, `_save_path_info`), and only
-/// sets up its Klipper updater when both exist
-/// (`components/update_manager/update_manager.py`:
-/// `os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`), so a path
-/// that does not exist leaves that updater a no-op instead of pointing it at a
-/// directory that is not Klipper. Both keys must still be present strings.
-const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
+/// Both path keys must always be present strings in an `info` response:
+/// Moonraker indexes them without a default
+/// (`moonraker/components/klippy_connection.py`, `_save_path_info`), and the
+/// resulting `KeyError` is not a `ServerError`, so it is not caught by the
+/// `except ServerError` around the initialization task
+/// (`klippy_connection.py:418-427`): that task dies with nobody awaiting it,
+/// the socket stays connected, `klippy_state` stays `startup` forever and no
+/// reconnect follows.
+///
+/// In production `klipper_path` is the released asset root the host gathered
+/// at start-up (see [`InfoResponse::klipper_path`]); a test fixture that does
+/// not release one passes this nonexistent path instead.
+#[cfg(test)]
+pub(crate) const NO_KLIPPER_PATH: &str = "/nonexistent/klipper";
 
 /// The interpreter this host does not have. See [`NO_KLIPPER_PATH`].
 const NO_PYTHON_PATH: &str = "/nonexistent/python3";
@@ -104,7 +107,7 @@ impl Info {
             state: state.category.as_category().to_string(),
             state_message: state.message,
             hostname: hostname(),
-            klipper_path: NO_KLIPPER_PATH.to_string(),
+            klipper_path: self.start_args.klipper_path.clone(),
             python_path: NO_PYTHON_PATH.to_string(),
             process_id: std::process::id(),
             user_id: current_user_id(),
@@ -223,8 +226,14 @@ pub struct InfoResponse {
     pub state_message: String,
     /// Host name of the machine running klippy.
     pub hostname: String,
-    /// Directory holding the Klipper installation, or a path that does not
-    /// exist when there is none — see [`NO_KLIPPER_PATH`].
+    /// Directory of the Klipper assets this host releases at start-up.
+    ///
+    /// The root the embedded trees were written to ([`crate::assets::release`]):
+    /// `config/` (the upstream configuration examples), `docs/` (this host's
+    /// user manuals plus a generated index) and `docs/klipper/` (the upstream
+    /// documentation, at the subpath Moonraker's documentation lookup expects
+    /// under this path). Upstream reports its own checkout here
+    /// (`klippy/webhooks.py:390`); this host reports what it carries.
     pub klipper_path: String,
     /// Interpreter running the host software, or a path that does not exist.
     ///
@@ -259,7 +268,8 @@ pub struct InfoResponse {
     pub log_file: Option<String>,
     /// Configuration file the host software was started with.
     pub config_file: String,
-    /// Version of the host software.
+    /// Version of the host software: the pinned upstream baseline plus this
+    /// crate's version ([`crate::version::software_version`]).
     pub software_version: String,
     /// CPU description, e.g. `"4 core ARMv7 Processor rev 4 (v7l)"`.
     ///
@@ -283,6 +293,8 @@ mod tests {
     use super::*;
     use crate::core::klippy::api::registry::Api;
     use crate::core::klippy::api::test_support::{context, silent_target};
+    use crate::core::klippy::api::WebhooksStatus;
+    use crate::core::klippy::printer::PrinterObject;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
 
@@ -295,6 +307,7 @@ mod tests {
         StartArgs {
             config_file: "/home/pi/printer.cfg".to_string(),
             log_file: None,
+            klipper_path: NO_KLIPPER_PATH.to_string(),
             software_version: "0.1.0".to_string(),
             cpu_info: "4 core ARMv7 Processor rev 4 (v7l)".to_string(),
             apiserver: None,
@@ -371,18 +384,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_two_klipper_paths_are_present_and_do_not_exist() {
-        // See `NO_KLIPPER_PATH`: Moonraker indexes both without a default and
-        // only enables its Klipper updater when both exist, so "present but
-        // nonexistent" is the answer for a host that has neither.
+    async fn test_klipper_path_is_the_start_args_value_and_python_stays_absent() {
+        // See `NO_KLIPPER_PATH`: Moonraker indexes both keys without a default
+        // and only sets up its Klipper updater when both paths exist — which
+        // this host keeps a no-op by reporting no interpreter, while
+        // `klipper_path` is the released asset root the start args carry.
         let (endpoint, _printer) = endpoint();
 
         let response = ask(&endpoint, r#"{"method":"info"}"#).await;
 
-        for key in ["klipper_path", "python_path"] {
-            let path = response[key].as_str().expect("a string");
-            assert!(!path.is_empty(), "{key} is empty");
-            assert!(!std::path::Path::new(path).exists(), "{key} exists: {path}");
+        assert_eq!(response["klipper_path"], NO_KLIPPER_PATH);
+        // `python_path` may not name something this host actually has: a real
+        // interpreter or a virtualenv would make Moonraker manage it (see
+        // `InfoResponse::python_path`), so pin that it is neither this crate's
+        // source tree nor the running binary — the two "real path" values a
+        // future edit is most likely to reach for.
+        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let executable = std::env::current_exe().expect("the test binary has a path");
+        let path = response["python_path"].as_str().expect("a string");
+        assert!(!path.is_empty(), "python_path is empty");
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "python_path exists: {path}"
+        );
+        assert_ne!(
+            std::path::Path::new(path),
+            manifest_dir,
+            "python_path is this crate"
+        );
+        assert_ne!(
+            std::path::Path::new(path),
+            executable,
+            "python_path is this binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_state_is_one_moonraker_accepts_and_webhooks_agrees() {
+        // Moonraker maps the reported state through its own enum and only knows
+        // `startup|ready|error|shutdown`: `KlippyState.from_string` raises
+        // `ValueError` for anything else (`moonraker/common.py:137-151`), from
+        // call sites that are not behind a `ServerError` guard
+        // (`klippy_connection.py:456,583`) — the host would sit in `startup`
+        // with the socket connected. `info` and `webhooks` both report the
+        // state, so both must draw from that same four-name domain and agree on
+        // the value.
+        let (endpoint, printer) = endpoint();
+        let webhooks = WebhooksStatus::new(Arc::clone(&printer));
+        let accepted = ["startup", "ready", "error", "shutdown"];
+
+        for halted in [false, true] {
+            if halted {
+                printer.invoke_shutdown("Printer is halted");
+            }
+            let info = ask(&endpoint, r#"{"method":"info"}"#).await;
+            let info_state = info["state"].as_str().expect("a string").to_string();
+            let webhooks_state = webhooks.get_status(0.0)["state"]
+                .as_str()
+                .expect("a string")
+                .to_string();
+
+            assert_eq!(info_state, webhooks_state, "the two state reports differ");
+            assert!(
+                accepted.contains(&info_state.as_str()),
+                "{info_state} is not a state Moonraker accepts"
+            );
         }
     }
 

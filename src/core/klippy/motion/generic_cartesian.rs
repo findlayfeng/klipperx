@@ -188,7 +188,7 @@ impl Kinematics for GenericCartesianKinematics {
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
         let end = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         // XY first, as `GenericCartesianKinematics.check_move` does
         // (`generic_cartesian.py:328-350`).
         for axis in [X_AXIS, Y_AXIS] {
@@ -251,8 +251,8 @@ impl Kinematics for GenericCartesianKinematics {
             .collect();
         json!({
             "homed_axes": homed,
-            "axis_minimum": self.axis_min.as_array(),
-            "axis_maximum": self.axis_max.as_array(),
+            "axis_minimum": self.axis_min.as_slice(),
+            "axis_maximum": self.axis_max.as_slice(),
         })
     }
 

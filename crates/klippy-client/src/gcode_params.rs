@@ -34,8 +34,13 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
             "SAMPLES_TOLERANCE",
             "SAMPLES_TOLERANCE_RETRIES",
             "SAMPLES_RESULT",
+            "PROFILE",
         ],
     ),
+    ("BED_MESH_MAP", &[]),
+    ("BED_MESH_OFFSET", &["X", "Y", "ZFADE"]),
+    ("BED_MESH_OUTPUT", &["PGP"]),
+    ("BED_MESH_PROFILE", &["LOAD", "SAVE", "REMOVE"]),
     (
         "BED_TILT_CALIBRATE",
         &[
@@ -100,6 +105,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("G90", &[]),
     ("G91", &[]),
     ("G92", &["X", "Y", "Z", "E"]),
+    ("GET_POSITION", &[]),
     ("GET_RETRACTION", &[]),
     ("IIC_READ", &["DEVICE", "WRITE", "READ_LEN"]),
     ("IIC_WRITE", &["DEVICE", "DATA"]),
@@ -286,7 +292,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         "SET_KINEMATIC_POSITION",
         &["X", "Y", "Z", "SET_HOMED", "CLEAR", "CLEAR_HOMED"],
     ),
-    ("SET_PIN", &["PIN", "VALUE", "CYCLE_TIME"]),
+    ("SET_PIN", &["PIN", "VALUE", "TEMPLATE", "CYCLE_TIME"]),
     (
         "SET_PRESSURE_ADVANCE",
         &["EXTRUDER", "ADVANCE", "SMOOTH_TIME"],

@@ -261,9 +261,18 @@ mod tests {
         .unwrap();
 
         mcu.send_msg(&DebugNop).unwrap();
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // The reply lands on the receive task's own thread, so the test waits
+        // for the callback rather than guessing how long it needs: a fixed
+        // 20 ms window was missed under the full gate's load, which failed a
+        // passing test. The wait is bounded — one second, then the same panic
+        // the fixed sleep gave.
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while seen.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "the result arrived");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
 
-        let result = seen.lock().unwrap().expect("the result arrived");
+        let result = seen.lock().unwrap().take().expect("the result arrived");
         assert_eq!(result.oid, 4);
         assert_eq!(result.next_clock, 9_000);
         assert_eq!(result.value, 0x0001_9000);

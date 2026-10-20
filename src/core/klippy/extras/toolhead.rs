@@ -99,6 +99,7 @@ use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
+use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -130,8 +131,12 @@ use crate::core::klippy::motion::rotary_delta::{
     rotary_delta_active_flags, rotary_delta_position_fn, RotaryDeltaConfig, RotaryDeltaKinematics,
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
-use crate::core::klippy::motion::stepcompress::{StepCommand, StepCompressError};
-use crate::core::klippy::motion::toolhead::{EstimatedPrintTime, ToolHead, WaitMovesState};
+use crate::core::klippy::motion::stepcompress::{HistoryStep, StepCommand, StepCompressError};
+use crate::core::klippy::motion::stepper::Stepper;
+use crate::core::klippy::motion::toolhead::{
+    EstimatedPrintTime, SyncPrintTimeNotify, ToolHead, WaitMovesState,
+};
+use crate::core::klippy::motion::trapq::MoveSegment;
 use crate::core::klippy::motion::winch::{winch_active_flags, winch_position_fn, WinchKinematics};
 use crate::core::klippy::motion::{HomeCoord, Homing, HomingHandle, HomingInfo};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject, RestartHooks};
@@ -513,6 +518,14 @@ pub struct ToolHeadObject {
     /// Flush callbacks registered before connect, installed the same way
     /// (`register_flush_callback` at config load).
     pending_flush_callbacks: Mutex<Vec<Box<dyn Fn(f64) + Send + 'static>>>,
+    /// The `toolhead:sync_print_time` payload waiting to be sent —
+    /// `(curtime, est_print_time, print_time)` — filled by the planner's sync
+    /// hook under the state lock (see [`install_sync_print_time_hook`]) and
+    /// drained by [`run_flush_loop`] once that lock is released.
+    ///
+    /// An `Arc` because the hook is a `'static` closure that outlives the call
+    /// installing it.
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
     /// Set when the object is dropped, to stop the flush task.
     shutdown: Arc<AtomicBool>,
 }
@@ -528,6 +541,29 @@ struct Connected {
     /// `self.trapq`, `force_move.py:33`). Kept beside the toolhead because the
     /// id only means anything for this connection's [`MotionQueuing`].
     force_move_trapq: Option<usize>,
+}
+
+/// One kinematics stepper, as `GET_POSITION` reports it
+/// (`gcode_move.py:269-272`).
+pub struct StepperReport {
+    /// The section name upstream prints (`stepper_x`, `stepper_bed`…).
+    pub name: String,
+    /// The firmware step count (`MCU_stepper.get_mcu_position`).
+    pub mcu_position: i64,
+    /// The position its solver last commanded it to
+    /// (`MCU_stepper.get_commanded_position`).
+    pub commanded_position: f64,
+}
+
+/// Where the machine is, from the steppers up (`GET_POSITION`,
+/// `gcode_move.py:267-274`).
+pub struct PositionReport {
+    /// Every kinematics stepper, in upstream's `kin.get_steppers()` order.
+    pub steppers: Vec<StepperReport>,
+    /// The carriage position the kinematics inverts those steppers to
+    /// (`kin.calc_position`). An axis is `None` when it cannot be recovered —
+    /// an unhomed delta, a non-invertible solver.
+    pub kinematic: [Option<f64>; 3],
 }
 
 /// The step commands to send, paired with the stepper that produced them and
@@ -913,6 +949,7 @@ impl ToolHeadObject {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         object.register_commands(printer)?;
@@ -1149,19 +1186,37 @@ impl PrinterObject for ToolHeadObject {
             return json!({});
         };
         let position = connected.toolhead.commanded_pos();
-        let homed_axes = connected
+        // Upstream starts its status from the kinematics' own
+        // (`res = dict(self.kin.get_status(eventtime))`, `toolhead.py:502`),
+        // which is where `homed_axes` and the four-axis `axis_minimum` /
+        // `axis_maximum` come from. No kinematics reads as the same zeros
+        // `none` reports (`kinematics/none.py:25`).
+        let kinematics_status = connected
             .toolhead
             .kinematics()
-            .map(|kinematics| kinematics.get_status()["homed_axes"].clone())
-            .unwrap_or_else(|| json!(""));
+            .map(|kinematics| kinematics.get_status());
+        let kinematics_key = |key: &str, fallback: Value| {
+            kinematics_status
+                .as_ref()
+                .map(|status| status[key].clone())
+                .unwrap_or(fallback)
+        };
+        let homed_axes = kinematics_key("homed_axes", json!(""));
+        let axis_minimum = kinematics_key("axis_minimum", json!([0.0, 0.0, 0.0, 0.0]));
+        let axis_maximum = kinematics_key("axis_maximum", json!([0.0, 0.0, 0.0, 0.0]));
         // The four velocity limits as upstream reports them (`get_status`,
         // `toolhead.py:502-515`); this object owns the copy the planner was
         // built from, and the runtime setters keep the two in step.
         let limits = self.limits_guard();
         json!({
-            "position": position.as_array(),
+            "position": position.as_slice(),
             "homed_axes": homed_axes,
+            "axis_minimum": axis_minimum,
+            "axis_maximum": axis_maximum,
             "print_time": connected.toolhead.print_time(),
+            // The MCU's estimate of the print time now, read fresh from the
+            // source `connect` installed (`toolhead.py:505-510`).
+            "estimated_print_time": connected.toolhead.estimated_print_time(),
             // The active extruder's name, as upstream reports it
             // (`toolhead.py:511`); `PARK_{printer.toolhead.extruder}` and
             // friends read it through the macro template.
@@ -1359,13 +1414,27 @@ impl PrinterObject for ToolHeadObject {
             // A reading taken here, at connect, would floor every later move at
             // a horizon the clock passed `idle` seconds ago (C5: the whole
             // motion expired and was dumped in one burst → `Timer too close`).
+            let est_reactor = Arc::clone(&reactor_for_est);
             toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(move || {
                 printer_for_est
                     .upgrade()
                     .and_then(|printer| printer.lookup_object_as::<McuObject>("mcu"))
-                    .and_then(|object| object.estimated_print_time(reactor_for_est.monotonic()))
+                    .and_then(|object| object.estimated_print_time(est_reactor.monotonic()))
                     .unwrap_or(0.0)
             }));
+
+            // The planner cannot send `toolhead:sync_print_time` itself: every
+            // path into `calc_print_time` holds the state lock this object
+            // shares, and a handler that reaches back into it (`idle_timeout`
+            // reads the print time) would deadlock on that same lock. So the
+            // hook parks the payload and the flush task sends it with the lock
+            // released — the ordering `set_position` uses for
+            // `toolhead:set_position`.
+            install_sync_print_time_hook(
+                &mut toolhead,
+                Arc::clone(&self.pending_sync_print_time),
+                Arc::clone(&reactor_for_est),
+            );
 
             // The extruders are the toolhead's `extra_axes`: each has its own
             // trapq, and the extruder queues the extrusion into it
@@ -1385,6 +1454,22 @@ impl PrinterObject for ToolHeadObject {
                         extruder.set_trapq(trapq);
                     }
                     toolhead.add_extra_axis(Arc::clone(&extruder) as Arc<dyn ExtraAxis>);
+                }
+            }
+
+            // The auto-enable chain (`MCU_stepper.add_active_callback`):
+            // `stepper_enable` armed a callback per stepper at config load, and
+            // its own registry is what the queue must check before every step
+            // generation. The queue cannot reach that object (`[printer]` loads
+            // last) and the object could not reach this queue (it does not exist
+            // yet), so the queue takes the set here.
+            if let Some(printer) = self.printer.upgrade() {
+                if let Some(stepper_enable) =
+                    printer.lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+                {
+                    toolhead
+                        .motion_queuing_mut()
+                        .set_active_callbacks(stepper_enable.active_callbacks());
                 }
             }
 
@@ -1431,11 +1516,13 @@ impl PrinterObject for ToolHeadObject {
             }
 
             // The flush task owns nothing the object does not share; it stops
-            // when the object is dropped, by reading `shutdown`.
+            // when the object is dropped, by reading `shutdown`. It also sends
+            // the print time sync the planner parks (`pending_sync_print_time`).
             tokio::spawn(run_flush_loop(
                 Arc::clone(&self.state),
                 Arc::clone(&self.shutdown),
                 self.printer.clone(),
+                Arc::clone(&self.pending_sync_print_time),
             ));
             Ok(())
         })
@@ -1775,6 +1862,30 @@ impl Drop for ToolHeadObject {
     }
 }
 
+/// One motion stepper's step history, as `motion_report/dump_stepper` reads it.
+///
+/// The compressor records firmware clocks; the report needs print seconds, so
+/// the mapping the compressor was given travels with the rows.
+pub struct StepperStepHistory {
+    /// The runs overlapping the read window, newest first
+    /// (`StepCompressor::extract_old`).
+    pub steps: Vec<HistoryStep>,
+    /// Millimetres per step (`MCU_stepper.step_dist`).
+    pub step_dist: f64,
+    /// Clock ticks per print second, and the print time clock 0 corresponds to
+    /// (`StepCompressor::mcu_freq` / `time_offset`).
+    pub mcu_freq: f64,
+    pub time_offset: f64,
+}
+
+impl StepperStepHistory {
+    /// The print time of one of the rows' clocks (upstream's
+    /// `MCU.clock_to_print_time`, the inverse of `print_time_to_clock`).
+    pub fn clock_to_print_time(&self, clock: u64) -> f64 {
+        clock as f64 / self.mcu_freq + self.time_offset
+    }
+}
+
 impl ToolHeadObject {
     fn lock(&self) -> MutexGuard<'_, Option<Connected>> {
         self.state
@@ -1810,6 +1921,16 @@ impl ToolHeadObject {
             .as_mut()
             .map(|connected| connected.toolhead.get_last_move_time())
             .unwrap_or(0.0)
+    }
+
+    /// [`Self::get_last_move_time`] for a caller that **dates** a change by it
+    /// (`stepper_enable`'s enable-line writes): `None` while there is no planner,
+    /// instead of the `0.0` that would schedule the change at the MCU's boot
+    /// clock.
+    pub fn last_move_time(&self) -> Option<f64> {
+        self.lock()
+            .as_mut()
+            .map(|connected| connected.toolhead.get_last_move_time())
     }
 
     /// Advance the planner's timeline by `delay` seconds (`toolhead.dwell`).
@@ -1950,6 +2071,27 @@ impl ToolHeadObject {
         connected.toolhead.move_to(position, speed)
     }
 
+    /// Queue a move that also drives the extra axes.
+    ///
+    /// `extras` are the new positions of the non-kinematic axes on position
+    /// index `E_AXIS + 1` and up — a `GCODE_AXIS` manual stepper's slot, or a
+    /// second extruder's. An axis the caller leaves out keeps where it is.
+    ///
+    /// # Errors
+    /// As [`Self::move_to`].
+    pub fn move_to_extended(
+        &self,
+        position: Coord,
+        extras: &[f64],
+        speed: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let Some(connected) = guard.as_mut() else {
+            return Err(CommandError::new("Printer is not ready"));
+        };
+        connected.toolhead.move_to_extended(position, extras, speed)
+    }
+
     /// The commanded position (upstream's `toolhead.get_position`).
     ///
     /// `None` before connect: there is no planner to ask yet, and
@@ -1958,6 +2100,89 @@ impl ToolHeadObject {
         self.lock()
             .as_ref()
             .map(|connected| connected.toolhead.commanded_pos())
+    }
+
+    /// The kinematics steppers' names, in upstream's `kin.get_steppers()`
+    /// order: each rail's motors in axis order, with polar's bare bed stepper
+    /// **before** the rails (`kinematics/polar.py:31-34`) and the rail-less
+    /// motors of winch and generic cartesian after them
+    /// (`kinematics/winch.py:29-30`,
+    /// `kinematics/generic_cartesian.py:233-234`).
+    ///
+    /// Not the order connect adds them in (`rails` → `generic_steppers` →
+    /// `bed` → `winch_steppers`): on polar the two differ, and upstream's is
+    /// what a `GET_POSITION` log is read against.
+    fn kinematics_stepper_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        if let Some(bed) = &self.bed {
+            names.push(bed.name().to_string());
+        }
+        for rail in &self.rails {
+            names.extend(
+                rail.steppers()
+                    .iter()
+                    .map(|stepper| stepper.name().to_string()),
+            );
+        }
+        names.extend(
+            self.generic_steppers
+                .iter()
+                .map(|stepper| stepper.stepper().name().to_string()),
+        );
+        names.extend(
+            self.winch_steppers
+                .iter()
+                .map(|stepper| stepper.name().to_string()),
+        );
+        names
+    }
+
+    /// Every kinematics stepper's step count and commanded position, plus the
+    /// carriage position the kinematics inverts them to — the three quantities
+    /// `GET_POSITION` reports (`gcode_move.py:267-274`).
+    ///
+    /// The extruder steppers are not kinematics steppers — upstream reaches
+    /// them only through `set_trapq` (`kinematics/extruder.py`) — so they are
+    /// left out. Read under one lock, so the two stepper lines and the
+    /// inversion describe the same instant.
+    ///
+    /// `None` before connect: there is no motion state to report yet.
+    pub fn position_report(&self) -> Option<PositionReport> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let (steppers, positions) = {
+            let queuing = connected.toolhead.motion_queuing_mut();
+            let mut steppers = Vec::new();
+            let mut positions = HashMap::new();
+            for name in self.kinematics_stepper_names() {
+                let Some(stepper) = queuing
+                    .steppers()
+                    .iter()
+                    .find(|stepper| stepper.name() == name)
+                else {
+                    // A kinematics stepper the motion queue does not hold: its
+                    // rail did not reach connect, so there is nothing to report
+                    // for it.
+                    continue;
+                };
+                positions.insert(name.clone(), stepper.commanded_position());
+                steppers.push(StepperReport {
+                    name,
+                    mcu_position: stepper.mcu_position(),
+                    commanded_position: stepper.commanded_position(),
+                });
+            }
+            (steppers, positions)
+        };
+        let kinematic = connected
+            .toolhead
+            .kinematics()
+            .map(|kinematics| kinematics.calc_position(&positions))
+            .unwrap_or([None; 3]);
+        Some(PositionReport {
+            steppers,
+            kinematic,
+        })
     }
 
     /// The kinematic Z position at a past print time, from the stepper step
@@ -1994,6 +2219,61 @@ impl ToolHeadObject {
             .map(|connected| connected.toolhead.main_trapq())
     }
 
+    /// The segments of trapq `trapq` that overlap `start_time..end_time`,
+    /// newest first (`trapq_extract_old`, the read side of
+    /// `motion_report/dump_trapq`).
+    ///
+    /// `trapq` is a [`MotionQueuing`](crate::core::klippy::motion::MotionQueuing)
+    /// id from this machine — [`ToolHeadObject::main_trapq`] or
+    /// [`crate::core::klippy::extras::extruder::PrinterExtruder::trapq`].
+    /// `None` before connect (the motion state the ids index does not exist
+    /// yet).
+    pub fn trapq_extract(
+        &self,
+        trapq: usize,
+        max: usize,
+        start_time: f64,
+        end_time: f64,
+    ) -> Option<Vec<MoveSegment>> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        Some(
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .trapq(trapq)
+                .extract_old(max, start_time, end_time),
+        )
+    }
+
+    /// One motion stepper's recent step runs plus the clock mapping that turns
+    /// its records' clocks into print times — what
+    /// `motion_report/dump_stepper` streams (`MCU_stepper.dump_steps`).
+    ///
+    /// `None` before connect, or when no motion stepper answers to `name`.
+    pub fn stepper_step_history(
+        &self,
+        name: &str,
+        max: usize,
+        start_clock: u64,
+        end_clock: u64,
+    ) -> Option<StepperStepHistory> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)?;
+        Some(StepperStepHistory {
+            steps: stepper.history(max, start_clock, end_clock),
+            step_dist: stepper.step_dist(),
+            mcu_freq: stepper.mcu_freq(),
+            time_offset: stepper.time_offset(),
+        })
+    }
+
     /// Point a motion stepper at a trapq by name, or take it off one with
     /// `None` (`MCU_stepper.set_trapq`, the per-motor detach/reattach
     /// `ZAdjustHelper.adjust_steppers` walks through).
@@ -2021,6 +2301,145 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Allocate a trapq for a stepper of the caller's own and put that stepper
+    /// in the motion queue reading it — upstream's
+    /// `motion_queuing.allocate_trapq()` plus `set_trapq`, which a
+    /// `[manual_stepper]` does in its own `__init__`
+    /// (`manual_stepper.py:31-34`) and this port does on the stepper's first
+    /// move (the trapq id only means something for a connection, so it cannot
+    /// be made at load).
+    ///
+    /// The stepper reads `trapq` and no other, and its generated steps reach
+    /// the firmware only through the `mcu_steppers` entry registered here —
+    /// `Connected::generate` looks a batch's stepper up by name to send it.
+    /// Returns the trapq id, which the caller keeps to append to.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    pub fn add_extra_axis_stepper(
+        &self,
+        mut stepper: Stepper,
+        mcu_stepper: Arc<McuStepper>,
+    ) -> Result<usize, CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let trapq = connected.toolhead.allocate_trapq();
+        // Added through the queue rather than `ToolHead::add_stepper`, which
+        // points every stepper it takes at the main trapq: this one drives its
+        // own.
+        stepper.set_trapq(trapq);
+        connected
+            .mcu_steppers
+            .insert(stepper.name().to_string(), mcu_stepper);
+        connected.toolhead.motion_queuing_mut().add_stepper(stepper);
+        Ok(trapq)
+    }
+
+    /// Append one trapezoid to the trapq `trapq` — upstream's
+    /// `lookup_trapq_append()`, for a caller that owns a trapq id but not the
+    /// queue (`[manual_stepper]`'s `_submit_move`, `manual_stepper.py:63-73`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_to_trapq(
+        &self,
+        trapq: usize,
+        print_time: f64,
+        accel_t: f64,
+        cruise_t: f64,
+        decel_t: f64,
+        start_pos: Xyz,
+        axes_r: Xyz,
+        start_v: f64,
+        cruise_v: f64,
+        accel: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        connected.toolhead.motion_queuing_mut().append(
+            trapq, print_time, accel_t, cruise_t, decel_t, start_pos, axes_r, start_v, cruise_v,
+            accel,
+        );
+        Ok(())
+    }
+
+    /// Put one motion stepper's solver at `position` on its own single-axis
+    /// coordinates (`MCU_stepper.set_position`), found by section name.
+    ///
+    /// A `[manual_stepper]` uses it after `SET_POSITION`: the trapq's positions
+    /// are that stepper's own coordinates, so the solver has to be moved with
+    /// the commanded position or the next appended move starts somewhere the
+    /// motor is not.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or the unknown-stepper error when
+    /// no motion stepper answers to `name`.
+    pub fn set_stepper_position(&self, name: &str, position: f64) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers_mut()
+            .iter_mut()
+            .find(|stepper| stepper.name() == name)
+            .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
+        stepper.set_position(Xyz::new(position, 0.0, 0.0));
+        Ok(())
+    }
+
+    /// The firmware stepper this connection registered for `name` — the one a
+    /// generated batch is sent through (`Connected::generate` matches a
+    /// stepper's name against this map). `None` before connect, or when no
+    /// stepper by that name was registered.
+    pub fn mcu_stepper(&self, name: &str) -> Option<Arc<McuStepper>> {
+        self.lock()
+            .as_ref()
+            .and_then(|connected| connected.mcu_steppers.get(name).cloned())
+    }
+
+    /// One motion stepper's firmware step counter
+    /// (`MCU_stepper.get_mcu_position`), found by section name.
+    ///
+    /// `None` before connect (the toolhead has no motion state yet), or when no
+    /// motion stepper answers to `name` — a stepper whose rail the kinematics
+    /// did not take. The steppers themselves live here: the toolhead took them
+    /// from [`crate::core::klippy::extras::stepper::PrinterStepper`] at connect.
+    pub fn stepper_mcu_position(&self, name: &str) -> Option<i64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)
+            .map(|stepper| stepper.mcu_position())
+    }
+
+    /// One motion stepper's host position, as its solver last commanded it
+    /// (upstream's `MCU_stepper.get_commanded_position`), found by section
+    /// name. `None` under the same conditions as
+    /// [`ToolHeadObject::stepper_mcu_position`].
+    pub fn stepper_commanded_position(&self, name: &str) -> Option<f64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)
+            .map(|stepper| stepper.commanded_position())
+    }
+
     /// Drive one stepper `dist` millimetres in its own coordinates, outside the
     /// planner and the kinematics (upstream `ForceMove.manual_move`,
     /// `force_move.py:75-91`): the `FORCE_MOVE` / `STEPPER_BUZZ` move.
@@ -2036,12 +2455,17 @@ impl ToolHeadObject {
     /// and trapq back and wipes the force-move trapq. The toolhead's
     /// `commanded_pos` and the stepper's own solver position are deliberately
     /// **not** touched: the move invalidates the kinematics (a
-    /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner.
+    /// `SET_KINEMATIC_POSITION` re-syncs it), it does not move the planner. No
+    /// homing state is consulted — upstream's `manual_move` never checks, so
+    /// `FORCE_MOVE` works on an unhomed machine while a planned `G1` still
+    /// answers `Must home axis first`.
     ///
-    /// A `stepper_name` the toolhead's motion queue does not hold — a stepper
-    /// `force_move` knows but those modules have not wired (the manual stepper,
-    /// the IDEX second carriage) — carries the move on the timeline only; see
-    /// [`manual_move`] for why.
+    /// A `stepper_name` the toolhead's motion queue does not hold — a
+    /// `[manual_stepper]` that has not taken a first `MOVE=` yet, or the IDEX
+    /// second carriage, which never joins the queue in this port — carries the
+    /// move on the timeline only, with a warning: nothing would generate its
+    /// steps. See [`warn_unwired_stepper`] for why that is a warning rather
+    /// than an error.
     ///
     /// # Errors
     /// "Printer is not ready" before connect, or a step-generation/send
@@ -2145,6 +2569,55 @@ impl ToolHeadObject {
     }
 }
 
+/// Install the planner's print-time sync hook (`ToolHeadObject::connect`): it
+/// dates the payload and parks it for [`run_flush_loop`].
+///
+/// The hook runs **under the toolhead's state lock** — every `calc_print_time`
+/// path holds it — so it must not send: `Printer::send_event` runs the handlers
+/// on that thread, and a handler that reads the planner would deadlock on the
+/// lock it is called under. A single slot is enough: only the latest raise
+/// matters to the handler, and a burst inside one 10 ms flush tick collapses
+/// into the last one.
+fn install_sync_print_time_hook(
+    toolhead: &mut ToolHead,
+    pending: Arc<Mutex<Option<(f64, f64, f64)>>>,
+    reactor: Arc<dyn Reactor>,
+) {
+    toolhead.set_sync_print_time_notify(SyncPrintTimeNotify::new(
+        move |est_print_time, print_time| {
+            // Upstream reads `curtime` when it enters `_calc_print_time`
+            // (`toolhead.py:261`); this is that instant.
+            *pending.lock().unwrap_or_else(|poison| poison.into_inner()) =
+                Some((reactor.monotonic(), est_print_time, print_time));
+        },
+    ));
+}
+
+/// Send the `toolhead:sync_print_time` the planner parked, if any.
+///
+/// Called by [`run_flush_loop`] with the state lock **released**: the lock is
+/// only held while steps are generated, and this event's handler
+/// (`idle_timeout`'s `handle_sync_print_time`) reads the planner's print time —
+/// sending it under that lock would deadlock the sending thread. The slot is
+/// also emptied before the send, so a handler that raises the print time again
+/// faces no held lock.
+fn flush_sync_print_time(pending: &Mutex<Option<(f64, f64, f64)>>, printer: &Weak<Printer>) {
+    let sync = pending
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .take();
+    if let Some((curtime, est_print_time, print_time)) = sync {
+        send(
+            printer,
+            &KlippyEvent::ToolheadSyncPrintTime {
+                curtime,
+                est_print_time,
+                print_time,
+            },
+        );
+    }
+}
+
 /// The flush task: generate the queued steps and await the transport.
 ///
 /// A command that must not return until the steps it queued are generated and
@@ -2155,6 +2628,7 @@ async fn run_flush_loop(
     state: Arc<Mutex<Option<Connected>>>,
     shutdown: Arc<AtomicBool>,
     printer: Weak<Printer>,
+    pending_sync_print_time: Arc<Mutex<Option<(f64, f64, f64)>>>,
 ) {
     loop {
         sleep(FLUSH_INTERVAL).await;
@@ -2170,6 +2644,10 @@ async fn run_flush_loop(
                 None => Ok(Vec::new()),
             }
         };
+        // The lock is out of scope here, so the print-time sync the planner
+        // parked can be sent (it is parked under that lock instead — see
+        // [`install_sync_print_time_hook`]).
+        flush_sync_print_time(&pending_sync_print_time, &printer);
         let batches = match batches {
             Ok(batches) => batches,
             // `check_line` failed, which upstream treats as an internal error
@@ -2230,6 +2708,37 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
     result
 }
 
+/// Report a force move on a stepper the toolhead's motion queue does not hold:
+/// the move travels the timeline, but no steps are generated for that motor.
+///
+/// **Why this is a warning and not an error**: upstream's `STEPPER_BUZZ` is
+/// legal G-code for every registered stepper, and the upstream corpus exercises
+/// exactly that on a carriage this port cannot drive —
+/// `test/klippy/dual_carriage.test:49` and
+/// `hybrid_corexy_dual_carriage.test:42` run `STEPPER_BUZZ STEPPER=dual_carriage`
+/// and require it to succeed. Upstream gets steps there because every
+/// `MCU_stepper` allocates a syncemitter in `motion_queuing` as it is built
+/// (`klippy/stepper.py:50-56`), so its flush generates all of them; this port's
+/// queue holds the toolhead's and the extruders' steppers plus the ones
+/// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a
+/// [`manual_stepper`](crate::core::klippy::extras::manual_stepper) installs
+/// there on its first `MOVE=`. The IDEX second carriage never does, which is a
+/// real gap of that module (not of `force_move`): the motor steps nowhere, for
+/// this command or any other. Reporting it as a command error would make this
+/// port's own defect punish legal upstream G-code, so the refusal is on the log
+/// and the command still answers.
+///
+/// Every call warns: the commands are rare, and a state that silently steps
+/// nothing is what made this look like "force_move produces no `queue_step` at
+/// all".
+fn warn_unwired_stepper(stepper_name: &str) {
+    warn!(
+        "Stepper {stepper_name} is not in the motion queue: no steps will be generated \
+         (force_move drives whichever stepper the queue holds; a [manual_stepper] joins it on \
+         its first MANUAL_STEPPER STEPPER=<short name> MOVE=…)"
+    );
+}
+
 /// Upstream `ForceMove.manual_move` (`force_move.py:75-91`): drive one motion
 /// stepper in its own coordinates, bypassing the planner and the kinematics.
 ///
@@ -2245,7 +2754,10 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
 /// so there is nothing to note. See [`force_move`](crate::core::klippy::extras::force_move).
 ///
 /// # Errors
-/// A step-generation/send failure.
+/// A step-generation/send failure. A stepper the toolhead's motion queue does
+/// not hold is not an error: the move travels the timeline and
+/// [`warn_unwired_stepper`] says that no steps will be generated (upstream's
+/// corpus requires `STEPPER_BUZZ` to succeed for such a name).
 async fn manual_move(
     connected: &mut Connected,
     stepper_name: &str,
@@ -2253,6 +2765,25 @@ async fn manual_move(
     speed: f64,
     accel: f64,
 ) -> Result<(), CommandError> {
+    let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
+    let move_time = accel_t + cruise_t + accel_t;
+    // The stepper to drive. A name the queue does not hold has no motor this
+    // port can generate for — the IDEX second carriage never joins it — so the
+    // move is carried on the timeline only, with a warning (see
+    // [`warn_unwired_stepper`] for why that is not a command error).
+    let index = connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .position(|stepper| stepper.name() == stepper_name);
+    let Some(index) = index else {
+        warn_unwired_stepper(stepper_name);
+        connected.toolhead.get_last_move_time();
+        connected.toolhead.dwell(move_time);
+        return Ok(());
+    };
+
     // Upstream's first `toolhead.flush_step_generation()`: drain what is
     // queued before the solver is swapped, so the two timelines do not
     // interleave.
@@ -2279,26 +2810,6 @@ async fn manual_move(
 
     // Swap in the cartesian single-axis solver and the force-move trapq,
     // keeping the old pair to restore afterwards.
-    //
-    // A stepper `force_move` knows but the toolhead's motion queue does not
-    // (the manual stepper and the IDEX second carriage build a `PrinterStepper`
-    // without being added to it — a documented gap of those modules) has no
-    // motor this port can drive. Upstream would move it; here the move is
-    // carried on the timeline only, so `STEPPER_BUZZ` / `FORCE_MOVE` on such a
-    // name still answer instead of erroring.
-    let index = connected
-        .toolhead
-        .motion_queuing_mut()
-        .steppers()
-        .iter()
-        .position(|stepper| stepper.name() == stepper_name);
-    let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
-    let move_time = accel_t + cruise_t + accel_t;
-    let Some(index) = index else {
-        connected.toolhead.get_last_move_time();
-        connected.toolhead.dwell(move_time);
-        return Ok(());
-    };
     let (prev_kinematics, prev_trapq) = {
         let stepper = &mut connected.toolhead.motion_queuing_mut().steppers_mut()[index];
         let solver = StepKinematics::new(
@@ -2387,11 +2898,23 @@ impl Connected {
         // Move whatever the planner has queued into the trapq first, so the
         // step generation time below covers it.
         self.toolhead.wait_moves();
-        let step_gen_time = self.horizon(self.toolhead.print_time());
         // The previous generation horizon is this batch's start: a lower
         // bound on when its first step runs, and what its messages carry as
         // `req_clock` (`StepBatchClocks`).
-        let start_time = self.last_step_gen_time;
+        //
+        // It is taken against the planner's own horizon, not this pass's copy:
+        // **every** generation raises that one (`ToolHead::flush_step_generation`
+        // maxes it), and a homing drip — or a probe's explicit
+        // `flush_step_generation` — generates at the motion level, without
+        // passing through here. A pass bounded below what those already put on
+        // the wire rewinds the solvers onto it, and the re-walk then queues
+        // steps that land before `last_step_clock` — what `check_line` reports
+        // as "Invalid sequence" and what shut the printer down after a failed
+        // `G28`.
+        let start_time = self
+            .last_step_gen_time
+            .max(self.toolhead.last_step_gen_time());
+        let step_gen_time = self.horizon(self.toolhead.print_time(), start_time);
         let batches = self.toolhead.flush_step_generation(step_gen_time)?;
         self.toolhead.finalize_moves(
             step_gen_time,
@@ -2413,7 +2936,8 @@ impl Connected {
     /// (`extras/motion_queuing.py:193-234`), with `need_step_gen_time` /
     /// `need_flush_time` read as the planner's own reach (`content_end`,
     /// `wait_moves` having just drained it) and `kin_flush_delay` — not
-    /// modelled in this host — left at zero.
+    /// modelled in this host — left at zero. `last` is the horizon the pass
+    /// starts from, which it never lowers.
     ///
     /// Bounded by the estimate: `est + 0.4 s` at rest, `est + 0.7 s` while
     /// queued motion lies beyond the horizon (batched in 0.25 s windows from
@@ -2425,8 +2949,7 @@ impl Connected {
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from a stepper's compressor.
-    fn horizon(&self, content_end: f64) -> f64 {
-        let last = self.last_step_gen_time;
+    fn horizon(&self, content_end: f64, last: f64) -> f64 {
         let est = self.toolhead.estimated_print_time();
         let want = if last < content_end {
             // Actively stepping — the aggressive branch with its 0.25 s
@@ -3024,6 +3547,170 @@ fn no_trigger_error(stepper_name: &str) -> CommandError {
     ))
 }
 
+/// Settle the motion state where a homing move stopped, on the **miss** path,
+/// before the "No trigger" error is raised.
+///
+/// Upstream does this whether or not the endstop fired: `homing_move` reads
+/// `move_end_print_time = toolhead.get_last_move_time()` (which floors
+/// `print_time` at the horizon the drip generated to), flushes step generation,
+/// and calls `set_position(haltpos)` — with `haltpos == movepos` once the drip
+/// has run its full travel (`homing.py:110-160`); only then does it raise the
+/// deferred error. The port used to return straight from the miss, leaving the
+/// planner at the drip's **start** with the dripped segment still queued in the
+/// trapq: the next flush pass then bounded its generation behind steps the drip
+/// had already put on the wire, and `stepcompress` refused the re-walk
+/// ("Invalid sequence" — see
+/// `test_set_kinematic_position_and_g1_after_a_missed_home_still_generate_in_order`).
+///
+/// The axes are **not** marked homed (`&[]`): a miss says nothing about where
+/// the carriage is, and this host reports that instead of pretending `G28`
+/// succeeded.
+fn settle_halt_position(connected: &mut Connected, haltpos: Coord) {
+    connected.toolhead.get_last_move_time();
+    connected.toolhead.set_position(haltpos, &[]);
+    connected.toolhead.wipe_trapq();
+}
+
+/// The print time an endstop's trigger is read back at.
+///
+/// Upstream asks the firmware for the trigger clock and, in file-output mode,
+/// answers the move's end instead because there is nothing to ask
+/// (`MCU_endstop.home_wait`, `klippy/mcu.py:396-400`). A file-output run here
+/// talks to a fake firmware that *does* answer, but with the move's first
+/// queued step — it models no hardware, which is what keeps a "triggered prior
+/// to movement" probe honest (`interface/devices/simulator.rs`) — so a
+/// position read back there would say "no travel yet" for every move.
+/// Upstream's file-output answer is the only one that means anything.
+fn trigger_instant(reported: f64, home_end_time: f64, printer: &Weak<Printer>) -> f64 {
+    match printer.upgrade() {
+        Some(printer) if printer.is_fileoutput() => home_end_time,
+        _ => reported,
+    }
+}
+
+/// Every motion stepper's firmware step position now
+/// (`MCU_stepper.get_mcu_position`: the step compressor's own counter, which
+/// keeps counting across a `set_position` jump — upstream's
+/// `_mcu_position_offset`).
+fn mcu_step_positions(connected: &mut Connected) -> HashMap<String, i64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers_mut()
+        .iter_mut()
+        .map(|stepper| {
+            let position = stepper.compressor_mut().last_position();
+            (stepper.name().to_string(), position)
+        })
+        .collect()
+}
+
+/// Every motion stepper's commanded position (mm), keyed by name
+/// (`MCU_stepper.get_commanded_position`).
+fn commanded_positions(connected: &mut Connected) -> HashMap<String, f64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .map(|stepper| (stepper.name().to_string(), stepper.commanded_position()))
+        .collect()
+}
+
+/// How far each stepper had travelled (mm) from `start_steps` at a past print
+/// time (`homing.py:36-40`'s `trig_pos - start_pos`, scaled by `step_dist`).
+fn travel_at(
+    connected: &mut Connected,
+    start_steps: &HashMap<String, i64>,
+    print_time: f64,
+) -> HashMap<String, f64> {
+    connected
+        .toolhead
+        .motion_queuing_mut()
+        .steppers()
+        .iter()
+        .map(|stepper| {
+            let start = start_steps.get(stepper.name()).copied().unwrap_or(0);
+            (
+                stepper.name().to_string(),
+                (stepper.past_mcu_position(print_time) - start) as f64 * stepper.step_dist(),
+            )
+        })
+        .collect()
+}
+
+/// How far (mm) each stepper ran **past** its trigger
+/// (`homing.py:141-142`'s `sp.halt_pos - sp.trig_pos`), in motor coordinates:
+/// negative when the move went in the negative direction, so adding it to the
+/// start position moves the axis further along the travel.
+///
+/// `halt_time` is where step generation stopped. A stepper whose halt is
+/// *behind* its trigger along the travel reports no overshoot: hardware cannot
+/// do that — the trigger stops the stepper — and a file-output run's fake
+/// firmware can (its trigger is the move's end while the host's drip stopped
+/// earlier).
+fn overshoot_after_trigger(
+    connected: &mut Connected,
+    start_steps: &HashMap<String, i64>,
+    trigger_time: f64,
+    halt_time: f64,
+) -> HashMap<String, f64> {
+    let trigger = travel_at(connected, start_steps, trigger_time);
+    travel_at(connected, start_steps, halt_time)
+        .into_iter()
+        .filter_map(|(name, travelled)| {
+            let over = travelled - trigger.get(&name).copied().unwrap_or(0.0);
+            (travelled.signum() * over > 0.0).then_some((name, over))
+        })
+        .collect()
+}
+
+/// The toolhead position a set of travelled distances implies
+/// (`HomingMove.calc_toolhead_pos`, `homing.py:63-71`).
+///
+/// `kin_spos` is where each stepper stood when the move began and `travel` how
+/// far each one went; an axis the kinematics cannot solve keeps the toolhead's
+/// current value and the extruder coordinate is untouched, as upstream's
+/// `None` fill and its `thpos[3:]` do.
+fn calc_toolhead_pos(
+    connected: &mut Connected,
+    kin_spos: &HashMap<String, f64>,
+    travel: &HashMap<String, f64>,
+) -> Coord {
+    let mut positions = kin_spos.clone();
+    for (name, distance) in travel {
+        *positions.entry(name.clone()).or_insert(0.0) += distance;
+    }
+    let solved = connected
+        .toolhead
+        .kinematics()
+        .map(|kinematics| kinematics.calc_position(&positions))
+        .unwrap_or([None; 3]);
+    let mut result = connected.toolhead.commanded_pos();
+    for (axis, value) in solved.iter().enumerate() {
+        if let Some(value) = value {
+            result.set_axis(axis, *value);
+        }
+    }
+    result
+}
+
+/// Place the toolhead where the steppers stopped: the position the driver just
+/// set, plus the distance each stepper ran past its trigger
+/// (`HomingMove.homing_move`'s non-probe branch, `homing.py:135-146`).
+///
+/// The caller has already set the position to the endstop coordinate, so the
+/// steppers' commanded positions are that position in their own coordinates —
+/// upstream's `halt_kin_spos`, read right after its `set_position(movepos)`.
+fn apply_home_overshoot(connected: &mut Connected, overshoot: &HashMap<String, f64>) {
+    if overshoot.is_empty() {
+        return;
+    }
+    let kin_spos = commanded_positions(connected);
+    let haltpos = calc_toolhead_pos(connected, &kin_spos, overshoot);
+    connected.toolhead.set_position(haltpos, &[]);
+}
+
 /// Home every rail in one multi-endstop move, as delta does
 /// (`Homing._do_home_rails` + `HomingMove.homing_move` with every endstop
 /// armed; upstream's retract + second pass is the gap
@@ -3060,6 +3747,9 @@ async fn home_unified(
     // homed (`Homing._set_start_position`), which is what lets the homing move
     // through its `check_move`.
     connected.toolhead.set_position(force, homing_axes);
+    // Where the steppers stand before the move: the trigger and stop
+    // positions are read as distances from it (`StepperPosition.start_pos`).
+    let start_steps = mcu_step_positions(connected);
 
     // The endstops all start sampling before the move and each is paced by
     // its own rail's travel (`HomingMove._calc_endstop_rate`).
@@ -3136,15 +3826,33 @@ async fn home_unified(
     // Prepare for a miss: upstream checks every rail's `home_wait` and raises
     // the first miss it finds, after the move-end event (`homing.py:109-119`).
     let mut missed: Option<CommandError> = None;
+    // What each rail's steppers ran past their own trigger, which moves the
+    // carriage past the endstop coordinate (`homing.py:135-146`).
+    let mut overshoot: HashMap<String, f64> = HashMap::new();
     for rail in rails {
         // A rail whose endstop never fired comes back as `0.0`
         // (`mcu/resource/endstop.rs`); `home_axis` below reads the same value.
-        let trigger_time = rail
+        let trigger_time = match rail
             .endstop()
             .expect("every rail's endstop was checked above")
             .home_wait(end)
             .await
-            .map_err(command_error)?;
+        {
+            Ok(trigger_time) => trigger_time,
+            Err(err) => {
+                // The wait itself failed: the rail's dispatch never reported a
+                // trigger and `HOME_WAIT_TIMEOUT` gave up on it (a comms timeout
+                // reaches the same place). `home_wait` already disarmed that
+                // endstop and stopped its trsync; a rail this host never gets to
+                // keeps its firmware deadline (`TRSYNC_SINGLE_MCU_TIMEOUT`),
+                // which stops its steppers without the host. What is left is to
+                // end the move and settle the planner where the drip ran to, as
+                // the missed path below does.
+                send(printer, &KlippyEvent::HomingHomingMoveEnd);
+                settle_halt_position(connected, target);
+                return Err(command_error(err));
+            }
+        };
         if trigger_time <= 0.0 {
             // Upstream keeps walking the rails after a miss, so its last note
             // is still recorded; this host errors right after the move-end
@@ -3153,26 +3861,38 @@ async fn home_unified(
             continue;
         }
         // Note each of the rail's steppers' trigger position
-        // (`StepperPosition.note_home_end`).
-        let steppers = connected.toolhead.motion_queuing_mut().steppers();
-        let mut state = homing.lock();
-        for (index, stepper) in rail.steppers().iter().enumerate() {
-            if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
-                state.set_trigger_position(
-                    stepper.name(),
-                    host.past_mcu_position(trigger_time) as f64,
-                );
-                state.set_primary(stepper.name(), index == 0);
+        // (`StepperPosition.note_home_end`), each at its own rail's trigger.
+        let instant = trigger_instant(trigger_time, end, printer);
+        {
+            let steppers = connected.toolhead.motion_queuing_mut().steppers();
+            let mut state = homing.lock();
+            for (index, stepper) in rail.steppers().iter().enumerate() {
+                if let Some(host) = steppers.iter().find(|host| host.name() == stepper.name()) {
+                    state.set_trigger_position(
+                        stepper.name(),
+                        host.past_mcu_position(instant) as f64,
+                    );
+                    state.set_primary(stepper.name(), index == 0);
+                }
+            }
+        }
+        for (name, distance) in
+            overshoot_after_trigger(connected, &start_steps, instant, flush_time)
+        {
+            if rail.steppers().iter().any(|stepper| stepper.name() == name) {
+                overshoot.insert(name, distance);
             }
         }
     }
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     if let Some(error) = missed {
+        settle_halt_position(connected, target);
         return Err(error);
     }
     // The carriage is now at its home position, with the kinematics' homed
-    // flags set.
+    // flags set — plus whatever the steppers ran past their triggers.
     connected.toolhead.set_position(target, homing_axes);
+    apply_home_overshoot(connected, &overshoot);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -3201,6 +3921,9 @@ async fn home_axis(
     let force = fill_coord(forcepos, current);
     let home = fill_coord(movepos, current);
     connected.toolhead.set_position(force, homing_axes);
+    // Where the steppers stand before the move: the trigger and stop positions
+    // are read as distances from it (`StepperPosition.start_pos`).
+    let start_steps = mcu_step_positions(connected);
 
     // Poll the endstop about once per step so a trigger is seen promptly.
     let move_t = move_distance(force, home) / info.speed;
@@ -3255,13 +3978,28 @@ async fn home_axis(
         }
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // The wait itself failed — the dispatch's trigger report never
+            // arrived and `HOME_WAIT_TIMEOUT` failed it as a communication
+            // timeout. `home_wait` already disarmed the endstop and stopped its
+            // trsync in the firmware; what is left is to end the move the way
+            // the miss below does (event, planner settled where the drip ran to)
+            // and raise the error, so `G28` fails instead of parking the script
+            // that started it.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            settle_halt_position(connected, home);
+            return Err(command_error(err));
+        }
+    };
     // A miss: upstream raises "No trigger on {name} after full movement" from
     // `homing_move` **after** the move-end event (`homing.py:119`). Without
     // this the axis would be marked homed at its endstop after driving the
     // whole 1.5× force distance.
     if trigger_time <= 0.0 {
         send(printer, &KlippyEvent::HomingHomingMoveEnd);
+        settle_halt_position(connected, home);
         let name = stepper_names
             .first()
             .expect("every rail has a primary stepper");
@@ -3269,6 +4007,7 @@ async fn home_axis(
     }
     // Note each stepper's trigger position (`StepperPosition.note_home_end`)
     // before `set_position` moves the solver to the endstop position.
+    let trigger_time = trigger_instant(trigger_time, end, printer);
     {
         let steppers = connected.toolhead.motion_queuing_mut().steppers();
         let mut state = homing.lock();
@@ -3279,9 +4018,14 @@ async fn home_axis(
             }
         }
     }
+    // Read before `set_position` moves the solver: this is what the steppers
+    // ran past the trigger, and the axis ends up that much past its endstop
+    // (`homing.py:135-146`).
+    let overshoot = overshoot_after_trigger(connected, &start_steps, trigger_time, flush_time);
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
     // The axis is now known at its endstop position.
     connected.toolhead.set_position(home, homing_axes);
+    apply_home_overshoot(connected, &overshoot);
     connected.toolhead.wipe_trapq();
     Ok(())
 }
@@ -3296,15 +4040,17 @@ async fn home_axis(
 /// Events follow upstream order: `homing_move_begin` **before** any
 /// sampling or movement, `homing_move_end` after.
 ///
-/// Returns the position the move stopped at: the move is always dripped to
-/// its end, and that end position is what it reports (and what the
-/// toolhead's commanded position is set to). This matches upstream's
-/// file-output mode, which completes the trigger only after the drip move
-/// ended (`mcu.py:TriggerDispatch.wait_end`) and takes `trigpos` at
-/// `home_end_time` (`homing.py`). This host's fake firmware fires the armed
-/// endstop at the move's first queued step, so ending the drip on that early
-/// clock would walk each repeated probe up by its retract distance and fail
-/// `samples_tolerance`.
+/// Returns the position the endstop **triggered** at — the carriage's own
+/// position, not the one the move was aimed at (`StepperPosition.note_home_end`
+/// together with `HomingMove.calc_toolhead_pos`, `homing.py:36-40,123-130`,
+/// where `trigpos` is the returned value) — while the toolhead is left where
+/// the steppers came to rest (`haltpos`). The move is always dripped to its
+/// end, so under a file-output run the trigger instant is that end: upstream's
+/// `home_wait` answers `home_end_time` there (`mcu.py:396-397`, see
+/// [`trigger_instant`]), which is also what keeps this host's fake firmware
+/// (it fires the armed endstop at the move's first queued step, so ending the
+/// drip on that early clock would walk each repeated probe up by its retract
+/// distance and fail `samples_tolerance`) from reporting the move's start.
 ///
 /// # Errors
 /// - `"No trigger on probe after full movement"` when the move completed
@@ -3369,6 +4115,12 @@ async fn probing_move(
     // Kept only for its side effect (arming the endstop); `home_wait` awaits
     // the same completion through the dispatch that owns it, and the drip
     // loop below deliberately does not poll it.
+    //
+    // The move's start, taken once the backlog is out: the trigger and stop
+    // positions below are read as distances from it (`HomingMove.homing_move`
+    // snapshots `kin_spos` here too, `homing.py:88-92`).
+    let kin_spos = commanded_positions(connected);
+    let start_steps = mcu_step_positions(connected);
     let _completion = endstop
         .home_start(
             print_time,
@@ -3420,7 +4172,16 @@ async fn probing_move(
         // run past 30 minutes).
     }
 
-    let trigger_time = endstop.home_wait(end).await.map_err(command_error)?;
+    let trigger_time = match endstop.home_wait(end).await {
+        Ok(trigger_time) => trigger_time,
+        Err(err) => {
+            // A failed wait (the dispatch's report never arrived) still ends the
+            // probe: pair the begin event and raise the error, as the miss below
+            // does.
+            send(printer, &KlippyEvent::HomingHomingMoveEnd);
+            return Err(command_error(err));
+        }
+    };
     send(printer, &KlippyEvent::HomingHomingMoveEnd);
 
     // No trigger: upstream raises "No trigger on {name} after full movement"
@@ -3429,45 +4190,30 @@ async fn probing_move(
         return Err(CommandError::new("No trigger on probe after full movement"));
     }
 
-    // Where the move stopped: the drip loop above just ran to
-    // `flush_time = end`, so the newest queued segment's position there is
-    // the move's end — the target. That is upstream's file-output `trigpos`
-    // (the stepper position at `home_end_time`); on real hardware upstream
-    // would read the firmware's trigger clock instead, which the corpus's
-    // fake MCUs cannot model (no step model: `stepper_get_position` answers
-    // zero). A following probe still has room to move down because every
-    // consumer lifts first — each sample retracts (`run_with`) and each
-    // point is preceded by a raise (`ProbePointsHelper`) — so the corpus
-    // never probes twice from the target into "Probe triggered prior to
-    // movement".
-    let stopped = {
-        let trapq = connected.toolhead.trapq();
-        let moves = trapq.moves();
-        // The newest segment that has started by `flush_time` is the one the
-        // carriage is in; a plain forward scan stops at the position marker
-        // `set_position` left behind, which sits at the origin.
-        let mut found = None;
-        for segment in moves.iter().rev() {
-            if segment.print_time <= flush_time {
-                let into = if flush_time <= segment.end_time() {
-                    flush_time - segment.print_time
-                } else {
-                    segment.move_t
-                };
-                found = Some(segment.coord(into));
-                break;
-            }
-        }
-        found
-    };
-    let mut result = connected.toolhead.commanded_pos();
-    if let Some(stopped) = stopped {
-        result.set_axis(0, stopped.x());
-        result.set_axis(1, stopped.y());
-        result.set_axis(Z_AXIS, stopped.z());
-        connected.toolhead.set_position(result, &[Z_AXIS]);
-    }
-    Ok(result)
+    // Where the endstop fired, and where the steppers stopped
+    // (`StepperPosition.note_home_end` + `HomingMove.calc_toolhead_pos`,
+    // `homing.py:36-40,123-134`): the probe **reports** the trigger position —
+    // a probe is asking where the bed is, which the endstop answered when it
+    // fired, not where the move was aimed — while the toolhead is left where
+    // the steppers came to rest, so the next probe starts from the same place
+    // every time.
+    let trigger_time = trigger_instant(trigger_time, end, printer);
+    let trigger_travel = travel_at(connected, &start_steps, trigger_time);
+    let trigpos = calc_toolhead_pos(connected, &kin_spos, &trigger_travel);
+    // The toolhead is left where the move ended — the position the drip
+    // generated to, not the step-quantized one the trigger position is read
+    // back from: this host's `set_position` does not re-anchor the step
+    // compressor the way upstream's `MCU_stepper.set_position` does with
+    // `_mcu_position_offset`, so a halt rounded back by a fraction of a step
+    // re-walks steps already sent (`stepcompress …: Invalid sequence`, seen in
+    // multi_z's third probe).
+    let haltpos = connected.toolhead.commanded_pos();
+    // A following probe still has room to move down because every consumer
+    // lifts first — each sample retracts (`run_with`) and each point is
+    // preceded by a raise (`ProbePointsHelper`) — so it never probes twice
+    // from the stop position into "Probe triggered prior to movement".
+    connected.toolhead.set_position(haltpos, &[Z_AXIS]);
+    Ok(trigpos)
 }
 
 fn command_error(err: McuError) -> CommandError {
@@ -3866,6 +4612,12 @@ pub(crate) fn load_config(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     let object = ToolHeadObject::new(config, printer)?;
+    // `motion_report` streams the toolhead's own queue under the name
+    // `toolhead` (`motion_report.py:169-172`). Upstream registers it in
+    // `klippy:connect`; the mux table here is filled from the load path, so the
+    // instance is registered by name and the trapq id resolved per batch.
+    crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+        .register_toolhead_trapq()?;
     // Upstream's `add_printer_objects` loads the default modules right after
     // the toolhead (`toolhead.py:610-613`), and `gcode_move` is the first of
     // them: it is what turns g-code coordinates into the toolhead's.
@@ -3885,6 +4637,7 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::mcu::McuError;
+    use tracing_subscriber::layer::SubscriberExt;
 
     #[test]
     fn test_axis_indices_reads_the_letters() {
@@ -4001,6 +4754,13 @@ mod tests {
         // The sibling is registered (so its connect runs) and its options were
         // read, which is what makes the factory-less section valid.
         assert!(printer.lookup_object("stepper_z1").is_some());
+        // `GET_POSITION` names the steppers in `kin.get_steppers()` order: each
+        // rail's motors in axis order, the sibling inside its rail
+        // (`kinematics/cartesian.py:46-47`).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_x", "stepper_y", "stepper_z", "stepper_z1"]
+        );
     }
 
     #[test]
@@ -4075,6 +4835,13 @@ mod tests {
         assert_eq!(object.max_angular_velocity, 5.0);
         // The Z rail is found by name, not by cartesian index.
         assert_eq!(object.z_stepper_names(), ["stepper_z"]);
+        // `kin.get_steppers()` puts the bare bed stepper **before** the rails
+        // (`kinematics/polar.py:33-34`), which is not the order connect adds
+        // them in (rails, then bed).
+        assert_eq!(
+            object.kinematics_stepper_names(),
+            ["stepper_bed", "stepper_arm", "stepper_z"]
+        );
     }
 
     #[test]
@@ -4300,6 +5067,14 @@ mod tests {
 
     /// A toolhead over one X stepper, homed, as if the machine were up.
     fn homed_toolhead() -> ToolHead {
+        homed_toolhead_with_range(
+            Coord::new(0.0, 0.0, 0.0, 0.0),
+            Coord::new(200.0, 200.0, 200.0, 0.0),
+        )
+    }
+
+    /// [`homed_toolhead`] over the given cartesian `axes_min` / `axes_max`.
+    fn homed_toolhead_with_range(axes_min: Coord, axes_max: Coord) -> ToolHead {
         use crate::core::klippy::motion::{Axis, CartesianKinematics, Stepper};
 
         let limits = MoveLimits {
@@ -4318,8 +5093,8 @@ mod tests {
         }
         toolhead.set_kinematics(Box::new(CartesianKinematics::new(
             ["stepper_x".into(), "stepper_y".into(), "stepper_z".into()],
-            Coord::new(0.0, 0.0, 0.0, 0.0),
-            Coord::new(200.0, 200.0, 200.0, 0.0),
+            axes_min,
+            axes_max,
             15.0,
             100.0,
             CartesianTransform::Standard,
@@ -4390,6 +5165,7 @@ mod tests {
             state,
             pending_lookahead_callbacks: Mutex::new(Vec::new()),
             pending_flush_callbacks: Mutex::new(Vec::new()),
+            pending_sync_print_time: Arc::new(Mutex::new(None)),
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         (printer, object)
@@ -4647,7 +5423,11 @@ mod tests {
         let (state, _gcode, printer) = connected_with_printer(toolhead);
         if debug_output {
             // The `-o` shape every corpus and harness run has.
-            let mut start_args = StartArgs::collect("m400.cfg", None);
+            let mut start_args = StartArgs::collect(
+                "m400.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
             start_args.debug_output = Some("_test_output".to_string());
             printer.set_start_args(Arc::new(start_args));
         }
@@ -4928,6 +5708,78 @@ mod tests {
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 
+    /// A home whose steppers ran past the trigger leaves the axis that far past
+    /// its endstop (`homing.py:135-146`): the carriage is placed where the
+    /// steppers stopped, not where the endstop is nominally.
+    ///
+    /// The endstop reports its trigger 1 s before the drip's end, and the 300 mm
+    /// force move at 5 mm/s was still walking 5 mm then. It runs in the negative
+    /// X direction, so the overshoot is a negative step count — the sign
+    /// upstream's `halt_pos - trig_pos` carries into `calc_toolhead_pos`. The
+    /// paused clock lets the whole move drip out in virtual time (as in the miss
+    /// test above).
+    #[tokio::test(start_paused = true)]
+    async fn test_home_axis_places_the_axis_past_its_endstop_by_the_overshoot() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        let endstop = TriggeringEndstop::new(true).triggered_before_the_end(1.0);
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await
+        .expect("the homing move completes");
+
+        // The endstop coordinate is 0.0 and the steppers were 5 mm past the
+        // trigger in the -X direction, give or take the step they are quantized
+        // to (1 mm here).
+        let x = connected.toolhead.commanded_pos().x();
+        assert!(
+            (x + 5.0).abs() <= 1.0,
+            "the axis is placed past its endstop by the overshoot, got {x}"
+        );
+        assert_eq!(
+            connected.toolhead.kinematics().unwrap().get_status()["homed_axes"],
+            "x",
+            "the axis is homed"
+        );
+        assert!(connected.toolhead.trapq().moves().is_empty());
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
     /// A rail endstop that never triggers is upstream's `No trigger on {name}
     /// after full movement` (`homing.py:119`): `home_axis` reports it **after**
     /// the move-end event instead of placing the axis at its endstop and
@@ -5011,6 +5863,323 @@ mod tests {
             !homing.lock().is_primary("stepper_x"),
             "a miss must not record an endstop trigger position"
         );
+        // Nor does the overshoot step run — there is no trigger to measure
+        // from — so the planner was settled at the homing target
+        // (`settle_halt_position`). The axes are left as `_set_start_position`
+        // marked them, from the force position.
+        assert_eq!(connected.toolhead.commanded_pos().x(), 0.0);
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// An endstop whose dispatch's trigger report never arrives: its completion
+    /// carries the dispatch's silence deadline and nothing ever completes it.
+    ///
+    /// This is the shipped failure (`bench-can-tmc2209.cfg`, 2026-02): every
+    /// `trsync_state` report went unhandled, so the completion never fired,
+    /// `home_wait` waited for ever, and `G28` — holding the g-code script that
+    /// started it — never returned. The whole client went unresponsive, `M112`
+    /// included.
+    struct LostReportEndstop {
+        completion: Arc<Completion>,
+    }
+
+    impl LostReportEndstop {
+        fn new() -> Self {
+            Self {
+                completion: Completion::new(),
+            }
+        }
+    }
+
+    impl HomingEndstop for LostReportEndstop {
+        fn home_start(
+            &self,
+            _print_time: f64,
+            _sample_time: f64,
+            _sample_count: u8,
+            _rest_time: f64,
+            _triggered: bool,
+        ) -> Result<Arc<Completion>, McuError> {
+            // What `TriggerDispatch::start` does for a real dispatch.
+            self.completion.arm_deadline();
+            Ok(Arc::clone(&self.completion))
+        }
+
+        fn home_wait(&self, _home_end_time: f64) -> EndstopFuture<'_> {
+            Box::pin(async move {
+                // `McuEndstop::home_wait`: the dispatch's silence deadline turns
+                // into upstream's communication-timeout error.
+                if self.completion.wait().await.is_failure() {
+                    return Err(McuError::Config(
+                        "Communication timeout during homing".to_string(),
+                    ));
+                }
+                Ok(0.0)
+            })
+        }
+    }
+
+    /// A lost trigger report must fail the homing move instead of parking it:
+    /// `home_axis` gives up after `HOME_WAIT_TIMEOUT`, ends the move, settles the
+    /// planner where the drip ran to, and the machine takes the next command.
+    ///
+    /// The drip loop stops as soon as the deadline fires, so the bound holds for
+    /// a move of any length — the shipped case was a homing move that never got
+    /// its report at all.
+    #[tokio::test(start_paused = true)]
+    async fn test_home_axis_fails_when_the_trigger_report_is_lost() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        let endstop = LostReportEndstop::new();
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let ended = Arc::clone(&ended);
+            printer.register_event_handler(
+                KlippyEvent::HomingHomingMoveEnd,
+                Box::new(move |_| ended.store(true, std::sync::atomic::Ordering::SeqCst)),
+            );
+        }
+        let printer = Arc::downgrade(&printer);
+
+        let homing = HomingHandle::new();
+        let started = tokio::time::Instant::now();
+        let error = home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await
+        .expect_err("a lost trigger report must fail the home, not park it");
+
+        // (a) Upstream's message for a dispatch whose answer never came
+        // (`klippy/mcu.py:393`), after the silence timeout — not later. The
+        // port's `command_error` puts the section context in front of every
+        // `McuError`, as it does for the other `home_wait` failures.
+        assert!(
+            error
+                .to_string()
+                .contains("Communication timeout during homing"),
+            "{error}"
+        );
+        assert!(
+            started.elapsed() >= crate::core::klippy::mcu::HOME_WAIT_TIMEOUT,
+            "the wait is bounded by the silence timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "homing_move_end must fire before the error (upstream's order)"
+        );
+        // The failure leaves the machine in the state a miss leaves it in: the
+        // dripped segment is not left queued for a later pass to re-walk.
+        assert!(
+            connected.toolhead.trapq().moves().is_empty(),
+            "the dripped segment must not stay queued for a later pass to re-walk"
+        );
+
+        // (b) The machine still takes commands: the recovery a session runs
+        // after a failed `G28` (`SET_KINEMATIC_POSITION` + a move) generates,
+        // which is what "the g-code lock was released" means at this seam.
+        connected.toolhead.get_last_move_time();
+        connected
+            .toolhead
+            .set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
+        connected
+            .toolhead
+            .move_to(Coord::new(10.0, 10.0, 0.0, 0.0), 100.0)
+            .expect("the move is inside the bed");
+        connected
+            .generate()
+            .expect("the flush pass runs after a timed-out home");
+        *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
+    }
+
+    /// A failed `G28` must leave the motion state consistent: the recovery a
+    /// debug session reaches for — `SET_KINEMATIC_POSITION` and then a `G1` —
+    /// has to generate in order afterwards, however often it is retried.
+    ///
+    /// Measured on the machine (`TODO.md`'s known defect): after `G28` failed
+    /// with `No trigger on x after full movement`, that pair raised
+    /// `Internal error in stepcompress: … Invalid sequence` and shut the
+    /// printer down.
+    ///
+    /// What it pins. A homing move **drips** its steps out: when it ends the
+    /// solvers have generated to the drip's end (`last_flush_time` is the move
+    /// end, the compressor's `last_step_clock` sits at the same clock) while
+    /// the planner's `print_time` is still the drip's *start*. The failed path
+    /// used to leave it there — the dripped segment still queued in the trapq,
+    /// the print time behind it — and the background flush pass, which picks its
+    /// horizon up from the last *planned* move, then bounded its generation
+    /// behind what the drip had already generated and rewound the solvers onto
+    /// it. `stepcompress`' `check_line` is what calls that out ("Invalid
+    /// sequence"): a queued step that lands before `last_step_clock` is the
+    /// signature, and the re-walk then injects exactly those.
+    #[tokio::test(start_paused = true)]
+    async fn test_set_kinematic_position_and_g1_after_a_missed_home_still_generate_in_order() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_position(Coord::default(), &[]);
+        if let Some(kinematics) = toolhead.kinematics_mut() {
+            kinematics.clear_homing_state(&[X_AXIS, Y_AXIS, Z_AXIS]);
+        }
+        let (state, _gcode) = connected(toolhead);
+        let mut connected = state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .unwrap();
+        // The failed home: an armed endstop that never triggers, so the drip
+        // runs the whole 1.5× force distance (300 mm at 5 mm/s) out over the
+        // paused clock.
+        let endstop = TriggeringEndstop::new(false);
+        use crate::core::klippy::extras::stepper::RailParams;
+        let params = RailParams {
+            position_min: 0.0,
+            position_max: 200.0,
+            position_endstop: 0.0,
+        };
+        let info = test_homing_info();
+        let (forcepos, movepos) =
+            home_move(X_AXIS, &info, params.position_min, params.position_max);
+        let printer = Arc::new(Printer::new(
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        let printer = Arc::downgrade(&printer);
+        let homing = HomingHandle::new();
+        let result = home_axis(
+            &mut connected,
+            X_AXIS,
+            forcepos,
+            movepos,
+            &[X_AXIS],
+            info,
+            1.0,
+            &["stepper_x".to_string()],
+            &endstop,
+            &homing,
+            &printer,
+        )
+        .await;
+        result.expect_err("the endstop never triggers, so the home fails");
+
+        // The horizon each stepper has generated to. A homing move is where
+        // this gets ahead of the planner, so no later pass may lower it — that
+        // lowering *is* the rewind `check_line` refuses.
+        let horizons = |connected: &mut Connected| {
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .steppers_mut()
+                .iter()
+                .map(|stepper| {
+                    (
+                        stepper.name().to_string(),
+                        stepper.kinematics().last_flush_time,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let drip_horizons = horizons(&mut connected);
+
+        // The failed home settles the halt position the way upstream does before
+        // it raises the deferred error (`settle_halt_position`): nothing of the
+        // drip stays queued, and the planner's time has caught up to what the
+        // solvers generated.
+        let x_horizon = drip_horizons
+            .iter()
+            .find(|(name, _)| name == "stepper_x")
+            .expect("stepper_x is registered")
+            .1;
+        assert!(
+            x_horizon > 0.0,
+            "the drip generated the homing move's steps"
+        );
+        assert!(
+            connected.toolhead.trapq().moves().is_empty(),
+            "the dripped segment must not stay queued for a later pass to re-walk"
+        );
+        assert!(
+            connected.toolhead.print_time() >= x_horizon,
+            "the planner's print time ({}) is still behind the horizon the drip \
+             generated to ({x_horizon})",
+            connected.toolhead.print_time()
+        );
+
+        // The recovery the machine was driven through, twice over: as many
+        // `SET_KINEMATIC_POSITION` + `G1` rounds as a session retries must all
+        // generate in order.
+        for round in 0..2 {
+            // `SET_KINEMATIC_POSITION X=0 Y=0 Z=0`: `force_move.py:118-119`
+            // reads `get_last_move_time()` first, then forces the position.
+            connected.toolhead.get_last_move_time();
+            connected
+                .toolhead
+                .set_position(Coord::default(), &[X_AXIS, Y_AXIS, Z_AXIS]);
+            // `G1 X10 Y10 F6000`.
+            connected
+                .toolhead
+                .move_to(Coord::new(10.0, 10.0, 0.0, 0.0), 100.0)
+                .expect("the move is inside the bed");
+            let gen_end = connected.toolhead.get_last_move_time();
+
+            // The background flush pass: the seam that shuts a real machine
+            // down (`run_flush_loop` → `Internal error in stepcompress`).
+            connected
+                .generate()
+                .unwrap_or_else(|err| panic!("round {round}: the flush pass failed: {err}"));
+            for (name, before) in &drip_horizons {
+                let after = horizons(&mut connected)
+                    .into_iter()
+                    .find(|(stepper, _)| stepper == name)
+                    .expect("every stepper is still registered")
+                    .1;
+                assert!(
+                    after >= *before,
+                    "round {round}: {name} was generated to {before} but the pass rewound \
+                     its horizon to {after}"
+                );
+            }
+
+            // …and the `G1` really steps: it is not silently dropped.
+            let batches = connected
+                .toolhead
+                .flush_step_generation(gen_end)
+                .unwrap_or_else(|err| panic!("round {round}: the move's steps failed: {err}"));
+            let x_steps = batches
+                .iter()
+                .find(|(name, _)| name == "stepper_x")
+                .map(|(_, commands)| commands.len())
+                .unwrap_or(0);
+            assert!(x_steps > 0, "round {round}: the G1 must produce X steps");
+        }
         *state.lock().unwrap_or_else(|p| p.into_inner()) = Some(connected);
     }
 
@@ -5163,6 +6332,10 @@ mod tests {
         completion: Arc<Completion>,
         /// If true, `home_wait` returns 0.0 (no trigger hit).
         no_trigger: std::sync::Mutex<bool>,
+        /// How long before the move's end the trigger fired: `0.0` reports the
+        /// end itself (upstream's file-output answer), a positive value a
+        /// trigger part way through the travel.
+        trigger_before_end: f64,
         /// Ordered list of operations for verifying begin fires before
         /// sampling/movement.
         ops: std::sync::Mutex<Vec<&'static str>>,
@@ -5173,8 +6346,16 @@ mod tests {
             Self {
                 completion: Completion::new(),
                 no_trigger: std::sync::Mutex::new(!triggered),
+                trigger_before_end: 0.0,
                 ops: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// Report the trigger `seconds` before the move's end — what hardware
+        /// does when the endstop fires part way through the travel.
+        fn triggered_before_the_end(mut self, seconds: f64) -> Self {
+            self.trigger_before_end = seconds;
+            self
         }
 
         fn record_home_start(&self) {
@@ -5231,7 +6412,7 @@ mod tests {
                         .complete(crate::core::klippy::cmd::trsync::TriggerReason::EndstopHit);
                 }
                 self.completion.wait().await;
-                Ok(home_end_time)
+                Ok(home_end_time - self.trigger_before_end)
             })
         }
     }
@@ -5251,6 +6432,144 @@ mod tests {
         // Advance print time so the first move has a non-zero delta.
         connected.toolhead.dwell(0.01);
         (connected, printer)
+    }
+
+    /// Mark `printer` as a file-output run (`-o`): the shape every corpus and
+    /// harness case has, and the one upstream's `home_wait` answers
+    /// `home_end_time` for (`klippy/mcu.py:396-397`).
+    fn set_file_output(printer: &Arc<Printer>) {
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "probe.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+    }
+
+    /// A probe reports where the carriage was when the endstop **fired**, not
+    /// where the move was aimed: `StepperPosition.note_home_end` reads each
+    /// stepper's past position at the trigger instant and
+    /// `HomingMove.calc_toolhead_pos` turns it into the `trigpos` that
+    /// `probing_move` returns (`homing.py:36-40,63-71,123-130`). The move is
+    /// 10 mm at 5 mm/s — 2 s — so a trigger 1 s before its end fires half way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_reports_the_trigger_position() {
+        let (mut connected, printer) = probing_connected();
+        let endstop = TriggeringEndstop::new(true).triggered_before_the_end(1.0);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let printer = Arc::downgrade(&printer);
+        endstop.fire();
+
+        let result = probing_move(&mut connected, &endstop, target, 5.0, &printer)
+            .await
+            .expect("the probing move completes");
+
+        // 5 mm, give or take the step the position is quantized to (1 mm
+        // here) and the 5 ms velocity ramps.
+        assert!(
+            (result.x() - 5.0).abs() <= 1.0,
+            "the trigger position is where the endstop fired, got {}",
+            result.x()
+        );
+        assert!(
+            result.x() < target.x(),
+            "it is not the position the move aimed at"
+        );
+        assert_eq!(
+            connected.toolhead.commanded_pos(),
+            target,
+            "the toolhead is left where the steppers stopped, not at the trigger"
+        );
+    }
+
+    /// A file-output run reports the move's end however early the endstop says
+    /// it fired: upstream's `home_wait` answers `home_end_time` there because
+    /// there is no firmware to ask (`mcu.py:396-397`), and the fake firmware a
+    /// file-output run does talk to reports the move's first queued step, from
+    /// which no position can be read back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_probing_move_reports_the_move_end_under_file_output() {
+        let (mut connected, printer) = probing_connected();
+        set_file_output(&printer);
+        let endstop = TriggeringEndstop::new(true).triggered_before_the_end(1.0);
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let printer = Arc::downgrade(&printer);
+        endstop.fire();
+
+        let result = probing_move(&mut connected, &endstop, target, 5.0, &printer)
+            .await
+            .expect("the probing move completes");
+
+        assert_eq!(
+            result, target,
+            "file output has no trigger clock to read a position back from"
+        );
+        assert_eq!(connected.toolhead.commanded_pos(), target);
+    }
+
+    /// Sampling the same descent three times reports the same trigger
+    /// position every time: the toolhead is left where the steppers stopped,
+    /// so nothing accumulates between the samples (`samples_tolerance` — the
+    /// corpus's only `samples: 3` case, `screws_tilt_adjust.cfg`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_repeated_probes_report_the_same_trigger_position() {
+        let (mut connected, printer) = probing_connected();
+        let target = Coord::new(10.0, 0.0, 0.0, 0.0);
+        let printer = Arc::downgrade(&printer);
+
+        let mut reported = Vec::new();
+        for _ in 0..3 {
+            let endstop = TriggeringEndstop::new(true).triggered_before_the_end(1.0);
+            endstop.fire();
+            reported.push(
+                probing_move(&mut connected, &endstop, target, 5.0, &printer)
+                    .await
+                    .expect("the probing move completes"),
+            );
+            // The consumer's lift between samples (`ProbeSessionHelper.run_with`
+            // retracts, and a probe point is preceded by a raise).
+            connected.toolhead.set_position(Coord::default(), &[]);
+        }
+
+        assert_eq!(
+            reported[1], reported[0],
+            "the second sample repeats the first"
+        );
+        assert_eq!(reported[2], reported[0], "and so does the third");
+    }
+
+    /// Homing leaves the carriage where the steppers stopped, not exactly at
+    /// the endstop: the distance a stepper ran past its trigger moves it that
+    /// much further (`HomingMove.homing_move`'s non-probe branch,
+    /// `homing.py:135-146`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_home_overshoot_places_the_carriage_past_the_endstop() {
+        let (mut connected, _printer) = probing_connected();
+        // Where `home_axis` / `home_unified` leave the axis before this step,
+        // and the axes they mark homed.
+        connected.toolhead.set_position(Coord::default(), &[X_AXIS]);
+
+        apply_home_overshoot(
+            &mut connected,
+            &HashMap::from([("stepper_x".to_string(), 2.0)]),
+        );
+
+        assert_eq!(
+            connected.toolhead.commanded_pos().x(),
+            2.0,
+            "two steps past the endstop is two mm at 1 mm/step"
+        );
+        assert_eq!(
+            connected.toolhead.kinematics().unwrap().get_status()["homed_axes"],
+            "xyz",
+            "the axes stay homed: this is where the carriage came to rest, not a new home"
+        );
+
+        // A home whose steppers all stopped on their trigger — every
+        // file-output one — leaves the endstop position alone.
+        apply_home_overshoot(&mut connected, &HashMap::new());
+        assert_eq!(connected.toolhead.commanded_pos().x(), 2.0);
     }
 
     /// `probing_move` reports the move's end, matching upstream's
@@ -5541,6 +6860,86 @@ mod tests {
         assert!(!steppers[0].history(10, 0, u64::MAX).is_empty());
     }
 
+    /// The print time a raise reports is **parked**, not sent: every
+    /// `calc_print_time` path runs under the toolhead's state lock, and the
+    /// event's handler reads the planner (`idle_timeout`), so sending there
+    /// would deadlock. `connect` installs this hook
+    /// ([`install_sync_print_time_hook`]) and the flush task sends the parked
+    /// payload once the lock is released ([`flush_sync_print_time`],
+    /// [`run_flush_loop`]).
+    #[test]
+    fn test_the_sync_print_time_is_parked_and_sent_with_the_lock_released() {
+        let reactor = Arc::new(crate::core::klippy::reactor::ManualReactor::new());
+        let pending = Arc::new(Mutex::new(None));
+        let (state, _gcode, printer) = connected_with_printer(homed_toolhead());
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        {
+            let sink = Arc::clone(&sent);
+            printer.register_event_handler(
+                KlippyEvent::ToolheadSyncPrintTime {
+                    curtime: 0.0,
+                    est_print_time: 0.0,
+                    print_time: 0.0,
+                },
+                Box::new(move |event| {
+                    if let KlippyEvent::ToolheadSyncPrintTime {
+                        curtime,
+                        est_print_time,
+                        print_time,
+                    } = event
+                    {
+                        sink.lock().unwrap_or_else(|p| p.into_inner()).push((
+                            *curtime,
+                            *est_print_time,
+                            *print_time,
+                        ));
+                    }
+                }),
+            );
+        }
+        // The clock the hook dates the event with (`toolhead.py:261`).
+        reactor.advance(2.0);
+
+        {
+            let mut guard = state.lock().unwrap_or_else(|p| p.into_inner());
+            let connected = guard.as_mut().expect("the machine is connected");
+            connected
+                .toolhead
+                .set_estimated_print_time_source(EstimatedPrintTime::new(|| 5.0));
+            install_sync_print_time_hook(
+                &mut connected.toolhead,
+                Arc::clone(&pending),
+                Arc::clone(&reactor) as Arc<dyn Reactor>,
+            );
+            // Priming raises the print time to the estimate plus the buffer,
+            // which is the raise that sends the event upstream.
+            let print_time = connected.toolhead.get_last_move_time();
+            assert!((print_time - 5.25).abs() < 1e-9, "{print_time}");
+
+            // The raise happened under this lock, and only parked the payload.
+            assert!(
+                sent.lock().unwrap_or_else(|p| p.into_inner()).is_empty(),
+                "the event must not be sent while the state lock is held"
+            );
+            assert_eq!(
+                *pending.lock().unwrap_or_else(|p| p.into_inner()),
+                Some((2.0, 5.0, 5.25))
+            );
+        }
+
+        // With the lock released, the flush task sends it: the payload is the
+        // one upstream sends, in its order (`toolhead.py:267-268`).
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(
+            *sent.lock().unwrap_or_else(|p| p.into_inner()),
+            [(2.0, 5.0, 5.25)]
+        );
+
+        // Nothing raised since: nothing left to send.
+        flush_sync_print_time(&pending, &Arc::downgrade(&printer));
+        assert_eq!(sent.lock().unwrap_or_else(|p| p.into_inner()).len(), 1);
+    }
+
     /// `z_stepper_names` reads the Z rail in config order — primary first,
     /// then `stepper_z1`, `stepper_z2` — which is the order `z_positions` and
     /// `adjustments` list the motors in.
@@ -5778,6 +7177,42 @@ mod tests {
         assert_eq!(status["minimum_cruise_ratio"].as_f64(), Some(0.0));
     }
 
+    /// `axis_minimum` / `axis_maximum` are the kinematics' configured range as
+    /// a four-axis coordinate, as upstream merges them in from
+    /// `kin.get_status()` (`toolhead.py:502`, `kinematics/cartesian.py:124-125`)
+    /// — the pair a host draws the bed and the soft limits from.
+    #[test]
+    fn test_get_status_reports_the_kinematics_axis_range() {
+        let (state, _gcode) = connected(homed_toolhead_with_range(
+            Coord::new(-5.0, -4.0, -2.0, 0.0),
+            Coord::new(250.0, 210.0, 220.0, 0.0),
+        ));
+        let (_printer, object) = object_over(state);
+        let status = object.get_status(0.0);
+        assert_eq!(status["axis_minimum"], json!([-5.0, -4.0, -2.0, 0.0]));
+        assert_eq!(status["axis_maximum"], json!([250.0, 210.0, 220.0, 0.0]));
+    }
+
+    /// `estimated_print_time` is the MCU's estimate *now*, read fresh from the
+    /// source `connect` installs (`toolhead.py:505-510`).
+    #[test]
+    fn test_get_status_reports_the_estimated_print_time() {
+        let mut toolhead = homed_toolhead();
+        toolhead.set_estimated_print_time_source(EstimatedPrintTime::new(|| 12.5));
+        let (state, _gcode) = connected(toolhead);
+        let (_printer, object) = object_over(state);
+        let status = object.get_status(0.0);
+        assert_eq!(status["estimated_print_time"].as_f64(), Some(12.5));
+    }
+
+    /// Nothing is reported before the machine is connected.
+    #[test]
+    fn test_get_status_is_empty_before_connect() {
+        let state = Arc::new(Mutex::new(None::<Connected>));
+        let (_printer, object) = object_over(state);
+        assert_eq!(object.get_status(0.0), json!({}));
+    }
+
     /// The planner profiles the *next* move from the new limits: a 100 mm move
     /// at 1000 mm/s is capped at 20 mm/s and accelerated at 100 mm/s², so it
     /// takes `d/v + v/a` = 5.2 s. This pins the two copies together — a
@@ -5910,7 +7345,11 @@ mod tests {
 
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("two-mcu.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "two-mcu.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 
@@ -6143,7 +7582,9 @@ mod tests {
         // (`toolhead.py:221-223`, `:426-427`). A real machine runs this way,
         // with a working clock.
         printer.set_start_args(Arc::new(crate::core::klippy::api::StartArgs::collect(
-            "m400.cfg", None,
+            "m400.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
         )));
 
         /// Read while the machine is up, asserted after it is down.
@@ -6351,27 +7792,88 @@ mod tests {
             .expect("the state was restored, so a third move still runs");
     }
 
-    /// A name the motion queue does not hold carries the move on the timeline
-    /// only, so `STEPPER_BUZZ` / `FORCE_MOVE` answer for a stepper those
-    /// modules have not wired (the manual stepper, the IDEX second carriage)
-    /// instead of erroring. The planner's position is still untouched.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_manual_move_carries_an_unwired_stepper_on_the_timeline_only() {
+    /// A name the motion queue does not hold travels the timeline without
+    /// stepping anything, and says so on the log — the state the operator sees
+    /// as "the command answered but the motor did not move". The warning is
+    /// captured here with a subscriber of this test's own; the command itself
+    /// must stay successful, because upstream's corpus requires `STEPPER_BUZZ`
+    /// to answer for such a carriage (`dual_carriage.test:49`).
+    #[tokio::test]
+    async fn test_manual_move_warns_and_carries_an_unwired_stepper_on_the_timeline_only() {
         let mut connected = force_move_connected();
-        let commanded = connected.toolhead.commanded_pos();
+        let print_time = connected.toolhead.print_time();
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
 
+        let _guard = tracing::subscriber::set_default(subscriber);
         manual_move(&mut connected, "not_on_the_queue", 10.0, 100.0, 0.0)
             .await
-            .expect("the move is accepted");
+            .expect("the move still answers");
 
-        assert_eq!(connected.toolhead.commanded_pos(), commanded);
-        // The move's 0.1 s still lands on the timeline, after the first move's
-        // 0.25 s prime (print time starts at the fixture's 0.01 s dwell).
+        let logged = capture.text();
+        assert!(
+            logged.contains("not_on_the_queue is not in the motion queue"),
+            "{logged}"
+        );
+        assert!(logged.contains("MANUAL_STEPPER"), "{logged}");
+        // The move's 0.1 s still lands on the timeline: that is what "carried
+        // on the timeline only" means, and what keeps the next command's print
+        // time coherent (0.25 s of it is the first move's prime).
         assert!(
             (connected.toolhead.print_time() - 0.35).abs() < 1e-9,
             "print time landed at {}",
             connected.toolhead.print_time()
         );
+        assert!(connected.toolhead.print_time() > print_time);
+        // And the state is whole: a stepper the queue does hold still moves.
+        manual_move(&mut connected, "stepper_x", 10.0, 100.0, 0.0)
+            .await
+            .expect("the wired stepper still moves");
+    }
+
+    /// A byte sink for the `fmt` layer above (the shape
+    /// `config/mcu.rs`'s tests use): `with_default` keeps the capture off the
+    /// process-wide subscriber.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -61,8 +61,8 @@ use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{Frame, FrameStream};
 use crate::core::klippy::interface::devices::serial::{
     admin_unit, encode_header, request_bootloader_unit, set_port_node_id, tunnel_block,
-    TunnelRegistry, TunnelSink, UnitStream, CMD_RESET_PORT, CMD_RESTART_DEVICE,
-    CMD_SET_PORT_TUNNEL,
+    TunnelRegistry, TunnelSink, UnitStream, CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT,
+    CMD_RESTART_DEVICE, CMD_SET_PORT_TUNNEL,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -100,14 +100,14 @@ pub(crate) const CAN_FD_FRAME_SIZE: usize = 72;
 /// unassigned MCU which node id to take, the broadcast that asks every board
 /// without one to answer, the answer itself, and the application id CanBoot
 /// reports in it.
-pub(crate) const ADMIN_ID: u32 = 0x3f0;
+const ADMIN_ID: u32 = 0x3f0;
 const CMD_SET_NODEID: u8 = 0x01;
 const CMD_QUERY_UNASSIGNED: u8 = 0x00;
 const RESP_NEED_NODEID: u8 = 0x20;
 const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
 
 /// How long a receive waits for a frame before rechecking the stop flag.
-pub(crate) const POLL_TIMEOUT: Duration = Duration::from_millis(100);
+const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
 // From `linux/can.h` and `linux/can/raw.h`; `libc` does not expose these.
 const CAN_SFF_MASK: u32 = 0x7ff;
@@ -161,7 +161,7 @@ impl CanWire {
 
     /// How many bytes this wire's kernel frame struct is: the size of one
     /// datagram, read or written.
-    pub(crate) fn frame_size(self) -> usize {
+    fn frame_size(self) -> usize {
         match self {
             Self::Classical => CAN_FRAME_SIZE,
             Self::Fd => CAN_FD_FRAME_SIZE,
@@ -169,7 +169,7 @@ impl CanWire {
     }
 
     /// The wire's name, as logs and errors spell it.
-    pub(crate) fn name(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::Classical => "classical CAN",
             Self::Fd => "CAN FD",
@@ -279,7 +279,7 @@ impl CanFrame {
 /// slices are together again; this is the other half of the story, and the two
 /// are logged separately because they are different things. A block small enough
 /// to fit one CAN frame still gets both lines.
-pub(crate) fn describe_can_frame(id: u32, data: &[u8]) -> String {
+fn describe_can_frame(id: u32, data: &[u8]) -> String {
     format!(
         "id {id:#x} data {}",
         crate::core::klippy::interface::hex_runs(data)
@@ -291,7 +291,7 @@ pub(crate) fn describe_can_frame(id: u32, data: &[u8]) -> String {
 ///
 /// The MCU answers on its new id only once it has seen this, which is why a config
 /// needs the UUID even when it states the node id.
-pub(crate) fn set_nodeid_payload(uuid: [u8; 6], nodeid: u32) -> [u8; CAN_DATA_BYTES] {
+fn set_nodeid_payload(uuid: [u8; 6], nodeid: u32) -> [u8; CAN_DATA_BYTES] {
     let mut data = [0u8; CAN_DATA_BYTES];
     data[0] = CMD_SET_NODEID;
     data[1..7].copy_from_slice(&uuid);
@@ -410,6 +410,27 @@ impl CanSerialLink {
 pub fn query_unassigned_frame() -> CanFrame {
     CanFrame::new(ADMIN_ID, &[CMD_QUERY_UNASSIGNED])
         .expect("the query is one byte, which fits in a CAN frame")
+}
+
+/// The admin frame that asks the board with `uuid` to leave its application and
+/// park in its bootloader.
+///
+/// The request byte, then the UUID most significant byte first — the seven data
+/// bytes `cansend can0 3f0#02<uuid>` writes, and the only shape the device side
+/// acts on (`can_process_request_bootloader` refuses a frame shorter than seven
+/// bytes and one whose bytes 1..7 are another board's UUID,
+/// `src/generic/canserial.c`). It is addressed to no node: the board still runs
+/// an application whose node id it is about to lose, so the bus broadcast is
+/// what reaches it — the same frame `scripts/flash_can.py`'s `_jump_to_bootloader`
+/// sends.
+///
+/// Nothing answers this: a board that took the request stops answering the id it
+/// had, which is what the caller is waiting for.
+pub fn request_bootloader_frame(uuid: [u8; 6]) -> CanFrame {
+    let mut data = [0u8; 7];
+    data[0] = CMD_REQUEST_BOOTLOADER;
+    data[1..].copy_from_slice(&uuid);
+    CanFrame::new(ADMIN_ID, &data).expect("the request is seven bytes, which fits in a CAN frame")
 }
 
 /// One board's answer to [`query_unassigned_frame`]: the UUID it is remembered
@@ -1261,7 +1282,7 @@ pub(crate) fn bind_interface(socket: &File, index: libc::c_uint) -> Result<(), I
 
 /// Ask the kernel for only the frames the MCU sends: the answer id, standard
 /// (11-bit) form.
-pub(crate) fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
+fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
     let filter = CanFilter {
         can_id: rx_id,
         // The mask has to include the flag bits, or standard frames never match.
@@ -1664,6 +1685,29 @@ mod tests {
         assert_eq!(abi[4], 1, "one data byte");
         assert_eq!(&abi[8..9], [0x00]);
         assert_eq!(&abi[9..], [0; CAN_DATA_BYTES - 1], "no padding is sent");
+    }
+
+    #[test]
+    fn test_the_request_bootloader_frame_is_the_admin_broadcast() {
+        // `scripts/flash_can.py::_jump_to_bootloader`: the admin id with the
+        // request byte and the board's UUID, most significant byte first — the
+        // bytes `cansend can0 3f0#02<uuid>` writes.
+        let uuid = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+        let frame = request_bootloader_frame(uuid);
+        assert_eq!(frame.id(), ADMIN_ID);
+        assert_eq!(frame.data(), [0x02, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc]);
+
+        // The literal the task's manual work used: `3f0#02` then the uuid.
+        let raw = frame.to_abi(CanWire::Classical).unwrap();
+        let abi = raw.as_bytes();
+        assert_eq!(u32::from_ne_bytes([abi[0], abi[1], abi[2], abi[3]]), 0x3f0);
+        assert_eq!(abi[4], 7, "seven data bytes, which is the device's minimum");
+        assert_eq!(
+            &abi[8..15],
+            [0x02, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            "the request byte, then the uuid"
+        );
+        assert_eq!(&abi[15..], [0; 1], "no padding is sent");
     }
 
     #[test]

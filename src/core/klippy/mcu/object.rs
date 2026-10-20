@@ -213,6 +213,13 @@ pub struct McuObject {
     /// ([`McuObject::connect_failure`]). `Arc` because the recording handlers are
     /// `'static`.
     connect_shutdown: Arc<Mutex<Option<String>>>,
+    /// Whether this MCU has already been reported as lost.
+    ///
+    /// Upstream's `_is_timeout` (`klippy/mcu.py:801`): one report per MCU. The
+    /// clock poll keeps running after the machine is shutdown, so without this
+    /// every later round would find the same unanswered queries and ask for the
+    /// same stop again.
+    clock_timed_out: AtomicBool,
     /// The latest scheduler load from the firmware's `stats` reports, for
     /// `get_status`'s `last_stats` (`klippy/mcu.py:974-975`).
     ///
@@ -288,6 +295,7 @@ impl McuObject {
             restart_method: Mutex::new(McuRestartMethod::Command),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             connect_shutdown: Arc::new(Mutex::new(None)),
+            clock_timed_out: AtomicBool::new(false),
             last_stats: Arc::new(Mutex::new(None)),
             secondary_sync: Mutex::new(None),
             bridge_ports: AtomicU16::new(0),
@@ -666,9 +674,11 @@ impl McuObject {
     /// MCU, none fed twice.
     ///
     /// A failed round trip is logged at debug level and the next interval runs
-    /// as usual: this timer feeds an estimate, it does not watch for a dead MCU.
-    /// Cancellation is the precedent's — [`McuObject::release_cycles`] on
-    /// teardown (`Drop`), so nothing polls after the machine comes down.
+    /// as usual — the failure itself is not the verdict on the link. What is
+    /// watched is the count of queries still waiting for an answer
+    /// ([`McuObject::check_clock_timeout`]). Cancellation is the precedent's —
+    /// [`McuObject::release_cycles`] on teardown (`Drop`), so nothing polls
+    /// after the machine comes down.
     ///
     /// One timer per object: [`McuObject::install_clock`] runs again when a
     /// reconnect replaces the session, and a second timer beside the first
@@ -716,8 +726,13 @@ impl McuObject {
     /// must not block the dispatcher. [`McuClock::get_clock`] folds the answer
     /// into its regression and, through it, into `Mcu::record_clock_sample`; a
     /// query that fails (a firmware without the message, a timeout) logs at
-    /// debug level, feeds nothing and changes nothing — the timer keeps its
-    /// schedule and the next round tries again.
+    /// debug level, feeds nothing — the timer keeps its schedule and the next
+    /// round tries again.
+    ///
+    /// What the failure does change is the estimator's outstanding-query count
+    /// (`ClockEstimator::is_active` is what reads it): that count is what
+    /// [`McuObject::check_clock_timeout`] judges the link by, and it is the
+    /// only state a dead board leaves behind.
     ///
     /// A **closed** session is not even asked: between a reconnect's
     /// [`Mcu::close`] and the new session's clock landing on the chip, the slot
@@ -734,8 +749,13 @@ impl McuObject {
             debug!("MCU '{name}': clock poll skipped: the session is closed");
             return;
         }
+        self.check_clock_timeout(&clock, &name);
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
+                // Outstanding until an answer folds in (`ClockEstimator::update`
+                // clears the count), which is exactly what a dead board never
+                // does.
+                clock.estimator().note_query_sent();
                 handle.spawn(async move {
                     if let Err(err) = clock.get_clock().await {
                         debug!("MCU '{name}': clock poll failed: {err}");
@@ -744,6 +764,41 @@ impl McuObject {
             }
             Err(_) => debug!("MCU '{name}': the clock poll needs an async runtime"),
         }
+    }
+
+    /// Report this MCU as lost once too many clock queries have gone
+    /// unanswered (`MCUConnHelper.check_timeout`, `klippy/mcu.py:895-905`).
+    ///
+    /// The judge is upstream's own: `ClockEstimator::is_active` tolerates up
+    /// to four outstanding queries and no more (`klippy/clocksync.py:156-157`),
+    /// so a board that stops answering is declared lost on the sixth round —
+    /// five unanswered intervals, at [`CLOCK_POLL_INTERVAL`]'s one second
+    /// each. The message is upstream's word for word, because clients and the
+    /// `error_mcu` hint table match on that text.
+    ///
+    /// A **file-output** run never gets here: it writes the protocol to a file
+    /// instead of a port (`Printer::is_fileoutput`), so nothing answers by
+    /// design and the count would be meaningless. Reported once
+    /// ([`McuObject::clock_timed_out`]) and not again: the timer keeps firing
+    /// after the machine is shutdown.
+    fn check_clock_timeout(&self, clock: &McuClock, name: &str) {
+        if clock.estimator().is_active() || self.clock_timed_out.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        if printer.is_fileoutput() {
+            debug!(
+                "MCU '{name}': no answer to the clock poll; not reported from a file-output run"
+            );
+            return;
+        }
+        self.clock_timed_out.store(true, Ordering::SeqCst);
+        report_shutdown(
+            &self.printer,
+            &format!("Lost communication with MCU '{name}'"),
+        );
     }
 
     /// Snapshot a connected MCU's identify status for `objects/query`.
@@ -791,10 +846,26 @@ impl McuObject {
     /// A `uart:`/`can:` transport's device sits behind a bridge port: it is
     /// reached on the bridge's own link and named by a port-level
     /// `SET_PORT_NODEID`, never by [`Transport::open`] (`mcu/bridge_attach.rs`).
-    /// Every other transport opens exactly as before. `config` must already
-    /// carry the id `connect` covered onto it — a bridge port is addressed by id
-    /// like every other MCU.
-    fn open_interface(&self, config: &McuConfig) -> Result<Interface, KlippyError> {
+    /// Every other transport opens as before. `config` must already carry the id
+    /// `connect` covered onto it — a bridge port is addressed by id like every
+    /// other MCU.
+    ///
+    /// `retrying` says whether this open belongs to a connect that may wait for
+    /// the port: an exclusive tty is then retried until it appears
+    /// ([`McuConfig::open_retrying`]) and the printer's exit request ends the
+    /// wait. The reopen after a `reset` passes `false` — its own loop already
+    /// retries, and nesting the two would multiply the two budgets.
+    ///
+    /// The wait runs on the blocking pool, not here: the retry sleeps between
+    /// attempts, and the machine runtime has two workers carrying the reactor
+    /// dispatcher and the send/receive tasks — a sleep of up to the retry budget
+    /// on one of them would stall everything the reactor owns for the whole
+    /// wait.
+    async fn open_interface(
+        &self,
+        config: &McuConfig,
+        retrying: bool,
+    ) -> Result<Interface, KlippyError> {
         if matches!(config.transport, Transport::BridgePort { .. }) {
             let printer = self.printer.upgrade().ok_or_else(|| {
                 KlippyError::Internal(format!(
@@ -811,7 +882,22 @@ impl McuObject {
             let link = bridge_attach::resolve(&printer, config)?;
             return bridge_attach::open(&printer, &link, id);
         }
-        config.open().map_err(KlippyError::Connection)
+        if !retrying {
+            return config.open().map_err(KlippyError::Connection);
+        }
+        let config = config.clone();
+        let printer = self.printer.upgrade();
+        tokio::task::spawn_blocking(move || {
+            let stop = move || {
+                printer
+                    .as_ref()
+                    .is_none_or(|printer| printer.exit_requested())
+            };
+            config.open_retrying(&stop)
+        })
+        .await
+        .map_err(|err| KlippyError::Internal(format!("the port retry task failed: {err}")))?
+        .map_err(KlippyError::Connection)
     }
 
     /// Open the port and identify the firmware, retrying while a rebooted board
@@ -819,14 +905,14 @@ impl McuObject {
     ///
     /// `reset` restarts the MCU, and a native-USB board disappears from the bus
     /// and re-enumerates, so the port may not be openable for a moment
-    /// (`mcu/restart.rs`). Only a bring-up that follows a reset uses this: a
-    /// plain start opens the port once and reports the error, so a missing
-    /// device is not hidden behind a retry.
+    /// (`mcu/restart.rs`). A bring-up that follows a reset retries the whole
+    /// open-and-handshake conversation here; the plain start retries only the
+    /// open (`McuConfig::open_retrying`), so a protocol error is never retried.
     async fn open_and_connect(&self, config: &McuConfig) -> Result<Arc<Mcu>, KlippyError> {
         let mut last = String::new();
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
-            let interface = match self.open_interface(config) {
+            let interface = match self.open_interface(config, false).await {
                 Ok(interface) => interface,
                 Err(err) => {
                     last = err.to_string();
@@ -1162,9 +1248,7 @@ impl McuObject {
             .iter()
             .map(|(_, path)| path.clone())
             .collect();
-        if !bridge_attach::wait_for_port_paths(&paths, bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
-            .await
-        {
+        if !bridge_attach::wait_for_port_paths(&paths, bridge_attach::PORT_RETURN_BUDGET).await {
             return err;
         }
         let Some(printer) = self.printer.upgrade() else {
@@ -1195,9 +1279,7 @@ impl McuObject {
         let Some(path) = bridge_attach::host_bridge_port_path(&printer, config) else {
             return err;
         };
-        if !bridge_attach::wait_for_port_paths(&[path], bridge_attach::BRIDGE_PORT_RETURN_TIMEOUT)
-            .await
-        {
+        if !bridge_attach::wait_for_port_paths(&[path], bridge_attach::PORT_RETURN_BUDGET).await {
             return err;
         }
         self.restart_for_bridge_port(&printer, config, err)
@@ -1605,8 +1687,12 @@ impl PrinterObject for McuObject {
             // rebooting — `command` sent the reset on the live connection
             // (`before_firmware_restart`), and the physical methods just switched
             // it — so the port is retried until it comes back. A plain start
-            // opens it once and reports the error, so a missing device is not
-            // hidden behind a retry.
+            // waits for the port the same way: a host that comes up before the
+            // kernel has re-enumerated the tty, or a board that was power-cycled
+            // under it, must not leave the printer in `error` after one failed
+            // open (`McuConfig::open_retrying`). Handshake and configuration
+            // stay single-shot in both cases, so a protocol error is reported as
+            // one.
             let mcu = if self.is_firmware_restart() {
                 match self.open_and_connect(&config).await {
                     Ok(mcu) => mcu,
@@ -1619,7 +1705,7 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = match self.open_interface(&config) {
+                let interface = match self.open_interface(&config, true).await {
                     Ok(interface) => interface,
                     Err(err) => return Err(self.recover_lost_child_port(&config, err).await),
                 };
@@ -1929,17 +2015,15 @@ pub fn load_config(
     // every explicit `canbus_nodeid` in the config, so the auto ids the later
     // sections receive step over them — an explicit claim is honoured wherever
     // it sits in the file. Every CAN family link brings its uuid and any
-    // explicit `canbus_nodeid`: the protocol (`cans`/`isotp`) and the wire
-    // (`canbus_fd`) shape **how** the blocks travel, not who is addressed, so
-    // an ISO-TP or CAN FD MCU takes the same allocation as a can-serial one;
-    // another transport takes the lowest free id from the same sequence, with
-    // no concrete allocation of its own yet.
+    // explicit `canbus_nodeid`: the wire (`canbus_fd`) shapes **how** the
+    // blocks travel, not who is addressed, so a CAN FD MCU takes the same
+    // allocation as a classical-wire one; another transport takes the lowest
+    // free id from the same sequence, with no concrete allocation of its own
+    // yet.
     let allocator = ids::ensure(printer)?;
     allocator.reserve_explicit(config);
     let id = match &parsed.transport {
-        Transport::Can { uuid, .. }
-        | Transport::CanFd { uuid, .. }
-        | Transport::Isotp { uuid, .. } => {
+        Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => {
             allocator.register_can(&parsed.name, *uuid, parsed.id)?
         }
         // A CAN port's member is addressed by its uuid exactly as a direct
@@ -2066,11 +2150,12 @@ mod tests {
     use crate::core::klippy::interface::devices::frame_mock::{
         FrameMock, FrameRecorder, MappingEntry,
     };
-    use crate::core::klippy::interface::devices::serial::DEFAULT_BAUD;
+    use crate::core::klippy::interface::devices::serial::{self, DEFAULT_BAUD};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::PrinterState;
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use tokio::time::Duration;
 
     fn section(sub: Option<&str>) -> ConfigSection {
@@ -2278,8 +2363,15 @@ mod tests {
         // MCU factory brings it in, and this test does too.
         crate::core::klippy::extras::error_mcu::ensure(&printer).unwrap();
         mcu.send("get_uptime", &[]).unwrap();
-        // Let the receive task decode and dispatch the shutdown frame.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait for the receive task to decode and dispatch the shutdown frame,
+        // on a bound rather than in a fixed window the scheduler can miss.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || printer.get_state_message().category == PrinterState::Shutdown,
+            "the firmware's shutdown reached the printer",
+        )
+        .await;
 
         let state = printer.get_state_message();
         assert_eq!(state.category, PrinterState::Shutdown);
@@ -2367,6 +2459,88 @@ mod tests {
 
         // The section's own parser names the port; the object does not have to.
         assert!(err.to_string().contains("/dev/not-a-serial-port"), "{err}");
+    }
+
+    /// A plain start waits for a port that is not there yet, and an exit request
+    /// ends that wait instead of leaving the process on the budget.
+    ///
+    /// Both halves are the fix: one failed open used to leave the printer in
+    /// `error` for a board that was still re-enumerating, and the wait must not
+    /// outlive a shutdown either.
+    #[tokio::test]
+    async fn test_a_missing_port_is_retried_and_an_exit_request_ends_the_wait() {
+        let start = std::time::Instant::now();
+        let waited = connect_to_a_missing_port(&printer()).await;
+        assert!(
+            waited.to_string().contains("/dev/not-a-serial-port"),
+            "{waited}"
+        );
+        assert!(waited.to_string().contains("gave up"), "{waited}");
+        assert!(
+            start.elapsed() >= serial::OPEN_RETRY_BUDGET,
+            "one attempt would have returned at once, took {:?}",
+            start.elapsed()
+        );
+
+        // Asked to leave before the open, the same connect ends with the retry's
+        // abort rather than sitting on the budget.
+        let printer = printer();
+        printer.request_exit("exit");
+        let start = std::time::Instant::now();
+        let aborted = connect_to_a_missing_port(&printer).await;
+        assert!(aborted.to_string().contains("aborted"), "{aborted}");
+        assert!(
+            start.elapsed() < serial::OPEN_RETRY_BUDGET,
+            "an exit request must not wait the budget, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The wait happens on the blocking pool, so a connect that is sitting on a
+    /// port that is not there yet does not stop the runtime it was called from.
+    ///
+    /// The machine runtime runs two workers (`klippy.rs`), one of which carries
+    /// the reactor dispatcher: a retry that slept on a worker would stall every
+    /// timer, every send/receive task and the API for the whole budget. A
+    /// current-thread runtime is the sharpest form of the test — nothing at all
+    /// runs on it while a task blocks it.
+    #[tokio::test]
+    async fn test_waiting_for_a_port_does_not_block_the_runtime() {
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+
+        let waited = connect_to_a_missing_port(&printer()).await;
+        ticker.abort();
+
+        assert!(waited.to_string().contains("gave up"), "{waited}");
+        // The budget is 300 ms in a test build: a runtime that kept running
+        // ticks ~15 times, one that was blocked ticks none.
+        let ticks = ticks.load(Ordering::SeqCst);
+        assert!(
+            ticks >= 5,
+            "the runtime was blocked for the wait ({ticks} ticks)"
+        );
+    }
+
+    /// Connect a `[mcu]` on a serial port no device is behind, and return the
+    /// error it reports.
+    async fn connect_to_a_missing_port(printer: &Arc<Printer>) -> KlippyError {
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            crate::core::klippy::config::ConfigValue::Single("/dev/not-a-serial-port".to_string()),
+        );
+        let object = McuObject::new(section, printer).unwrap();
+        object.set_id(4);
+        object.connect().await.unwrap_err()
     }
 
     /// The id gate itself: an object built outside the loader holds no id, and
@@ -2467,16 +2641,16 @@ mod tests {
             .id()
     }
 
-    /// A CAN FD and an ISO-TP MCU are addressed the way a can-serial one is:
-    /// the load registers them with their uuid (`register_can`), so their ids
-    /// come from the same sequence as a serial MCU's and interleave with it in
-    /// declaration order.
+    /// A CAN FD MCU is addressed the way a classical-wire one is: the load
+    /// registers it with its uuid (`register_can`), so its id comes from the
+    /// same sequence as a serial MCU's and interleaves with it in declaration
+    /// order.
     #[test]
     fn test_the_can_family_links_register_with_their_uuid() {
         let printer = load_printer(
             "[mcu]\nuuid: 11aa22bb33cc\ncanbus_fd: true\n\
              [mcu tool]\nserial: /dev/not-opened\n\
-             [mcu probe]\nuuid: 44dd55ee66ff\ncanbus_protocol: isotp\n",
+             [mcu probe]\nuuid: 44dd55ee66ff\ncanbus_fd: false\n",
         );
         // `NODEID_FIRST` (4) upward, one sequence for every transport.
         assert_eq!(id_of(&printer, "mcu"), Some(4));
@@ -2485,13 +2659,13 @@ mod tests {
     }
 
     /// The allocation is `register_can`'s, which is the one place a uuid is
-    /// remembered: a CAN FD and an ISO-TP section naming one identity are one
-    /// board claimed twice, exactly as two can-serial sections would be.
+    /// remembered: two CAN family sections naming one identity are one board
+    /// claimed twice, exactly as two classical-wire sections would be.
     #[test]
     fn test_a_uuid_is_claimed_once_across_the_can_family() {
         let (config, _) = Config::from_text(
             "[mcu a]\nuuid: 11aa22bb33cc\ncanbus_fd: true\n\
-             [mcu b]\nuuid: 11aa22bb33cc\ncanbus_protocol: isotp\n",
+             [mcu b]\nuuid: 11aa22bb33cc\ncanbus_fd: false\n",
         )
         .expect("the test config parses");
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
@@ -2752,6 +2926,19 @@ mod tests {
                 recorder,
             }
         }
+
+        /// Make this run a file-output one: the host's start arguments name a
+        /// `--debugoutput` file, which is what [`Printer::is_fileoutput`]
+        /// reads.
+        fn as_fileoutput(&self) {
+            let mut args = crate::core::klippy::api::StartArgs::collect(
+                "/tmp/printer.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            );
+            args.debug_output = Some("_test_output".to_string());
+            self.printer.set_start_args(Arc::new(args));
+        }
     }
 
     #[tokio::test]
@@ -2799,8 +2986,10 @@ mod tests {
         // A query that cannot go through (here `get_clock` is not even in the
         // firmware's dictionary, so it fails before anything is sent) must not
         // disturb anything: no sample, no panic, no state change — and the
-        // next interval runs as usual. Watching for a dead MCU is a different
-        // feature and deliberately not part of this timer.
+        // next interval runs as usual. A failed round is not yet a verdict on
+        // the link either: declaring it lost takes more unanswered queries
+        // than one round leaves outstanding
+        // (`McuObject::check_clock_timeout`).
         let rig = PollRig::new(json!({"config": {"CLOCK_FREQ": 20000000}}), vec![]);
         let seed = rig.object.clock().unwrap().estimator().last_clock();
         rig.object.register_clock_poll(rig.manual.as_ref());
@@ -2835,6 +3024,191 @@ mod tests {
             "the cancelled timer never fires"
         );
         assert!(rig.recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Liveness: a board that stops answering its clock queries
+    // -----------------------------------------------------------------------
+
+    /// `count` scripted `get_clock` blocks that reach the wire and are **never
+    /// answered** — a board that is still connected but no longer talking.
+    ///
+    /// The block sequence numbers are the ones the interface stamps on
+    /// consecutive sends, so a silent round cannot be mistaken for a mismatched
+    /// script entry. Two spare entries are appended: consuming the last entry
+    /// closes the mock's receive channel, which would end the session instead
+    /// of leaving it silent.
+    fn silent_clock_exchanges(count: usize) -> Vec<MappingEntry> {
+        (0..count + 2)
+            .map(|i| MappingEntry {
+                input: Frame::new((i & 0xf) as u8, vec![5]), // `get_clock`
+                outputs: vec![],
+            })
+            .collect()
+    }
+
+    /// `count` scripted `get_clock` exchanges that are all answered, in the
+    /// order the interface sends them.
+    fn answered_clock_exchanges(count: usize, clock: u32) -> Vec<MappingEntry> {
+        (0..count + 2)
+            .map(|i| {
+                let seq = (i & 0xf) as u8;
+                let mut response = Payload::new();
+                response.push_u8(18).unwrap(); // response id, `clock clock=%u`
+                response.push_u32(clock).unwrap();
+                MappingEntry {
+                    input: Frame::new(seq, vec![5]),
+                    outputs: vec![Frame::new(seq, response.into_raw())],
+                }
+            })
+            .collect()
+    }
+
+    /// Fire `rounds` clock-poll intervals. The rig's section names no `test:`,
+    /// so its interval is the production one second.
+    fn fire_clock_polls(rig: &PollRig, rounds: usize) {
+        for _ in 0..rounds {
+            assert_eq!(rig.manual.advance(1.0), 1, "one poll per interval");
+        }
+    }
+
+    /// Wait (bounded) for the outstanding clock query to be answered, so the
+    /// next round is judged on a clean count.
+    async fn wait_for_pending_clear(clock: &McuClock) {
+        for _ in 0..200 {
+            if clock.estimator().queries_pending() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!(
+            "the clock query was never answered ({})",
+            clock.estimator().queries_pending()
+        );
+    }
+
+    /// A board whose clock queries stop being answered is reported lost with
+    /// upstream's wording (`MCUConnHelper.check_timeout`, `klippy/mcu.py:895-905`).
+    #[tokio::test]
+    async fn test_an_mcu_that_stops_answering_the_clock_is_reported_lost() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            // The poll counts its own query as outstanding; only an answer
+            // clears the count (`ClockEstimator::update`).
+            fire_clock_polls(&rig, 1);
+            assert_eq!(clock.estimator().queries_pending(), 1);
+
+            // Up to four outstanding queries are still within upstream's
+            // `is_active` bound.
+            fire_clock_polls(&rig, 4);
+            assert_eq!(clock.estimator().queries_pending(), 5);
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown,
+                "four unanswered queries are still tolerated"
+            );
+
+            // The fifth unanswered round makes it a dead link, and the state
+            // message is upstream's word for word.
+            fire_clock_polls(&rig, 1);
+            let state = rig.printer.get_state_message();
+            assert_eq!(state.category, PrinterState::Shutdown);
+            assert_eq!(state.message, "Lost communication with MCU 'mcu'");
+        })
+        .await
+        .expect("the liveness check is bounded");
+    }
+
+    /// The normal path is untouched: answered queries never add up to a lost
+    /// link, however many intervals pass.
+    #[tokio::test]
+    async fn test_a_clock_that_keeps_answering_is_never_reported_lost() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let rig = PollRig::new(
+                polling_dictionary(),
+                answered_clock_exchanges(12, 21_000_500),
+            );
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            for _ in 0..12 {
+                fire_clock_polls(&rig, 1);
+                wait_for_pending_clear(&clock).await;
+            }
+
+            assert!(clock.estimator().is_active());
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown,
+                "an answering board is never declared lost"
+            );
+        })
+        .await
+        .expect("the answered path is bounded");
+    }
+
+    /// A file-output run never reports the MCU lost: the protocol is written to
+    /// a file instead of a port, so nothing answers by design and the count of
+    /// outstanding queries says nothing about a board (`MCU.is_fileoutput`,
+    /// the mode every corpus case runs in).
+    #[tokio::test]
+    async fn test_a_fileoutput_run_never_reports_the_mcu_lost() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            rig.as_fileoutput();
+            let clock = rig.object.clock().unwrap();
+            rig.object.register_clock_poll(rig.manual.as_ref());
+
+            // Far past the five unanswered rounds the real mode stops at.
+            fire_clock_polls(&rig, 8);
+
+            assert_eq!(clock.estimator().queries_pending(), 8);
+            assert_ne!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown
+            );
+        })
+        .await
+        .expect("the file-output path is bounded");
+    }
+
+    /// A lost MCU leaves the machine haltable and restartable: `M112` (which
+    /// does exactly the `invoke_shutdown` below) still lands, the first
+    /// message standing, and `RESTART`'s pair still brings the printer back to
+    /// `startup` so the config can be loaded again.
+    #[tokio::test]
+    async fn test_a_lost_mcu_leaves_m112_and_restart_usable() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let rig = PollRig::new(polling_dictionary(), silent_clock_exchanges(8));
+            rig.object.register_clock_poll(rig.manual.as_ref());
+            fire_clock_polls(&rig, 6);
+            assert_eq!(
+                rig.printer.get_state_message().category,
+                PrinterState::Shutdown
+            );
+
+            // `M112`'s handler body (`gcode.rs`, `register_command("M112", ..)`).
+            rig.printer.invoke_shutdown("Shutdown due to M112 command");
+            assert_eq!(
+                rig.printer.get_state_message().message,
+                "Lost communication with MCU 'mcu'",
+                "the first message stands"
+            );
+
+            // `RESTART`: the printer leaves its run loop and the next bring-up
+            // starts from `startup`.
+            rig.printer.request_exit("restart");
+            rig.printer.reset_for_restart("restart");
+            assert_eq!(
+                rig.printer.get_state_message().category,
+                PrinterState::Startup
+            );
+        })
+        .await
+        .expect("the halt and restart path is bounded");
     }
 
     // -----------------------------------------------------------------------
@@ -2952,7 +3326,15 @@ mod tests {
         // old transport stays silent.
         let before = object.clock().unwrap().estimator().last_clock();
         let _ = manual.advance(0.35); // `test:` cadence is 150 ms
-        tokio::time::sleep(Duration::from_millis(100)).await;
+                                      // Poll for the new session's sample instead of betting the round trip
+                                      // and the fold both land inside a fixed 100 ms window.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || object.clock().unwrap().estimator().last_clock() != before,
+            "a sample from the new session folded into the estimate",
+        )
+        .await;
         let after = object.clock().unwrap().estimator().last_clock();
         assert_ne!(
             before, after,

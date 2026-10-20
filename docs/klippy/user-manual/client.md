@@ -54,8 +54,63 @@ $ klipperx ~/printer.cfg -a tcp:127.0.0.1:7125            # TCP，供别的机�
 注意：上游 Moonraker 的 `[octoprint_compat]` 只是给**切片软件**上传 gcode 用的 OctoPrint API
 子集，**不是** OctoPrint 接入 Klipper 的途径 —— OctoPrint 只走上面那条 pty。
 
+### 接 Moonraker / Mainsail（推荐路径）
+
+上游 Moonraker 可以**直接**把本机当 klippy 用（L1 面：`0x03` 分隔 JSON over unix socket）；
+Mainsail/Fluidd 那层 HTTP/WebSocket（`server.*` / `machine.*` / `printer.objects.*`）全由
+Moonraker 自己提供，本仓不实现。2026-10-18 已对照 Moonraker 源码逐条核过握手链，无阻塞项。
+
+两条进程的命令行需对齐四个约定（否则能跑但某块 UI 会缺）。下面两种起法等价：
+
+**便捷起法（本仓自带，适合快速搭个环境）**：
+
+```console
+$ klipperx moonraker --dry-run      # 先看它会用哪份源码/venv 与最终命令行
+$ klipperx moonraker                # 首次：建 venv + pip install；之后只检查
+$ klipperx mainsail                 # 首次：npm ci && npm run build；之后只检查
+```
+
+- `klipperx moonraker`：venv 默认在 `~/.local/share/klipperx/moonraker-venv`（`--venv` 可改），依赖表哈希记在 `<venv>/klipperx-requirements.sha256`，**只有缺失或不一致才重装**；源码取 `--source` → `<data-path>/klipperx/moonraker`（首启从检出复制一次）→ `third_party/moonraker`；顺手建好 `data_path` 的目录并在缺 `moonraker.conf` 时生成一份能跑的最小配置。
+- `klipperx mainsail`：静态托管，默认 `--port 8080 --bind 0.0.0.0`；站点按 `--dir` → **编进二进制的那份**（发布包自带）→
+  `third_party/mainsail/dist`（开发检出里已构建的那份）取，**前端不在本机编译**，也不需要 node。
+  `/config.json` 在**请求时**给出（不再往站点里写文件）：
+  ① `--config-json <PATH>` 指定用哪份（启动时只查一次「是 JSON 对象且含 `instances` 数组」，通过后原样返回、不改写）；
+  ② 没给就用站点自带那份做底稿、把 `instances` 换成「**请求的 Host** 主机名 + `--moonraker-port`（默认 7125）」；
+  `--moonraker-host` 可固定主机名（Moonraker 绑在别处/走反代时用）。响应带 `Cache-Control: no-store`。
+- 这两条是**便利通道**，不是生产部署：生产环境仍建议用 Moonraker 官方 `install-moonraker.sh`（自带 systemd unit、升级/回滚），Mainsail 用它的发布包或容器。
+
+**手起（自己控每一步）**：
+
+```console
+# klipperx：socket 用 Moonraker 的默认值，日志与配置落在 Moonraker 的 data_path 下
+# 配置是**位置参数**（没有 -c）；-a 就是 Moonraker 的 klippy_uds_address
+$ klipperx klippy ~/printer_data/config/printer.cfg \
+      -a /tmp/klippy_uds --logfile ~/printer_data/logs/klippy.log
+```
+
+| 约定 | 为什么 |
+|------|--------|
+| `-a /tmp/klippy_uds` | Moonraker 的 `klippy_uds_address` 默认就是它（`klippy_connection.py:72-74`）；换路径要改 Moonraker 的 `moonraker.conf` |
+| `-c <data_path>/config/printer.cfg` | 配置不在 `config/` 下时 Moonraker 加一条 `klipper_config` 警告（`file_manager.py:212-231`） |
+| `--logfile <data_path>/logs/klippy.log` | **不给就 `info.log_file = null`**，`/server/files/klippy.log` 会 404，Mainsail 的日志页空着（日志同时不落盘） |
+| `[virtual_sdcard] path: <data_path>/gcodes` | 与 Moonraker 的 `gcodes` 根不一致只加一条 `gcode_path` 警告，不阻功能；但两边不一致时上传的文件本机看不到 |
+
+`info` 的 `python_path` 报的是**不存在**的路径，这是**故意的**、不要“修”：
+Moonraker 对这两个键无默认下标（`klippy_connection.py:352-354`），缺了会静默卡在 `startup` 且不重连；
+而报真的 venv 会让它的 Klipper 更新项直接报 `Invalid virtualenv` 起不来了（上游 `app_deploy.py:96-113`）。
+代价只是 Moonraker 的「更新」面板对 Klipper 一项退化为 no-op（已登记 `TODO.md` E2）。
+`klipper_path` 则是**真实存在的释放根**（2026-10-19 起）：构建期把上游 `config/`、本项目用户手册与上游文档
+（放 `docs/klipper/` 子路径）嵌进二进制，启动时按 `$RUNTIME_DIRECTORY` → `$XDG_RUNTIME_DIR/klipperx` →
+`/tmp/klipperx-<uid>` 三级链释放（**回落只因未配置；前两级配置了却不可写 ⇒ 启动报错退出**）；Moonraker 的
+「示例配置」与「文档」两个静态目录就注册自这个根。项目路径约定：需持久化的放 home、不需持久化的走这条释放链。
+
 本仓不实现行协议输入，连带没有：`ok` 应答行、`gcode:debuginput_exit` 事件、`stats`/`gcodein`
 计数。逐条登记见开发手册的[本项目与上游的偏移](../developer-manual/upstream-deviations.md)。
+
+**Mainsail 的客户端宏文件（`mainsail.cfg`）已入库作回归语料**（`src/core/klippy/extras/mainsail.cfg`，逐字副本）：
+`upstream::the_mainsail_client_macros_load_and_run` 逐宏起一台假固件机器跑 13 条脚本（`PAUSE`/`RESUME`/
+`CANCEL_PRINT`/`_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_*` 与两条暂停层钩子）。真机上把它 `[include]` 进
+`printer.cfg` 即可，与上游 Klipper 同一份文件、同一套行为。
 
 ### 顺便开个窗口
 
@@ -90,7 +145,7 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 - 没有终端（比如 systemd 里）时 `--tui` 只打印一行警告，主机照常无窗口运行。
 - 这个选项属于 `klipperx`，**独立二进制 `klippy` 没有它**：窗口是客户端，会带进
   一整套终端界面库，而只负责提供 API 的 `klippy` 用不到 —— 不装它的 `klippy`
-  因此小一号（release 16.1 MB，带窗口的 `klipperx` 是 18.3 MB，2026-10-03 实测）。要在独立主机上加
+  因此小一号（release 24.3 MB，带窗口的 `klipperx` 是 27.5 MB，2026-10-19 实测）。要在独立主机上加
   窗口，另开一个终端跑 `klippy-client console -a …` 即可。
 
 > **安全提醒**：API 没有任何认证，能连上的人就能操作打印机。TCP 监听只应开在
@@ -391,8 +446,8 @@ $ klippy-client console --plain -a /tmp/klippy_uds
 客户端会什么，取决于**主机实现了哪些端点**。完整清单与每个端点的参数、返回字段见
 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md)。
 
-> **当前状态**：端点是逐个落地的，下表里的操作**都已实现**；仍未实现的
-> （`bed_mesh/dump_mesh` 与尚未接入的 `*/dump_*`）调用时才会得到
+> **当前状态**：端点是逐个落地的，下表里的操作**都已实现**；只有未装载对应 extras 节时
+> （例如没有 `[bed_mesh]` 却调 `bed_mesh/dump_mesh`）才会得到
 > `webhooks: No registered callback for path '…'`——那不是客户端的问题。
 > 权威状态见 [第三方开发手册的 API 参考](../third-party-dev/api-reference.md) 开头的
 > 实现状态与主机侧 `api/endpoints/mod.rs` 的状态表。

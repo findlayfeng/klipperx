@@ -57,7 +57,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::force_move::ForceMove;
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
-use crate::core::klippy::extras::toolhead::HomingEndstop;
+use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{X_AXIS, Y_AXIS, Z_AXIS};
 use crate::core::klippy::mcu::McuStepper;
@@ -256,6 +256,14 @@ pub struct PrinterStepper {
     /// to the host solver at connect. `None` for every solver upstream runs
     /// without a `post_cb` (cartesian, corexy, extruder, polar's arm/z).
     hooks: Mutex<Option<SolverHooks>>,
+    /// The step pulse width in seconds, or `None` while nobody has decided
+    /// (upstream `MCU_stepper._step_pulse_duration`), paired with the
+    /// step-on-both-edges request a driver made (`_req_step_both_edge`).
+    ///
+    /// One slot for the two because they are written together
+    /// ([`PrinterStepper::setup_default_pulse_duration`]) and read together
+    /// ([`PrinterStepper::get_pulse_duration`]).
+    pulse_duration: Mutex<(Option<f64>, bool)>,
 }
 
 impl PrinterStepper {
@@ -343,6 +351,17 @@ impl PrinterStepper {
             None,
             None,
         )?;
+        // What the section wrote, `None` when it wrote nothing: upstream leaves
+        // `_step_pulse_duration` unset too, so a driver that knows the motor can
+        // install its own default later
+        // (`MCU_stepper.setup_default_pulse_duration`, `klippy/stepper.py:70-73`).
+        // The default above is still recorded for `settings` and still what
+        // `config_stepper` is built with (`_build_config`, `:79-80`).
+        let configured_step_pulse_duration = if config.has("step_pulse_duration") {
+            Some(step_pulse_duration)
+        } else {
+            None
+        };
 
         // `rotation_distance` is millimetres per full rotation; the divisor is
         // full steps times microsteps times any gearing
@@ -505,6 +524,12 @@ impl PrinterStepper {
         // `[force_move]` section (`ForceMove::ensure`).
         ForceMove::ensure(printer).register_stepper(&name, units_in_radians)?;
 
+        // Register with motion_report, upstream's third per-stepper helper
+        // module (`klippy/stepper.py:282-285`): every MCU stepper gets a
+        // `motion_report/dump_stepper` instance named after its section.
+        crate::core::klippy::extras::motion_report::MotionReport::ensure(printer)
+            .register_stepper(&name)?;
+
         Ok(Self {
             name,
             axis,
@@ -523,6 +548,7 @@ impl PrinterStepper {
             inner: Mutex::new(None),
             solver: Mutex::new(None),
             hooks: Mutex::new(None),
+            pulse_duration: Mutex::new((configured_step_pulse_duration, false)),
         })
     }
 
@@ -621,6 +647,34 @@ impl PrinterStepper {
         self.microsteps
     }
 
+    /// The step pulse width and whether the step is driven on both edges
+    /// (upstream `MCU_stepper.get_pulse_duration`, `klippy/stepper.py:68-69`).
+    ///
+    /// The width falls back to the 2 µs `config_stepper` would use when nobody
+    /// has decided (`MCU_stepper._build_config`, `:79-80`). The second item is
+    /// always `false`: this port's firmware config side drives the step on one
+    /// edge only, so the both-edge request
+    /// [`PrinterStepper::setup_default_pulse_duration`] records is not applied.
+    pub fn get_pulse_duration(&self) -> (f64, bool) {
+        let (duration, _requested_both_edge) = *self.pulse_duration_guard();
+        (duration.unwrap_or(DEFAULT_STEP_PULSE_DURATION), false)
+    }
+
+    /// Install a default pulse width and record the step-on-both-edges request
+    /// (upstream `MCU_stepper.setup_default_pulse_duration`,
+    /// `klippy/stepper.py:70-73`): the width wins **only** when the section
+    /// wrote no `step_pulse_duration`, so a config option always has
+    /// precedence. The request is stored and not applied — the firmware config
+    /// side has no both-edge step mode (see
+    /// [`PrinterStepper::get_pulse_duration`]).
+    pub fn setup_default_pulse_duration(&self, pulse_duration: f64, step_both_edge: bool) {
+        let mut pulse = self.pulse_duration_guard();
+        if pulse.0.is_none() {
+            pulse.0 = Some(pulse_duration);
+        }
+        pulse.1 = step_both_edge;
+    }
+
     /// Whether the step distance is in radians, not millimetres (upstream's
     /// `MCU_stepper.units_in_radians`, `klippy/stepper.py:65-67`): the polar
     /// bed answers true. `force_move`'s buzz reads it to pick a distance in
@@ -647,6 +701,29 @@ impl PrinterStepper {
     /// The firmware stepper resource.
     pub fn mcu_stepper(&self) -> &Arc<McuStepper> {
         &self.mcu_stepper
+    }
+
+    /// The firmware step counter the host solver's position corresponds to
+    /// (upstream `MCU_stepper.get_mcu_position`, `klippy/stepper.py:167-174`).
+    ///
+    /// The runtime stepper belongs to the toolhead once the machine is up
+    /// ([`PrinterStepper::take_stepper`] hands it over), so the count is read
+    /// through the toolhead by section name. `None` before connect, or when the
+    /// toolhead does not know this stepper.
+    pub fn get_mcu_position(&self, toolhead: &ToolHeadObject) -> Option<i64> {
+        toolhead.stepper_mcu_position(&self.name)
+    }
+
+    /// The host position a firmware step count corresponds to (upstream
+    /// `MCU_stepper.mcu_to_commanded_position`, `klippy/stepper.py:183-184`).
+    ///
+    /// Upstream subtracts `_mcu_position_offset`, the difference between the
+    /// firmware's counter and the host solver recorded when the counter was
+    /// read; this port aligns the solver to the counter instead
+    /// (`commanded_pos = steps * step_dist` in [`PrinterStepper::connect`]), so
+    /// the offset is always 0 and the distance alone converts.
+    pub fn mcu_to_commanded_position(&self, mcu_pos: i64) -> f64 {
+        mcu_pos as f64 * self.step_dist
     }
 
     /// Take the host-side stepper the toolhead will drive.
@@ -678,6 +755,12 @@ impl PrinterStepper {
 
     fn lock(&self) -> MutexGuard<'_, Option<Stepper>> {
         self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn pulse_duration_guard(&self) -> MutexGuard<'_, (Option<f64>, bool)> {
+        self.pulse_duration
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
@@ -794,8 +877,10 @@ impl std::fmt::Debug for PrinterStepper {
 ///
 /// The range and homing info come from the **primary** stepper, as upstream's
 /// `get_range`/`get_homing_info` read the rail's own (`[stepper_z]`) values.
-/// Homing all steppers of a multi-stepper rail from one endstop is the
-/// `endstop_phase`/trsync refinement (H9); this group only drives them.
+/// Every stepper of the rail is registered with the rail's endstop dispatch, as
+/// upstream's `add_stepper_from_config` does (`stepper.py:434-445`), so the
+/// firmware stops the whole rail on a trigger; the `endstop_phase` refinement
+/// for such a rail is H9.
 pub struct Rail {
     /// The base section name (`stepper_z`).
     name: String,
@@ -828,12 +913,42 @@ impl Rail {
                 ))
             })?;
         let mut steppers = vec![primary];
+        // The endstop the whole rail homes to. Upstream's `LookupMultiRail`
+        // registers **every** stepper of the rail with it — the primary through
+        // `LookupRail`, each sibling through `add_stepper_from_config`
+        // (`klippy/stepper.py:434-445`) — so one trigger stops all the motors.
+        // Without that, a Trident gantry (`stepper_z` + `z1` + `z2` on one
+        // rail) only stops `stepper_z` in firmware while `z1`/`z2` walk the rest
+        // of the queued move, and `set_position(home)` then records all three at
+        // the endstop: a skewed gantry that nothing accounts for.
+        let rail_endstop = steppers[0].endstop().cloned();
         for index in 1..99 {
             let identifier = format!("{base_id}{index}");
             let Some(sibling) = config.sibling(&identifier) else {
                 break;
             };
             let stepper = Arc::new(PrinterStepper::new(&sibling, printer, axis, false)?);
+            // A sibling that names its own `endstop_pin` was registered with
+            // that endstop by `PrinterStepper::new` — upstream's
+            // `add_stepper(stepper, config.get('endstop_pin', None))` likewise
+            // resolves such a stepper to its own endstop, not the rail's.
+            if stepper.endstop().is_none() {
+                if let Some(endstop) = &rail_endstop {
+                    let dispatch = endstop.dispatch().ok_or_else(|| {
+                        ConfigError::new(format!(
+                            "{identifier}: the rail's endstop must drive a trigger dispatch"
+                        ))
+                    })?;
+                    let mcu_stepper = stepper.mcu_stepper();
+                    dispatch
+                        .add_stepper(
+                            mcu_stepper.chip().clone(),
+                            Arc::downgrade(mcu_stepper),
+                            stepper.name(),
+                        )
+                        .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+                }
+            }
             printer.add_object(&identifier, stepper.clone())?;
             steppers.push(stepper);
         }
@@ -1172,6 +1287,106 @@ mod tests {
         assert!(stepper.endstop().is_none());
     }
 
+    /// A driver installs its own pulse width when the section wrote none, and a
+    /// section's option always wins over it (upstream
+    /// `MCU_stepper.setup_default_pulse_duration`, `klippy/stepper.py:70-73`).
+    #[test]
+    fn test_a_driver_default_fills_an_unset_pulse_duration() {
+        let (printer, result) = load(&config_with_x(""));
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .expect("the section registered a stepper object");
+        // TMC's recommended width, and the both-edge request it makes: the
+        // request is recorded rather than applied, so the second item stays
+        // `false`.
+        stepper.setup_default_pulse_duration(1e-7, true);
+        assert_eq!(stepper.get_pulse_duration(), (1e-7, false));
+        // A second driver's default does not move a decided width.
+        stepper.setup_default_pulse_duration(4e-7, false);
+        assert_eq!(stepper.get_pulse_duration(), (1e-7, false));
+    }
+
+    /// A `step_pulse_duration` option outranks any driver default.
+    #[test]
+    fn test_a_configured_pulse_duration_is_not_replaced_by_a_driver_default() {
+        let (printer, result) = load(&config_with_x("step_pulse_duration: 5e-7\n"));
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .expect("the section registered a stepper object");
+        assert_eq!(stepper.get_pulse_duration(), (5e-7, false));
+        stepper.setup_default_pulse_duration(1e-7, true);
+        assert_eq!(stepper.get_pulse_duration(), (5e-7, false));
+    }
+
+    /// With neither an option nor a driver default the width is the 2 µs the
+    /// firmware step is configured with (`klippy/stepper.py:79-80`).
+    #[test]
+    fn test_an_unset_pulse_duration_is_two_microseconds() {
+        let (printer, result) = load(&config_with_x(""));
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .expect("the section registered a stepper object");
+        assert_eq!(
+            stepper.get_pulse_duration(),
+            (DEFAULT_STEP_PULSE_DURATION, false)
+        );
+        assert_eq!(DEFAULT_STEP_PULSE_DURATION, 0.000_002);
+    }
+
+    /// The firmware counter and the host position convert into each other with
+    /// the step distance as the only factor: this port has no mcu position
+    /// offset (upstream `_mcu_position_offset`, `klippy/stepper.py:183-184`).
+    #[test]
+    fn test_a_firmware_counter_and_a_host_position_are_inverses() {
+        let (printer, result) = load(&config_with_x(""));
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .expect("the section registered a stepper object");
+        for mcu_pos in [-12_345i64, -3, -1, 0, 1, 7, 12_345] {
+            let position = stepper.mcu_to_commanded_position(mcu_pos);
+            // The counter a host position rounds to is the toolhead's
+            // `Stepper::mcu_position`: `(commanded_pos / step_dist).round()`.
+            assert_eq!(
+                (position / stepper.step_dist()).round() as i64,
+                mcu_pos,
+                "counter {mcu_pos} maps back to itself"
+            );
+        }
+    }
+
+    /// The position queries go through the toolhead, which took this stepper's
+    /// runtime half at connect: before connect there is no counter to read.
+    #[test]
+    fn test_a_mcu_position_is_read_through_the_toolhead() {
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PB0\ndir_pin: PB1\nrotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PC0\ndir_pin: PC1\nrotation_distance: 8\nmicrosteps: 16\nposition_max: 200\n",
+        );
+
+        result.unwrap();
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>("stepper_x")
+            .expect("the section registered a stepper object");
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the printer section registered a toolhead object");
+        // Nothing has driven the stepper: the toolhead holds no motion state.
+        assert_eq!(stepper.get_mcu_position(&toolhead), None);
+        assert_eq!(toolhead.stepper_mcu_position("stepper_x"), None);
+        assert_eq!(toolhead.stepper_commanded_position("stepper_x"), None);
+    }
+
     #[test]
     fn test_an_endstop_pin_builds_the_rail_endstop_and_homing_info() {
         let (printer, result) = load(&config_with_x("endstop_pin: PA2\n"));
@@ -1443,5 +1658,93 @@ mod tests {
         let (_, result) = load(&text);
         let err = result.unwrap_err().to_string();
         assert!(err.contains("position_endstop"), "{err}");
+    }
+
+    // -----------------------------------------------------------------------
+    // One endstop stops every motor of its rail (`stepper.py:434-445`)
+    // -----------------------------------------------------------------------
+
+    /// A Trident-shaped Z rail: `[stepper_z]` carries the rail's endstop,
+    /// `[stepper_z1]`/`[stepper_z2]` are bare siblings on the same axis.
+    fn three_motor_z(endstop_pin: &str) -> String {
+        format!(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             position_endstop: 0\nposition_max: 200\nendstop_pin: {endstop_pin}\n\
+             [stepper_z1]\nstep_pin: PA6\ndir_pin: PA7\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [stepper_z2]\nstep_pin: PC0\ndir_pin: PC1\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n"
+        )
+    }
+
+    /// The stepper names the endstop of `name` stops on a trigger.
+    fn dispatched(printer: &Arc<Printer>, name: &str) -> Vec<String> {
+        let stepper = printer
+            .lookup_object_as::<PrinterStepper>(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        let endstop = stepper
+            .endstop()
+            .cloned()
+            .unwrap_or_else(|| panic!("{name} named an endstop_pin"));
+        endstop
+            .dispatch()
+            .unwrap_or_else(|| panic!("{name}'s endstop drives a trigger dispatch"))
+            .stepper_names()
+    }
+
+    /// Every motor of a rail is registered with the rail's endstop, so the
+    /// firmware stops all three on a Trident gantry instead of stopping
+    /// `stepper_z` while `z1`/`z2` walk the rest of the queued move (which
+    /// leaves the gantry skewed while `set_position` records all three at the
+    /// endstop).
+    #[test]
+    fn test_a_rails_endstop_dispatches_for_every_motor_on_the_rail() {
+        let (printer, result) = load(&three_motor_z("^PA8"));
+        result.unwrap();
+
+        assert_eq!(
+            dispatched(&printer, "stepper_z"),
+            ["stepper_z", "stepper_z1", "stepper_z2"]
+        );
+    }
+
+    /// A rail with no siblings is unchanged: its endstop stops its one motor.
+    #[test]
+    fn test_a_single_motor_rail_dispatches_only_its_own_stepper() {
+        let (printer, result) = load(&config_with_x("endstop_pin: ^PA2\n"));
+        result.unwrap();
+
+        assert_eq!(dispatched(&printer, "stepper_x"), ["stepper_x"]);
+    }
+
+    /// A rail spanning two MCUs is still refused: one firmware trigger can only
+    /// stop the motors on its own MCU (`TriggerDispatch.add_stepper`,
+    /// `klippy/mcu.py:300-308`).
+    #[test]
+    fn test_a_rail_still_refuses_a_shared_axis_across_mcus() {
+        let (_, result) = load(
+            "[mcu]\nserial: /dev/a\n\
+             [mcu zboard]\nserial: /dev/b\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PA1\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_y]\nstep_pin: PA2\ndir_pin: PA3\n\
+             rotation_distance: 40\nmicrosteps: 16\nposition_max: 200\n\
+             [stepper_z]\nstep_pin: PA4\ndir_pin: PA5\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             position_endstop: 0\nposition_max: 200\nendstop_pin: ^PA8\n\
+             [stepper_z1]\nstep_pin: zboard:PA6\ndir_pin: zboard:PA7\n\
+             rotation_distance: 8\nmicrosteps: 16\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Multi-mcu homing not supported"), "{err}");
     }
 }

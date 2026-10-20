@@ -183,7 +183,6 @@ send/recv 两个后台任务——**双路 ramp 的余量未实测**，出现调
 canbus_interface: can0
 uuid: 12f912ed3873
 canbus_nodeid: 4        # stress 需要它；正式 printer.cfg 里可以省，由 [mcu_ids] 分配
-canbus_protocol: cans   # 下游跑 ISO-TP 应用时改 isotp
 ```
 
 节点固件要和载具配套：直连 CAN 的节点是**裸 canserial**（不要 `MUX_CAN`），而挂在 klipperx 桥 CAN

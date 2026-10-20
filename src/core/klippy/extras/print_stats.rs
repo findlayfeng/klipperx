@@ -16,15 +16,16 @@
 //! [`PrintStats::ensure`] is the lazy-creation entry point a caller like
 //! `virtual_sdcard` uses.
 //!
-//! # What is not here
+//! # Event handlers
 //!
-//! - **`_handle_activate_extruder` is not wired.** Upstream registers a handler
-//!   for `extruder:activate_extruder` that re-anchors `last_epos` when the
-//!   active extruder changes mid-print (`print_stats.py:20-22`). This port's
-//!   `extruder.rs` declares the event but does not fire it, so the handler would
-//!   never run. The `last_epos` is only re-anchored at `note_start`; a mid-print
-//!   extruder swap will produce a spurious filament-used spike. Wire the handler
-//!   once `extruder.rs` fires the event.
+//! - `extruder:activate_extruder` → [`PrintStats::handle_activate_extruder`]
+//!   re-anchors `last_epos` to the current E position when the active extruder
+//!   changes (`print_stats.py:19-22`). Upstream leaves `filament_used` alone:
+//!   the E coordinate jumps with the swap, and without the re-anchor the next
+//!   `_update_filament_usage` would book that jump as filament used. Re-anchored
+//!   in `note_start` as well, so this only covers mid-print swaps.
+//!
+//! # What is not here
 //!
 //! - **No config options.** Upstream's `PrintStats.__init__` reads nothing from
 //!   the config; the section exists only so `load_object` can create it.
@@ -34,6 +35,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::ConfigError;
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::gcode_move::{GCodeMove, GCODE_MOVE_OBJECT};
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -135,6 +137,7 @@ impl PrintStats {
         }
         let object = Arc::new(Self::new(printer));
         object.register_commands(printer)?;
+        object.register_handlers(printer);
         printer.add_object(
             PRINT_STATS_OBJECT,
             Arc::clone(&object) as Arc<dyn PrinterObject>,
@@ -237,7 +240,7 @@ impl PrintStats {
     }
 
     /// Read the current E position from `gcode_move.get_status` (used by
-    /// `note_start` to re-anchor `last_epos`).
+    /// `note_start` and `handle_activate_extruder` to re-anchor `last_epos`).
     fn read_e_position(&self, eventtime: f64) -> f64 {
         self.gcode_move_status(eventtime)
             .and_then(|s| s["position"][3].as_f64())
@@ -268,6 +271,29 @@ impl PrintStats {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// Upstream's `_handle_activate_extruder` (`print_stats.py:20-22`): move
+    /// `last_epos` to where E stands now, so the coordinate jump the extruder
+    /// swap causes is not counted as filament used.
+    ///
+    /// Reads the E position before taking the state lock, so the two locks are
+    /// never held together (no lock-order inversion with
+    /// [`Self::update_filament_usage`]).
+    fn handle_activate_extruder(&self) {
+        let epos = self.read_e_position(self.reactor_monotonic());
+        self.lock().last_epos = epos;
+    }
+
+    /// The events upstream's `__init__` subscribes to (`print_stats.py:19-20`).
+    fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) {
+        printer.register_event_handler(
+            KlippyEvent::ExtruderActivateExtruder,
+            Box::new({
+                let object = Arc::clone(self);
+                move |_| object.handle_activate_extruder()
+            }),
+        );
     }
 
     /// Register `SET_PRINT_STATS_INFO`, capturing a handle to this object.
@@ -387,6 +413,7 @@ pub fn load_config(
     }
     let object = Arc::new(PrintStats::new(printer));
     object.register_commands(printer)?;
+    object.register_handlers(printer);
     Ok(object as Arc<dyn PrinterObject>)
 }
 
@@ -397,7 +424,6 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::extras::gcode_move::{self, MoveTarget};
     use crate::core::klippy::mathutil::Coord;
     use crate::core::klippy::reactor::{ManualReactor, Reactor};
@@ -467,6 +493,27 @@ mod tests {
     }
 
     // -- reset / initial state -------------------------------------------
+
+    /// The very first status frame has to carry `state`.
+    ///
+    /// Moonraker reads `prev_ps['state']` off the previous `print_stats`
+    /// frame with no default (`moonraker/components/job_state.py:62-65`), so a
+    /// frame that leaves the key out is a `KeyError` on connect — before any
+    /// print has happened, which is exactly when the first frame is sent.
+    /// External dependency, do not drop the field.
+    #[test]
+    fn the_first_status_frame_carries_a_state_string() {
+        let (_reactor, _printer, _gcode, object) = machine();
+
+        let s = object.get_status(0.0);
+
+        let state = s
+            .as_object()
+            .expect("an object")
+            .get("state")
+            .expect("print_stats always reports state, even on the first frame");
+        assert_eq!(state.as_str(), Some("standby"));
+    }
 
     /// `reset` (and the initial state) match upstream's `reset`
     /// (`print_stats.py:90-98`).
@@ -812,5 +859,35 @@ mod tests {
         // filament_used should be 10.0 + (15 - 10) / 1.0 = 15.0.
         let s = object.get_status(5.0);
         assert_eq!(s["filament_used"], 15.0);
+    }
+
+    /// A mid-print `extruder:activate_extruder` re-anchors `last_epos` to the
+    /// current E position instead of booking the swap's coordinate jump as
+    /// filament used (`print_stats.py:20-22`); accumulation continues from the
+    /// new anchor.
+    ///
+    /// `gcode_move` re-anchors its g-code E on the same event (`base_position`
+    /// becomes the toolhead's E), so after the swap an absolute `E` word counts
+    /// from zero again while the toolhead E keeps running.
+    #[test]
+    fn activate_extruder_event_reanchors_last_epos() {
+        let (reactor, printer, gcode, object) = machine();
+        object.note_start();
+
+        // Extrude 10 mm while nobody reads the status, so `filament_used` has
+        // not been updated for it yet — the event will absorb the jump.
+        reactor.advance(1.0);
+        gcode.run_script_sync("G1 E10").unwrap();
+
+        // The swap announces itself; the toolhead stands at E=10 and the
+        // re-anchor keeps that from counting as filament used.
+        printer.send_event(&KlippyEvent::ExtruderActivateExtruder);
+        assert_eq!(object.get_status(2.0)["filament_used"], 0.0);
+
+        // 5 mm more: g-code E=5 on top of the new E anchor at 10 = toolhead
+        // E=15, so exactly the 5 mm count.
+        reactor.advance(1.0);
+        gcode.run_script_sync("G1 E5").unwrap();
+        assert_eq!(object.get_status(4.0)["filament_used"], 5.0);
     }
 }

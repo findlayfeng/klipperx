@@ -246,6 +246,12 @@ CAN 侧的同族常量在 `canserial.rs`。
 - **连接期**：`[mcu]` 节带 `uuid`（或别名 `canbus_uuid`）的共享串口，`attach()` 在发分配
   请求**之前**先写一枚 `SET_KLIPPER_NODEID`（按 uuid 点名 id），再走上一节的重确认
   握手——顺序与 CAN 的 `CanSerialDevice::open`（开链路时发 SET_NODEID）对应。
+- **握手被欠着的情形**（只出现在 `klipperx admin` 的桥 attach，2026-10-18）：重确认握手如果
+  一直无应答（板子卡在上一会话里），工具不再直接报错，而是用「不握手的打开」把链路开出来，
+  让 `identify` 先按 klippy 自己的接管逻辑（重号重发）清掉旧会话，**然后**在同一个 handle 上
+  补做那枚重确认握手 —— 即「先 establish、再 confirm」。顺序不能反过来：握手是给**已可达**的
+  设备确认 id 用的，没人在答的时候它永远无解；而 `SET_NODEID` 仍是 attach 在尝试阶段就发出去的。
+  `printer.cfg` 的连接路径没有这个回退（硬限制不变）。
 
 ### 固件端契约（设备半已实现，见 `src/mux.c`）
 
@@ -422,7 +428,7 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 | `[0x02][index][uuid]` 送引导 | `0x3f0 [0x02][uuid]` **单帧**（翻译即全部，不再重发单元） |
 | `[0x05]` 重启等 | 无 CAN 原生形态：整单元原样发到设备自己的 arb（mux 设备自己的命令，头是通道标记） |
 
-带上 uuid 的那条是关键：**单帧与载具无关**，所以一个把字节流做成 ISO-TP 的应用（`CONFIG_ISOTP`）也能被送进引导——它读不懂切片的单元，但读得懂这一帧。
+带上 uuid 的那条是关键：**单帧与载具无关**，所以它读不懂切片单元的设备也能被送进引导。
 
 上行：`0x3f1` 的 `[0x20][uuid][app]` 应答被包成 arb=`0x3f1` 的单元交给路由器（不是节点流量，不进分桶），桥既有逻辑会追加端口路径。
 
@@ -432,7 +438,14 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 2. **设备每次进引导都要重新指派**：CAN node id 是 RAM 态，应用启动丢一次、katapult 启动又丢一次——所以刷写流程是「指派 → 0x02 → 等引导 → 再指派 → 隧道」，这就是 `--assign-uuid` 存在的理由。
 3. **过滤器预算**：`0x3f1` 占 1 个 bank，每个下游 id 占 1 个（bit0 掩码一格盯 `id`/`id+1` 一对），追加项上限 `CANHW_EXTRA_FILTERS = 8`；装不下就 `shutdown` 点名，**不静默听不见**。
 
-隧道（`0x06`）在 CAN 口上恒按**切片**：运的是 katapult 裸帧，而 katapult 没有 ISO-TP。
+## 端口在"重新枚举"下的身份
+
+一条共享串口路径（`by-id` 软链）在 USB 板复位后会指向**新的**设备节点，而已打开的描述符仍在旧节点上——写它只会得到 `EIO`。本仓的两层处理（2026-10-19，真机 R3 现场验证）：
+
+1. **判定失效**：`port_registry` 的复用判据是「未停机 **且** 路径当前解析到的 `(dev, ino)` 与已打开描述符一致」（`serial.rs` 的 `same_file`）。不一致 ⇒ 该条目不再算这条路径的端口，按需重开（旧端口继续服务仍持有它的引用）。
+2. **attach 重试**：`attach` 在握手失败且端口已失效时重开（`ATTACH_REOPEN_ATTEMPTS = 4` × `ATTACH_REOPEN_DELAY = 250 ms`）；写错误本身不重试，因为失效描述符再写多少次都还是 `EIO`。
+
+实测：改一次配置 → 宿主 `reset` 板子 → USB 重新枚举（`ttyACM0 → ttyACM1`）→ 同一进程内重连成功（此前是 `serial write … Input/output error (os error 5)` 直接失败）。
 
 #### 桥扫描的发现路径与归属规则
 
@@ -471,8 +484,7 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 
 | 9 | **端口 tty 路径在库 `init` 前登记、运行期可注入**：`klipper_host_port(slot, path)`（`slot` = 端口 `index`，槽数 `KLIPPER_HOST_PORT_SLOTS = 4`，与固件 `BRIDGE_MAX_PORTS` 编译期绑定）；该槽未登记则回落构建期默认 `CONFIG_HOST_BRIDGE_SERIAL_PATH`（降级为兜底默认）；**同一路径的库在端口表不一致时拒绝复用**（`klipper_host_port()` 必须在 `init` 前调用——不做「表按路径合并」，那会让两条桥的槽号互相覆盖） | 固件 `src/host/host.c`、主机 `mcu/bridge_ports.rs` / `cmd/uart.rs` |
 | 10 | **口形态判据是「设备说不说单元」，与台数无关**：legacy（无 `uuid:` + uart）⇒ 该口剥头/加头；命名（写了 `uuid:`）⇒ 整单元原样转发；**多站口**（同一端口节被 ≥2 台命名设备引用，如 RS-485）⇒ 都带头、各自走自己的 `uuid → id`。**legacy 只允许出现在单设备端口上**（它与邻居无法区分 ⇒ 在共享端口上声明 legacy 是配置错） | 两级寻址一节、[MCU 连接方式](../user-manual/mcu-connection.md) |
-| 11 | **恢复预算：一次机会、归还条件明确**。桥 bring-up 因端口 `open` 失败、或 child 在连接期间被 `0x05` 重启而连不上 ⇒ **有界等 `uart_path` 回来**（`BRIDGE_PORT_RETURN_TIMEOUT` = 10 s、`BRIDGE_PORT_POLL` = 100 ms），回来就请求一次 **plain** restart（不是 `firmware_restart`，免得把子设备再点一次 `0x05` ⇒ 循环）。预算挂在 **`Printer`** 上**按节名**记（桥侧记桥节、child 侧记 child 节），**成功 connect 后归还**——所以「路径一直在但打不开」（目录/无权限/被占/槽越界）只重启**一次**便稳定 error，不会变成常驻重启风暴 | `mcu/object.rs`、`printer.rs::claim_bridge_port_recovery` / `clear_bridge_port_recovery` |
-| 12 | **`MUX_SERIAL`/`MUX_CAN` 的载体条件与「不默认开」**：`MUX_SERIAL depends on SERIAL \|\| USBSERIAL`（载体存在才可见）+ 身份来源 `HAVE_CHIPID \|\| MACH_HOST \|\| MACH_LINUX`；`MUX_CAN depends on CANBUS && HAVE_CHIPID`；两者都 `select MUX`，`BRIDGE` 是 `default y if MUX_SERIAL \|\| MUX_CAN`。**都不默认开**：单元格式不是上游 klippy 主机说的格式，必须是刻意选择（host 库由 `HOST_MUX_SERIAL` 选上）。CAN 的**传输层**另是一个独立开关：`ISOTP`（`depends on CANSERIAL`，把 can-serial 的 CAN 承载换成 ISO 15765-2，与 `MUX_CAN` 正交可叠加） | 固件 `src/Kconfig` |
+| 11 | **恢复预算：一次机会、归还条件明确**。桥 bring-up 因端口 `open` 失败、或 child 在连接期间被 `0x05` 重启而连不上 ⇒ **有界等 `uart_path` 回来**（`BRIDGE_PORT_RETURN_TIMEOUT` = 10 s、`BRIDGE_PORT_POLL` = 100 ms；bring-up 实际传给 `wait_for_port_paths` 的是 `PORT_RETURN_BUDGET`——生产等于前者，**测试构建下 300 ms**（否则八条真机链路用例各等 10 s 就吃掉半个闸门），见[测试](testing.md)），回来就请求一次 **plain** restart（不是 `firmware_restart`，免得把子设备再点一次 `0x05` ⇒ 循环）。**测试并发**：不捕 stderr 的用例各加载 `test-support::PrivateCopy`（自己的 `.so` 路径）因而不持 `HOST_LIBRARY_TEST_LOCK`，只有靠 fd 2 捕固件日志的那些必须串行。预算挂在 **`Printer`** 上**按节名**记（桥侧记桥节、child 侧记 child 节），**成功 connect 后归还**——所以「路径一直在但打不开」（目录/无权限/被占/槽越界）只重启**一次**便稳定 error，不会变成常驻重启风暴 | `mcu/object.rs`、`printer.rs::claim_bridge_port_recovery` / `clear_bridge_port_recovery` |
 | 13 | **口形态是主机每次命令的选择，不是编译期事实**：`flags` bit0 `MUX_PORT_UNITS` 由 `SET_PORT_NODEID` 给，桥两个方向都按它剥/加头；UNITS 口的**裸帧上行会被丢**（`bridge_port_raw_up`），legacy 口的**整单元照原样转发** | 固件 `src/mux.h`、`src/bridge.c` |
 | 14 | **端口 id 与 `flags` 解耦**：`SET_PORT_NODEID` 无论 UNITS/legacy 都记 `node_id`，因此隧道模式的上行在两种口上都成立（UNITS 口的 `node_id` 曾恒 0 ⇒ 隧道上行静默丢；2026-10-17 修） | 固件 `src/bridge.c::bridge_set_port_nodeid`、`bridge_port_tunnel_up`；探针 `devices/host.rs::test_the_bridge_tunnel_uplink_over_a_units_port_over_the_real_library` |
 | 15 | **「桥能给几个口」由后端声明**：三个后端各自 `DECL_CONSTANT("BRIDGE_UART_COUNT", …)`（stm32 1 / linux 1 / host `KLIPPER_HOST_PORT_SLOTS` = 4）；固件不再上报端口表，主机按这个常数列 `--port`，旧固件（无常量）由 `--port-count` 兜底 | `third_party/klipper/src/{stm32,linux,host}/bridge*.c`、`src/flash/bridge_flash.rs::uart_count` |
@@ -577,15 +589,11 @@ klipper 设备半的叙述**逐条对齐**：
   可能只有一台，CAN 不会）；故选用「载荷内同一套单元」而非「单帧 admin 命令」（后者承载不了下游数据）。
   `depends on CANBUS && HAVE_CHIPID`、**不默认开**；`src-$(CONFIG_MUX) += mux.c` 让两种载体共用一份
   `mux.c`（`MUX_SERIAL`/`MUX_CAN` 由各 arch 的通信接口 `choice` 天然互斥）。**CAN 上还能换一副传输承载**：
-  `CONFIG_ISOTP`（`src/generic/isotp.c`）把 can-serial 的「按帧容量切片」换成 ISO 15765-2 分段
-  （一条 Klipper 帧 = 一条 ISO-TP 消息），而单元层与 `mux_input`/`mux_send` 一个字节不改；
   **`depends on CANSERIAL`、且只编 classical**。**`vcan` 上的端到端已落地**：`linux` 架构的
   SocketCAN 控制台（`LINUX_CANSERIAL`）让真 `klipper.elf` 能当 can-serial 节点，主机侧已实测
   跑通完整 `[mcu]` 连接（admin 指派 → identify → `get_clock`/stats）；剩下的未落地项只有
-  **CAN 下游端口已落地**（`BRIDGE_PORT_CAN`：`generic/bridge_can.c`，单帧 admin 代理已验）与它的
-  **ISO-TP 端口载具**（`CONFIG_BRIDGE_PORT_CAN_ISOTP`，`MUX_PORT_ISOTP` 按端口声明、**只用于运行期**，
-  隧道永远切片）都已真机闭环；`printer.cfg` 的 `[can_device]` 端口节已接线（`can_bitrate` +
-  `can_protocol`，要求 `uuid:`）。仍未接的是 CAN **上游** attach（桥经 CAN 被宿主连，已挂起）。
+  **CAN 下游端口已落地**（`BRIDGE_PORT_CAN`：`generic/bridge_can.c`，单帧 admin 代理已验）；
+  仍未接的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 CAN **上游** attach。
 - **host 模式的数据面**：unit 接口已定义、固件也已按单元发出自己的帧，但**主机侧（klippyx）还没
   改用它**——`HostDevice` 仍走字节流/整帧。**分配段（扫描、`SET_NODEID`、重确认握手）走字节流
   这条已经通了**：mux 路径的真端到端 attach 就是走它。

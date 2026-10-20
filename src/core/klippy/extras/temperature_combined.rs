@@ -251,6 +251,10 @@ impl Sensor for TemperatureCombined {
     fn setup_callback(&self, callback: SensorCallback) {
         *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
     }
+
+    fn get_report_time_delta(&self) -> f64 {
+        REPORT_TIME
+    }
 }
 
 impl PrinterObject for TemperatureCombined {

@@ -18,8 +18,10 @@
 //! (`tmc2660.py:242-283`), so no `<driver>_<stepper>` chip is registered and
 //! `<driver>_<stepper>:virtual_endstop` cannot be named. **No wave table, no
 //! stealthchop and no `tcoolthrs`** — the chip has none of `mslut*`/`en_pwm_mode`
-//! and upstream's setup omits them. The `tmc/stallguard_dump` bulk endpoint is
-//! likewise absent, as it is for every driver in this host.
+//! and upstream's setup omits them. The `tmc/stallguard_dump` endpoint is
+//! **not** registered for this chip, and upstream does not register it either:
+//! the helper needs a `DRV_STATUS` register to probe, which the 2660 lacks
+//! (`tmc.py:241-242`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -284,7 +286,11 @@ mod tests {
         let config = machine_config(dict, tmc_extra);
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("tmc2660.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "tmc2660.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
         let setup = async {
@@ -569,7 +575,11 @@ mod tests {
         printer
             .add_object("mcu", object as Arc<dyn PrinterObject>)
             .unwrap();
-        let mut start_args = StartArgs::collect("tmc2660.cfg", None);
+        let mut start_args = StartArgs::collect(
+            "tmc2660.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
         printer

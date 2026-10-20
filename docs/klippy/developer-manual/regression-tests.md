@@ -115,7 +115,7 @@ connect_file(输出文件, 字典):
 |----|------|
 | `.test` 文件 | 37 |
 | 运行（`CONFIG` 块） | 239（`printers.test` 占 203） |
-| `test/configs/*.config` 目标 | 47 |
+| `test/configs/*.config` 文件 | 49（默认闸门按 `KLIPPERX_ARCHES` 建 46 份；simu/pru/ar100 三份要 `KLIPPERX_ALL_ARCHES=1`） |
 | 被 `.test` 引用的目标 | 28 |
 
 按 `CONFIG_MACH_<FAMILY>` 聚合（`目标` 为该架构的 kconfig 片段数，`引用` 为声明该架构字典
@@ -181,9 +181,8 @@ connect_file(输出文件, 字典):
 默认列表（`linux` + `avr` + 各 ARM 家族）会构建 44 份字典：28 个被 `.test` 引用的目标里除 `pru` 外
 全部具备（另有 17 份没被引用的目标也一并编出，作为编译覆盖，含 `linuxprocess-mux`（linux 可命名
 固件）、`linuxprocess-can`（linux 的 SocketCAN can-serial 控制台，`LINUX_CANSERIAL`——真
-`klipper.elf` 能绑 SocketCAN 当 can-serial 节点）、`stm32f103-can-mux`（CAN 载体的 `MUX_CAN`）、
-`stm32f103-can-isotp` 与 `stm32h743-can-isotp`（ISO-TP 从站的 `CONFIG_ISOTP`，分别覆盖 STM32 的
-bxCAN 与 FDCAN 两条 CAN 路径）与 `stm32f103-{usb,serial}-mux`（MCU 侧两种
+`klipper.elf` 能绑 SocketCAN 当 can-serial 节点）、`stm32f103-can-mux`（CAN 载体的 `MUX_CAN`）
+与 `stm32f103-{usb,serial}-mux`（MCU 侧两种
 载体的 `MUX_SERIAL`——后两个是唯一让 `usb_cdc.c`/`serial_irq.c` 的 mux 接线与 `mcu_restart()`
 进入闸门的目标））。引用 `pru` 的运行只有 2 条（`printers.test`
 里 `DICTIONARY pru.dict host=linuxprocess.dict` 那一组），它们因字典未构建被跳过。
@@ -197,7 +196,7 @@ bxCAN 与 FDCAN 两条 CAN 路径）与 `stm32f103-{usb,serial}-mux`（MCU 侧�
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
 | 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
 | 实际执行 | **237** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
-| 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（b39750f 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`（2026-10-06 起走**真命令**与会话生命周期，此前是未知命令放行）、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
+| 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（9ac97d0 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`（2026-10-06 起走**真命令**与会话生命周期，此前是未知命令放行）、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -207,7 +206,7 @@ bxCAN 与 FDCAN 两条 CAN 路径）与 `stm32f103-{usb,serial}-mux`（MCU 侧�
 
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
-  `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
+  `EXTRUDER` 默认项（8c76a33）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
 - `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中
   **237 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
@@ -240,7 +239,7 @@ bxCAN 与 FDCAN 两条 CAN 路径）与 `stm32f103-{usb,serial}-mux`（MCU 侧�
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
 - `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`：验收时必须确认反转真的验的是**越界检查**，
-  而不是被一个配置装载错误「喂饱」（它已在 b39750f 移出并验证过一次）。
+  而不是被一个配置装载错误「喂饱」（它已在 9ac97d0 移出并验证过一次）。
 
 ## 本仓库的复用
 
@@ -328,7 +327,7 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 - 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
 
 所以它的验收要点是：移出忽略列表前，配置必须先能装载——否则非零退出来自配置错误，反转就会被
-「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
+「喂饱」。这一条在 9ac97d0 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
 反转验的正是 `G1 Y9999` 越界）。
 
 **2026-10-02 回退与修复**：生成式运行器一度报告该 case 「成功」，被误读为 move-bounds 未实现而

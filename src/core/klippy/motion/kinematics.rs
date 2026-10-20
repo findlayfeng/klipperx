@@ -56,8 +56,8 @@ impl<'a> MoveContext<'a> {
         self.move_.max_cruise_v2
     }
 
-    /// The per-axis distance.
-    pub fn axes_d(&self) -> &[f64; 4] {
+    /// The per-axis distance, extra axes included.
+    pub fn axes_d(&self) -> &[f64] {
         &self.move_.axes_d
     }
 
@@ -65,8 +65,21 @@ impl<'a> MoveContext<'a> {
     ///
     /// The extruder's `check_move` reads the E direction cosine
     /// (`kinematics/extruder.py:208-235`).
-    pub fn axes_r(&self) -> &[f64; 4] {
+    pub fn axes_r(&self) -> &[f64] {
         &self.move_.axes_r
+    }
+
+    /// Where the move starts on `axis`, extra axes included.
+    pub fn start_axis(&self, axis: usize) -> f64 {
+        self.move_.start_axis(axis)
+    }
+
+    /// Where the move ends on `axis`, extra axes included.
+    ///
+    /// An extra axis' `check_move` reads its own position this way
+    /// (`manual_stepper.py:186`, `kinematics/extruder.py:207-263`).
+    pub fn end_axis(&self, axis: usize) -> f64 {
+        self.move_.end_axis(axis)
     }
 
     /// The total distance.
@@ -563,8 +576,8 @@ impl Kinematics for NoneKinematics {
         let zero = Coord::new(0.0, 0.0, 0.0, 0.0);
         json!({
             "homed_axes": "",
-            "axis_minimum": zero.as_array(),
-            "axis_maximum": zero.as_array(),
+            "axis_minimum": zero.as_slice(),
+            "axis_maximum": zero.as_slice(),
         })
     }
 
@@ -678,7 +691,7 @@ impl Kinematics for CartesianKinematics {
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
         let end = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         // XY first, as upstream does (`klippy/kinematics/cartesian.py:106-114`).
         for axis in [X_AXIS, Y_AXIS] {
             if axes_d[axis] == 0.0 {
@@ -743,8 +756,8 @@ impl Kinematics for CartesianKinematics {
             .collect();
         json!({
             "homed_axes": homed,
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 
@@ -971,7 +984,10 @@ impl Kinematics for PolarKinematics {
         // the gated XY radius, then Z's range and speed, then the
         // near-center angular slowdown.
         let end = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        // A copy: the slice borrow would still be alive when `limit_speed`
+        // needs `ctx` mutable below. Only the four modelled axes are read.
+        let mut axes_d = [0.0; AXES];
+        axes_d.copy_from_slice(&ctx.axes_d()[..AXES]);
         let xy2 = end.x() * end.x() + end.y() * end.y();
         if xy2 > self.limit_xy2 {
             if self.limit_xy2 < 0.0 {
@@ -1055,8 +1071,8 @@ impl Kinematics for PolarKinematics {
         };
         json!({
             "homed_axes": format!("{xy_home}{z_home}"),
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 

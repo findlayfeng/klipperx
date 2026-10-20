@@ -268,6 +268,8 @@ use crate::core::klippy::api::StartArgs;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::interface::Interface;
+use crate::core::klippy::mcu::ids::NODEID_FIRST;
+use crate::core::klippy::mcu::serial_ports::SerialPorts;
 use crate::core::klippy::printer::{Printer, PrinterState};
 use crate::core::klippy::reactor::TokioReactor;
 
@@ -530,6 +532,45 @@ pub struct Machine {
     _board: BoardLock,
 }
 
+/// Set the transport facts the load path would have put on `mcu` for `section`.
+///
+/// The load path decides "this `serial:` path is addressed by id" over the
+/// **whole** config (`SerialPorts::classify`, driven from `mcu/object.rs`) and
+/// stamps the answer on the MCU object; a test opens one section on its own, so
+/// it has to ask the same question of the same pass. Without this a bridge's mux
+/// firmware is opened with bare frames, answers nothing, and the session times
+/// out in identify — which is how this lane used to fail on a muxed board.
+pub fn apply_id_addressed_transport(config: &Config, section: &ConfigSection, mcu: &mut McuConfig) {
+    if let Some(baud) = id_addressed_baud(config, section) {
+        mcu.shared_baud = Some(baud);
+        // A shared port is addressed by id, which the load path takes from the
+        // allocator; one section takes the first id of the sequence.
+        mcu.id = Some(NODEID_FIRST);
+    }
+}
+
+/// The baud a section's `serial:` path is opened with when the path is
+/// addressed by id, or `None` when it is opened exclusively.
+///
+/// The load path decides this over the whole config
+/// (`SerialPorts::classify`, driven from `mcu/object.rs`); a hardware test has
+/// the parsed config here, so it asks the same question of the same pass.
+fn id_addressed_baud(config: &Config, section: &ConfigSection) -> Option<u32> {
+    let path = section.get_text("serial")?;
+    let wrapper = ConfigWrapper::with_config(
+        section,
+        crate::core::klippy::config::AccessTracking::shared(),
+        None,
+        config,
+    );
+    let ports = SerialPorts::classify(&wrapper);
+    if ports.is_id_addressed(&path) {
+        ports.effective_baud(&path)
+    } else {
+        None
+    }
+}
+
 impl Machine {
     /// The whole parsed printer config.
     pub fn config(&self) -> &Config {
@@ -579,6 +620,7 @@ impl Machine {
         printer.set_start_args(Arc::new(StartArgs::collect(
             self.path.display().to_string(),
             None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
         )));
 
         let setup = runtime.block_on(async {
@@ -650,8 +692,15 @@ impl Machine {
             .config
             .get_section(&section_id)
             .ok_or_else(|| format!("the config has no [{section_id}] section"))?;
-        let config =
+        let mut config =
             McuConfig::new(&ConfigWrapper::untracked(section)).map_err(|e| e.to_string())?;
+        // Whether this `serial:` path is addressed by id is the **whole
+        // config's** call at load time (`mcu/object.rs`, `serial_ports`), and a
+        // hardware test opens one section on its own. Asking the same question
+        // here is what lets the lane reach a bridge's mux firmware at all: a
+        // muxed console answers bare frames with silence, so the open would
+        // otherwise time out in identify.
+        apply_id_addressed_transport(&self.config, section, &mut config);
         config.open()
     }
 }
@@ -983,6 +1032,43 @@ mod tests {
     /// Parse fixture text with the real parser.
     fn config(text: &str) -> Config {
         Config::from_text(text).expect("the fixture parses").0
+    }
+
+    /// The transport facts `Machine::open_mcu_named` stamps on a section.
+    fn transport_facts(text: &str) -> (Option<u32>, Option<u32>) {
+        let parsed = config(text);
+        let section = parsed.get_section("mcu").expect("the fixture has [mcu]");
+        let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
+            section,
+            crate::core::klippy::config::AccessTracking::shared(),
+            None,
+            &parsed,
+        ))
+        .expect("the section parses");
+        apply_id_addressed_transport(&parsed, section, &mut mcu);
+        (mcu.shared_baud, mcu.id)
+    }
+
+    /// A path one `[mcu]` names, with no port section: opened exclusively, no
+    /// id — exactly what the load path decides.
+    #[test]
+    fn test_a_plain_serial_path_keeps_the_exclusive_open() {
+        assert_eq!(
+            transport_facts("[mcu]\nserial: /dev/ttyACM0\n"),
+            (None, None)
+        );
+    }
+
+    /// A path a bridge's port section names is addressed by id, so the lane must
+    /// open it the way the load path does — otherwise a mux firmware answers
+    /// nothing and every case times out in identify.
+    #[test]
+    fn test_a_bridge_path_is_opened_by_id() {
+        let facts = transport_facts(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n",
+        );
+        assert_eq!(facts, (Some(250_000), Some(NODEID_FIRST)));
     }
 
     /// A fixture config file, removed when the test ends.

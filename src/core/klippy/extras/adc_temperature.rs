@@ -704,10 +704,10 @@ impl<C: Convert + 'static> AdcTemperatureBridge<C> {
     }
 
     /// Handle one ADC report and forward the temperature via the stored callback.
-    pub fn handle_adc_report(&self, samples: &[(u64, f64)]) {
+    pub fn handle_adc_report(&self, samples: &[(f64, f64)]) {
         let (read_time, read_value) = samples[samples.len() - 1];
         let temp = self.convert.calc_temp(read_value);
-        let time = (read_time as f64) + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
+        let time = read_time + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
         if let Some(cb) = self
             .callback
             .lock()
@@ -743,6 +743,10 @@ impl<C: Convert + 'static> Sensor for AdcTemperatureBridge<C> {
 
     fn setup_callback(&self, callback: SensorCallback) {
         *self.callback.lock().unwrap_or_else(|p| p.into_inner()) = Some(callback);
+    }
+
+    fn get_report_time_delta(&self) -> f64 {
+        REPORT_TIME
     }
 }
 

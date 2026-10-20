@@ -17,9 +17,13 @@
 //!   into the mesh configuration (`bed_mesh.py:631-633`); the per-command
 //!   overrides that reads are not written yet, so `calibration` describes the
 //!   configuration the printer is running;
-//! * **`profiles` is always `{}`** — nothing is saved across a restart until
-//!   `BED_MESH_PROFILE` lands, and upstream's `probe_path` / `rapid_path`
-//!   (the probe scheduler's walk) are absent with it.
+//! * **`probe_path` / `rapid_path` are absent** — those are upstream's probe
+//!   scheduler walk (`bed_mesh.py:291-310`), which this host does not model yet.
+//!
+//! `profiles` is what the profile manager holds (the same map `bed_mesh`'s
+//! `get_status` reports, `[bed_mesh <name>]` sections included), so a client's
+//! profile list is real from the moment `BED_MESH_PROFILE SAVE=` (or
+//! `BED_MESH_CALIBRATE PROFILE=`) has run.
 //!
 //! `current_mesh` carries the two grids upstream reports: `probed_matrix` is the
 //! grid as probed, `mesh_matrix` the interpolation grid sampled from it
@@ -47,7 +51,7 @@ use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::extras::bed_mesh::{
     generate_points, BedMesh, BedMeshOptions, BED_MESH_OBJECT,
 };
-use crate::core::klippy::printer::Printer;
+use crate::core::klippy::printer::{Printer, PrinterObject};
 
 /// The path, and the name a machine without `[bed_mesh]` reports as missing.
 const PATH: &str = "bed_mesh/dump_mesh";
@@ -91,8 +95,16 @@ impl Endpoint for BedMeshDump {
 
             let mut result = Map::new();
             result.insert("current_mesh".to_string(), current_mesh(&bed)?);
-            // No profile manager yet: nothing has been saved (`bed_mesh.py:1665`).
-            result.insert("profiles".to_string(), json!({}));
+            // The same profiles `get_status` reports (`bed_mesh.py:1665`): empty
+            // until a `BED_MESH_PROFILE SAVE=` / `BED_MESH_CALIBRATE PROFILE=`
+            // has stored one.
+            result.insert(
+                "profiles".to_string(),
+                bed.get_status(0.0)
+                    .get("profiles")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            );
             if with_calibration {
                 result.insert("calibration".to_string(), calibration(&bed)?);
             }
@@ -308,7 +320,11 @@ mod tests {
         crate::core::klippy::api::register(
             &mut api,
             &printer,
-            StartArgs::collect("/tmp/printer.cfg", None),
+            StartArgs::collect(
+                "/tmp/printer.cfg",
+                None,
+                crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+            ),
         )
         .unwrap();
 
@@ -398,6 +414,48 @@ mod tests {
             })
         );
         assert_eq!(answer["profiles"], json!({}));
+    }
+
+    /// The profile manager's own answer, not a hard-coded `{}`: a saved profile
+    /// shows up in `profiles`, which is what a client's profile list reads.
+    #[tokio::test]
+    async fn test_a_saved_profile_comes_back_in_profiles() {
+        let (printer, bed) = printer();
+        bed.store_mesh_for_test(
+            "shop",
+            vec![
+                vec![0.1, 0.2, 0.3],
+                vec![0.4, 0.5, 0.6],
+                vec![0.7, 0.8, 0.9],
+            ],
+        );
+
+        // `SAVE=` is the profile manager's own path: the endpoint must report
+        // what it stored, not a constant. Commands need the machine ready.
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the fixture registers gcode");
+        gcode
+            .run_script("BED_MESH_PROFILE SAVE=shop")
+            .await
+            .expect("the loaded mesh saves as a profile");
+
+        let answer = dump(printer, r#"{"method":"bed_mesh/dump_mesh"}"#)
+            .await
+            .unwrap();
+
+        let profiles = answer["profiles"]
+            .as_object()
+            .expect("profiles is an object");
+        let shop = profiles
+            .get("shop")
+            .expect("the stored profile is reported by name");
+        assert_eq!(
+            shop["points"],
+            json!([[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]])
+        );
+        assert_eq!(shop["mesh_params"]["x_count"], 3);
     }
 
     #[tokio::test]

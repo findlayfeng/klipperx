@@ -33,11 +33,10 @@
 //!
 //! # What differs from upstream
 //!
-//! * **No `M105` line during the wait.** Upstream answers the wait loop with
-//!   the temperature report every second (`heaters.py:359`); the `M105`
-//!   g-code-id table is not wired here yet (`TODO H1`), so there is nothing
-//!   to report and the loop only waits — see
-//!   [`PrinterHeaters::set_temperature`].
+//! * **`M105` while waiting matches upstream.** Upstream answers the wait loop
+//!   with the temperature report every second (`heaters.py:349-359`); so does
+//!   [`PrinterHeaters::wait_for_temperature`], through the same g-code-id table
+//!   upstream's `_get_temp` reads (`heaters.py:331-340`).
 //! * **`write_file` sample times carry no `pwm_delay`.** Upstream dates a PWM
 //!   change at `read_time + pwm_delay` (`pid_calibrate.py:74`); this host
 //!   applies the output immediately (`Heater::temperature_callback`), so the
@@ -502,6 +501,9 @@ mod tests {
     impl Sensor for FakeSensor {
         fn setup_minmax(&self, _min_temp: f64, _max_temp: f64) {}
         fn setup_callback(&self, _callback: SensorCallback) {}
+        fn get_report_time_delta(&self) -> f64 {
+            0.3
+        }
     }
 
     /// A PWM that accepts everything.
@@ -845,6 +847,10 @@ mod tests {
             time += 0.1;
             let power = heater.get_status()["power"].as_f64().unwrap();
             temp += (power * 120.0 - (temp - 20.0) * 0.5) * 0.1;
+            // This loop is the test stand-in for the 1 s main-thread stamp the
+            // production timer takes: every reading it delivers comes from a
+            // main thread that is alive.
+            heater.stamp_mainthread(time);
             heater.temperature_callback(time, temp);
             powers.push(heater.get_status()["power"].as_f64().unwrap());
             if tune
@@ -923,6 +929,10 @@ mod tests {
                 let power = feed.get_status()["power"].as_f64().unwrap();
                 time += 0.1;
                 temp += (power * 120.0 - (temp - 20.0) * 0.5) * 0.1;
+                // This feeder is the test stand-in for the 1 s main-thread
+                // stamp the production timer takes: every reading it delivers
+                // comes from a main thread that is alive.
+                feed.stamp_mainthread(time);
                 feed.temperature_callback(time, temp);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }

@@ -14,9 +14,9 @@
 //!
 //! # What is not here
 //!
-//! The `tmc/stallguard_dump` bulk endpoint (`tmc.TMCStallguardDump`,
-//! `tmc.py:228-317`) is not registered, so `available_sensors` does not list it
-//! and the `stallguard_dump` query is unavailable. Nothing else is missing.
+//! The `tmc/stallguard_dump` endpoint is registered like every other chip's,
+//! and this one streams the SG2 result out of `DRV_STATUS.sg_result` (the chip
+//! has no `SG_RESULT` register of its own). Nothing else is missing.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -403,7 +403,11 @@ mod tests {
         let config = machine_config(dict, tmc_extra, endstop_pin);
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = crate::core::klippy::api::StartArgs::collect("tmc2130.cfg", None);
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "tmc2130.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
         let setup = async {

@@ -866,7 +866,11 @@ mod tests {
         let config = Config::from_text(&text).expect("the config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
         let printer = Arc::new(Printer::new(reactor));
-        let mut start_args = StartArgs::collect("display.cfg", None);
+        let mut start_args = StartArgs::collect(
+            "display.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         start_args.debug_output = Some("_test_output".to_string());
         printer.set_start_args(Arc::new(start_args));
 

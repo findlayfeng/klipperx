@@ -12,31 +12,42 @@
 //! | `EnableTracking` | per-stepper enable state + callbacks |
 //! | `PrinterStepperEnable` | global tracking, g-code commands, status |
 //!
+//! # Auto enable
+//!
+//! A motor is energised by its own motion, not by a command: every tracked
+//! stepper arms a callback on the motion queue's active-check list
+//! ([`ActiveCallbacks`]), and the flush pass fires it with the print time the
+//! stepper's first real move starts at — `EnableTracking.__init__`'s
+//! `stepper.add_active_callback(self.motor_enable)` and `_check_active`
+//! (`klippy/stepper.py:239-258`). `M84` re-arms it, so the next move after a
+//! stop enables again (`EnableTracking.motor_disable`).
+//!
 //! # Limitations
 //!
-//! The upstream implementation schedules enable/disable at print time through
-//! the toolhead (`toolhead.dwell`, `toolhead.flush_step_generation`). This
-//! port's toolhead exists but that wiring does not: `motor_off` /
-//! `SET_STEPPER_ENABLE` apply immediately rather than syncing with motion. A
-//! dedicated enable pin on its own is not urgent; what matters is that the
-//! infrastructure exists for when print-time scheduling (C1d) lands.
+//! Upstream's `set_motors_enable` opens with `toolhead.flush_step_generation()`
+//! and dwells `DISABLE_STALL_TIME` around a disable. Here the change is dated
+//! with `toolhead.get_last_move_time()` — the planner's horizon, which the
+//! background generator task turns into steps — and there is no dwell: a
+//! scheduled change and a step command are both on the MCU's timeline, so the
+//! ordering is the firmware's.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{sync, GCodeDispatch, GcodeCommand, GCODE_OBJECT};
 use crate::core::klippy::load::section;
+use crate::core::klippy::motion::queuing::ActiveCallbacks;
 use crate::core::klippy::pins::{DigitalOut, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
-// The constant upstream uses for the dwell before disabling motors
-// (`DISABLE_STALL_TIME`, `stepper_enable.py:8`).
-#[allow(dead_code)]
-const DISABLE_STALL_TIME: f64 = 0.100;
+/// The `[printer]` object, which dates a manual enable/disable
+/// (`set_motors_enable`'s `toolhead.get_last_move_time()`).
+const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// Shared enable pin with reference counting.
 ///
@@ -85,22 +96,37 @@ impl StepperEnablePin {
         }
     }
 
-    /// Increment the count and drive the pin high if transitioning from zero.
-    fn set_enable(&mut self) {
+    /// Increment the count and drive the pin high if transitioning from zero
+    /// (`StepperEnablePin.set_enable(print_time)`).
+    fn set_enable(&mut self, print_time: Option<f64>) {
         if self.enable_count == 0 {
-            if let Some(ref pin) = self.mcu_enable {
-                let _ = pin.update_digital_out(true);
-            }
+            self.drive(true, print_time);
         }
         self.enable_count += 1;
     }
 
     /// Decrement the count and drive the pin low if transitioning to zero.
-    fn set_disable(&mut self) {
+    fn set_disable(&mut self, print_time: Option<f64>) {
         self.enable_count -= 1;
         if self.enable_count == 0 {
-            if let Some(ref pin) = self.mcu_enable {
-                let _ = pin.update_digital_out(false);
+            self.drive(false, print_time);
+        }
+    }
+
+    /// Land a level on the pin at `print_time` (`mcu_pin.set_digital`), or drive
+    /// it now when the change carries no date or the pin's MCU cannot turn one
+    /// into a clock yet (not connected) — the same rule `extras/fan` and
+    /// `extras/output_pin` use.
+    fn drive(&self, value: bool, print_time: Option<f64>) {
+        let Some(pin) = &self.mcu_enable else {
+            return;
+        };
+        match print_time.and_then(|print_time| pin.print_time_to_clock(print_time)) {
+            Some(clock) => {
+                let _ = pin.queue_digital_out(clock as u32, value);
+            }
+            None => {
+                let _ = pin.update_digital_out(value);
             }
         }
     }
@@ -110,14 +136,18 @@ impl StepperEnablePin {
 ///
 /// Upstream's `EnableTracking`: it wraps a stepper with an enable pin,
 /// manages the enabled state, and calls registered callbacks on transitions.
+///
+/// The print time a transition carries (`Option<f64>`) is where it belongs on
+/// the MCU's timeline: the auto-enable path dates it with the first move's
+/// print time, a manual one with the planner's horizon, and `None` means "no
+/// timeline to date it against" (the pin then drives immediately).
 pub(crate) struct EnableTracking {
     /// The stepper name (`stepper_x`, etc.).
-    #[allow(dead_code)]
     stepper_name: String,
     /// The shared or dedicated enable pin.
     enable: Arc<Mutex<StepperEnablePin>>,
-    /// Callbacks registered by the stepper (fire on enable/disable).
-    callbacks: Vec<Box<dyn Fn(bool) + Send>>,
+    /// Callbacks registered by the driver (fire on enable/disable).
+    callbacks: Vec<Box<dyn Fn(Option<f64>, bool) + Send>>,
     /// Whether the motor is currently enabled.
     is_enabled: bool,
 }
@@ -132,42 +162,47 @@ impl EnableTracking {
         }
     }
 
-    /// Register a callback for enable/disable transitions.
-    #[allow(dead_code)]
-    fn register_state_callback<F: Fn(bool) + Send + 'static>(&mut self, cb: F) {
+    /// Register a callback for enable/disable transitions
+    /// (`register_state_callback`): it is called with the transition's print
+    /// time and the new state, in registration order.
+    pub(crate) fn register_state_callback<F: Fn(Option<f64>, bool) + Send + 'static>(
+        &mut self,
+        cb: F,
+    ) {
         self.callbacks.push(Box::new(cb));
     }
 
-    /// Enable the motor.
-    fn motor_enable(&mut self) {
+    /// Enable the motor at `print_time` (`EnableTracking.motor_enable`).
+    /// Idempotent: an already enabled line fires nothing and drives nothing.
+    fn motor_enable(&mut self, print_time: Option<f64>) {
         if !self.is_enabled {
             for cb in &self.callbacks {
-                cb(true);
+                cb(print_time, true);
             }
-            self.enable.lock().unwrap().set_enable();
+            self.enable.lock().unwrap().set_enable(print_time);
             self.is_enabled = true;
         }
     }
 
-    /// Disable the motor.
-    fn motor_disable(&mut self) {
+    /// Disable the motor at `print_time` (`EnableTracking.motor_disable`).
+    /// Idempotent; the caller re-arms the auto-enable callback.
+    fn motor_disable(&mut self, print_time: Option<f64>) {
         if self.is_enabled {
             for cb in &self.callbacks {
-                cb(false);
+                cb(print_time, false);
             }
-            self.enable.lock().unwrap().set_disable();
+            self.enable.lock().unwrap().set_disable(print_time);
             self.is_enabled = false;
         }
     }
 
     /// Whether the motor is currently enabled.
-    fn is_motor_enabled(&self) -> bool {
+    pub(crate) fn is_motor_enabled(&self) -> bool {
         self.is_enabled
     }
 
     /// Whether this is a dedicated (non-shared) enable pin.
-    #[allow(dead_code)]
-    fn has_dedicated_enable(&self) -> bool {
+    pub(crate) fn has_dedicated_enable(&self) -> bool {
         self.enable.lock().unwrap().is_dedicated
     }
 }
@@ -182,6 +217,11 @@ pub struct PrinterStepperEnable {
     /// mutability (stepper sections register themselves after this object
     /// is created).
     enable_lines: Arc<Mutex<HashMap<String, Arc<Mutex<EnableTracking>>>>>,
+    /// The auto-enable callbacks waiting for each stepper's first real motion
+    /// (`MCU_stepper.add_active_callback`). The toolhead's motion queue checks
+    /// this set before every step generation, which is where upstream installs
+    /// its `_check_active` flush callback.
+    active_callbacks: Arc<ActiveCallbacks>,
     /// Pin resolver, available at load time.
     pins: Mutex<Option<Arc<PrinterPins>>>,
     /// For looking up the gcode object to register commands.
@@ -193,9 +233,16 @@ impl PrinterStepperEnable {
     pub fn new(printer: &Arc<Printer>) -> Self {
         Self {
             enable_lines: Arc::new(Mutex::new(HashMap::new())),
+            active_callbacks: Arc::new(ActiveCallbacks::new()),
             pins: Mutex::new(None),
             printer: Some(Arc::clone(printer)),
         }
+    }
+
+    /// The auto-enable callbacks, for the motion queue to check
+    /// (`ToolHeadObject::connect` installs them).
+    pub fn active_callbacks(&self) -> Arc<ActiveCallbacks> {
+        Arc::clone(&self.active_callbacks)
     }
 
     /// The `stepper_enable` object, creating it if the config named no section.
@@ -230,14 +277,16 @@ impl PrinterStepperEnable {
         stepper_name: &str,
     ) -> Result<(), ConfigError> {
         let printer = self.printer.as_ref().expect("printer is set in new()");
-        let mut pins_lock = self.pins.lock().unwrap();
-        let pins = pins_lock.get_or_insert_with(|| {
-            printer
-                .lookup_object_as::<PrinterPins>(PINS_OBJECT)
-                .expect("the loader registers `pins` before any section")
-        });
+        let pins = {
+            let mut pins_lock = self.pins.lock().unwrap();
+            Arc::clone(pins_lock.get_or_insert_with(|| {
+                printer
+                    .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+                    .expect("the loader registers `pins` before any section")
+            }))
+        };
 
-        let enable = setup_enable_pin(config, pins)?;
+        let enable = setup_enable_pin(config, &pins)?;
         let tracking = Arc::new(Mutex::new(EnableTracking::new(
             stepper_name.to_string(),
             enable,
@@ -245,8 +294,37 @@ impl PrinterStepperEnable {
         self.enable_lines
             .lock()
             .unwrap()
-            .insert(stepper_name.to_string(), tracking);
+            .insert(stepper_name.to_string(), Arc::clone(&tracking));
+        self.arm_auto_enable(&tracking);
         Ok(())
+    }
+
+    /// Arm `stepper`'s auto-enable callback: its next real motion enables the
+    /// motor at that motion's print time
+    /// (`EnableTracking.__init__`'s `stepper.add_active_callback(self.motor_enable)`).
+    ///
+    /// Also the re-arm after a disable (`EnableTracking.motor_disable`), which is
+    /// what makes a move after `M84` energise the motor again. The callback holds
+    /// the tracking line weakly: the queue must not keep a retired stepper's
+    /// enable state alive.
+    fn arm_auto_enable(&self, tracking: &Arc<Mutex<EnableTracking>>) {
+        let weak: Weak<Mutex<EnableTracking>> = Arc::downgrade(tracking);
+        let stepper_name = tracking
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .stepper_name
+            .clone();
+        self.active_callbacks.add(
+            &stepper_name,
+            Box::new(move |print_time| {
+                if let Some(tracking) = weak.upgrade() {
+                    tracking
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .motor_enable(Some(print_time));
+                }
+            }),
+        );
     }
 
     /// Register g-code commands (M18, M84, SET_STEPPER_ENABLE) and the
@@ -287,14 +365,16 @@ impl PrinterStepperEnable {
             )
             .ok();
 
-        let enable_lines2 = Arc::clone(&self.enable_lines);
+        let weak = Arc::downgrade(self);
         let handler_set = sync(move |gcmd: &GcodeCommand| {
             let stepper_name = gcmd.get_str("STEPPER").map_err(|_| {
                 crate::core::klippy::gcode::CommandError::new("Missing STEPPER parameter")
             })?;
             let enable = gcmd.get_int_default("ENABLE", 1)? != 0;
 
-            set_motors_enable_inner(&enable_lines2, std::slice::from_ref(&stepper_name), enable);
+            if let Some(object) = weak.upgrade() {
+                object.set_motors_enable(std::slice::from_ref(&stepper_name), enable);
+            }
             Ok(())
         });
         // `STEPPER` names the line, `ENABLE` the state
@@ -331,25 +411,61 @@ impl PrinterStepperEnable {
     /// has always done; that keeps the manual stepper's `ENABLE` able to name a
     /// stepper this object does not manage without failing the command.
     ///
-    /// Unlike upstream, this does not flush step generation or dwell on the
-    /// toolhead — this port's enable/disable apply immediately (see the module
-    /// docs on print-time scheduling).
+    /// The change is dated with the print time the planner has reached — what
+    /// the MCU will be executing when it lands
+    /// (`toolhead.get_last_move_time()`) — and a disable re-arms the stepper's
+    /// auto-enable callback, so the next move turns it back on. Upstream dwells
+    /// `DISABLE_STALL_TIME` before a disable and after it; there is no dwell
+    /// here (see the module docs).
     pub fn set_motors_enable(&self, names: &[String], enable: bool) -> bool {
-        set_motors_enable_inner(&self.enable_lines, names, enable)
+        let mut did_change = false;
+        let mut print_time = None;
+        let lines = self.enable_lines.lock().unwrap();
+        for name in names {
+            let Some(tracking) = lines.get(name).cloned() else {
+                continue;
+            };
+            let mut line = tracking.lock().unwrap_or_else(|poison| poison.into_inner());
+            if line.is_motor_enabled() == enable {
+                continue;
+            }
+            // One reading for the whole call: a dwell-free timeline must not
+            // move between two lines of the same command.
+            let dated = *print_time.get_or_insert_with(|| self.last_move_time());
+            if enable {
+                line.motor_enable(dated);
+            } else {
+                line.motor_disable(dated);
+            }
+            drop(line);
+            if !enable {
+                // `EnableTracking.motor_disable`: enable on future movement.
+                self.arm_auto_enable(&tracking);
+            }
+            did_change = true;
+        }
+        did_change
     }
 
-    /// Turn off all motors and notify the rest of the machine.
+    /// Turn off all motors and notify the rest of the machine
+    /// (`PrinterStepperEnable.motor_off`): every line off through
+    /// [`Self::set_motors_enable`], so each one re-arms its auto enable.
     pub fn motor_off(&self) {
-        let stepper_names: Vec<String> =
-            self.enable_lines.lock().unwrap().keys().cloned().collect();
-        for name in &stepper_names {
-            if let Some(tracking) = self.enable_lines.lock().unwrap().get(name) {
-                tracking.lock().unwrap().motor_disable();
-            }
-        }
+        self.set_motors_enable(&self.get_steppers(), false);
         if let Some(printer) = &self.printer {
             printer.send_event(&KlippyEvent::StepperEnableMotorOff);
         }
+    }
+
+    /// The print time a manual enable or disable is dated with: the planner's
+    /// horizon (`toolhead.get_last_move_time()`), which is what the MCU is
+    /// executing now. `None` before the machine is up — the pin then takes its
+    /// immediate path.
+    fn last_move_time(&self) -> Option<f64> {
+        self.printer
+            .as_ref()?
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)?
+            .last_move_time()
     }
 
     /// Get the status object for `printer.stepper_enable`.
@@ -390,37 +506,6 @@ impl PrinterStepperEnable {
     }
 }
 
-/// Set the enable state of every named stepper, reporting whether anything
-/// changed.
-///
-/// Split out so the `SET_STEPPER_ENABLE` handler (one name) and the manual
-/// stepper's `ENABLE` (a list) share one loop, with the same ignore-unknown
-/// behavior the handler has always had.
-fn set_motors_enable_inner(
-    enable_lines: &Mutex<HashMap<String, Arc<Mutex<EnableTracking>>>>,
-    names: &[String],
-    enable: bool,
-) -> bool {
-    let mut did_change = false;
-    let lines = enable_lines.lock().unwrap();
-    for name in names {
-        let Some(tracking) = lines.get(name) else {
-            continue;
-        };
-        let mut tracking = tracking.lock().unwrap();
-        let was_enabled = tracking.is_motor_enabled();
-        if enable {
-            tracking.motor_enable();
-        } else {
-            tracking.motor_disable();
-        }
-        if tracking.is_motor_enabled() != was_enabled {
-            did_change = true;
-        }
-    }
-    did_change
-}
-
 /// Set up an enable pin for a stepper.
 ///
 /// Upstream's `setup_enable_pin` (`stepper_enable.py:25-42`): if `enable_pin`
@@ -457,6 +542,11 @@ fn setup_enable_pin(
         .map_err(|err| {
             ConfigError::new(format!("enable_pin in section '{}': {}", identifier, err))
         })?;
+    // The enable line is held, not refreshed: the firmware's default 2 s watchdog
+    // would shut the printer down (`Missed scheduling of next digital out event`)
+    // two seconds after the motor is turned on. Upstream clears it the same way
+    // (`stepper_enable.py`: `enable.setup_max_duration(0.)`).
+    mcu_enable.setup_max_duration(0.0);
 
     Ok(Arc::new(Mutex::new(StepperEnablePin::dedicated(
         mcu_enable,
@@ -495,6 +585,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::core::klippy::mathutil::Xyz;
+    use crate::core::klippy::mcu::McuError;
+    use crate::core::klippy::motion::itersolve::Axis;
+    use crate::core::klippy::motion::queuing::MotionQueuing;
+    use crate::core::klippy::motion::stepper::Stepper;
     use crate::core::klippy::reactor::ManualReactor;
 
     fn load(text: &str) -> (Arc<Printer>, Result<(), ConfigError>) {
@@ -532,6 +627,227 @@ mod tests {
         // Note: The actual pin setup depends on MCU chip being configured
     }
 
+    // -----------------------------------------------------------------------
+    // Auto enable: a motor is energised by its own motion
+    // -----------------------------------------------------------------------
+
+    /// An enable pin that records what it was told: dated changes and
+    /// immediate ones separately.
+    #[derive(Default)]
+    struct RecordingPin {
+        /// The dated changes, as `(clock, level)`.
+        queued: Mutex<Vec<(u32, bool)>>,
+        /// The levels driven with no date (`update_digital_out`).
+        immediate: Mutex<Vec<bool>>,
+    }
+
+    impl DigitalOut for RecordingPin {
+        fn setup_max_duration(&self, _max_duration: f64) {}
+        fn setup_start_value(&self, _start_value: bool, _shutdown_value: bool) {}
+        fn queue_digital_out(&self, clock: u32, value: bool) -> Result<(), McuError> {
+            self.queued.lock().unwrap().push((clock, value));
+            Ok(())
+        }
+        fn update_digital_out(&self, value: bool) -> Result<(), McuError> {
+            self.immediate.lock().unwrap().push(value);
+            Ok(())
+        }
+        /// One clock tick is one microsecond, so a print time reads back as its
+        /// clock: `0.1 s` → `100_000`.
+        fn print_time_to_clock(&self, print_time: f64) -> Option<u64> {
+            Some((print_time * 1_000_000.0) as u64)
+        }
+    }
+
+    /// Everything the auto-enable chain needs: an enable line on a recording
+    /// pin, the object that tracks it, and a motion queue armed the way
+    /// `ToolHeadObject::connect` arms it with this object's callbacks.
+    struct Fixture {
+        stepper_enable: Arc<PrinterStepperEnable>,
+        pin: Arc<RecordingPin>,
+        tracking: Arc<Mutex<EnableTracking>>,
+        queuing: MotionQueuing,
+        trapq: usize,
+        /// Where the axis is, so every appended segment starts where the last
+        /// one ended (the trapq stores absolute start positions).
+        position: f64,
+    }
+
+    impl Fixture {
+        /// `[stepper_x]` tracked by a fresh object, with a dedicated enable pin.
+        fn new() -> Self {
+            let printer = Arc::new(Printer::new(ManualReactor::shared()));
+            let stepper_enable = Arc::new(PrinterStepperEnable::new(&printer));
+            let pin = Arc::new(RecordingPin::default());
+            let enable = Arc::new(Mutex::new(StepperEnablePin::dedicated(
+                Arc::clone(&pin) as Arc<dyn DigitalOut>
+            )));
+            let tracking = Arc::new(Mutex::new(EnableTracking::new(
+                "stepper_x".to_string(),
+                enable,
+            )));
+            stepper_enable
+                .enable_lines
+                .lock()
+                .unwrap()
+                .insert("stepper_x".to_string(), Arc::clone(&tracking));
+            stepper_enable.arm_auto_enable(&tracking);
+
+            let mut queuing = MotionQueuing::new();
+            let trapq = queuing.allocate_trapq();
+            queuing.add_stepper(Stepper::cartesian(
+                "stepper_x",
+                0,
+                1.0,
+                Axis::X,
+                1_000_000.0,
+            ));
+            // What connect does: the queue checks this object's callbacks.
+            queuing.set_active_callbacks(stepper_enable.active_callbacks());
+            Self {
+                stepper_enable,
+                pin,
+                tracking,
+                queuing,
+                trapq,
+                position: 0.0,
+            }
+        }
+
+        /// Queue a dwell of `duration` seconds at `print_time`.
+        fn dwell(&mut self, print_time: f64, duration: f64) {
+            self.queuing.trapq_mut(self.trapq).append(
+                print_time,
+                duration,
+                0.0,
+                0.0,
+                Xyz::new(self.position, 0.0, 0.0),
+                Xyz::default(),
+                0.0,
+                0.0,
+                0.0,
+            );
+        }
+
+        /// Queue a 10 mm X move at `print_time` (0.1 s of acceleration, 0.1 s of
+        /// deceleration, no cruise). `axes_r` is the unit direction, as the trapq
+        /// stores it: the 10 mm comes from the velocity profile.
+        fn move_x(&mut self, print_time: f64) {
+            let start = self.position;
+            self.position += 10.0;
+            self.queuing.trapq_mut(self.trapq).append(
+                print_time,
+                0.1,
+                0.0,
+                0.1,
+                Xyz::new(start, 0.0, 0.0),
+                Xyz::new(1.0, 0.0, 0.0),
+                0.0,
+                100.0,
+                1000.0,
+            );
+        }
+
+        fn generate(&mut self, flush_time: f64) {
+            self.queuing.generate(flush_time).unwrap();
+        }
+
+        fn is_enabled(&self) -> bool {
+            self.tracking.lock().unwrap().is_motor_enabled()
+        }
+    }
+
+    /// The motor comes on when a real move is queued — once, dated with that
+    /// move's print time, and never again on later flushes
+    /// (`MCU_stepper.add_active_callback` + `_check_active`).
+    #[test]
+    fn test_a_move_enables_the_motor_once_at_its_print_time() {
+        let mut fixture = Fixture::new();
+        // A dwell first: it moves no axis, so it must not energise anything.
+        fixture.dwell(0.0, 0.1);
+        fixture.move_x(0.1);
+
+        fixture.generate(0.5);
+
+        assert!(fixture.is_enabled(), "the queued move energised the motor");
+        assert_eq!(
+            *fixture.pin.queued.lock().unwrap(),
+            [(100_000, true)],
+            "one dated change, at the move's print time, not an immediate one"
+        );
+        assert!(fixture.pin.immediate.lock().unwrap().is_empty());
+
+        // Already enabled: a later flush drives nothing and fires no callback.
+        fixture.generate(0.8);
+        assert_eq!(*fixture.pin.queued.lock().unwrap(), [(100_000, true)]);
+        assert!(fixture.pin.immediate.lock().unwrap().is_empty());
+    }
+
+    /// A motor a command already enabled stays on: the auto-enable callback
+    /// still fires, and enabling an enabled line drives nothing.
+    #[test]
+    fn test_an_already_enabled_motor_is_not_enabled_again() {
+        let mut fixture = Fixture::new();
+        assert!(
+            fixture
+                .stepper_enable
+                .set_motors_enable(&["stepper_x".to_string()], true),
+            "the command enabled the motor"
+        );
+        assert_eq!(fixture.pin.immediate.lock().unwrap().len(), 1);
+
+        fixture.move_x(0.0);
+        fixture.generate(0.5);
+
+        assert!(fixture.is_enabled());
+        assert!(
+            fixture.pin.queued.lock().unwrap().is_empty(),
+            "nothing was queued: the line was already on"
+        );
+        assert_eq!(fixture.pin.immediate.lock().unwrap().len(), 1);
+    }
+
+    /// `M84` re-arms the auto enable: the next move energises the motor again
+    /// (`EnableTracking.motor_disable`'s `add_active_callback`).
+    #[test]
+    fn test_a_move_after_motor_off_enables_the_motor_again() {
+        let mut fixture = Fixture::new();
+        fixture.move_x(0.0);
+        fixture.generate(0.5);
+        assert!(fixture.is_enabled());
+        assert_eq!(*fixture.pin.queued.lock().unwrap(), [(0, true)]);
+
+        fixture.stepper_enable.motor_off();
+        assert!(!fixture.is_enabled(), "M84 disabled the motor");
+        // No toolhead in this fixture, so the disable carries no date and the
+        // pin takes its immediate path.
+        assert_eq!(*fixture.pin.immediate.lock().unwrap(), [false]);
+
+        // A move queued after the stop turns it back on, at its own print time.
+        fixture.dwell(0.5, 0.5);
+        fixture.move_x(1.0);
+        fixture.generate(1.5);
+        assert!(fixture.is_enabled(), "the move after M84 re-enabled it");
+        assert_eq!(
+            *fixture.pin.queued.lock().unwrap(),
+            [(0, true), (1_000_000, true)]
+        );
+    }
+
+    /// A flush that generates nothing (only a dwell is queued) leaves the motor
+    /// off and the callback armed.
+    #[test]
+    fn test_a_flush_with_no_motion_leaves_the_motor_off() {
+        let mut fixture = Fixture::new();
+        fixture.dwell(0.0, 1.0);
+
+        fixture.generate(1.05);
+
+        assert!(!fixture.is_enabled(), "a dwell moves no axis");
+        assert!(fixture.pin.queued.lock().unwrap().is_empty());
+        assert!(fixture.pin.immediate.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn test_stepper_enablepin_no_pin() {
         let mut pin = StepperEnablePin::no_pin();
@@ -540,10 +856,10 @@ mod tests {
         assert!(pin.mcu_enable.is_none());
 
         // set_enable on no_pin should not change anything
-        pin.set_enable();
+        pin.set_enable(None);
         assert_eq!(pin.enable_count, 10000);
 
-        pin.set_disable();
+        pin.set_disable(None);
         assert_eq!(pin.enable_count, 9999);
     }
 
@@ -641,15 +957,15 @@ mod tests {
     ///
     /// # The state before `M18`, and why it is not a bug
     ///
-    /// On this port nothing enables a motor at bring-up: `motor_enable` /
-    /// `set_motors_enable` are called only by `force_move`, `manual_stepper` and
-    /// `SET_STEPPER_ENABLE`, never by the toolhead (the print-time enable wiring
-    /// is exactly what the module docs say has not landed). So the status is
-    /// normally already all-`false` before `M18`. The case therefore asserts
-    /// what is true — **after `M18` every stepper reads `false`**, plus the
-    /// event — rather than a `true → false` transition it could not produce
-    /// without first energising a motor. `motor_off` short-circuits an already
-    /// disabled line; that is the correct idempotent behaviour, not a mismatch.
+    /// Bringing a machine up queues no motion, so the auto-enable chain
+    /// (`MCU_stepper.add_active_callback`) has not fired: `motor_enable` runs
+    /// when a real move reaches the trapq. No command before `M18` queues one
+    /// here, so the status is normally already all-`false` before `M18`. The
+    /// case therefore asserts what is true — **after `M18` every stepper reads
+    /// `false`**, plus the event — rather than a `true → false` transition it
+    /// could not produce without first energising a motor. `motor_off`
+    /// short-circuits an already disabled line; that is the correct idempotent
+    /// behaviour, not a mismatch.
     ///
     /// # What it assumes about the wiring
     ///

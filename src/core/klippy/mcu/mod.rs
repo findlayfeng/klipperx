@@ -47,7 +47,8 @@ pub(crate) use resource::pin_number;
 pub use resource::{
     Completion, I2cMode, McuAdc, McuChip, McuDigitalOut, McuEndstop, McuI2c, McuPwm, McuSpi,
     McuStepper, McuTriggerAnalog, McuTrsync, SosFilter, SosFilterDesign, SpiMode, TriggerDispatch,
-    TrsyncRegistry, DEFAULT_SPEED, MONITOR_MAX, TRSYNC_SINGLE_MCU_TIMEOUT, TRSYNC_TIMEOUT,
+    TrsyncRegistry, DEFAULT_SPEED, HOME_WAIT_TIMEOUT, MONITOR_MAX, TRSYNC_SINGLE_MCU_TIMEOUT,
+    TRSYNC_TIMEOUT,
 };
 pub use restart_method::McuRestartMethod;
 
@@ -91,6 +92,13 @@ const SYNC_SEND_HEADROOM: usize = 16;
 /// in the reported error.
 const SYNC_SEND_WAIT: Duration = Duration::from_secs(1);
 
+/// How long an awaiting producer ([`Mcu::send_payload`],
+/// [`Mcu::send_move_payload`]) waits for a slot above [`SYNC_SEND_HEADROOM`]
+/// before it reports the queue as full — the same second as [`SYNC_SEND_WAIT`],
+/// though this producer yields while it waits: no slot after that means a send
+/// task that stopped draining.
+const PAYLOAD_ROOM_WAIT: Duration = Duration::from_secs(1);
+
 /// The first wait between two looks at the queue in [`try_send_bounded`].
 const SYNC_SEND_POLL_START: Duration = Duration::from_micros(50);
 
@@ -123,6 +131,7 @@ use crate::core::klippy::msg::error::MsgError;
 use crate::core::klippy::msg::parser::Parser;
 use crate::core::klippy::msg::proto::{ArgValue, Payload};
 use crate::core::klippy::msg::Msg;
+use crate::core::klippy::sleep_off_worker;
 use crate::core::klippy::trace_enabled;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -615,7 +624,7 @@ fn try_send_bounded(
                 item = returned;
             }
         }
-        std::thread::sleep(backoff);
+        sleep_off_worker(backoff);
         backoff = (backoff * 2).min(SYNC_SEND_POLL_MAX);
     }
 }
@@ -625,6 +634,28 @@ fn try_send_bounded(
 /// synchronous senders.
 fn payload_has_room(send_buf_tx: &mpsc::Sender<SendItem>) -> bool {
     send_buf_tx.capacity() > SYNC_SEND_HEADROOM
+}
+
+/// Queue `item` the way an awaiting producer does: wait for a slot above
+/// [`SYNC_SEND_HEADROOM`] for at most [`PAYLOAD_ROOM_WAIT`], then send. The
+/// condition it waits on has no other exit, like [`try_send_bounded`]'s.
+async fn queue_awaiting_room(
+    send_buf_tx: &mpsc::Sender<SendItem>,
+    item: SendItem,
+) -> Result<(), McuError> {
+    let deadline = tokio::time::Instant::now() + PAYLOAD_ROOM_WAIT;
+    while !payload_has_room(send_buf_tx) && !send_buf_tx.is_closed() {
+        if tokio::time::Instant::now() >= deadline {
+            return Err(McuError::Msg(MsgError::new(format!(
+                "send queue has no free slot within {PAYLOAD_ROOM_WAIT:?}"
+            ))));
+        }
+        sleep(Duration::from_micros(100)).await;
+    }
+    send_buf_tx
+        .send(item)
+        .await
+        .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
 }
 
 /// MCU object that represents a physical microcontroller unit.
@@ -2179,6 +2210,22 @@ impl Mcu {
         self.parser.lookup(name).is_some()
     }
 
+    /// Whether an [`McuEvent`](crate::core::klippy::event::McuEvent) handler for
+    /// `E` is bound on **this** session's event table.
+    ///
+    /// The table belongs to one connection: a session that replaced a firmware
+    /// reset starts empty, and reports for it are dropped as unhandled
+    /// (`mcu/mod.rs`'s receive loop). Resources bind at use time for exactly
+    /// that reason (`McuChip::attach`), so a test can pin "this session has a
+    /// router" without sending a report.
+    #[cfg(test)]
+    pub(crate) fn has_event_handler<E>(&self) -> bool
+    where
+        E: crate::core::klippy::event::McuEvent,
+    {
+        self.events.has_callback(&self.parser, E::NAME)
+    }
+
     /// Check whether the firmware implements `format`, without failing.
     ///
     /// Upstream's `MCU.try_lookup_command` (`klippy/mcu.py:1197`, wrapping
@@ -2383,18 +2430,14 @@ impl Mcu {
     /// blocking-in-the-async-sense counterpart the configuration phase uses.
     ///
     /// # Errors
-    /// Returns [`McuError::Msg`] if the send task has gone away.
+    /// Returns [`McuError::Msg`] if the send task has gone away, or if no slot
+    /// above [`SYNC_SEND_HEADROOM`] came free within [`PAYLOAD_ROOM_WAIT`] —
+    /// the queue is then reported, not waited on.
     pub(crate) async fn send_payload(&self, payload: Payload) -> Result<(), McuError> {
         // Hold back at the headroom so the sync `Mcu::send` keeps slots to
-        // land in (see `SYNC_SEND_HEADROOM`); give up waiting only if the
-        // channel closed, so the error below still surfaces.
-        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
-            sleep(Duration::from_micros(100)).await;
-        }
-        self.send_buf_tx
-            .send(SendItem::Payload(payload))
-            .await
-            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
+        // land in (`SYNC_SEND_HEADROOM`); no slot within `PAYLOAD_ROOM_WAIT` is
+        // reported, not waited on.
+        queue_awaiting_room(&self.send_buf_tx, SendItem::Payload(payload)).await
     }
 
     /// Encode and send a command to the MCU.
@@ -2513,14 +2556,9 @@ impl Mcu {
             show_est(self.gate_clock().estimated_clock()),
         );
         // Same headroom wait as `send_payload`: a long step batch must not
-        // starve the synchronous senders (`SYNC_SEND_HEADROOM`).
-        while !payload_has_room(&self.send_buf_tx) && !self.send_buf_tx.is_closed() {
-            sleep(Duration::from_micros(100)).await;
-        }
-        self.send_buf_tx
-            .send(SendItem::Clocked(payload, clocks))
-            .await
-            .map_err(|e| McuError::Msg(MsgError::new(e.to_string())))
+        // starve the synchronous senders (`SYNC_SEND_HEADROOM`), and the same
+        // bound reports a send task that stopped draining (`PAYLOAD_ROOM_WAIT`).
+        queue_awaiting_room(&self.send_buf_tx, SendItem::Clocked(payload, clocks)).await
     }
 
     /// The gates for one move-class command: the pool's floor for its
@@ -2730,6 +2768,9 @@ impl Mcu {
     /// Returns [`McuCallError`] if the command is unknown, already has a
     /// callback, the send buffer is full, or the response does not arrive
     /// within `timeout`.
+    ///
+    /// When several answers share this response name and only a tag tells them
+    /// apart, use [`Mcu::call_oid`].
     pub async fn call(
         &self,
         command: &str,
@@ -2737,19 +2778,62 @@ impl Mcu {
         response_name: &str,
         timeout: Duration,
     ) -> Result<Vec<ArgValue>, McuCallError> {
-        self.call_gated(command, args, response_name, timeout, SendClocks::default())
-            .await
+        self.call_gated_oid(
+            command,
+            args,
+            None,
+            response_name,
+            timeout,
+            SendClocks::default(),
+        )
+        .await
     }
 
-    /// [`Mcu::call`] with scheduling gates on the request ([`SendClocks`]).
+    /// [`Mcu::call`] whose response must carry `oid`, upstream's
+    /// `serial.register_response(cb, name, oid)`.
     ///
-    /// Used by the typed clocked call (`Mcu::call_msg_clocked`, `cmd`) — the
-    /// homing query paths are the callers that gate (`endstop_query_state`'s
-    /// `minclock`, upstream `klippy/mcu.py:401-405`).
-    pub(crate) async fn call_gated(
+    /// The response only resolves this call when its first parameter is `oid`.
+    /// That is what keeps several peripherals on one connection apart: the TMC
+    /// UART and SPI layers query many chips over the same MCU, and every answer
+    /// arrives under the same message name (`tmc_uart_read_response oid=%c
+    /// data=%*s`). A response for a different `oid` is dropped, never handed to
+    /// whoever happens to be waiting.
+    ///
+    /// # Errors
+    /// As [`Mcu::call`].
+    pub async fn call_oid(
         &self,
         command: &str,
         args: &[ArgValue],
+        oid: u8,
+        response_name: &str,
+        timeout: Duration,
+    ) -> Result<Vec<ArgValue>, McuCallError> {
+        self.call_gated_oid(
+            command,
+            args,
+            Some(oid),
+            response_name,
+            timeout,
+            SendClocks::default(),
+        )
+        .await
+    }
+
+    /// Shared body of the synchronous calls: register, send, wait, clean up.
+    ///
+    /// `oid` is `None` for the plain call and `Some` for [`Mcu::call_oid`]; it
+    /// goes into the registration so the receive task can tell the answers
+    /// apart, and it is part of what gets cancelled on every failure path.
+    ///
+    /// The typed calls in [`cmd`](crate::core::klippy::cmd) pass their
+    /// [`SendClocks`] through here — the homing query paths gate
+    /// (`endstop_query_state`'s `minclock`, upstream `klippy/mcu.py:401-405`).
+    pub(crate) async fn call_gated_oid(
+        &self,
+        command: &str,
+        args: &[ArgValue],
+        oid: Option<u8>,
         response_name: &str,
         timeout: Duration,
         clocks: SendClocks,
@@ -2768,16 +2852,16 @@ impl Mcu {
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
 
-        // 3. Register the pending call.
+        // 3. Register the pending call — with its `oid`, when it has one.
         self.pending_calls
-            .register(response_name.to_string(), tx)
+            .register(response_name.to_string(), oid, tx)
             .await;
 
         // 4. Send the command. Its line names the response it is waiting for.
         if let Err(e) = self.enqueue(command, args, Some(response_name), clocks) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
-            self.pending_calls.cancel(response_name).await;
+            self.pending_calls.cancel(response_name, oid).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
 
@@ -2789,7 +2873,7 @@ impl Mcu {
             Ok(Ok(params)) => Ok(params),
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
-                self.pending_calls.cancel(response_name).await;
+                self.pending_calls.cancel(response_name, oid).await;
                 error!(
                     "[{}] Response receiver dropped for '{}'",
                     self.name, response_name
@@ -2800,7 +2884,7 @@ impl Mcu {
             }
             Err(_) => {
                 // Timeout — clean up the pending call.
-                self.pending_calls.cancel(response_name).await;
+                self.pending_calls.cancel(response_name, oid).await;
                 warn!(
                     "[{}] Timeout waiting for response '{}'",
                     self.name, response_name
@@ -2965,6 +3049,7 @@ mod tests {
     };
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -3078,6 +3163,154 @@ mod tests {
                 .expect("both exchanges must complete");
             assert_eq!(params, vec![ArgValue::UInt32(0x1234)]);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // call_oid: answers told apart by their `oid`
+    // -----------------------------------------------------------------------
+
+    /// `tmc_uart_read oid=%c write=%*s read_len=%u` / `tmc_uart_read_response
+    /// oid=%c data=%*s` — the TMC bus pair: one command and one answer name for
+    /// every chip, `oid` first in the answer.
+    fn tmc_dictionary() -> Dictionary {
+        Dictionary::from_json(serde_json::json!({
+            "commands": {"tmc_uart_read oid=%c write=%*s read_len=%u": 70},
+            "responses": {"tmc_uart_read_response oid=%c data=%*s": 71}
+        }))
+        .unwrap()
+    }
+
+    /// One chip's register read. The `write` blob is 45 bytes, past the send
+    /// task's batching threshold, so each query leaves as its own block and two
+    /// of them can be in flight at once.
+    fn tmc_request(oid: u8) -> Vec<ArgValue> {
+        vec![
+            ArgValue::UInt8(oid),
+            ArgValue::Bytes(vec![oid; 45]),
+            ArgValue::UInt32(4),
+        ]
+    }
+
+    fn tmc_answer(oid: u8) -> Vec<ArgValue> {
+        vec![ArgValue::UInt8(oid), ArgValue::Bytes(vec![oid; 3])]
+    }
+
+    fn tmc_payload(parser: &Parser, name: &str, values: &[ArgValue]) -> Vec<u8> {
+        parser.encode(name, values).unwrap().into_raw()
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_hands_each_answer_to_its_own_caller() {
+        // Two chips answer on one connection with both queries in flight. The
+        // answers come back in the same order the queries went out, which is
+        // *not* the order that tells them apart — the `oid` is.
+        let mut parser = Parser::new();
+        parser
+            .register(70, "tmc_uart_read oid=%c write=%*s read_len=%u")
+            .unwrap();
+        parser
+            .register(71, "tmc_uart_read_response oid=%c data=%*s")
+            .unwrap();
+        let request = |oid: u8| tmc_payload(&parser, "tmc_uart_read", &tmc_request(oid));
+        let answer = |oid: u8| tmc_payload(&parser, "tmc_uart_read_response", &tmc_answer(oid));
+
+        let device = FrameMock::new(vec![
+            MappingEntry {
+                input: make_frame(0, &request(1)),
+                outputs: vec![make_frame(0, &answer(1))],
+            },
+            MappingEntry {
+                input: make_frame(1, &request(2)),
+                outputs: vec![make_frame(1, &answer(2))],
+            },
+        ]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let (request_one, request_two) = (tmc_request(1), tmc_request(2));
+        let (one, two) = tokio::join!(
+            mcu.call_oid(
+                "tmc_uart_read",
+                &request_one,
+                1,
+                "tmc_uart_read_response",
+                Duration::from_millis(500),
+            ),
+            mcu.call_oid(
+                "tmc_uart_read",
+                &request_two,
+                2,
+                "tmc_uart_read_response",
+                Duration::from_millis(500),
+            ),
+        );
+
+        assert_eq!(one.unwrap(), tmc_answer(1));
+        assert_eq!(two.unwrap(), tmc_answer(2));
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_takes_no_answer_that_carries_another_oid() {
+        // The mapping answers oid 1's query with oid 2's data: the shape of an
+        // answer another chip's query picked up. The call must sit out its
+        // timeout rather than return that data as its own.
+        let mut parser = Parser::new();
+        parser
+            .register(70, "tmc_uart_read oid=%c write=%*s read_len=%u")
+            .unwrap();
+        parser
+            .register(71, "tmc_uart_read_response oid=%c data=%*s")
+            .unwrap();
+        let request = tmc_payload(&parser, "tmc_uart_read", &tmc_request(1));
+        let foreign = tmc_payload(&parser, "tmc_uart_read_response", &tmc_answer(2));
+
+        let device = FrameMock::new(vec![MappingEntry {
+            input: make_frame(0, &request),
+            outputs: vec![make_frame(0, &foreign)],
+        }]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let err = mcu
+            .call_oid(
+                "tmc_uart_read",
+                &tmc_request(1),
+                1,
+                "tmc_uart_read_response",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            McuCallError::Timeout(msg) => {
+                assert!(
+                    msg.contains("no response for tmc_uart_read_response"),
+                    "{msg}"
+                );
+            }
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_oid_times_out_when_no_answer_arrives() {
+        // Nothing is mapped, so the device stays silent; both names are known,
+        // so the call reaches the timeout path.
+        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(Vec::new())));
+        mcu.install_dictionary(tmc_dictionary()).unwrap();
+
+        let err = mcu
+            .call_oid(
+                "tmc_uart_read",
+                &tmc_request(3),
+                3,
+                "tmc_uart_read_response",
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, McuCallError::Timeout(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -4382,7 +4615,15 @@ mod tests {
         // re-anchors the estimate, and the parked gate re-polls within
         // `GATE_REPOLL_MAX`.
         mcu.set_clock_base(release + 1);
-        sleep(Duration::from_millis(60)).await;
+        // Poll the wire instead of betting on a fixed window: under the full
+        // gate's load the gate's re-poll and the send task can both be late.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "not sent at the release clock",
+        )
+        .await;
         assert_eq!(recorder.frames().len(), 1, "not sent at the release clock");
         assert_eq!(recorder.frames()[0].payload(), &[5]);
     }
@@ -4430,7 +4671,13 @@ mod tests {
 
         // Inside the window for both: PR_NOW, lowest req_clock first.
         mcu.set_clock_base(BASE + (10.1 * FREQ) as u64);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "expected one coalesced block",
+        )
+        .await;
         let frames = recorder.frames();
         assert_eq!(frames.len(), 1, "expected one coalesced block: {frames:?}");
         assert_eq!(
@@ -4508,7 +4755,13 @@ mod tests {
         };
 
         // At the base clock only the two with a free slot go.
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 0, 0],
+            "the over-capacity moves went with the burst",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 0, 0],
@@ -4518,7 +4771,13 @@ mod tests {
 
         // The first slot's completion (+ margin): exactly one move lands.
         mcu.set_clock_base(free_at(c1) + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 1, 0],
+            "one slot did not release exactly one move",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 1, 0],
@@ -4541,7 +4800,13 @@ mod tests {
         // The digital out releases on its own clock's lead window, ahead of
         // the pool floor that would otherwise still hold it.
         mcu.set_clock_base(own_clock - (MIN_REQTIME_DELTA * FREQ) as u64 + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || d_sent() == 1,
+            "the digital out missed its req_clock window",
+        )
+        .await;
         assert_eq!(d_sent(), 1, "the digital out missed its req_clock window");
         assert_eq!(
             counts(),
@@ -4551,7 +4816,13 @@ mod tests {
 
         // The slot the digital out held: `m4` goes at its completion (+ margin).
         mcu.set_clock_base(free_at(own_clock) + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || counts() == [1, 1, 1, 1],
+            "moves did not release one slot at a time",
+        )
+        .await;
         assert_eq!(
             counts(),
             [1, 1, 1, 1],
@@ -4643,7 +4914,13 @@ mod tests {
         let (mcu, recorder) = gate_mcu(vec![gate_block(0, &[5]), gate_block(1, &[6])], BASE);
         mcu.set_move_slot_capacity(1);
         mcu.send_move("get_clock", &[], BASE, completion).unwrap();
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || sent_count(&recorder, 5) == 1,
+            "the predecessor goes",
+        )
+        .await;
         assert_eq!(sent_count(&recorder, 5), 1, "the predecessor goes");
 
         // The move: floor = free-at(predecessor completion), req = start.
@@ -4670,7 +4947,13 @@ mod tests {
         // (+1 tick of re-poll). If a (buggy) floor ever sat *past* this point,
         // this step would stay red — the Timer-too-close detector.
         mcu.set_clock_base(window + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || sent_count(&recorder, 6) == 1,
+            "not sent by its start clock minus MIN_SCHEDULE_TIME",
+        )
+        .await;
         assert_eq!(
             sent_count(&recorder, 6),
             1,
@@ -4699,7 +4982,13 @@ mod tests {
         mcu.send_move_payload(payload_from(&first), BASE, completion)
             .await
             .unwrap();
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "first batch on the wire",
+        )
+        .await;
         assert_eq!(recorder.frames().len(), 1, "first batch on the wire");
 
         // Second batch: its completion entered the pool, so its floor is the
@@ -4715,7 +5004,13 @@ mod tests {
         );
 
         mcu.set_clock_base(floor + 1);
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 2,
+            "released at its predecessor's slot-free clock",
+        )
+        .await;
         assert_eq!(
             recorder.frames().len(),
             2,
@@ -4774,7 +5069,13 @@ mod tests {
         )
         .unwrap();
 
-        sleep(Duration::from_millis(60)).await;
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() == 1,
+            "a gated message parked on an unjudgeable clock",
+        )
+        .await;
         assert_eq!(
             recorder.frames().len(),
             1,
@@ -4806,7 +5107,15 @@ mod tests {
 
         mcu.send("get_clock", &[]).unwrap();
         // The first send is immediate; the retransmit waits out MIN_RTO (25 ms).
-        tokio::time::sleep(Duration::from_millis(120)).await;
+        // Poll for it: a fixed window is only worth the timer's own latency,
+        // and the full gate's load can spend that on scheduling alone.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || recorder.frames().len() >= 2,
+            "expected the block to be sent again",
+        )
+        .await;
 
         let frames = recorder.frames();
         assert!(
@@ -5070,10 +5379,26 @@ mod tests {
                 .expect("get_clock while nudging the counter past the fresh range");
         }
         let running_at = seq(&mcu);
+        // The old session has to be gone before the port is reopened: `Drop`
+        // aborts both transport tasks, and their finishing is the port closing.
+        // Poll that instead of guessing how long the runtime needs.
+        let transport = [&mcu.recv_handle, &mcu.send_handle].map(|handles| {
+            handles
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .expect("both transport tasks are running here")
+                .abort_handle()
+        });
         drop(clock);
         drop(mcu);
-        // Let the receive task finish and the port close before reopening it.
-        sleep(Duration::from_millis(300)).await;
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            || transport.iter().all(|handle| handle.is_finished()),
+            "the old session's transport tasks finish before the port reopens",
+        )
+        .await;
 
         // 4. The board was never reset, so its counter carried on from where
         //    the first connection left it. The new connection numbers its first
@@ -5499,8 +5824,14 @@ mod tests {
         // Actively drop the `Mcu`; this must abort the receive task.
         drop(mcu);
 
-        // Give the runtime a chance to process the cancellation.
-        sleep(Duration::from_millis(20)).await;
+        // Wait for the runtime to process the cancellation, on a bound.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || abort_handle.is_finished(),
+            "receive task should be aborted after the Mcu is dropped",
+        )
+        .await;
         assert!(
             abort_handle.is_finished(),
             "receive task should be aborted after the Mcu is dropped"
@@ -5689,5 +6020,36 @@ mod tests {
             describe_value(&ArgValue::Bytes(vec![1, 2, 0xff])),
             r#"b"\x01\x02\xff""#
         );
+    }
+}
+
+/// The awaiting producers' bound ([`PAYLOAD_ROOM_WAIT`]), driven on a bare
+/// channel: an `Mcu`'s send task would drain a slot at the test's first await.
+#[cfg(test)]
+mod queue_room_deadline {
+    use super::*;
+
+    /// A queue nobody drains, and that never holds room above the headroom, is
+    /// reported after [`PAYLOAD_ROOM_WAIT`] instead of waited on.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_queue_that_never_drains_is_reported_after_the_wait() {
+        // Two slots never clear the headroom; `_rx` keeps the queue open (a
+        // closed one is the other exit).
+        let (tx, _rx) = mpsc::channel::<SendItem>(2);
+        let started = tokio::time::Instant::now();
+        // Virtual clock: the timeout catches a missing deadline, not a hang.
+        let result = tokio::time::timeout(
+            PAYLOAD_ROOM_WAIT * 3,
+            queue_awaiting_room(&tx, SendItem::Payload(Payload::new())),
+        )
+        .await
+        .expect("the wait is bounded");
+
+        let error = result.expect_err("a queue that never drains is an error");
+        assert_eq!(
+            error.to_string(),
+            format!("send queue has no free slot within {PAYLOAD_ROOM_WAIT:?}")
+        );
+        assert!(started.elapsed() >= PAYLOAD_ROOM_WAIT, "the bound");
     }
 }

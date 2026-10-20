@@ -9,7 +9,7 @@
 //! | method | here | elsewhere |
 //! |---|---|---|
 //! | `command` | nothing before the port opens | `reset` on the **live** connection, from `McuObject::before_firmware_restart`, before the parts come down; `config_reset` from the handshake (`mcu/object.rs`, `mcu/config.rs`) |
-//! | `admin` | nothing on this device's transport: the port-level `RESTART_DEVICE` the bridge forwards ([`reset_bridge_firmware`]) | — |
+//! | `admin` | on a **serial** MCU the bridge restarts **itself**: its own `RESTART_DEVICE` goes out on the mux admin channel ([`bridge_admin_restart`]); on a bridge-port device nothing here — the port-level `RESTART_DEVICE` the bridge forwards ([`reset_bridge_firmware`]) | — |
 //! | `arduino` | toggle DTR at 2400 baud — **untested on hardware**, and reported | — |
 //! | `cheetah` | RTS/DTR sequence at 2400 baud — **untested on hardware**, and reported; the connection itself also needs RTS deasserted (`McuConfig::open`) | — |
 //! | `rpi_usb` | cut and restore the USB port's power — **untested on hardware**, and reported | `interface/usb.rs` |
@@ -35,7 +35,7 @@ use tracing::{debug, info, warn};
 
 use crate::core::klippy::config::mcu::{BridgeRestart, McuConfig, Transport};
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::interface::devices::serial::ModemLines;
+use crate::core::klippy::interface::devices::serial::{self, ModemLines};
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::usb;
 use crate::core::klippy::interface::Interface;
@@ -63,6 +63,18 @@ const USB_PORT_RETURN_TIMEOUT: Duration = Duration::from_secs(10);
 /// read beforehand, so there is nothing to compare against.
 const RE_ENUMERATE_SETTLE: Duration = Duration::from_millis(1000);
 
+/// How long to wait for the bridge to answer the attach handshake, per attempt.
+/// The serial layer's own budget for the same handshake.
+const BRIDGE_ATTACH_TIMEOUT: Duration = serial::ASSIGN_ATTACH_TIMEOUT;
+
+/// The index that never names a port, so the admin unit carrying it is the
+/// **bridge's own**: the firmware's port table has at most eight entries, and an
+/// index outside it falls through to the device's own handler
+/// (`src/mux.c::mux_admin_unit`), whose `RESTART_DEVICE` arm calls
+/// `mcu_restart()` on that device. `src/flash` spells the same convention as
+/// `RESTART_DEVICE_TO_BRIDGE`.
+const BRIDGE_ITSELF: u8 = 0xFF;
+
 /// Reset the firmware on the transport that is about to be opened.
 ///
 /// Called by `McuObject::connect` when the bring-up follows a
@@ -79,11 +91,27 @@ pub async fn reset_firmware(
         // Nothing before the connection: `config_reset` clears the firmware once
         // it is up (`mcu/config.rs`).
         McuRestartMethod::Command => Ok(()),
-        // The device resets itself, and the bridge forwards the command: that
-        // travels the bridge's link, before this device is reached
-        // (`McuObject::connect`, `reset_bridge_firmware`), so there is nothing to
-        // do on a transport of its own.
-        McuRestartMethod::Admin => Ok(()),
+        // The device resets itself, and the mux admin channel is how it is told
+        // — which channel that is depends on the transport. A **bridge-port**
+        // device's restart travels the bridge's link, before this device is
+        // reached (`McuObject::connect`, `reset_bridge_firmware`), so there is
+        // nothing to do on a transport of its own. A **serial** MCU is the
+        // bridge itself: its admin channel is its own link, reached out of band
+        // because this device's session does not exist yet.
+        McuRestartMethod::Admin => match &config.transport {
+            Transport::Serial { path, baud, uuid } => {
+                let mcu_id = config.id.ok_or_else(|| {
+                    format!(
+                        "serial {path}: restart_method 'admin' needs the MCU id, which has not \
+                         been assigned"
+                    )
+                })?;
+                bridge_admin_restart(path, *baud, *uuid, mcu_id, handle).await
+            }
+            Transport::BridgePort { .. } => Ok(()),
+            // `parse_restart_method` only yields `admin` for the two shapes above.
+            _ => Ok(()),
+        },
         McuRestartMethod::Arduino => match &config.transport {
             Transport::Serial { path, .. } => {
                 warn_untested(config);
@@ -328,6 +356,75 @@ fn warn_untested(config: &McuConfig) {
 /// so a failed reset reads the same way a failed open does.
 fn serial_error(error: InterfaceError) -> String {
     format!("serial: {error}")
+}
+
+/// Restart the **bridge itself** over its mux admin channel.
+///
+/// The bridge is this MCU, and its firmware's own `RESTART_DEVICE` handler calls
+/// `mcu_restart()` — so the frame that asks for it *is* the reset. There is no
+/// session to send a `reset` command on and no identify to run: the admin id is
+/// where a device with no id listens (`src/mux.c::mux_unit`).
+///
+/// Off the runtime: the attach blocks on the mux handshake, and that is a wait,
+/// not work — the same reason `usb_set_power` leaves the runtime.
+async fn bridge_admin_restart(
+    path: &str,
+    baud: u32,
+    uuid: Option<[u8; 6]>,
+    mcu_id: u32,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    handle
+        .spawn_blocking(move || send_bridge_restart(&path, baud, uuid, mcu_id))
+        .await
+        .map_err(|e| format!("serial: {e}"))?
+}
+
+/// Open the bridge's link, send its own restart, and let the link go.
+///
+/// The handle comes from [`serial::attach`] with the section's `uuid`: that is
+/// the opening the shared-serial transport does, so a `uuid:` names the bridge
+/// as `mcu_id` (`SET_NODEID`) before the assignment request and the request is
+/// answerable whatever id the firmware was left holding.
+///
+/// A bridge whose firmware holds **no** node id answers nothing to that request:
+/// the mux's admin handler replies to it with the id it already has, and an
+/// unassigned one has none to reply with (`src/mux.c::mux_admin_unit`). That is
+/// the state an **exclusive** path leaves the mux in — the host never named it
+/// there — so an unanswered handshake falls back to
+/// [`serial::attach_downstream`]: the same port, registered without a handshake
+/// and writing nothing, and the admin unit goes out all the same, because the
+/// admin id is exactly where a device with no id is listening. Every other
+/// attach failure is the open's own and is reported.
+///
+/// Nothing waits for the bridge to come back: the bring-up that follows
+/// ([`McuConfig::open`], retried on a firmware restart) is what meets it.
+///
+/// Dropping the handle — the last reference — unregisters its slot and closes
+/// the port (`Drop for SharedSerialHandle` / `Drop for SharedSerialPort` stop the
+/// reader on the way out), so the open that follows finds the tty as it was.
+fn send_bridge_restart(
+    path: &Path,
+    baud: u32,
+    uuid: Option<[u8; 6]>,
+    mcu_id: u32,
+) -> Result<(), String> {
+    let handle = match serial::attach(path, baud, mcu_id, BRIDGE_ATTACH_TIMEOUT, uuid) {
+        Ok(handle) => handle,
+        Err(InterfaceError::Timeout) => {
+            serial::attach_downstream(path, baud, mcu_id).map_err(serial_error)?
+        }
+        Err(err) => return Err(serial_error(err)),
+    };
+    handle
+        .send_restart_device(BRIDGE_ITSELF)
+        .map_err(serial_error)?;
+    info!(
+        "bridge {} restarted over its admin channel (index {BRIDGE_ITSELF:#04x})",
+        path.display()
+    );
+    Ok(())
 }
 
 /// Toggle DTR at another rate — Klipper's `arduino_reset`
@@ -721,6 +818,32 @@ mod tests {
         assert!(err.contains("/dev/not-a-serial-port"), "{err}");
     }
 
+    /// `admin` on a serial MCU resets the **bridge itself**, so the dispatch
+    /// opens its port instead of doing nothing: a path that cannot be opened is
+    /// reported, never passed over as a no-op (the bridge would then come up
+    /// unrestarted).
+    #[tokio::test]
+    async fn test_admin_on_a_serial_mcu_resets_the_bridge_itself() {
+        let mut config = serial(McuRestartMethod::Admin);
+        config.id = Some(1);
+        let err = reset_firmware(&config, &tokio::runtime::Handle::current())
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("serial: "), "{err}");
+        assert!(err.contains("/dev/not-a-serial-port"), "{err}");
+
+        // The admin unit is addressed to an id, so the dispatch needs one: the
+        // bring-up assigns it before this runs, and a config without it says so
+        // rather than sending a frame nobody can answer on.
+        let err = reset_firmware(
+            &serial(McuRestartMethod::Admin),
+            &tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("has not been assigned"), "{err}");
+    }
+
     // -----------------------------------------------------------------------
     // The bridge-port reset, on the wire.
     // -----------------------------------------------------------------------
@@ -965,6 +1088,59 @@ mod tests {
             read_pty(&pty.master, expected.len(), Duration::from_secs(3)),
             expected,
             "the route is restated, then the device restart"
+        );
+    }
+
+    /// Read from the pty until `needle` is the tail of what came, within
+    /// `window` — for a stream whose earlier units (a handshake the bridge was
+    /// offered, say) are expected but not part of the assertion.
+    fn read_until(master: &std::fs::File, needle: &[u8], window: Duration) -> Vec<u8> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        while Instant::now() < deadline {
+            out.extend_from_slice(&read_pty(master, 1, Duration::from_millis(100)));
+            if out.ends_with(needle) {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The bridge's **own** restart goes out even when its firmware holds no
+    /// node id.
+    ///
+    /// A silent pty stands in for that bridge: it answers the attach handshake
+    /// with nothing — only an assigned mux replies to it (`src/mux.c`) — so the
+    /// fallback to `attach_downstream` is what runs, and the admin unit naming
+    /// the index no port can have is on the wire all the same.
+    #[tokio::test]
+    async fn a_bridge_with_no_id_is_restarted_over_its_admin_channel() {
+        let pty = Pty::new();
+        let config = McuConfig {
+            name: "bridge".to_string(),
+            restart_method: McuRestartMethod::Admin,
+            bridge_restart: None,
+            transport: Transport::Serial {
+                path: pty.path.to_str().expect("a utf-8 pty path").to_string(),
+                baud: 250_000,
+                uuid: None,
+            },
+            id: Some(1),
+            shared_baud: None,
+            host_mux: None,
+            host_port_paths: Vec::new(),
+            usb_power: usb::UsbPowerMethod::default(),
+        };
+
+        reset_firmware(&config, &tokio::runtime::Handle::current())
+            .await
+            .expect("the bridge restart goes out");
+
+        let restart = admin_unit(&[CMD_RESTART_DEVICE, 0xFF]);
+        let written = read_until(&pty.master, &restart, Duration::from_secs(5));
+        assert!(
+            written.ends_with(&restart),
+            "the bridge's own restart is the last unit on the wire: {written:?}"
         );
     }
 

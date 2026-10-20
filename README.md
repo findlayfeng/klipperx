@@ -50,7 +50,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 | 项 | 状态 |
 |---|---|
 | 上游语料（`KLIPPERX_UPSTREAM_ALL=1`） | **239 条声明运行**：其中 **237 条字典齐备、全部通过 / 0 条失败**；另 2 条（`generic-cramps.cfg`、`generic-replicape.cfg`，BeagleBone/PRU 板）因未构建 `pru` 字典而跳过——它们也正是静态缺口报告里**仅剩**的一处（`replicape` 节未实现）。忽略列表**已清空** |
-| 单进程闸门 | `cargo test -p klipperx --lib` → **2574 通过 / 0 失败 / 4 忽略**（含全部语料；4 忽略 = `pru` 字典未构建×2、内联 gcode 解析、真机用例；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)；计数 2026-10-06 实测重核）。这条很快但**不是全量闸门**：它不含 `klippy-client` 的集成测试（如 `gcode_params_table`），合并前跑 `cargo test --workspace`。签入的内建参数表（`crates/klippy-client/src/gcode_params.rs`）现在**在构建期**就被校验（`crates/klippy-client/build.rs`）：过期会让构建直接失败，不再靠人们记得跑那条测试 |
+| 单进程闸门 | `cargo test -p klipperx --lib` → **3557 通过 / 0 失败 / 15 忽略**（含全部语料；墙钟 **47.9 s**；15 忽略以需真机的用例为主（未设 `KLIPPERX_HW_CONFIG` 时整组忽略），另有 `pru` 字典未构建等；忽略列表守卫是 `KLIPPERX_UPSTREAM_GUARD`，见[环境变量](#环境变量开发与测试)；计数 2026-10-19 实测重核）。这条很快但**不是全量闸门**：它不含 `klippy-client` 的集成测试（如 `gcode_params_table`），合并前跑 `cargo test --workspace`。签入的内建参数表（`crates/klippy-client/src/gcode_params.rs`）现在**在构建期**就被校验（`crates/klippy-client/build.rs`）：过期会让构建直接失败，不再靠人们记得跑那条测试 |
 | 真机 | 只有少量冒烟（单轴运动与位置读回、SPI flash、`stats`、`output_pin`、`mcu_temp`）；完整三轴/归零待接线，见 [`TESTING.md`](TESTING.md) |
 | `[extras]` 覆盖 | `src/core/klippy/extras/` 104 个模块、117 个 `section!` 声明（装载 id 同数，由 `test_the_factory_table_is_in_load_order` 钉住；2026-10-03 实测重核）；覆盖范围与逐模块说明见[开发手册模块表](docs/klippy/developer-manual/README.md) |
 | 输入通道 | API（`-a` unix socket，Moonraker 语义）与终端客户端**可用**；`virtual_sdcard` 的文件回放（`M20`–`M27`）**已实现**；上游 `GCodeIO` 的行协议输入（伪 tty / 文件输入、`ok` 应答）**不做**（需要 OctoPrint 串口主机或上游 batch mode 时请用上游 Klipper，见[本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)） |
@@ -71,13 +71,13 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
    剩下 `sdcard_loop` 的 `SDCARD_LOOP_*` 与文件回放未接。
 2. **温度语义**：`M105` 的 gcode_id 表已接线（`heaters.rs:417` 的 `gcode_id_to_sensor`，
    没有登记传感器时才回 `T:0`）；`M190`/`M109` 按等待版本注册（`extruder.rs:263`、
-   `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`b5da84e`）。
+   `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`a802cdc`）。
 3. **运行时参数**：`M204`/`SET_VELOCITY_LIMIT` 已注册（2026-10-04），改完**同时**进状态与
    规划器；`SET_PRESSURE_ADVANCE` 会记录但**不作用于运动**（PA 只存值，运动层未消费）。
 4. **常见宏依赖**：`save_variables`（`SAVE_VARIABLE`）已落地（2026-10-04），宏可读写
    `printer.save_variables.variables`；`delayed_gcode`、`respond` 与 `gcode_macro` 的
    `rename_existing` 连接期换名（KAMP / `M600` 这类常见 `printer.cfg` 靠它）也都已落地
-   （2026-10-06，`8113056`）。仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
+   （2026-10-06，`5ba2356`）。仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
 5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），但
    `ToolHead.wait_moves` 不等待 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模、`send_wait_ack`
    还没有对应原语（`motion/toolhead.rs:440-470`、`mcu/mod.rs:2639-2650`），真机上尚未验证

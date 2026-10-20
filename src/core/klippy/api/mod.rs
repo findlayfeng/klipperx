@@ -206,7 +206,11 @@ mod tests {
 
     /// The start arguments a host would have gathered.
     fn start_args() -> StartArgs {
-        StartArgs::collect("/tmp/printer.cfg", None)
+        StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        )
     }
 
     #[tokio::test]

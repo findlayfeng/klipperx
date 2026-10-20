@@ -88,20 +88,17 @@ const UNITS_PORT_FLAGS: u8 = MUX_PORT_UNITS;
 /// case, which is why `admin bridge port --legacy` keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortRoute {
-    /// The device speaks units: `MUX_PORT_UNITS` set, and the port forwards
-    /// them as bare CAN/UART slices.
+    /// The device speaks units: `MUX_PORT_UNITS` set.
     Units,
     /// The device predates the mux: no flags.
     Legacy,
 }
 
 impl PortRoute {
-    /// The `flags` byte [`Interface::send_set_port_node_id`] carries: a units
-    /// route says so, a legacy route's byte is `0` — no units at all, which is
-    /// [`LEGACY_PORT_FLAGS`].
+    /// The `flags` byte [`Interface::send_set_port_node_id`] carries.
     fn flags(self) -> u8 {
         match self {
-            Self::Units => MUX_PORT_UNITS,
+            Self::Units => UNITS_PORT_FLAGS,
             Self::Legacy => LEGACY_PORT_FLAGS,
         }
     }
@@ -610,7 +607,6 @@ mod tests {
     use crate::core::klippy::config::mcu::McuConfig;
     use crate::core::klippy::config::{Config, ConfigWrapper};
     use crate::core::klippy::frame::{MESSAGE_HEADER_SIZE, MESSAGE_TRAILER_SIZE};
-    use crate::core::klippy::interface::devices::host::{HostDevice, HOST_LIBRARY_TEST_LOCK};
     use crate::core::klippy::interface::devices::serial::{
         admin_unit, attach_downstream, decode_header, HeaderScan, ADMIN_LISTEN,
         CMD_REQUEST_BOOTLOADER, CMD_RESET_PORT, CMD_RESTART_DEVICE, CMD_SET_PORT_NODEID,
@@ -1468,34 +1464,6 @@ mod tests {
         out
     }
 
-    /// Block (bounded) until the process-wide library on `path` is unloaded,
-    /// then return — and **fail here** rather than warning.
-    ///
-    /// Releasing [`HOST_LIBRARY_TEST_LOCK`] with the mux library still loaded is
-    /// what makes the *next* host-library test meet a live image and fail with
-    /// "only one host library per process", so the blame has to land on this
-    /// test. The probe is [`HostDevice::load_bytes`] in another output mode: it
-    /// fails while the mux library is live and succeeds (dropping the probe
-    /// unloads it again) once it is gone — the same test as
-    /// `bridge_attach::wait_for_mux_library_unload`, but bounded with a panic so
-    /// a stuck teardown cannot smuggle a live library past the lock.
-    fn wait_for_library_unload(path: &std::path::Path) {
-        for _ in 0..200 {
-            match HostDevice::load_bytes(path, Some([0x5a; 6])) {
-                Ok(probe) => {
-                    drop(probe);
-                    return;
-                }
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        panic!(
-            "the mux host library at {} was still loaded after 2s; the next \
-             library test would meet a live image",
-            path.display()
-        );
-    }
-
     /// The session over a real bridge: the mux host library loaded as a bridge
     /// with two ports on real ptys — port 0 the flashing target (legacy, sitting
     /// in its bootloader), port 1 a named device the bridge restarts.
@@ -1514,25 +1482,25 @@ mod tests {
     /// `RESTART_DEVICE` for port 1 is forwarded to it header-stripped — the bare
     /// `KXID` frame a legacy port's line carries.
     ///
-    /// `multi_thread` is not incidental: [`Mcu::close`] only **aborts** the
-    /// transport tasks, and on the default current-thread runtime an abort is
-    /// processed by the runtime — which is idle while the test thread blocks in
-    /// the unload wait below. The aborted tasks would keep their `Interface`
-    /// clones (and so the library) until the runtime is dropped *after* the lock
-    /// is released, leaving the mux library live for the next test. On worker
-    /// threads the aborts land while the wait runs, and the library unloads.
+    /// `multi_thread` is not incidental: the test thread blocks in the ptys'
+    /// `poll` ([`read_pty`]), so the connection's transport tasks need worker
+    /// threads of their own to run while it does.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library, so it is not the per-path singleton the
+    /// other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_open_bridge_over_the_real_library() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // A bridge opens a port's tty when the host declares it, so those ttys
         // have to exist when the library comes up, each on its own pty.
         let target_port = Pty::new();
         let named_port = Pty::new();
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let path = library.display().to_string();
         let text = format!(
             "[mcu]\nhost_library: {path}\n\
@@ -1619,13 +1587,11 @@ mod tests {
         );
 
         // The connection's transport tasks hold references to the library, so
-        // its drop is not synchronous with `drop(mcu)`: close it, let the
-        // blocked device read see the shutdown, then wait the library out — all
-        // of it under `_serial`, whose scope is the whole test, so the next
-        // library test cannot start before this path is free.
+        // its drop is not synchronous with `drop(mcu)`: close it and let the
+        // blocked device read see the shutdown. Nothing waits the copy out —
+        // its path belongs to this test alone.
         mcu.close();
         drop(mcu);
         drop(link);
-        wait_for_library_unload(&library);
     }
 }

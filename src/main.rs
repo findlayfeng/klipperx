@@ -128,6 +128,24 @@ enum Commands {
         #[command(subcommand)]
         command: AdminCommands,
     },
+
+    /// Serve the Mainsail web UI that this binary carries
+    ///
+    // The service half of the pair below: the site is a packaged static site, so
+    // this is a file server for the copy embedded at build time, a `--dir` given
+    // on the command line, or a checkout's `dist/`. Its arguments all have
+    // defaults — there is one site to serve and one port for it — so naming
+    // `mainsail` alone is an instruction, not a question, and it gets no
+    // `arg_required_else_help`.
+    Mainsail(klipperx::ui::mainsail::MainsailArgs),
+
+    /// Run Moonraker against this host, keeping its Python environment here
+    ///
+    // The other half of the pair: Moonraker is what the site talks to, and it
+    // needs a virtualenv and a data directory that this subcommand owns. Same
+    // rule as `mainsail` — every argument has a default, so a bare `moonraker`
+    // runs it.
+    Moonraker(klipperx::ui::moonraker::MoonrakerArgs),
 }
 
 /// The `admin` command family: one subcommand per board-level job.
@@ -174,11 +192,15 @@ enum AdminCommands {
         command: AdminBridgeCommands,
     },
 
-    /// Reset a bridge itself, or a device on one of its ports
+    /// Reset a bridge itself, or a device on one of its ports, or send a board
+    /// on a CAN bus into its bootloader
     //
     // The admin-channel reset: without `--port` the bridge restarts itself (the
     // step `flash` does before declaring ports), and with `--port` the device
     // behind that declared port is reset, the way `--port-reset` says.
+    // `--interface can0 --uuid <hex> --bootloader` is the direct CAN form: one
+    // admin frame on the bus, which parks the board in katapult so
+    // `admin flash --interface` can write it.
     #[command(arg_required_else_help = true)]
     Reset(klipperx::flash::cli::ResetArgs),
 }
@@ -217,6 +239,8 @@ fn main() {
         (Some(Commands::Console(args)), _) => client::run_console(args).map(|()| 0),
         (Some(Commands::Stress(args)), _) => klipperx::stress::run(args).map(|()| 0),
         (Some(Commands::Admin { command }), _) => run_admin(command),
+        (Some(Commands::Mainsail(args)), _) => klipperx::ui::mainsail::run(args),
+        (Some(Commands::Moonraker(args)), _) => klipperx::ui::moonraker::run(args),
         // No subcommand: the arguments were the host's all along.
         (None, host) => run_host(host),
     };

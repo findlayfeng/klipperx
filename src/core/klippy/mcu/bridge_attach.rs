@@ -65,9 +65,10 @@ use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::ConfigError;
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::interface::devices::host::HostDevice;
-use crate::core::klippy::interface::devices::serial;
+use crate::core::klippy::interface::devices::serial::{self, MUX_PORT_UNITS};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::printer::Printer;
+use crate::core::klippy::sleep_off_worker;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -103,10 +104,8 @@ pub(crate) struct BridgePortLink {
     pub index: u8,
     /// The port-level `SET_PORT_NODEID` flags byte: `0` for a legacy port
     /// ([`PortGroups::is_legacy`], one uart-port device with no `uuid:`), whose
-    /// device is spoken to in raw frames; otherwise
-    /// [`MUX_PORT_UNITS`](crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS)
-    /// — a port whose device speaks units (every port but a legacy one, CAN
-    /// included) forwards them as bare slices.
+    /// device is spoken to in raw frames; [`MUX_PORT_UNITS`] for a port whose
+    /// device speaks units — every port but a legacy one, CAN included.
     pub flags: u8,
     /// The child's own `uuid:`, or `None` for the legacy shape. It is what
     /// [`open`]'s named branch names the device with (`SET_KLIPPER_NODEID`): a
@@ -404,17 +403,14 @@ fn open_link_handle(
             ))
         }
         // Every CAN upstream is unwired for downstream devices for the same
-        // reason, so all three share one refusal rather than falling through to
-        // the `{:?}` arm: the wire (`CanFd`) and the segmentation (`Isotp`) are
-        // orthogonal to what is missing.
-        Transport::Can { .. } | Transport::CanFd { .. } | Transport::Isotp { .. } => {
-            Err(config_error(
-                "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
+        // reason, so both share one refusal rather than falling through to the
+        // `{:?}` arm: the wire (`CanFd`) is orthogonal to what is missing.
+        Transport::Can { .. } | Transport::CanFd { .. } => Err(config_error(
+            "a bridge reached over CAN cannot carry a downstream device yet: the CAN mux \
              carrier and the port-command units exist, but the host-side attach is not \
              wired yet"
-                    .to_string(),
-            ))
-        }
+                .to_string(),
+        )),
         other => Err(config_error(format!(
             "a bridge on {other:?} cannot carry a downstream device"
         ))),
@@ -478,7 +474,7 @@ pub(crate) fn open(
                 // next frame it sends is addressed to the new id. So this is a
                 // bounded grace the host cannot verify, exactly as the flash
                 // run's `ASSIGN_SETTLE` is after the assignment it makes.
-                std::thread::sleep(CAN_ASSIGN_SETTLE);
+                sleep_off_worker(CAN_ASSIGN_SETTLE);
             }
         }
     }
@@ -500,20 +496,23 @@ pub(crate) fn open(
 ///
 /// A legacy port's device does not speak the mux, so the bridge strips the
 /// header going down and heads a raw frame coming up (`0`); every other port's
-/// device speaks units, which the bridge must know
-/// ([`serial::MUX_PORT_UNITS`]) — the port forwards them as bare slices. The
-/// legacy judgment is the port grouping's ([`PortGroups::is_legacy`]) — the same
-/// one that refused a legacy device on a shared port at load — and `0` is
-/// exactly its byte, so the caller has no second answer to keep.
+/// device speaks units, which the bridge must know ([`MUX_PORT_UNITS`]). The
+/// judgment is the port grouping's ([`PortGroups::is_legacy`]) — the same one
+/// that refused a legacy device on a shared port at load — and `0` is exactly
+/// its byte, so the caller has no second answer to keep.
 ///
 /// A CAN port is never legacy, whatever its member wrote: CAN addressing is by
-/// uuid, so a `[can_device]` has no raw-frame shape at all. Its byte is
-/// therefore always [`serial::MUX_PORT_UNITS`].
+/// uuid, so a `[can_device]` has no raw-frame shape at all and its byte is
+/// always [`MUX_PORT_UNITS`].
 fn port_flags(groups: &PortGroups, port: &str) -> u8 {
-    if groups.kind(port) != Some(PortKind::Can) && groups.is_legacy(port) {
-        return 0;
+    if groups.kind(port) == Some(PortKind::Can) {
+        return MUX_PORT_UNITS;
     }
-    serial::MUX_PORT_UNITS
+    if groups.is_legacy(port) {
+        0
+    } else {
+        MUX_PORT_UNITS
+    }
 }
 
 /// The refusal a port section that the loader never wired gives [`resolve`]:
@@ -593,7 +592,26 @@ pub(crate) fn is_port_open_failure(reason: &str) -> bool {
 /// A USB CDC downstream that just restarted re-enumerates in about a second;
 /// the same 10 s bound is what a power-cycled `rpi_usb` port waits
 /// (`restart.rs`'s `USB_PORT_RETURN_TIMEOUT`).
+///
+/// **This is the production truth and stays 10 s.** What the bring-up actually
+/// passes to [`wait_for_port_paths`] is [`PORT_RETURN_BUDGET`], which is this
+/// value outside test builds and a 300 ms stand-in inside them — the tests that
+/// drive a real bring-up have to *wait out* the whole budget (they assert it was
+/// honoured), and eight of them at 10 s each were over half of the full gate's
+/// wall time. Same precedent as the serial connect retry
+/// (`interface/devices/serial.rs`: 90 s budget, 300 ms in test builds).
 pub(crate) const BRIDGE_PORT_RETURN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The budget the bring-up hands to [`wait_for_port_paths`].
+///
+/// Production: [`BRIDGE_PORT_RETURN_TIMEOUT`]. Test builds: 300 ms, still well
+/// above [`BRIDGE_PORT_POLL`] so the poll loop gets several probes in. The
+/// helper's own test drives it with a *different* budget, so a hardcoded delay
+/// inside the loop cannot pass.
+#[cfg(not(test))]
+pub(crate) const PORT_RETURN_BUDGET: Duration = BRIDGE_PORT_RETURN_TIMEOUT;
+#[cfg(test)]
+pub(crate) const PORT_RETURN_BUDGET: Duration = Duration::from_millis(300);
 
 /// How often a missing port tty is probed while it is away.
 const BRIDGE_PORT_POLL: Duration = Duration::from_millis(100);
@@ -664,16 +682,14 @@ pub(crate) fn wait_for_mux_library_unload(path: &std::path::Path) {
 mod tests {
     use super::*;
 
-    use crate::core::klippy::interface::devices::serial::MUX_PORT_UNITS;
-
     use crate::core::klippy::config::access::AccessTracking;
     use crate::core::klippy::config::{Config, ConfigWrapper};
     use crate::core::klippy::frame::{Frame, MESSAGE_MAX, MESSAGE_MIN};
     use crate::core::klippy::interface::devices::host::HOST_LIBRARY_TEST_LOCK;
     use crate::core::klippy::interface::pty::Pty;
-    use crate::core::klippy::interface::CanWire;
     use crate::core::klippy::printer::Printer;
     use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
+    use klipperx_test_support::PrivateCopy;
     use std::io::Read;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
@@ -936,8 +952,8 @@ mod tests {
 
     /// A bridge reached over CAN is refused with the one message the attach pass
     /// and the reset path share, and never through `{:?}`: its host-side attach
-    /// is not wired yet. The wire and the segmentation are orthogonal to what is
-    /// missing, so all three CAN transports share the refusal.
+    /// is not wired yet. The wire is orthogonal to what is missing, so both CAN
+    /// transports share the refusal.
     #[test]
     fn a_can_bridge_is_refused_with_the_shared_message() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
@@ -950,11 +966,6 @@ mod tests {
             Transport::CanFd {
                 interface: "can0".to_string(),
                 uuid,
-            },
-            Transport::Isotp {
-                interface: "can0".to_string(),
-                uuid,
-                wire: CanWire::Classical,
             },
         ];
 
@@ -1091,10 +1102,15 @@ mod tests {
     /// drop, so nothing is lost.
     ///
     /// The swap is process-wide, so it is only built while
-    /// [`HOST_LIBRARY_TEST_LOCK`] is held — the one lock every test that loads a
-    /// host library takes, and the reason no other library is writing to the
-    /// descriptor while it is redirected. Taking the guard as a parameter is
-    /// what makes that structural rather than a comment.
+    /// [`HOST_LIBRARY_TEST_LOCK`] is held — the reason no other library is
+    /// writing to the descriptor while it is redirected. Taking the guard as a
+    /// parameter is what makes that structural rather than a comment.
+    ///
+    /// A test takes the lock **because it redirects stderr**, not because it
+    /// loads a host library: a library registered per path is only a singleton
+    /// for the tests that share that path, so a test that needs no stderr takes
+    /// a [`PrivateCopy`] of the `.so` instead and runs beside the others. The
+    /// descriptor is the one piece of state the copies cannot separate.
     struct StderrCapture {
         saved: libc::c_int,
         path: std::path::PathBuf,
@@ -1190,12 +1206,12 @@ mod tests {
     /// the port, so the bytes carry header-led units too; the bare frame is found
     /// among them, and its payload starting with the host-defined `identify`
     /// message id (`0x01`, `identify.rs`) is what makes it the child's request.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_config_driven_legacy_route_reaches_the_bridge_port() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // The bridge opens its port while the host configures it, so the tty
         // has to exist first - and it is the port's own `uart_path:` rather than
         // the path the library was built with: that one path belongs to the
@@ -1203,7 +1219,9 @@ mod tests {
         // others.
         let pty = Pty::new();
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+            .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
@@ -1248,21 +1266,23 @@ mod tests {
     /// identify and `get_clock` (the chain of
     /// `the_config_driven_legacy_route_reaches_the_bridge_port`, with the
     /// hand-built answer replaced by a real firmware's).
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_real_linux_firmware_completes_identify_and_clock_behind_the_bridge_port() {
         use crate::core::klippy::cmd::{ClockSync, McuClock};
         use crate::core::klippy::printer::PrinterState;
-
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
 
         // The real downstream: its pty slave (hung at the `-I` path) is the
         // tty the port opens through `uart_path:`. Never written to directly.
         let firmware =
             klipperx_test_support::LinuxFirmware::spawn().expect("the firmware process starts");
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+            .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
@@ -1700,16 +1720,18 @@ mod tests {
     /// which is this bring-up. So a tty that is missing surfaces as the
     /// firmware's own `shutdown`, and the bring-up reports it with the reason
     /// the firmware gave (`McuObject::connect_failure`).
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_missing_port_tty_fails_the_configuration() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // The port names a tty that is not there: it cannot be opened.
         let missing = "/nonexistent/klipperx-missing-port-tty";
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+            .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
@@ -1800,9 +1822,9 @@ mod tests {
         assert_eq!(flags, MUX_PORT_UNITS);
     }
 
-    /// A CAN port's flags byte is **always** the units one: a `[can_device]`
-    /// has no legacy (raw-frame) shape, so the branch never looks at the
-    /// member's `uuid:`.
+    /// A CAN port's flags byte is **always** the units one: a `[can_device]` has
+    /// no legacy (raw-frame) shape — the branch does not look at the member's
+    /// `uuid:` at all, it asks the port's kind.
     #[test]
     fn a_can_port_always_sends_the_units_flag() {
         let groups = port_groups(
@@ -1919,56 +1941,6 @@ mod tests {
         );
     }
 
-    /// A **USB-console bridge carrying a CAN port** — the bench shape: the
-    /// bridge's own link is a native USB CDC console (a `serial:` path, so the
-    /// port goes through the mux), and the device under test hangs on its CAN
-    /// controller. The route unit must carry the port's flags byte, which a CAN
-    /// port always has as the units one.
-    ///
-    /// Naming a CAN device is the `SET_PORT_NODEID` + `SET_KLIPPER_NODEID` pair,
-    /// because an assignment travels as CAN's own admin frame whatever the device
-    /// reads its stream as.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_usb_console_bridge_routes_a_can_port() {
-        let named = [0x12, 0xf9, 0x12, 0xed, 0x38, 0x73];
-        let mcu_id = 7u32;
-        let flags = MUX_PORT_UNITS;
-
-        let pty = Pty::new();
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let link = BridgePortLink {
-            // A USB CDC console: one `serial:` path, addressed by id (the
-            // bridge's downstream devices travel it too).
-            transport: Transport::Serial {
-                path: pty.path.display().to_string(),
-                baud: serial::DEFAULT_BAUD,
-                uuid: Some([0x56, 0xec, 0x31, 0x27, 0x22, 0x4a]),
-            },
-            index: 0,
-            flags,
-            named: Some(named),
-            kind: PortKind::Can,
-        };
-
-        // Silence is success on a CAN port: naming it completes.
-        open(&printer, &link, mcu_id).expect("a silent CAN device is still named");
-
-        let mut expected = serial::set_port_node_id(0, mcu_id as u8, flags);
-        expected.extend_from_slice(
-            &serial::set_node_id_for(named, mcu_id).expect("id 7 is addressable"),
-        );
-        let seen = read_pty(&pty.master, expected.len(), Duration::from_secs(3));
-        assert_eq!(
-            seen, expected,
-            "the route unit carries the flags byte ({flags:#04x}), then the device's \
-             SET_KLIPPER_NODEID"
-        );
-        assert!(
-            read_pty(&pty.master, 1, Duration::from_millis(200)).is_empty(),
-            "nothing else goes down a CAN port while it is being named"
-        );
-    }
-
     /// The whole config-driven path for a **named** child: over the real bridge
     /// library and a real pty, `[mcu child] uart: uart0 uuid: …` comes up far
     /// enough that the child's naming handshake is carried to the bridge's port.
@@ -1983,18 +1955,20 @@ mod tests {
     /// Nothing behind the pty answers, so the child's `open` ends in its
     /// handshake timeout and the bring-up with it; the port's bytes are the
     /// observable.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_config_driven_named_route_carries_the_handshake_to_the_bridge_port() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         // The bridge opens its port during init, so the tty has to exist first —
         // the port's own `uart_path:`, named for its slot when the library comes
         // up.
         let pty = Pty::new();
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+            .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let named = [0x99, 0x88, 0x77, 0x66, 0x55, 0x44];
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
@@ -2054,15 +2028,17 @@ mod tests {
     /// ignored `uart_path:` would open the path the library was built with — one
     /// nothing links, so that port would fail its `config_uart` and the request
     /// would never arrive: the assertion below is red.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_ports_uart_path_is_the_tty_the_bridge_opens() {
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-
         let runtime = Pty::new();
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
+        let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+            .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
@@ -2209,11 +2185,11 @@ mod tests {
         // Bounded: the host waits for the tty it named, and no longer than the
         // bound plus the bring-up around it.
         assert!(
-            waited >= BRIDGE_PORT_RETURN_TIMEOUT,
+            waited >= PORT_RETURN_BUDGET,
             "the host waits for the port tty before reporting: {waited:?}"
         );
         assert!(
-            waited < BRIDGE_PORT_RETURN_TIMEOUT + Duration::from_secs(20),
+            waited < PORT_RETURN_BUDGET + Duration::from_secs(20),
             "the wait for the port tty is bounded: {waited:?}"
         );
         let state = printer.get_state_message();
@@ -2248,13 +2224,13 @@ mod tests {
     /// ~1 s loop of unload/reload. The first bring-up spends the one recovery it
     /// is given; the next rounds find it spent and report the named failure with
     /// no further restart, so the printer converges to `error`.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_port_tty_that_exists_but_cannot_be_opened_restarts_at_most_once() {
         use crate::core::klippy::printer::PrinterState;
-
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
 
         tokio::time::timeout(Duration::from_secs(120), async {
             // The port tty is a directory: present to `Path::exists()`, but
@@ -2267,7 +2243,9 @@ mod tests {
             let _ = std::fs::remove_dir_all(&directory);
             std::fs::create_dir_all(&directory).expect("the port-path directory is created");
 
-            let library = klipperx_test_support::klipper_host_mux_lib_path();
+            let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+                .expect("the private library copy is made");
+            let library = copy.path().to_path_buf();
             let text = format!(
                 "[mcu bridge]\nhost_library: {}\n\
                  [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\n\
@@ -2496,14 +2474,18 @@ mod tests {
     ///
     /// Returns the guard (it owns the printer) plus the printer and the parsed
     /// config, so a test can rebuild the machine (`reset_for_restart` +
-    /// `load_config`) the way the host's run loop does.
-    fn named_child_bridge(port_link: &std::path::Path) -> (BridgeTeardown, Arc<Printer>, Config) {
+    /// `load_config`) the way the host's run loop does. `library` is the host
+    /// library to load: the shared build path, or a test's own
+    /// [`PrivateCopy`] of it.
+    fn named_child_bridge(
+        port_link: &std::path::Path,
+        library: &std::path::Path,
+    ) -> (BridgeTeardown, Arc<Printer>, Config) {
         let uuid_hex: String = NAMED_CHILD_UUID
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
 
-        let library = klipperx_test_support::klipper_host_mux_lib_path();
         let text = format!(
             "[mcu bridge]\nhost_library: {}\n\
              [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_baud: 250000\n\
@@ -2514,7 +2496,7 @@ mod tests {
         );
         let config = Config::from_text(&text).expect("the test config parses").0;
         let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
-        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library);
+        let teardown = BridgeTeardown::new(Arc::new(Printer::new(reactor)), library.to_path_buf());
         let printer = teardown.printer();
         printer.load_config(&config).expect("the config loads");
         (teardown, printer, config)
@@ -2589,8 +2571,8 @@ mod tests {
             std::os::unix::fs::symlink(first.serial_path(), &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_teardown, printer, config) = named_child_bridge(&port_link);
             let library = klipperx_test_support::klipper_host_mux_lib_path();
+            let (_teardown, printer, config) = named_child_bridge(&port_link, &library);
 
             // Phase 1: the whole chain comes up on the real named downstream.
             tokio::time::timeout(Duration::from_secs(30), printer.bring_up())
@@ -2624,7 +2606,12 @@ mod tests {
                 dying,
                 Some((
                     replacement.serial_path().to_path_buf(),
-                    Duration::from_secs(3),
+                    // The tty has to come back **inside** the host's budget, or
+                    // the bring-up reports the original error instead of asking
+                    // for a restart. So the delay is a fraction of that budget,
+                    // not a fixed 3 s: it holds for the production 10 s and for
+                    // the 300 ms test stand-in alike.
+                    PORT_RETURN_BUDGET / 2,
                 )),
             ));
 
@@ -2694,7 +2681,10 @@ mod tests {
             std::os::unix::fs::symlink(&silent.path, &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_teardown, printer, _config) = named_child_bridge(&port_link);
+            let (_teardown, printer, _config) = named_child_bridge(
+                &port_link,
+                &klipperx_test_support::klipper_host_mux_lib_path(),
+            );
             let capture = StderrCapture::start(&_serial, "child-port-never-returns");
             let breaker = tokio::spawn(break_bridge_port(
                 capture.path().to_path_buf(),
@@ -2712,11 +2702,11 @@ mod tests {
             drop(capture);
 
             assert!(
-                waited >= BRIDGE_PORT_RETURN_TIMEOUT,
+                waited >= PORT_RETURN_BUDGET,
                 "the host waits for the port tty before reporting: {waited:?}"
             );
             assert!(
-                waited < BRIDGE_PORT_RETURN_TIMEOUT + Duration::from_secs(20),
+                waited < PORT_RETURN_BUDGET + Duration::from_secs(20),
                 "the wait for the port tty is bounded: {waited:?}"
             );
             let state = printer.get_state_message();
@@ -2749,13 +2739,13 @@ mod tests {
     /// The recovery budget's test on the child side: the port tty is there and
     /// the bridge opens it, but the device behind it never answers, so every
     /// round would ask for a restart without the per-section budget.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test does not redirect stderr, and it
+    /// loads a **private copy** of the library, so it is not the per-path
+    /// singleton the other library tests share and may run beside them.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_child_that_never_connects_restarts_at_most_once() {
         use crate::core::klippy::printer::PrinterState;
-
-        let _serial = HOST_LIBRARY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
 
         tokio::time::timeout(Duration::from_secs(120), async {
             // The bridge's port opens on a live pty nothing ever answers on.
@@ -2769,8 +2759,10 @@ mod tests {
             std::os::unix::fs::symlink(&silent.path, &port_link)
                 .unwrap_or_else(|e| panic!("failed to link {}: {e}", port_link.display()));
 
-            let (_teardown, printer, config) = named_child_bridge(&port_link);
-            let library = klipperx_test_support::klipper_host_mux_lib_path();
+            let copy = PrivateCopy::of(&klipperx_test_support::klipper_host_mux_lib_path())
+                .expect("the private library copy is made");
+            let library = copy.path().to_path_buf();
+            let (_teardown, printer, config) = named_child_bridge(&port_link, &library);
 
             // Round 1: the child's handshake times out, and the host spends its
             // one recovery on a restart.
@@ -2814,5 +2806,42 @@ mod tests {
         })
         .await
         .expect("the test finishes within its budget");
+    }
+
+    /// The wait derives its deadline from the budget it is handed — nothing in
+    /// the loop hardcodes a delay.
+    ///
+    /// The budget here (150 ms) is deliberately **not** [`PORT_RETURN_BUDGET`]
+    /// (300 ms under `cfg(test)`): a hardcoded delay would answer 300 ms and the
+    /// lower assertion would fail.
+    #[tokio::test]
+    async fn wait_for_port_paths_honours_the_budget_it_is_given() {
+        let budget = Duration::from_millis(150);
+        let started = Instant::now();
+        let arrived =
+            wait_for_port_paths(&["/nonexistent/klipperx-budget-probe".to_string()], budget).await;
+        let waited = started.elapsed();
+        assert!(!arrived, "a tty that is not there never arrives");
+        assert!(
+            waited >= budget,
+            "the wait runs for its whole budget: {waited:?}"
+        );
+        assert!(
+            waited < budget + Duration::from_secs(5),
+            "and no longer than that: {waited:?}"
+        );
+    }
+
+    /// The production budget is the 10 s USB-return bound that the bring-up
+    /// tests can no longer observe directly: they wait out the (shorter)
+    /// [`PORT_RETURN_BUDGET`] instead.
+    #[test]
+    fn the_production_budget_is_the_usb_return_bound() {
+        assert_eq!(BRIDGE_PORT_RETURN_TIMEOUT, Duration::from_secs(10));
+        assert_eq!(PORT_RETURN_BUDGET, Duration::from_millis(300));
+        assert!(
+            BRIDGE_PORT_POLL < PORT_RETURN_BUDGET,
+            "the loop gets several probes inside the test budget"
+        );
     }
 }

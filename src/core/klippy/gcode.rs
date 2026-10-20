@@ -847,12 +847,13 @@ impl GCodeDispatch {
                     let printer = self.inner.printer.clone();
                     sync(move |gcmd: &GcodeCommand| {
                         // The host's own version, from the start arguments
-                        // (`start_args['software_version']`); the crate version
-                        // is the fallback before the host sets them.
+                        // (`start_args['software_version']`); the composed
+                        // upstream-plus-crate version is the fallback before
+                        // the host sets them.
                         let version = printer
                             .upgrade()
                             .map(|printer| printer.software_version())
-                            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+                            .unwrap_or_else(crate::version::software_version);
                         let msg = format!("FIRMWARE_NAME:Klipper FIRMWARE_VERSION:{version}");
                         gcmd.respond_info(&msg);
                         Ok(())
@@ -2039,7 +2040,11 @@ mod tests {
         // `start_args['software_version']`), so a host that sets them gets its
         // own version in the reply.
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
-        let mut args = crate::core::klippy::api::StartArgs::collect("/tmp/printer.cfg", None);
+        let mut args = crate::core::klippy::api::StartArgs::collect(
+            "/tmp/printer.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
         args.software_version = "v9.9.9-test".to_string();
         printer.set_start_args(Arc::new(args));
         let dispatch = GCodeDispatch::new(Arc::clone(&printer));

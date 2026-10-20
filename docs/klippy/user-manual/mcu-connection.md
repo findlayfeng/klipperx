@@ -8,8 +8,7 @@
 | `uuid` | MCU 芯片的唯一 ID（12 位十六进制） | CAN 模式必给（Klipper 旧名 `canbus_uuid` 兼容，同节双写报错）；写在 `serial` 节上则连接期用它指派 id（见下节「共享串口」，独占串口忽略它） |
 | `canbus_interface` | CAN 网络接口名 | 可选，默认 `can0` |
 | `canbus_nodeid` | **MCU 层 id**（1..=255；CAN 上即节点号） | **可选**：不写就由 `[mcu_ids]`（历史名 `[canbus_ids]`）的分配器发 `4` 起的最小空位；写了就用写的那个（分配器装载时预扫全配置保留显式号，自动号绕开，写在哪个位置都生效）。只在两个显式号互撞、或 `4..=255` 占满时装载期报错 |
-| `canbus_protocol` | CAN **传输层**：`cans`（默认，Klipper 的 can-serial 字节流）或 `isotp`（ISO 15765-2 分段，一条 Klipper 帧 = 一条 ISO-TP 消息） | 只在 CAN 节有意义（其余节写它会被判「第二个接口」）。按**设备类型**选路：支持 FD 的板子用 `cans`；标准 CAN 板子用 `isotp` 承载大于一帧的 Klipper 消息。两种模式**不叠加**。不写 = `cans`，与今天逐字节同行为 |
-| `canbus_fd` | CAN **链路层**：`true` = CAN-FD（64 B/帧），默认 `false` = 经典 CAN（8 B/帧） | 与 `canbus_protocol` **正交**。已验收：`cans`+`true`、`isotp`+`false`；**`isotp`+`true` 合法但未验证**（解析期 `warn` 一次）。只在 CAN 节有意义 |
+| `canbus_fd` | CAN **链路层**：`true` = CAN-FD（64 B/帧），默认 `false` = 经典 CAN（8 B/帧） | 只在 CAN 节有意义（其余节写它会被判「第二个接口」）。不写 = `false`，与今天逐字节同行为 |
 | `host_library` | klipper host 库（`libklipper_host.so`）的路径 | 在主机进程内运行一份 klipper 固件（模拟与自测用）；**同路径被多颗 `[mcu]` 引用时库只加载一次**（通讯复用，一个 runtime/reader），各拿一个通讯引用共享它，`shutdown` 只停本引用、最后一个引用析构才卸载；旧固件没有桥/没有 mux 时，同一时刻只能有一路活动引用（设备层在 `interface/devices/host.rs`）。**2026-10-16 起一进程可跑多份库**：库不再装进程级 `SIGUSR1`（唤醒改按实例 `eventfd`），运行期/配置层那两处「按路径拒绝第二条」的守卫也已去掉；要两份**同进程独立固件**须加载**两份不同文件的拷贝**（`dlopen` 按 inode 识别，同一文件仍返回同一映射），同路径多节则照旧只加载一次并共享。|
 | `uart` | 引用 `[uart_device <名>]` 端口节的名字 | 把这颗 MCU 挂到**桥的下游 uart 口**上（端口本身用 `[uart_device]` 节声明，见下节「桥下游端口」）。`uuid` 可选——不写即 legacy。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥 |
 | `can` | 引用 `[can_device <名>]` 端口节的名字 | 挂到桥的下游 CAN 口。**`uuid` 必填**（CAN 寻址靠它）。与 `serial`/`host_library`/`test`/`canbus_interface`/`uart` 互斥。**配置面已接线且真机跑通**：主机为端口节发 `config_can`（带 `can_bitrate`）+ `config_bridge_port`，端口 `index` = 声明顺序（同 `uart_device`）；附着时发 `SET_PORT_NODEID` → 设备命名（CAN 走 `0x3f0` 单帧 + `0x3f1` 应答，不等串口 mux 的重确认）。运行期会话（`identify` + 配置握手 + 周期 `get_clock`）已真机验过，可反复附着；吞吐数字见[桥下游链路的吞吐与余量](#桥下游链路的吞吐与余量真机实测) |
@@ -28,11 +27,12 @@ canbus_nodeid: 2
 host_library: /usr/local/lib/libklipper_host.so
 ```
 
-节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。
+节名取自节的 sub（`[mcu zboard]` → `zboard`）。串口按 raw 模式打开：不回显、不做 CR/LF 转换、不启用协议没用到的流控。**连接期如果 tty 还不存在**（板子刚复位/上电、或宿主机先于内核枚举启动），独占串口的**打开**会按上游的预算重试：间隔 **5 s**、总预算 **90 s**（`serialhdl.py:181-204`），期间每条命令/信号都会让等待提前结束；握手与配置**不**重试，所以真正的协议错误仍是一次就报。`reset` 之后的重新打开走另一套有界重连循环（3 次），两层预算不叠加。`restart_method` 见下面的[固件重启方式](#固件重启方式restart_method)。
 
 CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬到 CAN 上跑），不是 CAN 协议本身。**CAN 的键名沿用 Klipper**（`canbus_interface` / `canbus_nodeid` 照旧），身份键则规范为 `uuid`——`canbus_uuid` 仍兼容（现有 Klipper 配置照用，同节两个都写会报错），「机器怎么接线」的语义不变。代码里那层实现叫 `CanSerial*`，把 `Canbus` 这个名字留给将来真正实现 CAN 协议的接口。
 
-**两个新键把「链路层」与「传输层」分开**（本仓扩展，上游无对应）：`canbus_fd` 选链路（经典 8 B/帧 / CAN-FD 64 B/帧），`canbus_protocol` 选传输（`cans` 的字节流切片 / `isotp` 的 ISO 15765-2 分段）。两者正交、四种组合都合法，但**已验收的只有两种**，对应两类设备：**支持 FD 的板子**用 `cans` + `canbus_fd: true`（一帧 64 B 直接装下上限 64 B 的 Klipper 消息，传输层保持现状），**标准 CAN 板子**用 `canbus_protocol: isotp`（8 B 帧装不下，靠 ISO-TP 承载）；`isotp` + `canbus_fd: true` 是保留可能性、解析期会 `warn` 一次「未验证」。不写这两个键就是今天的 `cans` + 经典 CAN，逐字节不变。
+
+**`canbus_fd` 把「链路层」拆出来**（本仓扩展，上游无对应）：它选链路（经典 8 B/帧 / CAN-FD 64 B/帧，一帧 64 B 直接装下上限 64 B 的 Klipper 消息），传输层仍是 Klipper 的 can-serial 字节流切片。不写它就是今天的经典 CAN，逐字节不变。
 
 节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
 
@@ -54,13 +54,13 @@ serial: /dev/ttyUSB0
 
 - **baud**：共享路径上以**显式写出的** baud 为准；多颗写了不同的值就 `warn` 并**取最小值**，没写 baud 的节跟着这个值走（不一致不再是配置错）。
 - **id**：就是 `[mcu_ids]` 分给该 MCU 的号（**仅 CAN 节**可用 `canbus_nodeid` 显式覆盖），与 CAN 节点号**同一个号段**——寻址用同一套映射 `0x100 + 2*id`（设备应答 `+1`）。
-- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。
+- **握手**：每颗 MCU 在**打开（分配）这个共享端口时**同步做一次 id 指派握手，identify 之前完成；默认 **500 ms × 3 次**，无回执即连接失败。节上写了 `uuid`（或别名 `canbus_uuid`）时，握手**先按它发一枚 SET_NODEID**（`0x3f0` 的 `0x01`，按 uuid 点名 id）再发原有的重确认请求——帧序见[串口复用协议](../developer-manual/serial-mux-protocol.md)；独占串口**忽略** `uuid`（不发任何帧）。**`klipperx admin` 的桥 attach 是唯一例外**：握手无应答时它不放弃，而是先把链路开出来、由 `identify` 接管陈旧会话，再在同一个 handle 上补做这次握手（见下文“桥的上游链路”节的刷写工具注意项）；`printer.cfg` 的连接路径仍按上面的硬限制走。
 - **复位**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb` 切电）作用在**整条线**上，会把共享端口上的所有 MCU 一起打断——所以共享路径**强制 `restart_method: command`**：**显式写了**别的值（`arduino`/`cheetah`/`rpi_usb`）会在装载期告警并改用 `command`；没写则静默降级（串口默认的 `arduino` 只是默认）；非法拼写仍是配置错。
 - **发现**：还没分配 id 的设备用 `klipperx admin scan` 扫出可粘进配置的 uuid（`--interface <总线>` 扫 CAN、`--port <tty>` 扫串口、`--host-library <path.so>` 扫一份 host 库、`--bridge <tty>` 扫桥下游各口；单次广播查询 + 截止窗口 + 按 uuid 去重，四种传输输出同形）。扫 host 库时用 `--host-identity <12 位十六进制>`（默认全 `0`）给出库在 `init` 前要采纳的身份，它**只在给了 `--host-library` 时可用**。
 
 **桥的上游链路也是复用**：被 `[uart_device]`/`[can_device]` 的 `*_mcu` 指为桥的那颗 `[mcu]`，其 `serial:`/`host_library:` 路径**按 id 寻址**，与引用颗数无关——这条链路上还跑着桥下游设备的帧（规则 7）。判定式是 `按 id 寻址 = 共享 ∨ 下游设备数 ≥ 1 ∨ 是桥`（`mcu/serial_ports.rs::is_id_addressed`，host 库侧同构 `mcu/host_libraries.rs::path_is_mux`）；**下游设备数**是挂在桥端口节（`uart:`/`can:`）上的 `[mcu]` 个数（`mcu/bridge_ports.rs::bridge_downstream_counts`）。**0 台下游的桥仍按 id 寻址**是刻意口径：桥被 mux 化后输出就带帧头，按裸帧解会错位。
 
-> 设备端**设备半与桥半都已实现，但没有架构默认启用它们**：`src/mux.c` 的设备半（就地解析、答扫描、采纳 node id、id 冲突照 CAN 弃号、剥头交付）与 `src/bridge.c` 的桥半（端口表、`uuid → 端口`/`id → 端口` 路由、扇出、单设备路径剥头加头）都在，host 库还有下游串口端口与 unit 收发接口；**mux 路径的真端到端 attach 已有永久测试**。串口侧已由各 MCU 架构（`chipid_init` 派生身份）与 linux 进程控制台（`-U <12 hex>`）接线、host 库由 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 选上；CAN 侧由 `MUX_CAN` 接线（`depends on CANBUS && HAVE_CHIPID`，同一套单元跑在 CAN 字节流里）。**`linux` 架构现在也能当 can-serial 节点**（`LINUX_CANSERIAL`：SocketCAN 控制台，身份只能由 `-U` 给——linux 没有芯片 id），但 `MUX_CAN` 仍不适用于 linux。**两种载体都刻意不默认开**——单元格式不是上游 klippy 主机说的格式，必须显式选择；误配到没开 mux 的旧固件只会连接失败/握手超时，不会搞乱会话。CAN **下游端口**（`BRIDGE_PORT_CAN`）与它的 ISO-TP 端口载具（`BRIDGE_PORT_CAN_ISOTP`，只用于运行期）已落地并经真机验证（见下节 CAN 小节），`printer.cfg` 的 `[can_device]` 端口节也已接线；仍未接线的是 CAN **上游** attach。
+> 设备端**设备半与桥半都已实现，但没有架构默认启用它们**：`src/mux.c` 的设备半（就地解析、答扫描、采纳 node id、id 冲突照 CAN 弃号、剥头交付）与 `src/bridge.c` 的桥半（端口表、`uuid → 端口`/`id → 端口` 路由、扇出、单设备路径剥头加头）都在，host 库还有下游串口端口与 unit 收发接口；**mux 路径的真端到端 attach 已有永久测试**。串口侧已由各 MCU 架构（`chipid_init` 派生身份）与 linux 进程控制台（`-U <12 hex>`）接线、host 库由 `HOST_MUX_SERIAL`/`HOST_BRIDGE_SERIAL` 选上；CAN 侧由 `MUX_CAN` 接线（`depends on CANBUS && HAVE_CHIPID`，同一套单元跑在 CAN 字节流里）。**`linux` 架构现在也能当 can-serial 节点**（`LINUX_CANSERIAL`：SocketCAN 控制台，身份只能由 `-U` 给——linux 没有芯片 id），但 `MUX_CAN` 仍不适用于 linux。**两种载体都刻意不默认开**——单元格式不是上游 klippy 主机说的格式，必须显式选择；误配到没开 mux 的旧固件只会连接失败/握手超时，不会搞乱会话。CAN **下游端口**（`BRIDGE_PORT_CAN`）已落地并经真机验证（见下节 CAN 小节）；仍未接线的是 CAN **上游** attach 与 `printer.cfg` 的 `[can_device]` 端口节。
 
 ### 线上的形状（设备端实现规格）
 
@@ -171,8 +171,7 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 out/firmware
 `--port-nodeid` 是桥给那个口的名字（`1..=255`），**不能是 `1`**——那是桥自己在这条链路上的 id，
 撞了隧道上的块会与桥自己的帧同 arb。
 
-**单独复位也行**：`admin reset --bridge <tty>` 复位**桥自身**（`RESTART_DEVICE(0xFF)` 穿透给它，重开 +
-重 identify 成功才算完）；`admin reset --bridge <tty> --port N [--port-reset reset-port|restart-device|bootloader]`
+**单独复位也行**：`admin reset --bridge <tty>` 复位**桥自身**（`RESTART_DEVICE(0xFF)` 穿透给它；**下发命令不需要 identify**，重置之后才重开 + identify 确认桥回来了）；`admin reset --bridge <tty> --port N [--port-reset reset-port|restart-device|bootloader]`
 复位该口设备（`0x04`/`0x05`/`0x02`，无回执，只能当“已发出”）。**注意**：这里的 `bootloader` 发的是裸
 `0x02`，只有该口已经被命名成 UNITS 时才送得到（且不会把口改回 legacy）；**要“刷之前切引导”，用 ④
 的 `--port-reset bootloader`**——它会自己先切 UNITS、发请求、等 5 s、再切回 legacy 开隧道。
@@ -196,9 +195,17 @@ klipperx admin flash --bridge /dev/ttyACM0 --port 0 --port-nodeid 7 \
   = 300 ms，窗口内迟到的应答丢掉）」归属，所以最坏情况是**漏报**（少列一个口上的设备），不会错报。
 - 桥已指派、但号不是 `admin` 工具默认的 `1`（`BRIDGE_MCU_ID`）时，初次打开需要
   `--bridge-uuid <12 位十六进制>` 点名（或先用 `admin scan` 取身份）；每一轮都重启桥的结构下，这是
-  正常代价，不是配置错。
+  正常代价，不是配置错。（可自动化：同一个 by-id 的 `admin scan --port` 已经能拿到该身份，现在只做到
+
+「不填就提示」，没有替你回填。）
 - 桥已在我们上一条命令里被赋过 node id 时，紧接着的**下一条命令**可能先报一次 `opening the bridge: Receive timeout`
-  ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）；仍失败就等几秒再试，或用 `--bridge-uuid`。
+  ——工具会自动重试（3 次 / 4 s 间隔 / 25 s 总预算）。**重试耗尽也不再直接放弃**（2026-10-18）：
+  它改为“不握手先把链路开出来 → `identify` 用 klippy 自己的接管逻辑清掉陈旧会话（重号重发）→
+  在**同一个 handle** 上补做分配握手”。接管就是普通 MCU 连接的那套，不是刷写工具自创的
+  命令序列（`mcu/mod.rs`）。失败分三种文案：真没应答 ⇒ 仍是 `AttachUnanswered`；板子在应答另一个
+  连接（重号后计数仍在跳）⇒ 直接点名“另一个进程（通常是 klippy）正在驱动这块板，先停掉它再重试”；
+  其余是 identify 自己的错。所以“被 `kill -9` 过的桥需要断电重插”不再成立。
+  （若仍想少走这一趟：用 `--bridge-uuid` 点名，或等几秒再试。）
 - **`printer.cfg` 侧已接线并真机跑通**：`[can_device]` 端口节由主机在配置期发 `config_can` + `config_bridge_port`，
   子设备用 `can:` 按名字引用；附着顺序是「路由（`SET_PORT_NODEID`）→ 设备命名（`0x3f0` 单帧，等 `0x3f1` 应答，
   超时也算已发出）」，之后 `identify` + 配置握手走 CAN 端口的中继会话（真机已通，可反复附着）。
@@ -232,8 +239,7 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
 
 - **速率**：`--can-bitrate`（默认 1000000）是**下游这段总线**的速率，桥会在开端口时用
   `canhw_set_rate` 改 BTR，所以换速率**不用重烧桥**；两端必须一致（下游的 `CANBUS_FREQUENCY`）。
-- **应用载具不影响刷机**：应用把字节流做成 ISO-TP（`CONFIG_ISOTP`）也可以照上面一条命令刷——
-  「送引导」走的是 CAN 单帧 admin（`0x3f0 [0x02][uuid]`），与载具无关；隧道仍是切片（katapult 只会切片）。
+- **送引导走 CAN 单帧 admin**：「送引导」走的是 `0x3f0 [0x02][uuid]`，与载具无关；隧道仍是切片（katapult 只会切片）。
 - **桥自己进引导**（改桥固件用）：`klipperx admin reset --bridge <桥 tty> --bootloader`，之后桥以
   `usb-katapult_stm32f446xx_<serial>` 出现，直接 `admin flash --device` 写它。
 - **F1 上 USB 与 CAN 互斥**（共用中断向量 20）：F103 做 CAN 桥只能用 USART 控制台；要 USB 控制台就
@@ -252,7 +258,6 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
 | UART 250 kbaud（默认） | **930** req/s | 1160 | 2270（debug）/2834（release） | — | — |
 | UART **500 kbaud** | **1814** req/s | 1452 | 2834 | **145 455** steps/s | ✅ |
 | CAN 1 Mbit（切片） | **2268** req/s | 2270 | 2834 | **15 625** steps/s | ✅ |
-| CAN 1 Mbit（桥端口 **ISO-TP 载具**） | **594** req/s | 380 | 2270 | **145 455** steps/s | ✅ |
 
 参照：同类 F103 **直连 USB** 的步进上限是 339 623 steps/s、往返 3552 req/s（[压力测试](../developer-manual/stress.md)），
 所以“桥中转 + mux”在这两条指标上大约要打 4 折（步进）和 8 折（往返）。
@@ -272,16 +277,6 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
   比这个数字好；但它确实说明 **CAN 端口不适合当作高步频板的唯一链路**，而 UART 500 k 可以。
 - **延迟**：中继 RTT 在 250 k 约 1.39 ms，500 k 约减半，CAN 1 Mbit 同量级；klipper 的移动队列
   有 1–2 s 深度，这点延迟无感，但不要拿它接“高速步进 + 极小 buffer”的组合。
-- **ISO-TP 载具（`can_protocol: isotp`）比切片贵，但不是“不能用”**：同一条 1 Mbit、同一块下游板，
-  切片 **2268** → ISO-TP **594** req/s（约 1/4；每往返 1.68 ms 对 0.44 ms），与桥自己并发时下游 **380**
-  （桥自己 2270 不变）。代价不在带宽而在**往返次数**：一条 22 B 的量测消息在 8 B 经典帧下是
-  FF + 若干 CF，FF 之后要等接收侧的流控帧，而 CF 由**任务**发（不在中断里），于是每个方向多出两次
-  调度往返。`step` 与切片同档（145 455 steps/s，瓶颈在下游固件的脉冲生成），`motion` 绿。**能切片就
-  切片**：ISO-TP 只在「共享总线上要给多台设备分地址、且设备只会讲 ISO-TP」时才值得。
-- **ISO-TP 的发送队列要够一个主机窗口**：两端都是「发完一条再发下一条」，而主机允许
-  **12 块**在线上未确认（`MAX_PENDING_BLOCKS`）；每块都会换来一条应答/确认消息，队列只有 2 槽时
-  这个突发会被**静默丢**几成（不报错，只是慢），16 槽才装得下一整窗。实测就是这一个改动把
-  桥 CAN 端口的 ISO-TP comm 从 244 拉到 **594** req/s。
 
 ### 主机直连 CAN：把一块板子当 USB-CAN 收发器
 
@@ -295,7 +290,7 @@ klipperx admin flash --bridge $B --port 0 --port-nodeid 7 \
 | 固件 | klipperx 的桥 + `CONFIG_BRIDGE_PORT_CAN` | 上游 `CONFIG_USBCANBUS`（USB id `1d50:606f`） |
 | 主机侧 | USB CDC 控制台 + 端口命令（`SET_PORT_NODEID` 等） | SocketCAN `can0` |
 | 下游节点固件 | **必须带 `MUX_CAN`**（端口转发的是单元） | **必须不带 `MUX_CAN`**（裸 canserial；带头会被主机的帧解析器当垃圾） |
-| CAN 载具 | 切片（默认）或 ISO-TP（`can_protocol: isotp`） | 切片（`cans`）或 ISO-TP（`canbus_protocol: isotp`） |
+| CAN 载具 | 切片（8 字节） | 切片（`cans`） |
 
 前置（root，一次）：
 
@@ -320,17 +315,22 @@ sudo ip link set dev can0 txqueuelen 128               # 默认 10 会在压测�
 | 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`＝固件脉冲生成上限） |
 | 单节点 `motion` | ✅ `motion smoke OK` |
 | **双节点并发**（桥板自身 + 下游，同一条 `can0`） | 两颗都 **2272 req/s**，聚合 ≈ 4.5k 往返/秒，互不拖累 |
-| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP`、无 mux） | ✅ 运行期通了：`identify` 139 条、`motion` 绿；**comm 742 req/s**（切片是 2272）、**step 首段 10 000 steps/s 就不过**（命令突发在 ISO-TP 下每条约 2 帧，代价约为切片的 3 倍——高步频板不要用 ISO-TP） |
 
 和上一节的桥端口对比：同样的 1 Mbit、同样的下游板，**主机直连的 step 是 145 455，而桥 CAN 端口只有
 15 625** —— 我们桥端口的 per-frame 转发在突发命令负载下代价明显更高（待查）。
 
-两个已知缺口（都在工具侧，记在这里免得再踩）：
+直连 CAN 的**送引导**现在是工具的一部分（两个旧缺口已补齐）：
 
-- **`admin flash --interface can0` 不会请求引导**（上游 `flash_can.py` 有 `-r`）。现在要先手工送一帧
-  `REQUEST_BOOTLOADER`：`cansend can0 3f0#02<uuid 12 位十六进制>`，等约 2 s 再 `admin flash`。
-- **`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器**，会报
-  `canbus: the MCU id has not been assigned`；在配置里给该节写显式 `canbus_nodeid:` 即可跑。
+```sh
+# 先把板子送进引导（不再需要手工 cansend）
+klipperx admin reset --interface can0 --uuid <12 位> --bootloader
+# 等约 2 s，再刷
+klipperx admin flash --interface can0 --uuid <12 位> <固件.bin>
+```
+
+- `admin reset` 的直连 CAN 形态与串口形态同语义：它发的是与载具无关的 `0x3f0 [0x02][uuid]` 单帧。
+- `stress` 给**直连 CAN** 的 MCU 也从同一条 id 序列分配节点号（与桥的端口设备同一分配器，因此两者
+  不会撞号）；不再需要手写 `canbus_nodeid:`（写了也尊重，冲突仍由分配器报错）。
 
 ### 换下游控制台的波特率（UART 口）
 
@@ -355,7 +355,7 @@ B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UA
 
 ## 固件重启方式（`restart_method`）
 
-系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。
+系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 与桥端口子节有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。
 
 | 值 | 做法 | 说明 |
 |----|------|------|
@@ -363,7 +363,7 @@ B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UA
 | `arduino` | 以 2400 波特打开串口，翻转 DTR | 串口**缺省**值；Arduino 及克隆板 |
 | `cheetah` | 以 2400 波特做一串 RTS/DTR 时序 | Fysetc Cheetah v1.2 等采用状态机 bootloader 电路的板子 |
 | `rpi_usb` | 切断再恢复该 USB 端口的供电 | 树莓派等能给 USB 口断电的机器 |
-| `admin` | 经桥转发 `RESTART_DEVICE (0x05)`，让该设备**重启自己的固件**（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **仅用于桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」。**设备重启会重新枚举 USB**：下游是 USB CDC 时，宿主库桥会因打不开该端口而失败——主机会**有界等 `uart_device` 的 `uart_path` 回来**（≤10s，建议写 by-id/by-path），回来就请求一次 plain restart（重走库会话、按配置重新登记端口）从而自动恢复；每个 MCU 只有一次这样的恢复预算（成功连上即归还），所以「路径在但一直打不开」只会重启一次便停在 error |
+| `admin` | **串口 `[mcu]`（桥自己）**：连接**之前**在自己的 admin 通道上发 `RESTART_DEVICE [0x05][0xFF]`（`0xFF` 超出任何桥的端口数，固件因此把它当"本机"），不需要 identify——板子卡在陈旧会话里也能这样重启。**桥下游命名设备**：经桥转发 `[0x05][index]`，让该设备重启自己的固件（进引导是刷写工具的 `REQUEST_BOOTLOADER (0x02)`，不属 `restart_method`） | **串口桥自己**（不需要 `uuid:`）或**桥下游端口上的命名设备**（写了 `uuid:`）；无 admin 通道的 legacy 设备改用端口节的 `uart_restart_method`（桥对该口做线脉冲），旧固件/非桥构建会点名报错。端口级命令都**无回执**，确认靠「能不能重新握手」。**设备重启会重新枚举 USB**：下游是 USB CDC 时，宿主库桥会因打不开该端口而失败——主机会**有界等 `uart_device` 的 `uart_path` 回来**（≤10s，建议写 by-id/by-path），回来就请求一次 plain restart（重走库会话、按配置重新登记端口）从而自动恢复；每个 MCU 只有一次这样的恢复预算（成功连上即归还），所以「路径在但一直打不开」只会重启一次便停在 error |
 
 ```ini
 [mcu]

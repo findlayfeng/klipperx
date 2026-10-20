@@ -9,6 +9,7 @@
 //! | `TMCCommandHelper` + `TMCCurrentHelper` + `TMCErrorCheck` | [`TmcDriver`] |
 //! | `TMCVirtualPinHelper` | [`TmcVirtualPin`] (chip) + [`TmcVirtualEndstop`] |
 //! | `TMCMicrostepHelper` / `TMCStealthchopHelper` / `TMCVcoolthrsHelper` / `TMCtstepHelper` | the free functions below |
+//! | `TMCStallguardDump` | [`TmcStallguardDump`] |
 //!
 //! # One concrete driver type
 //!
@@ -30,23 +31,41 @@
 //! exchange would hang. The driver-side cache (`fields.registers`) still tracks
 //! every write, so `DUMP_TMC` reports what was configured.
 //!
-//! The UART transport is likewise not wired for a live MCU in this unit: a
-//! non-file-output read or write reports
-//! [`McuError::Config`](crate::core::klippy::mcu::McuError::Config) rather than
-//! silently doing nothing. The SPI transports the `tmc2130`/`tmc5160`/`tmc2240`
-//! drivers share, and the TMC2660's own, are provided by a separate `tmc_spi`
-//! module and short-circuit the same way: under file output a read answers 0
-//! and a write is dropped.
+//! Both transports are **live**: the UART one ([`crate::core::klippy::extras::tmc_uart`])
+//! sends `tmcuart_send` / `tmcuart_response` pairs, the SPI ones
+//! ([`crate::core::klippy::extras::tmc_spi`]) `spi_send` / `spi_transfer`
+//! frames. Under file output — the corpus runs — neither touches a bus: a read
+//! answers 0 and a write is dropped without a frame, because the fake firmware
+//! never answers `tmcuart_response` / `spi_transfer_response` and a real
+//! exchange would hang. The driver-side cache (`fields.registers`) still tracks
+//! every write, so `DUMP_TMC` reports what was configured.
+//!
+//! # Deliberate deviation: the stallguard dump's read path
+//!
+//! Upstream's `TMCStallguardDump` picks its read path with one flag,
+//! `optimized_spi`, which it learns from the `spi_status` byte a SPI read
+//! returns — and uses the same flag for its poll cadence. A [`TmcRegister`]
+//! carries no bus status, so here the path is chosen by what the chip declares
+//! instead: a chip whose `DRV_STATUS` holds `sg_result` is read through
+//! `DRV_STATUS` (TMC2130/TMC5160/TMC2240), one with a separate `SG_RESULT`
+//! register through that (TMC2209). The cadence stays the UART one for every
+//! chip: nothing here can tell a SPI chain from a UART one.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::bulk_sensor::{
+    BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
+};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
+use crate::core::klippy::extras::heaters::{PrinterHeaters, HEATERS_OBJECT};
 use crate::core::klippy::extras::stepper::PrinterStepper;
+use crate::core::klippy::extras::stepper_enable::{EnableTracking, PrinterStepperEnable};
 use crate::core::klippy::extras::toolhead::{
     EndstopFuture, HomingEndstop, QueryEndstopFuture, ToolHeadObject,
 };
@@ -58,6 +77,8 @@ use crate::core::klippy::pins::{
     DigitalOut, PinChip, PinError, PinParams, PrinterPins, PINS_OBJECT,
 };
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
+use crate::core::klippy::reactor::TimerHandle;
+use crate::core::klippy::sleep_off_worker;
 
 /// The toolhead object's registered name (upstream `lookup_object('toolhead')`).
 const TOOLHEAD_OBJECT: &str = "toolhead";
@@ -286,6 +307,23 @@ impl FieldHelper {
         Ok(())
     }
 
+    /// Every field of `reg_name` read out of `reg_value`
+    /// (`FieldHelper.get_reg_fields`).
+    pub fn reg_fields(&self, reg_name: &str, reg_value: u32) -> HashMap<String, i64> {
+        let empty = HashMap::new();
+        self.all_fields
+            .get(reg_name)
+            .unwrap_or(&empty)
+            .keys()
+            .map(|field_name| {
+                (
+                    field_name.clone(),
+                    self.get_field(field_name, Some(reg_value), Some(reg_name)),
+                )
+            })
+            .collect()
+    }
+
     /// A human-readable rendering of a register value (`FieldHelper.pretty_format`).
     pub fn pretty_format(&self, reg_name: &str, reg_value: u32) -> String {
         let empty = HashMap::new();
@@ -327,13 +365,17 @@ pub struct TmcRegister {
 /// `MCU_TMC_uart`).
 ///
 /// The methods map a register *name* to its bus address through the chip's own
-/// table; the driver never sees addresses. Under file output a read answers 0
-/// and a write is dropped (see the module docs).
+/// table; the driver never sees addresses. Both implementations
+/// ([`crate::core::klippy::extras::tmc_uart`],
+/// [`crate::core::klippy::extras::tmc_spi`]) are live; under file output a read
+/// answers 0 and a write is dropped (see the module docs).
 pub trait TmcTransport: Send + Sync {
     /// Read a register, with the read time (`get_register_raw`).
     ///
     /// # Errors
-    /// The bus error, or the "not wired outside file output" refusal.
+    /// The bus error, a frame that never decoded (the read paths retry a few
+    /// times first), or `Unable to read tmc uart '<x>' register <REG>` once the
+    /// retries are spent.
     fn get_register_raw(&self, reg_name: &str) -> Result<TmcRegister, McuError>;
 
     /// Read a register's value (`get_register`).
@@ -347,7 +389,9 @@ pub trait TmcTransport: Send + Sync {
     /// Write a register (`set_register`).
     ///
     /// # Errors
-    /// The bus error, or the "not wired outside file output" refusal.
+    /// The bus error, or `Unable to write tmc uart '<x>' register <REG>` when
+    /// the read-back (the UART's `IFCNT`, the SPI chain's echoed value) never
+    /// matches after the retries.
     fn set_register(
         &self,
         reg_name: &str,
@@ -1060,45 +1104,121 @@ impl TmcCurrentHelper for Tmc2660Current {
 // Periodic error checking (`tmc.TMCErrorCheck`)
 // ===========================================================================
 
+/// How often the periodic check rereads the fault registers
+/// (`_do_periodic_check`'s `eventtime + 1.`).
+const CHECK_INTERVAL: f64 = 1.0;
+
+/// The most reads one register check makes before it gives up on a fault that
+/// will not clear (upstream's `count >= 3`).
+const MAX_CHECK_ATTEMPTS: u32 = 3;
+
+/// How long a UART read error waits before the check retries it (upstream's
+/// `reactor.pause(reactor.monotonic() + 0.050)`).
+const UART_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The error text a UART read failure carries upstream
+/// (`_query_register`'s `str(e).startswith("Unable to read tmc uart")`); such a
+/// failure is retried before it is reported.
+const UART_READ_ERROR_PREFIX: &str = "Unable to read tmc uart";
+
 /// The driver-fault check (upstream `TMCErrorCheck`).
 ///
-/// Only the synchronous part is kept: [`TmcErrorCheck::check_once`] runs the
-/// `DRV_STATUS` and `GSTAT` queries the periodic timer would. The timer itself
-/// is not started here — nothing calls the enable path that would start it — so
-/// a corpus run never leaves a timer behind. Under file output both reads
-/// answer 0, so a check never reports a fault (and never shuts the printer down).
+/// [`TmcErrorCheck::check_once`] runs the `DRV_STATUS` and `GSTAT` queries once,
+/// which is what a test or a caller without a running machine wants; the
+/// driver's enable path ([`TmcDriver`]) starts the 1 s timer through
+/// [`TmcErrorCheck::start_checks`] and stops it on disable
+/// ([`TmcErrorCheck::stop_checks`]). While the timer runs, a read that fails
+/// shuts the printer down (upstream's `_do_periodic_check`).
 ///
 /// Which register the fault status is read from depends on the driver
 /// (`TMCErrorCheck.__init__`'s `name_parts[0]` branches): the TMC2660 has no
 /// `DRV_STATUS` and reports through `READRSP@RDSEL2` instead.
 pub struct TmcErrorCheck {
+    printer: Weak<Printer>,
     transport: Arc<dyn TmcTransport>,
     fields: Arc<FieldHelper>,
     stepper_name: String,
-    drv_reg_name: String,
-    drv_mask: u32,
-    drv_err_mask: u32,
+    /// The fault register (`drv_status_reg_info`).
+    drv: CheckRegister,
+    /// The `drv_err` register, when the chip has one (`gstat_reg_info`).
+    gstat: Option<CheckRegister>,
     /// The field holding the run current (`irun`, `cs` on the TMC2660).
     irun_field: &'static str,
-    /// The bits of a zero run current that mean a driver reset.
-    cs_actual_mask: u32,
     /// Whether a GSTAT reset flag may be cleared (`tmc2130` clears its own).
     clear_gstat: bool,
-    gstat_reg: Option<String>,
-    last_drv_status: Mutex<Option<u32>>,
-    last_gstat: Mutex<Option<u32>>,
+    /// The `adc_temp` register, when the chip has one (`adc_temp_reg`).
+    adc_temp_reg: Option<String>,
+    /// The last temperature reading (`adc_temp`); `None` after a failed read.
+    adc_temp: Mutex<Option<u32>>,
+    /// The running periodic timer (`check_timer`); `None` while stopped.
+    check_timer: Mutex<Option<TimerHandle>>,
+    /// The last `DRV_STATUS` read and the fields it decoded to
+    /// (`last_drv_status` / `last_drv_fields`).
+    last_drv_fields: Mutex<DrvFields>,
+}
+
+/// One register the check polls, with its masks and the value it last saw —
+/// upstream's `reg_info` list (`[last_value, reg_name, mask, err_mask,
+/// cs_actual_mask]`).
+struct CheckRegister {
+    reg_name: String,
+    /// The bits whose change is logged (`mask`).
+    mask: u32,
+    /// The bits that are a fault (`err_mask`).
+    err_mask: u32,
+    /// The bits of a zero run current that mean a driver reset
+    /// (`cs_actual_mask`).
+    cs_actual_mask: u32,
+    /// The previous read (`reg_info[0]`); `None` before the first one.
+    last_value: Mutex<Option<u32>>,
+}
+
+impl CheckRegister {
+    fn new(reg_name: String, mask: u32, err_mask: u32, cs_actual_mask: u32) -> Self {
+        Self {
+            reg_name,
+            mask,
+            err_mask,
+            cs_actual_mask,
+            last_value: Mutex::new(None),
+        }
+    }
+}
+
+/// The last `DRV_STATUS` read, and the fields it decoded to
+/// (`last_drv_status` / `last_drv_fields`).
+#[derive(Default)]
+struct DrvFields {
+    value: Option<u32>,
+    fields: Option<HashMap<String, i64>>,
+}
+
+/// What the periodic check contributes to the driver status
+/// (`TMCErrorCheck.get_status`).
+#[derive(Debug, Default)]
+pub struct TmcCheckStatus {
+    /// The non-zero fields of the last `DRV_STATUS` read; `None` until the
+    /// checks run.
+    pub drv_status: Option<HashMap<String, i64>>,
+    /// The chip's temperature in °C, from `adc_temp`; `None` when the chip has
+    /// no such register, the checks are stopped, or the last read failed.
+    pub temperature: Option<f64>,
 }
 
 impl TmcErrorCheck {
     /// Build the register info (`TMCErrorCheck.__init__`).
     ///
     /// `driver_name` is the section's driver word (`tmc2209`, `tmc2660`, …),
-    /// which is what upstream's `name_parts[0]` branches read.
+    /// which is what upstream's `name_parts[0]` branches read. `config` is the
+    /// driver's own section, registered as a temperature monitor when the chip
+    /// has an `adc_temp` register.
     pub fn new(
         driver_name: &str,
         stepper_name: &str,
         fields: Arc<FieldHelper>,
         transport: Arc<dyn TmcTransport>,
+        printer: &Arc<Printer>,
+        config: &ConfigWrapper,
     ) -> Self {
         let gstat_reg = fields
             .lookup_register("drv_err")
@@ -1138,36 +1258,46 @@ impl TmcErrorCheck {
                 }
             }
         }
+        // The temperature query: the chip reports it in an `adc_temp` field, and
+        // its section joins the monitors `[heaters]` reports.
+        let adc_temp_reg = fields
+            .lookup_register("adc_temp")
+            .map(|name| name.to_string());
+        if adc_temp_reg.is_some() {
+            if let Some(heaters) = printer.lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT) {
+                heaters.register_monitor(config);
+            }
+        }
         Self {
+            printer: Arc::downgrade(printer),
             transport,
             fields,
             stepper_name: stepper_name.to_string(),
-            drv_reg_name,
-            drv_mask: mask,
-            drv_err_mask: err_mask,
+            drv: CheckRegister::new(drv_reg_name, mask, err_mask, cs_actual_mask),
+            gstat: gstat_reg.map(|name| CheckRegister::new(name, 0xffff_ffff, 0xffff_ffff, 0)),
             irun_field,
-            cs_actual_mask,
             clear_gstat,
-            gstat_reg,
-            last_drv_status: Mutex::new(None),
-            last_gstat: Mutex::new(None),
+            adc_temp_reg,
+            adc_temp: Mutex::new(None),
+            check_timer: Mutex::new(None),
+            last_drv_fields: Mutex::new(DrvFields::default()),
         }
     }
 
     /// The register the fault status is read from (`drv_status_reg_info`).
     pub fn register_name(&self) -> &str {
-        &self.drv_reg_name
+        &self.drv.reg_name
     }
 
     /// The bits a fault is reported on (`drv_status_reg_info`'s err mask).
     pub fn error_mask(&self) -> u32 {
-        self.drv_err_mask
+        self.drv.err_mask
     }
 
     /// The bits of a zero run current that mean a driver reset
     /// (`drv_status_reg_info`'s `cs_actual_mask`).
     pub fn cs_actual_mask(&self) -> u32 {
-        self.cs_actual_mask
+        self.drv.cs_actual_mask
     }
 
     /// The field the run current is read back from (upstream's `irun_field`).
@@ -1181,31 +1311,113 @@ impl TmcErrorCheck {
         self.clear_gstat
     }
 
-    fn query_register(
-        &self,
-        reg_name: &str,
-        mask: u32,
-        err_mask: u32,
-        last: &Mutex<Option<u32>>,
-    ) -> Result<(), McuError> {
-        let val = self.transport.get_register(reg_name)?;
-        let mut last = last.lock().unwrap_or_else(|poison| poison.into_inner());
-        if val & mask != last.unwrap_or(0) & mask {
-            tracing::info!(
-                "TMC '{}' reports {}",
-                self.stepper_name,
-                self.fields.pretty_format(reg_name, val)
-            );
+    /// Whether the periodic timer is running (`check_timer is not None`).
+    pub fn is_running(&self) -> bool {
+        self.check_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+    }
+
+    /// Read one register, logging a change and decoding a fault
+    /// (`TMCErrorCheck._query_register`), and return the fault bits it cleared
+    /// when `try_clear` is set.
+    ///
+    /// A UART read error is retried twice, as upstream allows; a fault (or a
+    /// zero `CS_ACTUAL` on a running check with a live run current) is reread up
+    /// to [`MAX_CHECK_ATTEMPTS`] times before it is reported, so a transient
+    /// reading does not shut the printer down.
+    ///
+    /// # Errors
+    /// The read error, or a fault the driver kept reporting.
+    fn query_register(&self, reg: &CheckRegister, try_clear: bool) -> Result<u32, McuError> {
+        let mut cleared_flags = 0u32;
+        let mut try_clear = try_clear;
+        let mut count = 0u32;
+        loop {
+            let val = match self.transport.get_register(&reg.reg_name) {
+                Ok(val) => val,
+                Err(err) => {
+                    count += 1;
+                    if count < MAX_CHECK_ATTEMPTS && is_uart_read_error(&err) {
+                        // Upstream pauses its own greenlet for 50 ms here. This
+                        // check is synchronous, so the wait is a sleep — but one
+                        // that hands the multi-threaded runtime's worker off for
+                        // the 50 ms, in a path that is already failing.
+                        sleep_off_worker(UART_RETRY_DELAY);
+                        continue;
+                    }
+                    return Err(err);
+                }
+            };
+            {
+                let mut last = reg
+                    .last_value
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                if val & reg.mask != last.unwrap_or(0) & reg.mask {
+                    tracing::info!(
+                        "TMC '{}' reports {}",
+                        self.stepper_name,
+                        self.fields.pretty_format(&reg.reg_name, val)
+                    );
+                }
+                *last = Some(val);
+            }
+            if val & reg.err_mask == 0 {
+                if reg.cs_actual_mask == 0 || val & reg.cs_actual_mask != 0 {
+                    break;
+                }
+                // A zero `CS_ACTUAL` field with a live run current means the
+                // driver reset: the register is reread, and the reading only
+                // counts once the check is running. The timer state is read
+                // first because a stopped check has no run current to compare
+                // (and a chip reachable here always has the field).
+                if !self.is_running() {
+                    break;
+                }
+                let irun = self.fields.get_field(self.irun_field, None, None);
+                if irun < 4 {
+                    break;
+                }
+                if self.irun_field == "irun" && self.fields.get_field("ihold", None, None) == 0 {
+                    break;
+                }
+            }
+            count += 1;
+            if count >= MAX_CHECK_ATTEMPTS {
+                return Err(McuError::Config(format!(
+                    "TMC '{}' reports error: {}",
+                    self.stepper_name,
+                    self.fields.pretty_format(&reg.reg_name, val)
+                )));
+            }
+            if try_clear && val & reg.err_mask != 0 {
+                try_clear = false;
+                cleared_flags |= val & reg.err_mask;
+                self.transport
+                    .set_register(&reg.reg_name, val & reg.err_mask, None)?;
+            }
         }
-        *last = Some(val);
-        if val & err_mask == 0 {
+        Ok(cleared_flags)
+    }
+
+    /// Read the temperature register (`_query_temperature`); a comms error only
+    /// drops the reading.
+    fn query_temperature(&self) -> Result<(), McuError> {
+        let Some(reg_name) = &self.adc_temp_reg else {
             return Ok(());
-        }
-        Err(McuError::Config(format!(
-            "TMC '{}' reports error: {}",
-            self.stepper_name,
-            self.fields.pretty_format(reg_name, val)
-        )))
+        };
+        let reading = match self.transport.get_register(reg_name) {
+            Ok(raw) => Some(raw),
+            // Ignore the comms error for the temperature
+            Err(_) => None,
+        };
+        *self
+            .adc_temp
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = reading;
+        Ok(())
     }
 
     /// Run one full check (`_query_register` on both register infos).
@@ -1213,17 +1425,172 @@ impl TmcErrorCheck {
     /// # Errors
     /// The read error, or a fault reported by the driver.
     pub fn check_once(&self) -> Result<(), McuError> {
-        self.query_register(
-            &self.drv_reg_name,
-            self.drv_mask,
-            self.drv_err_mask,
-            &self.last_drv_status,
-        )?;
-        if let Some(gstat) = &self.gstat_reg {
-            self.query_register(gstat, 0xffff_ffff, 0xffff_ffff, &self.last_gstat)?;
+        self.query_register(&self.drv, false)?;
+        if let Some(gstat) = &self.gstat {
+            self.query_register(gstat, false)?;
         }
         Ok(())
     }
+
+    /// Read the registers and start the 1 s check timer, reporting whether the
+    /// driver had been reset (`start_checks`).
+    ///
+    /// The reset flag is what makes the enable path forget the tracked phase
+    /// offset: a reset driver's rotor is no longer where the offset says.
+    ///
+    /// # Errors
+    /// The read error, or a fault reported by the driver.
+    pub fn start_checks(self: &Arc<Self>) -> Result<bool, McuError> {
+        if self.is_running() {
+            self.stop_checks();
+        }
+        self.query_register(&self.drv, false)?;
+        let mut cleared_flags = 0;
+        if let Some(gstat) = &self.gstat {
+            cleared_flags = self.query_register(gstat, self.clear_gstat)?;
+        }
+        if let Some(printer) = self.printer.upgrade() {
+            let reactor = printer.reactor();
+            let weak = Arc::downgrade(self);
+            let handle = reactor.register_timer_named(
+                "tmc_error_check",
+                Box::new(move |eventtime| match weak.upgrade() {
+                    Some(check) => check.periodic_check(eventtime),
+                    // Dropped while the timer was registered: retire it.
+                    None => None,
+                }),
+                reactor.monotonic() + CHECK_INTERVAL,
+            );
+            *self
+                .check_timer
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
+        }
+        if cleared_flags != 0 {
+            let reset_mask = self.fields.field_mask("GSTAT", "reset").unwrap_or(0);
+            if cleared_flags & reset_mask != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// One turn of the periodic timer (`_do_periodic_check`).
+    ///
+    /// A failing read shuts the printer down and retires the timer, as
+    /// upstream returns `NEVER`.
+    ///
+    /// The exchange itself runs **off** the reactor: a TMC read blocks on the
+    /// bus, and the reactor's task is what schedules steps. Inline, one slow
+    /// UART exchange stalls it — measured on the bench, a 5 s read timeout made
+    /// the reactor miss a digital-out deadline (`Missed scheduling of next
+    /// digital out event`) and the printer shut down with the motor idle.
+    fn periodic_check(self: &Arc<Self>, eventtime: f64) -> Option<f64> {
+        let this = Arc::clone(self);
+        // The machine always has a runtime; a unit test does not, and there the
+        // check runs inline so it can be asserted on.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    if this.check_and_report().is_err() {
+                        this.stop_checks();
+                    }
+                });
+                Some(eventtime + CHECK_INTERVAL)
+            }
+            Err(_) => match self.check_and_report() {
+                Ok(()) => Some(eventtime + CHECK_INTERVAL),
+                Err(()) => {
+                    self.stop_checks();
+                    None
+                }
+            },
+        }
+    }
+
+    /// Run the register and temperature queries, shutting the printer down on a
+    /// fault.
+    ///
+    /// `Err(())` says the fault was reported; the caller retires the timer.
+    fn check_and_report(&self) -> Result<(), ()> {
+        let result = self
+            .query_register(&self.drv, false)
+            .and_then(|_| match &self.gstat {
+                Some(gstat) => self.query_register(gstat, false).map(|_| ()),
+                None => Ok(()),
+            })
+            .and_then(|_| self.query_temperature());
+        if let Err(err) = result {
+            if let Some(printer) = self.printer.upgrade() {
+                printer.invoke_shutdown(&err.to_string());
+            }
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Stop the periodic timer (`stop_checks`). Idempotent.
+    pub fn stop_checks(&self) {
+        let handle = self
+            .check_timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            match self.printer.upgrade() {
+                Some(printer) => printer.reactor().unregister_timer(handle),
+                None => handle.cancel(),
+            }
+        }
+    }
+
+    /// The check's status contribution (`TMCErrorCheck.get_status`).
+    ///
+    /// Both entries are empty until the checks run; `drv_status` is the
+    /// non-zero fields of the last fault-register read, decoded once per new
+    /// reading.
+    pub fn get_status(&self) -> TmcCheckStatus {
+        if !self.is_running() {
+            return TmcCheckStatus::default();
+        }
+        let temperature = self
+            .adc_temp
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .map(|raw| (((f64::from(raw) - 2038.) / 7.7) * 100.).round() / 100.);
+        let last_value = *self
+            .drv
+            .last_value
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let drv_status = {
+            let mut cache = self
+                .last_drv_fields
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if cache.value != last_value {
+                cache.value = last_value;
+                cache.fields = last_value.map(|val| {
+                    self.fields
+                        .reg_fields(&self.drv.reg_name, val)
+                        .into_iter()
+                        .filter(|(_, field_value)| *field_value != 0)
+                        .collect()
+                });
+            }
+            cache.fields.clone()
+        };
+        TmcCheckStatus {
+            drv_status,
+            temperature,
+        }
+    }
+}
+
+/// Whether `err` is the UART read failure the check retries
+/// (`str(e).startswith("Unable to read tmc uart")`).
+fn is_uart_read_error(err: &McuError) -> bool {
+    err.to_string().starts_with(UART_READ_ERROR_PREFIX)
 }
 
 // ===========================================================================
@@ -1463,6 +1830,292 @@ pub fn wave_table_helper(config: &ConfigWrapper, fields: &FieldHelper) -> Result
 }
 
 // ===========================================================================
+// Record driver status (`tmc.TMCStallguardDump`)
+// ===========================================================================
+
+/// The mux endpoint the stallguard samples stream on
+/// (`add_mux_endpoint`'s path).
+pub const DUMP_ENDPOINT: &str = "tmc/stallguard_dump";
+
+/// The request key that selects a stepper's instance (`name`).
+pub const DUMP_KEY: &str = "name";
+
+/// The column header a connecting client receives.
+const DUMP_HEADER: [&str; 3] = ["time", "sg_result", "cs_actual"];
+
+/// The `DRV_STATUS` field carrying the stallguard result on the older chips;
+/// a chip that has it is upstream's `sg2_supp`.
+const SG2_FIELD: &str = "sg_result";
+
+/// The register TMC2209 keeps its stallguard result in.
+const SG_RESULT_REG: &str = "SG_RESULT";
+
+/// The separate stallguard-4 result register the TMC2240 also has.
+const SG4_RESULT_REG: &str = "SG4_RESULT";
+
+/// Seconds between polls of the driver's result registers (`_query_tmc`'s
+/// "UART queried as fast as possible" cadence).
+const QUERY_INTERVAL: f64 = 0.005;
+
+/// One sample: `(print time, sg_result, cs_actual)`.
+///
+/// `sg_result` and `cs_actual` start at `-1`, the sentinel a chip that does not
+/// report that value keeps (`_query_tmc`'s initialisers).
+type StallguardSample = (f64, i64, i64);
+
+/// Streams a driver's stallguard result to API clients, for tuning the SG
+/// threshold of sensorless homing (`tmc.TMCStallguardDump`).
+///
+/// Upstream builds this for every chip and lets the constructor decide whether
+/// there is anything to read. That decision is [`new`](Self::new)'s `None`:
+///
+/// - the TMC2660 has no `DRV_STATUS`, so it is unsupported for now (`It is
+///   possible to support TMC2660, just disable it for now`);
+/// - a chip with neither an `sg_result` field in `DRV_STATUS` nor a separate
+///   `SG_RESULT`/`SG4_RESULT` register (the TMC2208) has no stallguard result.
+///   Upstream's guard here (`if self.sg2_supp is None and self.sg4_reg_name is
+///   None`) can never fire — `sg2_supp` is a bool — so it registers a stream
+///   of `-1`s; here the endpoint is not registered at all.
+///
+/// The helper is a [`BatchBulkHelper`] client producer: its start callback arms
+/// a poll timer, the timer appends one sample per poll, and the batch callback
+/// hands the batch so far to the client every [`BATCH_INTERVAL`].
+pub struct TmcStallguardDump {
+    printer: Weak<Printer>,
+    fields: Arc<FieldHelper>,
+    transport: Arc<dyn TmcTransport>,
+    /// `DRV_STATUS` declares `sg_result`, so the SG2 result is read from that
+    /// register (upstream's `sg2_supp`).
+    sg2_supp: bool,
+    /// Where the chip keeps its separate stallguard result, if it has one.
+    sg4_reg_name: Option<&'static str>,
+    /// The samples taken since the last batch.
+    samples: Mutex<Vec<StallguardSample>>,
+    /// The poll timer, while a client is connected.
+    query_timer: Mutex<Option<TimerHandle>>,
+    /// The read failure that stopped the polling, for the next batch.
+    error: Mutex<Option<String>>,
+}
+
+impl TmcStallguardDump {
+    /// Build the helper for `stepper_name`, or `None` when the chip has no
+    /// stallguard result to stream.
+    ///
+    /// # Errors
+    /// The mux endpoint's registration failure (a conflicting instance).
+    pub fn new(
+        printer: &Arc<Printer>,
+        stepper_name: &str,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Result<Option<Arc<Self>>, ConfigError> {
+        let Some(drv_status) = fields.register_fields("DRV_STATUS") else {
+            return Ok(None);
+        };
+        let sg2_supp = drv_status.contains_key(SG2_FIELD);
+        // New drivers have a separate register for the SG4 result.
+        let sg4_reg_name = if transport.name_to_reg().contains_key(SG_RESULT_REG) {
+            Some(SG_RESULT_REG)
+        } else if transport.name_to_reg().contains_key(SG4_RESULT_REG) {
+            Some(SG4_RESULT_REG)
+        } else {
+            None
+        };
+        if !sg2_supp && sg4_reg_name.is_none() {
+            return Ok(None);
+        }
+
+        let state = Arc::new(Self {
+            printer: Arc::downgrade(printer),
+            fields,
+            transport,
+            sg2_supp,
+            sg4_reg_name,
+            samples: Mutex::new(Vec::new()),
+            query_timer: Mutex::new(None),
+            error: Mutex::new(None),
+        });
+
+        let weak = Arc::downgrade(&state);
+        let start_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.start();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.stop();
+                Ok(())
+            })
+        });
+        let weak = Arc::downgrade(&state);
+        let batch_cb: BatchCb = Arc::new(move |_eventtime| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let state = Weak::upgrade(&weak).ok_or_else(|| "tmc driver is gone".to_string())?;
+                state.dump()
+            })
+        });
+        let batch_bulk = BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, BATCH_INTERVAL);
+        // The registration owns the helper from here on: it holds the mux
+        // handler, and the handler reads this state through its `Weak`, so the
+        // driver only has to keep the state itself alive.
+        batch_bulk.add_mux_endpoint(
+            DUMP_ENDPOINT,
+            DUMP_KEY,
+            stepper_name,
+            json!({ "header": DUMP_HEADER }),
+        )?;
+        Ok(Some(state))
+    }
+
+    /// Start sampling: forget the last failure and arm the poll timer
+    /// (`_start`).
+    ///
+    /// Upstream also reads `DRV_STATUS` here to learn `optimized_spi` from the
+    /// reply's `spi_status` (a 1 ms poll on a SPI chain, 5 ms on UART). A
+    /// [`TmcRegister`] carries no bus status, so every chip is polled at the
+    /// UART period ([`QUERY_INTERVAL`]) and the read path comes from the chip's
+    /// declared fields instead (see the module docs).
+    fn start(self: &Arc<Self>) {
+        *self.error.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let reactor = printer.reactor();
+        let weak = Arc::downgrade(self);
+        let handle = reactor.register_timer_named(
+            "tmc_stallguard_dump",
+            Box::new(move |eventtime| {
+                // A configuration reload detaches the endpoint without running
+                // the stop callback, so the state can be gone while the timer
+                // still ticks: retire instead of polling a driver that no
+                // longer exists.
+                let state = weak.upgrade()?;
+                state.query(eventtime)
+            }),
+            reactor.monotonic(),
+        );
+        *self.query_timer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
+    }
+
+    /// Stop sampling: cancel the poll timer and drop the buffered samples
+    /// (`_stop`).
+    fn stop(&self) {
+        let timer = self
+            .query_timer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let (Some(handle), Some(printer)) = (timer, self.printer.upgrade()) {
+            printer.reactor().unregister_timer(handle);
+        }
+        self.samples
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    /// One poll: read the chip's result registers and append a sample
+    /// (`_query_tmc`).
+    ///
+    /// A failed read is remembered for the next batch and retires the timer
+    /// (upstream returns `NEVER` after storing the error), so a driver that
+    /// fell off the bus reports the failure instead of streaming stale values.
+    fn query(&self, eventtime: f64) -> Option<f64> {
+        // The values a chip does not report stay at the sentinel.
+        let mut sample: StallguardSample = (eventtime, -1, -1);
+        match self.read_sample(&mut sample) {
+            Ok(()) => {
+                self.samples
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(sample);
+                Some(eventtime + QUERY_INTERVAL)
+            }
+            Err(err) => {
+                *self.error.lock().unwrap_or_else(|p| p.into_inner()) = Some(err.to_string());
+                None
+            }
+        }
+    }
+
+    /// Fill `sample` from the chip (the body of `_query_tmc`'s `try`).
+    ///
+    /// `sample`'s time starts as the event time and becomes the read's
+    /// `receive_time` — already a print time — once a register was read.
+    fn read_sample(&self, sample: &mut StallguardSample) -> Result<(), McuError> {
+        if self.sg2_supp || self.sg4_reg_name == Some(SG4_RESULT_REG) {
+            // The chip reports its SG2 result in DRV_STATUS. `stealth` is looked
+            // up tolerantly: the TMC2130's DRV_STATUS has no such field, where
+            // upstream raises a `KeyError` — a defect we do not copy.
+            let status = self.transport.get_register_raw("DRV_STATUS")?;
+            sample.2 = self
+                .drv_status_field("cs_actual", status.data)
+                .unwrap_or(-1);
+            sample.1 = self.drv_status_field(SG2_FIELD, status.data).unwrap_or(-1);
+            let stealth = self.drv_status_field("stealth", status.data).unwrap_or(0) != 0;
+            sample.0 = status.receive_time;
+            // The TMC2240 keeps both results and switches to the SG4 one while
+            // stealthchop is on.
+            if stealth && self.sg4_reg_name == Some(SG4_RESULT_REG) {
+                let sg4 = self.transport.get_register_raw(SG4_RESULT_REG)?;
+                sample.1 = i64::from(sg4.data);
+                sample.0 = sg4.receive_time;
+            }
+        } else if self.sg4_reg_name == Some(SG_RESULT_REG) {
+            // TMC2209: the register holds the result itself, not a field.
+            let sg = self.transport.get_register_raw(SG_RESULT_REG)?;
+            sample.1 = i64::from(sg.data);
+            sample.0 = sg.receive_time;
+        }
+        Ok(())
+    }
+
+    /// A `DRV_STATUS` field of `reg_value`, or `None` when the chip does not
+    /// declare it.
+    ///
+    /// [`FieldHelper::get_field`] panics on an unknown field, so the field has
+    /// to be looked up first — upstream would raise instead.
+    fn drv_status_field(&self, field_name: &str, reg_value: u32) -> Option<i64> {
+        if !self
+            .fields
+            .register_fields("DRV_STATUS")?
+            .contains_key(field_name)
+        {
+            return None;
+        }
+        Some(
+            self.fields
+                .get_field(field_name, Some(reg_value), Some("DRV_STATUS")),
+        )
+    }
+
+    /// The batch callback: the samples taken since the last batch, or the
+    /// failure that stopped them (`_dump`).
+    ///
+    /// Unlike upstream, which always reports (even an empty `data` list), an
+    /// empty batch reports nothing: a poll every 5 ms would otherwise push a
+    /// message per batch carrying no sample at all.
+    fn dump(&self) -> Result<Option<Value>, String> {
+        if let Some(error) = self.error.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Err(error);
+        }
+        let samples = std::mem::take(&mut *self.samples.lock().unwrap_or_else(|p| p.into_inner()));
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(json!({ "data": samples })))
+    }
+}
+
+// ===========================================================================
 // G-Code command helpers + the driver object
 // ===========================================================================
 
@@ -1490,11 +2143,28 @@ pub struct TmcDriver {
     read_registers: Vec<String>,
     read_translate: Option<ReadTranslate>,
     mcu_phase_offset: Mutex<Option<i64>>,
+    /// Whether a phase sync an enable started is still owed because the
+    /// solver's step count could not be read at that moment
+    /// (`complete_owed_phase_sync`).
+    phase_sync_owed: AtomicBool,
     stepper: Mutex<Option<Arc<PrinterStepper>>>,
+    /// `stepper_enable`'s tracking for this stepper, once connect found it
+    /// (`self.stepper_enable`), used to read the enabled state.
+    enable_line: Mutex<Option<Arc<Mutex<EnableTracking>>>>,
+    /// The `toff` the driver was configured with, when the enable is not a pin
+    /// but a register write (`toff`); `None` on a dedicated enable pin.
+    toff: Mutex<Option<i64>>,
+    /// A weak handle to itself, for the deferred enable/disable work.
+    self_ref: Weak<TmcDriver>,
     /// Previous field values the virtual-endstop homing stashed, for restore.
     virtual_prev_state: Mutex<Vec<(&'static str, i64)>>,
     /// Registers the virtual-endstop homing changed, awaiting a send.
     virtual_dirty: Mutex<Vec<(String, u32)>>,
+    /// The stallguard dump helper (`self.record_helper` upstream), when the
+    /// chip has a result to stream (`[`DUMP_ENDPOINT`]`). The driver only keeps
+    /// it alive: the API endpoint and its poll timer drive it.
+    #[allow(dead_code)]
+    stallguard_dump: Option<Arc<TmcStallguardDump>>,
 }
 
 impl TmcDriver {
@@ -1502,10 +2172,12 @@ impl TmcDriver {
     ///
     /// `fields` must already carry the driver's default register values (the
     /// chip module sets them before calling this). This runs the microstep
-    /// helper, builds the error check and registers the command surface.
+    /// helper, builds the error check and the stallguard dump helper, and
+    /// registers the command surface.
     ///
     /// # Errors
-    /// A missing stepper section or a duplicate mux command.
+    /// A missing stepper section, a duplicate mux command, or a duplicate
+    /// `tmc/stallguard_dump` instance for this stepper.
     pub fn new(
         config: &ConfigWrapper,
         printer: &Arc<Printer>,
@@ -1527,8 +2199,16 @@ impl TmcDriver {
             &stepper_name,
             Arc::clone(&fields),
             Arc::clone(&transport),
+            printer,
+            config,
         ));
-        let driver = Arc::new(Self {
+        let stallguard_dump = TmcStallguardDump::new(
+            printer,
+            &stepper_name,
+            Arc::clone(&fields),
+            Arc::clone(&transport),
+        )?;
+        let driver = Arc::new_cyclic(|self_ref| Self {
             printer: Arc::downgrade(printer),
             name,
             stepper_name,
@@ -1539,9 +2219,14 @@ impl TmcDriver {
             read_registers,
             read_translate,
             mcu_phase_offset: Mutex::new(None),
+            phase_sync_owed: AtomicBool::new(false),
             stepper: Mutex::new(None),
+            enable_line: Mutex::new(None),
+            toff: Mutex::new(None),
+            self_ref: self_ref.clone(),
             virtual_prev_state: Mutex::new(Vec::new()),
             virtual_dirty: Mutex::new(Vec::new()),
+            stallguard_dump,
         });
         driver.clone().register_commands(printer)?;
         Ok(driver)
@@ -1638,19 +2323,31 @@ impl TmcDriver {
     /// The driver's phase count and tracked offset
     /// (`get_phase_offset`): `(mcu_phase_offset, (256 >> mres) * 4)`.
     ///
-    /// The offset stays `None` — this host runs no position-sync handler — but
-    /// the method exists so `[endstop_phase]` can find it.
+    /// The offset is written by the enable path ([`TmcDriver::sync_mcu_pos`]
+    /// reads the driver's own phase counter once the motor is on), which is
+    /// what `[endstop_phase]` looks for. An enable whose sync could not run at
+    /// the time finishes it here rather than leaving the offset unmeasured
+    /// ([`TmcDriver::complete_owed_phase_sync`]).
     pub fn get_phase_offset(&self) -> (Option<i64>, i64) {
-        let offset = *self
-            .mcu_phase_offset
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let phases = (256 >> self.fields.get_field("mres", None, None)) * 4;
-        (offset, phases)
+        self.complete_owed_phase_sync();
+        let offset = self.phase_offset();
+        (offset, self.phases())
     }
 
-    /// The error check, for a caller that wants to run it (the enable path
-    /// would call this).
+    /// The driver's phase count, `(256 >> mres) * 4` (`_get_phases`).
+    fn phases(&self) -> i64 {
+        (256 >> self.fields.get_field("mres", None, None)) * 4
+    }
+
+    fn phase_offset(&self) -> Option<i64> {
+        *self
+            .mcu_phase_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The error check, for a caller that wants to run it by hand (`INIT_TMC`
+    /// does not; the enable path starts and stops it).
     pub fn error_check(&self) -> &TmcErrorCheck {
         &self.echeck
     }
@@ -1661,6 +2358,272 @@ impl TmcDriver {
             .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
             .map(|toolhead| toolhead.get_last_move_time())
             .unwrap_or(0.)
+    }
+
+    // -- stepper phase tracking (`_query_phase` / `_handle_sync_mcu_pos`) ----
+
+    /// Read the driver's own phase counter (`_query_phase`): `mscnt`, or `mstep`
+    /// on a chip without one (the TMC2660).
+    ///
+    /// # Errors
+    /// The transport read error, or a chip with neither field.
+    fn query_phase(&self) -> Result<i64, McuError> {
+        let field_name = if self.fields.lookup_register("mscnt").is_some() {
+            "mscnt"
+        } else {
+            "mstep"
+        };
+        let reg_name = self
+            .fields
+            .lookup_register(field_name)
+            .map(|name| name.to_string())
+            .ok_or_else(|| {
+                McuError::Config(format!(
+                    "the driver has no '{field_name}' field to read its phase from"
+                ))
+            })?;
+        let reg = self.transport.get_register(&reg_name)?;
+        Ok(self.fields.get_field(field_name, Some(reg), None))
+    }
+
+    /// Record the offset between the driver's phase counter and the solver's
+    /// step count (`_handle_sync_mcu_pos`).
+    ///
+    /// When the counter cannot be read the offset is forgotten, and the error is
+    /// only passed on **while the motor is enabled** — a disabled motor is
+    /// allowed to be unreadable (upstream's semantics).
+    ///
+    /// When the solver's step count cannot be read *yet* the sync is not
+    /// dropped: it is owed, and the next [`TmcDriver::get_phase_offset`] finishes
+    /// it ([`TmcDriver::complete_owed_phase_sync`]).
+    ///
+    /// # Errors
+    /// The read error, when the motor is on.
+    fn sync_mcu_pos(&self) -> Result<(), McuError> {
+        let Some((stepper, mcu_position)) = self.solver_step_count() else {
+            // Upstream reads the count off the solver, which always has one.
+            // Here it lives in the toolhead's connected state, and a move that
+            // owns that state takes it out of its slot for its whole duration
+            // (`ToolHeadObject::probing_move`, `flush_step_generation`) — which
+            // is where the enable of the move's first step fires from. The sync
+            // is owed instead of lost: `get_phase_offset` finishes it once the
+            // count is readable again.
+            tracing::debug!(
+                "Deferring tmc {} phase sync: the solver's step count is not readable yet",
+                self.stepper_name
+            );
+            self.set_phase_sync_owed(true);
+            *self
+                .mcu_phase_offset
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+            return Ok(());
+        };
+        let driver_phase = match self.query_phase() {
+            Ok(driver_phase) => driver_phase,
+            Err(err) => {
+                tracing::info!("Unable to obtain tmc {} phase", self.stepper_name);
+                // Upstream gives up on a read it could not make.
+                self.set_phase_sync_owed(false);
+                *self
+                    .mcu_phase_offset
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner()) = None;
+                if self.motor_enabled() {
+                    return Err(err);
+                }
+                return Ok(());
+            }
+        };
+        let moff = phase_offset(
+            driver_phase,
+            stepper.get_dir_inverted().0,
+            self.phases(),
+            mcu_position,
+        );
+        let previous = self.phase_offset();
+        if let Some(previous) = previous {
+            if previous != moff {
+                tracing::warn!(
+                    "Stepper {} phase change (was {} now {})",
+                    self.stepper_name,
+                    previous,
+                    moff
+                );
+            }
+        }
+        *self
+            .mcu_phase_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(moff);
+        self.set_phase_sync_owed(false);
+        Ok(())
+    }
+
+    /// This stepper and the solver's step count at this instant
+    /// (`MCU_stepper.get_mcu_position`).
+    ///
+    /// `None` before connect, when this driver has no stepper, or while the
+    /// toolhead's connected state is out of its shared slot (a move owns it) —
+    /// [`ToolHeadObject::stepper_mcu_position`] answers `None` for all three.
+    fn solver_step_count(&self) -> Option<(Arc<PrinterStepper>, i64)> {
+        let stepper = self
+            .stepper
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()?;
+        let mcu_position = self
+            .printer
+            .upgrade()
+            .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
+            .and_then(|toolhead| stepper.get_mcu_position(&toolhead))?;
+        Some((stepper, mcu_position))
+    }
+
+    fn phase_sync_owed(&self) -> bool {
+        self.phase_sync_owed.load(Ordering::SeqCst)
+    }
+
+    fn set_phase_sync_owed(&self, owed: bool) {
+        self.phase_sync_owed.store(owed, Ordering::SeqCst);
+    }
+
+    /// Finish a phase sync an enable owed (`get_phase_offset`).
+    ///
+    /// The offset pairs the driver's counter with the solver's step count, so it
+    /// can be measured whenever both are readable while the rotor holds still —
+    /// the pairing does not change with the position. Upstream re-measures it
+    /// that way on every `stepper:sync_mcu_position`; here the moment a move
+    /// that owned the toolhead has finished is when `[endstop_phase]` asks for
+    /// it (`homing:home_rails_end`), so that read is where an owed sync
+    /// completes.
+    ///
+    /// Nothing is read while the motor is off: a disabled driver's counter says
+    /// nothing about the rotor.
+    fn complete_owed_phase_sync(&self) {
+        if !self.phase_sync_owed() || !self.motor_enabled() {
+            return;
+        }
+        // A read failure is `sync_mcu_pos`'s to report, and only the enable path
+        // can raise: a getter has nowhere to put it. `sync_mcu_pos` stops owing
+        // the sync either way, so a dead chip is asked once and not again.
+        let _ = self.sync_mcu_pos();
+    }
+
+    /// Whether `stepper_enable` has this motor on (`enable_line.is_motor_enabled`).
+    ///
+    /// Only safe outside the enable callback, which runs while `stepper_enable`
+    /// holds its locks — the callers here are the deferred enable/disable work
+    /// (the reactor, after that callback has returned) and
+    /// [`TmcDriver::complete_owed_phase_sync`] (the g-code thread that asked for
+    /// the offset); neither holds them.
+    fn motor_enabled(&self) -> bool {
+        self.enable_line
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .map(|line| {
+                line.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .is_motor_enabled()
+            })
+            .unwrap_or(false)
+    }
+
+    // -- stepper enable/disable tracking (`_do_enable` / `_do_disable`) -----
+
+    /// Turn the driver on (`_do_enable`): restore `toff`, send the registers,
+    /// start the error check and align the phase offset.
+    ///
+    /// # Errors
+    /// A register write or a read the error check made.
+    fn do_enable(&self) -> Result<(), McuError> {
+        if let Some(toff) = *self
+            .toff
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+        {
+            // Shared enable via comms handling
+            self.fields.set_field("toff", toff, None, None);
+        }
+        self.init_registers(None)?;
+        if self.echeck.start_checks()? {
+            // A driver reset moved the rotor, so a tracked offset is stale.
+            *self
+                .mcu_phase_offset
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) = None;
+        }
+        if self.phase_offset().is_some() {
+            return Ok(());
+        }
+        tracing::info!(
+            "Pausing toolhead to calculate {} phase offset",
+            self.stepper_name
+        );
+        // Upstream waits the queued moves out (`toolhead.wait_moves`). This
+        // port's toolhead has no synchronous drain — the planner is emptied by
+        // the background generator task — so the look-ahead is flushed into the
+        // trapq instead (`get_last_move_time`, the same call `INIT_TMC` reads its
+        // print time from). The counter read after it is the solver's last
+        // commanded position.
+        self.last_move_time();
+        self.sync_mcu_pos()
+    }
+
+    /// Turn the driver off (`_do_disable`): drop `toff` and stop the check.
+    ///
+    /// # Errors
+    /// The `toff` register write.
+    fn do_disable(&self) -> Result<(), McuError> {
+        let toff = *self
+            .toff
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if toff.is_some() {
+            let val = self.fields.set_field("toff", 0, None, None);
+            // `toff` is `Some` only when connect read the field, so the register
+            // it lives in is known.
+            let reg_name = self
+                .fields
+                .lookup_register("toff")
+                .expect("the toff field was read at connect")
+                .to_string();
+            self.transport.set_register(&reg_name, val, None)?;
+        }
+        self.echeck.stop_checks();
+        Ok(())
+    }
+
+    /// Hand an enable/disable transition to the reactor
+    /// (`_handle_stepper_enable`).
+    ///
+    /// `stepper_enable` delivers the callback **in place**, while it holds the
+    /// global enable-lines lock and this stepper's tracking lock; a
+    /// [`Mutex`] is not re-entrant, so the work (which reads the enabled state
+    /// and writes registers) is deferred to the next reactor turn instead of run
+    /// here. `toff` and the dedicated-enable decision are therefore taken at
+    /// registration time, not in the callback.
+    fn handle_stepper_enable(&self, is_enable: bool) {
+        let (Some(driver), Some(printer)) = (self.self_ref.upgrade(), self.printer.upgrade())
+        else {
+            return;
+        };
+        printer.reactor().call_later(
+            0.0,
+            Box::new(move |_eventtime: f64| {
+                let result = if is_enable {
+                    driver.do_enable()
+                } else {
+                    driver.do_disable()
+                };
+                if let Err(err) = result {
+                    if let Some(printer) = driver.printer.upgrade() {
+                        printer.invoke_shutdown(&err.to_string());
+                    }
+                }
+            }),
+        );
     }
 
     fn cmd_init_tmc(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
@@ -1928,38 +2891,125 @@ impl TmcDriver {
             .and_then(|extruder| extruder.printer_stepper().cloned())
     }
 
-    fn handle_connect(&self) {
+    fn handle_connect(&self) -> Result<(), ConfigError> {
         if let Some(stepper) = self.lookup_stepper() {
             *self
                 .stepper
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner()) = Some(stepper);
         }
+        self.setup_stepper_enable()?;
         if let Err(err) = self.init_registers(None) {
             tracing::info!("TMC {} failed to init: {}", self.name, err);
         }
+        Ok(())
     }
+
+    /// Hook the enable/disable tracking up (`_handle_connect`'s soft-enable
+    /// part).
+    ///
+    /// A driver without a dedicated enable pin turns its motor on and off by
+    /// writing `toff` over the bus: the configured value is stashed and `toff`
+    /// starts at 0, so the motor is off until `stepper_enable` says otherwise.
+    ///
+    /// The dedicated-enable answer and the `toff` value are taken **now**, while
+    /// nothing holds `stepper_enable`'s locks; the callback itself only defers.
+    ///
+    /// # Errors
+    /// A machine with no `stepper_enable`, or one that does not track this
+    /// stepper.
+    fn setup_stepper_enable(&self) -> Result<(), ConfigError> {
+        let printer = self
+            .printer
+            .upgrade()
+            .ok_or_else(|| ConfigError::new("the printer is gone"))?;
+        let stepper_enable = printer
+            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            .ok_or_else(|| ConfigError::new("the stepper_enable object is not registered"))?;
+        let enable_line = stepper_enable.lookup_enable(&self.stepper_name)?;
+        let has_dedicated_enable = enable_line
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .has_dedicated_enable();
+        if !has_dedicated_enable {
+            *self
+                .toff
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()) =
+                Some(self.fields.get_field("toff", None, None));
+            self.fields.set_field("toff", 0, None, None);
+            tracing::info!("Enabling TMC virtual enable for '{}'", self.stepper_name);
+        }
+        let weak = self.self_ref.clone();
+        enable_line
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .register_state_callback(Box::new(
+                // The print time is the queue's, not the driver's: `toff` goes
+                // over the bus on the reactor turn the callback defers to
+                // (`_handle_stepper_enable`'s `print_time` is unused too).
+                move |_print_time: Option<f64>, is_enable: bool| {
+                    if let Some(driver) = weak.upgrade() {
+                        driver.handle_stepper_enable(is_enable);
+                    }
+                },
+            ));
+        *self
+            .enable_line
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(enable_line);
+        Ok(())
+    }
+}
+
+/// The offset between the driver's phase counter and the solver's step count
+/// (`_handle_sync_mcu_pos`'s arithmetic, once the counter has been read).
+///
+/// `driver_phase` is the raw `mscnt`/`mstep` reading, `phases` the driver's
+/// `(256 >> mres) * 4`. The remainder is `rem_euclid`, not `%`: upstream's
+/// Python `%` returns a non-negative result for a negative left operand, and the
+/// offset is compared against the previous one, so its sign matters.
+fn phase_offset(driver_phase: i64, dir_inverted: bool, phases: i64, mcu_position: i64) -> i64 {
+    // The counter runs the other way unless the stepper's direction is inverted
+    // (`if not stepper.get_dir_inverted()[0]`).
+    let driver_phase = if dir_inverted {
+        driver_phase
+    } else {
+        1023 - driver_phase
+    };
+    let phase = ((driver_phase as f64 / 1024. * phases as f64) + 0.5) as i64 % phases;
+    (phase - mcu_position).rem_euclid(phases)
 }
 
 impl PrinterObject for TmcDriver {
     fn get_status(&self, _eventtime: f64) -> Value {
         // A chip with no hold current (the TMC2660) reports `null`.
         let (run_current, hold_current, _, _) = self.current.get_current();
-        let offset = *self
-            .mcu_phase_offset
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
+        let offset = self.phase_offset();
+        let phase_offset_position = match (
+            offset,
+            self.stepper
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref(),
+        ) {
+            (Some(offset), Some(stepper)) => json!(stepper.mcu_to_commanded_position(offset)),
+            _ => Value::Null,
+        };
+        let check = self.echeck.get_status();
         json!({
             "mcu_phase_offset": offset,
-            "phase_offset_position": Value::Null,
+            "phase_offset_position": phase_offset_position,
             "run_current": run_current,
             "hold_current": hold_current,
+            "drv_status": check.drv_status.map_or(Value::Null, |fields| json!(fields)),
+            "temperature": check.temperature.map_or(Value::Null, |temp| json!(temp)),
         })
     }
 
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         Box::pin(async move {
-            self.handle_connect();
+            self.handle_connect()?;
             Ok(())
         })
     }
@@ -2133,17 +3183,34 @@ impl HomingEndstop for TmcVirtualEndstop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::protocol::{PushTarget, Request};
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
+    use crate::core::klippy::api::webhooks;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::mathutil::Xyz;
+    use crate::core::klippy::motion::itersolve::Axis;
+    use crate::core::klippy::motion::queuing::MotionQueuing;
+    use crate::core::klippy::motion::stepper::Stepper;
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::{ManualReactor, Reactor};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A transport that records what it was asked to read and write, and answers
-    /// every read with 0 like the file-output short-circuit does.
+    /// every read with 0 like the file-output short-circuit does (unless a test
+    /// pins a register's value).
     #[derive(Default)]
     struct RecordingTransport {
         reads: Mutex<Vec<String>>,
         writes: Mutex<Vec<(String, u32)>>,
         names: HashMap<String, u8>,
+        /// Register values this transport answers with; 0 when absent.
+        values: Mutex<HashMap<String, u32>>,
+        /// Reads that fail before they answer, in order (a transport that
+        /// cannot reach the chip).
+        read_errors: Mutex<Vec<String>>,
+        /// The print time every answer carries (`#receive_time`).
+        read_time: Mutex<f64>,
     }
 
     impl RecordingTransport {
@@ -2161,14 +3228,48 @@ mod tests {
                 .find(|(name, _)| name == reg_name)
                 .map(|(_, value)| *value)
         }
+
+        /// Answer `reg_name` with `value` from now on.
+        fn set_read_value(&self, reg_name: &str, value: u32) {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(reg_name.to_string(), value);
+        }
+
+        /// Fail the next reads with `message`, then answer normally.
+        fn fail_reads(&self, message: &str, times: usize) {
+            let mut errors = self.read_errors.lock().unwrap();
+            for _ in 0..times {
+                errors.push(message.to_string());
+            }
+        }
+
+        /// Date every answer with `time` (the read's print time).
+        fn set_read_time(&self, time: f64) {
+            *self.read_time.lock().unwrap() = time;
+        }
     }
 
     impl TmcTransport for RecordingTransport {
         fn get_register_raw(&self, reg_name: &str) -> Result<TmcRegister, McuError> {
             self.reads.lock().unwrap().push(reg_name.to_string());
+            let failure = self.read_errors.lock().unwrap().pop();
+            if let Some(message) = failure {
+                return Err(McuError::Msg(
+                    crate::core::klippy::msg::error::MsgError::new(message),
+                ));
+            }
+            let data = self
+                .values
+                .lock()
+                .unwrap()
+                .get(reg_name)
+                .copied()
+                .unwrap_or(0);
             Ok(TmcRegister {
-                data: 0,
-                receive_time: 0.,
+                data,
+                receive_time: *self.read_time.lock().unwrap(),
             })
         }
 
@@ -2231,6 +3332,7 @@ mod tests {
             (
                 "CHOPCONF".to_string(),
                 HashMap::from([
+                    ("toff".to_string(), 0x0fu32),
                     ("vsense".to_string(), 0x01u32 << 17),
                     ("mres".to_string(), 0x0fu32 << 24),
                     ("intpol".to_string(), 0x01u32 << 28),
@@ -2253,7 +3355,11 @@ mod tests {
             ),
             (
                 "DRV_STATUS".to_string(),
-                HashMap::from([("ot".to_string(), 0x01u32 << 1)]),
+                HashMap::from([
+                    ("ot".to_string(), 0x01u32 << 1),
+                    // The phase counter the driver reads for its offset.
+                    ("mscnt".to_string(), 0x3ffu32 << 16),
+                ]),
             ),
         ])
     }
@@ -2394,6 +3500,25 @@ sense_resistor: 0.220
         )
         .unwrap();
         (driver, recording)
+    }
+
+    /// An error check over `fields`/`transport`, as a machine with no heaters
+    /// would build it (`TmcDriver::new`'s `TMCErrorCheck`).
+    fn error_check(
+        printer: &Arc<Printer>,
+        driver_name: &str,
+        fields: Arc<FieldHelper>,
+        transport: Arc<dyn TmcTransport>,
+    ) -> Arc<TmcErrorCheck> {
+        let section = section(driver_name, "stepper_x", &[]);
+        Arc::new(TmcErrorCheck::new(
+            driver_name,
+            "stepper_x",
+            fields,
+            transport,
+            printer,
+            &ConfigWrapper::untracked(&section),
+        ))
     }
 
     /// tmc5160 `_calc_globalscaler`/`_calc_current_bits` for
@@ -2604,6 +3729,7 @@ sense_resistor: 0.220
     /// every other driver reads `DRV_STATUS` without them.
     #[test]
     fn test_the_error_check_picks_the_register_and_masks_by_driver() {
+        let (printer, _gcode, _lines) = machine();
         let fields = Arc::new(FieldHelper::new(
             HashMap::from([
                 (
@@ -2624,9 +3750,9 @@ sense_resistor: 0.220
         let recording = Arc::new(RecordingTransport::default());
         let transport: Arc<dyn TmcTransport> = recording.clone();
 
-        let check = TmcErrorCheck::new(
+        let check = error_check(
+            &printer,
             "tmc2130",
-            "stepper_x",
             Arc::clone(&fields),
             Arc::clone(&transport),
         );
@@ -2640,7 +3766,7 @@ sense_resistor: 0.220
             vec!["DRV_STATUS".to_string(), "GSTAT".to_string()]
         );
 
-        let check = TmcErrorCheck::new("tmc2209", "stepper_x", Arc::clone(&fields), transport);
+        let check = error_check(&printer, "tmc2209", Arc::clone(&fields), transport);
         assert_eq!(check.register_name(), "DRV_STATUS");
         assert_eq!(check.cs_actual_mask(), 0);
         assert_eq!(check.irun_field(), "irun");
@@ -2702,5 +3828,838 @@ high_velocity_threshold: 50
         let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, &config);
         vhigh_helper(&wrapper, &fields, transport.as_ref()).unwrap();
         assert_eq!(fields.get_field("thigh", None, None), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Stepper phase tracking and the enable chain
+    // ------------------------------------------------------------------
+
+    /// A machine with a clock the test steps itself (nothing else registered).
+    fn clocked_machine() -> (Arc<Printer>, Arc<ManualReactor>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        (printer, reactor)
+    }
+
+    /// `[stepper_x]` with no `enable_pin`: `stepper_enable` then answers that
+    /// there is no dedicated enable, so the driver carries it over the bus.
+    const SOFT_ENABLE_STEPPER: &str = "\
+[mcu]
+serial: /dev/not-opened-yet
+[stepper_x]
+step_pin: PA0
+dir_pin: PA1
+microsteps: 16
+rotation_distance: 40
+position_endstop: 0
+position_max: 200
+homing_speed: 50
+";
+
+    /// A loaded machine with the soft-enable stepper, and the config carrying
+    /// the `[tmc2209 stepper_x]` section the driver is built from.
+    ///
+    /// Only the stepper is loaded: the loader would register a driver of its own
+    /// for the tmc section, and a second `SET_TMC_FIELD` registration is a
+    /// duplicate command.
+    fn soft_enable_machine() -> (Arc<Printer>, Arc<ManualReactor>, Config) {
+        let (printer, reactor) = clocked_machine();
+        let (loaded, _) = Config::from_text(SOFT_ENABLE_STEPPER).unwrap();
+        printer.load_config(&loaded).unwrap();
+        let (full, _) = Config::from_text(&format!(
+            "{SOFT_ENABLE_STEPPER}[tmc2209 stepper_x]\nrun_current: 0.5\n"
+        ))
+        .unwrap();
+        (printer, reactor, full)
+    }
+
+    /// The `[tmc2209 stepper_x]` driver of [`soft_enable_machine`], over a
+    /// transport the test can inspect and answer for.
+    fn soft_enable_driver(
+        printer: &Arc<Printer>,
+        config: &Config,
+    ) -> (Arc<TmcDriver>, Arc<RecordingTransport>) {
+        let section = config.get_section("tmc2209 stepper_x").unwrap().clone();
+        let wrapper = ConfigWrapper::with_config(&section, AccessTracking::shared(), None, config);
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let current = Arc::new(
+            TmcCurrent::new(&wrapper, Arc::clone(&fields), Arc::clone(&transport)).unwrap(),
+        );
+        let driver = TmcDriver::new(
+            &wrapper,
+            printer,
+            fields,
+            transport,
+            current,
+            vec!["DRV_STATUS".to_string()],
+            None,
+        )
+        .unwrap();
+        (driver, recording)
+    }
+
+    /// Enable/disable the stepper the way `SET_STEPPER_ENABLE` does.
+    fn enable_stepper(printer: &Arc<Printer>, enable: bool) {
+        let stepper_enable = printer
+            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            .expect("`[stepper_x]` registers with stepper_enable");
+        assert!(
+            stepper_enable.set_motors_enable(&["stepper_x".to_string()], enable),
+            "the enable state changed"
+        );
+    }
+
+    /// Give `printer` a connected `[printer]` whose motion queue holds `name`,
+    /// as an up machine has once `ToolHeadObject::connect` took the rails'
+    /// steppers.
+    ///
+    /// `steps` is the solver's commanded position; the stepper's step distance
+    /// is 1, so it is also the firmware step count `sync_mcu_pos` pairs the
+    /// driver's counter with. The firmware side of the stepper is built here
+    /// only for its identity — nothing is sent to it.
+    async fn toolhead_holding_stepper(
+        printer: &Arc<Printer>,
+        name: &str,
+        steps: f64,
+    ) -> Arc<ToolHeadObject> {
+        use crate::core::klippy::mcu::{ConfigBuilder, McuChip};
+
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let toolhead = Arc::new(
+            ToolHeadObject::new(&ConfigWrapper::untracked(&section), printer)
+                .expect("kinematics: none needs no rails"),
+        );
+        printer
+            .add_object(
+                TOOLHEAD_OBJECT,
+                Arc::clone(&toolhead) as Arc<dyn PrinterObject>,
+            )
+            .expect("only this helper registers a toolhead");
+        toolhead.connect().await.expect("the toolhead connects");
+
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .expect("the loader registers `pins`");
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::clone(&pins),
+        );
+        let pin = |pin: &str| PinParams {
+            chip_name: "mcu".to_string(),
+            pin: pin.to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let mcu_stepper = chip.setup_stepper(pin("PA0"), pin("PA1"), 0, 0.0, false);
+        let mut stepper = Stepper::cartesian(name, 0, 1.0, Axis::X, 1_000_000.0);
+        stepper.set_position(Xyz::new(steps, 0.0, 0.0));
+        toolhead
+            .add_extra_axis_stepper(stepper, mcu_stepper)
+            .expect("the toolhead takes the stepper");
+        toolhead
+    }
+
+    /// `_handle_sync_mcu_pos`'s arithmetic: the counter is complemented unless
+    /// the stepper's direction is inverted, scaled onto the driver's phase count,
+    /// and the offset is taken modulo that count.
+    #[test]
+    fn test_the_phase_offset_matches_the_upstream_arithmetic() {
+        // 16 microsteps → `(256 >> 4) * 4` = 64 phases.
+        let phases = 64;
+        // Not inverted: 1023 - 100 = 923, and 923/1024*64 + 0.5 = 58.18 → 58.
+        assert_eq!(phase_offset(100, false, phases, 10), 48);
+        // The same phase against a later position: 58 - 100 is negative, and the
+        // offset stays in `0..phases` as Python's `%` gives it.
+        assert_eq!(phase_offset(100, false, phases, 100), 22);
+        // Inverted: the reading is used as it stands, 512/1024*64 + 0.5 → 32.
+        assert_eq!(phase_offset(512, true, phases, 0), 32);
+    }
+
+    /// The counter always spans 1024 positions while the phase count follows
+    /// `mres`, so a coarser driver folds the counter: 16 phases map 1023 to 0.
+    #[test]
+    fn test_the_phase_offset_folds_a_1024_counter_onto_fewer_phases() {
+        assert_eq!(phase_offset(1023, false, 16, 0), 0);
+        // 1023/1024*16 + 0.5 = 16.48 → 16, which wraps to phase 0; 0 - 6 then
+        // lands at 10 (not -6).
+        assert_eq!(phase_offset(0, false, 16, 6), 10);
+        // 256 microsteps: `(256 >> 0) * 4` = 1024 phases, so the phase is the
+        // counter itself.
+        assert_eq!(phase_offset(500, true, 1024, 100), 400);
+    }
+
+    /// `phase_offset_position` needs both a tracked offset and a stepper: 8 steps
+    /// of a 16-microstep, 40 mm-per-rotation rail are 0.1 mm.
+    #[test]
+    fn test_get_status_reports_phase_offset_position_once_an_offset_is_tracked() {
+        let (printer, _reactor, config) = soft_enable_machine();
+        let (driver, _recording) = soft_enable_driver(&printer, &config);
+        driver.handle_connect().unwrap();
+
+        assert_eq!(driver.get_phase_offset(), (None, 64));
+        let status = driver.get_status(0.0);
+        assert_eq!(status["mcu_phase_offset"], Value::Null);
+        assert_eq!(status["phase_offset_position"], Value::Null);
+        // The error check has not run, so it reports nothing.
+        assert_eq!(status["drv_status"], Value::Null);
+        assert_eq!(status["temperature"], Value::Null);
+
+        *driver
+            .mcu_phase_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(8);
+        let status = driver.get_status(0.0);
+        assert_eq!(status["mcu_phase_offset"], json!(8));
+        let position = status["phase_offset_position"]
+            .as_f64()
+            .expect("a tracked offset converts through the stepper");
+        assert!((position - 0.1).abs() < 1e-12, "{position}");
+    }
+
+    /// The virtual enable is driven by the **auto-enable chain**, not only by
+    /// `SET_STEPPER_ENABLE`: a driver without a dedicated enable pin gets its
+    /// `toff` restored when real motion is queued for its stepper
+    /// (`_handle_stepper_enable` registered on the enable line).
+    #[test]
+    fn test_a_queued_move_restores_a_soft_enabled_drivers_toff() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, recording) = soft_enable_driver(&printer, &config);
+        // The value the section asked for; connect replaces it with 0, so the
+        // motor is off until the enable chain says otherwise.
+        driver.fields().set_field("toff", 3, None, None);
+        driver.handle_connect().unwrap();
+        assert_eq!(driver.fields().get_field("toff", None, None), 0);
+
+        // The queue the toolhead would own, armed with `stepper_enable`'s
+        // auto-enable callbacks — the set `ToolHeadObject::connect` installs.
+        let stepper_enable = printer
+            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+            .expect("`[stepper_x]` registers with stepper_enable");
+        let mut queuing = MotionQueuing::new();
+        let trapq = queuing.allocate_trapq();
+        queuing.add_stepper(Stepper::cartesian(
+            "stepper_x",
+            0,
+            1.0,
+            Axis::X,
+            1_000_000.0,
+        ));
+        queuing.set_active_callbacks(stepper_enable.active_callbacks());
+        // A 10 mm X move over 0.2 s (unit direction vector, as the trapq
+        // stores it).
+        queuing.trapq_mut(trapq).append(
+            0.0,
+            0.1,
+            0.0,
+            0.1,
+            Xyz::default(),
+            Xyz::new(1.0, 0.0, 0.0),
+            0.0,
+            100.0,
+            1000.0,
+        );
+        assert!(!driver.echeck.is_running(), "nothing has moved yet");
+
+        queuing.generate(0.5).unwrap();
+
+        // The callback ran in place and deferred the driver's work to the
+        // reactor (`_handle_stepper_enable`): `toff` is back and the check runs.
+        assert_eq!(reactor.run_due(), 1);
+        assert!(driver.echeck.is_running());
+        assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(3));
+    }
+
+    /// With no dedicated enable pin the driver holds the motor state in `toff`:
+    /// connect stashes the configured value and zeroes the register, and the
+    /// deferred enable/disable writes it back and runs the checks.
+    #[test]
+    fn test_enabling_and_disabling_the_stepper_drives_toff_and_the_checks() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, recording) = soft_enable_driver(&printer, &config);
+        // The value the section asked for; connect replaces it with 0.
+        driver.fields().set_field("toff", 3, None, None);
+        driver.handle_connect().unwrap();
+        assert_eq!(driver.fields().get_field("toff", None, None), 0);
+
+        // The callback defers its work to the reactor, so nothing has happened
+        // yet — it must not be run in place (`stepper_enable` holds its locks).
+        enable_stepper(&printer, true);
+        assert!(!driver.echeck.is_running());
+        assert_eq!(reactor.run_due(), 1);
+        assert!(driver.echeck.is_running());
+        assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(3));
+        // The phase counter lives in `DRV_STATUS` and is read for the offset;
+        // with no connected toolhead there is no step count to align to.
+        assert_eq!(
+            recording.reads().first().map(String::as_str),
+            Some("DRV_STATUS")
+        );
+        assert_eq!(driver.get_phase_offset(), (None, 64));
+        assert!(driver.get_status(0.0)["drv_status"].is_object());
+
+        enable_stepper(&printer, false);
+        assert_eq!(reactor.run_due(), 1);
+        assert!(!driver.echeck.is_running());
+        assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(0));
+        assert_eq!(driver.get_status(0.0)["drv_status"], Value::Null);
+    }
+
+    /// The enable path pairs the driver's phase counter with the solver's step
+    /// count (`_handle_sync_mcu_pos`). The counter answers 0 here, which is
+    /// `mscnt = 0` in `DRV_STATUS` (`current_fields` declares the field at bits
+    /// 16..26): the not-inverted branch turns that into 1023, `1023/1024 × 64`
+    /// rounds to phase 64, which folds to 0 — minus the 10 steps the solver has
+    /// commanded, the offset is 54 of 64 phases.
+    #[tokio::test]
+    async fn test_enable_records_the_phase_offset_against_the_solvers_step_count() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, _recording) = soft_enable_driver(&printer, &config);
+        driver.handle_connect().unwrap();
+        toolhead_holding_stepper(&printer, "stepper_x", 10.0).await;
+
+        enable_stepper(&printer, true);
+        assert_eq!(reactor.run_due(), 1);
+
+        assert_eq!(driver.get_phase_offset(), (Some(54), 64));
+        assert_eq!(driver.get_status(0.0)["mcu_phase_offset"], json!(54));
+        assert!(
+            !driver.phase_sync_owed(),
+            "a readable step count needs no second visit"
+        );
+    }
+
+    /// The enable of a move's first step fires from inside that move, and a move
+    /// that owns the toolhead takes its state **out** of the shared slot for its
+    /// whole duration (`ToolHeadObject::probing_move`,
+    /// `flush_step_generation`) — so `stepper_mcu_position` answers `None`
+    /// exactly then, and there is no step count to pair the counter with.
+    /// Upstream reads the count off the solver, which is always there; here the
+    /// sync is **owed** rather than dropped, and the next `get_phase_offset`
+    /// finishes it — which is where `[endstop_phase]` asks for the offset, after
+    /// the move gave the toolhead back.
+    #[tokio::test]
+    async fn test_a_phase_sync_owed_by_an_unreadable_step_count_completes_later() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, _recording) = soft_enable_driver(&printer, &config);
+        driver.handle_connect().unwrap();
+
+        // No readable step count (here: no toolhead yet, which is the same
+        // `None` a move owning the toolhead produces).
+        enable_stepper(&printer, true);
+        assert_eq!(reactor.run_due(), 1);
+        assert_eq!(driver.phase_offset(), None);
+        assert!(
+            driver.phase_sync_owed(),
+            "the sync is owed, not dropped (upstream never loses it)"
+        );
+
+        // The step count is readable again: the offset is measured then.
+        toolhead_holding_stepper(&printer, "stepper_x", 10.0).await;
+        assert_eq!(driver.get_phase_offset(), (Some(54), 64));
+        assert!(!driver.phase_sync_owed());
+        // A second read is served from the tracked offset: the counter is not
+        // asked again.
+        assert_eq!(driver.get_phase_offset(), (Some(54), 64));
+    }
+
+    /// An owed sync that meets a driver it cannot read reports nothing (a getter
+    /// has nowhere to raise) and is not re-queued: the chip is asked once, as
+    /// upstream asks it once.
+    #[tokio::test]
+    async fn test_an_owed_phase_sync_that_cannot_read_the_driver_reports_nothing() {
+        let (printer, reactor, config) = soft_enable_machine();
+        let (driver, recording) = soft_enable_driver(&printer, &config);
+        driver.handle_connect().unwrap();
+
+        enable_stepper(&printer, true);
+        assert_eq!(reactor.run_due(), 1);
+        assert!(driver.phase_sync_owed());
+
+        toolhead_holding_stepper(&printer, "stepper_x", 10.0).await;
+        recording.fail_reads("Unable to read tmc uart 'stepper_x' register MSCNT", 1);
+
+        assert_eq!(driver.get_phase_offset(), (None, 64));
+        assert!(!driver.phase_sync_owed());
+        // No shutdown: a read the getter cannot make is not a printer error.
+        assert_ne!(printer.get_state_message().category, PrinterState::Shutdown);
+    }
+
+    /// A UART read error is retried twice before it is reported
+    /// (`_query_register`'s `count < 3` on a "Unable to read tmc uart" error).
+    #[test]
+    fn test_the_error_check_retries_a_uart_read_error() {
+        let (printer, _reactor) = clocked_machine();
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let check = error_check(&printer, "tmc2209", fields, transport);
+
+        recording.fail_reads("Unable to read tmc uart 'stepper_x' register DRV_STATUS", 2);
+        check.check_once().unwrap();
+        assert_eq!(recording.reads().len(), 3);
+
+        recording.fail_reads("Unable to read tmc uart 'stepper_x' register DRV_STATUS", 3);
+        let err = check.check_once().expect_err("three failures are reported");
+        assert!(
+            err.to_string().starts_with("Unable to read tmc uart"),
+            "{err}"
+        );
+    }
+
+    /// A zero `CS_ACTUAL` with a live run current on a *running* check means the
+    /// driver reset: three such readings are a fault, and the printer stops. The
+    /// same reading before the timer starts is accepted.
+    #[test]
+    fn test_the_error_check_reads_a_zero_cs_actual_as_a_driver_reset() {
+        let (printer, reactor) = clocked_machine();
+        let fields = Arc::new(FieldHelper::new(
+            HashMap::from([
+                (
+                    "DRV_STATUS".to_string(),
+                    HashMap::from([
+                        ("ot".to_string(), 0x01u32 << 1),
+                        ("cs_actual".to_string(), 0x1fu32 << 16),
+                    ]),
+                ),
+                (
+                    "IHOLD_IRUN".to_string(),
+                    HashMap::from([
+                        ("ihold".to_string(), 0x1fu32),
+                        ("irun".to_string(), 0x1fu32 << 8),
+                    ]),
+                ),
+            ]),
+            &[],
+            HashMap::new(),
+        ));
+        fields.set_field("irun", 8, None, None);
+        fields.set_field("ihold", 8, None, None);
+        let recording = Arc::new(RecordingTransport::default());
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let check = error_check(&printer, "tmc2130", fields, transport);
+
+        // Stopped: a zero reading is not a reset signal yet.
+        check.check_once().unwrap();
+        // `start_checks` reads before it starts the timer, so it passes too; the
+        // 1 s tick then rereads three times and gives up.
+        assert!(!check.start_checks().unwrap());
+        assert!(check.is_running());
+        reactor.advance(1.0);
+        assert!(!check.is_running());
+        assert_eq!(printer.get_state_message().category, PrinterState::Shutdown);
+        let status = check.get_status();
+        assert!(status.drv_status.is_none());
+        assert!(status.temperature.is_none());
+    }
+
+    /// The 1 s timer reads once per tick, reports the last fault register's
+    /// non-zero fields, and stops for good on `stop_checks`.
+    #[test]
+    fn test_the_periodic_check_runs_until_it_is_stopped() {
+        let (printer, reactor) = clocked_machine();
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let recording = Arc::new(RecordingTransport::default());
+        // `mscnt` = 1023: no fault bits, so the check keeps running.
+        recording.set_read_value("DRV_STATUS", 0x3ff << 16);
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let check = error_check(&printer, "tmc2209", fields, transport);
+
+        assert_eq!(check.get_status().drv_status, None);
+        check.start_checks().unwrap();
+        assert!(check.is_running());
+        assert_eq!(
+            check.get_status().drv_status,
+            Some(HashMap::from([("mscnt".to_string(), 1023)]))
+        );
+
+        let before = recording.reads().len();
+        assert_eq!(reactor.advance(1.0), 1);
+        assert_eq!(recording.reads().len(), before + 1);
+
+        check.stop_checks();
+        assert!(!check.is_running());
+        let before = recording.reads().len();
+        assert_eq!(reactor.advance(5.0), 0);
+        assert_eq!(recording.reads().len(), before);
+        assert_eq!(check.get_status().drv_status, None);
+    }
+
+    /// The chip temperature is `(adc_temp - 2038) / 7.7`, rounded to two
+    /// decimals, and only reported while the checks run.
+    #[test]
+    fn test_the_periodic_check_reports_the_chip_temperature() {
+        let (printer, reactor) = clocked_machine();
+        let fields = Arc::new(FieldHelper::new(
+            HashMap::from([
+                (
+                    "DRV_STATUS".to_string(),
+                    HashMap::from([("ot".to_string(), 0x01u32 << 1)]),
+                ),
+                (
+                    "ADC_TEMP".to_string(),
+                    HashMap::from([("adc_temp".to_string(), 0x1fffu32)]),
+                ),
+            ]),
+            &[],
+            HashMap::new(),
+        ));
+        let recording = Arc::new(RecordingTransport::default());
+        // (2115 - 2038) / 7.7 = 10 °C.
+        recording.set_read_value("ADC_TEMP", 2115);
+        let transport: Arc<dyn TmcTransport> = recording.clone();
+        let check = error_check(&printer, "tmc2240", fields, transport);
+
+        assert_eq!(check.get_status().temperature, None);
+        check.start_checks().unwrap();
+        // The start reads the fault registers only; the temperature is read on
+        // the 1 s tick.
+        assert_eq!(check.get_status().temperature, None);
+        reactor.advance(1.0);
+        assert_eq!(check.get_status().temperature, Some(10.0));
+        check.stop_checks();
+        assert_eq!(check.get_status().temperature, None);
+    }
+
+    // ---------------------------------------------------------------------
+    // Stallguard dump (`TMCStallguardDump`)
+    // ---------------------------------------------------------------------
+
+    /// A printer on a reactor the test steps by hand.
+    fn stepped_machine() -> (Arc<Printer>, Arc<ManualReactor>) {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        (printer, reactor)
+    }
+
+    /// A transport whose register table is `names`, so a test can give a chip
+    /// the registers upstream's chip modules declare.
+    fn named_transport(names: &[(&str, u8)]) -> Arc<RecordingTransport> {
+        Arc::new(RecordingTransport {
+            names: names
+                .iter()
+                .map(|(name, address)| ((*name).to_string(), *address))
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    /// The TMC2209's stallguard tables: the result lives in its own
+    /// `SG_RESULT` register, so `DRV_STATUS` has no `sg_result` field
+    /// (`sg2_supp` false).
+    fn tmc2209_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                    ("stealth".to_string(), 0x01u32 << 30),
+                ]),
+            ),
+            (
+                "SG_RESULT".to_string(),
+                HashMap::from([("sg_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// The TMC2130's stallguard tables: `DRV_STATUS` carries the SG2 result and
+    /// the current scale, and there is no SG4/`SG_RESULT` register (upstream
+    /// registers neither for this chip).
+    fn sg2_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([(
+            "DRV_STATUS".to_string(),
+            HashMap::from([
+                ("sg_result".to_string(), 0x3ffu32),
+                ("cs_actual".to_string(), 0x1fu32 << 16),
+            ]),
+        )])
+    }
+
+    /// The TMC5160's stallguard tables: `DRV_STATUS` carries the SG2 result,
+    /// the current scale and the stealthchop flag, and the SG4 result has its
+    /// own register.
+    fn sg4_stallguard_fields() -> HashMap<String, HashMap<String, u32>> {
+        HashMap::from([
+            (
+                "DRV_STATUS".to_string(),
+                HashMap::from([
+                    ("sg_result".to_string(), 0x3ffu32),
+                    ("stealth".to_string(), 0x01u32 << 14),
+                    ("cs_actual".to_string(), 0x1fu32 << 16),
+                ]),
+            ),
+            (
+                "SG4_RESULT".to_string(),
+                HashMap::from([("sg4_result".to_string(), 0x3ffu32)]),
+            ),
+        ])
+    }
+
+    /// A recording push target for the endpoint test.
+    #[derive(Default)]
+    struct Recorder {
+        closed: AtomicBool,
+        messages: Mutex<Vec<Value>>,
+    }
+
+    impl PushTarget for Recorder {
+        fn is_closed(&self) -> bool {
+            self.closed.load(Ordering::SeqCst)
+        }
+        fn push(&self, message: Value) {
+            self.messages.lock().unwrap().push(message);
+        }
+    }
+
+    /// The TMC2660 answers through `READRSP@RDSEL*`, so it has no `DRV_STATUS`
+    /// and gets no endpoint (`It is possible to support TMC2660, just disable it
+    /// for now`).
+    #[test]
+    fn test_a_chip_without_drv_status_registers_no_stallguard_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(tmc2660_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("READRSP@RDSEL0", 0x00)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none(), "the TMC2660 has nothing to dump");
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty(), "no endpoint was registered");
+    }
+
+    /// A TMC2208 has neither an `sg_result` field nor an `SG_RESULT` register,
+    /// so upstream's dead guard (`sg2_supp is None and sg4_reg_name is None`)
+    /// never fires there; here the endpoint is simply not registered.
+    #[test]
+    fn test_a_chip_without_a_stallguard_result_registers_no_endpoint() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(current_fields(), &[], HashMap::new()));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport).unwrap();
+        assert!(dump.is_none());
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert!(registrations.is_empty());
+    }
+
+    /// A chip that reports its SG2 result in `DRV_STATUS` and has no SG4 or
+    /// `SG_RESULT` register (the TMC2130/TMC5160) streams that result. Upstream
+    /// reaches this path only through `optimized_spi`; here the chip's declared
+    /// fields choose it. `DRV_STATUS` of a TMC2130 has no `stealth` field, where
+    /// upstream raises a `KeyError`: the lookup is tolerant and the SG2 result
+    /// is streamed.
+    #[test]
+    fn test_a_chip_with_only_the_sg2_result_samples_drv_status() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg2_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("DRV_STATUS", 0x6f)]);
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        transport.set_read_time(1.5);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        reactor.run_due();
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[1.5, 42, 7]]})),
+            "the SG2 result and the current scale come from DRV_STATUS"
+        );
+        assert_eq!(transport.reads(), vec!["DRV_STATUS".to_string()]);
+    }
+
+    /// The TMC2209 branch: one `SG_RESULT` read per poll, whose raw value is the
+    /// result; `cs_actual` stays at its `-1` sentinel and the sample is dated
+    /// with the read's `receive_time`.
+    #[test]
+    fn test_a_tmc2209_samples_sg_result_with_a_sentinel_cs_actual() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 0x1234);
+        transport.set_read_time(7.25);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1, "the poll timer runs at NOW");
+        assert_eq!(transport.reads(), vec!["SG_RESULT".to_string()]);
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[7.25, 0x1234, -1]]})),
+            "the sample is dated with the read's print time"
+        );
+        assert_eq!(dump.dump().unwrap(), None, "the batch was taken");
+    }
+
+    /// The SG4_RESULT branch (TMC2130/TMC5160): the SG2 result and the current
+    /// scale come from `DRV_STATUS`, and stealthchop switches the result to the
+    /// separate SG4 register.
+    #[test]
+    fn test_the_sg4_branch_reads_drv_status_and_sg4_in_stealthchop() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            sg4_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG4_RESULT", 0x6c)]);
+        transport.set_read_time(3.5);
+        transport.set_read_value("SG4_RESULT", 0x155);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport.clone())
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // SpreadCycle: the SG2 result and the current scale are both there.
+        transport.set_read_value("DRV_STATUS", (7 << 16) | 42);
+        reactor.run_due();
+        // Stealthchop: the useful result is the one in SG4_RESULT.
+        transport.set_read_value("DRV_STATUS", (1 << 14) | (7 << 16));
+        reactor.advance(QUERY_INTERVAL);
+
+        assert_eq!(
+            dump.dump().unwrap(),
+            Some(json!({"data": [[3.5, 42, 7], [3.5, 0x155, 7]]}))
+        );
+        assert_eq!(
+            transport.reads(),
+            vec![
+                "DRV_STATUS".to_string(),
+                "DRV_STATUS".to_string(),
+                "SG4_RESULT".to_string()
+            ],
+            "the SG4 register is read only in stealthchop"
+        );
+    }
+
+    /// The endpoint is registered under the stepper name and answers a
+    /// connecting client with the column header.
+    #[tokio::test]
+    async fn test_the_stallguard_endpoint_streams_under_the_stepper_name() {
+        let (printer, _reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        // Held for the endpoint's lifetime: the callbacks reach the state
+        // through a `Weak`, and on a live machine the driver owns it.
+        let _dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].path, DUMP_ENDPOINT);
+        assert_eq!(registrations[0].key, DUMP_KEY);
+        assert_eq!(registrations[0].value.as_deref(), Some("stepper_x"));
+
+        let request = Request::parse(
+            br#"{"method":"tmc/stallguard_dump","params":{"name":"stepper_x",
+                 "response_template":{"method":"dump"}}}"#,
+        )
+        .unwrap();
+        let api = Api::new();
+        let recorder = Arc::new(Recorder::default());
+        let context = EndpointContext {
+            api: &api,
+            client: Arc::clone(&recorder) as Arc<dyn PushTarget>,
+        };
+        let reply = registrations[0]
+            .handler
+            .handle(&request, &context)
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({"header": ["time", "sg_result", "cs_actual"]}));
+        // The batch loop waits out its interval before the first batch, so the
+        // header is all the client has received.
+        assert!(recorder.messages.lock().unwrap().is_empty());
+    }
+
+    /// A failed read is reported to the client and retires the poll timer
+    /// (upstream stores the error and returns `NEVER`).
+    #[test]
+    fn test_a_failed_read_is_dumped_as_an_error_and_stops_the_polling() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.fail_reads("driver unreachable", 1);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        assert_eq!(reactor.run_due(), 1);
+        let error = dump.dump().unwrap_err();
+        assert!(
+            error.contains("driver unreachable"),
+            "the read failure is reported: {error}"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "the timer retired on the error");
+    }
+
+    /// Start, sample, hand the batch over, stop: the timer stops and the
+    /// buffered samples are dropped.
+    #[test]
+    fn test_samples_move_to_the_client_and_stop_cancels_the_timer() {
+        let (printer, reactor) = stepped_machine();
+        let fields = Arc::new(FieldHelper::new(
+            tmc2209_stallguard_fields(),
+            &[],
+            HashMap::new(),
+        ));
+        let transport = named_transport(&[("SG_RESULT", 0x41)]);
+        transport.set_read_value("SG_RESULT", 11);
+        let dump = TmcStallguardDump::new(&printer, "stepper_x", fields, transport)
+            .unwrap()
+            .unwrap();
+
+        dump.start();
+        // Polls at 0, 5, 10, 15 and 20 ms.
+        reactor.advance(0.02);
+        let batch = dump.dump().unwrap().unwrap();
+        let samples = batch["data"].as_array().unwrap();
+        assert_eq!(samples.len(), 5);
+        assert!(samples
+            .iter()
+            .all(|sample| sample[1] == 11 && sample[2] == -1));
+
+        // One more sample, dropped by `stop`.
+        reactor.advance(QUERY_INTERVAL);
+        dump.stop();
+        assert_eq!(
+            dump.dump().unwrap(),
+            None,
+            "stop drops the buffered samples"
+        );
+        assert_eq!(reactor.advance(0.05), 0, "stop cancels the poll timer");
     }
 }

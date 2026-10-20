@@ -73,7 +73,7 @@ M112
 M115
 ```
 
-返回主机自己的版本号（启动参数 `software_version`，主机尚未设置时回退到 crate 版本）：
+返回主机自己的版本号（启动参数 `software_version`，主机尚未设置时回退到 `version.rs` 的同一串——上游基线 + `-` + crate 版本）：
 
 ```
 // FIRMWARE_NAME:Klipper FIRMWARE_VERSION:<version>
@@ -214,7 +214,38 @@ X:<x> Y:<y> Z:<z> E:<e>
 
 保留三位小数，直接输出（无 `// ` 前缀）；**未就绪时也可执行**。
 
-### M220 / M221 — 速度/挤出系数
+### GET_POSITION — 报告七个位置（排障用）
+
+```
+GET_POSITION
+```
+
+```
+// mcu: stepper_x:100 stepper_y:-200 stepper_z:0
+// stepper: stepper_x:12.500000 stepper_y:-25.000000 stepper_z:0.000000
+// kinematic: X:12.500000 Y:-25.000000 Z:0.000000
+// toolhead: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000
+// gcode: X:12.500000 Y:-25.000000 Z:0.000000 E:0.000000
+// gcode base: X:0.000000 Y:0.000000 Z:0.000000 E:0.000000
+// gcode homing: X:0.000000 Y:0.000000 Z:0.000000
+```
+
+七行各看一层（与 `M114` 的四点差别）：
+
+| 行 | 数据源 | 精度 |
+|----|--------|------|
+| `mcu:` | 每个运动学 stepper 的**固件步数**（`get_mcu_position`，整数） | `%d` |
+| `stepper:` | 每个 stepper 的**主机指令位置** | 六位小数 |
+| `kinematic:` | 反解出的车架位置（**只 X/Y/Z**） | 六位小数 |
+| `toolhead:` | 规划器的 commanded 位置（**不经** `move_transform`） | 六位小数 |
+| `gcode:` | `last_position` 原值（**不减** `base_position`、**不除** `extrude_factor`） | 六位小数 |
+| `gcode base:` | `base_position`（`G92`/`SET_GCODE_OFFSET`/`G28` 的锚点） | 六位小数 |
+| `gcode homing:` | `homing_position`（**只 X/Y/Z**） | 六位小数 |
+
+- 本仓 `mcu:` 行是「主机指令位置换算回步数」（`mcmd_pos / step_dist`），**不是**读固件计数器；两者在步压缩缓冲排空时一致，缓冲未发完时会差。
+- `kinematic:` 某轴无法反解（未归零、不可逆解）时，**该轴回落为 `toolhead:` 行的值**（上游 `homing.py` 的同一口径）；不是打 0。
+- 没有 toolhead 时（未就绪）报 `Printer not ready`。
+- `axis_map`（见下）里有额外轴字母时，`mcu:`/`stepper:` 两行**不**包含它们（额外轴不是运动学 stepper）。
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
@@ -245,7 +276,7 @@ RESTORE_GCODE_STATE [NAME=<name>] [MOVE=0|1] [MOVE_SPEED=<mm/s>]
 `gcode_move` 自己也是一个可查询对象（对象名 `gcode_move`，`objects/list` 里能看到）。
 `get_status` 报：`speed`（mm/min）、`speed_factor`（倍数，`1.0` 即 100%）、`extrude_factor`、
 `absolute_coordinates` / `absolute_extrude`、`homing_origin`、`position`（工具头坐标）、
-`gcode_position`（g-code 坐标）、`axis_map`（`X/Y/Z/E` → 0..3）。
+`gcode_position`（g-code 坐标）、`axis_map`（对象：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`，`toolhead:update_extra_axes` 到达后追加额外轴字母，如 `"A":4`）。
 
 ---
 
@@ -298,6 +329,11 @@ G28 [X] [Y] [Z]
 
 点名的轴归零；**一个都不给就归零 XYZ 三轴**。归零由固件触发（endstop 命中即停步），
 是本主机里少数几个 `async` 处理器之一。
+
+**等触发有 5 s 兑底（上游 `TRSYNC_TIMEOUT` 语义）**：固件报告丢失（典型：上一轮被杀/重启固件
+后 `trsync_state` 落在没接的会话上）时，归零会在 5 s 内以 `Timeout during homing` 失败，
+并先发 `trsync_trigger` 收尾；**不会再占着 gcode 锁挂着**——以前这种情形会把整台机器
+变成「无法交互」：`G28` 永不返回，后面的 `M112`、连客户端的 `printer/info` 都排不进来。
 
 ### SET_VELOCITY_LIMIT — 运行期改速度上限
 
@@ -370,6 +406,12 @@ STEPPER_BUZZ STEPPER=<name>
 
 `M18`/`M84` 会广播 `stepper:motor_off`，让其余部件一起收尾。
 
+**电机由自己的运动自动使能**（2026-10-18 补齐，对齐上游 `EnableTracking` 的
+`stepper.add_active_callback(motor_enable)`，`klippy/stepper.py:239-258` 与
+`klippy/extras/stepper_enable.py:45-70`）：队列派发现真实运动时，使能按那段运动的 `print_time`
+排期发出（不是立即写），所以上电后第一条 `G28`/`G1` 就能动；`M84`/`M18` 失能后回调会重新武装，
+下一次运动会再次使能。`SET_STEPPER_ENABLE` 仍可手工开关。
+
 ---
 
 ## 温度与加热器
@@ -396,9 +438,9 @@ TEMPERATURE_WAIT SENSOR=<section> [MINIMUM=<celsius>] [MAXIMUM=<celsius>]
   `Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM.`）；给了两者时 `MAXIMUM` 必须
   **严格大于** `MINIMUM`（错误文案逐字上游）；
 - 等待循环每秒读一次，读数进入 `[MINIMUM, MAXIMUM]` 即返回；期间每轮回一行真报表
- （`M105` 的 gcode-id 表，`<id>:%.1f /%.1f`，空表回 `T:0`；2026-10-03 `14f5055` 接线）；printer shutdown 时中止。
+ （`M105` 的 gcode-id 表，`<id>:%.1f /%.1f`，空表回 `T:0`；2026-10-03 `c1fecac` 接线）；printer shutdown 时中止。
 
-（上游 `G-Codes.md` 同款语义；2026-10-03 `b5da84e`）
+（上游 `G-Codes.md` 同款语义；2026-10-03 `a802cdc`）
 
 ### TEMPERATURE_PROBE_CALIBRATE / _NEXT / _COMPLETE / ABORT / ENABLE — 探针温度标定
 
@@ -417,11 +459,11 @@ TEMPERATURE_PROBE_NEXT / TEMPERATURE_PROBE_COMPLETE / ABORT   （标定期间动
 - 流程：移动到 `calibration_position`（可选加热床/挤出机脚本，经 `TEMPERATURE_WAIT` 等温）
   → 手动探针定零点 → 每轮升温 `STEP` → 升温到位经 kick 自动发 `TEMPERATURE_PROBE_NEXT`
   → 记热膨胀 → 样本满由 `COMPLETE` 收尾（`≥3` 才出结果）、任何时刻 `ABORT` 收尾；
-- **ENABLE** 是漂移补偿的真实开关（`ENABLE=<0|1>` 必填，两段拒绝文案逐字；`704ee0d` 接真）；
+- **ENABLE** 是漂移补偿的真实开关（`ENABLE=<0|1>` 必填，两段拒绝文案逐字；`1f0d623` 接真）；
 - 上游 quirk：`TEMPERATURE_PROBE_COMPLETE` 的 help 显示的是 NEXT 的文案（上游注册即如此，
   本仓逐字保留）。
 
-（2026-10-03 `dfaf418` + `704ee0d`；`_check_homed` 成功分支与整条 `cmd_calibrate` 端到端单测不可达——测试机恒 unhomed，按 `TESTING.md` 的真机约定待真机验证）
+（2026-10-03 `65866da` + `1f0d623`；`_check_homed` 成功分支与整条 `cmd_calibrate` 端到端单测不可达——测试机恒 unhomed，按 `TESTING.md` 的真机约定待真机验证）
 
 ### M104 / M109 — 设置挤出机温度
 
@@ -437,8 +479,18 @@ M109 [S<temperature>] [T<index>]
 
 只有名字是 `extruder` 的主挤出机注册这两条（与上游一致）。**`M109` 等待升温**：
 `wait=true` 经 `PrinterHeaters::set_temperature(.., wait)` 阻塞到加热器到达目标
-（2026-10-03，`6900894`，匹配上游 `kinematics/extruder.py:260-279`）；`M104` 仅设目标即返回。编号指向的挤出机不存在时报
+（2026-10-03，`69e20e8`，匹配上游 `kinematics/extruder.py:260-279`）；`M104` 仅设目标即返回。编号指向的挤出机不存在时报
 `Extruder not configured`。
+
+### TURN_OFF_HEATERS — 关闭全部加热器
+
+```
+TURN_OFF_HEATERS
+```
+
+把每个已注册的加热器（床、挤出机、`heater_generic`）目标温度置 `0`（上游
+`heaters.py:319-321`），不阻塞。`[idle_timeout]` 默认脚本的第一行就是它（2026-10-18 补上；
+此前落到未知命令、实际只跑了 `M84`）。仅就绪后可用（上游同样注册在 ready 表，`heaters.py:255-256`）。
 
 ### M140 / M190 — 设置热床温度
 
@@ -448,7 +500,7 @@ M190 [S<temperature>]
 ```
 
 `S` 默认 `0`。**`M190` 等待升温**：`wait=true` 经 `PrinterHeaters::set_temperature(.., wait)`
-阻塞到热床到达目标（2026-10-03，`6745e83`，匹配上游 `heater_bed.py:17-28`）；`M140` 仅设目标即返回。
+阻塞到热床到达目标（2026-10-03，`b1a7a4b`，匹配上游 `heater_bed.py:17-28`）；`M140` 仅设目标即返回。
 
 ### PID_CALIBRATE — PID 自整定
 
@@ -471,7 +523,7 @@ PID_CALIBRATE HEATER=<name> TARGET=<celsius> [WRITE_FILE=<0|1>]
   结果经 `configfile.set` 暂存四条（`control: pid` + 三个 `pid_K*`），**执行 `SAVE_CONFIG` 才写回并重启**；
 - 校准未跑满（如停机）时报 `pid_calibrate interrupted`，交还原控制环（错误路径同样交还）；
 - 等待循环走 `set_temperature(.., wait)`，每秒回显一行真 `M105` 报表（`<id>:%.1f /%.1f`，
-  空表回 `T:0`；2026-10-03 `14f5055` 接线）。
+  空表回 `T:0`；2026-10-03 `c1fecac` 接线）。
 
 ### M106 / M107 — 风扇（由 `[fan]` 装载）
 
@@ -685,7 +737,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 ### G-Code 宏命令（由 `[gcode_macro <名>]` 注册）
 
-每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。 宏命令的**参数名**也随注册进入 `status.gcode.commands[<大写宏名>]["parameters"]`：装载时扫模板体里的 `params.NAME` / `params['NAME']` / `params["NAME"]`（去重、首次出现序），扫不到则退回该节的 `variable_*` 名，两者都无则不带该键——客户端补全 `KEY=` 左边时用这份（**内建兜底表不含配置定义的宏**，宏只能运行时知道）。**宏体已渲染执行**：渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**（单花括号定界符、缺键即报错、装载期编译），渲染后回 gcode 派发；`SET_GCODE_VARIABLE` 已注册；`{% set %}` 作用域对齐 Jinja2；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等构型均可解析（含 `template.rs` 步进宏字面用例的实测）。与 Jinja2 的已知差异与错误 detail 措辞见 `extras/template.rs` 模块文档。
+每个 `[gcode_macro <名>]` 段在装载时以**大写宏名**注册为一条命令（help = `description`）。 宏命令的**参数名**也随注册进入 `status.gcode.commands[<大写宏名>]["parameters"]`：装载时扫模板体里的 `params.NAME` / `params['NAME']` / `params["NAME"]`（去重、首次出现序），扫不到则退回该节的 `variable_*` 名，两者都无则不带该键——客户端补全 `KEY=` 左边时用这份（**内建兜底表不含配置定义的宏**，宏只能运行时知道）。**宏体已渲染执行**：渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**（单花括号定界符、缺键即报错、装载期编译），渲染后回 gcode 派发；`SET_GCODE_VARIABLE` 已注册（`VALUE=` 与 `variable_*` 一样按 Python 字面量解析，`{'call': 'PAUSE', 'enable': True}` 可直接写）；`{% set %}` 作用域对齐 Jinja2；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等构型均可解析（含 `template.rs` 步进宏字面用例的实测）。字符串侧另有 Python 方法（`split`/`strip`/`replace`/`startswith`/`endswith`/`join`/`find`/`count`/`lower`/`upper`）与 printf 式的 `"…%s…" % x` 写法（编译期改写成 `|format(...)`）。与 Jinja2 的已知差异与错误 detail 措辞见 `extras/template.rs` 模块文档；其中一条影响写法：**列表是值语义，`append`/`extend` 返回 `None` 且不修改原列表**，靠它收集元素的宏拿到的是空列表。
 
 ### QUERY_ENDSTOPS / M119
 
@@ -747,6 +799,21 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 > W25 系列 flash 的 JEDEC ID：发 `9f` + 3 个哑字节，返回的后 3 字节是厂商/类型/容量。
 
 ---
+
+### BED_MESH_CALIBRATE / PROFILE / OUTPUT / MAP / OFFSET — 网格床面（`[bed_mesh]`，2026-10-19）
+
+`BED_MESH_CALIBRATE` 探测网格并装载（`PROBE_PARAMS` 透传，外加 `PROFILE=`，默认 `default`：
+标定结束自动存该 profile）。其余四条是 profile 与网格输出的管理面，参数/文案对上游
+`bed_mesh.py:1741-286`：
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `BED_MESH_PROFILE` | `LOAD` / `SAVE` / `REMOVE` | 取第一个出现的参数；`SAVE=default` 报 `Profile 'default' is reserved, please choose another profile name.`；存于 `[bed_mesh <name>]`（`version: 1` + `points` + 网格参数），启动时读回但**不自动装载**，`SAVE_CONFIG` 才落盘 |
+| `BED_MESH_OUTPUT` | `PGP` | `PGP=1` 打探针点表（含 offset 调整列），否则打插值网格；无网格报 `Bed has not been probed` |
+| `BED_MESH_MAP` | — | `mesh_map_output <紧凑 JSON>`，payload `{mesh_min, mesh_max, z_positions}` |
+| `BED_MESH_OFFSET` | `X` / `Y` / **`ZFADE`** | 写进网格查找偏移（`ZFADE` 是 z 淡出偏移）；之后重锚 G-Code 坐标；无网格报 `No mesh loaded to offset` |
+
+> 注意 `BED_MESH_OFFSET` 的第三轴参数名是 **`ZFADE`**（上游同名），不是 `Z`。
 
 ### BED_TILT_CALIBRATE — 床面倾斜校准（`[bed_tilt]` 且写了 `points` 时才注册）
 
@@ -911,7 +978,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | `TAP=` 子模式（信息分支/试打/拒绝文案对上游 `probe_eddy_current.py`） | eddy tap 标定流程；**静态标定 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 已实现**（2026-10-03，`4caf425`） |
+| `PROBE_EDDY_CURRENT_TAP_CALIBRATE` | `TAP=` 子模式（信息分支/试打/拒绝文案对上游 `probe_eddy_current.py`） | eddy tap 标定流程；**静态标定 `CALIBRATE=enable` 与 `Z_OFFSET_APPLY_PROBE` 已实现**（2026-10-03，`a6004f7`） |
 | `PROBE_EDDY_CURRENT_CALIBRATE` | `CHIP=`（mux，段名）+ `PROBE_SPEED`（默认 5，above 0） | 手动探针 + 校准移动采样生成 `calibrate` 表（`EddyCalibrationTool`，2026-10-03） |
 | `Z_OFFSET_APPLY_PROBE` | `METHOD=`（`tap` 走 tap_z_offset 写回，否则偏移校准表） | 把回零偏移应用到校准数据（`EddyCalibrationTool`，2026-10-03） |
 

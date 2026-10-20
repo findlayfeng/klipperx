@@ -28,24 +28,39 @@
 //! lowercase request is accepted as its uppercase form; `F`, multi-character
 //! values, and non-letters are refused with `Not a valid GCODE_AXIS`.
 //!
-//! # Timelines: this port's gap
+//! # Timelines
 //!
 //! Upstream gives every manual stepper its own trapq
-//! (`motion_queuing.allocate_trapq`) and appends a move's trapezoid to it
-//! (`_submit_move`), so the motor really steps. This port has **no** public
-//! path to allocate a trapq and add a stepper to the toolhead's motion queue
-//! after connect, so the timeline here is **dwell-only**: `do_move` advances
-//! the planner's print time by `calc_move_time`'s trapezoid duration
-//! (`toolhead.dwell`) and moves `commanded_pos`, but **no trapq is appended and
-//! no steps are generated for a `MOVE`**. The corpus exercises the command
-//! surface, not the motion, so this is enough for `manual_stepper.test`; the
-//! step generation is the gap to close with a motion-queue seam.
+//! (`motion_queuing.allocate_trapq`) and appends a move's trapezoid to it,
+//! both from `MANUAL_STEPPER MOVE=` (`_submit_move`) and from the planner's
+//! `process_move` for a `GCODE_AXIS`, so the motor really steps. This port does
+//! the same. The trapq is taken on the stepper's first need rather than at
+//! load — a trapq id only means something for one connection — and taking it
+//! also installs the `PrinterStepper` into the toolhead's motion queue, reading
+//! that trapq (upstream does both in `__init__`,
+//! `manual_stepper.py:31-34`). `do_set_position` flushes step generation and
+//! re-points the solver, upstream's `rail.set_position([commanded_pos, 0, 0])`;
+//! `do_move` ends with a flush because this host's step generation runs on a
+//! 10 ms tick and has no `note_mcu_movequeue_activity` to pull it forward.
 //!
-//! `do_set_position` also skips upstream's `toolhead.flush_step_generation()`
-//! and the rail position write for the same reason. `STOP_ON_ENDSTOP` is
-//! parsed and answers `No endstop for this manual stepper` when the section
-//! has none, but an actual endstop-triggered homing run is not driven (there
-//! is no `homing.manual_home` in this port).
+//! Still missing here:
+//!
+//! * `STOP_ON_ENDSTOP` is parsed and answers `No endstop for this manual
+//!   stepper` when the section has none, but an endstop-triggered run is not
+//!   driven: upstream's `drip_move` needs `motion_queuing.drip_update_time`,
+//!   which this host does not have, and
+//!   [`ToolHead::drip_move`](crate::core::klippy::motion::toolhead::ToolHead::drip_move)
+//!   only feeds the toolhead's **main** trapq (and drops the extra axes), so a
+//!   manual-stepper drip loop has to be written against its own trapq.
+//! * This stepper's trapq is not registered with `motion_report`, which
+//!   streams the toolhead's and the extruders' queues only (upstream registers
+//!   one per manual stepper, `motion_report.py:177-179`). Its **steps** are
+//!   still on `motion_report/dump_stepper` — every `PrinterStepper` registers
+//!   one — just not its queue.
+//!
+//! A registered `GCODE_AXIS` reaches the planner (`G1 A10` gives it a position
+//! slot and a distance) and `process_move` appends that planned move to this
+//! stepper's trapq, the same way the extruder queues into its own.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -57,10 +72,12 @@ use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::stepper::{PrinterStepper, RailGeometry};
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::z_tilt::block_in_command;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::mathutil::Xyz;
 use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{cartesian_active_flags, cartesian_position_fn, Axis};
 use crate::core::klippy::motion::kinematics::MoveContext;
@@ -94,6 +111,10 @@ pub struct ManualStepper {
     next_cmd_time: Mutex<f64>,
     /// Where the stepper has been commanded to.
     commanded_pos: Mutex<f64>,
+    /// The trapq this stepper's moves are queued in, once it has one
+    /// (`get_trapq`). `None` until the first command that needs motion — a
+    /// trapq id belongs to one connection, so it cannot be made at load.
+    trapq: Mutex<Option<usize>>,
     /// The G-Code letter this stepper is registered under, if any.
     axis_gcode_id: Mutex<Option<String>>,
     /// The corner speed `GCODE_AXIS` registered (`INSTANTANEOUS_CORNER_VELOCITY`).
@@ -148,6 +169,13 @@ impl ManualStepper {
             cartesian_position_fn(Axis::X),
             cartesian_active_flags(Axis::X),
         );
+        // A hidden object so the stepper's own `connect` runs and builds the
+        // host `Stepper` this section takes on its first move — the same shape
+        // `[extruder]` uses for its stepper (`extruder_stepper <name>`).
+        printer.add_object(
+            &format!("manual_stepper_stepper {short_name}"),
+            Arc::clone(&stepper) as Arc<dyn PrinterObject>,
+        )?;
 
         // `velocity` (default 5, `above=0`) and `accel` (default 0,
         // `minval=0`), read exactly as upstream's `getfloat`s are.
@@ -168,6 +196,7 @@ impl ManualStepper {
             pos_max,
             next_cmd_time: Mutex::new(0.0),
             commanded_pos: Mutex::new(0.0),
+            trapq: Mutex::new(None),
             axis_gcode_id: Mutex::new(None),
             instant_corner_v: Mutex::new(0.0),
             gaxis_limit_velocity: Mutex::new(0.0),
@@ -235,19 +264,89 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `_submit_move` (`manual_stepper.py:63-73`) minus the trapq append.
+    /// This stepper's trapq, once it has one (upstream's `get_trapq`). `None`
+    /// until the first command that needs motion installs it.
+    pub fn trapq(&self) -> Option<usize> {
+        *self.lock_trapq()
+    }
+
+    /// The trapq this stepper appends to, installing the stepper into the
+    /// toolhead's motion queue on first use.
     ///
-    /// Returns the print time the move ends at. The trapezoid is *not* queued
-    /// (see the module docs); only the time and `commanded_pos` advance.
-    fn submit_move(&self, movetime: f64, movepos: f64, speed: f64, accel: f64) -> f64 {
+    /// Upstream allocates the trapq and points the rail at it in
+    /// `ManualStepper.__init__` (`manual_stepper.py:31-34`). A trapq id only
+    /// means something for one connection, so this port takes it on the first
+    /// command that needs motion instead: the hidden
+    /// `manual_stepper_stepper <name>` object has built the host `Stepper` by
+    /// then, and the toolhead can take it and read this trapq.
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect (no host stepper to take, or no
+    /// motion state), or a failure from the toolhead installing it.
+    fn ensure_motion(&self) -> Result<usize, CommandError> {
+        if let Some(trapq) = *self.lock_trapq() {
+            return Ok(trapq);
+        }
+        let toolhead = self.toolhead()?;
+        let stepper = self
+            .stepper
+            .take_stepper()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let trapq =
+            toolhead.add_extra_axis_stepper(stepper, Arc::clone(self.stepper.mcu_stepper()))?;
+        // The trapq's x is this stepper's own coordinate, not the toolhead's:
+        // start the solver where the commanded position stands, so the first
+        // appended move starts where the motor is.
+        toolhead.set_stepper_position(&self.name, *self.lock_commanded_pos())?;
+        *self.lock_trapq() = Some(trapq);
+        Ok(trapq)
+    }
+
+    /// `_submit_move` (`manual_stepper.py:63-73`): append this move's
+    /// trapezoid to the stepper's trapq and advance the commanded position.
+    ///
+    /// The trapezoid is the stepper's own coordinate on its trapq's x, which is
+    /// why `axes_r` is `(axis_r, 0, 0)` and the velocities carry `axis_r`
+    /// already unfolded into that coordinate (upstream passes the same shape).
+    ///
+    /// # Errors
+    /// "Printer is not ready" when the motion state is gone.
+    fn submit_move(
+        &self,
+        trapq: usize,
+        movetime: f64,
+        movepos: f64,
+        speed: f64,
+        accel: f64,
+    ) -> Result<f64, CommandError> {
         let cp = *self.lock_commanded_pos();
         let dist = movepos - cp;
-        let (_axis_r, accel_t, cruise_t, _cruise_v) = calc_move_time(dist, speed, accel);
+        let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
+        self.toolhead()?.append_to_trapq(
+            trapq,
+            movetime,
+            accel_t,
+            cruise_t,
+            accel_t,
+            Xyz::new(cp, 0.0, 0.0),
+            Xyz::new(axis_r, 0.0, 0.0),
+            0.0,
+            cruise_v,
+            accel,
+        )?;
         *self.lock_commanded_pos() = movepos;
-        movetime + accel_t + cruise_t + accel_t
+        Ok(movetime + accel_t + cruise_t + accel_t)
     }
 
     /// `do_move` (`manual_stepper.py:73-80`).
+    ///
+    /// Upstream notes the queue activity (`note_mcu_movequeue_activity`) so its
+    /// flush loop wakes sooner; this host generates on a 10 ms tick with no such
+    /// note, so the trapezoid appended here is generated and sent before the
+    /// command returns.
+    ///
+    /// # Errors
+    /// "Printer is not ready", or a step-generation/send failure.
     fn do_move(
         &self,
         movepos: f64,
@@ -255,14 +354,16 @@ impl ManualStepper {
         accel: f64,
         sync: bool,
     ) -> Result<(), CommandError> {
+        let trapq = self.ensure_motion()?;
         self.sync_print_time()?;
         let start = *self.lock_next_cmd_time();
-        let end = self.submit_move(start, movepos, speed, accel);
+        let end = self.submit_move(trapq, start, movepos, speed, accel)?;
         *self.lock_next_cmd_time() = end;
         if sync {
             self.sync_print_time()?;
         }
-        Ok(())
+        let toolhead = self.toolhead()?;
+        block_in_command(toolhead.flush_step_generation())
     }
 
     /// `do_enable` (`manual_stepper.py:54-57`): drive the enable line through
@@ -280,10 +381,25 @@ impl ManualStepper {
         Ok(())
     }
 
-    /// `do_set_position` (`manual_stepper.py:58-62`), minus the flush and the
-    /// rail write (module docs).
-    fn do_set_position(&self, setpos: f64) {
+    /// `do_set_position` (`manual_stepper.py:58-62`): flush what is queued,
+    /// move the commanded position, and put the solver there
+    /// (`self.rail.set_position([commanded_pos, 0., 0.])`).
+    ///
+    /// The flush comes first, as upstream's does: the trapezoids already queued
+    /// have to be generated before the position they were planned against is
+    /// rewritten.
+    ///
+    /// # Errors
+    /// "Printer is not ready", or a step-generation/send failure.
+    fn do_set_position(&self, setpos: f64) -> Result<(), CommandError> {
+        let toolhead = self.toolhead()?;
+        block_in_command(toolhead.flush_step_generation())?;
         *self.lock_commanded_pos() = setpos;
+        let installed = self.lock_trapq().is_some();
+        if installed {
+            toolhead.set_stepper_position(&self.name, setpos)?;
+        }
+        Ok(())
     }
 
     /// `do_homing_move` (`manual_stepper.py:81-92`).
@@ -315,7 +431,7 @@ impl ManualStepper {
         }
         if gcmd.get_command_parameters().contains_key("SET_POSITION") {
             let setpos = gcmd.get_float("SET_POSITION")?;
-            self.do_set_position(setpos);
+            self.do_set_position(setpos)?;
         }
         let speed = gcmd.get(
             "SPEED",
@@ -454,6 +570,10 @@ impl ManualStepper {
                 Ok(())
             }
             GcodeAxisPlan::Register(id) => {
+                // Upstream's trapq exists from `__init__`, so a planned move
+                // always has somewhere to go; here registration is the first
+                // need (module docs).
+                self.ensure_motion()?;
                 *self.lock_instant_corner_v() = instant_corner_v;
                 *self.lock_gaxis_limit_velocity() = limit_velocity;
                 *self.lock_gaxis_limit_accel() = limit_accel;
@@ -473,6 +593,12 @@ impl ManualStepper {
 
     fn lock_commanded_pos(&self) -> MutexGuard<'_, f64> {
         self.commanded_pos
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    fn lock_trapq(&self) -> MutexGuard<'_, Option<usize>> {
+        self.trapq
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
@@ -558,7 +684,7 @@ impl ExtraAxis for ManualStepper {
     }
 
     fn check_move(&self, ctx: &mut MoveContext<'_>, ea_index: usize) -> Result<(), CommandError> {
-        let movepos = ctx.end_pos()[ea_index];
+        let movepos = ctx.end_axis(ea_index);
         if self.pos_min.is_some_and(|min| movepos < min)
             || self.pos_max.is_some_and(|max| movepos > max)
         {
@@ -585,14 +711,37 @@ impl ExtraAxis for ManualStepper {
 
     fn process_move(
         &self,
-        _queuing: &mut MotionQueuing,
-        _print_time: f64,
+        queuing: &mut MotionQueuing,
+        print_time: f64,
         move_: &Move,
         ea_index: usize,
     ) {
-        // Upstream appends to this stepper's own trapq; this port has none, so
-        // only the commanded position follows the planned move (module docs).
-        *self.lock_commanded_pos() = move_.end_pos[ea_index];
+        // Upstream's `process_move` (`manual_stepper.py:168-179`): the move's
+        // trapezoid goes into this stepper's own trapq, with the axis ratio
+        // unfolded into the trapezoid's velocities and acceleration, and the x
+        // direction of 1.0 (this trapq holds one axis).
+        let Some(trapq) = *self.lock_trapq() else {
+            // No trapq means no motion was ever asked for, and a move is only
+            // planned for a registered axis — registering one installs it
+            // (`ensure_motion`), so this is a guard rather than a path: the
+            // commanded position still follows the move.
+            *self.lock_commanded_pos() = move_.end_axis(ea_index);
+            return;
+        };
+        let axis_r = move_.axes_r[ea_index];
+        queuing.append(
+            trapq,
+            print_time,
+            move_.accel_t,
+            move_.cruise_t,
+            move_.decel_t,
+            Xyz::new(move_.start_axis(ea_index), 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            move_.start_v * axis_r,
+            move_.cruise_v * axis_r,
+            move_.accel * axis_r,
+        );
+        *self.lock_commanded_pos() = move_.end_axis(ea_index);
     }
 
     fn find_past_position(&self, _print_time: f64) -> f64 {
@@ -648,7 +797,11 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::event::KlippyEvent;
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+    use crate::core::klippy::motion::MoveSegment;
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
+    use std::time::Duration;
 
     /// The corpus's `basic_stepper` body (`test/klippy/manual_stepper.cfg:2-9`).
     const BASIC: &str = "step_pin: PF0\ndir_pin: PF1\nenable_pin: !PD7\n\
@@ -681,6 +834,119 @@ mod tests {
         printer
             .lookup_object_as::<ManualStepper>("manual_stepper basic_stepper")
             .expect("[manual_stepper basic_stepper] is registered")
+    }
+
+    /// The g-code dispatcher the loader registers.
+    fn dispatcher(printer: &Arc<Printer>) -> Arc<GCodeDispatch> {
+        printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`")
+    }
+
+    /// The `atmega2560` dictionary a fake board serves, or `None` when
+    /// `build.rs` did not build it (`KLIPPERX_ARCHES` decides which exist), so a
+    /// test skips instead of failing on a product it never got.
+    fn board() -> Option<ResponderMcu> {
+        ResponderMcu::new("mcu", "atmega2560.dict")
+    }
+
+    /// The same `[manual_stepper basic_stepper]` body over the fake firmware
+    /// (`[mcu] test: dict=…`), as the corpus cases bring a machine up: the
+    /// stepper's own `connect` runs, so the toolhead can take it.
+    ///
+    /// The `[extruder]` is the position-3 extra axis: this port keeps the E
+    /// slot for the extruder, so a manual stepper is the axis **after** it —
+    /// which is what makes its `GCODE_AXIS` letter addressable at all
+    /// (`gcode_move` skips slot 3 for a lone manual stepper).
+    fn machine_config(board: &ResponderMcu) -> Config {
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n\
+             [extruder]\nstep_pin: PF2\ndir_pin: PF3\nmicrosteps: 16\n\
+             rotation_distance: 33.500\nnozzle_diameter: 0.400\nfilament_diameter: 1.750\n\
+             heater_pin: PB4\nsensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\n\
+             control: pid\npid_Kp: 22.2\npid_Ki: 1.08\npid_Kd: 114\n\
+             min_temp: 0\nmax_temp: 300\n\
+             [manual_stepper basic_stepper]\n{BASIC}",
+            board.dict().display()
+        );
+        Config::from_text(&text).expect("the config parses").0
+    }
+
+    /// Load and bring the machine up; `Err` says why it did not come up.
+    async fn up_machine(board: &ResponderMcu) -> (Arc<Printer>, Result<(), String>) {
+        let config = machine_config(board);
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "manual_stepper.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        let setup = async {
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+            Ok(())
+        }
+        .await;
+        (printer, setup)
+    }
+
+    /// Run one script, bounded.
+    async fn run(gcode: &GCodeDispatch, script: &str) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_secs(10), gcode.run_script(script))
+            .await
+            .map_err(|_| format!("`{script}` timed out"))?
+            .map_err(|err| format!("`{script}`: {err}"))
+    }
+
+    /// Every segment of `trapq` starting at or after `start_time`, newest first
+    /// (`trapq_extract_old`).
+    fn segments_since(
+        toolhead: &ToolHeadObject,
+        trapq: usize,
+        start_time: f64,
+    ) -> Vec<MoveSegment> {
+        toolhead
+            .trapq_extract(trapq, 64, start_time, 1e18)
+            .expect("the toolhead is connected")
+    }
+
+    /// The print time a move appended **now** starts at: the end of the newest
+    /// segment already in `trapq` (`0.0` when it is empty).
+    ///
+    /// A manual stepper queues on its own trapq, so neither `print_time()` nor
+    /// the planner horizon bounds it — they track the *main* trapq and stand
+    /// still while the manual one grows. The trapq's own end is the boundary
+    /// `extract_old` stops at (`start_time >= segment.end_time()`), so slicing
+    /// from it picks up exactly the segments appended afterwards, however much
+    /// the background generator has run.
+    fn trapq_end(toolhead: &ToolHeadObject, trapq: usize) -> f64 {
+        segments_since(toolhead, trapq, 0.0)
+            .first()
+            .map(|segment| segment.end_time())
+            .unwrap_or(0.0)
+    }
+
+    /// The trapq the stepper's moves are queued in, or an error naming the
+    /// command that was supposed to install it.
+    fn trapq_of(stepper: &Arc<ManualStepper>) -> Result<usize, String> {
+        stepper
+            .trapq()
+            .ok_or_else(|| "the stepper has no trapq yet".to_string())
     }
 
     /// The corpus's options are all read (the undefined-option check is what
@@ -723,44 +989,321 @@ mod tests {
     }
 
     /// `SPEED`/`ACCEL` fall back to the section's `velocity`/`accel`
-    /// (`manual_stepper.py:105-106`). The dwell-only timeline leaves
-    /// `next_cmd_time` at the trapezoid's duration, which is the observable.
-    #[test]
-    fn test_speed_and_accel_default_to_the_section_values() {
-        let printer = load_ok(&config(BASIC));
-        printer.send_event(&KlippyEvent::KlippyReady);
-        let gcode = printer
-            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .expect("the loader registers `gcode`");
-
-        // `MOVE=10 SPEED=10` — the explicit pair.
-        gcode
-            .run_script_sync("MANUAL_STEPPER STEPPER=basic_stepper MOVE=10 SPEED=10 ACCEL=100")
-            .unwrap();
-        let stepper = the_stepper(&printer);
-        let explicit = *stepper.lock_next_cmd_time();
-        // SPEED=10 ACCEL=100 over 10mm: accel_t=0.1, accel_decel_d=1, cruise_t=0.9.
-        assert!((explicit - 1.1).abs() < 1e-9, "{explicit}");
-
-        // A second move at the defaults: velocity=7, accel=500 over 5mm. The
-        // timeline is cumulative, so measure the increment.
-        let before = {
-            let stepper = the_stepper(&printer);
-            gcode
-                .run_script_sync("MANUAL_STEPPER STEPPER=basic_stepper SET_POSITION=0")
-                .unwrap();
-            let before = *stepper.lock_next_cmd_time();
-            before
+    /// (`manual_stepper.py:105-106`). A `MOVE` is a queued trapezoid now, so the
+    /// settings are read off its segments instead of the planner's print time:
+    /// the acceleration from the ramp segment's `half_accel`, the cruise speed
+    /// from the segment that follows it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_speed_and_accel_default_to_the_section_values() {
+        let Some(board) = board() else {
+            return;
         };
-        gcode
-            .run_script_sync("MANUAL_STEPPER STEPPER=basic_stepper MOVE=5")
-            .unwrap();
-        let stepper = the_stepper(&printer);
-        let delta = *stepper.lock_next_cmd_time() - before;
-        // velocity=7, accel=500: accel_t=0.014, accel_decel_d=0.098,
-        // cruise_t=(5-0.098)/7=0.7002857…, so 2*0.014 + 0.7002857… = 0.7282857…
-        let expected = 2.0 * (7.0 / 500.0) + (5.0 - (7.0 / 500.0) * 7.0) / 7.0;
-        assert!((delta - expected).abs() < 1e-9, "{delta} vs {expected}");
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+
+            // `MOVE=10 SPEED=10 ACCEL=100` — the explicit pair. 10 mm at
+            // 10 mm/s with acceleration 100: 0.1 s of ramp, 0.9 s of cruise.
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper MOVE=10 SPEED=10 ACCEL=100",
+            )
+            .await?;
+            let stepper = the_stepper(&printer);
+            let trapq = trapq_of(&stepper)?;
+            let explicit = segments_since(&toolhead, trapq, 0.0);
+            let ramp = explicit.last().ok_or("the trapq is empty")?;
+            if (ramp.move_t - 0.1).abs() > 1e-9 {
+                return Err(format!("accel time {} is not 0.1", ramp.move_t));
+            }
+            if (2.0 * ramp.half_accel - 100.0).abs() > 1e-9 {
+                return Err(format!("accel {} is not 100", 2.0 * ramp.half_accel));
+            }
+            let cruise = &explicit[explicit.len() - 2];
+            if (cruise.start_v - 10.0).abs() > 1e-9 {
+                return Err(format!("cruise velocity {} is not 10", cruise.start_v));
+            }
+
+            // A second move at the defaults: velocity=7, accel=500 over 5 mm —
+            // 0.014 s of ramp, then (5 - 0.098) / 7 = 0.7002857… s of cruise.
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper SET_POSITION=0",
+            )
+            .await?;
+            // The boundary is the trapq's own end (see [`trapq_end`]): the
+            // manual trapq is not the planner's timeline.
+            let before = trapq_end(&toolhead, trapq);
+            run(&gcode, "MANUAL_STEPPER STEPPER=basic_stepper MOVE=5").await?;
+            let default = segments_since(&toolhead, trapq, before);
+            let ramp = default.last().ok_or("the trapq is empty")?;
+            if ramp.start_pos.x().abs() > 1e-9 {
+                return Err(format!(
+                    "the default move starts at {} , not 0",
+                    ramp.start_pos.x()
+                ));
+            }
+            if (ramp.move_t - 7.0 / 500.0).abs() > 1e-9 {
+                return Err(format!("accel time {} is not 0.014", ramp.move_t));
+            }
+            if (2.0 * ramp.half_accel - 500.0).abs() > 1e-9 {
+                return Err(format!("accel {} is not 500", 2.0 * ramp.half_accel));
+            }
+            let cruise = &default[default.len() - 2];
+            if (cruise.start_v - 7.0).abs() > 1e-9 {
+                return Err(format!("cruise velocity {} is not 7", cruise.start_v));
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// A `MOVE` puts the manual stepper in the motion queue reading a trapq of
+    /// its own, and registers its firmware stepper so the generated steps can be
+    /// sent — upstream does all three in `__init__` (`manual_stepper.py:31-34`),
+    /// this port on the first command that needs motion.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_move_installs_the_stepper_with_its_own_trapq() {
+        let Some(board) = board() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            let stepper = the_stepper(&printer);
+            if stepper.trapq().is_some() {
+                return Err("the stepper has a trapq before its first move".to_string());
+            }
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper MOVE=1 SPEED=100 ACCEL=1000",
+            )
+            .await?;
+
+            let trapq = trapq_of(&stepper)?;
+            if Some(trapq) == toolhead.main_trapq() {
+                return Err(format!("the stepper reads the main trapq ({trapq})"));
+            }
+            if toolhead.mcu_stepper(stepper.name()).is_none() {
+                return Err("no firmware stepper is registered to send its steps".to_string());
+            }
+            if toolhead
+                .stepper_commanded_position(stepper.name())
+                .is_none()
+            {
+                return Err("the stepper is not in the motion queue".to_string());
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `MANUAL_STEPPER MOVE=` appends the trapezoid to that trapq and the move
+    /// really steps: the solver only advances when steps are generated, and the
+    /// firmware step count is the travelled distance over the step distance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_move_appends_a_trapezoid_and_generates_steps() {
+        let Some(board) = board() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper MOVE=10 SPEED=100 ACCEL=1000",
+            )
+            .await?;
+
+            let stepper = the_stepper(&printer);
+            let trapq = trapq_of(&stepper)?;
+            let queued = segments_since(&toolhead, trapq, 0.0);
+            let first = queued.last().ok_or("the trapq has no segment")?;
+            if first.start_pos.x().abs() > 1e-9 || (first.axes_r.x() - 1.0).abs() > 1e-9 {
+                return Err(format!(
+                    "the segment is start {:?} direction {:?}, not the stepper's own x",
+                    first.start_pos, first.axes_r
+                ));
+            }
+            // 10 mm at 100 mm/s with acceleration 1000: 0.1 s up, 0.1 s down.
+            if (first.move_t - 0.1).abs() > 1e-9 {
+                return Err(format!("ramp time {} is not 0.1", first.move_t));
+            }
+            if (2.0 * first.half_accel - 1000.0).abs() > 1e-9 {
+                return Err(format!("accel {} is not 1000", 2.0 * first.half_accel));
+            }
+
+            // The move ended before the generation horizon, so the `MOVE`'s own
+            // flush drove it out: the solver stands at the commanded position,
+            // and 40 mm per rotation over 200 full steps × 16 microsteps is
+            // 0.0125 mm per step, so 10 mm is 800 steps.
+            let position = toolhead
+                .stepper_commanded_position(stepper.name())
+                .ok_or("the stepper is not in the motion queue")?;
+            if (position - 10.0).abs() > 1e-6 {
+                return Err(format!("the solver stands at {position}, not 10"));
+            }
+            let steps = toolhead
+                .stepper_mcu_position(stepper.name())
+                .ok_or("the stepper is not in the motion queue")?;
+            if (steps - 800).abs() > 1 {
+                return Err(format!("{steps} steps generated, not 800"));
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `SET_POSITION` flushes what is queued and puts the solver where it says,
+    /// upstream's `flush_step_generation` + `rail.set_position`
+    /// (`manual_stepper.py:58-62`): the next move then starts from there instead
+    /// of from wherever the motor had walked to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_position_reanchors_the_solver() {
+        let Some(board) = board() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper MOVE=10 SPEED=100 ACCEL=1000",
+            )
+            .await?;
+            let stepper = the_stepper(&printer);
+            let trapq = trapq_of(&stepper)?;
+            let moved = toolhead
+                .stepper_commanded_position(stepper.name())
+                .ok_or("the stepper is not in the motion queue")?;
+            if (moved - 10.0).abs() > 1e-6 {
+                return Err(format!("the solver stands at {moved}, not 10"));
+            }
+
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper SET_POSITION=0",
+            )
+            .await?;
+            let reanchored = toolhead
+                .stepper_commanded_position(stepper.name())
+                .ok_or("the stepper is not in the motion queue")?;
+            if reanchored.abs() > 1e-9 {
+                return Err(format!("SET_POSITION left the solver at {reanchored}"));
+            }
+
+            // The next move is queued from the re-anchored position, so there is
+            // no jump for the solver to walk back through.
+            let before = trapq_end(&toolhead, trapq);
+            run(
+                &gcode,
+                "MANUAL_STEPPER STEPPER=basic_stepper MOVE=5 SPEED=100 ACCEL=1000",
+            )
+            .await?;
+            let queued = segments_since(&toolhead, trapq, before);
+            let oldest = queued.last().ok_or("the trapq has no segment")?;
+            if oldest.start_pos.x().abs() > 1e-9 {
+                return Err(format!(
+                    "the move after SET_POSITION starts at {}, not 0",
+                    oldest.start_pos.x()
+                ));
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// The S3/S4 seam: a registered `GCODE_AXIS` makes `G1 A…` plan a move, and
+    /// `process_move` queues it into this stepper's trapq with the axis ratio
+    /// unfolded into the trapezoid's velocities (upstream
+    /// `manual_stepper.py:168-179`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_gcode_axis_move_is_appended_to_the_steppers_trapq() {
+        let Some(board) = board() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = dispatcher(&printer);
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            run(&gcode, "MANUAL_STEPPER STEPPER=basic_stepper GCODE_AXIS=A").await?;
+            let stepper = the_stepper(&printer);
+            let trapq = trapq_of(&stepper)?;
+
+            // 1 mm at F600 (10 mm/s): short enough that the generation horizon
+            // covers the whole move on the next flush.
+            let before = trapq_end(&toolhead, trapq);
+            run(&gcode, "G1 A1 F600").await?;
+            tokio::time::timeout(Duration::from_secs(10), toolhead.flush_step_generation())
+                .await
+                .map_err(|_| "flush_step_generation timed out".to_string())?
+                .map_err(|err| err.to_string())?;
+
+            let queued = segments_since(&toolhead, trapq, before);
+            let first = queued.last().ok_or("the trapq has no segment")?;
+            if first.print_time < before {
+                return Err(format!(
+                    "the segment starts at {}, before the move ({before})",
+                    first.print_time
+                ));
+            }
+            if first.start_pos.x().abs() > 1e-9 || (first.axes_r.x() - 1.0).abs() > 1e-9 {
+                return Err(format!(
+                    "the segment is start {:?} direction {:?}, not the axis' own x",
+                    first.start_pos, first.axes_r
+                ));
+            }
+            // The axis ratio of a pure extra-axis move is 1, so the trapezoid's
+            // cruise velocity is the move's own speed (10 mm/s).
+            let cruise = &queued[queued.len() - 2];
+            if (cruise.start_v - 10.0).abs() > 1e-6 {
+                return Err(format!("cruise velocity {} is not 10", cruise.start_v));
+            }
+
+            if (*stepper.lock_commanded_pos() - 1.0).abs() > 1e-9 {
+                return Err(format!(
+                    "the stepper's commanded position is {}",
+                    *stepper.lock_commanded_pos()
+                ));
+            }
+            let position = toolhead
+                .stepper_commanded_position(stepper.name())
+                .ok_or("the stepper is not in the motion queue")?;
+            if (position - 1.0).abs() > 1e-6 {
+                return Err(format!("the solver stands at {position}, not 1"));
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
     }
 
     /// A `MOVE` outside `position_min`/`position_max` is refused with upstream's

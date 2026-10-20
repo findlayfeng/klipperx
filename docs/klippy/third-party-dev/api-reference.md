@@ -90,14 +90,14 @@
   "state": "ready",
   "state_message": "Printer is ready",
   "hostname": "klipper",
-  "klipper_path": "/home/pi/klipper",
-  "python_path": "/usr/bin/python3",
+  "klipper_path": "/run/user/1000/klipperx/assets-3f9a01c4b2d5e6a7",
+  "python_path": "/nonexistent/python3",
   "process_id": 12345,
   "user_id": 1000,
   "group_id": 1000,
   "log_file": "/tmp/klippy.log",
   "config_file": "/home/pi/printer.cfg",
-  "software_version": "v0.12.0-123-gabcdef",
+  "software_version": "v0.13.0-734-gfe4eb86-0.1.0",
   "cpu_info": "4 core ARMv7 Processor rev 4 (v7l)"
 }
 ```
@@ -107,16 +107,18 @@
 | `state` | string | 打印机状态：`startup` / `ready` / `shutdown` / `error` |
 | `state_message` | string | 状态描述信息 |
 | `hostname` | string | 主机名 |
-| `klipper_path` | string | Klipper 安装路径；本主机没有 Klipper 源码树，报一个**不存在的路径**，理由见下 |
+| `klipper_path` | string | **真实存在的释放根**：构建期嵌入的 config/docs 资产在启动时按三级环境变量链释放到磁盘，Moonraker 的示例配置与文档两个目录注册自它，理由见下 |
 | `python_path` | string | 解释型主机就报自己的解释器路径；本主机不是解释型的，报一个**不存在的路径**，理由见下 |
 | `process_id` | int | 进程 ID |
 | `user_id` / `group_id` | int | 运行用户/组 ID |
 | `log_file` | string/null | 日志文件路径；未指定日志文件时为 `null` |
 | `config_file` | string | 配置文件路径 |
-| `software_version` | string | Klipper 软件版本 |
+| `software_version` | string | Klipper 软件版本：**上游基线 `v0.13.0-734-gfe4eb86`**（上游 `git describe --tags --long` 形状：标签 `v0.13.0` + 自该标签起 734 个提交 + 基线提交 `fe4eb86`）+ `-` + 本仓 crate 版本 `0.1.0`，编译期钉死在 `src/version.rs` |
 | `cpu_info` | string | CPU 描述字符串，如 `"4 core ARMv7 Processor rev 4 (v7l)"`（非对象，客户端直接展示） |
 
-> **`klipper_path` / `python_path` 为什么是不存在的路径**：这两个键 Moonraker 都在 `_save_path_info` 里直接下标取值（缺了会 `KeyError`），而它只在 `klipper_path` 与 `python_path` 的父目录**都存在**时才给 Klipper 更新项装上真正的 deploy 类（`components/update_manager/update_manager.py`：`os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`），否则退回 `BaseDeploy`（no-op）。本主机没有 Klipper 源码树也没有解释器，报不存在的路径正好让它退化为 no-op。`python_path` 另有一层约束：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在）—— 这正是不能报本主机自己二进制的原因。
+> **`klipper_path` / `python_path` 与 Moonraker 的耦合**：这两个键 Moonraker 都在 `_save_path_info` 里直接下标取值（缺了会 `KeyError`），**键必须在**。
+> `klipper_path` 是**真实存在的释放根**（2026-10-19 起）：`build.rs` 把上游 `config/`、本项目用户手册与上游 `docs/`（放 `docs/klipper/` 子路径，索引 README 构建期生成）嵌进二进制，`src/klippy.rs` 在 reactor/UDS 之前释放——优先 `$RUNTIME_DIRECTORY`（守护进程给的专用目录，原样使用，多值取 `:` 首段），其次 `$XDG_RUNTIME_DIR/klipperx`，再退 `/tmp/klipperx-<uid>`；**回落只因「未配置」，前两级配置了却不可写 ⇒ 启动报错退出**。Moonraker 用它注册两个静态目录：`<root>/config` → 示例配置、`<root>/docs` → 文档（本项目用户手册在顶层，上游文档在 `docs/klipper/`）。至于更新项：虽然 `path` 存在了，`os.path.exists(kcfg["path"]) and os.path.exists(kcfg["env"])`（`update_manager.py`）的第二个条件仍被假的 `python_path` 挡死，且 `_set_klipper_repo` 的 `AppType.detect(释放根)` 因根内没有 `.git` 恒为 `NONE` ⇒ Klipper 更新项仍是 `BaseDeploy`（no-op）——**释放根里永远不放 `.git`**。
+> `python_path` 维持**不存在的路径**：这个字段只有 Moonraker 在用（它自己的文档也标注为 "moonraker use only"），而它把它当作 Klipper 安装的 **virtualenv 解释器**：填进更新项的 `env`，再推导出 `<venv>/bin/python` 跑 `-m pip`（`update_manager/app_deploy.py` 的 `_configure_virtualenv`）。所以存在且可执行、但不是 `<venv>/bin/python` 形状的路径会让 Moonraker **启动失败**（`Invalid virtualenv at path …`，因为 `<parent>/bin/activate` 不存在）—— 这正是不能报本主机自己二进制的原因。
 
 ---
 
@@ -172,7 +174,7 @@
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | `remote_method` | string | 是 | 远程方法名称 |
-| `response_template` | object | 是 | 推送消息的模板格式 |
+| `response_template` | object | 否 | 推送消息的模板格式；缺省 `{}`（与上游 `get_dict(..., {})` 一致），此时推送只有 `method` |
 
 > 服务端推送时，消息为 `{"params": {...}}` 与 `response_template` 合并（同 Subscription 机制）。若注册后连接已关闭，服务端会清理该注册；当某方法已无活动连接时，服务端内部调用会报 `No active connections for method '<method>'`。
 
@@ -560,12 +562,12 @@
 > 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
 > `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
 > ② `mesh_args` 只作开关，其键不回灌配置（上游 `update_config` 的 per-command 覆盖未实现）。
-> ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`dc1dd1e`）**：`mesh_matrix` 现在是
+> ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`07072b9`）**：`mesh_matrix` 现在是
 > 插值后的 6 位小数网格（默认 `mesh_pps: 2` 把 2×2 探测点插成 4×4）；`mesh_params.algo` 报的是
 > `_verify_algorithm` 校验（并可能改写）后的值——两轴 `mesh_pps` 全 0 时它会被改写为 `direct`。
 > ④ `profiles` 恒为 `{}`（`BED_MESH_PROFILE` 未做）；`current_mesh.name` 报 `default`
 > （上游 `PROFILE` 默认值）。
-> ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`dc1dd1e`）**：圆床行按上游补齐成方阵。
+> ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`07072b9`）**：圆床行按上游补齐成方阵。
 > ⑥ 请求参数只有 `mesh_args`（参数表无 profile 名键，profile 名只出现在 `current_mesh.name`）。
 
 > 运行期状态也可通过 `objects/query` 查询 `bed_mesh` 对象：
@@ -586,20 +588,23 @@
 
 ### 18. 数据转储端点一览
 
-| 端点路径 | mux key | 典型 value | 说明 |
-|----------|---------|-----------|------|
-| `adxl345/dump_adxl345` | `sensor` | 配置节名，如 `adxl345` | ADXL345 加速度数据 |
-| `angle/dump_angle` | `sensor` | 配置节名，如 `my_angle` | 磁编码角度传感器数据 |
-| `bmi160/dump_bmi160` | `sensor` | 配置节名 | BMI160 加速度数据 |
-| `icm20948/dump_icm20948` | `sensor` | 配置节名 | ICM20948 加速度数据 |
-| `ldc1612/dump_ldc1612` | `sensor` | 配置节名 | LDC1612 涡流传感器数据 |
-| `lis2dw/dump_lis2dw` | `sensor` | 配置节名 | LIS2DW 加速度数据 |
-| `mpu9250/dump_mpu9250` | `sensor` | 配置节名 | MPU9250 加速度数据 |
-| `motion_report/dump_stepper` | `name` | 步进电机名 | 步进脉冲时间戳 |
-| `motion_report/dump_trapq` | `name` | trapq 名 | 梯形运动队列 |
-| `tmc/stallguard_dump` | `name` | 步进电机名 | TMC StallGuard 数据 |
-| `load_cell/dump_force` | `load_cell` | load cell 名 | 已实现（批 #14）：四列表头 `time, force (g), counts, tare_counts`，未校准列 `null` |
-| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 探针敲击事件 |
+下表的「状态」一列是本仓实际注册情况：**已实现**的 6 条随对应 extras 节装载而注册，
+其余是上游的目标形状、本仓尚未落地（调它只会得到 `webhooks: No registered callback for path '…'`）。
+
+| 端点路径 | mux key | 典型 value | 状态 | 说明 |
+|----------|---------|-----------|------|------|
+| `adxl345/dump_adxl345` | `sensor` | 配置节名，如 `adxl345` | 已实现 | ADXL345 加速度数据 |
+| `angle/dump_angle` | `sensor` | 配置节名，如 `my_angle` | 未实现 | 磁编码角度传感器数据 |
+| `bmi160/dump_bmi160` | `sensor` | 配置节名 | 未实现 | BMI160 加速度数据 |
+| `icm20948/dump_icm20948` | `sensor` | 配置节名 | 未实现 | ICM20948 加速度数据 |
+| `ldc1612/dump_ldc1612` | `sensor` | 配置节名 | 已实现 | LDC1612 涡流传感器数据 |
+| `lis2dw/dump_lis2dw` | `sensor` | 配置节名 | 未实现 | LIS2DW 加速度数据 |
+| `mpu9250/dump_mpu9250` | `sensor` | 配置节名 | 已实现 | MPU9250 加速度数据 |
+| `motion_report/dump_stepper` | `name` | 步进电机名 | 已实现 | 步进脉冲时间戳 |
+| `motion_report/dump_trapq` | `name` | trapq 名 | 已实现 | 梯形运动队列 |
+| `tmc/stallguard_dump` | `name` | 步进电机名 | 未实现 | TMC StallGuard 数据 |
+| `load_cell/dump_force` | `load_cell` | load cell 名 | 已实现 | 四列表头 `time, force (g), counts, tare_counts`，未校准列 `null` |
+| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 未实现 | 探针敲击事件 |
 
 **请求示例（订阅 ADXL345 数据）：**
 
@@ -667,12 +672,12 @@
 | `axis_maximum` | Coord | 运动学最大坐标（来自运动学） |
 | `cone_start_z` | float | 仅 delta 运动学额外提供 |
 
-> **与上游的已知差异（2026-10-04 复核）**：本机 `get_status` 实际只返回上表中的 `position` /
-> `print_time` / `extruder` / `max_velocity` / `max_accel` / `minimum_cruise_ratio` /
-> `square_corner_velocity` / `homed_axes`；`stalls` / `estimated_print_time` / `extra_axes_status` /
-> `axis_minimum` / `axis_maximum` / `cone_start_z` **未返回**（前两个与停滞计数有关，额外轴状态
-> 表与运动学端点仍是缺口）。`max_velocity` / `max_accel` / `minimum_cruise_ratio` /
-> `square_corner_velocity` 可由 `SET_VELOCITY_LIMIT`（或 `M204`）在运行期修改，改完两侧同时生效。
+> **与上游的已知差异（2026-10-18 复核）**：仍**未返回** `stalls`（本仓 planner 没有停滞计数，需新增状态）、
+> `extra_axes_status` 与 `cone_start_z`。`axis_minimum` / `axis_maximum`（运动学四轴 `Coord`）与
+> `estimated_print_time` 已于 2026-10-18 补上：前两者从 `kin.get_status()` 取（上游 `toolhead.py:502`
+> 同源），后者读 `connect` 注入的活估计（`toolhead.py:505-510`）。`max_velocity` / `max_accel` /
+> `minimum_cruise_ratio` / `square_corner_velocity` 可由 `SET_VELOCITY_LIMIT`（或 `M204`）在运行期
+> 修改，改完两侧同时生效。
 
 ### `save_variables`
 
@@ -699,13 +704,13 @@
 |------|------|------|
 | `absolute_coordinates` | bool | 绝对坐标模式 |
 | `absolute_extrude` | bool | 绝对挤出模式 |
-| `speed` | float | 当前速度（mm/s） |
+| `speed` | float | 当前速度（mm/min） |
 | `speed_factor` | float | 速度系数（默认 1.0） |
 | `extrude_factor` | float | 挤出系数（默认 1.0） |
-| `position` | Coord | 上次设置的位置 `[x, y, z, e]` |
-| `gcode_position` | Coord | 含着所有偏移后的当前 G-Code 坐标 |
-| `homing_origin` | Coord | 归位原点偏移（`SET_GCODE_OFFSET` 的结果） |
-| `axis_map` | array | 轴映射，元素为 `[轴字母, 轴索引]` |
+| `position` | array | 上次设置的位置（初始 `[x, y, z, e]`；注册了额外轴时后面追加其数值） |
+| `gcode_position` | array | 含着所有偏移后的当前 G-Code 坐标（长度同上） |
+| `homing_origin` | array | 归位原点偏移（`SET_GCODE_OFFSET` 的结果，恒 4 元） |
+| `axis_map` | object | 轴映射：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`；`toolhead:update_extra_axes` 到达后追加如 `"A":4`（**不是**数组） |
 
 ### `configfile`
 

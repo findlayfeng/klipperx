@@ -231,10 +231,16 @@ impl McuEndstop {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         self.dispatch.wait_end(home_end_time);
         let reason = self.dispatch.completion().wait().await;
-        // Disable the check before anything else, as upstream does.
-        mcu.send_msg(&EndstopHome::disable(self.oid))?;
+        // Disable the check before anything else, as upstream does. Its failure
+        // must not skip the disarm below: the firmware deletes a group's report
+        // timer only on `trsync_trigger` (`src/trsync.c:171-186`), so a
+        // dispatch left armed keeps reporting every `report_ticks` forever
+        // (`src/trsync.c:57-65`) — upstream never has the hole because its
+        // disable is fire-and-forget (`klippy/mcu.py:396-398`).
+        let disabled = mcu.send_msg(&EndstopHome::disable(self.oid));
         // Reset the firmware's group; the completion already recorded why.
         self.dispatch.stop();
+        disabled?;
         if reason.is_failure() {
             return Err(McuError::Config(
                 "Communication timeout during homing".to_string(),
@@ -276,6 +282,7 @@ mod tests {
     use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
     use crate::core::klippy::printer::{Printer, PrinterObject};
     use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -297,6 +304,7 @@ mod tests {
             },
             "responses": {
                 "endstop_state oid=%c homing=%c next_clock=%u pin_value=%c": 43,
+                "trsync_state oid=%c can_trigger=%c trigger_reason=%c clock=%u": 35,
                 "config is_config=%c crc=%u is_shutdown=%c move_count=%hu": 9
             },
             "enumerations": {"pin": {"PA0": 0, "PA1": 1}},
@@ -428,7 +436,16 @@ mod tests {
         );
 
         mcu.set_clock_base(10_000_000 - 100_000 + 1);
-        sleep(std::time::Duration::from_millis(60)).await;
+        // Poll the wire on a bound: the gate's re-poll and the send task both
+        // have to run before the arm is on it, and a loaded machine can miss a
+        // fixed window that small.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || !sent.lock().unwrap().is_empty(),
+            "the arm never left after the window",
+        )
+        .await;
         // The whole arm releases — and the send task may coalesce it into one
         // block, so count messages, not frames.
         let frames = sent.lock().unwrap().clone();

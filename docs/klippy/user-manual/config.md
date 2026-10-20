@@ -91,7 +91,7 @@ points: 100, 100
 
 空的续行与整行注释不参与连接，也不会终止多行值。
 
-**序列化与回写（2026-10-03，`0960f44`）**：写多行值时（`SAVE_CONFIG` 块与 `build_config_string`），
+**序列化与回写（2026-10-03，`3aab53c`）**：写多行值时（`SAVE_CONFIG` 块与 `build_config_string`），
 值内的换行落为 **tab 缩进续行**（与上游 `configparser` 逐字同形）；**空的首行被保留**——
 `key:`（值为空）后接缩进续行的配置，读回时值以 `\n` 开头（同 configparser；执行侧 gcode 逐行跑、
 空行无害）。块内形状示例：
@@ -235,12 +235,10 @@ max_accel: 3000
 | `host_library` | 字符串 | 二选一 | — | klipper host 库（`libklipper_host.so`）的路径：在主机进程内跑一份 klipper 固件。与 `serial`/CAN 键互斥；同路径可被多颗 `[mcu]` 引用，判定为 mux 时连接按 id 寻址（见 [MCU 连接方式](mcu-connection.md)）；桥的各端口 tty 由主机在库 `init` 前按端口槽登记（`[uart_device] uart_path:`），不是编译期烘死；**一个进程只允许一份 host 库**——两个不同路径会在装载期点名报错（要两个固件请用同一路径的多引用，或用独立进程） |
 | `serial` | 字符串 | 二选一 | — | 串口设备路径（如 `/dev/ttyACM0`）。**同一路径被两颗及以上 `[mcu]` 引用即共享**（见 [MCU 连接方式](mcu-connection.md)） |
 | `uart` | 字符串 | 二选一 | — | 引用一个 `[uart_device <名>]` 端口节的**名字**（如 `uart: uartxx` 引 `[uart_device uartxx]`），把这颗 MCU 挂到桥的下游 uart 端口上。与 `serial`/`host_library`/`test`/`can`/`canbus_interface` 互斥；`uuid` 可选——**不写就是 legacy**（原始帧，规则见 [MCU 连接方式](mcu-connection.md#桥下游端口uart--can-引用端口节)）；`canbus_nodeid` 不可用（非 CAN 链路）。**端口在配置期由主机声明**：主机为该端口节发 `config_uart`（带本节的 `uart_baud`）与 `config_bridge_port`（把该 UART 对象接给桥），**端口 `index` = 端口节的声明顺序**；`uart_baud` 缺省 250000，写错/端口打不开等由固件 `shutdown` ⇒ **主机在配置阶段显式报错**（不再有「编译期端口表」）。**顺序约束**：桥必须**先于**本子节连接；而裸 `[mcu]` 在同一阶段总是先于 `[mcu <名>]` 装载，所以桥是裸 `[mcu]` 时本子节**必须**写成 `[mcu <名>]`（否则报点名错误） |
-| `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`canbus_protocol`/`canbus_fd`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。端口由主机在配置期声明（`config_can` + `config_bridge_port`，`index` = 声明顺序）；**运行期会话已真机跑通**（`identify` + 配置握手 + 周期 `get_clock`，可反复附着），吞吐见 [桥下游链路的吞吐与余量](mcu-connection.md#桥下游链路的吞吐与余量真机实测) |
+| `can` | 字符串 | 二选一 | — | 引用一个 `[can_device <名>]` 端口节的名字，挂到桥的下游 CAN 端口。**`uuid` 必填**（CAN 寻址靠它，装载期点名报错）；与 `serial`/`host_library`/`test`/`canbus_interface`/`canbus_fd`/`uart` 互斥；`canbus_nodeid` 可用（id 覆盖与链路正交）。端口由主机在配置期声明（`config_can` + `config_bridge_port`，`index` = 声明顺序）；**运行期会话已真机跑通**（`identify` + 配置握手 + 周期 `get_clock`，可反复附着），吞吐见 [桥下游链路的吞吐与余量](mcu-connection.md#桥下游链路的吞吐与余量真机实测) |
 | `baud` | 整数 | 否 | `250000` | 串口波特率（仅 `serial` 模式）。共享路径以**显式写出**的值为准——多颗写了不同值就 `warn` 并**取最小值**（没写的节跟着它走） |
 | `uuid` | 12 位十六进制 | 二选一 | — | MCU 芯片唯一 ID（12 位 hex）：CAN 模式必给；写在 `serial` 节上则共享串口连接期按它先发 SET_NODEID 再握手（独占串口忽略）。历史键名 `canbus_uuid` 仍兼容，同节两个都写会报错；**写在 `host_library` 节上**则指明这条库路径上被寻址的是哪块设备（判定见 [MCU 连接方式](mcu-connection.md)：同路径 1 节有 `uuid`、或 ≥2 节即按 id 寻址；不写 `uuid:` 的节认领桥自身设备，用装载期为该路径指派的身份点名） |
 | `canbus_interface` | 字符串 | 否 | `can0` | CAN 网络接口名 |
-| `canbus_protocol` | `cans` / `isotp` | 否 | `cans` | CAN **传输层**选择：`cans` = Klipper 的 can-serial（字节流按 CAN 帧容量切片，与 Klipper 一致）；`isotp` = ISO 15765-2 分段（消息语义，一条 Klipper 帧 = 一条 ISO-TP 消息）。只在 CAN 节（写了 `canbus_interface`）有意义；写到 `serial`/`host_library`/`test`/`uart`/`can` 节上会被判为「第二个接口」报错。**不写与写 `cans` 逐字节同行为**。按**设备类型**选：支持 FD 的板子用 `cans`，标准 CAN 板子用 `isotp` 承载大于一帧的 Klipper 消息 |
-| `canbus_fd` | `true` / `false` | 否 | `false` | CAN **链路层**选择：`true` = CAN-FD（一帧 64 数据字节），`false` = 经典 CAN（8 字节）。与 `canbus_protocol` **正交**，四种组合都合法：**已验收**的是 `cans`+`true`（FD 帧直接装下 64 B 的 Klipper 消息）与 `isotp`+`false`（标准 CAN 上用 ISO-TP 承载大消息）；**`isotp`+`true` 合法但未经验证**（解析期 `warn` 一次）。同上，只在 CAN 节有意义 |
 | `canbus_nodeid` | 整数 (1..=255) | 否 | 由 `[mcu_ids]` 分配 | **MCU 层 id**，**只有 CAN 节能写它**（写到其它节会被判为"第二个接口"报错；配置键名沿用 Klipper；在 CAN 上就是节点号，见下）。**不写就由分配器发**（`4` 起的最小空位，上限 255——CAN admin 报文只给它留了 1 字节）；写了就用写的那个——分配器装载时**预扫全配置**把显式号保留下来、自动号绕开，所以显式号写在哪个位置都生效、也不会被自动号占用。装载期只在两种情况报错：两个 `[mcu]` 写了同一个号，或 `4..=255` 已占满（上游靠固件 `can_id_conflict` 兜底，本仓提前拒）。 |
 | `restart_method` | `command` / `arduino` / `cheetah` / `rpi_usb` / `admin` | 否 | `arduino`（串口）/ `command`（非串口/共享串口） | MCU 固件重启方式。**共享串口强制 `command`**（线级复位会打断整条线上的所有 MCU；显式写了别的值会告警，没写则静默降级）。**桥下游端口上的设备另有一套**：命名设备（写了 `uuid:`）可用 **`admin`**——命令经桥转发 `RESTART_DEVICE (0x05)`、由设备自己重启固件（**不是**进 bootloader：进引导是刷写工具的命令 `REQUEST_BOOTLOADER (0x02)`，不进 `restart_method`）；设备重启会重新枚举，宿主库桥对因此打不开端口的情形会**有界等路径回来 + 一次 plain restart**（见 `uart_path` 行）；legacy 设备的复位由**端口节**的 `uart_restart_method` 决定（见下）。端口级命令都**无回执**，主机靠「复位后能否重新握手/identify」确认 |
 | `usb_power` | `auto` / `sysfs` / `libusb` | 否 | `auto` | `rpi_usb` 的切电机制 |
@@ -334,9 +332,10 @@ uuid: 11aa22cc33dd        # 同一条口上第二台必须写互异 uuid
 
 **注意：**
 - 数字输出与 PWM 都支持 `!` 取反前缀。
-- 值变化**按打印时间生效**（有 `[printer]` 即 toolhead 在时）：`SET_PIN` 经 `GCodeRequestQueue` 排进前瞻、flush 时以 `queue_digital_out(clock)`／对齐后的 `set_pwm` 落地，同值重复设置去重不发帧，`G4` 推进的时间线因此真正给引脚换相定时。**两条兑底**：配置里没有 `[printer]`（lookup 不到 toolhead）或资源未连接时，退回“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`，软 PWM 对齐到软件周期边界）。`TEMPLATE` / `static_value` 仍未做。
+- 值变化**按打印时间生效**（有 `[printer]` 即 toolhead 在时）：`SET_PIN` 经 `GCodeRequestQueue` 排进前瞻、flush 时以 `queue_digital_out(clock)`／对齐后的 `set_pwm` 落地，同值重复设置去重不发帧，`G4` 推进的时间线因此真正给引脚换相定时。**两条兑底**：配置里没有 `[printer]`（lookup 不到 toolhead）或资源未连接时，退回“立即”路径（数字输出 `update_digital_out`、PWM `update_pwm`，软 PWM 对齐到软件周期边界）。
+- `SET_PIN PIN=<名> TEMPLATE=<display_template 名> [PARAM_*=…]` **已支持**：模板每 0.5 s 求值一次（上游同款 reactor 定时器，**不走**前瞻），结果经 `send_async_request` 按最近的 min_schedule_time 下发；渲染失败只告警并落 `0`。`TEMPLATE=`（空值）取消订阅；`VALUE=` 与 `TEMPLATE=` 必须给且只给一个（否则报 `SET_PIN command must specify VALUE or TEMPLATE`）。模板路径的值**不除 `scale`**、也不做 `0/1` 校验（上游同）。
+- `static_value` 上游已删该参数（`Config_Changes` 20240912），本仓只**接受并忽略**它、不再当非法选项报错；启动值用 `value`。
 - 软件 PWM 的 `shutdown_value` 只能是 `0.0` 或 `1.0`（固件只能把引脚固定在高或低）。
-- `scale` / `static_value` / `TEMPLATE` 尚未实现。
 
 **示例：**
 
@@ -548,7 +547,7 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 |------|------|------|--------|------|
 | `sensor_type` | 字符串 | 是 | — | 温度传感器类型，查 `heaters` 注册表（可选值见 `[temperature_sensor]` 的速查表） |
 | `sensor_pin` | 引脚 | 是* | — | 传感器的 ADC 引脚；`DS18B20` / `temperature_mcu` / `temperature_combined` 不用它 |
-| `heater_pin` | 引脚 | 是 | — | 加热输出（按 PWM 接） |
+| `heater_pin` | 引脚 | 是 | — | 加热输出（按 PWM 接）；固件看门狗上限 `MAX_HEAT_TIME = 3.0 s`（主机停刷新则固件把口拉回 `shutdown_value`） |
 | `min_temp` | 浮点 (°C) | 是 | — | 报警下限 |
 | `max_temp` | 浮点 (°C) | 是 | — | 报警上限，`> min_temp` |
 | `min_extrude_temp` | 浮点 (°C) | 否 | `170` | 允许挤出的最低温度（须在 `[min_temp, max_temp]` 内） |
@@ -645,7 +644,7 @@ max_temp: 110
 | 电阻/热敏（内建表） | `PT1000`、`PT100 INA826`，以及 8 个内建热敏：`ATC Semitec 104GT-2`、`ATC Semitec 104NT-4-R025H42G`、`EPCOS 100K B57560G104F`、`Generic 3950`、`SliceEngineering 450`、`TDK NTCG104LH104JT1`、`Honeywell 100K 135-104LAG-J01`、`NTC 100K MGB18-104F39050L32` |
 | SPI 热电偶 / RTD | `MAX6675` `MAX31855` `MAX31856` `MAX31865`（选项含 `tc_averaging_count` / `tc_use_50Hz_filter` / `rtd_nominal_r` / `rtd_num_of_wires` / `rtd_use_50Hz_filter`，以及 SPI 共用的 `spi_bus` / `spi_mcu` / `cs_pin` 等） |
 | 1-wire | `DS18B20`（`serial_no` 必需、`sensor_mcu` 必需、`ds18_report_time` 默认 3.0 s ≥ 1.0 s） |
-| MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`） |
+| MCU 内部 | `temperature_mcu`（可带 `sensor_mcu`，默认 `mcu`；它写的是**芯片名**，即 `[mcu 下游名]` 里的 `下游名`，如 `sensor_mcu: downstream` 对应 printer 对象 `mcu downstream`，与上游 `'%s:ADC_TEMPERATURE' % mcu_name` 同口径） |
 | 组合 | `temperature_combined`（`sensor_list` 必需、`maximum_deviation` ≥ 0、`combination_method` ∈ `min`/`max`/`mean` 必需） |
 | 主机热区 | `temperature_host`（`sensor_path` 可选，默认 `/sys/class/thermal/thermal_zone0/temp`，见下节） |
 | 自定义 | 用 `[thermistor <name>]` / `[adc_temperature <name>]` 定义后按 `<name>` 引用（见下节） |
@@ -688,10 +687,10 @@ sensor_type: temperature_host
 
 内层先按 `sensor_type` 建一个普通传感器（与 `[temperature_sensor]` 同一 `heaters` 工厂机制），
 本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。核心与标定命令族
-均已落地（A `f6ea201`、B `dfaf418`——`calibration_position` / `calibration_bed_temp` /
+均已落地（A `19e7eb4`、B `65866da`——`calibration_position` / `calibration_bed_temp` /
 `calibration_extruder_temp` / `extruder_heating_z` / `resting_z` / `horizontal_move_z` / `speed`
 由 `TEMPERATURE_PROBE_*` 命令族消费）；漂移补偿 `EddyDriftCompensation` 也已落地
-（C `704ee0d`）：需**同名** `[probe_eddy_current <name>]` 段才会注册，`get_status` 的
+（C `1f0d623`）：需**同名** `[probe_eddy_current <name>]` 段才会注册，`get_status` 的
 `compensation_enabled` 是真实开关。
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
@@ -768,6 +767,41 @@ voltage2: 4.5
 ```ini
 [static_digital_output ms_select]
 pins: !PD0, PD1, PD2
+```
+
+### `[static_pwm_clock <name>]` — 固定频率、50% 占空比的时钟输出
+
+只消费一个引脚（**不是 pin 芯片**，不注册可被 `pin:` 引用的 chip），建硬件 PWM 并按 `frequency` 输出方波（0.5 / 0.5、`max_duration = 0`）；典型用途是给外部传感器送时钟。
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `pin` | 必需 | PWM 引脚（可带 `!`） |
+| `frequency` | `100` | 输出频率（Hz），必须 > 1/0.3 ≈ 3.3333 且 ≤ 520000000 |
+
+周期必须能被 MCU 时钟整除：`1/frequency` 换算出的 tick 数乘回频率须等于 MCU 时钟频率，否则 build 期报 `Frequency output must be without remainder`（上游同一算法/同一文案）。脉宽低于 40% 或高于 60% 只告警。无 `get_status`。`order = 35`，排在 `[board_pins]` 之后，别名可用。
+
+```ini
+[static_pwm_clock ldc1612_clk_in]
+pin: carto:PB4
+frequency: 24000000
+```
+
+### `[duplicate_pin_override]` — 允许一个 pin 被多处使用
+
+上游的“逃生门”：把一个 pin 在**这里**声明一次，之后多个节可以各自占用它（仍按节序解析，本仓按固定装载表）。
+
+| 参数 | 必需 | 说明 |
+|------|------|------|
+| `pins` | 是 | 逗号分隔的引脚描述 |
+
+- 描述里**不能带修饰符**（`!PA1`/`^PA1` 报 `Invalid pin description`）——极性属于真正驱动它的那一侧；
+- 别名按**拼写**记账：`pins: my_alias` 只覆盖同样写 `my_alias` 的节，不覆盖它的目标引脚（上游同）；
+- 装载相位 `phase = early`、`order = 17`，在 `[mcu]`(10)/`[multi_pin]`(15)/`[sx1509]`(16) 之后、其余泛型节之前——**晚于 17 才注册的芯片（如 `[adc_scaled]` 的虚拟 pin）不能在这里声明**（上游靠文件顺序，本仓靠固定表）；
+- 无资源、无命令、无 `get_status`。语料里没有任何配置使用它。
+
+```ini
+[duplicate_pin_override]
+pins: PA1, my_alias
 ```
 
 ---
@@ -915,9 +949,9 @@ pins: !PD0, PD1, PD2
 | `gcode` | 必填 | 宏体 |
 | `description` | `G-Code macro` | 命令 help 文本 |
 | `rename_existing` | — | 被改名的命令：装载期只做同型检查，**连接期把该命令的旧处理器位移到这个名下、本宏接管原名**（2026-10-06）；目标名须未被占用，已占用时报 `gcode command … already registered`（与上游 `gcode.py:142-144` 同款） |
-| `variable_<名>` | — | 字面量，`get_status` 可见（只读） |
+| `variable_<名>` | — | 字面量，`get_status` 可见（只读）。**按 Python 字面量解析**（`{'restore': False, 'temp': 0}`、`False`、单/双引号串、list/tuple/dict、尾随逗号；JSON 写法 `true/false/null` 也收），与上游 `ast.literal_eval` 同口径 |
 
-宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。仍缺的在缝上：读 `printer.objects` 的反射式枚举（`PrinterView` 目前不能被 `enumerate`）。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
+宏即命令（大写注册）；**宏体已渲染执行**（渲染引擎是 `extras/template.rs` 的 **minijinja 2.24 适配层**：单花括号定界符 `{`/`{%`/`{#}`、缺键即报错、装载期编译，渲染后经 gcode 派发）；`SET_GCODE_VARIABLE` 已注册（变量可写，`VALUE=` 同样按 Python 字面量解析）；裸 `[gcode_macro]` 为共享模板持有者（零选项）。`{% set %}` 作用域对齐 Jinja2 3.1.6（顶层/`if` 块外泄、`for` 块不外泄）；`namespace()`、关键字实参、`{% block %}`、`|float(默认)` 等 Jinja2 构型均可解析（`template.rs` 的三个步进宏字面用例即实测：`namespace(phase=0)`、`{% set count.phase %}`、if/elif 链、for+range、`G4 P` 值与 DIR 正反转）。字符串语义也照 Python：`str` 有 `split`/`strip`/`replace`/`startswith`/`endswith`/`join`/`find`/`count`/`lower`/`upper`，`list` 有 `index`/`count`；**标签打印容器时按 Python `str()` 拼写**（`{'call': 'PAUSE'}`）；`"…%s…" % x` 这类 printf 格式化会改写成 `|format(...)`（只收左侧是字符串字面量的形态）。仍缺的在缝上：读 `printer.objects` 的反射式枚举（`PrinterView` 目前不能被 `enumerate`）。与 Jinja2 的已知差异（`%`/`//` 为欧几里得取余、Strict 下缺键在打印/迭代/判真时报错、`|int`/`|float` 不可转换且无默认时报错、`~` 拼接容器不走 formatter、**列表不可变所以 `append`/`extend` 返回 `None` 且收集不到元素**、部分错误 detail 措辞）见 `extras/template.rs` 模块文档。
 
 ### [led <name>] / [neopixel <name>] / [dotstar <name>] / [pca9533 <name>] / [pca9632 <name>] / [display_template <name>]
 
@@ -944,15 +978,15 @@ pins: !PD0, PD1, PD2
 
 ### [exclude_object]
 
-零选项段（上游 `exclude_object.py:12-37`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。相关语料用例已转绿（2026-09-24）。
+零选项段（上游 `exclude_object.py:12-37`）。装载时注册 `EXCLUDE_OBJECT_START`/`_END`/`EXCLUDE_OBJECT`/`EXCLUDE_OBJECT_DEFINE` 四命令并持有对象状态；排除区内移动被 `MoveTarget` 变换丢弃，**离区时按上游扣被丢弃 prime 段的 E**（`offset[3]`/`extruder_adj`，批 #4）。**变换是链式的**（2026-10-19）：它转发给被自己顶替的占用者（`bed_mesh`/`bed_tilt` 先注册时就是它们），注销时交还——因此与网格/床倾斜同用**不会再丢它们的 Z 补偿**（此前会）。
 
 ### [virtual_sdcard] / [display_status] / [homing_override] / [sdcard_loop]
 
 | 节 | 选项 | 说明 |
 |---|------|------|
-| `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 文件回放命令族（M20-M27、`SDCARD_RESET_FILE` 等）未注册（H4） |
+| `virtual_sdcard` | `path`（必）、`on_error_gcode`（默认=上游 `DEFAULT_ERROR_GCODE`） | 回放命令族已注册（`extras/virtual_sdcard.rs:449-470`）：`M20`–`M27`、`M28`–`M30`（上游同款 `SD write not supported`，`virtual_sdcard.py:41,143`）、`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE` |
 | `display_status` | 无 | `M73`/`M117`/`SET_DISPLAY_TEXT` 已注册（批 #7）；进度/消息由这两条命令驱动（无 `[display]` 时也按需创建） |
-| `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | G28 包装未装——脚本体是宏模板、暂不渲染（H9 共担） |
+| `homing_override` | `axes`（默认 `XYZ`）、`set_position_x/y/z`（无）、`gcode`（必） | **接管 `G28`**（`order = 70, phase = late`，晚于 `[printer]` 的注册）：按 `axes` 掩码选择性接管、`G28` 的参数进模板的 `params`/`rawparams`、脚本体里再调 `G28` 回落到原 handler；与 `[safe_z_home]` 互斥 |
 | `sdcard_loop` | 无 | `SDCARD_LOOP_BEGIN/_END/_DESIST` 未注册；栈/索引语义已单测钉住 |
 
 ### [dual_carriage]
@@ -985,10 +1019,10 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `i2c_mcu` / `i2c_bus` / `i2c_address` | I2C 组（`setup_i2c` 共享读取） |
 | `sensor_type` | 传感器类型（语料 `eddy`） |
 | `z_offset` | 探针 Z 偏移 |
-| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**已接**——2026-10-03 `4caf425` 由 `PROBE_EDDY_CURRENT_CALIBRATE` 生成，`Z_OFFSET_APPLY_PROBE METHOD=tap` 写回 `tap_z_offset`） |
+| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**已接**——2026-10-03 `a6004f7` 由 `PROBE_EDDY_CURRENT_CALIBRATE` 生成，`Z_OFFSET_APPLY_PROBE METHOD=tap` 写回 `tap_z_offset`） |
 | 采样组（`samples`/`sample_retract_dist`/`samples_tolerance`/`lift_speed`…） | 由 probe/`ProbePointsHelper` 读取 |
 
-段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 已实现（2026-10-03，`4caf425`）。
+段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 已实现（2026-10-03，`a6004f7`）。
 
 > 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令把待写项写回文件并重启）。
 
@@ -1033,7 +1067,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 |------|------|------|
 | `recover_velocity` | `50.0` | `RESUME` 未给 `VELOCITY=` 时的恢复速度（mm/s） |
 
-四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**SD 分支已接线**（2026-10-03，`0890669`）：回放中 `PAUSE` / `RESUME` / `CANCEL_PRINT` 真驱动 `virtual_sdcard`（这三支**不发** `action:*` 行，同上游；`RESUME` 撞上 `SD busy` 从命令冒出、`is_paused` 保留），空闲时仍走 `respond_info` 发 `action:paused` / `action:resumed` / `action:cancel`；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点已注册（`84a09e0`）。
+四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**SD 分支已接线**（2026-10-03，`6cf2cd5`）：回放中 `PAUSE` / `RESUME` / `CANCEL_PRINT` 真驱动 `virtual_sdcard`（这三支**不发** `action:*` 行，同上游；`RESUME` 撞上 `SD busy` 从命令冒出、`is_paused` 保留），空闲时仍走 `respond_info` 发 `action:paused` / `action:resumed` / `action:cancel`；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点已注册（`922eadd`）。
 
 ### `[filament_switch_sensor <name>]` / `[filament_motion_sensor <name>]` — 断料检测（wave-2）
 
@@ -1057,7 +1091,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `fan_speed` | `1.0`（0..=1） | 触发时的风扇速度 |
 
 `pin`/`kick_start_time`/`max_power`/`shutdown_speed`/`off_below`/`cycle_time`/`hardware_pwm` 由 `[fan]` 核心读取。语义：每秒 tick；**任一 heater 有 target 或温度 > `heater_temp` 即为 `fan_speed`**；仅速度变化时写 PWM；掉线关机速度默认 **1.0**（与 `[controller_fan]` 的 0.0 不同）。无 G-Code 命令，`get_status` 转发 fan 状态。
-gap：本仓无 heater 注册表（H1），`heater` 名按 printer 对象名解析；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
+`heater` 名经加热器注册表的 `lookup_heater` 解析（`heaters.rs:501-506`，批 #20），未知名报上游逐字文案 `Unknown heater '<name>'`（`heater_fan.rs:119-120`）；语料中 2 个 run 的 `tachometer_pin`（`generic-prusa-buddy`、`printer-prusa-mini-plus-2020`）批 #8 已接通，实测两条 `run_case OK`。
 
 ### `[safe_z_home]` — 归零前安全 Z 抬升（批 #6）
 
@@ -1081,7 +1115,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `accel` | `0.0`（≥0） | 默认加速度 |
 | `position_min`/`position_max` | 无 | 可选软限位 |
 
-命令见 G-Code 参考的 `MANUAL_STEPPER`。gap（如实登记）：本仓只推进时间线与 `commanded_pos`，**不 append trapq、不产生 steps**；`G1 A<..>` 的 extra axis 词被 `gcode_move` 静默忽略；有 endstop 时的 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`。
+命令见 G-Code 参考的 `MANUAL_STEPPER`。现状：**`MOVE=` 与 `G1 A<..>` 都会真正出步**——这台电机有自己的 trapq（首次需要时 `take_stepper()` 装进运动队列），`process_move` 按上游 append（`start_axis/end_axis` + `axes_r[ea_index]`），`SET_POSITION` 先 flush 再把 solver 摆到 `commanded_pos`。gap（如实登记）：**自带回零仍缺**——有 `endstop_pin` 时 `STOP_ON_ENDSTOP` 报 `Manual stepper homing is not implemented in this host`（本仓没有 `drip_update_time`，且 `drip_move` 只灌主 trapq、不带额外轴）。
 
 ### `[display]` — 液晶与编码器（st7920/hd44780/uc1701/ssd1306 已落地，批 #7+#13）
 
@@ -1100,16 +1134,18 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 
 ### `[fan_generic <name>]` — 通用风扇（批 #18）
 
-本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=` 形式**未实现**（渲染引擎已在 `extras/template.rs`，但这条缝未接，调用报明确拒绝）。
+本身不读选项：整节交给 `[fan]` 的核心（`pin`/`max_power`/`kick_start_time`/`off_below`/`cycle_time`/`hardware_pwm`/`shutdown_speed`/`enable_pin`/`tachometer_*`；**`shutdown_speed` 默认 `0.0`**，与 `[heater_fan]` 的 1.0 不同）；节名即 mux 值，注册 `SET_FAN_SPEED FAN=<name> SPEED=<0..1>`。`TEMPLATE=<display_template 名> [PARAM_*=…]` **已支持**：与 `[output_pin]` 共用同一个 `template_evaluator`（0.5 s 求值一次，结果直接 `Fan::set_speed`）；`SPEED=` 与 `TEMPLATE=` 必须给且只给一个。
 
 ### `[idle_timeout]` — 空闲超时（批 #21）
+
+**这个节可以不写**（2026-10-18）：上游在 `toolhead.py:604-614` 无条件加载它，本仓 `load.rs` 的 `DEFAULT_MODULES` 照做——没有该节时对象仍存在、`timeout` 取默认 600、`SET_IDLE_TIMEOUT` 仍可用，`printer.configfile.settings.idle_timeout.timeout` 也有值（客户端宏如 Mainsail 的 `RESUME` 会无条件读 `printer.idle_timeout.state`）。
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
 | `timeout` | `600` | 空闲秒数，`above 0` |
 | `gcode` | 内置（`{% if 'heaters' in printer %}` → `TURN_OFF_HEATERS`；`M84`） | 超时后跑的脚本 |
 
-`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。gap：`TURN_OFF_HEATERS` 未实现（默认脚本里那行走「未知命令」）；上游的 `update_timer` 抢占唤醒与 `toolhead:sync_print_time` 事件在本仓降级为定时器自续期 + 观察 `print_time` 前进。
+`SET_IDLE_TIMEOUT [TIMEOUT=]` 可改超时；`get_status` 给 `state`（`Idle`/`Ready`/`Printing`）、`printing_time`、`idle_timeout`。起印识别以 `toolhead:sync_print_time` 事件为准（`calc_print_time` 抬高 print time 时发出）；事件未到达时仍回退到“观察 `print_time` 前进”，且收到过一次事件后不再双发。默认脚本的两行现在都真生效（`TURN_OFF_HEATERS` 与 `M84`）；上游的 `update_timer` 用本仓的 `arm`（注销后重挂）顶替。
 
 ### `[verify_heater <heater_name>]` — 加热器升温校验（批 #20）
 
@@ -1120,7 +1156,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `heating_gain` | `2` | 期望升温（`above 0.`） |
 | `check_gain_time` | `60`（`heater_bed`）/ `20`（其他） | 升温窗口秒数（`minval=1.`） |
 
-每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
+每个 heater 自动获得一个检查器（配置无此节时用默认值）；失败 `invoke_shutdown("Heater <name> not heating at expected rate" + 提示)`。它读到的是 `Heater::get_temp` 的两个保护后的值：目标为 0 输出 0；**读数超 7 s 未更新时报 `0`**（传感器静默当冷热床，上游 `QUELL_STALE_TIME`）；另有一个与它无关的宿主侧保护——主线程超 5 s 未证明自己活着时 PWM 直接归 0（`MAX_MAINTHREAD_TIME`）。已知差异：`[verify_heater <不存在的 heater>]` 报装载器的 `Section '…' is not a valid config section`，而非上游的 `Unknown heater`。
 
 ### `[dac084S085 <name>]` — 四通道 SPI DAC（批 #23）
 
@@ -1271,7 +1307,7 @@ gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_
 | `run_current` / `sense_resistor` / `stealthchop_threshold` | — / 0.110 / — | 电流与静音阈值 |
 | `interpolate` / `driver_SGTHRS` / `diag_pin` | True / — / — | 仅 tmc2209 |
 
-命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。gap：fileoutput 下总线读短路为 0。
+命令：`INIT_TMC` / `DUMP_TMC` / `SET_TMC_FIELD` / `SET_TMC_CURRENT`（mux 键 `STEPPER`）；`tmc2209_<stepper>:virtual_endstop` 可用作端停。**活线已接通（2026-10-18）**：真板上读写走 `tmcuart_send`/`tmcuart_response`（5 次重试 + IFCNT 回读校验，共享 UART 有总线锁，`select_pins` 会真拉脚），`DUMP_TMC` 读的是芯片真值、`SET_TMC_CURRENT`/`INIT_TMC` 真的生效；`--lib tmc` 102 测覆盖编解码与两条重试环路。fileoutput（语料）下仍短路：读 0、写丢弃、不发帧。
 
 **SPI 族（`[tmc2130]` / `[tmc2240]` / `[tmc2660]` / `[tmc5160]`）也已落地**（2026-10-06 复核：四个
 `section!` 均在工厂表，命令与 UART 族同）；本页尚未为它们补逐项选项表——选项集与上游同名节一致，

@@ -22,6 +22,7 @@ use std::time::Duration;
 use crate::core::klippy::cmd::debug::{DebugRead, DebugResult};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::heaters::{PrinterHeaters, Sensor, SensorCallback};
+use crate::core::klippy::extras::spi_device::mcu_object_name;
 use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, McuObject};
 use crate::core::klippy::pins::{Adc, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::Printer;
@@ -209,13 +210,13 @@ pub struct TemperatureMCUSensor {
 
 impl TemperatureMCUSensor {
     /// Forward one ADC report as a temperature.
-    fn handle_adc_report(&self, samples: &[(u64, f64)]) {
+    fn handle_adc_report(&self, samples: &[(f64, f64)]) {
         let (read_time, read_value) = samples[samples.len() - 1];
         let Some(calibration) = *self.calibration.lock().unwrap() else {
             return;
         };
         let temp = calibration.calc_temp(read_value);
-        let time = read_time as f64 + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
+        let time = read_time + f64::from(SAMPLE_COUNT) * SAMPLE_TIME;
         if let Some(cb) = self.callback.lock().unwrap().as_mut() {
             cb(time, temp);
         }
@@ -229,6 +230,10 @@ impl Sensor for TemperatureMCUSensor {
 
     fn setup_callback(&self, callback: SensorCallback) {
         *self.callback.lock().unwrap() = Some(callback);
+    }
+
+    fn get_report_time_delta(&self) -> f64 {
+        REPORT_TIME
     }
 }
 
@@ -287,7 +292,7 @@ pub fn temperature_mcu_factory(
         .lookup_object_as::<PrinterPins>(PINS_OBJECT)
         .ok_or_else(|| ConfigError::new("temperature_mcu: the pins object is not registered"))?;
     let mcu_object = printer
-        .lookup_object_as::<McuObject>(&sensor_mcu)
+        .lookup_object_as::<McuObject>(&mcu_object_name(&sensor_mcu))
         .ok_or_else(|| ConfigError::new(format!("temperature_mcu: no MCU named '{sensor_mcu}'")))?;
     let builder: Arc<ConfigBuilder> = mcu_object.config();
 
@@ -465,5 +470,80 @@ mod tests {
         // (100 - 25) / (0.25 - 0.5) = -300 °C per ADC.
         assert!((cal.slope + 300.0).abs() < 1e-9);
         assert!((cal.calc_temp(0.5) - 25.0).abs() < 1e-9);
+    }
+
+    /// `sensor_mcu` names a **chip**, as upstream: the option feeds
+    /// `'%s:ADC_TEMPERATURE' % mcu_name` (`temperature_mcu.py:23,33`), and
+    /// `[mcu downstream]` is chip `downstream` while its printer object is
+    /// `mcu downstream` (`mcu.py:1251`). Reading it straight as an object name
+    /// finds nothing on a second board, so the lookup goes through
+    /// `mcu_object_name` — with the default `mcu` both spellings agree.
+    #[test]
+    fn test_sensor_mcu_names_the_chip_and_finds_the_object_after_it() {
+        use crate::core::klippy::config::section::ConfigSection;
+        use crate::core::klippy::config::{Config, ConfigWrapper};
+        use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+        use crate::core::klippy::printer::PrinterObject;
+        use crate::core::klippy::reactor::ManualReactor;
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        let downstream = Arc::new(
+            McuObject::new(ConfigSection::new("mcu", Some("downstream")), &printer)
+                .expect("the MCU registers its chip"),
+        );
+        printer
+            .add_object("mcu downstream", downstream as Arc<dyn PrinterObject>)
+            .unwrap();
+
+        let config = Config::from_text(
+            "[temperature_sensor downstream_temp]\n\
+             sensor_type: temperature_mcu\n\
+             sensor_mcu: downstream\n\
+             min_temp: 0\n\
+             max_temp: 100\n",
+        )
+        .expect("parses")
+        .0;
+        let section = config
+            .get_sections_by_id("temperature_sensor")
+            .into_iter()
+            .next()
+            .expect("the section")
+            .clone();
+        // The lookup finds `mcu downstream` and the sensor builds: what the
+        // factory needs from the chip — the ADC sample range — is computed at
+        // build time, not here, so the empty test pin table never bites.
+        temperature_mcu_factory(&ConfigWrapper::untracked(&section), &printer)
+            .expect("sensor_mcu: downstream must find 'mcu downstream'");
+
+        // The default spells the same object as it does the chip: `mcu`.
+        let plain = Config::from_text(
+            "[temperature_sensor mcu_temp]\n\
+             sensor_type: temperature_mcu\n\
+             min_temp: 0\n\
+             max_temp: 100\n",
+        )
+        .expect("parses")
+        .0;
+        let plain = plain
+            .get_sections_by_id("temperature_sensor")
+            .into_iter()
+            .next()
+            .expect("the section")
+            .clone();
+        printer
+            .add_object("mcu", {
+                let mcu = Arc::new(
+                    McuObject::new(ConfigSection::new("mcu", None), &printer)
+                        .expect("the MCU registers its chip"),
+                );
+                mcu as Arc<dyn PrinterObject>
+            })
+            .unwrap();
+        temperature_mcu_factory(&ConfigWrapper::untracked(&plain), &printer)
+            .expect("the default sensor_mcu finds 'mcu'");
     }
 }

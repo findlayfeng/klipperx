@@ -135,6 +135,10 @@ impl TrsyncChip {
     }
 
     /// The `(offset, freq)` the print-time mapping uses.
+    ///
+    /// `freq` is zero when no mapping has been published and the firmware has
+    /// no frequency to stand behind yet (`fallback_mapping_freq`); the
+    /// estimator's placeholder 1 Hz is never converted with.
     pub fn time_mapping(&self) -> (f64, f64) {
         let freq = *self
             .print_time_freq
@@ -143,9 +147,7 @@ impl TrsyncChip {
         let freq = if freq > 0.0 {
             freq
         } else {
-            self.clock()
-                .map(|clock| clock.estimator().mcu_freq())
-                .unwrap_or(1.0)
+            fallback_mapping_freq(self.clock().as_deref())
         };
         let offset = *self
             .print_time_offset
@@ -172,6 +174,82 @@ impl TrsyncChip {
         let (offset, freq) = self.time_mapping();
         Some(clock as f64 / freq + offset)
     }
+}
+
+/// The clock facts an ADC input needs to date a report.
+///
+/// Deliberately **not** a whole [`McuChip`]: the chip owns the [`AdcRegistry`]
+/// that owns each input's state, so a chip stored in that state would make
+/// `registry ↔ state` a strong cycle — and through the chip's `mcu` slot it
+/// would keep the connected `Mcu` alive after teardown, whose parked blocking
+/// device read then hangs runtime shutdown. [`TrsyncChip`] avoids the same trap
+/// for the trsync layer; this is the ADC's narrower version of it.
+#[derive(Clone)]
+pub struct AdcClock {
+    clock: Arc<Mutex<Option<Arc<McuClock>>>>,
+    print_time_offset: Arc<Mutex<f64>>,
+    print_time_freq: Arc<Mutex<f64>>,
+}
+
+impl AdcClock {
+    /// Extend a 32-bit reading into this MCU's 64-bit domain.
+    pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
+        Some(self.clock()?.clock32_to_clock64(clock32))
+    }
+
+    /// The print-time mapping, once this MCU has connected.
+    ///
+    /// A report carries the firmware's clock, and the mapping is filled at
+    /// connect (`McuChip::set_clock`), so a sample that arrives earlier cannot
+    /// be dated. There is no estimate step in between: the mapping's frequency
+    /// is what converts, seeded or not.
+    pub fn mapping(&self) -> Option<ClockMapping> {
+        let freq = *self
+            .print_time_freq
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if freq <= 0.0 {
+            return None;
+        }
+        let offset = *self
+            .print_time_offset
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Some(ClockMapping { offset, freq })
+    }
+
+    fn clock(&self) -> Option<Arc<McuClock>> {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+}
+
+/// The `(offset, freq)` an [`AdcClock`] maps an MCU clock with.
+#[derive(Clone, Copy)]
+pub struct ClockMapping {
+    offset: f64,
+    freq: f64,
+}
+
+impl ClockMapping {
+    /// This MCU's clock as an absolute print time.
+    pub fn print_time(&self, clock: i64) -> f64 {
+        clock as f64 / self.freq + self.offset
+    }
+}
+
+/// The frequency a chip's print-time mapping converts with when none has been
+/// published, or zero when there is none.
+///
+/// [`McuChip::set_clock`] publishes the firmware's frequency at connect, so this
+/// only decides the window before that — and the MCU that has no dictionary
+/// frequency to publish at all, whose conversion callers already treat as "no
+/// mapping yet" (`bltouch`'s "no clock frequency yet"). The estimator's
+/// placeholder 1 Hz is not a candidate: a mapping on it reads ticks as seconds.
+fn fallback_mapping_freq(clock: Option<&McuClock>) -> f64 {
+    clock.and_then(|clock| clock.firmware_freq()).unwrap_or(0.0)
 }
 
 impl McuChip {
@@ -210,9 +288,31 @@ impl McuChip {
             .expect("the pins registry outlives its chips")
     }
 
-    /// Make the connected device reachable by the resources built on this chip.
+    /// Make the connected device reachable by the resources built on this chip,
+    /// and give that **session** its `trsync_state` router.
+    ///
+    /// Every `Mcu` is one connection, and its event table starts empty — while
+    /// a resource's handlers cannot be bound at configuration time for each of
+    /// them (`ConfigBuilder::build` runs the config callbacks once per
+    /// configuration, and a section that is reset in place keeps its chips but
+    /// gets a new session: `object.rs`'s `reconnect`). Binding here is what
+    /// makes a report that arrives **before** anything is armed harmless: a
+    /// host that was killed during a homing move leaves the firmware's periodic
+    /// `trsync_state` feed running (only `trsync_trigger` or a new
+    /// `trsync_start` deletes that timer, `src/trsync.c:171-186`), so the next
+    /// session receives reports for an oid it has never armed. Routed to the
+    /// registry, they are dropped in silence like upstream drops a late report
+    /// (`klippy/mcu.py:228-240`); without a handler they are logged as
+    /// unhandled, every `report_ticks`.
     pub fn attach(&self, mcu: Arc<Mcu>) {
-        *self.lock() = Some(mcu);
+        *self.lock() = Some(Arc::clone(&mcu));
+        // A firmware without `trsync_state` cannot home; the report (if any)
+        // then falls through to the generic "Unhandled message" warning, which
+        // names it. Nothing to add here — the arming path is what fails loudly
+        // (`McuTrsync::start`).
+        if let Err(err) = self.trsync_registry.bind(&mcu) {
+            tracing::debug!("[{}] no trsync_state router: {err}", self.name);
+        }
     }
 
     /// The connected device, or `None` before connect.
@@ -223,10 +323,15 @@ impl McuChip {
     /// Record the clock estimate and print-time mapping for this MCU.
     ///
     /// Called by the `[mcu]` object at connect (and by the periodic
-    /// recalibration, for a secondary). The frequency defaults to the
-    /// estimator's nominal one.
+    /// recalibration, for a secondary). The frequency is the firmware's
+    /// ([`McuClock::firmware_freq`]): a connect whose `get_uptime` never
+    /// answered seeds no estimate, and the placeholder 1 Hz left in it must not
+    /// become the mapping's frequency — that would read ticks as seconds.
+    /// Without a dictionary frequency to publish, no mapping is published at
+    /// all: `print_time_freq` stays zero, the state the conversions and the
+    /// ADC's drop gate already read as "no mapping".
     pub fn set_clock(&self, clock: Arc<McuClock>, print_time_offset: f64) {
-        let freq = clock.estimator().mcu_freq();
+        let freq = clock.firmware_freq().unwrap_or(0.0);
         *self
             .clock
             .lock()
@@ -271,6 +376,9 @@ impl McuChip {
     }
 
     /// The `(offset, freq)` the print-time mapping uses.
+    ///
+    /// `freq` is zero when no mapping has been published and the firmware has
+    /// no frequency to stand behind yet (`fallback_mapping_freq`).
     pub fn time_mapping(&self) -> (f64, f64) {
         let freq = *self
             .print_time_freq
@@ -279,9 +387,7 @@ impl McuChip {
         let freq = if freq > 0.0 {
             freq
         } else {
-            self.clock()
-                .map(|c| c.estimator().mcu_freq())
-                .unwrap_or(1.0)
+            fallback_mapping_freq(self.clock().as_deref())
         };
         (self.print_time_offset(), freq)
     }
@@ -317,6 +423,16 @@ impl McuChip {
         TrsyncChip {
             name: self.name.clone(),
             mcu: Arc::clone(&self.mcu),
+            clock: Arc::clone(&self.clock),
+            print_time_offset: Arc::clone(&self.print_time_offset),
+            print_time_freq: Arc::clone(&self.print_time_freq),
+        }
+    }
+
+    /// The [`AdcClock`] view of this chip: what an ADC input dates a report
+    /// with, **without** the registry that owns the input.
+    pub fn adc_clock(&self) -> AdcClock {
+        AdcClock {
             clock: Arc::clone(&self.clock),
             print_time_offset: Arc::clone(&self.print_time_offset),
             print_time_freq: Arc::clone(&self.print_time_freq),
@@ -508,6 +624,7 @@ impl PinChip for McuChip {
             self.name.clone(),
             Arc::clone(&self.adc_registry),
             params.clone(),
+            self.adc_clock(),
         )))
     }
 
@@ -859,6 +976,95 @@ mod tests {
         assert_eq!(chip.time_mapping(), (0.5, 20_000_100.0));
         assert_eq!(chip.print_time_to_clock(1.0), Some(10_000_050));
         assert_eq!(chip.clock_to_print_time(10_000_050), Some(1.0));
+    }
+
+    /// A chip whose clock was built over `mcu` but never seeded, as
+    /// `install_clock`'s `uptime=None` branch leaves it.
+    fn unseeded_chip(mcu: Arc<Mcu>) -> McuChip {
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let clock = Arc::new(McuClock::new(
+            mcu,
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        chip.set_clock(clock, 0.0);
+        chip
+    }
+
+    #[tokio::test]
+    async fn test_chip_mapping_uses_the_dictionary_frequency_without_a_sample() {
+        // A connect whose `get_uptime` never answered (`install_clock`'s
+        // `uptime=None`) seeds no estimate, so the estimator still holds
+        // upstream's placeholder 1 Hz. The mapping is the firmware's frequency
+        // anyway — on the placeholder it would read ticks as seconds.
+        let chip = unseeded_chip(Arc::new(mcu()));
+
+        assert_eq!(chip.time_mapping(), (0.0, 20_000_000.0));
+        assert_eq!(chip.print_time_to_clock(1.0), Some(20_000_000));
+    }
+
+    #[tokio::test]
+    async fn test_chip_mapping_falls_back_to_a_late_dictionary() {
+        // A clock built before identify cannot take the frequency with it; the
+        // mapping asks the dictionary itself instead of publishing the
+        // placeholder.
+        let mcu = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(Vec::new())),
+        ));
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let clock = Arc::new(McuClock::new(
+            Arc::clone(&mcu),
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        mcu.install_dictionary(dictionary()).unwrap();
+        chip.set_clock(clock, 0.0);
+
+        assert_eq!(chip.time_mapping(), (0.0, 20_000_000.0));
+    }
+
+    #[tokio::test]
+    async fn test_chip_publishes_no_mapping_without_a_dictionary_frequency() {
+        // With no `CLOCK_FREQ` to publish there is no mapping at all: the
+        // frequency stays zero, which the conversions read as "no mapping yet"
+        // and the ADC input refuses to date a report with (it drops the samples
+        // and warns once, `mcu/resource/adc.rs:256`).
+        let chip = unseeded_chip(Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(Vec::new())),
+        )));
+
+        assert_eq!(chip.time_mapping(), (0.0, 0.0));
+        assert!(chip.adc_clock().mapping().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_seeded_clock_still_dates_reports() {
+        // The normal path: `get_uptime` answered, so the estimate is seeded and
+        // the mapping keeps that frequency, with a secondary's offset on top.
+        let chip = McuChip::new(
+            "zboard".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let clock = Arc::new(McuClock::new(
+            Arc::new(mcu()),
+            crate::core::klippy::reactor::ManualReactor::shared(),
+        ));
+        clock.seed(0.0, 100_000_000); // 5 s at the fixture's 20 MHz
+        chip.set_clock(clock, 3.0);
+
+        assert_eq!(chip.time_mapping(), (3.0, 20_000_000.0));
+        assert_eq!(chip.clock_to_print_time(100_000_000), Some(8.0));
+        let mapping = chip.adc_clock().mapping().unwrap();
+        assert_eq!(mapping.print_time(20_000_000), 4.0);
     }
 
     /// A chip with the main MCU registered under `mcu`.

@@ -253,6 +253,19 @@ pub trait PwmOut: Send + Sync {
         None
     }
 
+    /// The estimated print time this resource's MCU is at, at a host instant
+    /// (upstream's `mcu_pwm.get_mcu().estimated_print_time()`).
+    ///
+    /// The heater's main-thread deadline is dated in the PWM chip's print time
+    /// (`heaters.py:137-140`), which is why this sits on the resource rather
+    /// than on the printer. The default answers `None`: a resource with no clock
+    /// (a test double before it has one, or a chip that does not model one)
+    /// makes the caller skip its dated work.
+    fn estimated_print_time(&self, eventtime: f64) -> Option<f64> {
+        let _ = eventtime;
+        None
+    }
+
     /// The lead the firmware's scheduler puts between a request and its clock;
     /// see [`DigitalOut::min_schedule_time`]. The default answers `None`.
     fn min_schedule_time(&self) -> Option<f64> {
@@ -260,13 +273,16 @@ pub trait PwmOut: Send + Sync {
     }
 }
 
-/// A batch of ADC samples: `(firmware clock, value)` pairs, oldest first.
+/// A batch of ADC samples: `(print time, value)` pairs, oldest first.
 ///
-/// Upstream dates samples with print time; this callback carries the firmware
-/// clock (the print-time layer landed with C1d, and a sensor that needs print
-/// time converts through `McuChip::clock_to_print_time`). The value is already
-/// scaled to `0.0..=1.0`.
-pub type AdcCallback = Box<dyn Fn(&[(u64, f64)]) + Send + Sync>;
+/// The times are **print time**, converted in the resource layer from the
+/// firmware's 32-bit report clock — the same shape as upstream's `MCU_adc`,
+/// whose `_handle_analog_in_state` calls `clock32_to_clock64` and then
+/// `clock_to_print_time` before invoking the callback (`klippy/mcu.py:636-646`).
+/// A report that arrives before the MCU's clock mapping exists is dropped whole,
+/// and the first such drop is logged. The value is already scaled to
+/// `0.0..=1.0`.
+pub type AdcCallback = Box<dyn Fn(&[(f64, f64)]) + Send + Sync>;
 
 /// An analog input resource.
 ///
@@ -290,8 +306,8 @@ pub trait Adc: Send + Sync {
     /// Install the callback that receives each batch.
     fn setup_adc_callback(&self, callback: AdcCallback);
 
-    /// The last sample seen, as `(firmware clock, value)`.
-    fn get_last_value(&self) -> Option<(u64, f64)>;
+    /// The last sample seen, as `(print time, value)`.
+    fn get_last_value(&self) -> Option<(f64, f64)>;
 }
 
 /// The chip (MCU) side of pin setup.
@@ -1034,11 +1050,17 @@ impl PrinterPins {
 
     /// Allow a pin to be used by several owners.
     ///
+    /// Upstream's `allow_multi_use_pin` parses the description with
+    /// `parse_pin`'s defaults (`pins.py:133`: `can_invert=False,
+    /// can_pullup=False`), so a decorated description (`!PA1`, `^PA1`) is
+    /// refused here as an invalid description; the decoration belongs to the
+    /// resource that actually uses the pin.
+    ///
     /// # Errors
     /// Returns [`PinError::UnknownChip`] / [`PinError::InvalidDescription`]
     /// from parsing `description`.
     pub fn allow_multi_use_pin(&self, description: &str) -> Result<(), PinError> {
-        let params = self.parse_pin(description, true, true)?;
+        let params = self.parse_pin(description, false, false)?;
         self.lock().allow_multi_use.insert(params.share_name());
         Ok(())
     }
@@ -1498,6 +1520,24 @@ mod tests {
 
         pins.lookup_pin("PA1", false, false, None).unwrap();
         pins.lookup_pin("PA1", false, false, None).unwrap();
+    }
+
+    #[test]
+    fn test_multi_use_pin_refuses_a_decorated_description() {
+        // Upstream parses with `can_invert`/`can_pullup` at their defaults
+        // (`pins.py:133`), so a decoration is a malformed description, not a
+        // pin with a polarity.
+        let pins = pins();
+
+        for description in ["!PA1", "^PA1"] {
+            let err = pins.allow_multi_use_pin(description).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Invalid pin description '{description}'\nFormat is: [chip_name:] pin_name"
+                )
+            );
+        }
     }
 
     #[test]

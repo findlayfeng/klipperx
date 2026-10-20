@@ -23,6 +23,7 @@
 $ klipperx api -a /tmp/klippy_uds list_endpoints
 {
   "endpoints": [
+    "bed_mesh/dump_mesh",
     "emergency_stop",
     "gcode/firmware_restart",
     "gcode/help",
@@ -50,7 +51,7 @@ $ klipperx api -a tcp:127.0.0.1:7125 info
 ```console
 $ klipperx console -a /tmp/klippy_uds
 Connected to unix:/tmp/klippy_uds.
-Printer is ready — Printer is ready (v0.12.0-123-gabcdef, 4 core ARMv7 Processor rev 4 (v7l))
+Printer is ready — Printer is ready (v0.13.0-734-gfe4eb86-0.1.0, 4 core ARMv7 Processor rev 4 (v7l))
 Type a request: a method name (`info`), a method and parameters
 (`objects/query {objects: {toolhead: null}}`), or a whole request object.
 They are YAML — JSON is YAML too. An `id` is added when you leave it out;

@@ -526,7 +526,7 @@ impl Kinematics for RotaryDeltaKinematics {
 
     fn check_move(&self, ctx: &mut MoveContext<'_>) -> Result<(), CommandError> {
         let end = *ctx.end_pos();
-        let axes_d = *ctx.axes_d();
+        let axes_d = ctx.axes_d();
         let end_xy2 = end.x() * end.x() + end.y() * end.y();
         if end_xy2 <= *self.limit_xy2.lock().unwrap_or_else(|p| p.into_inner())
             && axes_d[Z_AXIS] == 0.0
@@ -591,8 +591,8 @@ impl Kinematics for RotaryDeltaKinematics {
     fn get_status(&self) -> Value {
         json!({
             "homed_axes": if self.need_home { "" } else { "xyz" },
-            "axis_minimum": self.axes_min.as_array(),
-            "axis_maximum": self.axes_max.as_array(),
+            "axis_minimum": self.axes_min.as_slice(),
+            "axis_maximum": self.axes_max.as_slice(),
         })
     }
 

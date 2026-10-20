@@ -21,8 +21,10 @@
 //! | undefined behavior | `UndefinedBehavior::Strict` | a missing status key must not render a blank `PARK_` line — the rule the hand-written subset had |
 //! | auto escape | `AutoEscape::None` | a macro body is g-code, not HTML (the engine's default callback switches on the template name's extension) |
 //! | trailing newline | kept | a corpus body ends with a newline and the rendered text is run line by line; Jinja2/minijinja drop the last one by default (see the deviation table) |
+//! | output formatter | Python's `str` ([`format_output`]) | a tag renders `str(value)`, so a container prints its elements' `repr` (`{'call': 'PAUSE'}`, `['a', 1]`); the engine's own formatter prints them with Rust's `Debug` (`{call: PAUSE}`) |
 //! | filters | the engine's, with `int`, `float`, `min`, `max` replaced | the corpus spells its coercions `params.S\|default(1000.0)\|float` and folds lists with `\|min`/`\|max` |
 //! | globals | the engine's, with `range` and `namespace` bound explicitly | `range(...)` (`exclude_object.cfg:92`) and `namespace(...)`, which `gcode_macro` bodies call — the corpus spells `range`, this module's stepper-macro test binds `namespace` |
+//! | unknown method callback | Python's `str` and `list` methods ([`unknown_method`]) | the engine has no method table for a plain string or list, so `client.runout_sensor.split(" ")[1]` (`mainsail.cfg`'s `RESUME`, on every resume) would fail as `unknown method` — the callback answers it; see the deviation table's `append`/`extend` row |
 //!
 //! Compiling and evaluating are **two phases**: [`Template::parse`] compiles the
 //! body into the environment (`Environment::add_template_owned`),
@@ -86,6 +88,11 @@
 //! | a missing status object (`printer.nope`) | `Undefined` | same: undefined, which Strict then fails on if it is used |
 //! | trailing newline | one newline dropped | kept (`set_keep_trailing_newline(true)`), because `idle_timeout`'s default script and the corpus' bodies are written to keep theirs |
 //! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
+//! | a container joined with `~` | `str()` of it, elements `repr`-quoted: `'x' ~ {'call': 'PAUSE'}` is `x{'call': 'PAUSE'}` | the engine's `Display`, elements unquoted: `'x' ~ {'call': 'PAUSE'}` is `x{call: PAUSE}` — `~` joins through `Display` before the formatter sees a string, so only a whole tag (`{ … }`) gets Python's spelling |
+//! | printing a *silent* undefined (`{x if c}`, which has no `else`) | blank | an `undefined value` error: the engine's own formatter lets *that* one print nothing (it tells the two kinds of undefined apart), a custom formatter does not — `ValueKind::Undefined` is one kind — so the strict check [`format_output`] repeats covers both; a *default* undefined (`{nope}`) is the error it always was |
+//! | `"…%s…" % value` (a **string literal** directly left of `%`) | Python's printf formatting | rewritten at compile time into the engine's `\|format` filter, which is the same printf formatting with its arguments passed separately: `{"Restoring \"%s\"" % x}` → `{"Restoring \"%s\""\|format(x)}` ([`rewrite_printf_formatting`]). Both tag kinds carry expressions, so `{ … }` and `{% … %}` are both rewritten; a `{# … #}` comment is not. Narrow on purpose: the literal must be alone on the left and its `%` must end an operand position — any other `%` stays the remainder operator, and a formatting this rewrite cannot read fails the load the way it did before rather than mis-rendering |
+//! | `"%(key)s" % {'key': v}` (a mapping operand) | formatted from the mapping | unsupported: the operand right of `%` is a dict literal this rewrite does not read, so the tag keeps its Python spelling and fails the load (`%` is the remainder, which a string left operand cannot take); `\|format` reads a mapping only when the whole operand is one map value |
+//! | a method that mutates a **list** (`append`, `extend`, `pop`) | appends/extends/pops in place | `None`, and the list is unchanged: the engine's lists are **values**, so nothing can write back to the list a body holds. A body that collects into one (`{% set _d = prompt_txt.append(…) %}`, `mainsail.cfg`'s abort prompt) therefore reads an **empty** list afterwards — one `debug!` line per process records that the degradation happened. The read-only methods (`index`, `count`) are Python's own |
 //!
 //! Detail wording differs wherever the engine owns the wording. The frames
 //! (`Error loading template '<name>'\nline <n>: …`, `Error evaluating
@@ -108,14 +115,20 @@
 //! A failure the engine reports without a location (`error.line()` is `None`)
 //! reads as line 1.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value as MjValue, ValueKind};
-use minijinja::{AutoEscape, Environment, Error as MjError, ErrorKind, UndefinedBehavior::Strict};
+use minijinja::{
+    escape_formatter, AutoEscape, Environment, Error as MjError, ErrorKind, Output, State,
+    UndefinedBehavior::Strict,
+};
 use serde_json::Value;
+use tracing::debug;
 
 use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::printer::Printer;
@@ -435,12 +448,19 @@ impl Template {
     /// Compile `source`, reporting an unparsable body with upstream's
     /// load-error frame (`gcode_macro.py:57-60`).
     ///
+    /// Python's string `%` formatting is rewritten into the engine's
+    /// `\|format` filter first ([`rewrite_printf_formatting`]) — in a `{ … }`
+    /// expression tag and in a `{% … %}` statement tag alike. The rewrite adds
+    /// and removes no newline, so a load error still names the line the body
+    /// wrote.
+    ///
     /// # Errors
     /// A syntax error in the body: an unclosed tag, a statement the engine
     /// does not know, an unbalanced block, a malformed expression.
     pub fn parse(name: &str, source: &str) -> Result<Self, TemplateError> {
         let mut env = environment();
-        env.add_template_owned(name.to_string(), source.to_string())
+        let source = rewrite_printf_formatting(source);
+        env.add_template_owned(name.to_string(), source.into_owned())
             .map_err(|error| TemplateError::of(name, Phase::Load, &error))?;
         Ok(Self {
             name: name.to_string(),
@@ -471,10 +491,385 @@ impl Template {
     }
 }
 
+// ===========================================================================
+// Python's `%` formatting
+// ===========================================================================
+
+/// Rewrite Python's string formatting into the engine's `\|format` filter.
+///
+/// Upstream runs Jinja2, where a string on the left of `%` is Python's printf
+/// formatting (`"Restoring \"%s\"" % printer.toolhead.extruder`); this engine's
+/// `%` is the remainder operator and refuses a string operand outright. Its
+/// `format` filter is printf formatting with the arguments passed separately
+/// (`"%s, %s!"\|format(a, b)`), so such a formatting is rewritten into that call
+/// — the eleven in `mainsail.cfg`, eight inside a `{ … }` tag and three inside
+/// a `{% set %}` (`145`, `152`, `163`).
+///
+/// Both tag kinds carry expressions, so both are rewritten; the rewrite is
+/// narrow on purpose, so every other `%` keeps the engine's own meaning:
+///
+/// - `{ … }` expression tags and `{% … %}` statement tags are rewritten; a
+///   `{# … #}` comment and everything between tags are copied byte for byte.
+///   The `%` of a `{%` opener and of a `%}` closer is a delimiter, never an
+///   operator, because a body starts after the one and ends before the other;
+/// - the operand left of `%` must be **exactly one string literal** (single or
+///   double quoted, escapes included) with only whitespace between it and the
+///   `%`, and it must not itself be the right operand of something else;
+///   otherwise the `%` stays the remainder operator — `{% set x = 100 %}` and
+///   `{% if n % 2 == 0 %}` come through untouched;
+/// - the operand right of it must end an operand position (the body's end, a
+///   `,` `)` `]` `}` or `|`); a formatting this rewrite cannot read (an
+///   unbalanced bracket, a dict operand, an operator binding looser than a
+///   filter) is left as it is and fails the load the way it does today — never
+///   silently mis-rendered;
+/// - that operand becomes the filter's arguments: one parenthesized group
+///   whose top level holds commas is a tuple (`(a, b)` → `format(a, b)`), one
+///   without is a single argument (`(a)` → `format(a)`), and any other operand
+///   is taken whole, trailers included (`(xs.split(" "))[1]` is one argument);
+/// - no newline is added or removed, so an error still reports the line number
+///   the body wrote.
+fn rewrite_printf_formatting(source: &str) -> Cow<'_, str> {
+    let bytes = source.as_bytes();
+    let mut rewritten = String::with_capacity(source.len());
+    let mut kept = 0;
+    let mut changed = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'{' {
+            i += 1;
+            continue;
+        }
+        let (body_start, body_end, after) = match bytes.get(i + 1).copied() {
+            // A statement tag: its body is what `{%` and `%}` enclose.
+            Some(b'%') => {
+                let Some(close) = find_bytes(bytes, b"%}", i + 2) else {
+                    break;
+                };
+                (i + 2, close, close + 2)
+            }
+            // A comment tag: copied verbatim, end or no end.
+            Some(b'#') => {
+                let Some(close) = find_bytes(bytes, b"#}", i + 2) else {
+                    break;
+                };
+                i = close + 2;
+                continue;
+            }
+            // An expression tag, whose `}` a dict literal or a `split("}")`
+            // inside it does not end early.
+            _ => {
+                let Some(close) = tag_end(bytes, i + 1) else {
+                    break;
+                };
+                (i + 1, close, close + 1)
+            }
+        };
+        if let Some(body) = rewrite_tag_body(&source[body_start..body_end]) {
+            rewritten.push_str(&source[kept..body_start]);
+            rewritten.push_str(&body);
+            kept = body_end;
+            changed = true;
+        }
+        i = after;
+    }
+    if !changed {
+        return Cow::Borrowed(source);
+    }
+    rewritten.push_str(&source[kept..]);
+    Cow::Owned(rewritten)
+}
+
+/// One tag body with every `"…" % operand` in it rewritten, or `None` when it
+/// holds no formatting this rewrite reads.
+fn rewrite_tag_body(body: &str) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut rewritten: Option<String> = None;
+    let mut kept = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            // A string literal's own characters are never structure: not its
+            // brackets, and not its `%`.
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'%' => {
+                // A `%` this rewrite cannot read stays the remainder it is.
+                let Some((start, call, end)) = printf_call(body, i) else {
+                    i += 1;
+                    continue;
+                };
+                let out = rewritten.get_or_insert_with(String::new);
+                out.push_str(&body[kept..start]);
+                out.push_str(&call);
+                kept = end;
+                i = end;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let mut rewritten = rewritten?;
+    rewritten.push_str(&body[kept..]);
+    Some(rewritten)
+}
+
+/// The `"…"\|format(…)` call replacing the formatting whose `%` sits at `pct`,
+/// the index of the literal it starts at, and the index just past the operand
+/// it replaces.
+fn printf_call(body: &str, pct: usize) -> Option<(usize, String, usize)> {
+    let bytes = body.as_bytes();
+    let literal = string_before(bytes, pct)?;
+    // The literal has to start an operand itself: right after a value or a
+    // closing bracket it is the *right* operand of something, where a filter
+    // would bind tighter than the operator there and change the meaning.
+    if let Some(before) = bytes[..literal]
+        .iter()
+        .rfind(|byte| !byte.is_ascii_whitespace())
+    {
+        if before.is_ascii_alphanumeric()
+            || matches!(before, b'_' | b'\'' | b'"' | b')' | b']' | b'}')
+        {
+            return None;
+        }
+    }
+    let (arguments, end) = printf_arguments(body, pct + 1)?;
+    // ... and what follows it has to end an operand position; an operator there
+    // binds looser than a filter and would be rebound by the rewrite.
+    if !matches!(
+        bytes.get(skip_whitespace(bytes, end)).copied(),
+        None | Some(b',') | Some(b')') | Some(b']') | Some(b'}') | Some(b'|')
+    ) {
+        return None;
+    }
+    Some((
+        literal,
+        // The literal without the whitespace the `%` was padded with.
+        format!(
+            "{}|format({})",
+            &body[literal..string_close(bytes, literal)? + 1],
+            arguments
+        ),
+        end,
+    ))
+}
+
+/// The filter arguments of the formatting whose `%` sits just before `from`,
+/// and the index just past the operand they were read from.
+fn printf_arguments(body: &str, from: usize) -> Option<(String, usize)> {
+    let bytes = body.as_bytes();
+    let start = skip_whitespace(bytes, from);
+    if bytes.get(start) == Some(&b'(') {
+        let close = bracket_close(bytes, start)?;
+        // A group with a trailer — `(xs.split(" "))[1]` — is one operand, not a
+        // tuple: the trailer belongs to it.
+        let trailered = matches!(bytes.get(close + 1).copied(), Some(b'[' | b'.' | b'('));
+        if !trailered {
+            let arguments = tuple_arguments(body, start + 1, close)?;
+            return Some((arguments, close + 1));
+        }
+    }
+    let end = simple_operand_end(bytes, start)?;
+    Some((body[start..end].to_string(), end))
+}
+
+/// The arguments of a parenthesized group whose body is `body[from..to]`: its
+/// top-level commas split them, and a group without one is one argument.
+fn tuple_arguments(body: &str, from: usize, to: usize) -> Option<String> {
+    let bytes = body.as_bytes();
+    let mut arguments: Vec<&str> = Vec::new();
+    let mut depth = 0usize;
+    let mut item = from;
+    let mut i = from;
+    while i < to {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth = depth.checked_sub(1)?,
+            b',' if depth == 0 => {
+                arguments.push(body[item..i].trim());
+                item = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let last = body[item..to].trim();
+    // `(a,)` is Python's one-element tuple.
+    if !last.is_empty() {
+        arguments.push(last);
+    }
+    if arguments.is_empty() || arguments.iter().any(|argument| argument.is_empty()) {
+        return None;
+    }
+    Some(arguments.join(", "))
+}
+
+/// The end of the single operand starting at `start`: a primary (a name, a
+/// number, a string, a bracketed group) followed by its `.name` / `[…]` / `(…)`
+/// trailers, so `(xs.split(" "))[1]` is one operand.
+fn simple_operand_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = primary_end(bytes, start)?;
+    loop {
+        end = match bytes.get(end).copied() {
+            Some(b'.') => name_end(bytes, end + 1)?,
+            Some(b'[' | b'(') => bracket_close(bytes, end)? + 1,
+            _ => return Some(end),
+        };
+    }
+}
+
+/// The end of a primary expression: a name, a number, a string literal or a
+/// bracketed group.
+fn primary_end(bytes: &[u8], start: usize) -> Option<usize> {
+    match bytes.get(start).copied()? {
+        b'\'' | b'"' => string_close(bytes, start).map(|close| close + 1),
+        b'(' | b'[' => bracket_close(bytes, start).map(|close| close + 1),
+        digit if digit.is_ascii_digit() => {
+            let mut end = start;
+            while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+            }
+            // A fraction, not the `.name` trailer of a name.
+            if bytes.get(end) == Some(&b'.') && bytes.get(end + 1).is_some_and(u8::is_ascii_digit) {
+                end += 1;
+                while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+                    end += 1;
+                }
+            }
+            Some(end)
+        }
+        name if name.is_ascii_alphabetic() || name == b'_' => name_end(bytes, start),
+        _ => None,
+    }
+}
+
+/// The end of the name starting at `start`.
+fn name_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut end = start;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    (end > start).then_some(end)
+}
+
+/// The opening quote of the string literal that ends (whitespace aside) right
+/// before `pct`, or `None` when the operand left of it is not a string literal.
+fn string_before(bytes: &[u8], pct: usize) -> Option<usize> {
+    let mut end = pct;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let quote = *bytes.get(end.checked_sub(1)?)?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    // The closing quote is the one we landed on; the literal's opening one is
+    // the nearest same quote before it that no backslash escapes.
+    let mut open = end - 1;
+    while open > 0 {
+        open -= 1;
+        if bytes[open] != quote {
+            continue;
+        }
+        let mut escapes = 0;
+        while open > escapes && bytes[open - escapes - 1] == b'\\' {
+            escapes += 1;
+        }
+        if escapes % 2 == 0 {
+            return Some(open);
+        }
+    }
+    None
+}
+
+/// The index of the quote closing the string literal that opens at `open`, its
+/// escapes counted, or `None` when it never closes.
+fn string_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let quote = *bytes.get(open)?;
+    let mut i = open + 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' {
+            i += 2;
+        } else if bytes[i] == quote {
+            return Some(i);
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// The index of the `}` closing a `{ … }` tag whose body starts at `from`: the
+/// first one at bracket depth zero and outside a string.
+fn tag_end(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = from;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'}' if depth == 0 => return Some(i),
+            b'}' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the bracket closing the one at `open`, strings and nesting
+/// inside it accounted for.
+fn bracket_close(bytes: &[u8], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => i = string_close(bytes, i)?,
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The first index of `needle` in `haystack` at or after `from`.
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    let mut i = from;
+    while i + needle.len() <= haystack.len() {
+        if &haystack[i..i + needle.len()] == needle {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the first non-whitespace byte at or after `from`.
+fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+        i += 1;
+    }
+    i
+}
+
 /// The environment every body is compiled into: upstream's delimiters,
 /// undefined behavior and escaping, this port's trailing-newline rule, the four
-/// filters the corpus spells differently, and the two Jinja2 globals the
-/// corpus (`range`) and this module's stepper-macro test (`namespace`) call.
+/// filters the corpus spells differently, the two Jinja2 globals the corpus
+/// (`range`) and this module's stepper-macro test (`namespace`) call, and the
+/// unknown-method callback that answers `str`/`list` method calls
+/// ([`unknown_method`]).
 fn environment() -> Environment<'static> {
     let mut env = Environment::new();
     env.set_syntax(
@@ -494,7 +889,91 @@ fn environment() -> Environment<'static> {
     env.add_filter("max", filter_max);
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
+    env.set_formatter(format_output);
+    env.set_unknown_method_callback(unknown_method);
     env
+}
+
+// ===========================================================================
+// Output
+// ===========================================================================
+
+/// What a `{ … }` tag writes: Python's `str`, which is what a Jinja2 tag
+/// renders (`gcode_macro.py:83`).
+///
+/// The engine prints a container by walking it with Rust's `Debug`
+/// (`Object::render`), which leaves the elements unquoted — `{call: PAUSE}`.
+/// Jinja2 prints a container with its elements' `repr`, so upstream's
+/// `{params}` reads `{'call': 'PAUSE'}`, and a macro body that writes a
+/// container into a g-code value (`mainsail.cfg:182`'s
+/// `SET_GCODE_VARIABLE … VALUE="{…}"`) writes that text. Everything that is
+/// not a container is already Python's spelling in the engine's own `Display`
+/// (`True`, `None`, `3.0`), so it keeps the default formatter.
+///
+/// A custom formatter is also what the engine drops its strict-undefined check
+/// for on printing (`Instruction::Emit` only applies it when
+/// `is_default_formatter`), so the check moves here: printing an undefined
+/// stays the `undefined value` error a body has always got.
+fn format_output(
+    out: &mut Output<'_>,
+    state: &State<'_, '_>,
+    value: &MjValue,
+) -> Result<(), MjError> {
+    if value.is_undefined() {
+        return Err(MjError::from(ErrorKind::UndefinedError));
+    }
+    match value.kind() {
+        ValueKind::Map | ValueKind::Seq => {
+            out.write_str(&python_repr(value)).map_err(MjError::from)
+        }
+        _ => escape_formatter(out, state, value),
+    }
+}
+
+/// One value the way Python's `repr` spells it — what a container's elements
+/// are printed with. A number, a boolean or `None` keeps the engine's spelling
+/// (already Python's, `Display`'s `3.0` / `True` / `None`); a container recurses
+/// so nesting reads like Python's too.
+fn python_repr(value: &MjValue) -> String {
+    match value.kind() {
+        ValueKind::String => python_repr_string(value.as_str().unwrap_or_default()),
+        ValueKind::Seq => match value.try_iter() {
+            Ok(items) => format!(
+                "[{}]",
+                items
+                    .map(|item| python_repr(&item))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Err(_) => value.to_string(),
+        },
+        ValueKind::Map => match value.as_object().and_then(|object| object.try_iter_pairs()) {
+            Some(entries) => format!(
+                "{{{}}}",
+                entries
+                    .map(|(key, item)| format!("{}: {}", python_repr(&key), python_repr(&item)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => value.to_string(),
+        },
+        _ => value.to_string(),
+    }
+}
+
+/// A string as Python's `repr` quotes it inside a container: single quotes,
+/// with a backslash and the quote itself escaped.
+fn python_repr_string(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('\'');
+    for ch in text.chars() {
+        if ch == '\'' || ch == '\\' {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('\'');
+    quoted
 }
 
 // ===========================================================================
@@ -673,6 +1152,475 @@ fn ordering_name(value: &MjValue) -> &'static str {
     }
 }
 
+/// The Python type name a method's argument error uses (`replace() argument
+/// 'old' must be str, not int`). Numbers are told apart as `int`/`float`,
+/// which is `TypeError`'s wording — unlike [`ordering_name`], whose two-type
+/// form keeps the old subset's `min`/`max` messages.
+fn python_type(value: &MjValue) -> &'static str {
+    match value.kind() {
+        ValueKind::Number if value.as_i64().is_some() => "int",
+        ValueKind::Number => "float",
+        ValueKind::Bool => "bool",
+        ValueKind::String => "str",
+        ValueKind::None | ValueKind::Undefined => "NoneType",
+        ValueKind::Seq => "list",
+        ValueKind::Map => "dict",
+        _ => "object",
+    }
+}
+
+// ===========================================================================
+// Methods
+// ===========================================================================
+
+/// The answer for a method call on a value the engine has no method table for
+/// — every plain string and list, which is why a body's
+/// `client.runout_sensor.split(" ")[1]` (`mainsail.cfg`'s `RESUME`, on every
+/// resume) would otherwise fail as `unknown method`.
+///
+/// A `str` gets [`string_method`], a `list` gets [`list_method`]. Everything
+/// else — another type, another name — stays the `UnknownMethod` error it was,
+/// so a body still hears about a method nothing implements.
+///
+/// The one gap is **mutation**: the engine's lists are values, so
+/// `list.append`/`extend`/`pop` cannot write back to the list the body holds
+/// (see [`mixed_method`]); they answer `None` rather than fail, so the corpus'
+/// `{% set _d = prompt_txt.append(…) %}` keeps rendering.
+fn unknown_method(
+    _state: &State,
+    value: &MjValue,
+    method: &str,
+    args: &[MjValue],
+) -> Result<MjValue, MjError> {
+    match value.kind() {
+        ValueKind::String => string_method(value.as_str().unwrap_or_default(), method, args),
+        ValueKind::Seq => list_method(value, method, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// The method `method` on the string `text`, with Python's `str` semantics for
+/// each name this port implements; an unimplemented name is `UnknownMethod`.
+fn string_method(text: &str, method: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    match method {
+        "split" => method_split(text, args),
+        "strip" => strip(method, text, args, Side::Both),
+        "lstrip" => strip(method, text, args, Side::Left),
+        "rstrip" => strip(method, text, args, Side::Right),
+        "lower" => {
+            takes_no_arguments(method, args)?;
+            Ok(MjValue::from(text.to_lowercase()))
+        }
+        "upper" => {
+            takes_no_arguments(method, args)?;
+            Ok(MjValue::from(text.to_uppercase()))
+        }
+        "replace" => method_replace(text, args),
+        "startswith" => affix(method, text, args, Affix::Start),
+        "endswith" => affix(method, text, args, Affix::End),
+        "join" => method_join(text, args),
+        "find" => method_find(text, args),
+        "count" => method_count(text, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// The method `method` on the list `value`: the three that would mutate it are
+/// answered by [`mixed_method`], the read-only ones are Python's own, and every
+/// other name is `UnknownMethod`.
+fn list_method(value: &MjValue, method: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    match method {
+        "append" => {
+            arg_count(method, args, 1, 1)?;
+            Ok(mixed_method(method))
+        }
+        "extend" => {
+            arg_count(method, args, 1, 1)?;
+            // Python refuses a non-iterable argument instead of extending
+            // with it, so the degradation never swallows that mistake.
+            match args[0].kind() {
+                ValueKind::String | ValueKind::Seq | ValueKind::Iterable | ValueKind::Map => {
+                    Ok(mixed_method(method))
+                }
+                _ => Err(MjError::new(
+                    ErrorKind::InvalidOperation,
+                    format!(
+                        "{method}() argument must be an iterable, not {}",
+                        python_type(&args[0])
+                    ),
+                )),
+            }
+        }
+        "pop" => {
+            arg_count(method, args, 0, 1)?;
+            Ok(mixed_method(method))
+        }
+        "index" => list_index(value, args),
+        "count" => list_count(value, args),
+        _ => Err(MjError::from(ErrorKind::UnknownMethod)),
+    }
+}
+
+/// A method whose effect is a **mutation** of its receiver: this port's lists
+/// are values, so there is no way to write back to the list a body holds.
+///
+/// `append` and `extend` return `None`, which is what Python returns, and the
+/// list keeps its contents — a body that collects into a list this way
+/// (`{% set _d = prompt_txt.append(…) %}`, `mainsail.cfg`'s abort prompt) gets
+/// an always-empty list. `pop` returns `None` too instead of the item it could
+/// not remove. One `debug!` line per process records that the degradation
+/// happened, so a render is never silent about it.
+fn mixed_method(method: &str) -> MjValue {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if !REPORTED.swap(true, Ordering::Relaxed) {
+        debug!(
+            "template: list.{}() returns None and leaves the list unchanged — this port's lists \
+             are values, so a macro cannot collect into one",
+            method
+        );
+    }
+    MjValue::from(())
+}
+
+/// A method's argument count, checked the way Python's method errors spell it:
+/// `takes at most N arguments (M given)` / `takes at least N positional
+/// arguments (M given)`. Neither wording runs the method's body.
+fn arg_count(method: &str, args: &[MjValue], min: usize, max: usize) -> Result<(), MjError> {
+    if args.len() < min {
+        return Err(MjError::new(
+            ErrorKind::MissingArgument,
+            format!(
+                "{method}() takes at least {min} positional arguments ({} given)",
+                args.len()
+            ),
+        ));
+    }
+    if args.len() > max {
+        return Err(MjError::new(
+            ErrorKind::TooManyArguments,
+            format!(
+                "{method}() takes at most {max} arguments ({} given)",
+                args.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// `str`'s own no-argument methods (`lower`, `upper`), worded as CPython words
+/// them: `str.lower() takes no arguments (1 given)`.
+fn takes_no_arguments(method: &str, args: &[MjValue]) -> Result<(), MjError> {
+    if args.is_empty() {
+        return Ok(());
+    }
+    Err(MjError::new(
+        ErrorKind::TooManyArguments,
+        format!("str.{method}() takes no arguments ({} given)", args.len()),
+    ))
+}
+
+/// One argument as a string, or the `TypeError` Python raises for a value that
+/// is not one.
+fn as_text<'a>(method: &str, value: &'a MjValue, name: &str) -> Result<&'a str, MjError> {
+    value.as_str().ok_or_else(|| {
+        MjError::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "{method}() argument '{name}' must be str, not {}",
+                python_type(value)
+            ),
+        )
+    })
+}
+
+/// One argument as an integer, or the `TypeError` Python raises for a value
+/// that is not one.
+fn as_int(method: &str, value: &MjValue, name: &str) -> Result<i64, MjError> {
+    value.as_i64().ok_or_else(|| {
+        MjError::new(
+            ErrorKind::InvalidOperation,
+            format!(
+                "{method}() argument '{name}' must be int, not {}",
+                python_type(value)
+            ),
+        )
+    })
+}
+
+/// `str.split([sep[, maxsplit]])`.
+///
+/// Splitting on a separator keeps every empty piece (`' a  b '.split(' ')` is
+/// `['', 'a', '', 'b', '']`) and, with a `maxsplit`, keeps the tail verbatim;
+/// splitting on whitespace drops the leading run, treats any run of whitespace
+/// as one separator, and drops nothing else. An empty separator is Python's
+/// `ValueError`.
+fn method_split(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("split", args, 0, 2)?;
+    let maxsplit = match args.get(1) {
+        Some(arg) => Some(as_int("split", arg, "maxsplit")?),
+        None => None,
+    };
+    let pieces: Vec<MjValue> = match args.first() {
+        None => split_whitespace(text, maxsplit),
+        Some(sep) if sep.kind() == ValueKind::None => split_whitespace(text, maxsplit),
+        Some(sep) => {
+            let sep = as_text("split", sep, "sep")?;
+            if sep.is_empty() {
+                return Err(MjError::new(ErrorKind::InvalidOperation, "empty separator"));
+            }
+            let limit = match maxsplit {
+                Some(maxsplit) => usize::try_from(maxsplit)
+                    .map_or(usize::MAX, |maxsplit| maxsplit.saturating_add(1)),
+                None => usize::MAX,
+            };
+            text.splitn(limit, sep).map(MjValue::from).collect()
+        }
+    };
+    Ok(MjValue::from(pieces))
+}
+
+/// `str.split()` with no separator: the leading run of whitespace is dropped,
+/// a run separates two pieces, and with a `maxsplit` the tail after the last
+/// split is kept verbatim — `' a  b   c  '.split(None, 1)` is
+/// `['a', 'b   c  ']`, trailing whitespace and all.
+fn split_whitespace(text: &str, maxsplit: Option<i64>) -> Vec<MjValue> {
+    let mut rest = text.trim_start_matches(char::is_whitespace);
+    let mut left = maxsplit.map(|maxsplit| maxsplit.max(0) as usize);
+    let mut pieces = Vec::new();
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        if left == Some(0) {
+            pieces.push(MjValue::from(rest));
+            break;
+        }
+        match rest.find(char::is_whitespace) {
+            Some(index) => {
+                pieces.push(MjValue::from(&rest[..index]));
+                rest = rest[index..].trim_start_matches(char::is_whitespace);
+                left = left.map(|left| left - 1);
+            }
+            None => {
+                pieces.push(MjValue::from(rest));
+                break;
+            }
+        }
+    }
+    pieces
+}
+
+/// Which end [`strip`] trims.
+#[derive(Clone, Copy)]
+enum Side {
+    Both,
+    Left,
+    Right,
+}
+
+/// `str.strip([chars])` — and the one-sided `lstrip`/`rstrip`. No argument
+/// trims whitespace (Unicode `White_Space`, which is Python's set minus the
+/// `\x1c`–`\x1f` controls); an argument trims any of its characters.
+fn strip(method: &str, text: &str, args: &[MjValue], side: Side) -> Result<MjValue, MjError> {
+    arg_count(method, args, 0, 1)?;
+    let trimmed = match args.first() {
+        None => trim(text, side, char::is_whitespace),
+        Some(arg) => {
+            let chars = as_text(method, arg, "chars")?;
+            trim(text, side, |ch: char| chars.contains(ch))
+        }
+    };
+    Ok(MjValue::from(trimmed))
+}
+
+fn trim(text: &str, side: Side, stripped: impl Fn(char) -> bool) -> &str {
+    match side {
+        Side::Both => text.trim_matches(stripped),
+        Side::Left => text.trim_start_matches(stripped),
+        Side::Right => text.trim_end_matches(stripped),
+    }
+}
+
+/// `str.replace(old, new[, count])`. A negative `count` is unlimited, as in
+/// Python, and an empty `old` inserts `new` between every character (and at
+/// both ends), which is Python's own reading of it.
+fn method_replace(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("replace", args, 2, 3)?;
+    let old = as_text("replace", &args[0], "old")?;
+    let new = as_text("replace", &args[1], "new")?;
+    let replaced = match args.get(2) {
+        None => text.replace(old, new),
+        Some(arg) => match usize::try_from(as_int("replace", arg, "count")?) {
+            Ok(count) => text.replacen(old, new, count),
+            // A negative count is unlimited, as in Python.
+            Err(_) => text.replace(old, new),
+        },
+    };
+    Ok(MjValue::from(replaced))
+}
+
+/// Which end [`affix`] tests.
+#[derive(Clone, Copy)]
+enum Affix {
+    Start,
+    End,
+}
+
+/// `str.startswith(prefix[, start[, end]])` and `str.endswith`.
+///
+/// Python's first argument may be a tuple of prefixes; the engine has no
+/// tuple, so a **list** of them stands in for it. `start`/`end` slice the
+/// string the way Python's do ([`py_slice`]).
+fn affix(method: &str, text: &str, args: &[MjValue], affix: Affix) -> Result<MjValue, MjError> {
+    arg_count(method, args, 1, 3)?;
+    let (_, slice) = py_slice(method, text, args.get(1), args.get(2))?;
+    let candidates: Vec<MjValue> = match args[0].kind() {
+        ValueKind::Seq => args[0]
+            .try_iter()
+            .map_err(|_| uniterable(&args[0]))?
+            .collect(),
+        _ => vec![args[0].clone()],
+    };
+    for candidate in &candidates {
+        let candidate = as_text(method, candidate, "prefix")?;
+        let matched = match affix {
+            Affix::Start => slice.starts_with(candidate),
+            Affix::End => slice.ends_with(candidate),
+        };
+        if matched {
+            return Ok(MjValue::from(true));
+        }
+    }
+    Ok(MjValue::from(false))
+}
+
+/// `str.join(iterable)` — every item must be a string, as Python's own
+/// `TypeError` demands.
+fn method_join(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("join", args, 1, 1)?;
+    let items: Vec<MjValue> = match args[0].kind() {
+        ValueKind::String | ValueKind::Seq | ValueKind::Iterable | ValueKind::Map => args[0]
+            .try_iter()
+            .map_err(|_| uniterable(&args[0]))?
+            .collect(),
+        _ => {
+            return Err(MjError::new(
+                ErrorKind::InvalidOperation,
+                "can only join an iterable",
+            ))
+        }
+    };
+    let mut joined = String::new();
+    for (index, item) in items.iter().enumerate() {
+        let piece = item.as_str().ok_or_else(|| {
+            MjError::new(
+                ErrorKind::InvalidOperation,
+                format!(
+                    "sequence item {index}: expected str instance, {} found",
+                    python_type(item)
+                ),
+            )
+        })?;
+        if index > 0 {
+            joined.push_str(text);
+        }
+        joined.push_str(piece);
+    }
+    Ok(MjValue::from(joined))
+}
+
+/// `str.find(sub[, start[, end]])`: the **character** index of the first
+/// occurrence (Python counts code points, not bytes), `-1` when there is none.
+fn method_find(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("find", args, 1, 3)?;
+    let sub = as_text("find", &args[0], "sub")?;
+    let (begin, slice) = py_slice("find", text, args.get(1), args.get(2))?;
+    let found = slice.find(sub).map_or(-1, |byte| {
+        begin as i64 + slice[..byte].chars().count() as i64
+    });
+    Ok(MjValue::from(found))
+}
+
+/// `str.count(sub[, start[, end]])`: non-overlapping occurrences, as Python
+/// counts them (`'aaa'.count('aa')` is `1`); an empty `sub` counts the gaps
+/// between characters, `len + 1` of them.
+fn method_count(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("count", args, 1, 3)?;
+    let sub = as_text("count", &args[0], "sub")?;
+    let (_, slice) = py_slice("count", text, args.get(1), args.get(2))?;
+    Ok(MjValue::from(slice.matches(sub).count() as i64))
+}
+
+/// `list.index(value)` — the first equal item's index; Python's `ValueError`
+/// when there is none.
+fn list_index(value: &MjValue, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("index", args, 1, 1)?;
+    let found = value
+        .try_iter()
+        .map_err(|_| uniterable(value))?
+        .position(|item| item == args[0]);
+    match found {
+        Some(index) => Ok(MjValue::from(index as i64)),
+        None => Err(MjError::new(
+            ErrorKind::InvalidOperation,
+            format!("{} is not in list", python_repr(&args[0])),
+        )),
+    }
+}
+
+/// `list.count(value)` — how many items equal `value`.
+fn list_count(value: &MjValue, args: &[MjValue]) -> Result<MjValue, MjError> {
+    arg_count("count", args, 1, 1)?;
+    let count = value
+        .try_iter()
+        .map_err(|_| uniterable(value))?
+        .filter(|item| *item == args[0])
+        .count();
+    Ok(MjValue::from(count as i64))
+}
+
+/// The Python slice of `text` the `start`/`end` arguments of
+/// `find`/`count`/`startswith`/`endswith` name: a negative index counts back
+/// from the end, both are clamped to the string's length, and `start >= end`
+/// is the empty string. Returns the slice with the **character** index it
+/// starts at, so a found offset can be reported the way Python reports it.
+fn py_slice<'a>(
+    method: &str,
+    text: &'a str,
+    start: Option<&MjValue>,
+    end: Option<&MjValue>,
+) -> Result<(usize, &'a str), MjError> {
+    let length = text.chars().count() as i64;
+    let bound = |arg: Option<&MjValue>, default: i64, name: &str| -> Result<i64, MjError> {
+        match arg {
+            None => Ok(default),
+            Some(value) => {
+                let index = as_int(method, value, name)?;
+                Ok(if index < 0 {
+                    (length + index).max(0)
+                } else {
+                    index.min(length)
+                })
+            }
+        }
+    };
+    let first = bound(start, 0, "start")?;
+    let last = bound(end, length, "end")?;
+    if first >= last {
+        return Ok((first as usize, ""));
+    }
+    let from = char_offset(text, first as usize);
+    let to = char_offset(text, last as usize);
+    Ok((first as usize, &text[from..to]))
+}
+
+/// The byte offset character `index` starts at (`text.len()` past the end).
+fn char_offset(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map_or(text.len(), |(offset, _)| offset)
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -743,6 +1691,321 @@ mod tests {
         assert_eq!(ok("{-3.5}"), "3.5");
         assert_eq!(ok("{ -3.5}"), "-3.5");
         assert_eq!(ok("{ 0 - 3.5 }"), "-3.5");
+    }
+
+    /// A container prints the way Python's `str` prints it: its elements' own
+    /// `repr` — strings quoted, `True`/`None`, floats with `.0`, nesting
+    /// recursed — so `mainsail.cfg:184`'s
+    /// `VALUE="{{ 'enable': ENABLE, 'call': MACRO }}"` writes a text a Python
+    /// reader can evaluate back instead of the engine's `Debug` output.
+    #[test]
+    fn containers_render_python_repr() {
+        let dict = |value: Value| {
+            let mut context = context(&[], "");
+            context.insert("v", Rt::Json(value));
+            context
+        };
+
+        // Keys come out in the engine's map order (its map is ordered), which
+        // is alphabetical, not Jinja2's literal order.
+        assert_eq!(
+            render(
+                "{v}",
+                &mut dict(json!({"layer": 1, "call": "PAUSE", "enable": true}))
+            )
+            .expect("renders"),
+            "{'call': 'PAUSE', 'enable': True, 'layer': 1}"
+        );
+        assert_eq!(
+            render(
+                "{v}",
+                &mut dict(json!({"outer": {"inner": [1, 2.0, Value::Null]}}))
+            )
+            .expect("renders"),
+            "{'outer': {'inner': [1, 2.0, None]}}"
+        );
+        assert_eq!(
+            render("{v}", &mut dict(json!(["a", 1, 2.0]))).expect("renders"),
+            "['a', 1, 2.0]"
+        );
+        assert_eq!(render("{v}", &mut dict(json!({}))).expect("renders"), "{}");
+        assert_eq!(render("{v}", &mut dict(json!([]))).expect("renders"), "[]");
+        // A backslash and the quote itself are escaped, as `repr` escapes them.
+        assert_eq!(
+            render("{v}", &mut dict(json!({"it's": "a \\ b"}))).expect("renders"),
+            r"{'it\'s': 'a \\ b'}"
+        );
+        // The scalar spellings inside a container are the same Python ones the
+        // engine already prints: `True`, `None`, `2.0`.
+        assert_eq!(
+            render("{v}", &mut dict(json!([true, false, null, 2.0]))).expect("renders"),
+            "[True, False, None, 2.0]"
+        );
+        // A dict *literal* in a body, which is how the corpus spells it.
+        assert_eq!(
+            ok("{ {'enable': True, 'call': 'PAUSE'} }"),
+            "{'call': 'PAUSE', 'enable': True}"
+        );
+        // A **whole tag** is `str`: a top-level string stays unquoted, and so
+        // does a container's key read out of it.
+        assert_eq!(
+            render("{v}", &mut dict(json!("PAUSE"))).expect("renders"),
+            "PAUSE"
+        );
+        assert_eq!(
+            render("{v.call}", &mut dict(json!({"call": "PAUSE"}))).expect("renders"),
+            "PAUSE"
+        );
+    }
+
+    /// The two kinds of `Undefined` the engine distinguishes are one kind to a
+    /// formatter, so the strict check covers both: printing a *silent* one
+    /// (`{1 if False}`, blank in Jinja2) fails the render instead of printing
+    /// nothing — the trade the deviations table records. An undefined that
+    /// `is defined` probes or `\|default` swallows never reaches the formatter,
+    /// so those stay quiet.
+    #[test]
+    fn a_printed_undefined_is_a_render_error() {
+        let error = render("{1 if False}", &mut context(&[], "")).expect_err("silent undefined");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+        assert_eq!(ok("{nope|default('none')}"), "none");
+    }
+
+    /// `mainsail.cfg:176-182`'s `SET_PAUSE_NEXT_LAYER`, body for body: the
+    /// value it hands `SET_GCODE_VARIABLE` is a dict, and upstream writes it
+    /// with a tag (`VALUE="{{ … }}"`) — so its text must be Python's spelling
+    /// (`klippy`'s `ast.literal_eval` reads it back).
+    #[test]
+    fn pause_next_layer_writes_its_value_as_python_repr() {
+        let printer = printer_with(
+            "gcode_macro SET_PRINT_STATS_INFO",
+            json!({"pause_next_layer": {"enable": false, "call": "PAUSE"}}),
+        );
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("params", Rt::Json(json!({"ENABLE": "1"})));
+        let body = "{% set pause_next_layer = printer['gcode_macro SET_PRINT_STATS_INFO']\
+                    .pause_next_layer %}\n\
+                    {% set ENABLE = params.ENABLE|default(1)|int != 0 %}\n\
+                    {% set MACRO = params.MACRO|default(pause_next_layer.call, True) %}\n\
+                    SET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer \
+                    VALUE=\"{{ 'enable': ENABLE, 'call': MACRO }}\"\n";
+        assert_eq!(
+            render(body, &mut context).expect("the macro loads"),
+            // The three `{% set %}` lines leave their newlines; the value itself
+            // is Python's spelling of the dict.
+            "\n\n\nSET_GCODE_VARIABLE MACRO=SET_PRINT_STATS_INFO VARIABLE=pause_next_layer \
+             VALUE=\"{'call': 'PAUSE', 'enable': True}\"\n"
+        );
+    }
+
+    /// `mainsail.cfg`'s printf formatings in **expression** tags, body for
+    /// body: upstream runs Jinja2, where a string on the left of `%` is
+    /// Python's printf formatting, which this engine's `%` (the remainder)
+    /// refuses; [`rewrite_printf_formatting`] turns each tag into the engine's
+    /// `|format` filter before it is compiled, `%s` / `%d` / `%3.1f` / `%%`
+    /// included.
+    #[test]
+    fn mainsail_printf_formatings_render() {
+        let printer = printer_with("toolhead", json!({"extruder": "extruder"}));
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("last_extruder_temp", Rt::Json(json!({"temp": 205.0})));
+        context.insert("element", Rt::Json(json!("M117 hello")));
+        context.insert("pause_next_layer", Rt::Json(json!({"call": "PAUSE"})));
+        context.insert(
+            "pause_at_layer",
+            Rt::Json(json!({"call": "PAUSE_AT_LAYER", "layer": 12})),
+        );
+
+        // A `(a, b)` tuple becomes two arguments, a `%3.1f` a printf float.
+        assert_eq!(
+            render(
+                r#"{"Restoring \"%s\" temperature to %3.1f\u00B0C, this may take some time" % (printer.toolhead.extruder, last_extruder_temp.temp) }"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:138 renders"),
+            "Restoring \"extruder\" temperature to 205.0\u{00B0}C, this may take some time"
+        );
+        // A single operand, no parentheses.
+        assert_eq!(
+            render(
+                r#"{"Resume aborted !!! \"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:144 renders"),
+            "Resume aborted !!! \"extruder\" not hot enough, please heat up again and press RESUME"
+        );
+        assert_eq!(
+            render(r#"{"action:prompt_text %s" % element}"#, &mut context)
+                .expect("mainsail.cfg:169 renders"),
+            "action:prompt_text M117 hello"
+        );
+        assert_eq!(
+            render(
+                r#"{"%s, forced by pause_next_layer" % pause_next_layer.call}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:203 renders"),
+            "PAUSE, forced by pause_next_layer"
+        );
+        assert_eq!(
+            render(
+                r#"{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:207 renders"),
+            "PAUSE_AT_LAYER, forced by pause_at_layer [12]"
+        );
+        // `%%` is one literal `%`, as in Python.
+        assert_eq!(
+            render(r#"{"%d%% of %s" % (12, element)}"#, &mut context).expect("a `%%` renders"),
+            "12% of M117 hello"
+        );
+    }
+
+    /// A statement tag carries expressions too, so `{% set %}` is rewritten
+    /// the same way: `mainsail.cfg:145`/`:152` (one body) and `:163`, whose
+    /// printf sits inside a `prompt_txt.append(…)` call — the exact source and
+    /// the exact rewritten text, then a render of the same tag.
+    #[test]
+    fn mainsail_printf_formatings_in_set_tags_are_rewritten() {
+        let not_hot_enough: &str = r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder) %}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(not_hot_enough),
+            r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME"|format(printer.toolhead.extruder)) %}"#
+        );
+
+        let no_filament: &str = r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]) %}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(no_filament),
+            r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])) %}"#
+        );
+
+        // `.append(…)` and `.split(…)` are Python **methods** this port's
+        // engine does not have yet (the `|format` operand text is the part
+        // this unit owns), so the render keeps the tag and the literal and
+        // binds what the call would have produced.
+        let printer = printer_with("toolhead", json!({"extruder": "extruder"}));
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context.insert("runout_name", Rt::Json(json!("Sensor")));
+        assert_eq!(
+            render(
+                r##"{% set txt = "\"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder %}{txt}"##,
+                &mut context
+            )
+            .expect("a set-tag formatting renders"),
+            "\"extruder\" not hot enough, please heat up again and press RESUME"
+        );
+        assert_eq!(
+            render(
+                r##"{% set txt = "\"%s\" detects no filament, please load filament and press RESUME" % runout_name %}{txt}"##,
+                &mut context
+            )
+            .expect("a set-tag formatting renders"),
+            "\"Sensor\" detects no filament, please load filament and press RESUME"
+        );
+    }
+
+    /// The expression-tag half of `mainsail.cfg:162`: a parenthesized group with
+    /// a trailer is **one** argument, `(client.runout_sensor.split(" "))[1]`.
+    #[test]
+    fn a_trailered_group_is_one_format_argument() {
+        let source: &str = r#"{"\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]}"#;
+        assert_eq!(
+            &*rewrite_printf_formatting(source),
+            r#"{"\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])}"#
+        );
+        // `.split(…)` is a Python method this port's engine does not have yet,
+        // so the render binds what the call would have produced.
+        let mut context = context(&[], "");
+        context.insert("runout_name", Rt::Json(json!("Sensor")));
+        assert_eq!(
+            render(
+                r#"{"\"%s\" detects no filament, please load filament and press RESUME" % runout_name}"#,
+                &mut context
+            )
+            .expect("renders"),
+            "\"Sensor\" detects no filament, please load filament and press RESUME"
+        );
+    }
+
+    /// Every other `%` keeps the engine's meaning: a numeric left operand is
+    /// untouched, a non-literal one is left to fail the way it does today, and
+    /// a formatting the rewrite cannot read is not guessed at (no panic, the
+    /// loud load error it always was).
+    #[test]
+    fn a_percent_that_is_not_a_string_formatting_is_left_alone() {
+        assert_eq!(ok("{ 7 % 3 }"), "1");
+        assert_eq!(ok("{ 17 * 2 + 1 % 4 }"), "35");
+
+        let mut context = context(&[], "");
+        context.insert("s", Rt::Json(json!("abc")));
+        let error = render("{ s % 3 }", &mut context).expect_err("% of a string");
+        assert!(
+            error
+                .to_string()
+                .contains("tried to use % operator on unsupported types string and number"),
+            "{error}"
+        );
+        assert!(Template::parse("t", r#"{"x %s" % (a}"#).is_err());
+        let error = render(r#"{"%(key)s" % {'key': 1}}"#, &mut context).expect_err("a mapping");
+        assert!(
+            error
+                .to_string()
+                .contains("tried to use % operator on unsupported types string and map"),
+            "{error}"
+        );
+    }
+
+    /// A `{% set %}` or `{% if %}` whose `%` is an **operator**, a comment tag
+    /// and the text between tags keep their bytes, and the rewrite adds no
+    /// newline — an error still names the line the body wrote.
+    #[test]
+    fn the_printf_rewrite_leaves_non_formatings_and_comments_alone() {
+        for source in [
+            "{% set x = 100 %}",
+            "{% if n % 2 == 0 %}even{% else %}odd{% endif %}",
+            "{# \"%s\" % x #}",
+            "{# \"%s\" % x #}\"%s\" % x",
+        ] {
+            assert_eq!(&*rewrite_printf_formatting(source), source);
+        }
+        assert_eq!(ok("{% set x = 100 %}{x}"), "100");
+        let mut context = context(&[], "");
+        context.insert("n", Rt::Json(json!(4)));
+        assert_eq!(
+            render(
+                "{% if n % 2 == 0 %}even{% else %}odd{% endif %}",
+                &mut context
+            )
+            .expect("`%` is still the remainder"),
+            "even"
+        );
+        context.insert("t", Rt::Json(json!("v")));
+        assert_eq!(
+            render(
+                "{# \"%s\" % t #}\"%s\" % t\n{% set x = 1 %}{x}",
+                &mut context
+            )
+            .expect("text and tags survive"),
+            "\"%s\" % t\n1"
+        );
+        let error = render("{\"%s\" % t}\n{nope}", &mut context).expect_err("undefined");
+        assert!(error.to_string().contains("line 2"), "{error}");
+    }
+
+    /// The vendored client macro file itself: every one of its eleven printf
+    /// formatings is rewritten — six in `{ … }` tags, five in `{% set %}` —
+    /// and no newline moves, so its error frames still name its own lines.
+    #[test]
+    fn every_printf_in_the_vendored_mainsail_file_is_rewritten() {
+        let source = include_str!("mainsail.cfg");
+        let rewritten = rewrite_printf_formatting(source);
+        assert_eq!(source.matches("|format(").count(), 0);
+        assert_eq!(rewritten.matches("|format(").count(), 11);
+        assert_eq!(rewritten.lines().count(), source.lines().count());
     }
 
     /// `if` / `elif` / `else` and `for` over `range(… | int)`, the shapes
@@ -1654,5 +2917,218 @@ STEPPER_RELEASE";
         );
         assert_eq!(backward.matches("G4 P5").count(), 8, "{backward}");
         assert_eq!(backward.matches("G4 P5\n").count(), 8, "{backward}");
+    }
+
+    /// `str.split`, the method the Mainsail corpus' `RESUME` depends on:
+    /// `client.runout_sensor.split(" ")[1]` runs on every resume
+    /// (`mainsail.cfg`). Each shape is what
+    /// `python3 -c "print(…split(…))"` prints.
+    #[test]
+    fn split_follows_python_for_whitespace_separators_and_maxsplit() {
+        // No argument: a run of whitespace separates, nothing empty survives.
+        assert_eq!(ok("{ 'a b  c'.split() }"), "['a', 'b', 'c']");
+        assert_eq!(ok("{ '  '.split() }"), "[]");
+        assert_eq!(ok("{ ''.split() }"), "[]");
+        // A separator: every empty piece is kept, consecutive separators too.
+        assert_eq!(ok("{ ' a  b '.split(' ') }"), "['', 'a', '', 'b', '']");
+        assert_eq!(ok("{ 'a,b'.split(',') }"), "['a', 'b']");
+        assert_eq!(ok("{ 'a'.split(',') }"), "['a']");
+        // `maxsplit` leaves the tail alone, and the whitespace form keeps its
+        // trailing blanks (`' a  b   c  '.split(None, 1)` in Python).
+        assert_eq!(ok("{ 'a b c'.split(' ', 1) }"), "['a', 'b c']");
+        assert_eq!(ok("{ 'a,b,,c'.split(',', 2) }"), "['a', 'b', ',c']");
+        assert_eq!(ok("{ ' a  b   c  '.split(none, 1) }"), "['a', 'b   c  ']");
+        assert_eq!(ok("{ ' a  b '.split(none, 0) }"), "['a  b ']");
+        // The corpus' own line.
+        assert_eq!(
+            ok("{ 'runout_sensor: TRIGGERED'.split(' ')[1] }"),
+            "TRIGGERED"
+        );
+
+        let error =
+            render("{ 'a b'.split('') }", &mut context(&[], "")).expect_err("empty separator");
+        assert!(error.to_string().contains("empty separator"), "{error}");
+    }
+
+    /// `str.strip`/`lstrip`/`rstrip`, `lower`/`upper` and `replace`.
+    #[test]
+    fn strip_case_and_replace_follow_python() {
+        assert_eq!(ok("[{ '  x  '.strip() }]"), "[x]");
+        assert_eq!(ok("[{ '  x  '.lstrip() }]"), "[x  ]");
+        assert_eq!(ok("[{ '  x  '.rstrip() }]"), "[  x]");
+        // An argument is a *set* of characters, not a substring.
+        assert_eq!(ok("{ 'xxaxx'.strip('x') }"), "a");
+        assert_eq!(ok("{ 'xyaxy'.strip('xy') }"), "a");
+        assert_eq!(ok("{ 'AbC'.lower() }/{ 'AbC'.upper() }"), "abc/ABC");
+
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+') }"), "a+b+c");
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', 1) }"), "a+b-c");
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', 0) }"), "a-b-c");
+        // A negative count is unlimited, as in Python.
+        assert_eq!(ok("{ 'a-b-c'.replace('-', '+', -1) }"), "a+b+c");
+        // An empty `old` inserts between every character and at both ends.
+        assert_eq!(ok("{ 'abc'.replace('', '-') }"), "-a-b-c-");
+        assert_eq!(ok("{ 'abc'.replace('', '-', 2) }"), "-a-bc");
+    }
+
+    /// `str.startswith`/`endswith` with the optional `start`/`end` window.
+    #[test]
+    fn affixes_follow_python_including_the_slice_window() {
+        assert_eq!(ok("{ 'setup.cfg'.startswith('setup') }"), "True");
+        assert_eq!(ok("{ 'setup.cfg'.endswith('.cfg') }"), "True");
+        assert_eq!(ok("{ 'setup.cfg'.startswith('cfg') }"), "False");
+        assert_eq!(ok("{ 'abc'.startswith('b', 1) }"), "True");
+        assert_eq!(ok("{ 'abc'.endswith('b', 0, 2) }"), "True");
+        assert_eq!(ok("{ 'abc'.startswith('b', 0, 1) }"), "False");
+        // Negative indexes count from the end.
+        assert_eq!(ok("{ 'abc'.endswith('c', -1) }"), "True");
+        // A list stands in for Python's tuple of prefixes.
+        assert_eq!(ok("{ 'abc'.startswith(['x', 'a']) }"), "True");
+        assert_eq!(ok("{ 'abc'.endswith(['x', 'a']) }"), "False");
+    }
+
+    /// `str.find` and `str.count`: Python's **character** indexes, its window
+    /// arguments, and `find`'s `-1`.
+    #[test]
+    fn find_and_count_follow_python() {
+        assert_eq!(ok("{ 'abcabc'.find('bc') }"), "1");
+        assert_eq!(ok("{ 'abc'.find('z') }"), "-1");
+        assert_eq!(ok("{ 'abcabc'.find('bc', 2) }"), "4");
+        assert_eq!(ok("{ 'abc'.find('', 1) }"), "1");
+        // Code points, not bytes, as Python counts them.
+        assert_eq!(ok("{ 'héllo'.find('llo') }"), "2");
+
+        assert_eq!(ok("{ 'aaa'.count('aa') }"), "1");
+        assert_eq!(ok("{ 'abcabc'.count('bc', 2) }"), "1");
+        assert_eq!(ok("{ 'abc'.count('') }"), "4");
+        assert_eq!(ok("{ 'abc'.count('z') }"), "0");
+    }
+
+    /// `str.join`: the separator comes from the receiver, the items must be
+    /// strings, and a string argument iterates as its characters.
+    #[test]
+    fn join_follows_python() {
+        assert_eq!(ok("{ '-'.join(['a', 'b']) }"), "a-b");
+        assert_eq!(ok("{ ''.join(['a', 'b']) }"), "ab");
+        assert_eq!(ok("[{ '-'.join([]) }]"), "[]");
+        assert_eq!(ok("{ '-'.join('abc') }"), "a-b-c");
+
+        let error = render("{ '-'.join([1]) }", &mut context(&[], "")).expect_err("item");
+        assert!(
+            error
+                .to_string()
+                .contains("sequence item 0: expected str instance, int found"),
+            "{error}"
+        );
+        let error = render("{ '-'.join(1) }", &mut context(&[], "")).expect_err("not iterable");
+        assert!(
+            error.to_string().contains("can only join an iterable"),
+            "{error}"
+        );
+    }
+
+    /// The list methods that read (`index`, `count`) are Python's own, and the
+    /// three that would mutate are answered with `None`: the engine's lists are
+    /// values, so nothing can write back to the list a body holds — the
+    /// deviation table's row. What a body sees: `None` back, the list as it was.
+    #[test]
+    fn list_reads_work_and_list_mutation_degrades_to_none() {
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.count(2) }"), "2");
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.count(3) }"), "0");
+        assert_eq!(ok("{% set n = [1, 2, 2] %}{ n.index(2) }"), "1");
+        let error =
+            render("{% set n = [1] %}{ n.index(3) }", &mut context(&[], "")).expect_err("absent");
+        assert!(error.to_string().contains("3 is not in list"), "{error}");
+
+        // `{% set _d = prompt_txt.append(…) %}` — `mainsail.cfg`'s abort
+        // prompt — renders, answers `None`, and collects nothing.
+        assert_eq!(
+            ok("{% set n = [1, 2] %}{% set _d = n.append(3) %}{ n }/{ _d }"),
+            "[1, 2]/None"
+        );
+        assert_eq!(
+            ok("{% set n = [1] %}{% set _d = n.extend([2, 3]) %}{ n }"),
+            "[1]"
+        );
+        assert_eq!(
+            ok("{% set n = [1, 2] %}{% set _d = n.pop() %}{ n }/{ _d }"),
+            "[1, 2]/None"
+        );
+
+        let error =
+            render("{% set n = [1] %}{ n.extend(1) }", &mut context(&[], "")).expect_err("int");
+        assert!(
+            error
+                .to_string()
+                .contains("extend() argument must be an iterable, not int"),
+            "{error}"
+        );
+    }
+
+    /// A method nothing implements — another name, another type — stays the
+    /// engine's `unknown method` error rather than a quiet `None`.
+    #[test]
+    fn unimplemented_methods_stay_unknown_method_errors() {
+        for source in [
+            "{ 'a'.nosuch() }",
+            "{ 'a'.sort() }",
+            "{ params.split('a') }",
+            "{% set n = [1] %}{ n.sort() }",
+            "{ (1).split() }",
+        ] {
+            let error = render(source, &mut context(&[], "")).expect_err(source);
+            assert!(
+                error.to_string().contains("has no method named"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    /// A wrong argument is Python's `TypeError` shape — an argument count or a
+    /// type — not a silently wrong answer.
+    #[test]
+    fn method_arguments_are_checked_like_pythons() {
+        let error = render("{ 'a b'.split(' ', 1, 2) }", &mut context(&[], "")).expect_err("3");
+        assert!(
+            error
+                .to_string()
+                .contains("split() takes at most 2 arguments (3 given)"),
+            "{error}"
+        );
+        let error = render("{ 'a b'.split(1) }", &mut context(&[], "")).expect_err("int sep");
+        assert!(
+            error
+                .to_string()
+                .contains("split() argument 'sep' must be str, not int"),
+            "{error}"
+        );
+        let error = render("{ 'a'.replace('a') }", &mut context(&[], "")).expect_err("1 arg");
+        assert!(
+            error
+                .to_string()
+                .contains("replace() takes at least 2 positional arguments (1 given)"),
+            "{error}"
+        );
+        let error = render("{ 'a'.lower(1) }", &mut context(&[], "")).expect_err("1 arg");
+        assert!(
+            error
+                .to_string()
+                .contains("str.lower() takes no arguments (1 given)"),
+            "{error}"
+        );
+        let error = render("{ ' a '.strip(1) }", &mut context(&[], "")).expect_err("int chars");
+        assert!(
+            error
+                .to_string()
+                .contains("strip() argument 'chars' must be str, not int"),
+            "{error}"
+        );
+        let error = render("{ 'a'.find('a', 'x') }", &mut context(&[], "")).expect_err("start");
+        assert!(
+            error
+                .to_string()
+                .contains("find() argument 'start' must be int, not str"),
+            "{error}"
+        );
     }
 }

@@ -73,7 +73,7 @@
   发散、`verify_heater` 不误触发。**注意**：`M109`/`M190` 已会等到目标温度、`M105` 按
   gcode-id 表输出（2026-10-06 复核：`extras/extruder.rs:263`、`extras/heater_bed.rs:53`、
   `extras/heaters.rs:417`；此前本节「不等温、回 `T:0`」的说法已过时）；`TEMPERATURE_WAIT`
-  亦可等待（2026-10-03，`b5da84e`）。
+  亦可等待（2026-10-03，`a802cdc`）。
 
 - [ ] **R7 挤出机进料（E 轴）** —— 真实测试：热态下 `G1 E10`（配合 `M83`）送料，
   量实际挤出长度；冷态再发同一条。判定：进料量与 `rotation_distance`/齿轮比对账；
@@ -97,7 +97,7 @@
 - [ ] **R11 连续运行的真机时序** —— 真实测试：把 R1–R9 的最小任务**循环跑满一段较长
   时间**（分钟到小时级，或用 `stress --task step` 顶着上限压）。判定：无
   `Stepper too far in past` / `Timer too close`、无丢步、USB 不掉线；本项要暴露的
-  代码侧缺口：**宿主的 `ToolHead.wait_moves` 等待已落地（2026-10-06，`46d6e64`）**，但它按上游
+  代码侧缺口：**宿主的 `ToolHead.wait_moves` 等待已落地（2026-10-06，`a23a92b`）**，但它按上游
   `can_pause` 在 fileoutput 下短路，所以**真机路径（无 `debug_output`）仍未验证**——本项就是要验它。
   尚未建模的剩 `send_wait_ack`（消息的 `min_clock`/`req_clock` 闸**已建模**，见 `mcu/mod.rs:149-176`；
   `mcu/mod.rs:2639-2650` 自述只是 flush、不是「块被固件确认」）。
@@ -107,7 +107,65 @@
   `[gcode_button]` 的 cfg 在 `-o` 下同样泄漏，代价是那两条各 5.25s 的收尾；根因是命令表反向钉住
   部件的强引用环，2026-10-06 已断——现在这两条收尾回到毫秒级、且探针会点名泄漏的 cfg。）
 
+- [ ] **R12 加热的时钟域与主线程护栏** —— 真机部分验过（2026-10-19，裸 STM32F103 +
+  `[heater_generic]` 软件 PWM 脚 + 板载 LED + `temperature_mcu`）：
+  **① 跨 32 位时钟绕圈 ✅ 通过**：`power` 恒 1.0 连跑 180 s（F103 72 MHz ⇒ 59.6 s 一圈，跨 3 圈），
+  每 2 s 采一次共 90 样本 —— 温度 min 36.24 / max 36.51 / **极差 0.27 ℃**、`power` **90/90 全 1.0**、
+  分段均值 36.31→36.36→36.45 单调微升、会话全程 `ready`。改动前（ADC 样本时间是裸 tick）绕圈后
+  `time_diff` 变负巨值 ⇒ 平滑温度乱跳 ⇒ watermark 把占空比打 0（LED 会每 ~60 s 闪一下）。
+  **② 5 s 主线程护栏在真机上「结构上不可达」——由 6 s 停顿实测证明**：`SIGSTOP` 6 s 后固件先报
+  `MCU shutdown: Missed scheduling of next digital out event`（软件 PWM 每 0.1 s 需要一个新边沿，
+  宿主停下就漏排；上游的加热器同样是软件 PWM，`heaters.py:61` 写死 `setup_cycle_time(pwm_cycle_time)`），
+  也就是说对**真实加热器**来说，0.1 s 级的固件看门狗比 5 s 的主线程截止先咬人，护栏只是纵深防御。
+  同一次停顿在修「迟到读数排到过去」之前还会先报 `Rescheduled timer in the past`（见下），修后只剩
+  固件的 missed-scheduling。护栏归零时现已留限速告警（每秒读时一条），但正常与停顿两条路都到不了它。
+  （补记：对齐上游后已加 **PWM 更新棘轮**——`min_pwm_change = max_power×5%` +
+  `next_pwm_time = pwm_time + 3.0 − (3×pwm_delay + 0.001)`，PWM 事件从约 3.3 条/秒降到
+  约 0.5 条/秒；重跑 6 s `SIGSTOP` **仍然**以 `Missed scheduling of next digital out event`
+  结束——这在软件 PWM 下是上游设计行为（宿主必须持续服务），不是本仓缺陷。）
+  **③ 7 s 陈旧压制同样未被真机观测**：恢复后第一条读数即刷新 `last_temp_time`，窗口只有其前几毫秒；
+  且 `M105` 文本不经 `gcode/script` 应答回传。②③ 的边界由单测钉住
+  （`test_a_reading_past_the_mainthread_deadline_sends_no_power`、
+  `test_a_quiet_sensor_quells_to_zero_after_seven_seconds`、`test_a_stall_is_reported_at_most_once_a_second`）。
+  **前置修复（同批）**：真机首次跑时 `[heater_generic]` 一连接就 `Timer too close`（上电 3.28 s），
+  首因是 PWM 变更走无时钟即时路径、撞上固件的 `MAX_HEAT_TIME` auto-off；改成上游的
+  `set_pwm(read_time + pwm_delay)` 排期后 `state: ready`、`power 1.0`。
+  **第二层（同批后续修）**：排期后又出现 `Rescheduled timer in the past`（上电 10.4 s）——USB CDC
+  把多批报告攒在一起送达时，最后一条读数的 `read_time` 已落后宿主 ~0.3 s，`read_time + pwm_delay`
+  正好落在固件时钟之后；现在延迟从「读数与芯片 print time 之较晚者」起算，修后同场景只剩固件的
+  missed-scheduling（预期行为）。
+
 ## 已完成真机验证（留档）
+
+### 2026-10-19 自动化 lane 首次跑通（裸 STM32F103，桥固件 / mux 控制台）
+
+配置：`/tmp/kx-hw.cfg`（单 `[mcu]` + 一个桥端口节让主机按 id 寻址；`[stepper_x]` 用空闲 GPIO
+PB4/PB5/`!PB6`，`endstop_pin: ^PD10`，不接任何负载）。`KLIPPERX_HW_CONFIG=<cfg> cargo hwtest`：
+
+| 用例 | 结果 |
+|---|---|
+| R1 帧序同步 | ✅ `connect #1: took_over=true at sequence 10`、`#2 adopted sequence 3`，0.88 s |
+| R2 复位三轮 | ✅ 每轮 `rebooted, identified and answered get_clock`：765 / 763 / 764 ms，共 2.64 s |
+| R5 单轴步数 | ✅ `firmware position: 400 step(s), expected 400`（5 mm @ 10 mm/s，0.96 s） |
+| R11 短时 soak | ✅ `5000 steps/s for 2.0 s` → 10000 步（≈125 mm），无 shutdown，2.70 s |
+| R3 端停电平 | ✅ **交互式跑通（需人手一次）**：`endstop_pin: ^PD10`（上拉）→ `read 1: TRIGGERED`（悬空被上拉为高）；把 PD10 短到 GND 后回车 → `read 2: open`，输出 `电平翻转确认：TRIGGERED -> open`（44 s，含等人） |
+
+> **接线语义（实测确认，与上游同款）**：`^` 只置上拉、`!` 才置 flip（`pins.py:70-76` ↔ `pins.rs:970-972`）；主机
+> `query_endstop` 返回 `pin_value ^ invert`（`endstop.rs:146` ↔ `mcu.py:406`），`true` 打印为 `TRIGGERED`。
+> 所以 `^PD10` **悬空 = 高 = TRIGGERED**、**短到 GND = 低 = open**——klipper 的 `^` 端停按常闭接法工作。
+
+**同日修复并复验（串口在重新枚举下的身份）**：改一次 `endstop_pin`（PD10 → PD11 → 再回 PD10）⇒ lane 必须
+`reset` 板子 ⇒ USB 重新枚举；此前同一场景是 `serial write … Input/output error (os error 5)` 直接失败，
+现在两轮都 `the firmware accepted the configuration` 并读到电平（`^PD10` 短到 GND 时 `read 1: open`）。
+机制：`port_for` 的复用判据加了「路径当前解析到的 `(dev, ino)` 与已打开描述符一致」(`same_file`)，
+`attach` 在握手失败且端口已失效时重开（4 × 250 ms）。
+
+**前置修复（同批）**：这份 lane 以前打不通这块板——`hardware_test`/`stress` 各自只拿到一节就
+`McuConfig::open()`，而"这条 `serial:` 路径按 id 寻址"是**装载期**在整份配置上判定的，于是 lane 用
+独占裸帧对 mux 固件说话、identify 必然超时（日志里 `serial port …` 没有 `shared` 字样）。现在两处都
+调用 `apply_id_addressed_transport`（`serial_ports` 同一分类 + `NODEID_FIRST`），并加了两条单测钉住
+"单 `[mcu]` 仍独占 / 桥端口节按 id"。
+
 
 | 项 | 结果 |
 |---|---|
@@ -195,7 +253,9 @@
   `SET_PORT_NODEID`/`RESET_PORT`。判定：同 M1-1/M1-2 的 identify + `get_clock`，且**单元不被截断**。
   **缺件（2026-10-17 复核，已缩小）**：固件的 CAN **下游端口**后端（`BRIDGE_PORT_CAN`）与它的
   单帧 admin 代理**已经落地并真机验过**（见下方「经桥刷 CAN 下游」，F446 桥 + F103 下游，含可反复刷）；
-  仍未接线的是 `printer.cfg` 的 `[can_device]` 端口节（配置期仍点名拒绝）与 **CAN 上游 attach**
+  仍未接线的只剩 **CAN 上游 attach**（桥自己经 CAN 被宿主连）；`printer.cfg` 的 `[can_device]` 端口节
+  已接线并真机跑通（主机在配置期发 `config_can` + `config_bridge_port`，见
+  [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的 CAN 一节）。
   （桥自己经 CAN 被宿主连）。
   **预判风险**：`mux_input` 在 `irq_save()` 段内对 192 B 收缓冲做就地 memmove（与 `serial_irq.c` 同形），
   CAN 侧帧更密，真机需量一次中断关闭时长与丢帧率；`mux_send` 满缓冲丢单元（协议靠重发，
@@ -233,8 +293,9 @@
 **上板发现的前置条件（当结论用）**：A) 想当 mux 下游的板，其控制台必须已接 mux 线（含 USB CDC）；
 B) `REQUEST_BOOTLOADER (0x02)` 要真生效，下游固件得带**可软件进入的 bootloader**（CanBoot / USB-HID）
 ——不带就是设计内 no-op，它属**刷写工具**；「重启固件」用 `RESTART_DEVICE (0x05)`（`restart_method: admin`）；
-C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」还需 MCU 侧 **UART 端口后端**
-（`CONFIG_SERIAL_UART` 目前只有 host 库实现）。
+C) 原生 USB CDC 板不看 DTR/RTS，线级 `RESET_PORT` 对它无效；D) 「板做桥」当时还缺 MCU 侧的 **UART 端口后端**
+（`CONFIG_SERIAL_UART` 那时只有 host 库实现）——**现已落地**（stm32 `src/stm32/bridge_serial.c`，多选 USART1/2/3 + UART4/5，
+见 [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md) 的多端口一节），这句留作上板当天的记录。
 
 **刷写这台板的正确姿势（本轮踩过，写下来）**：`./venv/bin/pyocd load -O connect_mode=halt
 -O frequency=1000000 -e chip --target stm32f103ze out/firmware/klipper/klipper.elf`
@@ -261,6 +322,36 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   child 135 重新起来、state=ready**（全链约 40s，其中 ~35s 是 child 会话自身的超时）；同一条链在
   没有恢复前是 `Printer error` 终点。仍未覆盖：**in-place reset（`reconnect`）内**的 child 失败不走这条路。
 
+### 真机结果（2026-10-16，mux 设备半直连：隧道 / 送引导 / 重启）
+
+目的：**不摆桥**、只把板子当一个 mux 设备半，先验「设备对新指令的应答对不对」。固件 = klipper
+子模组 `test/configs/stm32f103-usb-mux.config` 加 `CONFIG_STM32_FLASH_START_2000=y`（应用偏移
+`0x8002000`，与 katapult 对齐），**构建外移**（`KCONFIG_CONFIG`/`OUT` 指自建目录
+`target/hw-phase1`，不碰子模组的 `.config`/`out/`）；用 `klipperx admin flash --device <by-id>` 直连
+USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/devices/serial.rs` 的两条
+`#[ignore]` 探针，tty 由 `KLIPPERX_HW_MUX_TTY=<by-id>` 给（uuid 默认本板 `e512c60ac0e6`，可
+`KLIPPERX_HW_MUX_UUID` 覆盖）。
+
+| # | 验项 | 结果 |
+|---|------|------|
+| 1 | 发现（未指派）：应答落在 admin 应答 id `0x3f1`、`application=None`、`NEED_NODEID` | ✓ |
+| 2 | 指派被采纳：再扫**静默**（号只由主机持有） | ✓ |
+| 3 | `SET_PORT_NODEID (0x03)`：设备不执行（桥自身命令），无任何应答 | ✓ |
+| 4 | 隧道单元（`01 88 …`）：整段丢弃且流恢复 | ✓ |
+| 5 | `RESTART_DEVICE (0x05)`：真重启、号丢失、再扫仍应答同一 uuid | ✓ |
+| 6 | `REQUEST_BOOTLOADER (0x02)`：板子重枚举为 `usb-katapult_stm32f103xe_devloop1-if00` | ✓ |
+
+实测耗时：第 1 条 8.91 s、第 2 条 2.41 s。**阶段结束时板子停在 katapult**（第 6 条是最后一步）。
+
+两条踩出来的口径（已写进探针注释）：
+
+- **板子会自发 1 Hz `stats` 帧**（固件字典记作 id `-12`，编码首字节 `0x74`），且上一轮残留的应答头
+  会先到；所以探针开端口时必须 `tcflush` 清输入缓冲，并且**盲读第一个单元会把两者粘连误判**——
+  解析器必须按 arb 分派、必要时 `drop_to_sync`。
+- **隧道单元之后至多吞一帧**：设备解析器遇到内层 katapult 帧（首字节 `0x01` 不是合法长度）就进入
+  「等下一个 SYNC」态，紧随其后那一帧被整体吃掉、再下一帧恢复——与主机侧「丢到下一个 `0x7e`、至多
+  损失一个单元」同性质，刷写会话的重传（`tries=5`）盖得过它。
+
 ### 真机结果（2026-10-17，主机直连 CAN：上游 USB-CAN 桥）
 
 做法：把 F446 桥板刷成**上游 klipper 的 `USBCANBUS`**（`src/generic/usb_canbus.c`，USB id
@@ -275,19 +366,19 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 |---|---|
 | `admin scan --interface can0` | 两颗：桥板自己 `56ec3127224a`、下游 `12f912ed3873` |
 | `klippy` 附着下游 | ✅ `MCU 'child' identified: 139 messages` |
-| `admin flash --interface can0`（切片节点 40 824 B / ISO-TP 节点 42 040 B） | ✅ 638 / 657 块，但需先 `cansend can0 3f0#02<uuid>` 送引导（工具侧缺口） |
+| `admin flash --interface can0`（切片节点 40 824 B） | ✅ 638 块，但需先 `cansend can0 3f0#02<uuid>` 送引导（工具侧缺口） |
 | 单节点 `comm` | **2272 req/s**（2842 崩） |
 | 单节点 `step` | **145 455 steps/s**（181 818 崩，`Stepper too far in past`） |
 | 单节点 `motion` | ✅ |
 | **双节点并发**（桥板自身 + 下游，同一条 can0） | 两颗都 **2272 req/s**（聚合 ≈ 4.5k 往返/秒） |
-| ISO-TP（`canbus_protocol: isotp`，节点刷 `CANSERIAL+ISOTP` 无 mux） | ✅ 修掉 BS=0 之后通了：`identify` 139；**comm 742 req/s**（切片 2272）、**motion 绿**、**step 首段 10 000 steps/s 即超时**（ISO-TP 每条命令约 2 帧，约为切片 3 倍代价）；修复前 `candump` 已指向真因：设备发 FF → 我们 FC(`30 00 00`) → 设备只发 **1 个 CF** 就停，25 ms 后超时——两端固件都把 `BS=0` 当成「本块 0 帧」而不是「不限」 |
 
 对比：同样 1 Mbit、同样下游板，主机直连的 `step` 是 **145 455**，而 klipperx 桥的 CAN 端口只有
 **15 625**（9 倍差）；说明桥端口的 per-frame 转发在突发命令负载下代价更高，待查。
 
-工具侧两个缺口（本轮踩到）：`admin flash --interface can0` 不会请求引导（需手工 `cansend` 一帧
-`0x3f0 [0x02][uuid]`）；`stress` 连 `canbus_interface` 的 MCU 时不跑 id 分配器，必须写显式
-`canbus_nodeid:`。
+工具侧两个缺口已补齐（2026-10-18）：`admin reset --interface can0 --uuid <12 位> --bootloader`
+能直接从主机侧把板子送进引导（不再要手工 `cansend` 一帧 `0x3f0 [0x02][uuid]`）；`stress` 给连
+`canbus_interface` 的 MCU 也从同一条 id 序列分配节点号（不再要手写 `canbus_nodeid:`）。两者的
+主机侧验收是单测（`flasher/cli` 与 `stress` 的分配器用例），**未上真机重跑**。
 
 ### 真机结果（2026-10-17，四台设备压测轮）
 
@@ -300,7 +391,7 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 
 | 症状 | 根因 | 修复 |
 |---|---|---|
-| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`b2ee68a`） |
+| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`8c4a9bf`） |
 | UART 下游每次会话后 mux 身份从 `97abe031988e` 变成 `7eabe031988e`，重连再也握不上手，须重新上电 | **上游 console bug**：`encode_acknak.min_size = 0`，`transmit_room()` 压缩后把 5 字节 ack 写到 `transmit_buf[96..100]`，帧尾 `0x7e` 落在 `mux_identity[0]`（250 kbaud 饱和链路几乎每个 ack 都走压缩分支） | `min_size = MESSAGE_MIN` + ack 短路遵守 `buf_size`（`df4ed17c`） |
 | CAN 下游 `identify` 永远超时；scan / 指派 / 送引导 / 隧道刷写全通 | CAN 侧 `can_decode_nodeid()` 给的是**仲裁 id**，被当成 node id 交给 mux 设备半 ⇒ 设备发出的帧头是 `mux_encode_header(0)`（`80 00`，没有地址），也拒收发给它的单元 | 交接米跑 wire 上的 node id（`7ca47634`） |
 | `[can_device]` 配置期 shutdown：`Pin PB8 reserved for CAN - can't reserve for bridge_can` | 端口型 build 同一对引脚被 `RESERVE_PINS_CAN` 与 `RESERVE_PINS_bridge_can` 各声明一次 | 引脚由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下只声明一次（`24cc4eba`） |
@@ -312,22 +403,92 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
 | UART 250 kbaud | 930 req/s | 1160 | 2270(debug)/2834(release) | — | — |
 | UART 500 kbaud | 1814 req/s | 1452 | 2834 | 145 455 steps/s | ✅ |
 | CAN 1 Mbit（切片） | 2268 req/s | 2270 | 2834（并发时掉到 1816） | 15 625 steps/s | ✅ |
-| CAN 1 Mbit（桥端口 **ISO-TP 载具**） | 594 req/s | 380 | 2270 | **145 455** steps/s | ✅ |
 
 读法（详见 [MCU 连接方式 → 桥下游链路的吞吐与余量](docs/klippy/user-manual/mcu-connection.md#桥下游链路的吞吐与余量真机实测)）：
 250 k 是纯线速瓶颈；并发损耗**不对称**（UART 损被中继侧 ~20%，CAN 损桥自己 ~36%）；CAN 的 step 低是
 8 B 帧下 `queue_step` 要拆两帧、压测突发下发超过一段的提前量（真实主机是连续投递，不是突发）。
 
 **CAN 端口运行期会话已闭环**：`identify` → 配置握手 → 周期 `get_clock`，同一拓扑连续两次 `klippy` 都成功。
+仍未覆盖：CAN 上游 attach（桥经 CAN 被宿主连）。
 
-**CAN 端口 ISO-TP 载具也已闭环**（`bench-can-isotp.cfg`，下游刷 `CONFIG_ISOTP` 应用 44 520 B、
-桥 53 636 B，1 Mbit）：连跑 **3 次全绿**且**零重传**（`mcu` 150 条 / `downstream` 139 条），
-`comm` **594 req/s**（745 崩，与桥并发时下游 380）、`step` **145 455 steps/s**、`motion` ✅。
-两个修复：① 桥半发送循环里 `BS=0` 的余留判据（首帧 + 首个连续帧之后就停等 FC，于是 13 B 以上的
-单元永远到不了设备——定位手法是把设备 `halt` 住后读它的 CAN FIFO0 输出邮箱，帧会冻在里面）；
-② 两端 ISO-TP 的**发送队列从 2 槽加深到 16 槽**（主机允许 12 块未确认，每块都要回一条消息，
-2 槽时突发被静默丢；这一项把 comm 从 244 拉到 594）。详情见工作记录。
-仍未覆盖：CAN 上游 attach（桥经 CAN 被宿主连，挂起）。
+### 真机结果（2026-10-18，TMC2209 直接挂在桥板上，单线 UART）
+
+拓扑：F446 桥（USB CDC 控制台 + CAN1）；TMC2209 接在**桥板**上——STEP=PC8、DIR=PC7、
+EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂在 CAN 端口（它的 PC13 是状态灯）。
+配置：`kinematics: cartesian` + `[stepper_x]`（Y/Z 是没接电机的占位轴，只为 cartesian 成立）+
+`[tmc2209 stepper_x]` + `[endstop_phase stepper_x]`；`run_current 0.35 A`、`driver_SGTHRS 80`。
+
+**验过的（硬证据）**：
+
+| 项 | 证据 |
+|---|---|
+| UART 读 | `IOIN 21000041 version=0x21`（TMC2209）、`GCONF 1c0`（`pdn_disable`/`mstep_reg_select`/`multistep_filt`）、`CHOPCONF 14030053`（`toff=3 mres=16 intpol=1`）、`DRV_STATUS cs_actual/stealth/stst` |
+| UART 写 | `SLAVECONF 200 senddelay=2`、`IHOLD_IRUN` 随 `SET_TMC_CURRENT` 变化、`SET_TMC_FIELD toff` 改 `CHOPCONF` 后读回 |
+| 转动 | `MSCNT` 451→911（驱动侧微步计数）、±100 mm @5 mm/s 连续来回多轮不出错；也能用 `G1` 往复做出"嗡鸣" |
+| 相位 | `SET_STEPPER_ENABLE` 后 `mcu_phase_offset=1`、`phase_offset_position=0.0013228`（正好 1 微步） |
+| 周期检查 | 1 s 一次，`drv_status` 出现在 `tmc2209 stepper_x` 状态里 |
+| DIAG 接线 | 接上后空闲读引脚为**低**（`G28 X` 跑满行程报 `No trigger on x after full movement`）；未接时因内部上拉而"立刻触发" |
+
+**这一轮踩出并修掉的三个缺陷**（`a816520`、`1e0afc3`）：
+
+1. **写必须等固件自己的应答**：固件对每一条 `tmcuart_send` 都回一个 `tmcuart_response`（写也回，
+   载荷为空），那是"这一帧已发完"的完成信号。主机之前 fire-and-forget，于是只能靠 sleep 猜，
+   且那条没人收的应答会被下一条查询吃掉，返回上一帧的状态（表现为 `IFCNT` 不前进而寄存器其实已改）。
+2. **使能脚要关掉固件看门狗**：`digital_out` 默认带 2 s `max_duration`，使能后 move queue 空时固件
+   直接 shutdown（`Missed scheduling of next digital out event`）。上游 `stepper_enable.py` 会
+   `setup_max_duration(0.)`，本仓漏了 ⇒ **任何写 `enable_pin` 的轴都会中枪**（此前 bench 配置都没写它）。
+3. **周期检查不能阻塞反应堆**：一次 5 s 的 UART 读超时让反应堆忙 5 s，MCU 错过下一个 digital-out
+   截止时间而 shutdown。改成 `spawn` 到运行时，并把 UART 交换超时收到 500 ms（正常交换 ~5 ms）。
+
+**两个发现（当日均未修，2026-10-18 当晚已处理，见 `TODO.md`）**：
+
+- `FORCE_MOVE` / `STEPPER_BUZZ` / `[manual_stepper]` 在真机上**不产生任何 `queue_step`**（`MSCNT`
+  不动）；只有 `[stepper_x]` + cartesian 的 `G1` 走完整 host 路径才真的出步。
+  **重新归因**：假固件上 host 侧本来就出步（`FORCE_MOVE` +800、`STEPPER_BUZZ` ±800），所以真机症状
+  的成因是 ① 电机没使能（EN 未开 / TMC `toff=0`）② `[manual_stepper]` 未进队列 ③ 队列外电机静默空跑。
+  ①②已修（自动使能链、manual_stepper 自有 trapq），③改为 `warn!`。**这三条仍需上板逐条复验。**
+- `G28` 失败（`No trigger …`）之后再做 `SET_KINEMATIC_POSITION` + `G1`，会撞
+  `Internal error in stepcompress: … Invalid sequence` 而 shutdown（正常路径与零长度移动都不触发）。
+  **已修**：失败回零没有补上游的收尾三步，导致生成地平线被后台 flush pass 回退；现在地平线取
+  `max(两处)` + 未触发分支补收尾。仍需上板复验一次。
+
+**仍未验**：无感回零的**真触发**（这台电机是空悬的，不会堵转，需要负载或手捏轴）与
+`tmc/stallguard_dump` 的随负载采样；SPI 族（2130/2240/2660/5160）的真板读写本轮没上板。
+
+### 真机结果（2026-10-18，桥的自恢复：admin 重置不再需要 identify）
+
+背景：`restart_method: command` 是"连上之后发固件 `reset`"，所以它**只能在 identify 之后**生效——板子卡在
+陈旧会话、认不出来时正好用不上。真机验过两条 admin 路径，它们都不需要 klipper 会话：
+
+```bash
+# 1) 工具路径（不读 printer.cfg）：重置桥自己 / 送它进 katapult
+klipperx admin reset --bridge /dev/serial/by-id/usb-Klipper_stm32f446xx_… --bridge-uuid 56ec3127224a
+klipperx admin reset --bridge … --bootloader
+
+# 2) 配置路径：桥自己的 [mcu] 写 restart_method: admin，之后 FIRMWARE_RESTART 就走同一条 admin 帧
+```
+
+实测（F446，`admin reset --bridge …`，0.99 s）：
+
+```
+shared serial … open at 250000 baud
+Creating MCU: bridge                                  ← 只开 mux 链路，没有 identify
+shared serial … open at 250000 baud                   ← 重启之后的回归确认
+MCU 'bridge' identified: 150 messages registered
+reset: bridge (restarted and identified again)
+```
+
+实测（同一块板，`restart_method: admin` + `FIRMWARE_RESTART`）：
+
+```
+05:55:12 bridge … restarted over its admin channel (index 0xff)
+05:55:13 MCU 'mcu' identified: 150 messages registered
+05:55:13 MCU 'downstream' identified: 139 messages registered     → state: ready
+```
+
+两者发的都是 `RESTART_DEVICE [0x05][0xFF]`：`0xFF` 超出任何桥的端口数（`BRIDGE_MAX_PORTS = 8`），
+固件的 `bridge.c` 因此不把它当"某个端口的下游设备"，而是落给 `mux_admin_unit` → `mcu_restart()`。
+`--bootloader` 同位置发 `[0x02][0xFF]` → `bootloader_request()`（未在本轮跑，避免把桥刷成 katapult 后还要重刷）。
 
 ## 范围外的真板项（不属最小打印任务，未排期）
 
@@ -335,9 +496,13 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   USB/CAN 抖动（软件侧已用 ±100 ppm/1 h 模拟；`SecondarySync` 周期重校准）。
 - **`rpi_usb` 物理复位**：per-port 断电重启、换电后 identify 不误判、拔插（`restart_method: rpi_usb`，
   代码与决策逻辑已就绪）。
-- **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD、tmcuart——
+- **未接的外设**：固件按钮查询、`trigger_analog` 宿主节、sdcard、LCD——
   各接一个真实外设后验。（宿主模块已落地但尚未上真板的：`pulse_counter`、`neopixel`/`dotstar`、
   `sensor_bulk` 与各类 SPI/I2C 传感器。）
+- **TMC 驱动剩下的真板项**：UART 侧已在 2026-10-18 验过（见上一节），剩下三项：① 无感回零的**真触发**
+  （需要带负载的机构，空悬电机不会堵转）；② `tmc/stallguard_dump` 端点在**有负载**时采到随推力变化的
+  `sg_result`；③ SPI 族（`tmc2130`/`tmc2240`/`tmc2660`/`tmc5160`）的真板读写**一次都还没上板**。
+  **注意**：两条传输层的 `block_in_command` 要求多线程 runtime，真板上不能把命令塞进 current-thread runtime。
 - **回零精度数字**：`homing_retract_dist` 二次回零与 `endstop_phase` 相位调节的**实际精度**
   （功能已软件落地，真板只差精度测量）。
 - **katapult 刷写真机验证（直连）**：带 katapult 引导的板子（应用带偏移）经 `klipperx admin flash` 直刷——
@@ -392,14 +557,12 @@ device could not be opened`。主机会**有界等该端口路径回来**（≤1
   | 3 | 指派 | `admin bridge port … --port 0 --port-nodeid 7 --assign-uuid 12f912ed3873` | `assign: … (sent, no confirmation — katapult does not acknowledge it, which is normal)` |
   | 4 | 经 CAN 隧道刷写 | `admin flash --bridge <F446> … --port 0 --port-nodeid 7 <fw>` | `complete: 43284 bytes in 677 blocks` |
   | 5 | **可反复刷**（目标正跑应用） | 同上 + `--port-reset bootloader --assign-uuid …` | `complete: 43284 bytes in 677 blocks`；刷完扫描见 `Application: Klipper` |
-  | 6 | **应用载具无关**：下游跑 `CONFIG_ISOTP` 应用 | 同上（刷 ISO-TP 应用 → 再一条命令刷回切片应用） | `complete: 44468 bytes in 695 blocks` → `complete: 43284 bytes in 677 blocks` |
-  | 7 | 桥自己进引导 | `admin reset --bridge <F446> --bootloader` | 板子以 `usb-katapult_stm32f446xx_<serial>` 重新枚举，随后 `admin flash --device` 写它 |
+  | 6 | 桥自己进引导 | `admin reset --bridge <F446> --bootloader` | 板子以 `usb-katapult_stm32f446xx_<serial>` 重新枚举，随后 `admin flash --device` 写它 |
 
   CAN 专属判据：① `0x3f1` 的 `[0x20][uuid][app]` 被包成带端口路径的单元上行（第 2 行）；
   ② 隧道帧的 arb = `0x100 + 2*7`（端口 `node_id`），上行按 `reply_arb_id` 回；
   ③ **CAN 的 node id 是 RAM 态**，所以流程必须是「指派 → 送引导 → 再指派 → 隧道」（第 5 行从应用态
-  一次成功，就是这三步都在断言内的证据）；④ 第 6 行证明「应用把字节流做成 ISO-TP」不影响刷机——
-  送引导走的是 `0x3f0 [0x02][uuid]` 单帧，与载具无关。
+  一次成功，就是这三步都在断言内的证据）；④ 送引导走的是 `0x3f0 [0x02][uuid]` 单帧，与载具无关。
 
   真机踩过、已修/已写进手册的坑：F446 那块板是 **12 MHz 晶振**（必须 `LOW_LEVEL_OPTIONS` +
   `STM32_CLOCK_REF_12M`，否则 PLL 算错、USB 不枚举）；**F4 的 Kconfig 没有 8 KiB 引导选项**，

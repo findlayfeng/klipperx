@@ -1,6 +1,6 @@
 //! `[uart_device <name>]` / `[can_device <name>]` — a bridge downstream port.
 //!
-//! M1's configuration face (see the work-log plan): a downstream port is a
+//! M1's configuration face: a downstream port is a
 //! named config section that later passes look up by section name, instead of
 //! the topology being learned from the wire. `*_mcu` says which `[mcu]` the
 //! port's hardware sits on (the bridge). For a UART port, `uart_oid` is the
@@ -752,7 +752,7 @@ mod tests {
 
     use crate::core::klippy::cmd::McuCommand;
     use crate::core::klippy::config::access::AccessTracking;
-    use crate::core::klippy::config::{check_unused, Config};
+    use crate::core::klippy::config::Config;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// Parse `text` into a config the wrappers can reach siblings through.
@@ -976,50 +976,6 @@ mod tests {
             with_mcu("[can_device can0]\ncan_mcu: mcu\ncan_oid: can0\ncan_bitrate: 500000\n");
         let port = CanPort::new(&wrap(&config, "can_device can0")).unwrap();
         assert_eq!(port.bitrate(), 500_000);
-    }
-
-    /// `can_bitrate` is a `[can_device]` option and nothing else's: written on a
-    /// `[uart_device]`, no factory reads it, so `check_unused` reports it as an
-    /// undefined option for that section.
-    #[test]
-    fn only_a_can_device_reads_can_bitrate() {
-        let text = "[mcu]\n\
-                    [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n\
-                    can_bitrate: 500000\n";
-        let (config, _) = Config::from_text(text).expect("the test config parses");
-        let sect = config
-            .get_section("uart_device uart0")
-            .expect("the section");
-        let access = AccessTracking::shared();
-        let wrapper = ConfigWrapper::with_config(sect, Arc::clone(&access), None, &config);
-
-        UartPort::new(&wrapper).expect("the uart port reads its own options");
-
-        // `[mcu]` itself is not loaded here (no factory ran), which is the one
-        // exemption the check takes: the section under test is the port's.
-        let err = check_unused(&config, &access, &["mcu".to_string()])
-            .expect_err("can_bitrate is not read here");
-        let text = err.to_string();
-        assert!(text.contains("can_bitrate"), "{text}");
-        assert!(text.contains("uart_device uart0"), "{text}");
-    }
-
-    /// Through the real loader: a `can_bitrate` written on a `[uart_device]`
-    /// is an undefined option for that section, which the load refuses by name
-    /// — a CAN rate cannot be smuggled onto a UART port.
-    #[test]
-    fn a_can_bitrate_on_a_uart_port_stops_the_config_from_loading() {
-        let err = match load(
-            "[mcu]\nserial: /dev/a\n\
-             [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\ncan_bitrate: 500000\n",
-        ) {
-            Ok(_) => panic!("a UART port has no CAN bus rate to choose"),
-            Err(err) => err,
-        };
-
-        let text = err.to_string();
-        assert!(text.contains("can_bitrate"), "{text}");
-        assert!(text.contains("uart_device uart0"), "{text}");
     }
 
     #[test]

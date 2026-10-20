@@ -422,8 +422,10 @@ impl AdcState {
     fn query_for(&self, oid: u8, clock: u32) -> Result<AdcQuery, McuError> {
         let sample_count = u8::try_from(*self.lock(|state| &state.sample_count))
             .map_err(|_| McuError::Config("ADC sample_count does not fit a byte".to_string()))?;
-        let range_check_count =
-            u8::try_from(*self.lock(|state| &state.range_check_count)).unwrap_or(u8::MAX);
+        let range_check_count = u8::try_from(*self.lock(|state| &state.range_check_count))
+            .map_err(|_| {
+                McuError::Config("ADC range_check_count does not fit a byte".to_string())
+            })?;
         let sample_ticks = *self.lock(|state| &state.sample_ticks);
         let rest_ticks = *self.lock(|state| &state.report_clock);
         let min_value = *self.lock(|state| &state.min_sample);
@@ -614,6 +616,24 @@ mod tests {
         };
         // One sample per report is still two bytes.
         assert_eq!(query.args()[5], ArgValue::UInt8(2));
+    }
+
+    #[test]
+    fn test_a_range_check_count_that_does_not_fit_a_byte_is_rejected() {
+        let state = armed_state(false, 4);
+        // The wire field is `%c`. Clamping to 255 would arm a different check
+        // than the one asked for, silently; upstream's format packing refuses.
+        *state.lock(|s| &s.range_check_count) = 256;
+
+        let Err(err) = state.query_for(0, 123) else {
+            panic!("a range_check_count of 256 was clamped into the query");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("range_check_count does not fit a byte"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

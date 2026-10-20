@@ -118,6 +118,23 @@ const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 /// [`InterfaceError::SendError`] rather than retrying.
 const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How many times the node id assignment is written, and how far apart.
+///
+/// A CAN device adopts `SET_NODEID` **in silence** (`generic/canserial.c`,
+/// `can_process_set_klipper_nodeid`: it arms its filter and says nothing), so
+/// there is no answer to wait for here, and nothing this open can read the id
+/// back with: `get_canbus_id` — the command that names the uuid — is a
+/// dictionary message, and the dictionary is what `identify` delivers long after
+/// this open ([`CanSerialDevice::open_with_wire`]). What is left is to make a
+/// frame lost on a busy bus recoverable: the assignment is idempotent (same
+/// uuid, same id), so it goes out [`NODEID_ASSIGN_ATTEMPTS`] times,
+/// [`NODEID_ASSIGN_INTERVAL`] apart — under a second in all, the same retry
+/// shape the shared serial attach has (`ASSIGN_ATTACH_ATTEMPTS`) and the same
+/// reading a bridge's CAN port gets (`name_can_device`: a silent device is not
+/// an error).
+const NODEID_ASSIGN_ATTEMPTS: u32 = 3;
+const NODEID_ASSIGN_INTERVAL: Duration = Duration::from_millis(200);
+
 // From `linux/can.h` and `linux/can/raw.h`; `libc` does not expose these.
 const CAN_SFF_MASK: u32 = 0x7ff;
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
@@ -665,11 +682,21 @@ impl CanSerialDevice {
     /// round) cannot hear each other, because the kernel drops the frames instead
     /// of reporting them.
     ///
+    /// The node id is *sent*, not negotiated: a CAN device adopts `SET_NODEID`
+    /// without answering, so the assignment goes out
+    /// [`NODEID_ASSIGN_ATTEMPTS`] times and this returns once one of them has
+    /// been written. Whether the node is up — and whether it is *this* uuid's
+    /// board — is the identify handshake's to establish: the readback that names
+    /// the uuid (`get_canbus_id`) is a dictionary message, and the dictionary is
+    /// what identify delivers after this open.
+    ///
     /// # Errors
     /// Returns [`InterfaceError`] when the node id is outside `1..=MAX_MCU_ID`
     /// (`0xff`), the interface does not exist, the socket cannot be created (no
     /// CAN support), it cannot be bound or filtered, CAN FD cannot be enabled on
-    /// it, or the node id could not be handed over.
+    /// it, or the node id was not delivered: the assignment is written
+    /// [`NODEID_ASSIGN_ATTEMPTS`] times, and every write failing is the open
+    /// failing.
     pub fn open_with_wire(
         interface: &str,
         uuid: [u8; 6],
@@ -688,11 +715,7 @@ impl CanSerialDevice {
         let socket = open_socket(wire)?;
         bind_interface(&socket, index)?;
         filter_answers(&socket, link.rx_id())?;
-
-        let assignment = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, nodeid))?;
-        (&socket)
-            .write_all(assignment.to_abi(wire)?.as_bytes())
-            .map_err(|e| InterfaceError::Other(format!("failed to send the node id: {e}")))?;
+        assign_node_id(&mut (&socket), uuid, nodeid, wire)?;
 
         info!(
             "can serial link ready on {interface} ({}): node {nodeid} assigned, writing to \
@@ -1360,6 +1383,69 @@ fn filter_answers(socket: &File, rx_id: u32) -> Result<(), InterfaceError> {
     Ok(())
 }
 
+/// Where the node id assignment goes, and how the gap between two sends is
+/// spent: the socket in production, a recorder in tests — the pauses are real
+/// time in one case and worth pinning in the other, so they are part of the
+/// seam rather than a `sleep` call inside the loop.
+trait AssignChannel {
+    /// Write one whole assignment frame.
+    fn send(&mut self, frame: &CanFrame, wire: CanWire) -> Result<(), InterfaceError>;
+
+    /// Spend the wait between two sends.
+    fn pause(&mut self, gap: Duration);
+}
+
+impl AssignChannel for &File {
+    fn send(&mut self, frame: &CanFrame, wire: CanWire) -> Result<(), InterfaceError> {
+        let abi = frame.to_abi(wire)?;
+        self.write_all(abi.as_bytes())
+            .map_err(|e| InterfaceError::Other(format!("failed to send the node id: {e}")))
+    }
+
+    fn pause(&mut self, gap: Duration) {
+        std::thread::sleep(gap);
+    }
+}
+
+/// Hand `nodeid` to the board `uuid`, resent a bounded number of times.
+///
+/// The assignment is idempotent, so a repeated frame is harmless and a frame
+/// lost on a busy bus is not fatal — which is all this can do, because a CAN
+/// device takes its node id without answering and the readback that would name
+/// the uuid back is a dictionary message ([`NODEID_ASSIGN_ATTEMPTS`]).
+///
+/// A send that fails **after** one has landed is reported and not fatal: the
+/// link is up on the frame that landed, and the same uuid asking for the same id
+/// again changes nothing. Only a run in which no write got through is the
+/// open's failure.
+fn assign_node_id(
+    channel: &mut impl AssignChannel,
+    uuid: [u8; 6],
+    nodeid: u32,
+    wire: CanWire,
+) -> Result<(), InterfaceError> {
+    let assignment = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, nodeid))?;
+    let mut delivered = false;
+    let mut last_error = None;
+    for attempt in 1..=NODEID_ASSIGN_ATTEMPTS {
+        match channel.send(&assignment, wire) {
+            Ok(()) => {
+                delivered = true;
+                last_error = None;
+            }
+            Err(e) if delivered => warn!("re-sending the node id for {uuid:02x?} failed: {e}"),
+            Err(e) => last_error = Some(e),
+        }
+        if attempt < NODEID_ASSIGN_ATTEMPTS {
+            channel.pause(NODEID_ASSIGN_INTERVAL);
+        }
+    }
+    if delivered {
+        return Ok(());
+    }
+    Err(last_error.expect("every attempt failed, so one of them recorded why"))
+}
+
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -1665,6 +1751,116 @@ mod tests {
         let payload = set_nodeid_payload([0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc], 2);
         assert_eq!(payload, [0x01, 0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc, 0x02]);
         assert_eq!(set_nodeid_payload([0; 6], 1)[7], 1);
+    }
+
+    /// A recorded assignment channel: what went out, and how the gaps were
+    /// spent, without a socket or a real clock.
+    #[derive(Default)]
+    struct RecordedAssign {
+        sent: Vec<(CanFrame, CanWire)>,
+        pauses: Vec<Duration>,
+        /// Positions of the sends that fail (0 is the first); every other send
+        /// is delivered.
+        fail_at: Vec<usize>,
+    }
+
+    impl AssignChannel for RecordedAssign {
+        fn send(&mut self, frame: &CanFrame, wire: CanWire) -> Result<(), InterfaceError> {
+            let attempt = self.sent.len();
+            self.sent.push((*frame, wire));
+            if self.fail_at.contains(&attempt) {
+                return Err(InterfaceError::Other("network is down".to_string()));
+            }
+            Ok(())
+        }
+
+        fn pause(&mut self, gap: Duration) {
+            self.pauses.push(gap);
+        }
+    }
+
+    #[test]
+    fn test_the_node_id_assignment_is_resent_within_its_budget() {
+        // A CAN device takes `SET_NODEID` in silence, so the open cannot tell a
+        // lost frame from a quiet board; what it can do is send the idempotent
+        // assignment more than once, so one lost frame is not a dead link.
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let mut channel = RecordedAssign::default();
+        assign_node_id(&mut channel, uuid, 7, CanWire::Classical)
+            .expect("the recorded channel delivers");
+
+        let expected = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, 7)).unwrap();
+        assert_eq!(channel.sent.len(), NODEID_ASSIGN_ATTEMPTS as usize);
+        assert!(
+            channel
+                .sent
+                .iter()
+                .all(|(frame, wire)| *frame == expected && *wire == CanWire::Classical),
+            "the same Klipper admin frame every time: {:?}",
+            channel.sent
+        );
+        assert_eq!(
+            channel.pauses,
+            [NODEID_ASSIGN_INTERVAL; NODEID_ASSIGN_ATTEMPTS as usize - 1],
+            "one wait between sends, none after the last"
+        );
+
+        // The whole retry is a bounded stall on a bring-up, not a hang: under a
+        // second, which is what makes a silent bus an error rather than a wait.
+        let spent: Duration = channel.pauses.iter().sum();
+        assert!(
+            spent < Duration::from_secs(1),
+            "the resend budget is under a second: {spent:?}"
+        );
+    }
+
+    #[test]
+    fn test_an_assignment_that_never_goes_out_fails_the_open() {
+        // The one thing that is fatal here: no write got through at all. The
+        // error says what the socket said.
+        let mut channel = RecordedAssign {
+            fail_at: (0..NODEID_ASSIGN_ATTEMPTS as usize).collect(),
+            ..RecordedAssign::default()
+        };
+        let err = assign_node_id(&mut channel, [0x11; 6], 7, CanWire::Classical)
+            .expect_err("nothing was delivered");
+        assert!(err.to_string().contains("network is down"), "{err}");
+        assert_eq!(channel.sent.len(), NODEID_ASSIGN_ATTEMPTS as usize);
+    }
+
+    #[test]
+    fn test_a_failure_after_a_delivered_assignment_is_not_fatal() {
+        // The first send lands and the retries do not: the node was told its id,
+        // and the same uuid asking again would change nothing, so the open goes
+        // on rather than failing a link that is up.
+        let mut channel = RecordedAssign {
+            fail_at: vec![1, 2],
+            ..RecordedAssign::default()
+        };
+        assign_node_id(&mut channel, [0x11; 6], 7, CanWire::Classical)
+            .expect("a delivered assignment is the open succeeding");
+        assert_eq!(
+            channel.sent.len(),
+            NODEID_ASSIGN_ATTEMPTS as usize,
+            "the retries are still attempted"
+        );
+    }
+
+    #[test]
+    fn test_the_assignment_reaches_the_wire_three_times() {
+        // The production channel is the socket itself: what the retry loop hands
+        // it must arrive as whole `can_frame` records, not as one frame written
+        // three times into a stream nobody can cut up again.
+        let (socket, mut wire) = UnixStream::pair().expect("a socket pair");
+        let socket = File::from(OwnedFd::from(socket));
+        let uuid = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        assign_node_id(&mut (&socket), uuid, 7, CanWire::Classical)
+            .expect("the socket pair takes the writes");
+
+        let records = read_wire(&mut wire);
+        assert_eq!(records.len(), NODEID_ASSIGN_ATTEMPTS as usize);
+        let expected = CanFrame::new(ADMIN_ID, &set_nodeid_payload(uuid, 7)).unwrap();
+        assert_eq!(records, vec![expected; NODEID_ASSIGN_ATTEMPTS as usize]);
     }
 
     #[test]

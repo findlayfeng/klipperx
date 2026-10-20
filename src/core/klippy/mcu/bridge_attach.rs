@@ -446,11 +446,18 @@ pub(crate) fn open(
     link: &BridgePortLink,
     mcu_id: u32,
 ) -> Result<Interface, KlippyError> {
-    let id = u8::try_from(mcu_id).map_err(|_| {
-        KlippyError::Connection(format!(
-            "MCU id {mcu_id} is outside the range a bridge port can address (1..=255)"
-        ))
-    })?;
+    // The range is the message's `1..=255`, not `u8`'s: the firmware's
+    // `mux_arb_id(0)` is `0` and drops every frame under it, so id 0 fits a
+    // `u8` yet names no port — it would pass a bare conversion and attach a
+    // device nothing can ever reach.
+    let id = match u8::try_from(mcu_id) {
+        Ok(id) if id != 0 => id,
+        _ => {
+            return Err(KlippyError::Connection(format!(
+                "MCU id {mcu_id} is outside the range a bridge port can address (1..=255)"
+            )))
+        }
+    };
     let (interface, handle) = open_link_handle(printer, link, mcu_id)?;
     // The route first, then the device's own naming — see the function doc; the
     // handshake's units are dropped by the bridge without it.
@@ -1839,6 +1846,36 @@ mod tests {
             "a CAN port is never legacy"
         );
         assert_eq!(port_flags(&groups, "can_device can0"), MUX_PORT_UNITS);
+    }
+
+    /// A bridge port addresses ids **`1..=255`** — the firmware's
+    /// `mux_arb_id(0)` is `0` and drops every frame under it, so id 0 fits a
+    /// `u8` yet names no port. The refusal comes from that range, before the
+    /// link is touched: the path below exists, so an open attempt would show
+    /// (the assertion is the message, not the I/O error).
+    #[test]
+    fn open_refuses_an_id_outside_the_port_range() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let link = BridgePortLink {
+            transport: Transport::Serial {
+                path: "/dev/null".to_string(),
+                baud: serial::DEFAULT_BAUD,
+                uuid: None,
+            },
+            index: 0,
+            flags: MUX_PORT_UNITS,
+            named: None,
+            kind: PortKind::Uart,
+        };
+
+        for mcu_id in [0u32, 256] {
+            let err = open(&printer, &link, mcu_id).unwrap_err();
+            let text = err.to_string();
+            assert!(
+                text.contains("outside the range a bridge port can address (1..=255)"),
+                "id {mcu_id}: {text}"
+            );
+        }
     }
 
     /// The order `open` exists for, over a real serial link on a pty: the

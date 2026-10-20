@@ -889,7 +889,15 @@ impl McuObject {
                 ))
             })?;
             let link = bridge_attach::resolve(&printer, config)?;
-            return bridge_attach::open(&printer, &link, id);
+            // The attach is blocking I/O throughout — the tty open, the bridge
+            // `dlopen`, up to three 500 ms naming attempts and the CAN settle
+            // — so it runs on the blocking pool like the retry below it: on a
+            // reactor worker the whole reactor waits for it.
+            return tokio::task::spawn_blocking(move || bridge_attach::open(&printer, &link, id))
+                .await
+                .map_err(|err| {
+                    KlippyError::Internal(format!("the bridge attach task failed: {err}"))
+                })?;
         }
         if !retrying {
             return config.open().map_err(KlippyError::Connection);

@@ -425,11 +425,10 @@ impl McuClock {
     pub fn new(mcu: Arc<Mcu>, reactor: Arc<dyn Reactor>) -> Self {
         let mut estimator = ClockEstimator::new(1.0);
         // Upstream takes the frequency from the dictionary as it connects
-        // (`klippy/clocksync.py:34`), so 1 Hz is only ever a starting value: a
-        // session whose `get_uptime` never answers still converts print time
-        // with the firmware's own frequency. A clock built before identify
-        // keeps the placeholder; [`McuClock::firmware_freq`] reads the
-        // dictionary then.
+        // (`klippy/clocksync.py:34`), so 1 Hz is only ever a starting value: the
+        // estimate converts print time with the firmware's own frequency, seed
+        // or no seed. A clock built before identify keeps the placeholder;
+        // [`McuClock::firmware_freq`] reads the dictionary then.
         if let Ok(freq) = mcu.clock_freq() {
             estimator.set_mcu_freq(freq);
         }
@@ -814,8 +813,7 @@ mod tests {
     async fn test_a_new_clock_takes_its_frequency_from_the_dictionary() {
         // Upstream connects with the dictionary's `CLOCK_FREQ`
         // (`klippy/clocksync.py:34`), so the estimate converts with a real
-        // frequency before any sample arrives: a connect whose `get_uptime`
-        // never answered still has to map print time.
+        // frequency from the start, before any sample arrives.
         let mcu = mcu_answering(Vec::new());
         let clock = McuClock::new(mcu, ManualReactor::shared());
 

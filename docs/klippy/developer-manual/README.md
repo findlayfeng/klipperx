@@ -210,7 +210,7 @@ klipperx（bin，src/main.rs）
 |------|------|
 | `mod.rs` | 固件事件词汇：`McuEvent`，以及回调注册 `Mcu::bind_event`（底层 `Mcu::bind_callback` 在 `mcu`）；列出 `decl` 与 `printer_bus` |
 | `stats.rs` | `stats` 事件（`basecmd.c` 的 `stats_update` 定时推送；id 由字典给出，如 AVR 固件是 -12、host 库是 16——主机不写死）；`register_stats` 注册
-|              | 订阅（算 `last_stats` 并记日志），在 `McuObject::connect` 中调用，固件每 5 秒推送一次 |
+|              | 订阅（算 `last_stats` 并记日志），在 `McuObject::connect` 中调用，固件每 5 秒推送一次。`last_stats` 上报 `mcu_tick_*`（来自 `count/sum/sumsq` 的换算，需要字典的 `CLOCK_FREQ`/`STATS_SUMSQ_BASE`）以及 `bytes_read`/`bytes_write`/`last_stats_time`（线路字节与到达时刻，**不依赖那两个常量**——利用率只吃这三个字段） |
 | `shutdown.rs` | `shutdown` / `is_shutdown` / `starting`：固件停机/重启事件；`static_string_id` 经字典枚举解成原因文本，由 `McuObject` 绑成打印机停机 |
 | `printer_bus.rs` | `KlippyEvent`：`include!` 由 `build.rs` 写入 `OUT_DIR` 的生成文件 |
 | `test_support.rs` | 事件模块测试共用的夹具（仅 `cfg(test)`）：伪造的字典/帧——格式串在这里是“固件会发什么”的样本，不是主机常量 |

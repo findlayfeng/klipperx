@@ -102,8 +102,9 @@ const RESET_SETTLE: Duration = Duration::from_millis(500);
 
 /// How long the one `get_uptime` that seeds the clock estimate may take.
 ///
-/// The same order as the other connect-time reads; a firmware that does not
-/// answer only loses the estimate, not the connection.
+/// The same order as the other connect-time reads. A firmware that does not
+/// answer fails the connect (`seed_clock_base`): without this reading there is
+/// no anchor for the print-time mapping at all.
 const CLOCK_BASE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// How often a secondary MCU's clock alignment is recalibrated, in seconds
@@ -1008,7 +1009,9 @@ impl McuObject {
             .as_ref()
             .map(|reactor| reactor.monotonic())
             .unwrap_or(0.0);
-        let uptime = seed_clock_base(&mcu).await;
+        let uptime = seed_clock_base(&mcu)
+            .await
+            .map_err(|err| self.connect_failure(err))?;
         if let Some(reactor) = &reactor {
             self.install_clock(&mcu, reactor, sent_time, uptime);
         }
@@ -1031,18 +1034,17 @@ impl McuObject {
     ///
     /// `sent_time` is the reactor time just before `uptime` was read, so the
     /// seed anchors the regression on that round trip (`seed_clock_base`).
+    /// That reading is not optional: the bring-up fails before this is reached
+    /// when the firmware cannot give one.
     fn install_clock(
         &self,
         mcu: &Arc<Mcu>,
         reactor: &Arc<dyn Reactor>,
         sent_time: f64,
-        uptime: Option<u64>,
+        uptime: u64,
     ) {
         let clock = Arc::new(McuClock::new(Arc::clone(mcu), Arc::clone(reactor)));
-        let seeded = uptime.is_some();
-        if let Some(clock64) = uptime {
-            clock.seed(sent_time, clock64 as i64);
-        }
+        clock.seed(sent_time, uptime as i64);
         let now = reactor.monotonic();
         let offset = if self.name() == "mcu" {
             0.0
@@ -1095,14 +1097,12 @@ impl McuObject {
         }
         // The periodic `get_clock` that keeps the estimate fed — for
         // every MCU, primary and secondary alike (`mcu_recalibrate`
-        // only reads the estimators, it never queries). Registered
-        // only once the seed is in, so a sample always corrects a base
-        // instead of starting an unseeded regression; before identify
-        // there is no clock to poll at all. `register_clock_poll` keeps
-        // one timer per object, so the reconnect's install is a no-op for it.
-        if seeded {
-            self.register_clock_poll(reactor.as_ref());
-        }
+        // only reads the estimators, it never queries). It goes in with the
+        // seed it corrects: a poll on an unseeded regression would have
+        // nothing to correct, and before identify there is no clock to poll
+        // at all. `register_clock_poll` keeps one timer per object, so the
+        // reconnect's install is a no-op for it.
+        self.register_clock_poll(reactor.as_ref());
     }
 
     /// Whether this bring-up follows a `firmware_restart`.
@@ -1766,14 +1766,17 @@ impl PrinterObject for McuObject {
             self.watch_connect_shutdown(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
             // One clock read, so an unclocked resource can estimate "now"
-            // (`Mcu::estimated_clock`). A firmware without `get_uptime` simply
-            // has no estimate.
+            // (`Mcu::estimated_clock`). A firmware that cannot answer it has no
+            // anchor at all, which upstream treats as a failed connect
+            // (`seed_clock_base`), not as a session to carry on without.
             let reactor = self.printer.upgrade().map(|printer| printer.reactor());
             let sent_time = reactor
                 .as_ref()
                 .map(|reactor| reactor.monotonic())
                 .unwrap_or(0.0);
-            let uptime = seed_clock_base(&mcu).await;
+            let uptime = seed_clock_base(&mcu)
+                .await
+                .map_err(|err| self.connect_failure(err))?;
             if let Some(reactor) = &reactor {
                 self.install_clock(&mcu, reactor, sent_time, uptime);
             }
@@ -1920,34 +1923,42 @@ async fn reset_and_flush(mcu: &Mcu) -> Result<(), KlippyError> {
     Ok(())
 }
 
-/// Seed the firmware-clock estimate from one `get_uptime`.
+/// Seed the firmware-clock estimate from one `get_uptime`, or fail the bring-up.
 ///
 /// Upstream's clock sync reads the clock at connect too
-/// (`MCUConnectHelper._attach` → `clocksync.connect`); this host keeps only the
-/// base point, for resources that need a "now" clock without consulting the
-/// print-time estimate. The 64-bit `get_uptime` is used rather than `get_clock`
-/// because the 32-bit counter wraps every few minutes at a typical
-/// `CLOCK_FREQ`. A firmware that does not publish it simply has no estimate.
-async fn seed_clock_base(mcu: &Mcu) -> Option<u64> {
+/// (`MCUConnectHelper._attach` → `clocksync.connect`, `klippy/clocksync.py:33-36`);
+/// this host keeps only the base point, for resources that need a "now" clock
+/// without consulting the print-time estimate. The 64-bit `get_uptime` is used
+/// rather than `get_clock` because the 32-bit counter wraps every few minutes at
+/// a typical `CLOCK_FREQ`.
+///
+/// A failed reading is **not** a session to carry on without: the anchors of
+/// the mapping (`ClockEstimator::clock_at_sample`, `clock_sample_time`) would
+/// stay at zero, so print time 0 would map onto firmware clock 0 — the past, as
+/// the firmware's scheduler reads it, and every move gated on it comes back
+/// "Timer too close" (or fires at once). Upstream has no fallback for this
+/// step either: `clocksync.connect` sends `get_uptime` and lets the exception
+/// end the connect. The error names the MCU and the message that did not
+/// answer, which is the only thing the user can act on.
+async fn seed_clock_base(mcu: &Mcu) -> Result<u64, KlippyError> {
     if !mcu.has_message(GetUptime::NAME) {
-        return None;
+        return Err(KlippyError::Connection(format!(
+            "MCU '{}': the firmware does not publish 'get_uptime', so its clock base \
+             cannot be read and the connect is refused",
+            mcu.name()
+        )));
     }
-    match mcu
+    let uptime = mcu
         .call_msg::<GetUptime, Uptime>(&GetUptime, CLOCK_BASE_TIMEOUT)
         .await
-    {
-        Ok(uptime) => {
-            mcu.set_clock_base(uptime.clock64());
-            Some(uptime.clock64())
-        }
-        Err(err) => {
-            warn!(
-                "MCU '{}': could not read the clock for a time estimate: {err}",
+        .map_err(|err| {
+            KlippyError::Connection(format!(
+                "MCU '{}': 'get_uptime' went unanswered, so its clock base cannot be read: {err}",
                 mcu.name()
-            );
-            None
-        }
-    }
+            ))
+        })?;
+    mcu.set_clock_base(uptime.clock64());
+    Ok(uptime.clock64())
 }
 
 /// Keep the first stop a connection reported while it was connecting.
@@ -3333,7 +3344,7 @@ mod tests {
             .install_dictionary(Dictionary::from_json(polling_dictionary()).unwrap())
             .unwrap();
         object.chip.attach(Arc::clone(&previous));
-        object.install_clock(&previous, &reactor, 0.0, Some(1_000_000));
+        object.install_clock(&previous, &reactor, 0.0, 1_000_000);
         let held = Arc::clone(&previous);
 
         let mut reconnect = Box::pin(object.reconnect(&config, previous));

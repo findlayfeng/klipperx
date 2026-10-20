@@ -146,9 +146,14 @@ impl SerialDevice {
     /// they are a protocol conversation with a device that answered an open, and
     /// a retry there would turn a real protocol error into a slow one.
     ///
-    /// `stop` is polled before every attempt and between sleep slices, so an
-    /// exit request ends the wait instead of holding the process for the whole
-    /// budget.
+    /// `stop` is polled after every failed attempt and between sleep slices —
+    /// never before an attempt, so an open that succeeds first time costs no
+    /// poll — which is what ends the wait on an exit request instead of
+    /// holding the process for the whole budget.
+    ///
+    /// Every failed attempt logs a warning naming the port and the OS's reason,
+    /// so a wait on a board that is not plugged in is visible while it lasts
+    /// rather than only in the error the budget ends with.
     ///
     /// # Errors
     /// Returns the last attempt's error, with the attempt count appended, when
@@ -161,7 +166,7 @@ impl SerialDevice {
         stop: &dyn Fn() -> bool,
     ) -> Result<Self, InterfaceError> {
         let path = path.as_ref();
-        retry_open(budget, interval, || Self::open_once(path, baud), stop)
+        retry_open(path, budget, interval, || Self::open_once(path, baud), stop)
     }
 
     /// One attempt: open the port and put the line into raw mode.
@@ -253,10 +258,13 @@ impl SerialDevice {
 ///
 /// A failed exit keeps the last attempt's error — it is the one that names the
 /// port and the OS's reason — and appends the attempt count, so the log says
-/// how hard the open tried. `stop` is the exit request: it is polled after every
-/// failed attempt and between sleep slices, which is what keeps a shutdown from
-/// waiting out the budget.
+/// how hard the open tried. Each failed attempt is logged with `path` and the
+/// reason as it happens: the error alone only surfaces once the budget is spent,
+/// which on a board that is not plugged in is the whole minute and a half. `stop`
+/// is the exit request: it is polled after every failed attempt and between
+/// sleep slices, which is what keeps a shutdown from waiting out the budget.
 fn retry_open<T>(
+    path: &Path,
     budget: Duration,
     interval: Duration,
     mut try_open: impl FnMut() -> Result<T, InterfaceError>,
@@ -268,7 +276,13 @@ fn retry_open<T>(
         attempts += 1;
         let last = match try_open() {
             Ok(value) => return Ok(value),
-            Err(err) => err,
+            Err(err) => {
+                warn!(
+                    "serial port {} is not open yet (attempt {attempts}): {err}",
+                    path.display()
+                );
+                err
+            }
         };
         if stop() {
             return Err(open_retry_error(last, attempts, "aborted"));
@@ -710,6 +724,7 @@ mod tests {
         let (opened, attempts) = bounded(|| {
             let attempts = AtomicUsize::new(0);
             let opened = retry_open(
+                Path::new("/dev/ttyUSB0"),
                 Duration::from_secs(1),
                 Duration::from_millis(10),
                 || {
@@ -740,6 +755,7 @@ mod tests {
             let polls = AtomicUsize::new(0);
             let start = Instant::now();
             let err = retry_open::<()>(
+                Path::new("/dev/ttyUSB0"),
                 Duration::from_secs(60),
                 Duration::from_millis(20),
                 || {

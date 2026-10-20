@@ -253,6 +253,27 @@ pub trait Attachment {
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
 }
 
+/// Worker threads for a runtime whose work is other people's requests.
+///
+/// Left unset, tokio sizes a runtime from [`std::thread::available_parallelism`],
+/// and on Linux that number follows a cgroup CPU quota as well as the CPU count:
+/// a service limited to a quarter of a core reports **1**, which leaves one
+/// thread for the accept loop and every endpoint handler behind it — a single
+/// slow client then holds every other client, and a blocked handler holds the
+/// accept loop too. The machine runtime is pinned at exactly 2 for the same
+/// reason it must not queue behind client traffic (see `worker_threads(2)`
+/// below); clients get the same floor, and are otherwise left to the platform.
+///
+/// The card-sized machines this host targets are the case that matters: an
+/// RK3328-class board running the host under a cgroup limit is exactly where
+/// `available_parallelism` returns 1.
+pub(crate) fn api_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|parallelism| parallelism.get())
+        .unwrap_or(2)
+        .max(2)
+}
+
 /// Main run function for klippy subcommand.
 ///
 /// `attachment` is an optional client to run alongside the host, on the host's
@@ -354,6 +375,7 @@ pub fn run(
     // attached to the host. It is multi-threaded because endpoint handlers are
     // independent work and one slow client must not hold up another.
     let api_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(api_worker_threads())
         .thread_name("klippy-api")
         .enable_all()
         .build()?;
@@ -605,6 +627,20 @@ mod tests {
         assert!(is_restart("firmware_restart"));
         assert!(!is_restart("exit"));
         assert!(!is_restart("error_exit"));
+    }
+
+    #[test]
+    fn test_the_api_runtime_has_at_least_two_workers() {
+        // A quota-limited platform reports 1 from `available_parallelism`; the
+        // floor keeps the accept loop off the same thread as the handlers.
+        assert!(super::api_worker_threads() >= 2);
+        assert!(
+            super::api_worker_threads()
+                >= std::thread::available_parallelism()
+                    .map(|parallelism| parallelism.get())
+                    .unwrap_or(1)
+                    .min(2)
+        );
     }
 
     #[test]

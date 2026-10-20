@@ -270,6 +270,7 @@ fn serve(args: &MainsailArgs, site: Site) -> Result<i32, String> {
         moonraker_port: args.moonraker_port,
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(crate::klippy::api_worker_threads())
         .enable_all()
         .build()
         .map_err(|error| format!("cannot start a runtime: {error}"))?;

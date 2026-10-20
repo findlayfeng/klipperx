@@ -3054,6 +3054,27 @@ mod tests {
             .0
     }
 
+    /// Two boards on one `serial:` path are opened by **different** ids: the
+    /// load path gives every `[mcu]` its own number in declaration order, and a
+    /// run that stamped both with the sequence's first id put two sessions on
+    /// one id — the second board's answers read as the first's.
+    #[test]
+    fn boards_sharing_a_serial_path_take_distinct_ids() {
+        let config = Config::from_text(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+        )
+        .expect("a shared-port config parses")
+        .0;
+
+        let mcu = resolve_mcu(&config, "mcu").expect("the board resolves");
+        let tool = resolve_mcu(&config, "tool").expect("the second board resolves");
+        assert_eq!(mcu.shared_baud, Some(250_000), "the shared port's rate");
+        assert_eq!(tool.shared_baud, Some(250_000));
+        assert_eq!(mcu.id, Some(4), "the first section of the sequence");
+        assert_eq!(tool.id, Some(5), "the second, not the first id again");
+    }
+
     /// A `[mcu]` on a CAN bus names its board by `uuid`; the node id it is
     /// addressed by is the allocator's, and a stress run that parses the section
     /// itself has to ask for one — otherwise `Transport::open` refuses the link

@@ -1070,16 +1070,23 @@ mod tests {
 
     /// The transport facts `Machine::open_mcu_named` stamps on a section.
     fn transport_facts(text: &str) -> (Option<u32>, Option<u32>) {
-        let parsed = config(text);
-        let section = parsed.get_section("mcu").expect("the fixture has [mcu]");
+        transport_facts_of(&config(text), "mcu")
+    }
+
+    /// The same for the board called `name`, in the config `parsed`.
+    fn transport_facts_of(parsed: &Config, name: &str) -> (Option<u32>, Option<u32>) {
+        let identifier = mcu_section_id(name);
+        let section = parsed
+            .get_section(&identifier)
+            .unwrap_or_else(|| panic!("the fixture has [{identifier}]"));
         let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
             section,
             crate::core::klippy::config::AccessTracking::shared(),
             None,
-            &parsed,
+            parsed,
         ))
         .expect("the section parses");
-        apply_id_addressed_transport(&parsed, section, &mut mcu);
+        apply_id_addressed_transport(parsed, section, &mut mcu);
         (mcu.shared_baud, mcu.id)
     }
 
@@ -1103,6 +1110,47 @@ mod tests {
              [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n",
         );
         assert_eq!(facts, (Some(250_000), Some(NODEID_FIRST)));
+    }
+
+    /// Two boards on one shared port are addressed by **different** ids: the
+    /// load path hands every `[mcu]` its own number in declaration order, so
+    /// stamping both with the sequence's first id put two sessions on one id —
+    /// the second board's identify answered for the first.
+    #[test]
+    fn test_two_boards_on_one_shared_port_get_the_ids_the_load_path_gives_them() {
+        let parsed = config(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+        );
+
+        assert_eq!(transport_facts_of(&parsed, "mcu").1, Some(NODEID_FIRST));
+        assert_eq!(
+            transport_facts_of(&parsed, "tool").1,
+            Some(NODEID_FIRST + 1),
+            "the second section of the sequence, not the first id again"
+        );
+    }
+
+    /// The number is the **allocator's**, not the section's index: an explicit
+    /// `canbus_nodeid` anywhere in the config is reserved before the first auto
+    /// id, so the shared port's boards step over it exactly as they do at load.
+    #[test]
+    fn test_an_explicit_nodeid_is_stepped_over_when_stamping_a_shared_port() {
+        let parsed = config(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n\
+             [mcu can]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 4\n",
+        );
+
+        assert_eq!(
+            transport_facts_of(&parsed, "mcu").1,
+            Some(NODEID_FIRST + 1),
+            "4 is claimed explicitly, so the sequence starts at 5"
+        );
+        assert_eq!(
+            transport_facts_of(&parsed, "tool").1,
+            Some(NODEID_FIRST + 2)
+        );
     }
 
     /// A fixture config file, removed when the test ends.

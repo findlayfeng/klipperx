@@ -60,7 +60,16 @@ use crate::core::klippy::reactor::{Reactor, TimerHandle};
 /// reboot. A native-USB board re-enumerates, so the port is briefly gone.
 const RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
-/// How many times to try reopening before giving up (a little over 5 s).
+/// How many times to try reopening before giving up.
+///
+/// The delay alone is 20 × [`RECONNECT_DELAY`] = 5 s, which is *not* the
+/// budget: each round also runs a full `Mcu::connect`, whose identify is
+/// bounded by [`IDENTIFY_TIMEOUT`](crate::core::klippy::identify::IDENTIFY_TIMEOUT)
+/// (10 s) and shares it with everything else that round waits for. A board that
+/// stays silent is therefore waited on for up to 20 × (250 ms + 10 s) ≈ 205 s.
+/// That bound is what makes the exit check in `open_and_connect` necessary: a
+/// shutdown must not sit on three and a half minutes of a board that is not
+/// coming back.
 const RECONNECT_ATTEMPTS: usize = 20;
 
 /// How long to wait for the `reset` command to leave the send queue before the
@@ -908,10 +917,26 @@ impl McuObject {
     /// (`mcu/restart.rs`). A bring-up that follows a reset retries the whole
     /// open-and-handshake conversation here; the plain start retries only the
     /// open (`McuConfig::open_retrying`), so a protocol error is never retried.
+    ///
+    /// The rounds are what a shutdown has to be able to end: one round can spend
+    /// the whole identify budget on a board that never answers, so
+    /// [`RECONNECT_ATTEMPTS`] of them is minutes, not the seconds
+    /// [`RECONNECT_DELAY`] suggests. An exit request is therefore polled after
+    /// every sleep — the same test `open_interface(config, true)` gives its own
+    /// retry — and ends the loop with a failure that says so.
     async fn open_and_connect(&self, config: &McuConfig) -> Result<Arc<Mcu>, KlippyError> {
         let mut last = String::new();
+        let mut aborted = false;
         for _ in 0..RECONNECT_ATTEMPTS {
             tokio::time::sleep(RECONNECT_DELAY).await;
+            if self
+                .printer
+                .upgrade()
+                .is_none_or(|printer| printer.exit_requested())
+            {
+                aborted = true;
+                break;
+            }
             let interface = match self.open_interface(config, false).await {
                 Ok(interface) => interface,
                 Err(err) => {
@@ -923,6 +948,16 @@ impl McuObject {
                 Ok(mcu) => return Ok(mcu),
                 Err(err) => last = err.to_string(),
             }
+        }
+        if aborted {
+            let last = match last.is_empty() {
+                true => "no attempt had failed yet",
+                false => last.as_str(),
+            };
+            return Err(KlippyError::Connection(format!(
+                "MCU '{}': the reopen after a reset was aborted by an exit request: {last}",
+                config.name
+            )));
         }
         Err(KlippyError::Connection(format!(
             "MCU '{}' did not come back after a reset: {last}",
@@ -2492,6 +2527,46 @@ mod tests {
         assert!(
             start.elapsed() < serial::OPEN_RETRY_BUDGET,
             "an exit request must not wait the budget, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// The reopen loop after a `reset` waits far longer than the single open
+    /// above, so an exit request has to end it too.
+    ///
+    /// One round may spend the whole identify budget (10 s) on a board that
+    /// never answers, and the loop runs [`RECONNECT_ATTEMPTS`] rounds: the wait a
+    /// shutdown would sit on is ~205 s. The port here fails at once, so the
+    /// loop's own delays are the only time it spends — and the check after the
+    /// first sleep is enough to end it.
+    #[tokio::test]
+    async fn test_an_exit_request_ends_the_reopen_after_a_reset() {
+        let printer = printer();
+        printer.request_exit("exit");
+        let mut section = section(None);
+        section.parameters.insert(
+            "serial".to_string(),
+            ConfigValue::Single("/dev/not-a-serial-port".to_string()),
+        );
+        let object = McuObject::new(section, &printer).unwrap();
+        let config = McuConfig::new(&ConfigWrapper::untracked(&object.section)).unwrap();
+
+        let start = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), object.open_and_connect(&config))
+            .await
+            .expect("the exit request ends the loop instead of running its budget")
+            .err()
+            .expect("the board never comes back");
+
+        // Which failure it is says why the wait ended: the loop's own verdict
+        // names the MCU and the exit, not just the last open error.
+        assert!(err.to_string().contains("exit request"), "{err}");
+        assert!(err.to_string().contains("'mcu'"), "{err}");
+        // The delays alone are 20 × 250 ms = 5 s; ending on the first check is
+        // what keeps the shutdown off them.
+        assert!(
+            start.elapsed() < RECONNECT_DELAY * 4,
+            "the loop ran on for {:?}",
             start.elapsed()
         );
     }

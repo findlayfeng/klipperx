@@ -38,8 +38,8 @@
 use crate::core::klippy::assign;
 use crate::core::klippy::config::mcu::MAX_MCU_ID;
 use crate::core::klippy::frame::{
-    Frame, FrameStream, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_POS_LEN,
-    MESSAGE_POS_SEQ, MESSAGE_SYNC, MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
+    Frame, FrameStream, MESSAGE_HEADER_SIZE, MESSAGE_MAX, MESSAGE_MIN, MESSAGE_PAYLOAD_MAX,
+    MESSAGE_POS_LEN, MESSAGE_POS_SEQ, MESSAGE_SYNC, MESSAGE_TRAILER_SIZE, MESSAGE_TRAILER_SYNC,
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
@@ -1347,7 +1347,22 @@ const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
 /// broadcast and the node-id assignment below ride the same self-delimiting
 /// frame with one opcode byte — [`CMD_QUERY_UNASSIGNED`] /
 /// [`CMD_SET_KLIPPER_NODEID`] — after the marker.
+///
+/// # Panics
+///
+/// Panics if the marker plus `payload` does not fit one frame's payload
+/// ([`MESSAGE_PAYLOAD_MAX`]): the firmware refuses a `KXID` frame over
+/// `MESSAGE_MAX` rather than spelling it (`mux_kxid_frame` in
+/// `third_party/klipper/src/mux.c` returns 0), and a length that overflows here
+/// would go on the wire as a frame no receiver accepts. Every caller passes a
+/// fixed-length command body, so this is a programming error.
 fn kxid_unit(payload: &[u8]) -> Vec<u8> {
+    assert!(
+        MAGIC.len() + payload.len() <= MESSAGE_PAYLOAD_MAX,
+        "KXID payload of {} bytes with a {}-byte marker does not fit a {MESSAGE_MAX}-byte frame",
+        payload.len(),
+        MAGIC.len()
+    );
     let mut body = MAGIC.to_vec();
     body.extend_from_slice(payload);
     Frame::with_wire_seq(ASSIGN_SEQ_BYTE, body).raw_bytes()
@@ -3730,7 +3745,7 @@ mod mux_tests {
             let pty = Pty::new();
             let port = SharedSerialPort::open(&pty.path, DEFAULT_BAUD).unwrap();
             // A full-size unit, so the buffer fills in a second or so of loop.
-            let unit = admin_unit(&[0u8; MESSAGE_MAX]);
+            let unit = admin_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len()]);
             let start = Instant::now();
             let mut failure = None;
             for _ in 0..4_000 {
@@ -5248,6 +5263,28 @@ mod mux_tests {
             admin_unit(&[CMD_REQUEST_BOOTLOADER, 1]),
             [0xe8, 0x3f, 0x0b, 0x20, 0x4b, 0x58, 0x49, 0x44, 0x02, 0x01, 0x10, 0x2f, 0x7e]
         );
+    }
+
+    /// The frame the `KXID` marker rides in is bounded exactly like the
+    /// firmware's: a payload that fills the frame to `MESSAGE_MAX` goes out, one
+    /// byte more panics instead of spelling a length no receiver accepts.
+    #[test]
+    fn a_kxid_frame_is_bounded_by_the_message_max() {
+        let full = kxid_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len()]);
+        assert_eq!(
+            full[0] as usize, MESSAGE_MAX,
+            "the length byte counts the whole frame"
+        );
+        assert_eq!(full.len(), MESSAGE_MAX, "the frame is the whole unit body");
+    }
+
+    #[test]
+    #[should_panic(expected = "does not fit a 64-byte frame")]
+    fn a_kxid_payload_over_the_message_max_is_refused() {
+        // `mux_kxid_frame` answers 0 for this and sends nothing; the host side
+        // refuses it in the builder rather than writing a frame whose length
+        // byte the far end drops.
+        kxid_unit(&[0u8; MESSAGE_PAYLOAD_MAX - MAGIC.len() + 1]);
     }
 
     /// `RESTART_DEVICE` (0x05) is what a named bridge-port device's

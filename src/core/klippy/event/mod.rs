@@ -151,7 +151,9 @@ mod tests {
                 outputs: vec![frame(
                     0,
                     &[
-                        ArgValue::UInt8(12),
+                        // The id the firmware's dictionary publishes for
+                        // `stats`: a signed VLQ byte, so -1 on the wire.
+                        ArgValue::Int16(-1),
                         ArgValue::UInt32(5),
                         ArgValue::UInt32(100),
                         ArgValue::UInt32(2500),
@@ -210,11 +212,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_stats_binds_a_handler() {
+    async fn test_register_stats_binds_a_handler_without_the_tick_constants() {
+        // The fixture dictionary publishes neither `CLOCK_FREQ` nor
+        // `STATS_SUMSQ_BASE`: the handler still binds, so the firmware's
+        // five-second report is consumed instead of logged as unhandled.
         let mcu = mcu(Vec::new());
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
 
         let slot = Arc::new(std::sync::Mutex::new(None));
-        stats::register_stats(&mcu, 72_000_000.0, 4.0, slot, Arc::downgrade(&printer)).unwrap();
+        stats::register_stats(&mcu, slot, Arc::downgrade(&printer)).unwrap();
     }
 }

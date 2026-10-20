@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub(super) fn dictionary() -> Dictionary {
     Dictionary::from_json(json!({
         "commands": {"get_uptime": 4},
-        "responses": {"stats count=%u sum=%u sumsq=%u": 12}
+        "responses": {"stats count=%u sum=%u sumsq=%u": -1}
     }))
     .unwrap()
 }

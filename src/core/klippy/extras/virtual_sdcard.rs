@@ -13,6 +13,28 @@
 //! | `path` | — (required) | the directory print files live in |
 //! | `on_error_gcode` | upstream's `DEFAULT_ERROR_GCODE` | script to run after a file error |
 //!
+//! # Blocking file I/O
+//!
+//! The three synchronous file operations of a print — `File::open` plus its
+//! size probe in `load_file`, and the `seek` / 8 KiB `read` in `work_handler` —
+//! run inside `tokio::task::spawn_blocking`, so a slow eMMC/SD read parks a
+//! blocking-pool thread instead of one of the machine runtime's two workers.
+//! The block size (8192), the `partial_input` stitching, the EOF `take()` of
+//! the file, the `must_pause_work` checkpoints and every `tracing::error!` text
+//! are unchanged.
+//!
+//! The reader sits behind its own `Mutex` ([`Reader`]) and the replay loop
+//! clones the `Arc` out of `current_file` per call, rather than taking the
+//! whole `FileHandle` out of the slot and putting it back afterwards: the slot
+//! must stay populated while a read is in flight, otherwise `file_path()`,
+//! `M27` ("Not SD printing." vs "SD printing byte …") and `get_status` would
+//! answer "no file" for the few milliseconds of every chunk, and the exit
+//! branch that picks `note_pause` over `note_complete` would depend on the
+//! slot being refilled before the loop leaves. The only `MutexGuard` a blocking
+//! operation holds is the reader's own, and it is taken and dropped **inside**
+//! the closure — a `std::sync::MutexGuard` alive across an `.await` would make
+//! the replay future `!Send` and stall the worker that polls it.
+//!
 //! # What is not here
 //!
 //! - **`gcode.get_mutex().test()` yield** — upstream yields before each line
@@ -121,6 +143,11 @@ pub struct VirtualSdCard {
     gcode: Arc<GCodeDispatch>,
     /// The printer, for `send_event` and `reactor` (`virtual_sdcard.py:18`).
     printer: Arc<Printer>,
+    /// Test-only record of where the replay loop's blocking file I/O ran (see
+    /// [`BlockingIo`]). Cloned into the `spawn_blocking` closures; absent from
+    /// production builds.
+    #[cfg(test)]
+    io_log: Arc<Mutex<Vec<BlockingIo>>>,
 }
 
 /// A snapshot of the mutable state, for `get_status`.
@@ -131,15 +158,69 @@ struct StateSnapshot {
     is_active: bool,
 }
 
+/// The reader of the open file.
+///
+/// An `Arc` so the replay loop can clone it out of `current_file` and move the
+/// clone into `spawn_blocking` (the slot keeps the original, so `file_path()`
+/// keeps answering during the call), and a `Mutex` because each blocking
+/// operation needs `&mut` — that guard is taken and dropped inside the closure,
+/// never across an `.await`.
+type Reader = Arc<Mutex<std::io::BufReader<fs::File>>>;
+
 /// The open file and its display name (the relative path the user gave to
 /// `M23`/`SDCARD_PRINT_FILE`, which is what upstream's `current_file.name`
 /// reports through `file_path()`).
 struct FileHandle {
-    /// The reader, seeked and read by the replay loop.
-    reader: std::io::BufReader<fs::File>,
+    /// The reader, seeked and read by the replay loop on the blocking pool.
+    reader: Reader,
     /// The filename as the user supplied it (without leading `/`),
     /// reported through `file_path()` / `get_status`.
     name: String,
+}
+
+/// Which blocking file operation the replay loop performed, recorded only in
+/// test builds so `replay_file_io_runs_off_the_runtime_worker` can prove none
+/// of them runs on a runtime worker.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockingIoKind {
+    /// `File::open` plus the size probe of `load_file`.
+    Open,
+    /// A `seek` to `file_position`.
+    Seek,
+    /// One 8 KiB chunk read.
+    Read,
+}
+
+/// One recorded blocking file operation, with the thread that ran it.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct BlockingIo {
+    kind: BlockingIoKind,
+    thread: std::thread::ThreadId,
+}
+
+/// Record that `kind` ran on the current thread. Called from **inside** the
+/// `spawn_blocking` closures, so the thread it records is the blocking-pool
+/// thread that performed the I/O.
+#[cfg(test)]
+fn record_io(log: &Mutex<Vec<BlockingIo>>, kind: BlockingIoKind) {
+    log.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(BlockingIo {
+            kind,
+            thread: std::thread::current().id(),
+        });
+}
+
+/// Which blocking step of `load_file` failed, so the caller keeps the original
+/// log wording (`file open` vs `file seek`) even though both steps now run in
+/// one `spawn_blocking` call.
+enum OpenFailure {
+    /// `fs::File::open`
+    Open(std::io::Error),
+    /// The size probe: `seek(End(0))` then the rewind to the start.
+    Seek(std::io::Error),
 }
 
 impl VirtualSdCard {
@@ -172,6 +253,8 @@ impl VirtualSdCard {
             on_error_gcode,
             gcode,
             printer: Arc::clone(printer),
+            #[cfg(test)]
+            io_log: Arc::new(Mutex::new(Vec::new())),
         });
         object.register_commands(printer)?;
         Ok(object)
@@ -226,9 +309,13 @@ impl VirtualSdCard {
     /// find the file in the listing, open it, report its size, and set it as
     /// the current file.
     ///
+    /// `File::open` and the `seek(End(0))` size probe are blocking I/O, so they
+    /// run on the blocking pool (see the module docs): one round trip opens the
+    /// file, sizes it and rewinds it.
+    ///
     /// # Errors
     /// `Unable to open file` when the file cannot be found or opened.
-    fn load_file(
+    async fn load_file(
         &self,
         gcmd: &GcodeCommand,
         filename: &str,
@@ -251,21 +338,33 @@ impl VirtualSdCard {
                 .ok_or_else(|| CommandError::new("Unable to open file"))?
         };
         let full_path = Path::new(&self.sdcard_dirname).join(&fname);
-        let file = fs::File::open(&full_path).map_err(|e| {
-            tracing::error!("virtual_sdcard file open: {e}");
-            CommandError::new("Unable to open file")
-        })?;
-        let mut reader = std::io::BufReader::new(file);
-        let fsize = {
-            reader.seek(SeekFrom::End(0)).map_err(|e| {
+        #[cfg(test)]
+        let io_log = Arc::clone(&self.io_log);
+        let opened = tokio::task::spawn_blocking(move || -> Result<(Reader, u64), OpenFailure> {
+            #[cfg(test)]
+            record_io(&io_log, BlockingIoKind::Open);
+            let file = fs::File::open(&full_path).map_err(OpenFailure::Open)?;
+            let mut reader = std::io::BufReader::new(file);
+            let fsize = reader.seek(SeekFrom::End(0)).map_err(OpenFailure::Seek)?;
+            reader.seek(SeekFrom::Start(0)).map_err(OpenFailure::Seek)?;
+            Ok((Arc::new(Mutex::new(reader)), fsize))
+        })
+        .await;
+        let (reader, fsize) = match opened {
+            Ok(Ok(opened)) => opened,
+            Ok(Err(OpenFailure::Open(e))) => {
+                tracing::error!("virtual_sdcard file open: {e}");
+                return Err(CommandError::new("Unable to open file"));
+            }
+            Ok(Err(OpenFailure::Seek(e))) => {
                 tracing::error!("virtual_sdcard file seek: {e}");
-                CommandError::new("Unable to open file")
-            })?
+                return Err(CommandError::new("Unable to open file"));
+            }
+            Err(e) => {
+                tracing::error!("virtual_sdcard file open: {e}");
+                return Err(CommandError::new("Unable to open file"));
+            }
         };
-        reader.seek(SeekFrom::Start(0)).map_err(|e| {
-            tracing::error!("virtual_sdcard file seek: {e}");
-            CommandError::new("Unable to open file")
-        })?;
         gcmd.respond_raw(&format!("File opened:{} Size:{}", filename, fsize));
         gcmd.respond_raw("File selected");
         *self.current_file.lock().unwrap() = Some(FileHandle {
@@ -500,6 +599,73 @@ impl VirtualSdCard {
 
     // -- work_handler (replay loop) -------------------------------------
 
+    /// Clone the current reader out of `current_file`, or `None` when no file
+    /// is selected.
+    ///
+    /// The slot's guard is dropped before this returns, so no
+    /// `std::sync::MutexGuard` of `current_file` outlives an `.await`; the
+    /// slot itself stays populated, which is what `file_path()` / `M27` /
+    /// `get_status` read while a blocking call is in flight.
+    fn reader(&self) -> Option<Reader> {
+        self.current_file
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|file| Arc::clone(&file.reader))
+    }
+
+    /// `reader.seek(target)` on the blocking pool.
+    ///
+    /// `Err` is the message to log (an I/O error, or a blocked task that
+    /// panicked or was cancelled); the caller keeps the original
+    /// `virtual_sdcard seek: …` wording. The reader's guard is taken and
+    /// dropped inside the closure, never across the `.await`.
+    async fn seek_reader(&self, reader: Reader, target: SeekFrom) -> Result<u64, String> {
+        #[cfg(test)]
+        let io_log = Arc::clone(&self.io_log);
+        let seeked = tokio::task::spawn_blocking(move || -> Result<u64, String> {
+            #[cfg(test)]
+            record_io(&io_log, BlockingIoKind::Seek);
+            reader
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .seek(target)
+                .map_err(|e| e.to_string())
+        })
+        .await;
+        match seeked {
+            Ok(result) => result,
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Read one 8192-byte chunk on the blocking pool — upstream
+    /// `data = self.current_file.read(8192)` (`virtual_sdcard.py:258`).
+    ///
+    /// Returns the buffer and the byte count (a count of 0 is EOF). The block
+    /// size is upstream's and stays fixed. `Err` is the message to log; the
+    /// caller keeps the original `virtual_sdcard read: …` wording.
+    async fn read_chunk(&self, reader: Reader) -> Result<([u8; 8192], usize), String> {
+        #[cfg(test)]
+        let io_log = Arc::clone(&self.io_log);
+        let read = tokio::task::spawn_blocking(move || -> Result<([u8; 8192], usize), String> {
+            #[cfg(test)]
+            record_io(&io_log, BlockingIoKind::Read);
+            let mut buf = [0u8; 8192];
+            let n = reader
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .read(&mut buf)
+                .map_err(|e| e.to_string())?;
+            Ok((buf, n))
+        })
+        .await;
+        match read {
+            Ok(result) => result,
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
     /// `work_handler(self, eventtime)` (`virtual_sdcard.py:240-320`): the
     /// replay loop, running as a detached tokio task spawned by `do_resume`'s
     /// reactor timer callback.
@@ -514,20 +680,18 @@ impl VirtualSdCard {
             *self.file_position.lock().unwrap()
         );
 
-        // Seek to `file_position` (upstream `current_file.seek`).
+        // Seek to `file_position` (upstream `current_file.seek`), on the
+        // blocking pool.
         let start_pos = *self.file_position.lock().unwrap();
-        {
-            let mut current_file = self.current_file.lock().unwrap();
-            let Some(ref mut file) = *current_file else {
-                tracing::error!("virtual_sdcard: no file open for replay");
-                *self.work_active.lock().unwrap() = false;
-                return;
-            };
-            if let Err(e) = file.reader.seek(SeekFrom::Start(start_pos)) {
-                tracing::error!("virtual_sdcard seek: {e}");
-                *self.work_active.lock().unwrap() = false;
-                return;
-            }
+        let Some(reader) = self.reader() else {
+            tracing::error!("virtual_sdcard: no file open for replay");
+            *self.work_active.lock().unwrap() = false;
+            return;
+        };
+        if let Err(e) = self.seek_reader(reader, SeekFrom::Start(start_pos)).await {
+            tracing::error!("virtual_sdcard seek: {e}");
+            *self.work_active.lock().unwrap() = false;
+            return;
         }
 
         self.print_stats.note_start();
@@ -539,19 +703,16 @@ impl VirtualSdCard {
 
         while !*self.must_pause_work.lock().unwrap() {
             if lines.is_empty() {
-                // Read more data (upstream `current_file.read(8192)`).
-                let mut buf = [0u8; 8192];
-                let n = {
-                    let mut current_file = self.current_file.lock().unwrap();
-                    let Some(ref mut file) = *current_file else {
+                // Read more data (upstream `current_file.read(8192)`), on the
+                // blocking pool: an eMMC/SD read must not stall a worker.
+                let Some(reader) = self.reader() else {
+                    break;
+                };
+                let (buf, n) = match self.read_chunk(reader).await {
+                    Ok(read) => read,
+                    Err(e) => {
+                        tracing::error!("virtual_sdcard read: {e}");
                         break;
-                    };
-                    match file.reader.read(&mut buf) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            tracing::error!("virtual_sdcard read: {e}");
-                            break;
-                        }
                     }
                 };
 
@@ -617,9 +778,11 @@ impl VirtualSdCard {
             let current_next = *self.next_file_position.lock().unwrap();
             if current_next != next_file_position {
                 file_position = *self.file_position.lock().unwrap();
-                let mut current_file = self.current_file.lock().unwrap();
-                if let Some(ref mut file) = *current_file {
-                    if let Err(e) = file.reader.seek(SeekFrom::Start(file_position)) {
+                if let Some(reader) = self.reader() {
+                    if let Err(e) = self
+                        .seek_reader(reader, SeekFrom::Start(file_position))
+                        .await
+                    {
                         tracing::error!("virtual_sdcard seek: {e}");
                         break;
                     }
@@ -785,7 +948,7 @@ fn cmd_m23<'a>(object: &'a Arc<VirtualSdCard>, gcmd: &'a GcodeCommand) -> Comman
         if filename.starts_with('/') {
             filename = filename[1..].to_string();
         }
-        object.load_file(gcmd, &filename, false)?;
+        object.load_file(gcmd, &filename, false).await?;
         Ok(())
     })
 }
@@ -870,7 +1033,7 @@ fn cmd_sdcard_print_file<'a>(
         if filename.starts_with('/') {
             filename = filename[1..].to_string();
         }
-        object.load_file(gcmd, &filename, true)?;
+        object.load_file(gcmd, &filename, true).await?;
         object.do_resume()?;
         Ok(())
     })
@@ -1437,12 +1600,29 @@ mod tests {
         (reactor, printer, object, gcode)
     }
 
-    /// Let a spawned task run (`ManualReactor` runs no tasks, so the test
-    /// drives the runtime itself).
-    async fn settle() {
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
-        }
+    /// How long [`settle`] waits for the replay task to reach its stopping
+    /// point.
+    const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Let the replay task run to its stopping point (EOF, pause or error).
+    ///
+    /// `ManualReactor` runs no tasks, so the test drives the runtime itself.
+    /// The replay loop reads its file through `spawn_blocking`, so a fixed run
+    /// of `yield_now`s can return before a chunk read completes; this waits for
+    /// `is_active()` to clear and gives up after [`SETTLE_TIMEOUT`], so a wedged
+    /// replay fails the test instead of hanging it.
+    async fn settle(object: &VirtualSdCard) {
+        let waited = tokio::time::timeout(SETTLE_TIMEOUT, async {
+            while object.is_active() {
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(
+            waited.is_ok(),
+            "the replay task exited within {SETTLE_TIMEOUT:?}"
+        );
     }
 
     /// M24 starts the replay, the file plays to EOF, and `print_stats` goes
@@ -1462,7 +1642,7 @@ mod tests {
         assert!(object.is_active());
         reactor.run_due();
         assert!(object.is_active());
-        settle().await;
+        settle(&object).await;
         assert!(!object.is_active());
 
         let out = emitted(&lines);
@@ -1503,7 +1683,7 @@ mod tests {
         assert!(object.is_active());
         reactor.run_due();
         assert!(object.is_active());
-        settle().await;
+        settle(&object).await;
         assert!(!object.is_active());
     }
 
@@ -1597,7 +1777,7 @@ mod tests {
         gcode.run_script("M23 job.gcode").await.unwrap();
         gcode.run_script("M24").await.unwrap();
         reactor.run_due();
-        settle().await;
+        settle(&object).await;
         assert!(!object.is_active());
 
         let out = emitted(&lines);
@@ -1632,7 +1812,7 @@ mod tests {
         gcode.run_script("M23 err.gcode").await.unwrap();
         gcode.run_script("M24").await.unwrap();
         reactor.run_due();
-        settle().await;
+        settle(&object).await;
         assert!(!object.is_active());
 
         let out = emitted(&lines);
@@ -1666,7 +1846,7 @@ mod tests {
         assert_eq!(err.to_string(), "SD busy");
         // Clean up: let the task run.
         reactor.run_due();
-        settle().await;
+        settle(&object).await;
         assert!(!object.is_active());
     }
 
@@ -1682,8 +1862,58 @@ mod tests {
         assert_eq!(object.get_status(0.0)["progress"], 0.0);
         gcode.run_script("M24").await.unwrap();
         reactor.run_due();
-        settle().await;
+        settle(&object).await;
         assert_eq!(object.get_status(0.0)["progress"], 1.0);
+    }
+
+    // -- blocking file I/O -----------------------------------------------
+
+    /// Every file operation the replay performs — the `M23` open with its size
+    /// probe, the `M24` seek, and each 8 KiB chunk read — runs on the blocking
+    /// pool, not on the thread that polls the async tasks.
+    ///
+    /// `#[tokio::test]` is a current-thread runtime, so this test body, the
+    /// command handlers and the replay task all run on one thread: anything the
+    /// probe recorded on a different thread ran outside the runtime's worker.
+    /// The recorded calls are the ones the probe saw in the `spawn_blocking`
+    /// closures, which is where the I/O itself happens.
+    #[tokio::test]
+    async fn replay_file_io_runs_off_the_runtime_worker() {
+        let dir = TempDir::new("io_off_worker");
+        let path = dir.path();
+        std::fs::write(path.join("job.gcode"), "M21\nM21\nM21\n").unwrap();
+
+        let (reactor, _printer, object, gcode) = machine_with_reactor(path);
+        let worker = std::thread::current().id();
+
+        // `M23` opens the file (blocking `File::open` + size probe).
+        gcode.run_script("M23 job.gcode").await.unwrap();
+        // `M24` spawns the replay, whose first act is the seek to
+        // `file_position`.
+        gcode.run_script("M24").await.unwrap();
+        reactor.run_due();
+        settle(&object).await;
+
+        let io = object.take_io_log();
+        assert!(
+            io.iter().any(|call| call.kind == BlockingIoKind::Open),
+            "the open was recorded: {io:?}"
+        );
+        assert!(
+            io.iter().any(|call| call.kind == BlockingIoKind::Seek),
+            "the seek was recorded: {io:?}"
+        );
+        assert!(
+            io.iter().any(|call| call.kind == BlockingIoKind::Read),
+            "at least one 8 KiB chunk read was recorded: {io:?}"
+        );
+        for call in &io {
+            assert_ne!(
+                call.thread, worker,
+                "{:?} ran on the runtime worker: {io:?}",
+                call.kind
+            );
+        }
     }
 
     // -- helpers ---------------------------------------------------------
@@ -1692,6 +1922,12 @@ mod tests {
         /// Test-only: check that `on_error_gcode` was loaded (non-panicking).
         fn on_error_gcode_is_loaded(&self) -> bool {
             true
+        }
+
+        /// Test-only: drain the record of blocking file I/O (see
+        /// [`BlockingIo`]).
+        fn take_io_log(&self) -> Vec<BlockingIo> {
+            std::mem::take(&mut *self.io_log.lock().unwrap_or_else(|p| p.into_inner()))
         }
     }
 }

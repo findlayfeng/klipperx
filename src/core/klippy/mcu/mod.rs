@@ -1423,7 +1423,13 @@ impl Sender {
 
     /// Put one block on the wire, carrying the sequence this connection is at, and
     /// remember it until the firmware answers it.
-    async fn send_block(&mut self, interface: &Interface, payload: Vec<u8>) {
+    ///
+    /// Returns whether the block went out. A write the transport refuses is
+    /// **not** folded into success here: the block has left the queue and this
+    /// call will never send it, so a flush barrier behind it would declare bytes
+    /// delivered that never reached the wire. The caller stops the send task on
+    /// `false`, which fails every barrier still waiting (see [`Mcu::flush`]).
+    async fn send_block(&mut self, interface: &Interface, payload: Vec<u8>) -> bool {
         // The counter is unwrapped here and only its low four bits go on the wire
         // (`Frame` keeps what it is given and masks when encoding), but the frame
         // this connection remembers has to carry those four bits too: that is what
@@ -1454,11 +1460,13 @@ impl Sender {
                     self.sample_seq = Some(seq);
                 }
                 self.arm_retransmit();
+                true
             }
             Err(e) => {
                 // Nothing went out, so the number was not used after all.
                 error!("Send failed (seq={}): {e}", seq & 0xf);
                 self.wire.next.store(seq, Ordering::Relaxed);
+                false
             }
         }
     }
@@ -1484,7 +1492,20 @@ impl Sender {
                 self.sample_seq = None;
                 self.arm_retransmit();
             }
-            Err(e) => error!("Retransmit failed (seq={}): {e}", frame.seq()),
+            Err(e) => {
+                error!("Retransmit failed (seq={}): {e}", frame.seq());
+                // The block is still the one the firmware is waiting for, and
+                // both callers hand their blocks over by draining the window
+                // first: dropping it here would lose that sequence for good.
+                // Put it back, in the order it was taken out, and arm the
+                // retransmit timer so the next wait tries again.
+                self.in_flight.push_back(InFlightBlock {
+                    seq,
+                    frame,
+                    sent_at: Instant::now(),
+                });
+                self.arm_retransmit();
+            }
         }
     }
 
@@ -1558,8 +1579,14 @@ impl Sender {
             self.sample_seq = None;
             let again: Vec<InFlightBlock> = self.in_flight.drain(..).collect();
             for block in again {
-                self.send_block(interface, block.frame.payload().to_vec())
-                    .await;
+                if !self
+                    .send_block(interface, block.frame.payload().to_vec())
+                    .await
+                {
+                    // The transport took nothing: resending the rest would
+                    // only fail the same way.
+                    return;
+                }
             }
             return;
         }
@@ -1826,9 +1853,14 @@ impl Mcu {
                     ) {
                         if payload.try_merge(&next).is_err() {
                             // Merge failed (would exceed max), send current batch first
-                            sender
+                            if !sender
                                 .send_block(&interface_for_send, payload.into_raw())
-                                .await;
+                                .await
+                            {
+                                // The transport took nothing: the connection is
+                                // over, and the batch is gone with it.
+                                break 'outer;
+                            }
                             // Start new batch with next
                             payload = next;
                         }
@@ -1934,16 +1966,27 @@ impl Mcu {
 
                 // send the batched payload to the MCU
                 debug!("Sending batch: {} bytes", payload.len());
-                sender
+                let written = sender
                     .send_block(&interface_for_send, payload.into_raw())
                     .await;
                 if let Some((done, queued_at)) = flush_done {
-                    debug!(
-                        "[{board}] gate flush: satisfied after {:.0} ms — its batch is on the \
-                         wire",
-                        queued_at.elapsed().as_secs_f64() * 1000.
-                    );
-                    let _ = done.send(());
+                    // A batch that never reached the wire is no boundary: the
+                    // barrier fails with the connection instead of telling the
+                    // caller its bytes are out (dropping `done`).
+                    if written {
+                        debug!(
+                            "[{board}] gate flush: satisfied after {:.0} ms — its batch is on the \
+                             wire",
+                            queued_at.elapsed().as_secs_f64() * 1000.
+                        );
+                        let _ = done.send(());
+                    }
+                }
+                if !written {
+                    // Nothing this task writes gets through any more: stop, so
+                    // that the queue closes and every caller waiting on it —
+                    // `Mcu::flush` above all — hears about it.
+                    break 'outer;
                 }
             }
         });
@@ -2679,19 +2722,36 @@ impl Mcu {
     /// read or acted on them. It is a flush, not an acknowledgement; waiting for
     /// an effect needs the message that reports it (see `mcu/config.rs`).
     ///
+    /// `timeout` bounds the **whole** call: queueing the barrier counts against
+    /// it, not just waiting for it to be reached. A wedged send task leaves the
+    /// queue full, and a barrier that cannot be queued at all would otherwise
+    /// wait for room forever — there is nobody left to make room.
+    ///
     /// # Errors
-    /// Returns [`McuError::Call`] if the send task is gone, or if the barrier was
-    /// not reached within `timeout` (a wedged transport).
+    /// Returns [`McuError::Call`] if the send task is gone, or
+    /// [`McuCallError::Timeout`] if the barrier was not queued and reached
+    /// within `timeout` (a wedged transport).
     pub async fn flush(&self, timeout: Duration) -> Result<(), McuError> {
         if self.is_closed() {
             return Err(McuCallError::SendFailed("the connection is closed".to_string()).into());
         }
+        let deadline = tokio::time::Instant::now() + timeout;
         let (done_tx, done_rx) = oneshot::channel();
-        self.send_buf_tx
-            .send(SendItem::Flush(done_tx))
+        match tokio::time::timeout_at(deadline, self.send_buf_tx.send(SendItem::Flush(done_tx)))
             .await
-            .map_err(|e| McuError::Call(McuCallError::SendFailed(e.to_string())))?;
-        match tokio::time::timeout(timeout, done_rx).await {
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(McuError::Call(McuCallError::SendFailed(e.to_string())));
+            }
+            Err(_) => {
+                return Err(McuCallError::Timeout(format!(
+                    "flush barrier not queued within {timeout:?}"
+                ))
+                .into());
+            }
+        }
+        match tokio::time::timeout_at(deadline, done_rx).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => {
                 Err(McuCallError::SendFailed("the send task dropped the flush".to_string()).into())
@@ -4426,9 +4486,13 @@ mod tests {
     }
 
     /// `send_payload` never spends the slots it reserves for the sync path.
+    ///
+    /// The transport is one that accepts every block: a write the transport
+    /// refuses now ends the session (`Sender::send_block` reports it, the send
+    /// task stops), which is not what this test is about.
     #[tokio::test]
     async fn test_send_payload_leaves_the_sync_headroom_free() {
-        let mcu = Mcu::for_test("test_mcu", Interface::new(FrameMock::new(vec![])));
+        let mcu = Mcu::for_test("test_mcu", Interface::recording(RecordingWire::new()));
         let dictionary =
             Dictionary::from_json(serde_json::json!({"commands": {"get_clock": 5}})).unwrap();
         mcu.install_dictionary(dictionary).unwrap();

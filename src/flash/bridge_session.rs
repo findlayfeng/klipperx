@@ -17,11 +17,12 @@
 //!    arrive: the stream is opened, the port is hung on the router and numbered
 //!    by arrival order. There is no `finalize_config` in this flow; these
 //!    commands alone are what initializes a bridge for a flash run.
-//! 2. **reset** each port's device, the way the plan says ([`PortReset`]) —
+//! 2. **reset the target's device**, the way the plan says ([`PortReset`]) —
 //!    written at the line for a device with no admin channel, restarted through
 //!    it for one that has, and for a device being sent into its bootloader a
 //!    route of its own: units for the request, legacy again before the tunnel
-//!    ([`request_bootloader`]).
+//!    ([`request_bootloader`]). The plan's other ports are declared and left
+//!    alone: only the port the run targets is reset.
 //! 3. **name the target** and **open its tunnel** — `SET_PORT_NODEID` with no
 //!    port flags (a *legacy* route) and `SET_PORT_TUNNEL`, the toggle that makes
 //!    the port carry the katapult raw byte stream instead of mux units.
@@ -270,7 +271,10 @@ pub struct BridgePort {
     /// stream *is* the bus, so this is where `canhw_set_rate` gets its number.
     /// A UART slot ignores it.
     pub bitrate: u32,
-    /// Which reset this port's device gets before the tunnel opens.
+    /// Which reset this port's device gets before the tunnel opens — read for
+    /// the entry the plan **targets** and for no other, since [`reset_ports`]
+    /// resets the target's port alone. The entries below the target are there
+    /// for the declaration and carry it unused, as in [`declare_ports`].
     pub reset: PortReset,
 }
 
@@ -372,7 +376,7 @@ impl From<MsgError> for BridgeError {
 /// firmware needs, so a session either runs to the end or fails with the bridge
 /// as it was.
 ///
-/// A port whose plan reset is [`PortReset::Bootloader`] costs the session
+/// The target's [`PortReset::Bootloader`] costs the session
 /// [`BOOTLOADER_ENTRY_WAIT`] on top: its device has to leave its firmware before
 /// the tunnel opens ([`request_bootloader`]).
 ///
@@ -481,15 +485,20 @@ pub async fn declare_port(mcu: &Mcu, index: u8, port: BridgePort) -> Result<(), 
     mcu.flush(DECLARE_FLUSH_TIMEOUT).await?;
     Ok(())
 }
-/// step 2, after [`declare_ports`] so each command addresses a port the bridge
-/// has. Ports are judged one at a time: a plan's other ports keep the single
-/// unit their own reset is.
+/// Reset the **target's** port's device — [`open_bridge`]'s step 2, after
+/// [`declare_ports`] so the command addresses a port the bridge has.
 ///
-/// A [`PortReset::Bootloader`] port is the one case that cannot be one unit
-/// ([`request_bootloader`]), and it needs an id to name the route with — the
-/// reason `target` is here. A plan carries an id only for the target, so a
-/// bootloader reset on any **other** port falls back to the bare unit
-/// [`reset_port`] sends, the request a legacy route strips.
+/// Only the entry the plan **targets** is reset. The ports below it carry the
+/// declaration and nothing else: the bridge numbers a port by the order
+/// `config_bridge_port` reaches it, so a target at `index` needs the ports
+/// under it declared — but a caller's plan says what to do with the device it
+/// means to reach, not with the devices on the way there, and a line pulse is
+/// not something to send to hardware nobody named.
+///
+/// The target's [`PortReset::Bootloader`] is the one case that cannot be one
+/// unit ([`request_bootloader`]), and it is why `target` is here rather than
+/// the reset alone: naming the port back to legacy takes the id its device
+/// answers to, and a plan carries an id only for the target.
 ///
 /// # Errors
 /// [`BridgeError::Link`] when the link refuses a port-level write.
@@ -499,14 +508,16 @@ pub async fn reset_ports(
     target: BridgeTarget,
     uuid: Option<[u8; 6]>,
 ) -> Result<(), BridgeError> {
-    for (index, port) in ports.iter().enumerate() {
-        let index = index as u8;
-        match port.reset {
-            PortReset::Bootloader if index == target.index => {
-                request_bootloader(link, index, target.node_id, uuid).await?
-            }
-            reset => reset_port(link, index, reset, uuid)?,
+    let Some(port) = ports.get(usize::from(target.index)) else {
+        // A plan with no entry for the target names no port to reset; the
+        // declaration refused it, or [`open_target_port`] will.
+        return Ok(());
+    };
+    match port.reset {
+        PortReset::Bootloader => {
+            request_bootloader(link, target.index, target.node_id, uuid).await?
         }
+        reset => reset_port(link, target.index, reset, uuid)?,
     }
     Ok(())
 }
@@ -692,9 +703,10 @@ mod tests {
         admin_unit(command)[HEADER_BYTES..].to_vec()
     }
 
-    /// The plan's steps in the order the firmware needs them: the declaration
-    /// pairs in index order, then each port's reset as its plan says, then the
-    /// target named **legacy** and its tunnel opened.
+    /// [`expected_steps`] is the plan `test_open_bridge_declares_resets_and_opens_the_tunnel_in_order`
+    /// runs: two ports, the target at index 0 and port 1 asking for
+    /// `RestartDevice`. The declaration pairs come in index order, then the
+    /// target's reset, then the target named **legacy** and its tunnel opened.
     fn expected_steps(target_node_id: u8) -> Vec<Step> {
         vec![
             Step::Command("allocate_oids".to_string(), vec![ArgValue::UInt8(4)]),
@@ -723,7 +735,6 @@ mod tests {
                 vec![ArgValue::UInt8(3), ArgValue::UInt8(2)],
             ),
             Step::Admin(admin_payload(&[CMD_RESET_PORT, 0])),
-            Step::Admin(admin_payload(&[CMD_RESTART_DEVICE, 1])),
             // flags=0 is the legacy route the katapult stream needs: a units
             // port would drop the raw uplink in silence.
             Step::Admin(admin_payload(&[
@@ -755,9 +766,10 @@ mod tests {
     }
 
     /// [`expected_steps`]' admin half for a plan whose target (index 1) is sent
-    /// into its bootloader: the other port's pulse, then the target's three
-    /// units — units naming, the request, legacy naming — and then
-    /// [`open_target_port`]'s own legacy naming and the tunnel.
+    /// into its bootloader: the target's three units — units naming, the
+    /// request, legacy naming — and then [`open_target_port`]'s own legacy
+    /// naming and the tunnel. The port below the target is declared and gets
+    /// nothing: `admin flash --bridge --port 1` does not pulse port 0's device.
     ///
     /// The legacy naming appears twice on purpose: [`request_bootloader`]
     /// restores the route it broke, and [`open_target_port`] establishes the
@@ -765,7 +777,6 @@ mod tests {
     /// four-byte idempotent unit.
     fn expected_bootloader_admin_steps() -> Vec<Step> {
         vec![
-            Step::Admin(admin_payload(&[CMD_RESET_PORT, 0])),
             Step::Admin(admin_payload(&[
                 CMD_SET_PORT_NODEID,
                 1,
@@ -925,6 +936,9 @@ mod tests {
     /// The three steps, in the order the firmware needs them, observed at the
     /// wire: a bridge link on a pty, the declaration as coalesced command
     /// frames, the port-level commands as admin units behind their mux header.
+    ///
+    /// The plan below asks for `RestartDevice` on port 1 and the run targets
+    /// port 0, so port 1 is declared and its reset never goes out.
     #[tokio::test]
     async fn test_open_bridge_declares_resets_and_opens_the_tunnel_in_order() {
         let pty = Pty::new();
@@ -958,17 +972,99 @@ mod tests {
         );
         assert_eq!(ready.target, target);
 
-        // The four admin units are the last things on the wire, so seeing them
+        // The three admin units are the last things on the wire, so seeing them
         // all means every declaration frame is already in hand.
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
-            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 4
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 3
         });
         let parser = mux_parser();
         assert_eq!(
             steps(&parser, &units),
             expected_steps(TARGET_NODE_ID),
-            "the declaration pairs in index order, then each reset as its plan says, \
-             then the target named legacy and its tunnel opened"
+            "the declaration pairs in index order, then the target's reset as its plan \
+             says, then the target named legacy and its tunnel opened"
+        );
+    }
+
+    /// Only the **target's** entry is reset, whatever the plan says about the
+    /// ports below it: a flash run that reaches port 2 declares ports 0 and 1 —
+    /// the bridge numbers a port by the order its declaration rows arrive — and
+    /// sends a line pulse or a bootloader request to neither of them.
+    ///
+    /// Before this, `admin flash --bridge --port N` pulsed the line of every
+    /// port below N: a reset of devices the caller never named.
+    #[tokio::test]
+    async fn test_only_the_targets_port_is_reset() {
+        let pty = Pty::new();
+        let link = shared_serial_link(&pty);
+        let mcu = bridge_mcu("bridge", &link);
+
+        let ports = [
+            BridgePort {
+                baud: 250_000,
+                bitrate: CAN_BITRATE,
+                reset: PortReset::RestartDevice,
+            },
+            BridgePort {
+                baud: 250_000,
+                bitrate: CAN_BITRATE,
+                reset: PortReset::Bootloader,
+            },
+            BridgePort {
+                baud: 250_000,
+                bitrate: CAN_BITRATE,
+                reset: PortReset::ResetPort,
+            },
+        ];
+        let target = BridgeTarget {
+            index: 2,
+            node_id: TARGET_NODE_ID,
+        };
+        open_bridge(&mcu, &link, &ports, target)
+            .await
+            .expect("the session runs");
+
+        // The declaration is 3 pairs of commands and the port half 2 units, so
+        // both are in hand once the tunnel is on the wire.
+        let units = read_units(&pty.master, Duration::from_secs(2), |units| {
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+        });
+        let parser = mux_parser();
+        let observed: Vec<Step> = steps(&parser, &units)
+            .into_iter()
+            .filter(|step| matches!(step, Step::Admin(..)))
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                Step::Admin(admin_payload(&[CMD_RESET_PORT, 2])),
+                Step::Admin(admin_payload(&[
+                    CMD_SET_PORT_NODEID,
+                    2,
+                    TARGET_NODE_ID,
+                    LEGACY_PORT_FLAGS,
+                ])),
+                Step::Admin(admin_payload(&[CMD_SET_PORT_TUNNEL, 2])),
+            ],
+            "the target's pulse and its port's two namings, and nothing for ports 0 and 1"
+        );
+        for (command, index) in [
+            (CMD_RESET_PORT, 0),
+            (CMD_RESTART_DEVICE, 0),
+            (CMD_RESET_PORT, 1),
+        ] {
+            assert!(
+                observed
+                    .iter()
+                    .all(|step| !is_command_for_port(step, command, index)),
+                "port {index} is declared only: no reset unit names it"
+            );
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|step| !is_command_for_port(step, CMD_REQUEST_BOOTLOADER, 1)),
+            "port 1's plan reset is a bootloader request, and it is not sent either"
         );
     }
 
@@ -1279,9 +1375,9 @@ mod tests {
     }
 
     /// A plan whose target is sent into its bootloader: the target's three
-    /// units sit where its one reset unit would, between the other ports' resets
-    /// and the target's naming, and the other port keeps its single pulse — no
-    /// units naming, no request, no second naming.
+    /// units sit where its one reset unit would, and the port below it is
+    /// declared and gets nothing — no pulse, no units naming, no request, no
+    /// second naming.
     ///
     /// The wait inside the sequence is real time here: [`open_bridge`] also runs
     /// the declaration barrier, whose own timeout must not be auto-advanced. A
@@ -1314,10 +1410,10 @@ mod tests {
             .await
             .expect("the session runs");
 
-        // Six admin units close the sequence (one pulse, the target's three,
-        // its naming and the tunnel).
+        // Five admin units close the sequence (the target's three, its naming
+        // and the tunnel).
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
-            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 6
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 5
         });
         let parser = mux_parser();
         let observed: Vec<Step> = steps(&parser, &units)
@@ -1335,8 +1431,8 @@ mod tests {
                 .iter()
                 .filter(|step| is_command_for_port(step, CMD_RESET_PORT, 0))
                 .count(),
-            1,
-            "the non-bootloader port keeps its one pulse"
+            0,
+            "port 0 is declared only: no pulse reaches the device below the target"
         );
         for command in [
             CMD_SET_PORT_NODEID,
@@ -1564,15 +1660,12 @@ mod tests {
 
         let quiet = Duration::from_millis(500);
 
-        // Port 1: exactly one thing on its line — the restart, which the bridge
-        // forwards to the port with the unit header stripped. One byte past it
-        // is asked for, so the window also shows that nothing else arrived.
-        let restart = admin_unit(&[CMD_RESTART_DEVICE, 1]);
-        let forwarded = &restart[HEADER_BYTES..];
-        let on_the_line = read_pty(&named_port.master, forwarded.len() + 1, quiet);
-        assert_eq!(
-            on_the_line, forwarded,
-            "RESTART_DEVICE reaches a legacy port as the bare KXID frame"
+        // Port 1 is declared and is not the target, so its plan reset
+        // (`RestartDevice`) is never sent: a bridge forwards a restart to its
+        // port as the bare KXID frame, and here there is nothing to forward.
+        assert!(
+            read_pty(&named_port.master, 2, quiet).is_empty(),
+            "a port below the target is declared only: no reset unit reaches its line"
         );
 
         // Port 0, the target: the declaration opened its stream and nothing of

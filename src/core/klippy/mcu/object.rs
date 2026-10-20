@@ -2221,11 +2221,13 @@ mod tests {
         FrameMock, FrameRecorder, MappingEntry,
     };
     use crate::core::klippy::interface::devices::serial::{self, DEFAULT_BAUD};
+    use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::printer::{Printer, PrinterState};
     use crate::core::klippy::reactor::{ManualReactor, Reactor};
     use crate::core::klippy::test_util::wait_until;
+    use std::io::Write;
     use tokio::time::{timeout, Duration};
 
     fn section(sub: Option<&str>) -> ConfigSection {
@@ -2927,11 +2929,15 @@ mod tests {
             mcu_tick_stddev: 2.5e-7,
             mcu_tick_awake: 0.25,
             eventtime: 12.5,
+            bytes_read: 1_024,
+            bytes_write: 2_048,
         });
 
         let status = object.get_status(0.0);
         assert_eq!(status["last_stats"]["mcu_tick_awake"], 0.25);
         assert_eq!(status["last_stats"]["mcu_tick_avg"], 1.5e-6);
+        assert_eq!(status["last_stats"]["bytes_read"], 1_024);
+        assert_eq!(status["last_stats"]["bytes_write"], 2_048);
         assert_eq!(status["last_stats_time"], 12.5);
     }
 
@@ -3074,6 +3080,94 @@ mod tests {
             "the later report is the one reported"
         );
         assert!((second.mcu_tick_awake - 8000.0 / 72_000_000.0).abs() < 1e-18);
+    }
+
+    /// An MCU on `pty`'s line, with [`register_stats`] keeping its reports in
+    /// `object`'s slot.
+    ///
+    /// Unlike [`attached_with_stats`] this transport has a real wire, so its
+    /// byte counters move with what the test writes.
+    fn attached_over_a_line(
+        object: &McuObject,
+        printer: &Arc<Printer>,
+        pty: &Pty,
+        name: &str,
+    ) -> Arc<Mcu> {
+        let device = serial::SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+        let mcu = Arc::new(Mcu::for_test(name, Interface::from_serial(device)));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"stats count=%u sum=%u sumsq=%u": 12},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        register_stats(
+            &mcu,
+            72_000_000.0,
+            4.0,
+            Arc::clone(&object.last_stats),
+            Arc::downgrade(printer),
+        )
+        .unwrap();
+        mcu
+    }
+
+    #[tokio::test]
+    async fn test_last_stats_carries_the_wire_bytes_of_its_own_line() {
+        // The utilization a client computes is `(Δbytes_read + Δbytes_write)`
+        // over the interval: the status has to name the line's own counters, not
+        // another MCU's and not a frame count. The two reports here are of
+        // different lengths, so a mix-up between the lines would also show.
+        let (printer, clock) = printer_with_clock();
+        let first = McuObject::new(section(None), &printer).unwrap();
+        let second = McuObject::new(section(Some("extra")), &printer).unwrap();
+        let first_pty = Pty::new();
+        let second_pty = Pty::new();
+        attached_over_a_line(&first, &printer, &first_pty, "mcu");
+        attached_over_a_line(&second, &printer, &second_pty, "extra");
+
+        let first_report = stats_frame(0, 100, 3000, 250_000).raw_bytes();
+        let second_report = stats_frame(1, 5, 100, 2500).raw_bytes();
+        assert_ne!(
+            first_report.len(),
+            second_report.len(),
+            "the two lines must differ in traffic to tell them apart"
+        );
+        clock.advance(2.5);
+        (&first_pty.master).write_all(&first_report).unwrap();
+        (&second_pty.master).write_all(&second_report).unwrap();
+        last_report_at(&first, 2.5).await;
+        last_report_at(&second, 2.5).await;
+
+        let first_status = first.get_status(0.0);
+        let second_status = second.get_status(0.0);
+        assert_eq!(
+            first_status["last_stats"]["bytes_read"],
+            first_report.len() as u64
+        );
+        assert_eq!(
+            second_status["last_stats"]["bytes_read"],
+            second_report.len() as u64
+        );
+        // Nothing has been sent on either line yet, so neither has written.
+        assert_eq!(first_status["last_stats"]["bytes_write"], 0);
+        assert_eq!(second_status["last_stats"]["bytes_write"], 0);
+        // Each line's own load, from its own report.
+        assert_eq!(
+            first_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            3000.0 / 72_000_000.0
+        );
+        assert_eq!(
+            second_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            100.0 / 72_000_000.0
+        );
     }
 
     #[tokio::test]

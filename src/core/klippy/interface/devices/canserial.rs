@@ -75,7 +75,7 @@ use std::os::fd::OwnedFd;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 #[cfg(test)]
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, trace, warn};
@@ -646,6 +646,11 @@ pub struct CanSerialDevice {
     /// units are headed with — the uplink half of a flashing tunnel
     /// ([`CanSerialDevice::set_tunnel_sink`]).
     tunnels: TunnelRegistry,
+    /// Bytes [`Device::receive`] took off the bus since it was opened: the byte
+    /// stream the CAN frames carried, not their CAN framing.
+    bytes_read: AtomicU64,
+    /// Bytes handed to the bus, same measure.
+    bytes_write: AtomicU64,
     stopped: AtomicBool,
 }
 
@@ -732,6 +737,8 @@ impl CanSerialDevice {
             wire,
             link: Mutex::new(link),
             tunnels: TunnelRegistry::new(),
+            bytes_read: AtomicU64::new(0),
+            bytes_write: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
         })
     }
@@ -739,6 +746,20 @@ impl CanSerialDevice {
     /// The UUID this device assigned a node id to.
     pub fn uuid(&self) -> [u8; 6] {
         self.uuid
+    }
+
+    /// Bytes this link has read since it was opened.
+    ///
+    /// The byte stream the CAN frames carried, so the number is comparable
+    /// across transports; the bus's own per-frame overhead is not in it.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes it has written, measured the same way — unit headers included,
+    /// since they are part of the byte stream.
+    pub fn bytes_write(&self) -> u64 {
+        self.bytes_write.load(Ordering::Relaxed)
     }
 
     /// The interface this device opened.
@@ -789,6 +810,8 @@ impl CanSerialDevice {
             frames.len(),
             self.link.lock().unwrap().tx_id()
         );
+        self.bytes_write
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -983,6 +1006,8 @@ impl Device for CanSerialDevice {
                             describe_can_frame(can_frame.id(), can_frame.data())
                         );
                         debug!("received CAN frame of {} bytes", can_frame.data().len());
+                        self.bytes_read
+                            .fetch_add(can_frame.data().len() as u64, Ordering::Relaxed);
                     } else {
                         debug!("ignoring CAN frame for id {:#x}", can_frame.id());
                     }
@@ -1033,6 +1058,8 @@ impl CanSerialDevice {
                 CanSerialLink::for_node(nodeid).expect("a test node id is in the CAN range"),
             ),
             tunnels: TunnelRegistry::new(),
+            bytes_read: AtomicU64::new(0),
+            bytes_write: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
         };
         (device, reader)

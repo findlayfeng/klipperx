@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::fake::{FakeBootloader, Quirk};
 use super::frame::command;
-use super::session::{flash_with_config, FlashError, SessionConfig};
+use super::session::{command as send_command, flash_with_config, FlashError, SessionConfig};
 
 /// Run `body` on a watchdog thread; fail the test if it exceeds 30 s.
 fn bounded(body: impl FnOnce() + Send + 'static) {
@@ -33,6 +33,23 @@ fn test_config() -> SessionConfig {
         read_timeout: Duration::from_millis(40),
         retry_delay: Duration::from_millis(5),
         busy_delay: Duration::from_millis(5),
+    }
+}
+
+/// A transport that never takes a byte: the shape a tty whose device stopped
+/// draining its output queue has, and a CAN socket with a full tx queue.
+struct StalledWriter;
+
+impl std::io::Write for StalledWriter {
+    fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "output queue full",
+        ))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -209,5 +226,80 @@ fn test_verify_detects_a_block_the_device_stored_corrupted() {
         }
         assert_eq!(fake.seen(command::REQUEST_BLOCK), 1, "failed on block 1");
         assert_eq!(fake.seen(command::COMPLETE), 0, "never completed");
+    });
+}
+
+/// The `0xF1` answer is a zero-word frame: it must be read as a NACK (a spent
+/// try), not as a short response — that misreading is what hid a real device
+/// refusing the write behind `Retry("response shorter than one word")`.
+#[test]
+fn test_a_zero_word_nack_frame_is_a_nack_not_a_short_response() {
+    bounded(|| {
+        let fake = FakeBootloader::new();
+        fake.script(command::CONNECT, 1, Quirk::Nack);
+        fake.script(command::CONNECT, 2, Quirk::Nack);
+        fake.script(command::CONNECT, 3, Quirk::Nack);
+        let mut reader = fake.reader();
+        let mut writer = fake.writer();
+        let err = flash_with_config(&mut reader, &mut writer, &payload(), &test_config(), |_| {})
+            .expect_err("three nacks must exhaust the tries");
+        match err {
+            FlashError::RetriesExhausted { cmd, tries, last } => {
+                assert_eq!(cmd, command::CONNECT);
+                assert_eq!(tries, 3);
+                assert_eq!(last, "nack", "the code says nack, not short payload");
+            }
+            other => panic!("expected RetriesExhausted, got {other:?}"),
+        }
+        assert_eq!(fake.seen(command::CONNECT), 3);
+    });
+}
+
+/// The `0xF3` answer is zero-word too: it must reach `Outcome::Busy` (wait,
+/// then spend the try), not be taken for a short response.
+#[test]
+fn test_a_zero_word_busy_frame_spends_a_try_as_busy() {
+    bounded(|| {
+        let fake = FakeBootloader::new();
+        fake.script(command::CONNECT, 1, Quirk::Busy);
+        fake.script(command::CONNECT, 2, Quirk::Busy);
+        fake.script(command::CONNECT, 3, Quirk::Busy);
+        let mut reader = fake.reader();
+        let mut writer = fake.writer();
+        let err = flash_with_config(&mut reader, &mut writer, &payload(), &test_config(), |_| {})
+            .expect_err("three busy answers must exhaust the tries");
+        match err {
+            FlashError::RetriesExhausted { cmd, last, .. } => {
+                assert_eq!(cmd, command::CONNECT);
+                assert_eq!(last, "busy");
+            }
+            other => panic!("expected RetriesExhausted, got {other:?}"),
+        }
+        assert_eq!(fake.seen(command::CONNECT), 3);
+    });
+}
+
+/// A write direction with no takers: the session must give up inside the try's
+/// window with an I/O timeout, not sit in the write forever.
+#[test]
+fn test_a_transport_that_never_takes_the_frame_fails_the_write_within_the_window() {
+    bounded(|| {
+        let fake = FakeBootloader::new();
+        let mut reader = fake.reader();
+        let mut writer = StalledWriter;
+        let cfg = test_config();
+        let start = std::time::Instant::now();
+        let err = send_command(&mut reader, &mut writer, command::CONNECT, &[], &cfg)
+            .expect_err("a stalled write must fail, not block");
+        match err {
+            FlashError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a write timeout, got {other:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= cfg.read_timeout && elapsed < Duration::from_secs(5),
+            "the write waited out exactly one window: {elapsed:?}"
+        );
+        assert_eq!(fake.seen(command::CONNECT), 0, "no byte ever arrived");
     });
 }

@@ -209,11 +209,14 @@ fn handle(state: &mut State, frame: Frame) {
             q.used = true;
             q.kind
         });
-    let orig = u32::from(cmd).to_le_bytes();
+    // NACK, busy and command error carry **no** payload word: katapult answers
+    // them with `command_respond(out, RESPONSE_*, ARRAY_SIZE(out))` on a
+    // two-word `out`, i.e. `(2 - 2) << 24` payload words
+    // (`third_party/katapult/src/command.c`).
     match kind {
-        Some(Quirk::Nack) => push_response(state, build_frame(NACK, &orig)),
-        Some(Quirk::Busy) => push_response(state, build_frame(ACK_BUSY, &orig)),
-        Some(Quirk::Error) => push_response(state, build_frame(ACK_ERROR, &orig)),
+        Some(Quirk::Nack) => push_response(state, build_frame(NACK, &[])),
+        Some(Quirk::Busy) => push_response(state, build_frame(ACK_BUSY, &[])),
+        Some(Quirk::Error) => push_response(state, build_frame(ACK_ERROR, &[])),
         Some(Quirk::Silent) => state.muted.push(cmd),
         Some(Quirk::CorruptResponse) => {
             let good = respond(state, &frame, false);
@@ -282,7 +285,8 @@ fn respond(state: &mut State, frame: &Frame, corrupt_stored: bool) -> Vec<u8> {
             data.extend_from_slice(&[0x11, 0xAA, 0x22, 0xBB, 0x33, 0xCC, 0x00, 0x00]);
             build_frame(ACK_SUCCESS, &data)
         }
-        // Unknown or malformed request: a command error, as the firmware does.
-        _ => build_frame(ACK_ERROR, &orig),
+        // Unknown or malformed request: a command error, as the firmware does
+        // (zero payload words, like the ack of no command at all).
+        _ => build_frame(ACK_ERROR, &[]),
     }
 }

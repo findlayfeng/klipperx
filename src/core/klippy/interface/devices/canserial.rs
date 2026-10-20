@@ -897,7 +897,13 @@ impl Device for CanSerialDevice {
             // A tunnel unit that arrived for this link goes to its listener
             // whole; the frame path cannot see it (its first byte is no klipper
             // length). With none, it is dropped.
-            if let Some((arb, block)) = self.link.lock().unwrap().next_tunnel() {
+            //
+            // The result is taken into a local first so the guard is gone before
+            // the body runs: an `if let` scrutinee temporary lives until the end
+            // of the `if let` (Rust 2021), and the body's `self.id()` locks the
+            // same mutex — that would re-enter it on this thread and deadlock.
+            let tunnel = self.link.lock().unwrap().next_tunnel();
+            if let Some((arb, block)) = tunnel {
                 if !self.tunnels.deliver(arb, &block) {
                     debug!(
                         "[{}]: no tunnel listener for {arb:#x}; dropping {}-byte tunnel block",
@@ -908,7 +914,9 @@ impl Device for CanSerialDevice {
             }
             // The slices came together: the block is logged the way the serial
             // port logs one — however many CAN frames it took, even one.
-            if let Some(frame) = self.link.lock().unwrap().next_frame() {
+            // Same reason as above: `self.id()` below locks the link again.
+            let frame = self.link.lock().unwrap().next_frame();
+            if let Some(frame) = frame {
                 trace!(
                     "rx frame [{}]: {}",
                     self.id(),

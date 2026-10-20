@@ -173,9 +173,11 @@
 //!   of [`Machine::bring_up`].
 //! * **Its failures are failures.** A config that names a board which cannot be
 //!   opened, or a bring-up that does not reach `Ready`, is an `Err` — the config
-//!   said that hardware was there, so it was there to run. Only an unmet
-//!   [`Requires`] and an unset [`HW_CONFIG_ENV`] are skips, and `bring_up` is
-//!   never reached in either case.
+//!   said that hardware was there, so it was there to run. A [`HW_CONFIG_ENV`]
+//!   that is set but names a config that cannot be read or parsed is a failure
+//!   too ([`acquire`] panics): the variable said there was a config to test
+//!   against. Only an unmet [`Requires`] and an unset [`HW_CONFIG_ENV`] are
+//!   skips, and `bring_up` is never reached in either case.
 //!
 //! # The live shape, not the corpus' file-output shape
 //!
@@ -234,8 +236,11 @@
 //! here is `#[ignore]`d. Asking for the ignored ones on a machine with no
 //! `KLIPPERX_HW_CONFIG` prints `HW-IGNORED: <test>: <why>` and **passes** —
 //! "this machine has no board for that" is a skip, and a green run must say so
-//! rather than test nothing quietly. A config that is there and names a device
-//! which then refuses to open is a real failure: it was there to run.
+//! rather than test nothing quietly. The same line is printed when the config is
+//! there but does not provide what the test declared it needs. A config that is
+//! named but unreadable or unparsable is not a skip: it is a failure, because the
+//! variable promised a config. A config that is there and names a device which
+//! then refuses to open is a real failure too: it was there to run.
 //!
 //! # Serialised on the board
 //!
@@ -269,7 +274,6 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::ids::NODEID_FIRST;
-use crate::core::klippy::mcu::serial_ports::SerialPorts;
 use crate::core::klippy::printer::{Printer, PrinterState};
 use crate::core::klippy::reactor::TokioReactor;
 
@@ -522,6 +526,48 @@ fn ensure_not_in_runtime() -> Result<(), String> {
     Ok(())
 }
 
+/// Take `runtime` down, bounded by `timeout`, and say whether it finished inside
+/// the bound.
+///
+/// One measure for both callers — [`Machine::bring_up`]'s failure path and
+/// [`StartedMachine`]'s `Drop` — so "the parts went" and "a part was leaked" are
+/// told apart by the same rule: a device's blocking read cannot be cancelled, so
+/// a runtime that is still alive when the bound runs out is holding one. `Err`
+/// carries the elapsed time, for the message.
+fn shut_down(runtime: Runtime, timeout: Duration) -> Result<(), Duration> {
+    let started = Instant::now();
+    runtime.shutdown_timeout(timeout);
+    let elapsed = started.elapsed();
+    if elapsed < timeout {
+        Ok(())
+    } else {
+        Err(elapsed)
+    }
+}
+
+/// The `Err` a failed [`Machine::bring_up`] returns, once its machine is down.
+///
+/// `reason` is the failure that stopped the bring-up and is always kept as the
+/// `Err`'s beginning; the shutdown's own verdict is appended, never substituted,
+/// because the two are different faults. A runtime that does not close inside
+/// `timeout` is a leaked part, and saying so is the point: the failure path has
+/// no assertion to make — the failure is already being reported — so it reports
+/// this one in the message instead of swallowing it.
+///
+/// `timeout` is a parameter so the bound can be exercised without waiting
+/// [`SHUTDOWN_TIMEOUT`] out; [`Machine::bring_up`] passes exactly that.
+fn bring_up_failure(reason: String, runtime: Runtime, timeout: Duration) -> String {
+    match shut_down(runtime, timeout) {
+        Ok(()) => reason,
+        Err(elapsed) => format!(
+            "{reason}; and the failed machine's runtime did not shut down within \
+             {timeout:?} ({elapsed:?}): a part was leaked, so its blocking device read \
+             is still parked and the next test would trip over it. This is \
+             `StartedMachine`'s own measure, which fails a case for it."
+        ),
+    }
+}
+
 /// A config that satisfies a test's [`Requires`], with the board locked.
 pub struct Machine {
     /// The parsed printer config.
@@ -540,36 +586,11 @@ pub struct Machine {
 /// it has to ask the same question of the same pass. Without this a bridge's mux
 /// firmware is opened with bare frames, answers nothing, and the session times
 /// out in identify — which is how this lane used to fail on a muxed board.
-pub fn apply_id_addressed_transport(config: &Config, section: &ConfigSection, mcu: &mut McuConfig) {
-    if let Some(baud) = id_addressed_baud(config, section) {
-        mcu.shared_baud = Some(baud);
-        // A shared port is addressed by id, which the load path takes from the
-        // allocator; one section takes the first id of the sequence.
-        mcu.id = Some(NODEID_FIRST);
-    }
-}
-
-/// The baud a section's `serial:` path is opened with when the path is
-/// addressed by id, or `None` when it is opened exclusively.
 ///
-/// The load path decides this over the whole config
-/// (`SerialPorts::classify`, driven from `mcu/object.rs`); a hardware test has
-/// the parsed config here, so it asks the same question of the same pass.
-fn id_addressed_baud(config: &Config, section: &ConfigSection) -> Option<u32> {
-    let path = section.get_text("serial")?;
-    let wrapper = ConfigWrapper::with_config(
-        section,
-        crate::core::klippy::config::AccessTracking::shared(),
-        None,
-        config,
-    );
-    let ports = SerialPorts::classify(&wrapper);
-    if ports.is_id_addressed(&path) {
-        ports.effective_baud(&path)
-    } else {
-        None
-    }
-}
+/// The implementation is [`crate::stress::apply_id_addressed_transport`]'s: this
+/// module is `#[cfg(test)]`, that one is not, and the release `klipperx stress`
+/// asks exactly the same question and must get the same answer.
+pub(crate) use crate::stress::apply_id_addressed_transport;
 
 impl Machine {
     /// The whole parsed printer config.
@@ -597,6 +618,10 @@ impl Machine {
     /// `#[test]` — which is refused before any device is touched. A config that
     /// does not satisfy [`Requires`] never gets here — [`acquire`] reports that
     /// as `HW-IGNORED` and hands out no [`Machine`] at all.
+    ///
+    /// A failed machine is taken down before the `Err` is returned, on the bound
+    /// [`StartedMachine`]'s `Drop` uses; a runtime that does not close inside it
+    /// is a leaked part, and the `Err` says so after the original reason.
     pub fn bring_up(&self) -> Result<StartedMachine, String> {
         // First, before any device or config work: a bring-up from inside a
         // runtime cannot work, and a plain `Err` beats tokio's panic (see the
@@ -656,8 +681,7 @@ impl Machine {
                 // leave the next test a parked read to trip over.
                 printer.teardown();
                 drop(printer);
-                runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
-                Err(reason)
+                Err(bring_up_failure(reason, runtime, SHUTDOWN_TIMEOUT))
             }
         }
     }
@@ -765,14 +789,14 @@ impl Drop for StartedMachine {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        let started = Instant::now();
-        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
-        let elapsed = started.elapsed();
+        let leaked = shut_down(runtime, SHUTDOWN_TIMEOUT).err();
         if std::thread::panicking() {
             return;
         }
-        assert!(
-            elapsed < SHUTDOWN_TIMEOUT,
+        let Some(elapsed) = leaked else {
+            return;
+        };
+        panic!(
             "the machine's runtime did not shut down within {SHUTDOWN_TIMEOUT:?} \
              ({elapsed:?}): a part was leaked, so its blocking device read is still parked \
              and the board's session was never closed. The heater ring this used to name \
@@ -858,13 +882,19 @@ fn run_line(test_name: &str) -> String {
 ///
 /// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
 /// decides what it offers. Returns `None` — and prints one
-/// `HW-IGNORED: <test>: <why>` line — when the variable is unset, the file is
-/// missing or unparsable, or the config does not provide `requires`; a skipped
-/// test touches no device and takes no lock.
+/// `HW-IGNORED: <test>: <why>` line — in the two skip cases: the variable is
+/// unset, or the config does not provide `requires`. A skipped test touches no
+/// device and takes no lock.
 ///
 /// Returns `Some(machine)` with the board locked exclusively when everything is
 /// in place, printing the [`run_line`] first. The lock is held until the machine
 /// is dropped, so the test body and its cleanup are one session on the board.
+///
+/// # Panics
+/// When the variable is set but names a config that cannot be used (missing
+/// file, parser error), or the board cannot be locked: the variable said the
+/// machine had a config, so "there was nothing to test" is a failure, not a
+/// skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
     acquire_at(path.as_deref().map(Path::new), test_name, requires)
@@ -882,8 +912,12 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
             None
         }
         Decision::Unreadable(reason) => {
-            println!("HW-IGNORED: {test_name}: {reason}");
-            None
+            // The variable named a config, so this machine was supposed to have
+            // one. Only an unset variable and an unmet `Requires` are skips; a
+            // path that does not exist or a file that does not parse is a
+            // failure — a green run must not report "nothing to test" for a
+            // config the user told it to use.
+            panic!("{test_name}: {HW_CONFIG_ENV} is set but its config cannot be used: {reason}")
         }
         Decision::Missing(missing) => {
             let reasons: Vec<String> = missing.iter().map(ToString::to_string).collect();
@@ -1036,16 +1070,23 @@ mod tests {
 
     /// The transport facts `Machine::open_mcu_named` stamps on a section.
     fn transport_facts(text: &str) -> (Option<u32>, Option<u32>) {
-        let parsed = config(text);
-        let section = parsed.get_section("mcu").expect("the fixture has [mcu]");
+        transport_facts_of(&config(text), "mcu")
+    }
+
+    /// The same for the board called `name`, in the config `parsed`.
+    fn transport_facts_of(parsed: &Config, name: &str) -> (Option<u32>, Option<u32>) {
+        let identifier = mcu_section_id(name);
+        let section = parsed
+            .get_section(&identifier)
+            .unwrap_or_else(|| panic!("the fixture has [{identifier}]"));
         let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
             section,
             crate::core::klippy::config::AccessTracking::shared(),
             None,
-            &parsed,
+            parsed,
         ))
         .expect("the section parses");
-        apply_id_addressed_transport(&parsed, section, &mut mcu);
+        apply_id_addressed_transport(parsed, section, &mut mcu);
         (mcu.shared_baud, mcu.id)
     }
 
@@ -1069,6 +1110,47 @@ mod tests {
              [uart_device uart0]\nuart_mcu: mcu\nuart_oid: uart0\n",
         );
         assert_eq!(facts, (Some(250_000), Some(NODEID_FIRST)));
+    }
+
+    /// Two boards on one shared port are addressed by **different** ids: the
+    /// load path hands every `[mcu]` its own number in declaration order, so
+    /// stamping both with the sequence's first id put two sessions on one id —
+    /// the second board's identify answered for the first.
+    #[test]
+    fn test_two_boards_on_one_shared_port_get_the_ids_the_load_path_gives_them() {
+        let parsed = config(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n",
+        );
+
+        assert_eq!(transport_facts_of(&parsed, "mcu").1, Some(NODEID_FIRST));
+        assert_eq!(
+            transport_facts_of(&parsed, "tool").1,
+            Some(NODEID_FIRST + 1),
+            "the second section of the sequence, not the first id again"
+        );
+    }
+
+    /// The number is the **allocator's**, not the section's index: an explicit
+    /// `canbus_nodeid` anywhere in the config is reserved before the first auto
+    /// id, so the shared port's boards step over it exactly as they do at load.
+    #[test]
+    fn test_an_explicit_nodeid_is_stepped_over_when_stamping_a_shared_port() {
+        let parsed = config(
+            "[mcu]\nserial: /dev/ttyACM0\n\
+             [mcu tool]\nserial: /dev/ttyACM0\n\
+             [mcu can]\nuuid: 11aa22bb33cc\ncanbus_nodeid: 4\n",
+        );
+
+        assert_eq!(
+            transport_facts_of(&parsed, "mcu").1,
+            Some(NODEID_FIRST + 1),
+            "4 is claimed explicitly, so the sequence starts at 5"
+        );
+        assert_eq!(
+            transport_facts_of(&parsed, "tool").1,
+            Some(NODEID_FIRST + 2)
+        );
     }
 
     /// A fixture config file, removed when the test ends.
@@ -1791,6 +1873,62 @@ mod tests {
         );
     }
 
+    /// The failure path's shutdown is checked on the same measure
+    /// [`StartedMachine`]'s `Drop` uses: a runtime that is still alive when the
+    /// bound runs out is a leaked part, and the `Err` carries that after the
+    /// bring-up's own reason instead of hiding it.
+    ///
+    /// The parked blocking read is the leak's shape (a device read cannot be
+    /// cancelled), and the short bound keeps the check off the real
+    /// [`SHUTDOWN_TIMEOUT`].
+    #[test]
+    fn test_a_failed_machine_that_does_not_shut_down_says_so_in_the_err() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failed machine");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            let _ = held.recv();
+        });
+
+        let reason = bring_up_failure(
+            "the machine did not come up: a part never connected".to_string(),
+            runtime,
+            Duration::from_millis(100),
+        );
+
+        assert!(
+            reason.starts_with("the machine did not come up: a part never connected"),
+            "the original reason is kept: {reason}"
+        );
+        assert!(reason.contains("did not shut down"), "{reason}");
+        assert!(reason.contains("leaked"), "{reason}");
+        drop(release);
+    }
+
+    /// The other half: a failed machine whose parts did go hands back the
+    /// bring-up's reason unchanged — the check adds a verdict only when there is
+    /// one.
+    #[test]
+    fn test_a_failed_machine_that_shuts_down_keeps_its_own_reason() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failed machine");
+
+        let reason = bring_up_failure(
+            "the machine did not come up: a part never connected".to_string(),
+            runtime,
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(
+            reason,
+            "the machine did not come up: a part never connected"
+        );
+    }
+
     /// The skip path is unchanged: an unmet [`Requires`] hands back `None` (the
     /// caller sees `HW-IGNORED` and returns), no machine is built, and the board
     /// is not locked — so the next test can have it.
@@ -1809,5 +1947,54 @@ mod tests {
         );
         // A skipped test took no lock: the board is free for whoever comes next.
         let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
+    }
+
+    /// The message a caught panic carried.
+    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_else(|| "a panic with no message".to_string())
+    }
+
+    /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,
+    /// not a skip: the variable said the machine had a config to test against.
+    /// Only an unset variable and an unmet [`Requires`] are skips.
+    #[test]
+    fn test_a_named_config_that_does_not_parse_fails_instead_of_skipping() {
+        let fixture = TempConfig::new("serial: /dev/ttyACM0\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new())
+        })) {
+            Ok(_) => panic!("a config that does not parse is a failure, not a skip"),
+            Err(payload) => payload,
+        };
+
+        let message = panic_message(payload.as_ref());
+        assert!(message.contains("cannot be used"), "{message}");
+        // The parser's own reason travels with it.
+        assert!(
+            message.contains("Parameter outside of section"),
+            "{message}"
+        );
+    }
+
+    /// The same for a path that does not exist: a set variable is a promise.
+    #[test]
+    fn test_a_named_config_that_does_not_exist_fails_instead_of_skipping() {
+        let absent = std::env::temp_dir().join("klipperx-hwtest-does-not-exist/printer.cfg");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(&absent), "self-test", &Requires::new())
+        })) {
+            Ok(_) => panic!("a config path that does not exist is a failure, not a skip"),
+            Err(payload) => payload,
+        };
+
+        let message = panic_message(payload.as_ref());
+        assert!(message.contains("cannot be used"), "{message}");
+        assert!(message.contains("printer.cfg"), "{message}");
     }
 }

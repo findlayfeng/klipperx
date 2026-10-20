@@ -13,6 +13,13 @@
 //! owns, and be lost. With it, the window's log holds both sides interleaved,
 //! which is the only way the two are readable together.
 //!
+//! Neither destination is written from the thread that logged: the formatted
+//! bytes go into a bounded queue that one writer thread drains ([`LogSink`]). The
+//! threads that log are the reactor loop and the MCU's receive task, and on a
+//! card-sized board a write to eMMC/SD can take milliseconds — waiting for the
+//! disk there is waiting in the middle of a move. A full queue drops the record
+//! and counts it ([`dropped_records`]) rather than blocking the caller.
+//!
 //! This module is an application concern that lives in the library because the
 //! library is already where this crate's application entry points live.
 
@@ -20,7 +27,10 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::debug;
@@ -125,21 +135,31 @@ fn detail(filter: &EnvFilter) -> LevelFilter {
 /// Installing twice is not an error: the second attempt is ignored, which is
 /// what a user of the library as a library will do.
 pub fn init(verbose: bool, log_file: Option<&Path>) {
-    let filter = filter_for(verbose, std::env::var("RUST_LOG").ok().as_deref());
-    let output = LogOutput::new(log_file);
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let filter = filter_for(verbose, std::env::var("RUST_LOG").ok().as_deref());
+        let output = LogOutput::new(log_file);
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_target(false)
-                .with_writer(output),
-        )
-        .with(ToWindow)
-        .try_init()
-        .ok();
+        let installed = tracing_subscriber::registry()
+            .with(filter)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_target(false)
+                    .with_writer(output.clone()),
+            )
+            .with(ToWindow)
+            .try_init()
+            .is_ok();
 
-    debug!("Debug mode enabled");
+        // Only a subscriber that was actually installed has records to write out;
+        // otherwise the sink is dropped, and the writer thread with it, having
+        // opened the log file for nothing.
+        if installed {
+            register_exit_drain(&output.sink);
+        }
+
+        debug!("Debug mode enabled");
+    });
 }
 
 /// Open a window over this process's own output.
@@ -182,12 +202,62 @@ fn wall_clock() -> i64 {
     unsafe { libc::time(std::ptr::null_mut()) as i64 }
 }
 
+/// How many formatted records may wait for the writer thread.
+///
+/// Bounded, because the caller is a caller in the middle of something else — the
+/// queue is a handoff, not a buffer of last resort. 1024 records is a few hundred
+/// kilobytes of ordinary log lines: enough to ride out a slow write burst on a
+/// card, small enough that the queue itself never becomes the memory problem it
+/// exists to prevent. What does not fit is dropped, not waited for.
+const QUEUE_CAPACITY: usize = 1024;
+
+/// How long the exit drain waits for the writer thread before giving up.
+///
+/// A process that is exiting has to exit: half a second is long enough to write
+/// the queued records out on a card, and short enough that a stuck destination (a
+/// terminal that stopped reading, a disk that went away) cannot hold the host
+/// hostage. Whatever is still queued after that is lost — the alternative is a
+/// host that will not stop.
+const DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many records were dropped because the writer could not keep up.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// How many records this process has dropped because the writer could not keep
+/// up.
+///
+/// A record is dropped when the queue is full: the thread that logged carries on
+/// instead of waiting for the disk. Never reset — it counts for the life of the
+/// process, and it is the one number a log can offer about its own completeness.
+pub fn dropped_records() -> u64 {
+    DROPPED.load(Ordering::Relaxed)
+}
+
+/// What the thread that logs hands to the writer thread.
+enum Command {
+    /// One formatted record, already bytes.
+    ///
+    /// `to_stdout` is decided by the sender rather than by the writer: whether a
+    /// window is up is a property of the moment the record was made, and the
+    /// window may be gone by the time the writer gets to the record.
+    Record { bytes: Vec<u8>, to_stdout: bool },
+    /// Flush both destinations.
+    Flush,
+    /// Write what is queued, then stop.
+    Shutdown,
+    /// Answer on the channel once everything queued so far has been written.
+    ///
+    /// Tests need a moment at which the writer has caught up; nothing on the
+    /// host's own path may wait for it.
+    #[cfg(test)]
+    Sync(Sender<()>),
+}
+
 /// Where the formatted output goes: stdout (unless a window is up) and, when
-/// `--logfile` was given, that file too.
+/// `--logfile` was given, that file too — through a queue one thread drains.
 #[derive(Clone)]
 struct LogOutput {
-    /// The open log file, shared with every writer the layer makes.
-    file: Option<Arc<Mutex<LogFile>>>,
+    sink: Arc<LogSink>,
 }
 
 impl LogOutput {
@@ -199,13 +269,218 @@ impl LogOutput {
     /// The same, reading "now" from `clock` instead of the wall clock.
     fn with_clock(path: Option<&Path>, clock: Clock) -> Self {
         let file = path.and_then(|path| match LogFile::open(path, clock) {
-            Ok(file) => Some(Arc::new(Mutex::new(file))),
+            Ok(file) => Some(file),
             Err(err) => {
                 eprintln!("warning: cannot open log file {}: {err}", path.display());
                 None
             }
         });
-        Self { file }
+        Self {
+            sink: LogSink::spawn(file),
+        }
+    }
+}
+
+/// The queue a log record is handed to, and the thread that drains it.
+struct LogSink {
+    /// The queue. Bounded ([`QUEUE_CAPACITY`]) and only ever filled without
+    /// waiting.
+    queue: SyncSender<Command>,
+    /// Answered when the writer thread has drained and stopped; taken by
+    /// [`LogSink::drain`], which is why it is an `Option`.
+    finished: Mutex<Option<Receiver<()>>>,
+}
+
+impl LogSink {
+    /// Start the thread that owns the log file and stdout, and the queue that
+    /// feeds it.
+    fn spawn(file: Option<LogFile>) -> Arc<Self> {
+        let (queue, commands) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
+        let (finished, done) = std::sync::mpsc::channel();
+        std::thread::Builder::new()
+            .name("log-writer".to_string())
+            .spawn(move || writer(commands, file, finished))
+            .expect("the log writer thread starts");
+        Arc::new(Self {
+            queue,
+            finished: Mutex::new(Some(done)),
+        })
+    }
+
+    /// Hand one formatted record over, or count it as dropped.
+    ///
+    /// Never waits: a full queue — or a writer thread that is gone — is a lost
+    /// record and an incremented counter, not a delay on the thread that logged.
+    /// Neither is an error to report, because the only thing that could report it
+    /// is the log; a host that cannot write its log still runs.
+    fn submit(&self, bytes: &[u8], to_stdout: bool) {
+        let record = Command::Record {
+            bytes: bytes.to_vec(),
+            to_stdout,
+        };
+        if let Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) =
+            self.queue.try_send(record)
+        {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Ask for a flush, without waiting for it to happen.
+    ///
+    /// A dropped request is harmless because a flush is idempotent: the log
+    /// file's writes are unbuffered, and anything still owed to stdout is flushed
+    /// by the exit drain — a host that asked to flush once has nothing more to say
+    /// than a host that asked twice.
+    fn flush(&self) {
+        let _ = self.queue.try_send(Command::Flush);
+    }
+
+    /// Write what is queued, stop the writer thread, and wait at most `within`.
+    ///
+    /// This is the exit drain: the last records of a run are the interesting ones,
+    /// and they are worth a short wait at the end of the process — and nothing
+    /// more than a short one, because a destination that has stopped accepting
+    /// bytes must not stop the host from exiting.
+    ///
+    /// Returns whether the writer thread finished; if it did not, whatever it still
+    /// held is lost with the process.
+    fn drain(&self, within: Duration) -> bool {
+        let finished = self
+            .finished
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        // Already drained, or (in a test) a sink that never had a writer thread.
+        let Some(finished) = finished else {
+            return false;
+        };
+        let deadline = Instant::now() + within;
+        // Handing the shutdown over can need a wait of its own: the queue may be
+        // full of records the thread has not written yet, and it can only make
+        // room by writing them. The whole drain is still bounded by `within`.
+        loop {
+            match self.queue.try_send(Command::Shutdown) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return false,
+                Err(TrySendError::Full(_)) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return false;
+                    }
+                    std::thread::sleep(left.min(Duration::from_millis(1)));
+                }
+            }
+        }
+        finished
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .is_ok()
+    }
+
+    /// Wait for the writer thread to have written everything queued so far.
+    ///
+    /// A test helper, not a host path: the host never waits for its own log.
+    #[cfg(test)]
+    fn sync(&self) {
+        let (done, written) = std::sync::mpsc::channel();
+        if self.queue.send(Command::Sync(done)).is_ok() {
+            let _ = written.recv_timeout(Duration::from_secs(10));
+        }
+    }
+}
+
+/// The writer thread: the only thing that touches stdout and the log file.
+///
+/// A thread of its own because the threads that log are the ones that must not
+/// wait — the reactor loop and the MCU's receive task are not the place to spend
+/// a card's write latency. It blocks on the queue when there is nothing to write,
+/// which costs nothing.
+fn writer(mut commands: Receiver<Command>, mut file: Option<LogFile>, finished: Sender<()>) {
+    while let Ok(command) = commands.recv() {
+        if let Command::Shutdown = command {
+            // A shutdown is not a discarding stop: what is already queued is
+            // written first, which is what the caller waits for.
+            while let Ok(command) = commands.try_recv() {
+                write_command(command, &mut file);
+            }
+            flush_destinations(&mut file);
+            break;
+        }
+        write_command(command, &mut file);
+    }
+    let _ = finished.send(());
+}
+
+/// Do one queued command's work, on the writer thread.
+fn write_command(command: Command, file: &mut Option<LogFile>) {
+    match command {
+        Command::Record { bytes, to_stdout } => {
+            // A write to either destination failing must not lose the other, and
+            // must not take the host down: a host that cannot write its log file
+            // still runs.
+            if to_stdout {
+                let _ = std::io::stdout().write_all(&bytes);
+            }
+            if let Some(file) = file.as_mut() {
+                let _ = file.write_all(&bytes);
+            }
+        }
+        Command::Flush => flush_destinations(file),
+        // Handled by the loop itself; a record queued after a shutdown is one the
+        // process no longer owes.
+        Command::Shutdown => {}
+        #[cfg(test)]
+        Command::Sync(done) => {
+            let _ = done.send(());
+        }
+    }
+}
+
+/// Flush stdout and the log file, ignoring failures the way a record's writes do.
+fn flush_destinations(file: &mut Option<LogFile>) {
+    let _ = std::io::stdout().flush();
+    if let Some(file) = file.as_mut() {
+        let _ = file.flush();
+    }
+}
+
+/// The sinks the process has to write out before it exits.
+///
+/// Only [`init`] registers here, so a test's own sinks are neither held alive by
+/// this list nor written at the end of the test binary.
+static SINKS: Mutex<Vec<Arc<LogSink>>> = Mutex::new(Vec::new());
+
+/// Whether the exit handler below has been installed.
+static EXIT_DRAIN: Once = Once::new();
+
+/// Have the process write out `sink`'s queue when it exits.
+///
+/// The records at the end of a run are the ones that matter — the shutdown, the
+/// error that ended it — and a log file or a pipe to `tail` can still hold them
+/// when `main` returns. `atexit` is the hook this build has: the binaries call
+/// [`init`] and exit as they please, and nothing in the host would call a drain of
+/// its own.
+fn register_exit_drain(sink: &Arc<LogSink>) {
+    SINKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .push(Arc::clone(sink));
+    EXIT_DRAIN.call_once(|| {
+        // SAFETY: `atexit` only stores the function pointer. The handler reads
+        // state this module owns — the sink list and the writers' queues — none of
+        // which the C library tears down before it runs.
+        unsafe { libc::atexit(drain_at_exit) };
+    });
+}
+
+/// Write out every registered sink, waiting a bounded moment for each.
+extern "C" fn drain_at_exit() {
+    let sinks: Vec<Arc<LogSink>> = SINKS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .drain(..)
+        .collect();
+    for sink in sinks {
+        sink.drain(DRAIN_TIMEOUT);
     }
 }
 
@@ -379,42 +654,30 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogOutput {
 
     fn make_writer(&'a self) -> Self::Writer {
         Tee {
-            file: self.file.clone(),
+            sink: Arc::clone(&self.sink),
         }
     }
 }
 
-/// One formatted record's destination: stdout (or nowhere while a window is up)
-/// plus the log file.
+/// One formatted record's destination: the writer thread's queue.
+///
+/// The layer hands a whole record over in one `write_all`; nothing here waits for
+/// it to be written — see [`LogSink::submit`] for what a full queue does.
 struct Tee {
-    file: Option<Arc<Mutex<LogFile>>>,
+    sink: Arc<LogSink>,
 }
 
 impl Write for Tee {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // A write to either destination failing must not lose the other, and
-        // must not make the tracing layer panic: a host that cannot write its
-        // log file still runs.
-        if window().is_none() {
-            let _ = std::io::stdout().write_all(buf);
-        }
-        if let Some(file) = &self.file {
-            let _ = file
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .write_all(buf);
-        }
+        // The window gate stays on this side of the queue: whether these bytes go
+        // to stdout is a property of the moment the record was made, not of the
+        // moment the writer gets to it.
+        self.sink.submit(buf, window().is_none());
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let _ = std::io::stdout().flush();
-        if let Some(file) = &self.file {
-            let _ = file
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .flush();
-        }
+        self.sink.flush();
         Ok(())
     }
 }

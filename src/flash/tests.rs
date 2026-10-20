@@ -3,14 +3,17 @@
 //! panics if the body outlives its deadline, so a broken bound in the session
 //! fails the suite instead of hanging it.
 
+use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use super::fake::{FakeBootloader, Quirk};
-use super::frame::command;
-use super::session::{command as send_command, flash_with_config, FlashError, SessionConfig};
+use super::frame::{build_frame, command, ACK_SUCCESS};
+use super::session::{
+    command as send_command, connect, flash_with_config, FlashError, SessionConfig,
+};
 
 /// Run `body` on a watchdog thread; fail the test if it exceeds 30 s.
 fn bounded(body: impl FnOnce() + Send + 'static) {
@@ -62,6 +65,18 @@ fn padded_tail() -> Vec<u8> {
     let mut tail = payload()[64..].to_vec();
     tail.resize(64, 0xFF);
     tail
+}
+
+/// A `CONNECT` ack reporting `block_size`, the rest of its data shaped like the
+/// fake bootloader's (`super::fake`): protocol 1.0.2, the STM32 start address,
+/// a NUL-padded `STM32F103`.
+fn connect_ack(block_size: u32) -> Vec<u8> {
+    let mut data = u32::from(command::CONNECT).to_le_bytes().to_vec();
+    data.extend_from_slice(&0x0001_0002u32.to_le_bytes());
+    data.extend_from_slice(&0x0800_2000u32.to_le_bytes());
+    data.extend_from_slice(&block_size.to_le_bytes());
+    data.extend_from_slice(b"STM32F103\0\0\0");
+    build_frame(ACK_SUCCESS, &data)
 }
 
 #[test]
@@ -301,5 +316,36 @@ fn test_a_transport_that_never_takes_the_frame_fails_the_write_within_the_window
             "the write waited out exactly one window: {elapsed:?}"
         );
         assert_eq!(fake.seen(command::CONNECT), 0, "no byte ever arrived");
+    });
+}
+
+/// `CONNECT`'s block size has to fit one katapult frame: a `SEND_BLOCK` is
+/// `8 + 4 + block_size` bytes and the firmware stops at `MESSAGE_MAX` 128 B
+/// (`third_party/katapult/src/command.h`), so a 128/256/512 B block would be
+/// NACKed and dropped, and the session would retry itself out instead of saying
+/// why. The refusal names the frame limit and the size it was handed.
+#[test]
+fn test_connect_refuses_a_block_size_no_katapult_frame_can_carry() {
+    bounded(|| {
+        // 64 B is what the arch Kconfigs build katapult with: accepted.
+        let mut reader = Cursor::new(connect_ack(64));
+        let mut writer = Vec::new();
+        let info =
+            connect(&mut reader, &mut writer, &test_config()).expect("a 64 B block fits one frame");
+        assert_eq!(info.block_size, 64);
+
+        for block_size in [128u32, 256, 512] {
+            let mut reader = Cursor::new(connect_ack(block_size));
+            let mut writer = Vec::new();
+            let err = connect(&mut reader, &mut writer, &test_config())
+                .expect_err("a block that does not fit one frame is refused");
+            match err {
+                FlashError::Protocol(msg) => assert!(
+                    msg.contains("128") && msg.contains(&block_size.to_string()),
+                    "the refusal names the frame limit and the size: {msg}"
+                ),
+                other => panic!("expected a protocol error, got {other:?}"),
+            }
+        }
     });
 }

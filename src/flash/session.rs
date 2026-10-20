@@ -272,7 +272,16 @@ pub fn command<R: Read, W: Write>(
 }
 
 /// `CONNECT`: returns protocol version, start address, block size and MCU
-/// identity; rejects a block size the flasher cannot use (not 64/128/256/512).
+/// identity; rejects a block size no katapult frame can carry.
+///
+/// A block arrives as one `SEND_BLOCK` frame: `12 + block_size` bytes (header and
+/// trailer, the address word, the data). katapult's frames stop at `MESSAGE_MAX`
+/// 128 B (`third_party/katapult/src/command.h`, enforced by `command_find_block`,
+/// which NACKs and drops such a frame), so the 128, 256 and 512 B blocks
+/// `flashtool.py` would accept cannot travel: the session would retry each one
+/// out instead of saying why. 64 B — what katapult's arch Kconfigs build with by
+/// default (`BLOCK_SIZE`) and what a real bootloader reports — is the largest of
+/// those sizes that fits one frame, so a larger one is refused here.
 pub fn connect<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
@@ -281,9 +290,10 @@ pub fn connect<R: Read, W: Write>(
     let data = command(reader, writer, frame::command::CONNECT, &[], cfg)?;
     let info = ConnectInfo::parse(&data)
         .ok_or_else(|| FlashError::Protocol("CONNECT ack shorter than 12 bytes".into()))?;
-    if !matches!(info.block_size, 64 | 128 | 256 | 512) {
+    if info.block_size == 0 || info.block_size > 64 {
         return Err(FlashError::Protocol(format!(
-            "invalid block size {}",
+            "invalid block size {}: a SEND_BLOCK frame is 12 + block_size bytes and a katapult \
+             frame stops at 128 bytes (MESSAGE_MAX), so only a 64-byte block fits",
             info.block_size
         )));
     }

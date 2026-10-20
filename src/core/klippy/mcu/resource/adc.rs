@@ -263,27 +263,33 @@ impl AdcState {
             return;
         };
         let old_format = *self.lock(|state| &state.old_format);
+        // `next_clock` is when the **next** report is due, so every sample of
+        // this one is dated backwards from it: the last sample of a batch sits
+        // one report period before `next_clock`, the first one `count` periods
+        // before (`klippy/mcu.py:635,644`).
+        let report_clock = i64::from(*self.lock(|state| &state.report_clock));
 
         let samples: Vec<(f64, f64)> = if old_format {
             let raw = match values.get(2) {
                 Some(ArgValue::UInt16(value)) => *value,
                 _ => return,
             };
-            vec![(mapping.print_time(next_clock), self.scale(raw))]
+            vec![(
+                mapping.print_time(next_clock - report_clock),
+                self.scale(raw),
+            )]
         } else {
             let bytes = match values.get(2) {
                 Some(ArgValue::Bytes(bytes)) => bytes,
                 _ => return,
             };
-            let report_clock = i64::from(*self.lock(|state| &state.report_clock));
             let count = bytes.len() / 2;
             let mut samples = Vec::with_capacity(count);
             for (index, pair) in bytes.chunks_exact(2).enumerate() {
                 let raw = u16::from_le_bytes([pair[0], pair[1]]);
-                // The last sample is the report; earlier ones are one report
-                // period apart. The back-off happens in the 64-bit domain, so
-                // the wrap cannot fold into a huge unsigned difference.
-                let clock = next_clock - (count - 1 - index) as i64 * report_clock;
+                // The back-off happens in the 64-bit domain, so a report that
+                // straddles the wrap cannot fold into a huge difference.
+                let clock = next_clock - (count - index) as i64 * report_clock;
                 samples.push((mapping.print_time(clock), self.scale(raw)));
             }
             samples
@@ -727,8 +733,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_the_old_report_scales_the_single_value() {
+    async fn test_the_old_report_dates_the_sample_one_report_back() {
         let (chip, clock) = dated_clock(0);
+        // `next_clock` is when the next report is due, so the sample in this one
+        // is a report period older (`klippy/mcu.py:635`).
         let expected_time = chip.clock_to_print_time(5_000).unwrap();
         let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -741,7 +749,7 @@ mod tests {
 
         state.handle(&[
             ArgValue::UInt8(0),
-            ArgValue::UInt32(5_000),
+            ArgValue::UInt32(2_005_000),
             ArgValue::UInt16(4095),
         ]);
 
@@ -757,8 +765,10 @@ mod tests {
         // Seeded just below the wrap, so both reports extend forwards from it:
         // the first stays at 0xffff_ff00, the second becomes 0x1_0000_0100.
         let (chip, clock) = dated_clock(0xffff_fe00);
-        let first = chip.clock_to_print_time(0xffff_ff00).unwrap();
-        let second = chip.clock_to_print_time(0x0001_0000_0100).unwrap();
+        let first = chip.clock_to_print_time(0xffff_ff00 - 2_000_000).unwrap();
+        let second = chip
+            .clock_to_print_time(0x0001_0000_0100 - 2_000_000)
+            .unwrap();
         let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
@@ -782,20 +792,24 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
+        // Running past the wrap while the samples are dated.
         assert!(
             seen[1].0 > seen[0].0,
             "the second sample is dated before the first: {:?}",
             *seen
         );
-        // 0x200 ticks apart, both dates from the chip's own conversion.
+        // One report period back from each `next_clock`, from the chip's own
+        // conversion.
         assert_eq!([seen[0].0, seen[1].0], [first, second]);
     }
 
     #[tokio::test]
-    async fn test_the_batched_report_dates_each_sample() {
+    async fn test_the_batched_report_dates_each_sample_back_from_the_next_one() {
         let (chip, clock) = dated_clock(0);
-        let first = chip.clock_to_print_time(8_000).unwrap();
-        let last = chip.clock_to_print_time(9_000).unwrap();
+        // Two samples one report period (1000 ticks) apart, both dated back
+        // from the *next* report: 9_000 - 2 * 1000 and 9_000 - 1000.
+        let first = chip.clock_to_print_time(7_000).unwrap();
+        let last = chip.clock_to_print_time(8_000).unwrap();
         let state = state(clock, false, 1.0 / 4095.0, 1_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
@@ -804,7 +818,8 @@ mod tests {
             .replace(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
             }));
-        // Two samples, the report clock 1000 later: the first is one period back.
+        // Two samples, the report clock 1000 apart: each is dated one period
+        // before the report that follows it.
         let bytes = vec![0xff, 0x0f, 0x00, 0x08]; // 4095, 2048
         state.handle(&[
             ArgValue::UInt8(0),

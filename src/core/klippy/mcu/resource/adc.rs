@@ -125,8 +125,8 @@ struct AdcState {
     last_value: Mutex<Option<(f64, f64)>>,
     /// Whether an undatable report has already been warned about.
     undated_reported: Mutex<bool>,
-    /// The consumer's callback.
-    callback: Mutex<Option<AdcCallback>>,
+    /// The consumer's callback, shared so it can be cloned out before it runs.
+    callback: Mutex<Option<Arc<AdcCallback>>>,
 }
 
 /// One analog input on an MCU.
@@ -214,7 +214,7 @@ impl Adc for McuAdc {
     }
 
     fn setup_adc_callback(&self, callback: AdcCallback) {
-        *self.state.lock(|state| &state.callback) = Some(callback);
+        *self.state.lock(|state| &state.callback) = Some(Arc::new(callback));
     }
 
     fn get_last_value(&self) -> Option<(f64, f64)> {
@@ -298,9 +298,12 @@ impl AdcState {
         if let Some(last) = samples.last() {
             *self.lock(|state| &state.last_value) = Some(*last);
         }
-        let callback = self.lock(|state| &state.callback);
-        if let Some(callback) = callback.as_ref() {
-            callback(&samples);
+        // Cloned out, then the lock is gone before the consumer runs: a std
+        // mutex is not reentrant, and a consumer that reads this input back
+        // from its callback (`get_last_value`) would deadlock on it.
+        let callback = self.lock(|state| &state.callback).clone();
+        if let Some(callback) = callback {
+            (*callback)(&samples);
         }
     }
 
@@ -763,9 +766,9 @@ mod tests {
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         state.handle(&[
             ArgValue::UInt8(0),
@@ -794,9 +797,9 @@ mod tests {
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         // The 32-bit report clock wraps between the two reports.
         state.handle(&[
@@ -835,9 +838,9 @@ mod tests {
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
         // Two samples, the report clock 1000 apart: each is dated one period
         // before the report that follows it.
         let bytes = vec![0xff, 0x0f, 0x00, 0x08]; // 4095, 2048
@@ -856,6 +859,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_a_consumer_is_called_with_the_callback_lock_released() {
+        let (_chip, clock) = dated_clock(0);
+        let state = state(clock, true, 1.0 / 4095.0, 1_000);
+        let probe = Arc::downgrade(&state);
+        let reentrant: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let reentrant_for_callback = Arc::clone(&reentrant);
+        state
+            .lock(|state| &state.callback)
+            .replace(Arc::new(Box::new(move |_samples| {
+                let state = probe.upgrade().unwrap();
+                // A consumer may re-register itself from its own callback
+                // (`setup_adc_callback`), or touch any other field. A std mutex
+                // is not reentrant, so the callback lock has to be free here.
+                *reentrant_for_callback.lock().unwrap() = Some(state.callback.try_lock().is_ok());
+            })));
+
+        state.handle(&[
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(2_000),
+            ArgValue::UInt16(4095),
+        ]);
+
+        assert_eq!(*reentrant.lock().unwrap(), Some(true));
+    }
+
     #[test]
     fn test_a_report_before_the_clock_mapping_is_dropped_whole() {
         let state = state(undated_clock(), false, 1.0 / 4095.0, 1_000);
@@ -863,9 +892,9 @@ mod tests {
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         state.handle(&[
             ArgValue::UInt8(0),

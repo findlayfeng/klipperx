@@ -150,9 +150,18 @@ impl McuPwm {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))
     }
 
-    /// Send a runtime command to the connected device.
-    fn send<C: McuCommand>(&self, cmd: &C) -> Result<(), McuError> {
-        self.connected_mcu()?.send_msg(cmd)
+    /// Send a **move-class** command to the connected device.
+    ///
+    /// Both duty commands take a node from the board's move free list in the
+    /// firmware (`pwmcmds.c:86`, `gpiocmds.c:148` — `move_alloc()`, which
+    /// shuts down with "Move queue overflow" on an empty list), so they enter
+    /// this MCU's move pool instead of the plain send path
+    /// ([`Mcu::send_move_msg`]). The command's own clock is both when the
+    /// change is due and when its slot frees — the pair `queue_digital_out`
+    /// uses (`resource/pin.rs`).
+    fn send_move<C: McuCommand>(&self, cmd: &C, clock: u32) -> Result<(), McuError> {
+        self.connected_mcu()?
+            .send_move_msg(cmd, u64::from(clock), u64::from(clock))
     }
 
     /// Lock one of the shared state's fields.
@@ -193,17 +202,23 @@ impl PwmOut for McuPwm {
 
         let hardware = *self.lock(|state| &state.hardware);
         if hardware {
-            self.send(&QueuePwmOut {
-                oid,
+            self.send_move(
+                &QueuePwmOut {
+                    oid,
+                    clock,
+                    value: scaled as u16,
+                },
                 clock,
-                value: scaled as u16,
-            })?;
+            )?;
         } else {
-            self.send(&QueueDigitalOut {
-                oid,
+            self.send_move(
+                &QueueDigitalOut {
+                    oid,
+                    clock,
+                    on_ticks: scaled,
+                },
                 clock,
-                on_ticks: scaled,
-            })?;
+            )?;
         }
         *self.lock(|state| &state.last_clock) = clock;
         *self.lock(|state| &state.last_value) = value;
@@ -646,6 +661,55 @@ mod tests {
 
         // Hardware PWM: the command is a `queue_pwm_out` and encodes.
         pwm.update_pwm(0.75).unwrap();
+    }
+
+    /// Both duty handlers `move_alloc()` in the firmware (`pwmcmds.c:86`,
+    /// `gpiocmds.c:148`), so a queued change holds a slot in the move pool —
+    /// the plain send path would leave the pool empty.
+    #[tokio::test]
+    async fn test_a_queued_hardware_duty_enters_the_move_pool() {
+        let (chip, pins) = chip();
+        let pwm = pins.setup_pwm("PA1", None).unwrap();
+        pwm.setup_cycle_time(0.1, true);
+        pwm.setup_max_duration(0.0);
+        pwm.setup_start_value(0.0, 0.0);
+        let mcu = Arc::new(mcu_with_clock());
+        chip.config().build(mcu.as_ref()).unwrap();
+        chip.attach(Arc::clone(&mcu));
+
+        pwm.set_pwm(1_000_000, 0.75).unwrap();
+
+        let pending = mcu
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .pending
+            .len();
+        assert_eq!(pending, 1);
+    }
+
+    /// The software path's `queue_digital_out` is the same move-class command
+    /// a plain digital output sends (`resource/pin.rs`).
+    #[tokio::test]
+    async fn test_a_queued_software_duty_enters_the_move_pool() {
+        let (chip, pins) = chip();
+        let pwm = pins.setup_pwm("PB2", None).unwrap();
+        pwm.setup_cycle_time(0.1, false);
+        pwm.setup_max_duration(0.0);
+        pwm.setup_start_value(0.0, 0.0);
+        let mcu = Arc::new(mcu_with_clock());
+        chip.config().build(mcu.as_ref()).unwrap();
+        chip.attach(Arc::clone(&mcu));
+
+        pwm.set_pwm(1_000_000, 0.5).unwrap();
+
+        let pending = mcu
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .pending
+            .len();
+        assert_eq!(pending, 1);
     }
 
     #[tokio::test]

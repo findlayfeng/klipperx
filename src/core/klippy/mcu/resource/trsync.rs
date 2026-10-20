@@ -222,11 +222,40 @@ impl Completion {
 pub struct TriggerGroup {
     trsyncs: Mutex<Vec<Arc<McuTrsync>>>,
     completion: Arc<Completion>,
-    /// Whether the group can still trigger, as far as the host knows.
+    /// Whether the group can still trigger, as far as the host knows
+    /// (`trdispatch.c:21`): set when a dispatch arms, cleared by the report
+    /// that closes it, and read to drop reports a closed dispatch can no
+    /// longer use (`trdispatch.c:78-79`).
     can_trigger: AtomicBool,
 }
 
 impl TriggerGroup {
+    /// Close the group on a `can_trigger=0` report: it can no longer trigger,
+    /// and every MCU in it is told to trigger.
+    ///
+    /// Upstream `handle_trsync_state` (`chelper/trdispatch.c:81-89`): the MCU
+    /// that reported has already stopped watching — it hit the endstop or its
+    /// expire timer fired — while the others may still be driving the move, so
+    /// each one gets `trsync_trigger` (the reporting MCU included, as upstream's
+    /// loop does) with `HOST_REQUEST`. Then the reason is recorded, after the
+    /// triggers go out, so the completion never precedes the stop messages.
+    fn close(&self, raw_reason: u8) {
+        self.can_trigger.store(false, Ordering::SeqCst);
+        let trsyncs: Vec<Arc<McuTrsync>> = self
+            .trsyncs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        for trsync in &trsyncs {
+            trsync.send_trigger(TriggerReason::HostRequest);
+        }
+        // Zero is not a reason the firmware reports, so it completes nothing,
+        // as before.
+        if raw_reason != 0 {
+            self.completion.complete_raw(raw_reason);
+        }
+    }
+
     /// Recompute the minimum acknowledged time and extend each MCU's deadline
     /// (`handle_trsync_state`).
     ///
@@ -536,17 +565,38 @@ impl McuTrsync {
         }
     }
 
+    /// Send `trsync_trigger` for this trsync's MCU (`send_trsync_trigger`,
+    /// `chelper/trdispatch.c:40-47`): fire-and-forget, no answer awaited.
+    fn send_trigger(&self, reason: TriggerReason) {
+        if let Some(mcu) = self.chip.mcu() {
+            let _ = mcu.send_msg(&TrsyncTrigger {
+                oid: self.oid,
+                reason: reason as u8,
+            });
+        }
+    }
+
     /// Handle one `trsync_state` (`MCU_trsync._handle_trsync_state`).
     fn handle_state(&self, state: TrsyncState) {
+        let group = self.group.upgrade();
+        // A group that has closed takes no report: what arrives now is the tail
+        // of the round that closed it — the answer to the `trsync_trigger`s its
+        // close broadcast. Upstream returns immediately here
+        // (`chelper/trdispatch.c:78-79`), because taking such a report would
+        // extend timeouts, fire `PAST_END_TIME`, or complete a dispatch with
+        // the previous round's reason.
+        if group
+            .as_ref()
+            .is_some_and(|group| !group.can_trigger.load(Ordering::SeqCst))
+        {
+            return;
+        }
         if !state.can_trigger {
             // Record every real reason, including codes the typed enum does
             // not name (5+, `trigger_analog`'s errors): a completion that
-            // stays silent would hang `home_wait`. Zero is not a reason the
-            // firmware reports, so it completes nothing, as before.
-            if state.trigger_reason != 0 {
-                if let Some(group) = self.group.upgrade() {
-                    group.completion.complete_raw(state.trigger_reason);
-                }
+            // stays silent would hang `home_wait`.
+            if let Some(group) = &group {
+                group.close(state.trigger_reason);
             }
             return;
         }
@@ -566,15 +616,10 @@ impl McuTrsync {
                     .home_end_clock
                     .lock()
                     .unwrap_or_else(|p| p.into_inner()) = None;
-                if let Some(mcu) = self.chip.mcu() {
-                    let _ = mcu.send_msg(&TrsyncTrigger {
-                        oid: self.oid,
-                        reason: TriggerReason::PastEndTime as u8,
-                    });
-                }
+                self.send_trigger(TriggerReason::PastEndTime);
             }
         }
-        if let Some(group) = self.group.upgrade() {
+        if let Some(group) = &group {
             group.on_report();
         }
     }
@@ -836,6 +881,10 @@ impl TriggerDispatch {
     }
 
     /// Fire every trsync with `HOST_REQUEST` and return the recorded reason.
+    ///
+    /// The group is closed here too, so the reports these triggers provoke are
+    /// dropped once they arrive (`handle_state`) instead of completing or
+    /// extending a dispatch that already ended.
     pub fn stop(&self) -> TriggerReason {
         self.group.can_trigger.store(false, Ordering::SeqCst);
         for trsync in self
@@ -845,12 +894,7 @@ impl TriggerDispatch {
             .unwrap_or_else(|p| p.into_inner())
             .iter()
         {
-            if let Some(mcu) = trsync.chip.mcu() {
-                let _ = mcu.send_msg(&TrsyncTrigger {
-                    oid: trsync.oid,
-                    reason: TriggerReason::HostRequest as u8,
-                });
-            }
+            trsync.send_trigger(TriggerReason::HostRequest);
         }
         self.group
             .completion
@@ -1204,6 +1248,10 @@ mod tests {
         let trsync = first(&dispatch);
         let registry = chip.trsync_registry();
         registry.register(&trsync);
+        // Armed, so the group can trigger: a report for a dispatch that never
+        // armed is dropped (`handle_state`), which is the case pinned by
+        // `test_a_killed_process_leftover_feed_is_silent_and_cleared_on_connect`.
+        dispatch.start(0.0).unwrap();
 
         // An oid nobody owns stops at the registry: the handler is bound to the
         // MCU, so a late report never falls through to the "unhandled message"
@@ -1248,6 +1296,10 @@ mod tests {
         let registry = chip.trsync_registry();
         registry.register(&tx);
         registry.register(&ty);
+        // Both groups armed: each is open to reports, so a report reaching the
+        // wrong group would complete it.
+        x.start(0.0).unwrap();
+        y.start(0.0).unwrap();
         registry.route(TrsyncState {
             oid: ty.oid,
             can_trigger: false,
@@ -1473,12 +1525,26 @@ mod tests {
         // Let the arm flush as its own block, so the trigger below is answered
         // on its own (the wire answers a whole block at a time).
         sleep(Duration::from_millis(120)).await;
-        dispatch.stop();
+        // The trigger goes out while the group is still armed, and the wire
+        // answers it with the report the firmware sends back. The trigger comes
+        // from the test rather than `TriggerDispatch::stop`, because a closed
+        // group drops reports (`handle_state`): what this test pins is a report
+        // an **open** dispatch must take, routed through the replaced session's
+        // handler.
+        second_session
+            .send_msg(&TrsyncTrigger {
+                oid: trsync.oid(),
+                reason: TriggerReason::HostRequest as u8,
+            })
+            .unwrap();
 
         let reason = timeout(Duration::from_secs(2), completion.wait())
             .await
             .expect("the report must be routed, not dropped as unhandled");
         assert_eq!(reason, TriggerReason::HostRequest);
+        // The close-out `home_wait` runs once the completion has resolved
+        // (`McuEndstop::home_wait`): it tells every MCU in the group to trigger.
+        dispatch.stop();
 
         // The arm and the stop both reached the firmware. `trsync_trigger` is
         // what deletes the firmware's report and expire timers

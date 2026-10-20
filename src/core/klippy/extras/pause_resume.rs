@@ -891,9 +891,26 @@ mod tests {
 
     /// Let a spawned task run (`ManualReactor` runs no tasks, so the test
     /// drives the runtime itself) — the `virtual_sdcard` tests' helper.
-    async fn settle() {
-        for _ in 0..32 {
-            tokio::task::yield_now().await;
+    /// Wait, bounded, for the replay task to report the end of the file.
+    ///
+    /// A fixed number of yields was enough while the 8 KiB read happened on the
+    /// replay task itself: the whole file was consumed inside the yields. The
+    /// read now runs on the blocking pool (`virtual_sdcard`), so a yield budget
+    /// races a real thread and loses under load — the test then reports "the
+    /// replay restarted and finished" for a file that simply had not finished
+    /// yet. Waiting on the line itself is what the assertion is about; the
+    /// deadline is what keeps a genuinely stuck replay from hanging the suite
+    /// (the caller's own assert then prints what was captured).
+    async fn settle(lines: &Arc<Mutex<Vec<String>>>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if emitted(lines)
+                .iter()
+                .any(|line| line == "Done printing file")
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
     }
 
@@ -986,7 +1003,7 @@ mod tests {
         gcode.run_script("RESUME").await.expect("RESUME runs");
         assert!(!object.is_paused());
         reactor.run_due();
-        settle().await;
+        settle(&lines).await;
 
         let out = emitted(&lines);
         assert!(

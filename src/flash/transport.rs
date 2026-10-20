@@ -168,13 +168,19 @@ impl Read for TtyPort<'_> {
 
 impl Write for TtyPort<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // The deadline has to be **here**, not only around the frame: the port
-        // is in blocking mode, so a `write_all` parks inside the driver when the
-        // far end stops draining, and `session::write_frame`'s window can only
-        // be checked between writes. `write_bounded` waits for room under the
-        // serial device's own bound (`WRITE_STALL_BOUND`), the same one
-        // `Device::send` uses, and reports `TimedOut` when it expires.
-        self.dev.borrow_mut().write_bounded(buf)?;
+        // A plain pass-through write, exactly as before the bounded write path
+        // existed. The flash session's own window (`session::write_frame`) is
+        // what bounds a frame, and a blocking `write` on this tty returns as soon
+        // as the driver has taken the bytes.
+        //
+        // It must not go through `write_bounded`: that waits for `poll(POLLOUT)`
+        // first, and on a real katapult flash the first block after `CONNECT`
+        // found the port reporting no room for the whole window on a link that
+        // had just carried the command — so the gate turned a working flash into
+        // "transport took 0 of 76 bytes". The stall this module can act on is
+        // "the session got nothing back in its read window", which it already
+        // measures.
+        self.dev.borrow_mut().write(buf);
         Ok(buf.len())
     }
 

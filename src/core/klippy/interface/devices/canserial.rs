@@ -109,6 +109,15 @@ const CMD_SET_CANBOOT_NODEID: u8 = 0x11;
 /// How long a receive waits for a frame before rechecking the stop flag.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How long one write may wait for the socket to take a frame.
+///
+/// A raw CAN socket blocks once its send buffer is full — a bus whose peer never
+/// acknowledges, or one held down by another process, stops draining it — and a
+/// write without a deadline then waits forever. The kernel turns this option into
+/// `EAGAIN`/`EWOULDBLOCK` once it expires, which every write here reports as an
+/// [`InterfaceError::SendError`] rather than retrying.
+const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+
 // From `linux/can.h` and `linux/can/raw.h`; `libc` does not expose these.
 const CAN_SFF_MASK: u32 = 0x7ff;
 const CAN_EFF_FLAG: u32 = 0x8000_0000;
@@ -1231,7 +1240,43 @@ pub(crate) fn open_socket(wire: CanWire) -> Result<File, InterfaceError> {
     if wire == CanWire::Fd {
         enable_fd_frames(&socket)?;
     }
+    // Not fatal: a socket that took the rest of the options still carries frames,
+    // and a host that cannot set the option at all would otherwise fail to open a
+    // bus it could use. It is said once per socket, and it says the wait is
+    // unbounded from here on.
+    if let Err(e) = set_send_timeout(&socket) {
+        warn!("CAN socket write deadline not set, writes may wait indefinitely: {e}");
+    }
     Ok(socket)
+}
+
+/// Give the socket a deadline for one write: `SEND_TIMEOUT`.
+///
+/// The option is `SO_SNDTIMEO`, so it bounds a *blocking* send rather than making
+/// the socket non-blocking — a full send buffer is the only wait a CAN write has,
+/// and leaving the descriptor blocking keeps every other call as it was.
+fn set_send_timeout(socket: &File) -> Result<(), InterfaceError> {
+    let timeout = libc::timeval {
+        tv_sec: SEND_TIMEOUT.as_secs() as libc::time_t,
+        tv_usec: SEND_TIMEOUT.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: the option value is a `timeval` of the length passed.
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDTIMEO,
+            &timeout as *const libc::timeval as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if rc < 0 {
+        return Err(InterfaceError::Other(format!(
+            "failed to set the CAN socket write deadline: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// Ask the kernel to pass CAN FD frames on this socket.
@@ -2161,6 +2206,77 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.receive(), Some(block));
+    }
+
+    #[test]
+    fn test_a_socket_write_has_a_deadline() {
+        // A full send buffer is the one wait a CAN write has. The socket gets
+        // `SO_SNDTIMEO`, and the kernel then reports the expiry instead of
+        // blocking forever — which is what makes the write sites' `SendError`
+        // reachable at all.
+        let (socket, _reader) = UnixStream::pair().expect("a socket pair");
+        let socket = File::from(OwnedFd::from(socket));
+        set_send_timeout(&socket).expect("the deadline is set on a socket");
+
+        // The option is the one asked for, and it is a whole `timeval`.
+        let mut read_back = libc::timeval {
+            tv_sec: -1,
+            tv_usec: -1,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        // SAFETY: the option value is a `timeval`, and `len` says how much of it
+        // the kernel may write.
+        let rc = unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
+                &mut read_back as *mut libc::timeval as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "the option was set");
+        // The kernel keeps this in timer ticks, so it reads back as the deadline
+        // rounded *up* — never as the unbounded wait, which is zero.
+        assert_eq!(read_back.tv_sec, 0, "a sub-second deadline");
+        assert!(
+            read_back.tv_usec >= SEND_TIMEOUT.as_micros() as libc::suseconds_t
+                && read_back.tv_usec < 2 * SEND_TIMEOUT.as_micros() as libc::suseconds_t,
+            "the deadline is {} ms, rounded up to a tick: {} us",
+            SEND_TIMEOUT.as_millis(),
+            read_back.tv_usec
+        );
+
+        // Fill the buffer with nobody reading: the write that cannot fit reports
+        // the deadline (`EAGAIN`, which std calls `WouldBlock`) instead of
+        // waiting for room that never comes.
+        let started = Instant::now();
+        let chunk = [0u8; 4096];
+        let mut blocked = None;
+        for _ in 0..1024 {
+            match (&socket).write(&chunk) {
+                Ok(_) => {}
+                Err(e) => {
+                    blocked = Some(e);
+                    break;
+                }
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the test is bounded: filling the buffer must not take long"
+            );
+        }
+        let err = blocked.expect("the send buffer fills, so one write has to wait");
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the expired deadline is reported, not another failure: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait ended at the deadline, not far past it: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

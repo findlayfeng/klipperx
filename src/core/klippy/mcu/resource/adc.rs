@@ -32,7 +32,7 @@ use crate::core::klippy::cmd::McuResponse;
 use crate::core::klippy::mcu::{query_slot, ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{Adc, AdcCallback, PinError, PinParams, PrinterPins};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// The format string of the older one-sample query (no `bytes_per_report`).
 ///
@@ -125,6 +125,13 @@ struct AdcState {
     last_value: Mutex<Option<(f64, f64)>>,
     /// Whether an undatable report has already been warned about.
     undated_reported: Mutex<bool>,
+    /// Why the post-init query was not armed, if it failed.
+    ///
+    /// Arming runs after the firmware accepted the configuration, where nothing
+    /// can fail the connect any more; without this record a dead input would
+    /// look exactly like one whose reports never arrive. The message is
+    /// escalated the first time a consumer touches the input.
+    arm_error: Mutex<Option<String>>,
     /// The consumer's callback, shared so it can be cloned out before it runs.
     callback: Mutex<Option<Arc<AdcCallback>>>,
 }
@@ -165,6 +172,7 @@ impl McuAdc {
             old_format: Mutex::new(true),
             last_value: Mutex::new(None),
             undated_reported: Mutex::new(false),
+            arm_error: Mutex::new(None),
             callback: Mutex::new(None),
         });
 
@@ -214,10 +222,14 @@ impl Adc for McuAdc {
     }
 
     fn setup_adc_callback(&self, callback: AdcCallback) {
+        // A consumer attaching to an input that never armed is the first moment
+        // the dead sensor is attributable to somebody: escalate there.
+        self.state.report_arm_failure();
         *self.state.lock(|state| &state.callback) = Some(Arc::new(callback));
     }
 
     fn get_last_value(&self) -> Option<(f64, f64)> {
+        self.state.report_arm_failure();
         *self.state.lock(|state| &state.last_value)
     }
 }
@@ -304,6 +316,23 @@ impl AdcState {
         let callback = self.lock(|state| &state.callback).clone();
         if let Some(callback) = callback {
             (*callback)(&samples);
+        }
+    }
+
+    /// Record that the post-init query could not be armed.
+    fn note_arm_failure(&self, failure: String) {
+        *self.lock(|state| &state.arm_error) = Some(failure);
+    }
+
+    /// Escalate a recorded arming failure to an error, once.
+    ///
+    /// Taken rather than read: a consumer polling [`Adc::get_last_value`] gets
+    /// `None` on every read, and repeating the reason each time would bury it.
+    fn report_arm_failure(&self) {
+        let failure = self.lock(|state| &state.arm_error).take();
+        if let Some(failure) = failure {
+            let oid = *self.lock(|state| &state.oid);
+            error!("ADC input oid={oid:?}: {failure}; it will not report samples");
         }
     }
 
@@ -399,7 +428,9 @@ impl AdcState {
         let state = Arc::clone(self);
         builder.register_post_init_callback(Box::new(move |mcu| {
             if let Err(err) = state.arm_query(mcu, oid) {
-                warn!("MCU '{}': could not arm the ADC query: {err}", mcu.name());
+                let failure = format!("MCU '{}': could not arm the ADC query: {err}", mcu.name());
+                warn!("{failure}");
+                state.note_arm_failure(failure);
                 return;
             }
             if let Err(err) = registry.register(mcu, oid, Arc::clone(&state)) {
@@ -483,6 +514,63 @@ mod tests {
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
+    use std::io::Write;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Run `body`, returning what it returned and the **error** lines it logged.
+    ///
+    /// A dead input has to be attributable in the log, and only an assertion on
+    /// the captured output can tell an `error!` from the `warn!` it replaced.
+    fn capturing_errors<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::ERROR)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let value = tracing::subscriber::with_default(subscriber, body);
+        (value, capture.text())
+    }
+
+    /// A byte sink for the fmt layer above; `with_default` keeps the capture off
+    /// the process-wide subscriber, so tests stay independent of each other.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// A dictionary whose query/response pair matches `batched`.
     fn dictionary(batched: bool) -> Dictionary {
@@ -751,6 +839,7 @@ mod tests {
             old_format: Mutex::new(old_format),
             last_value: Mutex::new(None),
             undated_reported: Mutex::new(false),
+            arm_error: Mutex::new(None),
             callback: Mutex::new(None),
         })
     }
@@ -910,5 +999,57 @@ mod tests {
             state.lock(|state| &state.last_value).as_ref().copied(),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A query that never armed
+    // -----------------------------------------------------------------------
+
+    /// An input with a consumer-facing surface but no build behind it.
+    fn unbuilt_adc() -> McuAdc {
+        McuAdc::new(
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+            "mcu".to_string(),
+            Arc::new(AdcRegistry::new()),
+            PinParams {
+                chip_name: "mcu".to_string(),
+                pin: "PA1".to_string(),
+                invert: false,
+                pullup: 0,
+                share_type: None,
+            },
+            undated_clock(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_arming_is_escalated_once_a_consumer_touches_the_input() {
+        let adc = unbuilt_adc();
+        // The oid arming would have used: the escalation has to name the input.
+        *adc.state.lock(|state| &state.oid) = Some(0);
+        adc.state.note_arm_failure(
+            "MCU 'mcu': could not arm the ADC query: no clock estimate".to_string(),
+        );
+
+        // The consumer attaching is the first moment the dead input has an
+        // owner: the warning that was logged at arming time becomes an error.
+        let (_, log) = capturing_errors(|| adc.setup_adc_callback(Box::new(|_| {})));
+        assert!(
+            log.contains("could not arm the ADC query") && log.contains("oid=Some(0)"),
+            "the arming failure was not escalated: {log}"
+        );
+        assert!(log.contains("will not report samples"), "{log}");
+
+        // Once: a polling consumer must not get the same line on every read.
+        let (value, log) = capturing_errors(|| adc.get_last_value());
+        assert_eq!(value, None);
+        assert_eq!(log, "");
+
+        // The read path escalates too, when it is the first to touch the input.
+        adc.state
+            .note_arm_failure("MCU 'mcu': could not arm the ADC query".to_string());
+        let (_, log) = capturing_errors(|| adc.get_last_value());
+        assert!(log.contains("could not arm the ADC query"), "{log}");
     }
 }

@@ -2167,6 +2167,18 @@ impl Mcu {
         &self.handle
     }
 
+    /// How many bytes this connection's transport has read and written since it
+    /// was opened: `(read, write)`.
+    ///
+    /// The transport's own counters ([`Interface::bytes_read`],
+    /// [`Interface::bytes_write`]), sampled from the print connection. They are
+    /// cumulative and monotonic, so a client that wants a rate takes the
+    /// difference between two readings together with the time between them —
+    /// `last_stats`/`last_stats_time` carries exactly that pair.
+    pub fn wire_bytes(&self) -> (u64, u64) {
+        (self.interface.bytes_read(), self.interface.bytes_write())
+    }
+
     /// Whether this connection had to take over a session that was already
     /// running.
     ///

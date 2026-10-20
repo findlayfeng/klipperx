@@ -17,11 +17,12 @@
 //! file is loaded, and connect is what finally sends them
 //! (`builder.configure`), after identify has made the dictionary available.
 //!
-//! The reported fields are the three identify ones. `last_stats` is upstream's
-//! fourth (`klippy/mcu.py:975`) and is **not** reported yet: it is accumulated
-//! from the `stats` event, which today is only logged
-//! ([`register_stats`](crate::core::klippy::event::stats::register_stats)).
-//! It comes back with the statistics consumer.
+//! The reported fields are the four upstream has: the three identify ones and
+//! `last_stats`, which is accumulated from the firmware's periodic `stats`
+//! event ([`register_stats`](crate::core::klippy::event::stats::register_stats))
+//! and dated by its companion `last_stats_time`. Both appear only once a report
+//! has arrived, as upstream's `last_stats` does (its `stats()` collector is what
+//! adds the key, `klippy/mcu.py:975`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -232,7 +233,8 @@ pub struct McuObject {
     /// same stop again.
     clock_timed_out: AtomicBool,
     /// The latest scheduler load from the firmware's `stats` reports, for
-    /// `get_status`'s `last_stats` (`klippy/mcu.py:974-975`).
+    /// `get_status`'s `last_stats` and `last_stats_time`
+    /// (`klippy/mcu.py:974-975`).
     ///
     /// `Arc` because the `'static` event handler owns its handle to it.
     last_stats: Arc<Mutex<Option<LastStats>>>,
@@ -1597,10 +1599,13 @@ impl PrinterObject for McuObject {
             .unwrap_or_else(|p| p.into_inner())
             .clone();
         // `last_stats` appears only once a report has arrived, as upstream's
-        // does (the key is added by its `stats()` collector).
+        // does (the key is added by its `stats()` collector). `last_stats_time`
+        // is this host's stamp on that same report, so it arrives with it and
+        // never before.
         if let Some(last) = *self.last_stats.lock().unwrap_or_else(|p| p.into_inner()) {
             if let Value::Object(fields) = &mut status {
                 fields.insert("last_stats".to_string(), last.to_json());
+                fields.insert("last_stats_time".to_string(), json!(last.eventtime));
             }
         }
         status
@@ -1868,10 +1873,14 @@ impl PrinterObject for McuObject {
                 .dictionary()
                 .and_then(|dictionary| dictionary.constant_f64("STATS_SUMSQ_BASE"));
             match (freq, sumsq_base) {
-                (Some(freq), Some(sumsq_base)) => {
-                    register_stats(&mcu, freq, sumsq_base, Arc::clone(&self.last_stats))
-                        .map_err(|err| KlippyError::Internal(err.to_string()))?
-                }
+                (Some(freq), Some(sumsq_base)) => register_stats(
+                    &mcu,
+                    freq,
+                    sumsq_base,
+                    Arc::clone(&self.last_stats),
+                    self.printer.clone(),
+                )
+                .map_err(|err| KlippyError::Internal(err.to_string()))?,
                 _ => warn!(
                     "MCU '{}' has no clock statistics constants; last_stats stays empty",
                     self.chip.name()
@@ -2212,12 +2221,14 @@ mod tests {
         FrameMock, FrameRecorder, MappingEntry,
     };
     use crate::core::klippy::interface::devices::serial::{self, DEFAULT_BAUD};
+    use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
-    use crate::core::klippy::printer::PrinterState;
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::printer::{Printer, PrinterState};
+    use crate::core::klippy::reactor::{ManualReactor, Reactor};
     use crate::core::klippy::test_util::wait_until;
-    use tokio::time::Duration;
+    use std::io::Write;
+    use tokio::time::{timeout, Duration};
 
     fn section(sub: Option<&str>) -> ConfigSection {
         ConfigSection::new("mcu", sub)
@@ -2907,20 +2918,293 @@ mod tests {
     #[test]
     fn test_last_stats_appears_in_the_status_once_reported() {
         // Upstream's `MCUStatsHelper` puts the running numbers in `last_stats`
-        // (`klippy/mcu.py:974-975`); before any report the key is absent.
+        // (`klippy/mcu.py:974-975`); before any report both keys are absent.
         let printer = printer();
         let object = McuObject::new(section(None), &printer).unwrap();
         assert!(object.get_status(0.0).get("last_stats").is_none());
+        assert!(object.get_status(0.0).get("last_stats_time").is_none());
 
         *object.last_stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(LastStats {
             mcu_tick_avg: 1.5e-6,
             mcu_tick_stddev: 2.5e-7,
             mcu_tick_awake: 0.25,
+            eventtime: 12.5,
+            bytes_read: 1_024,
+            bytes_write: 2_048,
         });
 
         let status = object.get_status(0.0);
         assert_eq!(status["last_stats"]["mcu_tick_awake"], 0.25);
         assert_eq!(status["last_stats"]["mcu_tick_avg"], 1.5e-6);
+        assert_eq!(status["last_stats"]["bytes_read"], 1_024);
+        assert_eq!(status["last_stats"]["bytes_write"], 2_048);
+        assert_eq!(status["last_stats_time"], 12.5);
+    }
+
+    /// Frame carrying one `stats` report: id 12, then `count`, `sum`, `sumsq`.
+    fn stats_frame(seq: u8, count: u32, sum: u32, sumsq: u32) -> Frame {
+        let mut payload = Payload::new();
+        payload.push_i16(12).unwrap();
+        payload.push_u32(count).unwrap();
+        payload.push_u32(sum).unwrap();
+        payload.push_u32(sumsq).unwrap();
+        Frame::new(seq, payload.into_raw())
+    }
+
+    /// A printer whose clock the test steps, for `last_stats_time`.
+    fn printer_with_clock() -> (Arc<Printer>, Arc<ManualReactor>) {
+        let clock = Arc::new(ManualReactor::new());
+        let reactor: Arc<dyn Reactor> = Arc::clone(&clock) as Arc<dyn Reactor>;
+        let printer = Arc::new(Printer::new(reactor));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        (printer, clock)
+    }
+
+    /// An MCU attached to `object`'s chip whose `get_uptime` answers are the
+    /// given `stats` reports, in order, with [`register_stats`] keeping the
+    /// latest in the object's slot.
+    ///
+    /// A `stats` report is unsolicited on the wire — the firmware sends it every
+    /// five seconds (`src/basecmd.c:332-334`). Answering an unrelated command is
+    /// only how a test gets one to arrive, the same trick `event/mod.rs` uses.
+    fn attached_with_stats(
+        object: &McuObject,
+        printer: &Arc<Printer>,
+        reports: &[(u32, u32, u32)],
+    ) -> Arc<Mcu> {
+        let mappings = reports
+            .iter()
+            .enumerate()
+            .map(|(seq, &(count, sum, sumsq))| MappingEntry {
+                input: Frame::new(seq as u8, vec![4]),
+                outputs: vec![stats_frame(seq as u8, count, sum, sumsq)],
+            })
+            .collect();
+        let mcu = Arc::new(Mcu::for_test(
+            "mcu",
+            Interface::new(FrameMock::new(mappings)),
+        ));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"stats count=%u sum=%u sumsq=%u": 12},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        register_stats(
+            &mcu,
+            72_000_000.0,
+            4.0,
+            Arc::clone(&object.last_stats),
+            Arc::downgrade(printer),
+        )
+        .unwrap();
+        mcu
+    }
+
+    /// The object's report, waiting (bounded) until one stamped `eventtime` has
+    /// arrived.
+    ///
+    /// Waiting on the stamp and not just on "a report arrived" is what tells a
+    /// replacement from the report it replaced: the slot is already filled by
+    /// the earlier one.
+    async fn last_report_at(object: &McuObject, eventtime: f64) -> LastStats {
+        let wait = wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || {
+                object
+                    .last_stats
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some_and(|last| last.eventtime == eventtime)
+            },
+            "a `stats` report must arrive",
+        );
+        timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the wait is bounded");
+        object
+            .last_stats
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("just waited for it")
+    }
+
+    #[tokio::test]
+    async fn test_a_stats_report_becomes_last_stats_with_its_arrival_time() {
+        let (printer, clock) = printer_with_clock();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let mcu = attached_with_stats(&object, &printer, &[(100, 3000, 250_000)]);
+
+        // The report arrives at 2.5 s, so the stamp cannot be mistaken for the
+        // "no report yet" absence of the key.
+        clock.advance(2.5);
+        mcu.send_msg(&GetUptime).unwrap();
+        let last = last_report_at(&object, 2.5).await;
+
+        assert_eq!(last.eventtime, 2.5, "stamped with the machine's clock");
+        assert!((last.mcu_tick_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
+        let status = object.get_status(0.0);
+        assert_eq!(status["last_stats_time"], 2.5);
+        assert_eq!(
+            status["last_stats"]["mcu_tick_awake"].as_f64().unwrap(),
+            3000.0 / 72_000_000.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_later_stats_report_replaces_the_earlier_one() {
+        let (printer, clock) = printer_with_clock();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let mcu = attached_with_stats(
+            &object,
+            &printer,
+            &[(100, 3000, 250_000), (200, 8000, 400_000)],
+        );
+
+        clock.advance(2.5);
+        mcu.send_msg(&GetUptime).unwrap();
+        assert_eq!(last_report_at(&object, 2.5).await.eventtime, 2.5);
+
+        clock.advance(5.0);
+        mcu.send_msg(&GetUptime).unwrap();
+        let second = last_report_at(&object, 7.5).await;
+
+        assert_eq!(
+            second.eventtime, 7.5,
+            "the later report is the one reported"
+        );
+        assert!((second.mcu_tick_awake - 8000.0 / 72_000_000.0).abs() < 1e-18);
+    }
+
+    /// An MCU on `pty`'s line, with [`register_stats`] keeping its reports in
+    /// `object`'s slot.
+    ///
+    /// Unlike [`attached_with_stats`] this transport has a real wire, so its
+    /// byte counters move with what the test writes.
+    fn attached_over_a_line(
+        object: &McuObject,
+        printer: &Arc<Printer>,
+        pty: &Pty,
+        name: &str,
+    ) -> Arc<Mcu> {
+        let device = serial::SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+        let mcu = Arc::new(Mcu::for_test(name, Interface::from_serial(device)));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"stats count=%u sum=%u sumsq=%u": 12},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        register_stats(
+            &mcu,
+            72_000_000.0,
+            4.0,
+            Arc::clone(&object.last_stats),
+            Arc::downgrade(printer),
+        )
+        .unwrap();
+        mcu
+    }
+
+    #[tokio::test]
+    async fn test_last_stats_carries_the_wire_bytes_of_its_own_line() {
+        // The utilization a client computes is `(Δbytes_read + Δbytes_write)`
+        // over the interval: the status has to name the line's own counters, not
+        // another MCU's and not a frame count. The two reports here are of
+        // different lengths, so a mix-up between the lines would also show.
+        let (printer, clock) = printer_with_clock();
+        let first = McuObject::new(section(None), &printer).unwrap();
+        let second = McuObject::new(section(Some("extra")), &printer).unwrap();
+        let first_pty = Pty::new();
+        let second_pty = Pty::new();
+        attached_over_a_line(&first, &printer, &first_pty, "mcu");
+        attached_over_a_line(&second, &printer, &second_pty, "extra");
+
+        let first_report = stats_frame(0, 100, 3000, 250_000).raw_bytes();
+        let second_report = stats_frame(1, 5, 100, 2500).raw_bytes();
+        assert_ne!(
+            first_report.len(),
+            second_report.len(),
+            "the two lines must differ in traffic to tell them apart"
+        );
+        clock.advance(2.5);
+        (&first_pty.master).write_all(&first_report).unwrap();
+        (&second_pty.master).write_all(&second_report).unwrap();
+        last_report_at(&first, 2.5).await;
+        last_report_at(&second, 2.5).await;
+
+        let first_status = first.get_status(0.0);
+        let second_status = second.get_status(0.0);
+        assert_eq!(
+            first_status["last_stats"]["bytes_read"],
+            first_report.len() as u64
+        );
+        assert_eq!(
+            second_status["last_stats"]["bytes_read"],
+            second_report.len() as u64
+        );
+        // Nothing has been sent on either line yet, so neither has written.
+        assert_eq!(first_status["last_stats"]["bytes_write"], 0);
+        assert_eq!(second_status["last_stats"]["bytes_write"], 0);
+        // Each line's own load, from its own report.
+        assert_eq!(
+            first_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            3000.0 / 72_000_000.0
+        );
+        assert_eq!(
+            second_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            100.0 / 72_000_000.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_each_mcu_keeps_its_own_last_stats() {
+        // The slot is per object, so two MCUs report their own load — and the
+        // one that has not spoken yet keeps reporting nothing.
+        let (printer, clock) = printer_with_clock();
+        let first = McuObject::new(section(None), &printer).unwrap();
+        let second = McuObject::new(section(Some("extra")), &printer).unwrap();
+        let first_mcu = attached_with_stats(&first, &printer, &[(100, 3000, 250_000)]);
+        let second_mcu = attached_with_stats(&second, &printer, &[(50, 1000, 60_000)]);
+
+        clock.advance(2.5);
+        first_mcu.send_msg(&GetUptime).unwrap();
+        assert_eq!(last_report_at(&first, 2.5).await.eventtime, 2.5);
+        assert!(second.get_status(0.0).get("last_stats").is_none());
+
+        clock.advance(5.0);
+        second_mcu.send_msg(&GetUptime).unwrap();
+        assert_eq!(last_report_at(&second, 7.5).await.eventtime, 7.5);
+
+        let first_status = first.get_status(0.0);
+        assert_eq!(first_status["last_stats_time"], 2.5);
+        assert_eq!(
+            first_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            3000.0 / 72_000_000.0
+        );
+        let second_status = second.get_status(0.0);
+        assert_eq!(second_status["last_stats_time"], 7.5);
+        assert_eq!(
+            second_status["last_stats"]["mcu_tick_awake"]
+                .as_f64()
+                .unwrap(),
+            1000.0 / 72_000_000.0
+        );
     }
 
     // -----------------------------------------------------------------------

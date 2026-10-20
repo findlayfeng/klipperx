@@ -136,6 +136,8 @@ mod tests {
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::ArgValue;
+    use crate::core::klippy::printer::Printer;
+    use crate::core::klippy::reactor::ManualReactor;
     use tokio::sync::mpsc;
     use tokio::time::{timeout, Duration};
 
@@ -210,8 +212,9 @@ mod tests {
     #[tokio::test]
     async fn test_register_stats_binds_a_handler() {
         let mcu = mcu(Vec::new());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
 
         let slot = Arc::new(std::sync::Mutex::new(None));
-        stats::register_stats(&mcu, 72_000_000.0, 4.0, slot).unwrap();
+        stats::register_stats(&mcu, 72_000_000.0, 4.0, slot, Arc::downgrade(&printer)).unwrap();
     }
 }

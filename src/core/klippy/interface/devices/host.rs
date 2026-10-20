@@ -97,7 +97,7 @@ use std::ffi::CString;
 use std::fmt;
 use std::os::raw::{c_char, c_int, c_long, c_uchar};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -842,6 +842,13 @@ pub struct HostDevice {
     /// and the poll loop. This is per-handle: the library's own `stopped` is
     /// set only by the final teardown.
     stopped: AtomicBool,
+    /// Bytes this reference has read since it was opened: what
+    /// [`Device::receive`] took out of `input`, and what the raw
+    /// [`HostDevice::read`] handed a bench scan.
+    bytes_read: AtomicU64,
+    /// Bytes [`HostDevice::write_raw`] handed the library, mux unit headers
+    /// included — that is what goes on the wire.
+    bytes_write: AtomicU64,
     /// Bytes pulled from `input`, reassembled into frames.
     ///
     /// A release build is handed whole frames and never needs this.
@@ -1091,6 +1098,8 @@ impl HostDevice {
             library,
             reference,
             stopped: AtomicBool::new(false),
+            bytes_read: AtomicU64::new(0),
+            bytes_write: AtomicU64::new(0),
             #[cfg(debug_assertions)]
             stream: Mutex::new(FrameStream::new()),
             raw: Mutex::new(Vec::new()),
@@ -1102,6 +1111,19 @@ impl HostDevice {
     /// Path of the library this reference was loaded from.
     pub fn library_path(&self) -> &Path {
         &self.library.router.library_path
+    }
+
+    /// Bytes this reference has read since it was opened.
+    ///
+    /// Per **reference**, not per library: the library is one loaded object
+    /// shared by the MCUs on it, but each reference owns the queue it reads.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes it has written, mux unit headers included.
+    pub fn bytes_write(&self) -> u64 {
+        self.bytes_write.load(Ordering::Relaxed)
     }
 
     /// Whether this reference is muxed: only a muxed one is addressed by an id,
@@ -1142,6 +1164,7 @@ impl HostDevice {
         let read = buf.len().min(pending.len());
         buf[..read].copy_from_slice(&pending[..read]);
         pending.drain(..read);
+        self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
         Ok(read)
     }
 
@@ -1197,6 +1220,8 @@ impl HostDevice {
                 bytes.len()
             )));
         }
+        self.bytes_write
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -1453,7 +1478,11 @@ impl HostDevice {
                 .input
                 .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
             {
-                Ok(bytes) => self.units.lock().unwrap().feed(&bytes),
+                Ok(bytes) => {
+                    self.bytes_read
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    self.units.lock().unwrap().feed(&bytes);
+                }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return None,
             }
@@ -1553,6 +1582,8 @@ impl Device for HostDevice {
                 .recv_timeout(Duration::from_millis(OUTPUT_WAIT_MS as u64))
             {
                 Ok(bytes) => {
+                    self.bytes_read
+                        .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                     // A debug build reassembles the stream; a release build is
                     // handed whole frames and only has to validate them.
                     #[cfg(debug_assertions)]

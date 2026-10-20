@@ -50,7 +50,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
@@ -113,6 +113,10 @@ pub struct SerialDevice {
     port: File,
     path: PathBuf,
     baud: u32,
+    /// Bytes [`Device::receive`] took off the line since the port was opened.
+    bytes_read: AtomicU64,
+    /// Bytes [`Device::send`] put on it, framing included.
+    bytes_write: AtomicU64,
     /// Bytes read from the port, reassembled into frames.
     stream: Mutex<FrameStream>,
     /// Set by `shutdown`; the read loop checks it between timeouts.
@@ -120,6 +124,19 @@ pub struct SerialDevice {
 }
 
 impl SerialDevice {
+    /// Bytes this connection has read from the port since it was opened.
+    ///
+    /// Counted on the frame path ([`Device::receive`]), not on the bench tools'
+    /// raw [`SerialDevice::read`]: what a client wants to see is the traffic of
+    /// the print connection.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes it has written, everything the tty carried including the framing.
+    pub fn bytes_write(&self) -> u64 {
+        self.bytes_write.load(Ordering::Relaxed)
+    }
     /// Returns a short identifier for logging: `"/dev/ttyACM0"`.
     fn id(&self) -> String {
         self.path.display().to_string()
@@ -195,6 +212,8 @@ impl SerialDevice {
             port,
             path,
             baud,
+            bytes_read: AtomicU64::new(0),
+            bytes_write: AtomicU64::new(0),
             stream: Mutex::new(FrameStream::new()),
             stopped: AtomicBool::new(false),
         })
@@ -352,6 +371,8 @@ impl Device for SerialDevice {
                 self.path.display()
             ))
         })?;
+        self.bytes_write
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         debug!("sent {} bytes to {}", bytes.len(), self.path.display());
         Ok(())
     }
@@ -373,6 +394,7 @@ impl Device for SerialDevice {
                 Ok(read) => {
                     trace!("rx frame [{}]: {}", self.id(), describe_frame(&buf[..read]));
                     debug!("received {} bytes from {}", read, self.path.display());
+                    self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
                     self.stream.lock().unwrap().push(&buf[..read]);
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
@@ -952,6 +974,47 @@ mod tests {
 
         assert_eq!(device.receive(), Some(Frame::new(1, b"one".to_vec())));
         assert_eq!(device.receive(), Some(Frame::new(2, b"two".to_vec())));
+    }
+
+    #[test]
+    fn test_the_port_counts_the_bytes_it_writes() {
+        // What a client turns into port utilization is the line's own traffic:
+        // the frame as it went out, length/seq/CRC/SYNC included, and not the
+        // payload length the caller handed over.
+        let pty = Pty::new();
+        let device = SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+        let frame = Frame::new(0, b"hello".to_vec());
+
+        device.send(&frame).unwrap();
+
+        assert_eq!(
+            device.bytes_write(),
+            Frame::encode(0, b"hello").len() as u64
+        );
+        assert_eq!(device.bytes_read(), 0, "nothing has come back yet");
+    }
+
+    #[test]
+    fn test_the_port_counts_the_bytes_it_reads() {
+        // Cumulative and exact over reads: two frames of different lengths add
+        // up to the bytes the master wrote, not to a frame count.
+        let pty = Pty::new();
+        let device = SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+        let first = Frame::encode(1, b"one");
+        let second = Frame::encode(2, b"two");
+        (&pty.master)
+            .write_all(&[first.clone(), second.clone()].concat())
+            .unwrap();
+
+        let (first_seen, second_seen, counted) = bounded(move || {
+            let first_seen = device.receive();
+            let second_seen = device.receive();
+            (first_seen, second_seen, device.bytes_read())
+        });
+
+        assert_eq!(first_seen, Some(Frame::new(1, b"one".to_vec())));
+        assert_eq!(second_seen, Some(Frame::new(2, b"two".to_vec())));
+        assert_eq!(counted, (first.len() + second.len()) as u64);
     }
 
     /// The same round trip through `Interface`, which is how a transport uses the
@@ -2142,6 +2205,11 @@ pub struct SharedSerialPort {
     /// admin answers, which a scan reads
     /// ([`SharedSerialHandle::set_unit_sink`]).
     units: UnitRegistry,
+    /// Bytes the port's reader took off the line since it was opened — every
+    /// MCU's units together, because there is one wire.
+    bytes_read: AtomicU64,
+    /// Bytes written to the line, unit headers included.
+    bytes_write: AtomicU64,
     stopped: AtomicBool,
     reader: Mutex<Option<JoinHandle<()>>>,
 }
@@ -2419,6 +2487,8 @@ impl SharedSerialPort {
             write_lock: Mutex::new(()),
             tunnels: TunnelRegistry::new(),
             units: UnitRegistry::new(),
+            bytes_read: AtomicU64::new(0),
+            bytes_write: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
             reader: Mutex::new(None),
         });
@@ -2468,7 +2538,11 @@ impl SharedSerialPort {
     fn write_unit(&self, unit: &[u8]) -> Result<(), InterfaceError> {
         let _writing = self.write_lock.lock().unwrap();
         match write_whole(&self.port, unit) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.bytes_write
+                    .fetch_add(unit.len() as u64, Ordering::Relaxed);
+                Ok(())
+            }
             Err(e) => {
                 self.stop();
                 Err(InterfaceError::SendError(format!(
@@ -2527,6 +2601,7 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
             Ok(read) => {
                 pending.extend_from_slice(&buf[..read]);
                 let Some(port) = weak.upgrade() else { return };
+                port.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
                 dispatch(&port, &mut pending, &mut needs_sync);
                 // Drop the strong reference before blocking in `read` again, or
                 // the last handle could never bring the port down. This drop
@@ -2705,6 +2780,20 @@ fn route_ack(port: &SharedSerialPort, mcu_id: u32) {
 }
 
 impl SharedSerialHandle {
+    /// Bytes the port has read since it was opened.
+    ///
+    /// Per **port**, not per MCU: several `[mcu]` sections on one tty share one
+    /// line, so they see the same number. That is the wire they are sharing.
+    pub fn bytes_read(&self) -> u64 {
+        self.port.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes written to the port, unit headers included. Per port, as
+    /// [`Self::bytes_read`].
+    pub fn bytes_write(&self) -> u64 {
+        self.port.bytes_write.load(Ordering::Relaxed)
+    }
+
     /// Write one unit on this port under an arbitrary arbitration id: the
     /// checked two-byte header for `arb` ([`encode_header`]), then `payload`
     /// exactly as given.
@@ -3291,6 +3380,36 @@ mod mux_tests {
             units,
             vec![(assign::arb_id(4).unwrap(), Frame::new(0, b"hello".to_vec()))]
         );
+    }
+
+    #[test]
+    fn the_shared_port_counts_whole_units_header_included() {
+        // The port's counters measure the **line**, so a host→device unit is
+        // counted with the two header bytes that named its MCU — that header is
+        // exactly the traffic two MCUs sharing the tty add. Both directions are
+        // counted on the port, not per handle: it is one wire.
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+        let frame = Frame::new(0, b"hello".to_vec());
+        let unit_len = 2 + frame.raw_bytes().len();
+        // The attach handshake's own request and reply are already in the
+        // counters: what the test adds is measured from here.
+        let baseline_write = handle.bytes_write();
+        let baseline_read = handle.bytes_read();
+
+        handle.send(&frame).unwrap();
+
+        assert_eq!(handle.bytes_write() - baseline_write, unit_len as u64);
+        assert_eq!(
+            handle.bytes_read(),
+            baseline_read,
+            "sending writes; it reads nothing"
+        );
+
+        let answer = device_unit(4, &Frame::encode(1, b"hi"));
+        master_write(&pty.master, &answer);
+        assert_eq!(handle.receive(), Some(Frame::new(1, b"hi".to_vec())));
+        assert_eq!(handle.bytes_read() - baseline_read, answer.len() as u64);
     }
 
     /// With a uuid the handshake starts by naming the board: the SET_NODEID

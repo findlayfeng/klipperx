@@ -18,15 +18,16 @@
 //! consumed by a callback registered through [`Mcu::bind_event`], never by
 //! `call_msg`.
 //!
-//! The real consumer is a statistics display. Until that exists,
-//! [`register_stats_logging`] subscribes a handler that only logs each report,
-//! which is enough to exercise the event path end to end without inventing a
-//! consumer.
+//! The consumer is [`register_stats`]: it keeps the latest report as the
+//! `last_stats` / `last_stats_time` pair `get_status` reports, so a client can
+//! see what the firmware thinks it is doing — and, with two reports, how fast
+//! its clock is running.
 
 use crate::core::klippy::cmd::Params;
 use crate::core::klippy::event::McuEvent;
 use crate::core::klippy::mcu::{Mcu, McuError};
-use std::sync::{Arc, Mutex};
+use crate::core::klippy::printer::Printer;
+use std::sync::{Arc, Mutex, Weak};
 use tracing::info;
 
 /// `stats count=%u sum=%u sumsq=%u` — one timing report from `stats_update`.
@@ -56,7 +57,8 @@ impl McuEvent for Stats {
     }
 }
 
-/// The scheduler load a `stats` report turns into.
+/// The last `stats` report: the scheduler load it turns into, when it arrived,
+/// and how much traffic the transport had carried by then.
 ///
 /// Upstream's `MCUStatsHelper._handle_mcu_stats` (`klippy/mcu.py:931-941`),
 /// the three numbers its `stats()` collector reports and its `get_status`
@@ -65,6 +67,12 @@ impl McuEvent for Stats {
 /// - `mcu_tick_avg` — mean time in scheduled tasks, in seconds;
 /// - `mcu_tick_stddev` — its standard deviation, in seconds;
 /// - `mcu_tick_awake` — total time awake, in seconds.
+///
+/// The rest is this host's, because the report carries only the three numbers
+/// above: `eventtime` stamps it with the machine's clock, and the byte counts
+/// are the transport's, not the firmware's. Upstream fills the same keys from
+/// its C serial queue (`serialqueue_get_stats`,
+/// `klippy/chelper/serialqueue.c:1040-1050`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LastStats {
     /// Mean task duration, seconds.
@@ -73,16 +81,51 @@ pub struct LastStats {
     pub mcu_tick_stddev: f64,
     /// Total time spent awake, seconds.
     pub mcu_tick_awake: f64,
+    /// When the report arrived, in [`Printer::eventtime`] seconds.
+    ///
+    /// A counter delta means nothing without the interval it was measured
+    /// over, so the numbers here are only interpretable next to this.
+    pub eventtime: f64,
+    /// Bytes the transport had read when the report arrived.
+    ///
+    /// Cumulative since it was opened, and the link's traffic as the host sees
+    /// it: a mux unit's header and a tunnel block's bytes are in it. Upstream's
+    /// `bytes_read`.
+    pub bytes_read: u64,
+    /// Bytes it had written: upstream's `bytes_write`.
+    pub bytes_write: u64,
+}
+
+/// What the host knows about a `stats` report besides the firmware's own
+/// numbers.
+///
+/// Gathered at dispatch, on the receive task, so the reader inside
+/// [`from_report`](LastStats::from_report) needs no clock of its own and the
+/// two numbers below are a single point in time.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReportContext {
+    /// [`Printer::eventtime`] seconds when the report arrived.
+    pub eventtime: f64,
+    /// Bytes the transport had read at that moment.
+    pub bytes_read: u64,
+    /// Bytes it had written at that moment.
+    pub bytes_write: u64,
 }
 
 impl LastStats {
     /// Turn one raw report into the three numbers.
     ///
     /// `mcu_freq` is the firmware's `CLOCK_FREQ` and `stats_sumsq_base` its
-    /// `STATS_SUMSQ_BASE`; both are firmware constants read at identify. A
-    /// report with `count == 0` (or a non-positive frequency) has nothing to
-    /// average, so it leaves the previous values in place.
-    pub fn from_report(report: &Stats, mcu_freq: f64, stats_sumsq_base: f64) -> Option<Self> {
+    /// `STATS_SUMSQ_BASE`; both are firmware constants read at identify.
+    /// `context` is the host's side of the same moment. A report with
+    /// `count == 0` (or a non-positive frequency) has nothing to average, so it
+    /// leaves the previous values in place.
+    pub fn from_report(
+        report: &Stats,
+        mcu_freq: f64,
+        stats_sumsq_base: f64,
+        context: ReportContext,
+    ) -> Option<Self> {
         if report.count == 0 || mcu_freq <= 0.0 {
             return None;
         }
@@ -95,40 +138,64 @@ impl LastStats {
             mcu_tick_avg: sum * c,
             mcu_tick_stddev: c * diff.max(0.0).sqrt(),
             mcu_tick_awake: sum / mcu_freq,
+            eventtime: context.eventtime,
+            bytes_read: context.bytes_read,
+            bytes_write: context.bytes_write,
         })
     }
 
-    /// The three numbers as `last_stats`.
+    /// The load and the traffic as `last_stats`.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
             "mcu_tick_avg": self.mcu_tick_avg,
             "mcu_tick_stddev": self.mcu_tick_stddev,
             "mcu_tick_awake": self.mcu_tick_awake,
+            "bytes_read": self.bytes_read,
+            "bytes_write": self.bytes_write,
         })
     }
 }
 
 /// Subscribe a handler that keeps the latest [`LastStats`] in `slot`.
 ///
-/// This replaces the placeholder that only logged each report: the value is
-/// what `get_status` reports as `last_stats`, and the log line stays so the
-/// event path is still visible in DEBUG builds.
+/// The value is what `get_status` reports as `last_stats` and its
+/// `eventtime` as `last_stats_time`; the log line stays so the event path is
+/// still visible in DEBUG builds. `printer` is only read for its clock —
+/// [`Printer::eventtime`] — and a machine that is already gone stamps nothing,
+/// which is why the slot then keeps its previous report.
 ///
 /// # Errors
 /// Returns [`McuError`] when the MCU is not identified, or when its dictionary
 /// has no `stats` response.
 pub fn register_stats(
-    mcu: &Mcu,
+    mcu: &Arc<Mcu>,
     mcu_freq: f64,
     stats_sumsq_base: f64,
     slot: Arc<Mutex<Option<LastStats>>>,
+    printer: Weak<Printer>,
 ) -> Result<(), McuError> {
+    // A `Weak`, like the printer: the callback table belongs to the session and
+    // a handler holding its own `Mcu` strongly would be another
+    // `Mcu → events → handler → Mcu` edge for `clear_events` to break.
+    let connection = Arc::downgrade(mcu);
     mcu.bind_event::<Stats, _>(move |stats| {
         info!(
             "stats count={} sum={} sumsq={}",
             stats.count, stats.sum, stats.sumsq
         );
-        if let Some(last) = LastStats::from_report(&stats, mcu_freq, stats_sumsq_base) {
+        let Some(printer) = printer.upgrade() else {
+            return;
+        };
+        let Some(connection) = connection.upgrade() else {
+            return;
+        };
+        let (bytes_read, bytes_write) = connection.wire_bytes();
+        let context = ReportContext {
+            eventtime: printer.eventtime(),
+            bytes_read,
+            bytes_write,
+        };
+        if let Some(last) = LastStats::from_report(&stats, mcu_freq, stats_sumsq_base, context) {
             *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(last);
         }
     })
@@ -210,9 +277,16 @@ mod tests {
             sum: 3000,
             sumsq: 250_000,
         };
-        let last = LastStats::from_report(&report, 72_000_000.0, 4.0).unwrap();
+        let context = ReportContext {
+            eventtime: 12.5,
+            bytes_read: 1_024,
+            bytes_write: 2_048,
+        };
+        let last = LastStats::from_report(&report, 72_000_000.0, 4.0, context).unwrap();
 
         // c = 1/(100 * 72e6); avg = sum * c; awake = sum / 72e6.
+        assert_eq!(last.eventtime, 12.5, "stamped with the arrival time");
+        assert_eq!((last.bytes_read, last.bytes_write), (1_024, 2_048));
         assert!((last.mcu_tick_avg - 3000.0 / (100.0 * 72_000_000.0)).abs() < 1e-18);
         assert!((last.mcu_tick_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
         // stddev = c * sqrt(count*sumsq*base - sum^2).
@@ -228,6 +302,16 @@ mod tests {
             sum: 0,
             sumsq: 0,
         };
-        assert!(LastStats::from_report(&report, 72_000_000.0, 4.0).is_none());
+        assert!(LastStats::from_report(
+            &report,
+            72_000_000.0,
+            4.0,
+            ReportContext {
+                eventtime: 12.5,
+                bytes_read: 0,
+                bytes_write: 0,
+            }
+        )
+        .is_none());
     }
 }

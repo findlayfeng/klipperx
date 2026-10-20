@@ -567,6 +567,35 @@ impl Interface {
             Transport::Recording(device) => device.shutdown(),
         }
     }
+
+    /// Bytes this transport has read since it was opened.
+    ///
+    /// Cumulative, so a client takes the difference between two readings; a
+    /// test transport has no wire and reports zero. It counts what the byte
+    /// stream carried — a mux unit's header and a tunnel block's bytes included
+    /// — because that is the traffic that fills the link.
+    pub fn bytes_read(&self) -> u64 {
+        match &self.transport {
+            Transport::Serial(device) => device.bytes_read(),
+            Transport::SharedSerial(device) => device.bytes_read(),
+            Transport::CanSerial(device) => device.bytes_read(),
+            Transport::Host(device) => device.bytes_read(),
+            #[cfg(test)]
+            Transport::FrameMock(_) | Transport::Simulator(_) | Transport::Recording(_) => 0,
+        }
+    }
+
+    /// Bytes it has written, cumulative and measured as [`Interface::bytes_read`].
+    pub fn bytes_write(&self) -> u64 {
+        match &self.transport {
+            Transport::Serial(device) => device.bytes_write(),
+            Transport::SharedSerial(device) => device.bytes_write(),
+            Transport::CanSerial(device) => device.bytes_write(),
+            Transport::Host(device) => device.bytes_write(),
+            #[cfg(test)]
+            Transport::FrameMock(_) | Transport::Simulator(_) | Transport::Recording(_) => 0,
+        }
+    }
 }
 
 // ===========================================================================

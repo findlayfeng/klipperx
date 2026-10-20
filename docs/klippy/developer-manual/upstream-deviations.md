@@ -155,6 +155,8 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `--logfile`（澄清项） | [日志与调试](../user-manual/logging.md) | 日志同时写终端与文件 | **上游有** `-l` / `--logfile`（`klippy.py:272`）——此条列出只为消除误解 |
 | `restart_method: rpi_usb` 的 udev 脚本（澄清项） | `scripts/klipperx-usb-udev.sh`、[MCU 连接方式](../user-manual/mcu-connection.md) | 生成 hub 供电授权规则 | 机制上游有（`mcu.py`）；**脚本**是本仓加的 |
 | `scripts/pyref-audit.py` | 本页 §6、[测试](testing.md) | 校验文档/注释里的上游行号引用是否还对上 | **无** |
+| `scripts/kx-sched.py` | [延迟与抖动](latency.md#两个可重跑的测量脚本) | 量**宿主线程**的运行队列等待（两次 `/proc/<pid>/task/*/schedstat` 差分） | **无** |
+| `scripts/stats-jitter.py` | 同上 | 把 `klippy.log` 里的 `stats count=/sum=/sumsq=` 换成固件每轮耗时 avg/sd/awake | **无**（上游 `scripts/graphstats.py` 只吃它自己的 `Stats` 行且要 `print_time`） |
 
 ### 4.3 测试与构建基建
 
@@ -181,7 +183,22 @@ OctoPrint 只走 pty，与本条取舍无关。
 | **CAN 控制器当桥的下游口，以及端口上的 CAN admin 代理** | 上游的 CAN 只有两种身份：本机控制台（`CANSERIAL`）或 USB-CAN；「一块板把 CAN 控制器**转给桥**」不存在，把 `0x3f0`/`0x3f1` 的单帧对话**双向翻译**成 mux 单元更不存在 | `generic/bridge_can.c`：`write` 解单元头得 arb 后**剥头**，只把 klipper 帧按 8 B 切片赶上总线（**单元头不上线**：在 CAN 上地址已由 arb 承载，头是主机↔桥那一段的寻址层；legacy/隧道口本来无头，用端口 `node_id`），收侧按 node 分桶重组后交路由器；`SET_PORT_NODEID` 经 `bridge_port_ops.node_id` 钩子装过滤器（`canhw_add_filter`，bit0 掩码一格盯 `id`/`id+1` 一对）；**单帧 admin 代理**：KXID `0x00`/`0x01`（+`0x11`）/`0x02` → `0x3f0` 单帧，翻译即全部下发（不再重发单元），`0x3f1` 的 `[0x20][uuid][app]` → 带端口路径的单元上行；**唯一**整单元下发的 admin 命令是没有 CAN 原生形态的 `0x05 RESTART_DEVICE`（头在那里是通道标记，不是地址）。另加 `canhw_set_rate()`（运行期改 BTR 并重装过滤器）与 `CANBUS_FILTER_MULTI` 能力位。**F1 上 `STM32_BRIDGE_CAN_*` `depends on !(MACH_STM32F1 && USBSERIAL)`**（USB 与 CAN1 RX0 共用向量 20，与上游 `HAVE_STM32_USBCANBUS depends on !MACH_STM32F1` 同因） | [串口复用协议](serial-mux-protocol.md)、[MCU 连接方式](../user-manual/mcu-connection.md) |
 | **console 的 ack 预留与 mux 应答缓冲（上游 bug 的修复）** | 上游同样有：`encode_acknak` 只声明 `max_size`（`min_size` 为 0），`console_sendf` 便按 0 预留空间，`transmit_room()` 压缩后可以把 5 字节的 ack 放到缓冲区之外（`transmit_buf[96..100]`）；`mux_need_nodeid_via` 的答案缓冲也比最坏情况少一字节 | 本仓修了两处：`encode_acknak` 声明 `min_size = MESSAGE_MIN`，`command_encodef` 的 ack 短路也遵守 `buf_size`（放不下就丢 ack，不写越界）；`mux_need_nodeid_via` 的缓冲按「标记 + uuid + app + 满路径 + 两个追加字节」取足。**这是真机压测发现的**：250 kbaud 饱和链路上 ack 几乎每次都走压缩分支，越界的最后一个字节（帧尾 sync `0x7e`）正好落在 `mux_identity[0]`，把设备的 mux 身份从 `97abe031988e` 改成 `7eabe031988e`——之后主机拿配置里的旧 uuid 指派不生效，重连永远握不上手，只有重新上电才恢复 | [串口复用协议](serial-mux-protocol.md)、[MCU 连接方式](../user-manual/mcu-connection.md) |
 
-### 4.5 一条负向结论
+### 4.5 比上游多出来的状态键（接口形状）
+
+两处**只增不减**的差异，写到客户端兼容判断时要考虑：
+
+1. **新对象 `system_stats` 的 `dispatch` 子键**。对象名与三个键（`sysload`/`cputime`/`memavail`）
+   与上游 `extras/statistics.py` 一致，但上游没有 `dispatch`（本仓的 reactor 迟到统计）。
+   不读它的客户端会直接忽略。字段定义见
+   [对象状态说明](../third-party-dev/api-reference.md#system_stats)。
+2. **`last_stats` 的键名曾与本仓文档不同**：本仓曾对外报 `mcu_tick_avg`/`mcu_tick_stddev`/
+   `mcu_tick_awake`，现已改成上游名 `mcu_task_avg`/`mcu_task_stddev`/`mcu_awake`（数值公式一直与
+   上游相同，见 `third_party/klipper/klippy/mcu.py` 的 `MCUStatsHelper.stats`）。同时补上了上游
+   也有的 `srtt`/`rttvar`/`rto`（秒，首样本之后才出现）。`bytes_retransmit`/`bytes_invalid`/
+   `send_seq`/`receive_seq`/`retransmit_seq` 仍**不上报**：它们属于上游 C 侧 `serialqueue`，本仓的
+   传输层没有等价计数器，报 0 比不报更容易误导。
+
+### 4.6 一条负向结论
 
 **API 端点没有本仓特有项**：`src/core/klippy/api/endpoints/` 注册的 13 条 path 全部能对上上游
 `klippy/webhooks.py`（以及 `query_endstops` / `pause_resume` / `bed_mesh` 各自的 extras）的注册处，

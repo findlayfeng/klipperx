@@ -188,6 +188,42 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 那是两次 `get_clock` 之间「让 50 MHz 计数器走一点」的间隔，没有后台状态可轮询，且上界
 `advanced < 251_000_000` 是 `(5 s + 20 ms) × 50 MHz`——余量 250 倍，只有 sleep 被拉长 >5 s 才会破。
 
+**同一个坑的另一个形状：固定 yield 次数。** `pause_resume` 的 `resume_restarts_a_paused_replay`
+原用 `settle()` = 32 次 `yield_now()` 之后断言「Done printing file」出现。回放的 8 KiB 读改成在
+blocking 池上跑之后，yield 预算追不上真线程，满载时假失败（实测：全量闸门 1 条 flake，单跑就过）。
+现在 `settle(&lines)` 改成**对目标行本身**做有界等待（5 s 上限，到点让调用方自己的断言把捕获内容
+打出来）。判据一样：**等的是那个条件，不是时间；等待必须有上界**。
+
+### 抖动从哪来：两个可重跑的测量脚本
+
+「宿主稳不稳 / 固件抖不抖」不要靠感觉，两个脚本各管一半，都自带 `--help`（单位、判据、示例在里面）：
+
+```bash
+venv/bin/python scripts/kx-sched.py --pid $(pgrep -f klipperx | head -1) --interval 10
+venv/bin/python scripts/stats-jitter.py ~/printer_data/logs/klippy.log
+```
+
+- `kx-sched.py`：宿主侧 OS 份额——两次读 `/proc/<pid>/task/*/{schedstat,sched}` 取差值，
+  `mean_wait_us` 是「每次被调度前在运行队列里等了多久」，`preempt` 是被内核夺走 CPU 的次数。
+  本机 `kernel.sched_schedstats=0` 时 wait 字段**仍在累计**（实测可差分）；`/proc/<tid>/sched`
+  没有 `sched_info` 块，所以只有均值、拿不到 `wait_max`。
+- `stats-jitter.py`：固件侧——把 `klippy.log` 里的 `stats count=/sum=/sumsq=` 换成每轮任务耗时的
+  avg/sd/awake（公式来自 `event/stats.rs` 与上游 `basecmd.c`）。它量的是**每轮任务耗时，
+  **不是**唤醒迟到；先剔活动尖峰、再按 count 最大间隙分族（双 MCU 时一板一族），
+  日志行不带 MCU 名，所以「哪族是哪块板」得靠晶振频率推。
+
+**卡片机等价环境怎么造**（目标机是 RK3328 级：4×A53 + eMMC/SD）：
+
+```bash
+taskset -c 0,1 klipperx klippy -a tcp:127.0.0.1:7125 printer.cfg     # 限核：tokio worker 数会跟着亲和性变
+systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总量：≈ 1/4 个 Zen4 核 ≈ RK3328
+```
+
+两个反直觉但实测成立的细节：① `available_parallelism()` **会读 cgroup 的 `cpu.max`**，
+`CPUQuota=25%` 时它报 **1**（所以 API runtime 有了那个 `max(2, …)` 的地板）；
+② 限到 2 核时两个 `klippy-mcu` worker 里**只有一个**开始排队（0.08 vs 9.28 µs），
+因为另一个总能抢到 CPU。实测基线与读法见[延迟与抖动](latency.md#本机实测基线2026-10-20供对照)。
+
 ### 闸门墙钟：128 s → 57 s，以及天花板在哪
 
 同机实测的全量 `cargo test -p klipperx --lib`（2026-10-19；末行 ⑩ 是 2026-10-20 的重核）：
@@ -206,6 +242,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | ⑧ 串口重新枚举下的身份 | `same_file`（路径 `(dev,ino)` 对比）+ `attach` 重开 4×250 ms：板子复位重新枚举后同进程重连成功（此前 EIO 直接失败，+1 测） | **57.8 s** | 3527 |
 | ⑦ 真机 lane 支持 mux/桥 | `apply_id_addressed_transport`：`hardware_test`/`stress` 与装载期用同一分类（`serial_ports` + `NODEID_FIRST`），mux 固件板不再 identify 超时（+2 测 / 真机 R1/R2/R5/R11 跑通） | **57.6 s** | 3526 |
 | ⑥ PWM 更新棘轮（对齐上游） | `min_pwm_change = max_power × 5%` + `next_pwm_time`（≈每 2.1 s 一个发送窗口）：事件从 3.3 条/秒降到 0.5 条/秒，批次迟到不再把旧样本年龄写上线（+3 测） | **57.6 s** | 3524 |
+| ⑪ 宿主抖动/IO 批（6 lane + 2 直提交，2026-10-20） | reactor 迟到统计进 `system_stats`（新增对象）、`last_stats` 键名对齐上游并补 `srtt/rttvar/rto`、日志改专用写线程+有界队列（满则丢并计数）、打印回放的 open/seek/8 KiB 读移到 blocking 池、API/mainsail runtime 的 worker 下限 2、两个测量脚本入 `scripts/`（+23 个 `fn test_`；`pause_resume` 的固定 yield 改成有界等待） | **46.4 s** | 3634 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。

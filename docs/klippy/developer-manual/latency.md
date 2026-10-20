@@ -19,6 +19,73 @@ A1b 的延迟度量（`Reactor::set_latency_notifier`）给出每个分发轮次
 `extras/garbage_collection.py` 的 `THRESHOLD` 也是 50 ms）。要判断抖动是不是问题、要不要做
 下面的优化，先看这条日志：**是哪个回调、晚多少、忙多久**。没有数据就别先绑核。
 
+### 不超阈值也要有数：`system_stats.dispatch`
+
+50 ms 的阈值比我们要看的抖动高好几个数量级，所以「没看到告警」不等于「没抖动」。
+因此每个分发轮次**不管超没超**都在 `system_stats.dispatch` 里累加（无锁原子量，热路径不加锁）：
+`rounds` / `busy_avg_s` / `busy_max_s` / `lateness_avg_s` / `lateness_max_s` / `over_threshold` / `threshold_s`。
+字段定义见[对象状态说明](../third-party-dev/api-reference.md#system_stats)。
+
+拿到它就有可比的数：
+
+```bash
+klipperx api -a tcp:127.0.0.1:7125 objects/query '{"objects":{"system_stats":["dispatch"]}}'
+```
+
+### 两个可重跑的测量脚本
+
+宿主侧与固件侧分开量，两个脚本都自带 `--help`（单位、判据、示例写在里面）：
+
+- `scripts/kx-sched.py` —— **宿主线程的调度等待**：两次读 `/proc/<pid>/task/*/{schedstat,sched}`
+  取差值，`mean_wait_us` = 「每次被调度前在运行队列里等了多久」。它量的是 OS 那一半。
+- `scripts/stats-jitter.py` —— **固件每轮任务耗时**（从 `klippy.log` 的 `stats count=/sum=/sumsq=`
+  行算 avg/sd/awake）。注意它量的**不是**唤醒迟到，别混用。
+
+两个都在仓库根的 venv 里跑（见 [`python-tools`](../../../.agents/skills/python-tools/SKILL.md)）：
+
+```bash
+venv/bin/python scripts/kx-sched.py --pid $(pgrep -f klipperx | head -1) --interval 10
+venv/bin/python scripts/stats-jitter.py ~/printer_data/logs/klippy.log
+```
+
+### 本机实测基线（2026-10-20，供对照）
+
+固件侧（`klippy.log` 1850 份 5 s 报告，7.7 小时）：每轮任务耗时 **6.4 µs**（180 MHz 那侧）/ **15.9 µs**
+（72 MHz 那侧），跨 10 分钟分桶不漂。宿主侧（真机会话，8 路 `gcode/script` + 8 路 `info` 压着）：
+
+| 环境 | `klippy-mcu` worker 平均运行队列等待 |
+|---|---|
+| 32 核宿主 | 0.09 µs |
+| 2 核（`taskset -c 0,1`） | 0.08 / 9.28 µs（两个 worker 里只有一个吃亏） |
+| ≈RK3328（4 核 + `CPUQuota=25%`） | 0.08 / 5.60 µs |
+
+读法：**卡片机量级的调度抖动是个位数 µs**，与固件自身 6.4 µs 同量级、距步进允许的 1 ms
+（`third_party/klipper/src/stepper.c` 的过期判定）还有两个数量级。所以优先级应该给「不阻塞回调」
+与「不把阻塞 IO 放在 worker 上」，而不是加线程。
+
+### 应用层的那一半：`dispatch` 实测
+
+上面那张表是**内核调度**那一半。`system_stats.dispatch` 量的是另一半（从定时器到期到回调真开始跑，
+含 tokio 唤醒与轮内排队）。无硬件宿主上连续采样 35 s（`rounds` 13 → 32 → 92）：
+
+| 量 | 实测 |
+|---|---|
+| `busy_avg_s` | **1.16–1.30 ms** |
+| `busy_max_s` | 2.18–2.33 ms |
+| `lateness_avg_s` | **1.13–1.27 ms**（≈ `busy_avg`：几乎整轮都算「晚开始」） |
+| `lateness_max_s` | 2.30 ms |
+| `over_threshold` | 0 / 92 轮（阈值 50 ms） |
+
+这比线程调度那半（亚 µs）**大三个数量级**，原因不在调度而在休眠机制：dispatcher 用
+`tokio::time::sleep(remaining)` 等到下一个唤醒时刻，而 tokio 的定时器时间轮是 **ms 级粒度**，
+所以「到期 → 真醒」天然差 1–2 ms。这是推断，但三个观测同时成立：lateness 与 busy 几乎相等
+（一轮里所有回调都晚启动同样多，而不是某个回调慢）、量级落在 1–2 ms、且与负载无关。
+
+**要不要紧？** 不要紧，但要知道边界：主机只需把 move **提前**送进 MCU 的步进队列，固件那一侧
+有几百 ms 缓冲（[与打印时序的关系](reactor.md#与打印时序的关系)）。1–2 ms 的唤醒粒度落在缓冲里，
+真机上也没出现过由此引起的停机（50 ms 阈值的告警在真机会话里是 0 条）。若以后真要亚 ms 级唤醒，
+改的是**休眠方式**（用 `poll`/`clock_nanosleep` 按绕对时刻休眠、绕开时间轮），不是绑核。
+
 ## 可能的来源
 
 按「离主机多远」排，从近到远。量级只是数量级，不是实测值。

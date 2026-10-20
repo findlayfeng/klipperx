@@ -112,7 +112,13 @@ pub trait Reactor: Send + Sync {
 
 名字在注册时给出（`register_timer_named`）——上游是反射出回调名（`get_function_owner`，`extras/garbage_collection.py:13`），Rust 闭包没有名字可读。`register_timer` 是无名版（报告里叫 `"<timer>"`）。
 
-上游的 `set_latency_notifier`（`reactor.py:316`）消费者是 `extras/garbage_collection.py`（它把警告写成 `Reactor busy for …`）；Rust 没有 GC，所以这里**纯是诊断**：trait 默认什么都不做，只有 `TokioReactor` 实现，主机在 `src/klippy.rs` 挂一个 50 ms 阈值的日志回调（与上游 `THRESHOLD` 同为 50 ms）。这个回调自己跑在 dispatcher 上，同样不许阻塞。抖动的来源与要不要绑核见 [延迟与抖动](latency.md)。本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。
+上游的 `set_latency_notifier`（`reactor.py:316`）消费者是 `extras/garbage_collection.py`（它把警告写成 `Reactor busy for …`）；Rust 没有 GC，所以这里**纯是诊断**：trait 默认什么都不做，只有 `TokioReactor` 实现，主机在 `src/klippy.rs` 挂一个 50 ms 阈值的日志回调（与上游 `THRESHOLD` 同为 50 ms）。这个回调自己跑在 dispatcher 上，同样不许阻塞。
+
+告警只在**越过 50 ms** 时出现，而真正的抖动在 µs–ms 量级——所以每一轮**不管超没超**都在
+`Dispatcher` 里累加（无锁 `AtomicU64`，热路径不加锁），经 `system_stats` 对象的 `dispatch`
+子对象对外：`rounds` / `busy_avg_s` / `busy_max_s` / `lateness_avg_s` / `lateness_max_s` /
+`over_threshold` / `threshold_s`。它把「没告警」变成一个可比的数，也是 [延迟与抖动](latency.md)
+那张基线表的来源。抖动的来源与要不要绑核见 [延迟与抖动](latency.md)。本页与上游不一致处统一登记在[本项目与上游的偏移](upstream-deviations.md)。
 
 ## 回调里不许等待、不许做重活
 

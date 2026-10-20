@@ -745,6 +745,56 @@
 | `speed` | float | 风扇转速（0.0 ~ 1.0） |
 | `rpm` | float/null | 风扇转速（RPM），如无测速则为 null |
 
+### `mcu`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `mcu_version` | string | 固件版本（编译期锉死） |
+| `mcu_build_versions` | string | 构建信息 |
+| `mcu_constants` | object | 固件字典常量（`CLOCK_FREQ`、`STATS_SUMSQ_BASE` 等） |
+| `last_stats` | object | 固件每 5 秒推送的统计（见下），首份报告到达前不存在 |
+| `last_stats_time` | float | 上表那份报告的到达时刻（宿主 `eventtime`，秒） |
+
+`last_stats` 的键名与上游 `klippy/mcu.py` 一致，方便按上游写的客户端直接读：
+
+| 键 | 单位 | 说明 |
+|----|------|------|
+| `mcu_task_avg` | 秒 | 固件每一轮任务处理的**平均耗时**（`sum/(count·CLOCK_FREQ)`） |
+| `mcu_task_stddev` | 秒 | 上述耗时的标准差（`√(count·sumsq·256 − sum²)/(count·CLOCK_FREQ)`） |
+| `mcu_awake` | 秒 | 本窗口内固件处于忙的总时长（`sum/CLOCK_FREQ`） |
+| `bytes_read` / `bytes_write` | 字节 | 传输层累计收发字节（宿主自己的计数，不依赖固件常量） |
+| `srtt` / `rttvar` / `rto` | 秒 | 往返时延估计；**首样本之后才出现**，无样本时不给这三个键（不伪造 0） |
+
+口径提醒：这三个 `mcu_*` 量的是**每轮任务耗时**，不是「定时器比预定时刻晚了多少」——
+上游就是这个语义（`third_party/klipper/src/basecmd.c` 的 `stats_update`，调用点
+`src/sched.c` 的 `run_tasks` 把睡眠时间减掉）。定量方法与基线见
+[延迟与抖动](../developer-manual/latency.md)。
+
+### `system_stats`
+
+无需任何配置节，宿主启动时无条件注册（与上游 `extras/statistics.py` 的 `system_stats` 同名同三键）：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `sysload` | float | `/proc/loadavg` 第一个字段（1 分钟平均负载） |
+| `cputime` | float | 本进程累计 CPU 时间（秒，`/proc/self/stat` 的 utime+stime） |
+| `memavail` | int | `/proc/meminfo` 的 `MemAvailable`（kB） |
+| `dispatch` | object | 本项目新增（上游没有）：reactor 分发的迟到统计 |
+
+`dispatch` 的字段（单位除计数外均为秒）：
+
+| 字段 | 说明 |
+|------|------|
+| `rounds` | 已统计的分发轮数 |
+| `busy_avg_s` / `busy_max_s` | 一轮「从最早唤醒时刻到本轮结束」的平均/最大长度 |
+| `lateness_avg_s` / `lateness_max_s` | 轮内回调比自己的唤醒时刻晚启动的平均/最大量 |
+| `over_threshold` | 超过告警阈值（默认 50 ms，与上游 `THRESHOLD` 同）的轮数 |
+| `threshold_s` | 阈值本身（秒），便于客户端自己换算 |
+
+这三个 `busy_*`/`lateness_*` 量的是**宿主侧的调度抖动**：它包含 tokio 唤醒、机器 runtime
+的 2 个 worker 争用、以及本轮里哪个回调慢了。它与上面 `mcu_task_*`（固件侧）分开看：
+两者相加才是「从该发命令到命令真上线」的抖动。
+
 ### `pause_resume`
 
 | 字段 | 类型 | 说明 |

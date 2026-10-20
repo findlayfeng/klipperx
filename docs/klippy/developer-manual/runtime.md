@@ -23,10 +23,22 @@ dispatcher 前面——那只是把抖动从 API 换成了机器内部。
 
 | | 机器 runtime | API runtime |
 |---|---|---|
-| 形态 | `new_multi_thread`，`worker_threads(2)` | `new_multi_thread`，默认 worker 数 |
+| 形态 | `new_multi_thread`，`worker_threads(2)` | `new_multi_thread`，`max(2, available_parallelism())` |
 | 线程名 | `klippy-mcu`（worker），`klippy-machine`（驱动线程） | `klippy-api` |
 | 驱动 | 一条专用 OS 线程 `block_on(klippy_process(...))` | 主线程 `block_on(…)` |
-| 建在哪 | `src/klippy.rs` 的 `machine_runtime` | `src/klippy.rs` 的 `api_runtime` |
+| 建在哪 | `src/klippy.rs` 的 `machine_runtime` | `src/klippy.rs` 的 `api_runtime`（worker 数由 `api_worker_threads()` 定） |
+
+两边 worker 数都是**钉住的**，不是一个留省事一个另起。机器侧写死 2 是因为它的活就是
+「dispatcher + MCU 收发 + bring-up」，设备读写走 blocking pool 不占 worker。API 侧写的是
+`max(2, available_parallelism())`：不设时 tokio 直接用 `available_parallelism()`，而在 Linux 上
+它还跟着 **cgroup 的 `cpu.max` 配额**走——一台 RK3328 级卡片机把宿主放进限额容器（或
+systemd 的 `CPUQuota=25%`）时会报 **1**，那时唯一那个 worker 要同时扛 accept 循环和所有
+endpoint handler，一个慢客户端就拖住其他客户端与 accept。下限 2 只抬地板、不改变向上伸缩。
+
+除这两套 runtime 的线程，进程里还有第三条长驻线程：**日志写线程**（`log-writer`，
+`src/logging.rs`）。它独占 stdout 与 `--logfile` 的文件句柄，其他线程只往一条有界队列里投
+已格式化的字节，所以写盘慢（卡片机的 eMMC/SD）不会再卡住 reactor 回调或 MCU 收包；队列满时
+丢日志并计数（见 [日志](../user-manual/logging.md#日志是异步的)）。
 
 **机器侧**（全在机器 runtime 上）：reactor 的 dispatcher、MCU 发送/接收任务、设备的阻塞 I/O
 （机器 runtime 的 blocking pool）、`bring_up` / `load_config` / `reset_for_restart` / `teardown`、

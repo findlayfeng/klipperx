@@ -994,6 +994,109 @@ mod tests {
         assert!(!path.exists(), "a log file appeared at {}", path.display());
     }
 
+    // =======================================================================
+    // The queue
+    // =======================================================================
+
+    /// A sink whose writer thread never ran.
+    ///
+    /// The test holds both receiving ends and never answers them, so the queue
+    /// fills up and the exit drain is never told the writer finished. Holding them
+    /// (rather than dropping them) is what keeps the channels connected.
+    struct StalledSink {
+        sink: Arc<LogSink>,
+        _commands: Receiver<Command>,
+        _finished: Sender<()>,
+    }
+
+    impl StalledSink {
+        fn new() -> Self {
+            let (queue, commands) = std::sync::mpsc::sync_channel(QUEUE_CAPACITY);
+            let (finished, done) = std::sync::mpsc::channel();
+            Self {
+                sink: Arc::new(LogSink {
+                    queue,
+                    finished: Mutex::new(Some(done)),
+                }),
+                _commands: commands,
+                _finished: finished,
+            }
+        }
+    }
+
+    /// A full queue is a dropped record, not a wait: the thread that logged is in
+    /// the middle of something else, so a writer that cannot keep up costs it the
+    /// record and nothing else.
+    #[test]
+    fn test_a_full_queue_drops_a_record_instead_of_waiting() {
+        let stalled = StalledSink::new();
+        let before = dropped_records();
+
+        let started = Instant::now();
+        // One record more than the queue holds: the last one has nowhere to go.
+        for _ in 0..=QUEUE_CAPACITY {
+            stalled
+                .sink
+                .submit(b"a record the writer never takes\n", false);
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "submitting {QUEUE_CAPACITY} records took {elapsed:?}: the caller waited for the writer"
+        );
+        assert!(
+            dropped_records() - before > 0,
+            "a full queue dropped nothing"
+        );
+    }
+
+    /// The host's own path: a record handed over reaches the file, and the exit
+    /// drain does not lose the records still queued behind it.
+    #[test]
+    fn test_queued_records_are_written_and_the_exit_drain_keeps_them() {
+        let dir = TempDir::new("drain");
+        let path = dir.path("klippy.log");
+        let output = LogOutput::new(Some(&path));
+
+        // Queued, not written: nothing on this side waits for the disk.
+        for line in ["first\n", "second\n", "third\n"] {
+            output.sink.submit(line.as_bytes(), false);
+        }
+
+        assert!(
+            output.sink.drain(DRAIN_TIMEOUT),
+            "the writer did not finish within {DRAIN_TIMEOUT:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the log file is readable"),
+            "first\nsecond\nthird\n"
+        );
+    }
+
+    /// The exit drain is bounded: a writer that never finishes costs the process
+    /// one short wait rather than a hang, and the drain says it did not finish.
+    #[test]
+    fn test_a_drain_with_no_writer_gives_up_within_its_bound() {
+        let stalled = StalledSink::new();
+        stalled.sink.submit(b"never written\n", false);
+
+        let bound = Duration::from_millis(50);
+        let started = Instant::now();
+        let drained = stalled.sink.drain(bound);
+        let elapsed = started.elapsed();
+
+        assert!(!drained, "a drain nobody served reported success");
+        assert!(
+            elapsed >= bound,
+            "the drain gave up after {elapsed:?}, before its bound of {bound:?}"
+        );
+        assert!(
+            elapsed < bound + Duration::from_secs(2),
+            "the drain took {elapsed:?}, which is not bounded by {bound:?}"
+        );
+    }
+
     #[test]
     fn test_rollover_info_is_sorted_and_cleared() {
         let _slot = exclusive();

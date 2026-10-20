@@ -526,6 +526,48 @@ fn ensure_not_in_runtime() -> Result<(), String> {
     Ok(())
 }
 
+/// Take `runtime` down, bounded by `timeout`, and say whether it finished inside
+/// the bound.
+///
+/// One measure for both callers — [`Machine::bring_up`]'s failure path and
+/// [`StartedMachine`]'s `Drop` — so "the parts went" and "a part was leaked" are
+/// told apart by the same rule: a device's blocking read cannot be cancelled, so
+/// a runtime that is still alive when the bound runs out is holding one. `Err`
+/// carries the elapsed time, for the message.
+fn shut_down(runtime: Runtime, timeout: Duration) -> Result<(), Duration> {
+    let started = Instant::now();
+    runtime.shutdown_timeout(timeout);
+    let elapsed = started.elapsed();
+    if elapsed < timeout {
+        Ok(())
+    } else {
+        Err(elapsed)
+    }
+}
+
+/// The `Err` a failed [`Machine::bring_up`] returns, once its machine is down.
+///
+/// `reason` is the failure that stopped the bring-up and is always kept as the
+/// `Err`'s beginning; the shutdown's own verdict is appended, never substituted,
+/// because the two are different faults. A runtime that does not close inside
+/// `timeout` is a leaked part, and saying so is the point: the failure path has
+/// no assertion to make — the failure is already being reported — so it reports
+/// this one in the message instead of swallowing it.
+///
+/// `timeout` is a parameter so the bound can be exercised without waiting
+/// [`SHUTDOWN_TIMEOUT`] out; [`Machine::bring_up`] passes exactly that.
+fn bring_up_failure(reason: String, runtime: Runtime, timeout: Duration) -> String {
+    match shut_down(runtime, timeout) {
+        Ok(()) => reason,
+        Err(elapsed) => format!(
+            "{reason}; and the failed machine's runtime did not shut down within \
+             {timeout:?} ({elapsed:?}): a part was leaked, so its blocking device read \
+             is still parked and the next test would trip over it. This is \
+             `StartedMachine`'s own measure, which fails a case for it."
+        ),
+    }
+}
+
 /// A config that satisfies a test's [`Requires`], with the board locked.
 pub struct Machine {
     /// The parsed printer config.
@@ -576,6 +618,10 @@ impl Machine {
     /// `#[test]` — which is refused before any device is touched. A config that
     /// does not satisfy [`Requires`] never gets here — [`acquire`] reports that
     /// as `HW-IGNORED` and hands out no [`Machine`] at all.
+    ///
+    /// A failed machine is taken down before the `Err` is returned, on the bound
+    /// [`StartedMachine`]'s `Drop` uses; a runtime that does not close inside it
+    /// is a leaked part, and the `Err` says so after the original reason.
     pub fn bring_up(&self) -> Result<StartedMachine, String> {
         // First, before any device or config work: a bring-up from inside a
         // runtime cannot work, and a plain `Err` beats tokio's panic (see the
@@ -635,8 +681,7 @@ impl Machine {
                 // leave the next test a parked read to trip over.
                 printer.teardown();
                 drop(printer);
-                runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
-                Err(reason)
+                Err(bring_up_failure(reason, runtime, SHUTDOWN_TIMEOUT))
             }
         }
     }
@@ -744,14 +789,14 @@ impl Drop for StartedMachine {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        let started = Instant::now();
-        runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
-        let elapsed = started.elapsed();
+        let leaked = shut_down(runtime, SHUTDOWN_TIMEOUT).err();
         if std::thread::panicking() {
             return;
         }
-        assert!(
-            elapsed < SHUTDOWN_TIMEOUT,
+        let Some(elapsed) = leaked else {
+            return;
+        };
+        panic!(
             "the machine's runtime did not shut down within {SHUTDOWN_TIMEOUT:?} \
              ({elapsed:?}): a part was leaked, so its blocking device read is still parked \
              and the board's session was never closed. The heater ring this used to name \
@@ -1777,6 +1822,62 @@ mod tests {
         assert!(
             reason.contains("/dev/klipperx-hwtest-no-such-port"),
             "the reason names the device the config asked for: {reason}"
+        );
+    }
+
+    /// The failure path's shutdown is checked on the same measure
+    /// [`StartedMachine`]'s `Drop` uses: a runtime that is still alive when the
+    /// bound runs out is a leaked part, and the `Err` carries that after the
+    /// bring-up's own reason instead of hiding it.
+    ///
+    /// The parked blocking read is the leak's shape (a device read cannot be
+    /// cancelled), and the short bound keeps the check off the real
+    /// [`SHUTDOWN_TIMEOUT`].
+    #[test]
+    fn test_a_failed_machine_that_does_not_shut_down_says_so_in_the_err() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failed machine");
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        runtime.spawn_blocking(move || {
+            let _ = held.recv();
+        });
+
+        let reason = bring_up_failure(
+            "the machine did not come up: a part never connected".to_string(),
+            runtime,
+            Duration::from_millis(100),
+        );
+
+        assert!(
+            reason.starts_with("the machine did not come up: a part never connected"),
+            "the original reason is kept: {reason}"
+        );
+        assert!(reason.contains("did not shut down"), "{reason}");
+        assert!(reason.contains("leaked"), "{reason}");
+        drop(release);
+    }
+
+    /// The other half: a failed machine whose parts did go hands back the
+    /// bring-up's reason unchanged — the check adds a verdict only when there is
+    /// one.
+    #[test]
+    fn test_a_failed_machine_that_shuts_down_keeps_its_own_reason() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("a runtime for the failed machine");
+
+        let reason = bring_up_failure(
+            "the machine did not come up: a part never connected".to_string(),
+            runtime,
+            Duration::from_millis(100),
+        );
+
+        assert_eq!(
+            reason,
+            "the machine did not come up: a part never connected"
         );
     }
 

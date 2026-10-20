@@ -1653,7 +1653,9 @@ impl PrinterObject for McuObject {
             // to install if it will not). A hub that reports no power switching
             // cannot switch it at all, so that check is also where `rpi_usb` is
             // dropped before it ever disconnects a board for nothing.
-            if let Some(reason) = super::restart::check_usb_power(&config) {
+            if let Some(reason) =
+                super::restart::check_usb_power(&config, &tokio::runtime::Handle::current()).await
+            {
                 self.usb_reset_unusable(&config, &reason);
                 config.restart_method = McuRestartMethod::Command;
             }

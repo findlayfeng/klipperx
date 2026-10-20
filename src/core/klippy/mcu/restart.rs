@@ -27,8 +27,10 @@
 //!
 //! [`McuObject::connect`]: super::object::McuObject::connect
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use tokio::time::Duration;
 use tracing::{debug, info, warn};
@@ -282,6 +284,12 @@ pub fn restart_before_bringup(config: &McuConfig, restarting: bool) -> Option<&'
 /// missing udev rule is reported at startup — with the rules to install —
 /// instead of at the first `FIRMWARE_RESTART`.
 ///
+/// The reading happens off the runtime ([`hub_report`]): the sysfs walk, the
+/// hub's class descriptor and the mechanism probe are `nusb`'s blocking path, and
+/// this runs on the connect path. A port that resolves is also
+/// [recorded](HubPorts) for [`rpi_usb_reset`], which needs those coordinates in
+/// the case this method exists for.
+///
 /// # Returns
 /// The reason this port's power **cannot be switched at all**, when the hub says
 /// so itself ([`usb::PortPower::Unsupported`]): switching it would only disconnect
@@ -289,7 +297,10 @@ pub fn restart_before_bringup(config: &McuConfig, restarting: bool) -> Option<&'
 /// drops `rpi_usb` for `command` instead of trying (`mcu/object.rs`). `None` when
 /// the mechanism is usable, the method is not `rpi_usb`, or nothing could be found
 /// out about the hub.
-pub fn check_usb_power(config: &McuConfig) -> Option<String> {
+pub async fn check_usb_power(
+    config: &McuConfig,
+    handle: &tokio::runtime::Handle,
+) -> Option<String> {
     if config.restart_method != McuRestartMethod::RpiUsb {
         return None;
     }
@@ -297,46 +308,169 @@ pub fn check_usb_power(config: &McuConfig) -> Option<String> {
         return None;
     };
 
-    let error = match usb::resolve_tty_port(Path::new(path)) {
-        Err(err) => err,
-        Ok(port) => {
-            // Ask the hub before anything else: a hub without power switching
-            // makes both mechanisms pointless, so neither the rule below nor the
-            // switch is worth reporting or attempting.
-            match usb::port_power(&port) {
-                Some(usb::PortPower::Unsupported) => {
-                    return Some(format!(
-                        "hub {}:{} reports no port power switching (wHubCharacteristics)",
-                        port.bus, port.device
-                    ));
-                }
-                Some(usb::PortPower::Ganged) => warn!(
-                    "MCU '{}': hub {}:{} switches the power of all its ports together \
-                     (ganged), so anything else on that hub goes down with this port",
-                    config.name, port.bus, port.device
-                ),
-                _ => (),
-            }
-            match usb::probe(&port, config.usb_power) {
-                Ok(power) => {
-                    debug!(
-                        "MCU '{}' will switch USB port power via {power:?}",
-                        config.name
-                    );
-                    return None;
-                }
-                Err(err) => format!(
-                    "{err}\n  install a udev rule, for example:\n    {}",
-                    usb::recommended_rules(&port).replace('\n', "\n    ")
-                ),
-            }
+    let tty = PathBuf::from(path);
+    let method = config.usb_power;
+    let report = match handle
+        .spawn_blocking(move || hub_report(&tty, method))
+        .await
+    {
+        Ok(report) => report,
+        Err(err) => Err(format!("usb: {err}")),
+    };
+    let report = match report {
+        Ok(report) => report,
+        Err(error) => {
+            warn_power_may_not_switch(&config.name, &error);
+            return None;
         }
     };
+    // The coordinates are only readable while the board is: keep the ones this
+    // connect saw, for the reset that has to power it on when it is not.
+    remember_hub_port(path, &report.port);
+
+    // Ask the hub before anything else: a hub without power switching makes both
+    // mechanisms pointless, so neither the rule below nor the switch is worth
+    // reporting or attempting.
+    match report.power {
+        Some(usb::PortPower::Unsupported) => {
+            return Some(format!(
+                "hub {}:{} reports no port power switching (wHubCharacteristics)",
+                report.port.bus, report.port.device
+            ));
+        }
+        Some(usb::PortPower::Ganged) => warn!(
+            "MCU '{}': hub {}:{} switches the power of all its ports together \
+             (ganged), so anything else on that hub goes down with this port",
+            config.name, report.port.bus, report.port.device
+        ),
+        _ => (),
+    }
+    match report.probe {
+        Ok(power) => {
+            debug!(
+                "MCU '{}' will switch USB port power via {power:?}",
+                config.name
+            );
+            None
+        }
+        Err(error) => {
+            warn_power_may_not_switch(&config.name, &error);
+            None
+        }
+    }
+}
+
+/// What [`check_usb_power`] needs to know about the port, all of it read in the
+/// one blocking block.
+struct HubReport {
+    /// The hub port the tty resolved to.
+    port: usb::UsbPort,
+    /// The hub's own answer about switching this port's power.
+    power: Option<usb::PortPower>,
+    /// The mechanism, or why neither is usable — with the rules that would make
+    /// one usable.
+    probe: Result<usb::UsbPower, String>,
+}
+
+/// Resolve the tty's hub port, ask the hub what it can do, and probe the
+/// mechanism.
+///
+/// The three steps are one blocking block rather than three: each is a sysfs walk
+/// or a `nusb` blocking call ([`usb::resolve_tty_port`], [`usb::port_power`],
+/// [`usb::probe`], and the descriptor reads behind [`usb::recommended_rules`]), so
+/// the thread is parked once and the caller's worker is never the one parked. The
+/// error text is completed here too, where the rules can still be read off the
+/// port.
+fn hub_report(tty: &Path, method: usb::UsbPowerMethod) -> Result<HubReport, String> {
+    let port = usb::resolve_tty_port(tty)?;
+    let power = usb::port_power(&port);
+    let probe = usb::probe(&port, method).map_err(|err| {
+        format!(
+            "{err}\n  install a udev rule, for example:\n    {}",
+            usb::recommended_rules(&port).replace('\n', "\n    ")
+        )
+    });
+    Ok(HubReport { port, power, probe })
+}
+
+/// The warning an `rpi_usb` port that cannot be switched gets: the method stays,
+/// and the next connect reports again.
+fn warn_power_may_not_switch(name: &str, error: &str) {
     warn!(
-        "MCU '{}' may not be able to switch the USB port power (restart_method 'rpi_usb'): {error}",
-        config.name
+        "MCU '{name}' may not be able to switch the USB port power (restart_method 'rpi_usb'): \
+         {error}"
     );
-    None
+}
+
+// ===========================================================================
+// The hub port a configured serial path was last resolved to
+// ===========================================================================
+
+/// The hub coordinates each configured `serial:` path was last resolved to.
+///
+/// [`rpi_usb_reset`] needs a [`usb::UsbPort`] to switch, and resolving it from
+/// the tty is the one step that cannot work when the method is most needed: a
+/// board whose tty is gone — upstream's `enable power` gate,
+/// [`restart_before_bringup`] — has no `/sys/class/tty` entry to walk, so a reset
+/// that only resolved would never power it back on, and the board would stay off.
+/// The coordinates are therefore remembered whenever they *can* be read (every
+/// connect, [`check_usb_power`], and every reset that resolves) and used as the
+/// fallback when the tty is missing.
+///
+/// Keyed by the configured path — the one name both sides have: the config's
+/// `serial:` string is what [`reset_firmware`] was handed, and it goes on naming
+/// the device while the kernel node comes and goes (`/dev/serial/by-id/…`
+/// especially). A path never resolved has no entry, and the reset then reports the
+/// missing coordinates instead of promising a power switch it cannot make.
+///
+/// Process-wide: the reset runs far from the connect that recorded it, and there
+/// is one of each per process. Stale coordinates are only ever used when the tty
+/// resolves to nothing — a hub that moved, or a board replugged onto another port,
+/// is picked up by the resolution whenever there is one.
+struct HubPorts {
+    /// The coordinates, by configured `serial:` path.
+    ports: BTreeMap<String, usb::UsbPort>,
+}
+
+impl HubPorts {
+    /// An empty table.
+    const fn new() -> Self {
+        Self {
+            ports: BTreeMap::new(),
+        }
+    }
+
+    /// The coordinates recorded for `path`, if any.
+    fn recall(&self, path: &str) -> Option<usb::UsbPort> {
+        self.ports.get(path).cloned()
+    }
+
+    /// Record `port` as the coordinates `path` last resolved to.
+    fn remember(&mut self, path: &str, port: &usb::UsbPort) {
+        self.ports.insert(path.to_string(), port.clone());
+    }
+}
+
+/// The process-wide [`HubPorts`].
+static HUB_PORTS: Mutex<HubPorts> = Mutex::new(HubPorts::new());
+
+/// Run `with` on [`HUB_PORTS`], poison notwithstanding: a panic elsewhere must not
+/// cost an `rpi_usb` reset the coordinates it needs to power a board back on.
+fn with_hub_ports<T>(with: impl FnOnce(&mut HubPorts) -> T) -> T {
+    let mut ports = HUB_PORTS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    with(&mut ports)
+}
+
+/// Record `port` as the coordinates `path` resolved to.
+fn remember_hub_port(path: &str, port: &usb::UsbPort) {
+    with_hub_ports(|ports| ports.remember(path, port));
+}
+
+/// The coordinates `path` was last seen to resolve to, if any were recorded.
+fn recorded_hub_port(path: &str) -> Option<usb::UsbPort> {
+    with_hub_ports(|ports| ports.recall(path))
 }
 
 /// Report that a reset path has never run against hardware.
@@ -486,27 +620,154 @@ async fn cheetah_reset(path: &str) -> Result<(), String> {
 /// Upstream shells out to a compiled `hub-ctrl` with `sudo`; here the port is
 /// read from sysfs and switched the way `usb_power` asks (`interface/usb.rs`).
 /// The port must be closed, and the caller opens it afterwards.
+///
+/// The hub coordinates come from the tty when it is there — the normal case, and
+/// the only one that follows a hub that moved — and from [`HubPorts`] when it is
+/// not: a board with no tty is exactly the one this method is asked to power on
+/// ([`restart_before_bringup`]), and its coordinates were recorded by the connect
+/// that still had a node to read. With neither, the reset says so — the board has
+/// to be powered on by hand once, which the next connect then records.
 async fn rpi_usb_reset(
     serial_path: &str,
     method: usb::UsbPowerMethod,
     handle: &tokio::runtime::Handle,
 ) -> Result<(), String> {
     let tty = PathBuf::from(serial_path);
-    let port = usb::resolve_tty_port(&tty)?;
+    let resolved = usb_resolve_tty_port(&tty, handle).await;
+    let port = reset_port(serial_path, resolved, recorded_hub_port(serial_path))?;
+    remember_hub_port(serial_path, &port);
     // Resolve the mechanism per reset, so a hub that was replugged (or a udev
     // rule that only now applies) is picked up again.
-    let power = usb::probe(&port, method)?;
+    let power = usb_probe(&port, method, handle).await?;
     // The device's own node number, to tell the old instance from the one that
     // comes back.
     let before = device_node(&tty);
 
     usb_set_power(&port, &power, false, handle).await?;
     tokio::time::sleep(USB_POWER_OFF).await;
-    usb_set_power(&port, &power, true, handle).await?;
+    power_on(&port, &power, handle).await?;
 
     // The caller is about to open the port, so wait for the board to be back
     // rather than opening the instance that is still on its way out.
     wait_for_new_device(&tty, before, USB_PORT_RETURN_TIMEOUT).await
+}
+
+/// The hub port an `rpi_usb` reset switches: the tty's, or the coordinates
+/// recorded for this path at an earlier connect.
+///
+/// Split out because the choice is the whole point of [`HubPorts`] and needs no
+/// hub to test. The tty wins whenever it resolves — it is the fresher answer, and
+/// the only one that can see a board moved to another port — and the recorded
+/// coordinates are used when it does not, because a board whose node is gone is
+/// precisely the one a power switch is worth trying.
+fn reset_port(
+    path: &str,
+    resolved: Result<usb::UsbPort, String>,
+    recorded: Option<usb::UsbPort>,
+) -> Result<usb::UsbPort, String> {
+    match resolved {
+        Ok(port) => Ok(port),
+        Err(error) => match recorded {
+            Some(port) => {
+                warn!(
+                    "usb: {error}; using the hub port recorded for {path} at the last connect \
+                     (hub {}:{} port {}), so this reset switches that one",
+                    port.bus, port.device, port.port
+                );
+                Ok(port)
+            }
+            None => Err(format!(
+                "{error}\n  no hub port is recorded for that path either, so its power cannot be \
+                 switched: it has to be powered on by hand once, and the next connect will \
+                 record where it is"
+            )),
+        },
+    }
+}
+
+/// How many times the port is switched back on before the reset gives up.
+///
+/// Switching a port's power is idempotent (there is nothing to advance, only a
+/// level to set), and what fails is transient — a hub still settling after the
+/// port went down. Giving up here leaves the board **powered off**, so the few
+/// retries are worth more than the failure they avoid.
+const POWER_ON_ATTEMPTS: usize = 3;
+
+/// How long to wait between those attempts.
+const POWER_ON_RETRY: Duration = Duration::from_millis(100);
+
+/// Switch the port back on, retrying a transient failure ([`POWER_ON_ATTEMPTS`]).
+async fn power_on(
+    port: &usb::UsbPort,
+    power: &usb::UsbPower,
+    handle: &tokio::runtime::Handle,
+) -> Result<(), String> {
+    retrying_power_on(|| usb_set_power(port, power, true, handle)).await
+}
+
+/// [`power_on`]'s retry loop, with the switch passed in.
+///
+/// Split out so the attempts and the message can be tested without a hub. The
+/// last failure is what comes back, with the state it left the board in.
+async fn retrying_power_on<F, Fut>(mut switch: F) -> Result<(), String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let mut last = String::new();
+    for attempt in 1..=POWER_ON_ATTEMPTS {
+        match switch().await {
+            Ok(()) => {
+                if attempt > 1 {
+                    info!("usb: port powered back on at attempt {attempt}/{POWER_ON_ATTEMPTS}");
+                }
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    "usb: powering the port back on failed \
+                     (attempt {attempt}/{POWER_ON_ATTEMPTS}): {error}"
+                );
+                last = error;
+                if attempt < POWER_ON_ATTEMPTS {
+                    tokio::time::sleep(POWER_ON_RETRY).await;
+                }
+            }
+        }
+    }
+    Err(format!(
+        "usb: the port did not power back on in {POWER_ON_ATTEMPTS} attempts: {last}; the board \
+         is left powered off, so it has to be powered on by hand"
+    ))
+}
+
+/// [`usb::resolve_tty_port`] off the runtime: the sysfs walk parks the caller's
+/// worker for as long as the kernel takes to answer, which on a connect path is
+/// not the caller's to spend.
+async fn usb_resolve_tty_port(
+    tty: &Path,
+    handle: &tokio::runtime::Handle,
+) -> Result<usb::UsbPort, String> {
+    let tty = tty.to_path_buf();
+    handle
+        .spawn_blocking(move || usb::resolve_tty_port(&tty))
+        .await
+        .map_err(|e| format!("usb: {e}"))?
+}
+
+/// [`usb::probe`] off the runtime: the control route opens the hub and reads its
+/// bits, and `nusb`'s blocking path is a wait, not work — the same reason
+/// [`usb_set_power`] leaves the runtime.
+async fn usb_probe(
+    port: &usb::UsbPort,
+    method: usb::UsbPowerMethod,
+    handle: &tokio::runtime::Handle,
+) -> Result<usb::UsbPower, String> {
+    let port = port.clone();
+    handle
+        .spawn_blocking(move || usb::probe(&port, method))
+        .await
+        .map_err(|e| format!("usb: {e}"))?
 }
 
 /// Switch one hub port, off the runtime: `nusb`'s blocking path does the syscalls.
@@ -789,21 +1050,119 @@ mod tests {
         assert!(err.starts_with("usb: "), "{err}");
     }
 
-    #[test]
-    fn test_the_startup_check_only_answers_for_rpi_usb_on_a_serial_port() {
+    #[tokio::test]
+    async fn test_the_startup_check_only_answers_for_rpi_usb_on_a_serial_port() {
+        let handle = tokio::runtime::Handle::current();
         // Everything else has no port switch to judge, so nothing is reported and
         // nothing is taken away from the caller.
         assert_eq!(
-            check_usb_power(&no_transport(McuRestartMethod::Command)),
+            check_usb_power(&no_transport(McuRestartMethod::Command), &handle).await,
             None
         );
         assert_eq!(
-            check_usb_power(&no_transport(McuRestartMethod::RpiUsb)),
+            check_usb_power(&no_transport(McuRestartMethod::RpiUsb), &handle).await,
             None
         );
         // A path that is not a USB tty cannot say anything about a hub either:
         // the lookup reports itself and the caller keeps `rpi_usb`.
-        assert_eq!(check_usb_power(&serial(McuRestartMethod::RpiUsb)), None);
+        assert_eq!(
+            check_usb_power(&serial(McuRestartMethod::RpiUsb), &handle).await,
+            None
+        );
+    }
+
+    /// A resolved port, for the tests that need coordinates without a hub.
+    fn hub_port(port: u8) -> usb::UsbPort {
+        usb::UsbPort {
+            bus: 1,
+            device: 2,
+            port,
+            hub_dir: PathBuf::from(format!("/sys/devices/fake-hub/port{port}")),
+        }
+    }
+
+    #[test]
+    fn test_the_hub_port_table_is_keyed_by_the_configured_path() {
+        let mut ports = HubPorts::new();
+        // Nothing recorded yet: no fallback, which is what the reset reports.
+        assert_eq!(ports.recall("/dev/ttyACM0"), None);
+
+        ports.remember("/dev/ttyACM0", &hub_port(1));
+        ports.remember("/dev/serial/by-id/board", &hub_port(2));
+        assert_eq!(ports.recall("/dev/ttyACM0"), Some(hub_port(1)));
+        assert_eq!(ports.recall("/dev/serial/by-id/board"), Some(hub_port(2)));
+        // A path of its own, and an unknown one, are not answered by someone
+        // else's coordinates.
+        assert_eq!(ports.recall("/dev/ttyACM1"), None);
+
+        // Recording again replaces, so the reset switches the last place seen.
+        ports.remember("/dev/ttyACM0", &hub_port(3));
+        assert_eq!(ports.recall("/dev/ttyACM0"), Some(hub_port(3)));
+    }
+
+    #[test]
+    fn test_a_reset_falls_back_to_the_recorded_hub_port() {
+        // The tty resolves: its answer is used, recorded or not (it is the only
+        // one that can see a board that moved).
+        assert_eq!(
+            reset_port("/dev/ttyACM0", Ok(hub_port(1)), Some(hub_port(2))),
+            Ok(hub_port(1))
+        );
+        // No tty — the `enable power` case this fallback exists for: the connect
+        // that still had a node recorded where the port is.
+        assert_eq!(
+            reset_port(
+                "/dev/ttyACM0",
+                Err("usb: no node".to_string()),
+                Some(hub_port(2))
+            ),
+            Ok(hub_port(2))
+        );
+        // Neither: the error says the coordinates are missing instead of
+        // promising a power switch that cannot be made.
+        let err = reset_port("/dev/ttyACM0", Err("usb: no node".to_string()), None).unwrap_err();
+        assert!(err.starts_with("usb: no node"), "{err}");
+        assert!(err.contains("no hub port is recorded"), "{err}");
+        assert!(err.contains("powered on by hand"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_powering_the_port_back_on_is_retried() {
+        // A failure part way through is transient: the next attempt is the one
+        // that leaves the board powered on.
+        let mut calls = 0u8;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            retrying_power_on(|| {
+                calls += 1;
+                std::future::ready(if calls < 3 {
+                    Err(format!("usb: attempt {calls} failed"))
+                } else {
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+        .expect("the retries must not hang");
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 3);
+
+        // Every attempt failing: the board is left off, and that is said.
+        let mut calls = 0u8;
+        let err = tokio::time::timeout(Duration::from_secs(5), async {
+            retrying_power_on(|| {
+                calls += 1;
+                std::future::ready(Err("usb: switch refused".to_string()))
+            })
+            .await
+        })
+        .await
+        .expect("the retries must not hang")
+        .unwrap_err();
+        assert_eq!(calls as usize, POWER_ON_ATTEMPTS);
+        assert!(err.contains("did not power back on in 3 attempts"), "{err}");
+        assert!(err.contains("usb: switch refused"), "{err}");
+        assert!(err.contains("left powered off"), "{err}");
     }
 
     #[tokio::test]

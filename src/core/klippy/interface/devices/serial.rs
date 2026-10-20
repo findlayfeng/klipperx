@@ -2226,6 +2226,14 @@ impl SharedSerialPort {
         self.stopped.store(true, Ordering::SeqCst);
         if let Ok(slots) = self.slots.lock() {
             for slot in slots.values() {
+                // Taken so the `stopped` flag above cannot land between
+                // `receive`'s check of it and that receiver entering
+                // `cv.wait`: the notifying thread has to hold the same
+                // `incoming` lock the waiter checks under, so the wake-up is
+                // never sent to a receiver that has not parked yet (a missed
+                // one would park for good — the reader that could wake it is
+                // going away with the port).
+                let _incoming = slot.incoming.lock().unwrap();
                 slot.cv.notify_all();
                 slot.ack_cv.notify_all();
             }
@@ -3827,6 +3835,69 @@ mod mux_tests {
                 .is_some(),
             "shutdown must not take the port down"
         );
+    }
+
+    /// A port stop wakes a receiver that is already parked.
+    ///
+    /// `receive` checks `stopped` and enters `cv.wait` under the slot's
+    /// `incoming` lock, and `stop` takes that same lock before notifying: the
+    /// flag cannot be set in the window between the check and the park, so the
+    /// wake-up cannot be missed. Missing it is fatal rather than late — the
+    /// reader that would push the next frame goes away with the port, so the
+    /// receiver would never be woken again.
+    ///
+    /// The test holds that lock across the stop, which is the window itself:
+    /// a `stop` that notifies without taking it gets through and leaves the
+    /// receiver parked (and the test fails), instead of the mismatch only
+    /// showing up as a lost race every so often.
+    #[test]
+    fn a_port_stop_unblocks_a_waiting_receive() {
+        let pty = Pty::new();
+        let handle = attach_downstream(&pty.path, DEFAULT_BAUD, 4)
+            .expect("a downstream attach on a live port");
+        let port = Arc::clone(&handle.port);
+        let slot = Arc::clone(&handle.slot);
+
+        let (received, got) = std::sync::mpsc::channel();
+        let receiving = thread::spawn(move || {
+            // Blocks: nothing is written for id 4 and the port is not stopped.
+            let _ = received.send(handle.receive());
+        });
+        // Time for the receiver to reach `cv.wait`: the state the stop's
+        // wake-up is meant to find. Waiting for the lock (should the receiver
+        // not have parked yet) needs no window of its own — `wait` releases it.
+        let incoming = slot.incoming.lock().unwrap();
+
+        let (stopped, stop_done) = std::sync::mpsc::channel();
+        let stopping = {
+            let port = Arc::clone(&port);
+            thread::spawn(move || {
+                port.stop();
+                let _ = stopped.send(());
+            })
+        };
+        assert_eq!(
+            stop_done.recv_timeout(Duration::from_millis(200)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "stop must take the slot's incoming lock before waking its receiver"
+        );
+
+        // Released, the stop runs: the flag is set and the parked receiver is
+        // woken to see it. `recv_timeout` (not a bare `join`) is what bounds a
+        // receive that was not woken — it fails the test rather than the run.
+        drop(incoming);
+        stop_done
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the stop must finish once the slot's lock is free");
+        assert_eq!(
+            got.recv_timeout(Duration::from_secs(1)),
+            Ok(None),
+            "a waiting receive must return None within a second of the stop"
+        );
+        stopping.join().expect("the stopping thread must not hang");
+        receiving
+            .join()
+            .expect("the receiving thread must not hang");
     }
 
     /// The `ptr_eq` guard keeps a **stale** handle from unregistering a slot a

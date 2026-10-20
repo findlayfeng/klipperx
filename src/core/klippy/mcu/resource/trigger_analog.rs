@@ -505,8 +505,9 @@ impl McuTriggerAnalog {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         mcu.send_msg(&TriggerAnalogHome::disable(self.oid))?;
         let state = mcu
-            .call_msg::<TriggerAnalogQueryState, TriggerAnalogState>(
+            .call_msg_oid::<TriggerAnalogQueryState, TriggerAnalogState>(
                 &TriggerAnalogQueryState { oid: self.oid },
+                self.oid,
                 QUERY_TIMEOUT,
             )
             .await?;

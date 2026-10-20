@@ -207,7 +207,7 @@ impl McuI2c {
             };
             let response: crate::core::klippy::cmd::i2c::I2cReadResponse = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                mcu.call_msg(&read_cmd, std::time::Duration::from_secs(1)),
+                mcu.call_msg_oid(&read_cmd, oid, std::time::Duration::from_secs(1)),
             )
             .await
             .map_err(|_| {
@@ -226,7 +226,7 @@ impl McuI2c {
             };
             let response: crate::core::klippy::cmd::i2c::I2cResponse = tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                mcu.call_msg(&cmd, std::time::Duration::from_secs(1)),
+                mcu.call_msg_oid(&cmd, oid, std::time::Duration::from_secs(1)),
             )
             .await
             .map_err(|_| {
@@ -292,7 +292,7 @@ impl McuI2c {
         };
         let response: crate::core::klippy::cmd::i2c::I2cResponse = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            mcu.call_msg(&cmd, std::time::Duration::from_secs(1)),
+            mcu.call_msg_oid(&cmd, oid, std::time::Duration::from_secs(1)),
         )
         .await
         .map_err(|_| {

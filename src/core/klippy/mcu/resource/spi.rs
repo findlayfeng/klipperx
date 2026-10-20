@@ -164,14 +164,16 @@ impl McuSpi {
             oid,
             data: data.to_vec(),
         };
-        let response: SpiTransferResponse =
-            tokio::time::timeout(TRANSFER_TIMEOUT, mcu.call_msg(&command, TRANSFER_TIMEOUT))
-                .await
-                .map_err(|_| {
-                    McuError::Call(crate::core::klippy::mcu::McuCallError::Timeout(
-                        "spi_transfer timed out".to_string(),
-                    ))
-                })??;
+        let response: SpiTransferResponse = tokio::time::timeout(
+            TRANSFER_TIMEOUT,
+            mcu.call_msg_oid(&command, oid, TRANSFER_TIMEOUT),
+        )
+        .await
+        .map_err(|_| {
+            McuError::Call(crate::core::klippy::mcu::McuCallError::Timeout(
+                "spi_transfer timed out".to_string(),
+            ))
+        })??;
         Ok(response.response)
     }
 

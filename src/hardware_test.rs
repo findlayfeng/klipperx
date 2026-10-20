@@ -269,7 +269,6 @@ use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::ids::NODEID_FIRST;
-use crate::core::klippy::mcu::serial_ports::SerialPorts;
 use crate::core::klippy::printer::{Printer, PrinterState};
 use crate::core::klippy::reactor::TokioReactor;
 
@@ -540,36 +539,11 @@ pub struct Machine {
 /// it has to ask the same question of the same pass. Without this a bridge's mux
 /// firmware is opened with bare frames, answers nothing, and the session times
 /// out in identify — which is how this lane used to fail on a muxed board.
-pub fn apply_id_addressed_transport(config: &Config, section: &ConfigSection, mcu: &mut McuConfig) {
-    if let Some(baud) = id_addressed_baud(config, section) {
-        mcu.shared_baud = Some(baud);
-        // A shared port is addressed by id, which the load path takes from the
-        // allocator; one section takes the first id of the sequence.
-        mcu.id = Some(NODEID_FIRST);
-    }
-}
-
-/// The baud a section's `serial:` path is opened with when the path is
-/// addressed by id, or `None` when it is opened exclusively.
 ///
-/// The load path decides this over the whole config
-/// (`SerialPorts::classify`, driven from `mcu/object.rs`); a hardware test has
-/// the parsed config here, so it asks the same question of the same pass.
-fn id_addressed_baud(config: &Config, section: &ConfigSection) -> Option<u32> {
-    let path = section.get_text("serial")?;
-    let wrapper = ConfigWrapper::with_config(
-        section,
-        crate::core::klippy::config::AccessTracking::shared(),
-        None,
-        config,
-    );
-    let ports = SerialPorts::classify(&wrapper);
-    if ports.is_id_addressed(&path) {
-        ports.effective_baud(&path)
-    } else {
-        None
-    }
-}
+/// The implementation is [`crate::stress::apply_id_addressed_transport`]'s: this
+/// module is `#[cfg(test)]`, that one is not, and the release `klipperx stress`
+/// asks exactly the same question and must get the same answer.
+pub(crate) use crate::stress::apply_id_addressed_transport;
 
 impl Machine {
     /// The whole parsed printer config.

@@ -75,6 +75,7 @@ use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigW
 use crate::core::klippy::extras::board_pins::BoardPins;
 use crate::core::klippy::mathutil::Xyz;
 use crate::core::klippy::mcu::port_grouping::{self, PortKind};
+use crate::core::klippy::mcu::serial_ports::SerialPorts;
 use crate::core::klippy::mcu::{
     bridge_attach, bridge_ports, ids, load_config as load_mcu_object, pin_number, ConfigBuilder,
     Mcu, McuChip, McuError, McuObject,
@@ -975,7 +976,6 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
             format!("no [mcu {name}] section")
         }
     })?;
-    #[allow(unused_mut)]
     let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
         section,
         AccessTracking::shared(),
@@ -986,9 +986,112 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
     // The same question the load path asks: is this `serial:` path addressed by
     // id (a bridge's mux console, a shared port)? A stress case opens the
     // section itself, so it applies the answer here.
-    #[cfg(test)]
-    crate::hardware_test::apply_id_addressed_transport(config, section, &mut mcu);
+    apply_id_addressed_transport(config, section, &mut mcu);
     Ok(mcu)
+}
+
+/// Set the transport facts the load path would have put on `mcu` for `section`.
+///
+/// The load path decides "this `serial:` path is addressed by id" over the
+/// **whole** config (`SerialPorts::classify`, driven from `mcu/object.rs`) and
+/// stamps the answer on the MCU object; a lane that opens one section on its own
+/// — a stress case here, a hardware test in `hardware_test.rs` — has to ask the
+/// same question of the same pass. Without this a bridge's mux firmware is
+/// opened with bare frames, answers nothing, and the session times out in
+/// identify.
+///
+/// It lives in this module rather than `hardware_test.rs` because that module is
+/// `#[cfg(test)]` (`lib.rs`) while `klipperx stress` is a shipped command: both
+/// lanes ask the question, and only this module is built into a release binary.
+/// Leaving the stamp to the test build is what opened a shared port with bare
+/// frames in a release `klipperx stress`.
+pub(crate) fn apply_id_addressed_transport(
+    config: &Config,
+    section: &ConfigSection,
+    mcu: &mut McuConfig,
+) {
+    let Some(baud) = id_addressed_baud(config, section) else {
+        return;
+    };
+    mcu.shared_baud = Some(baud);
+    // A shared port is addressed by id, and the number is the whole config's:
+    // the load path gives every `[mcu]` one in declaration order, so this
+    // section's id is that sequence's, not always the first of it.
+    mcu.id = Some(load_time_id(config, &mcu.name));
+}
+
+/// The baud a section's `serial:` path is opened with when the path is
+/// addressed by id, or `None` when it is opened exclusively.
+///
+/// The load path decides this over the whole config
+/// (`SerialPorts::classify`, driven from `mcu/object.rs`); a lane that holds the
+/// parsed config asks the same question of the same pass.
+fn id_addressed_baud(config: &Config, section: &ConfigSection) -> Option<u32> {
+    let path = section.get_text("serial")?;
+    let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, config);
+    let ports = SerialPorts::classify(&wrapper);
+    if ports.is_id_addressed(&path) {
+        ports.effective_baud(&path)
+    } else {
+        None
+    }
+}
+
+/// The id the load path's allocator gives the `[mcu]` section called `name`.
+///
+/// `mcu/ids.rs` hands every `[mcu]` an id from **one** sequence, in the order
+/// the config declares the sections, after reserving every explicit
+/// `canbus_nodeid` (`mcu/object.rs::load_config`). A lane that opens one section
+/// on its own therefore cannot assume "the first id of the sequence": two boards
+/// on a shared port would both answer to it. The walk is replayed here over the
+/// config already parsed — a local [`ids::McuIds`], the explicit claims reserved
+/// first, then each `[mcu]` registered the way the load registers it (a CAN link
+/// with its uuid and any explicit node id, every other transport with
+/// `register`) — and the id the section under `name` receives is the answer.
+///
+/// `NODEID_FIRST` stands in only when the walk cannot register — a config the
+/// load path would have rejected before any session existed — so the fallback is
+/// unreachable for a machine that came up, and keeps this total instead of
+/// inventing an error path for a config that cannot run.
+fn load_time_id(config: &Config, name: &str) -> u32 {
+    let sections = config.get_sections_by_id("mcu");
+    let Some(first) = sections.first() else {
+        return ids::NODEID_FIRST;
+    };
+    let allocator = ids::McuIds::new();
+    allocator.reserve_explicit(&ConfigWrapper::with_config(
+        first,
+        AccessTracking::shared(),
+        None,
+        config,
+    ));
+    for section in sections {
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, config);
+        let Ok(parsed) = McuConfig::new(&wrapper) else {
+            // A section the load itself could not parse took no id there
+            // either; the config is broken and the walk carries on without it.
+            continue;
+        };
+        let id = match &parsed.transport {
+            Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => {
+                allocator.register_can(&parsed.name, *uuid, parsed.id)
+            }
+            Transport::BridgePort {
+                uuid,
+                kind: PortKind::Can,
+                ..
+            } => allocator.register_can(
+                &parsed.name,
+                uuid.expect("a CAN port member writes a uuid (checked at parse, rule 6)"),
+                parsed.id,
+            ),
+            _ => allocator.register(&parsed.name),
+        };
+        if parsed.name == name {
+            return id.unwrap_or(ids::NODEID_FIRST);
+        }
+    }
+    ids::NODEID_FIRST
 }
 
 /// How one selected board's session is opened.

@@ -163,6 +163,27 @@ pub enum Control {
     Quit,
 }
 
+/// A sink for the entries of a request the session makes on its own account.
+///
+/// `objects/list` is asked so the session can name the machine's MCUs; the ask
+/// is plumbing, not something that happened to the printer, so neither it nor
+/// its (long) answer belongs in a client's log.
+#[derive(Default)]
+struct Quiet;
+
+impl Output for Quiet {
+    fn write(&mut self, _entry: Entry) {}
+}
+
+/// Whether an object name is an MCU's: `mcu` for the main board, `mcu <name>`
+/// for every other one.
+///
+/// The MCU objects are registered under their config section's name, which is
+/// the only place the two spellings are fixed.
+pub(crate) fn is_mcu_object(name: &str) -> bool {
+    name == "mcu" || name.starts_with("mcu ")
+}
+
 /// What the printer's `gcode` object says about its commands: what they are
 /// called, and which parameter names each one declares.
 ///
@@ -189,6 +210,21 @@ pub struct Session {
     label: String,
     connection: Connection,
 }
+
+/// The fields a status display draws an MCU's traffic from.
+///
+/// Named rather than `null`, because the rest of an `mcu` object is
+/// `mcu_constants` and the identify-time strings, which never change and would
+/// be pushed once for nothing. A field the printer does not report is answered
+/// (and tracked) as `null` and pushed the moment it appears, so naming one this
+/// host does not send yet costs nothing.
+pub const MCU_STATS_FIELDS: [&str; 5] = [
+    "last_stats",
+    "last_stats_time",
+    "bytes_retransmit",
+    "srtt",
+    "rto",
+];
 
 impl Session {
     /// Connect to `target`.
@@ -350,35 +386,77 @@ impl Session {
         Ok(())
     }
 
-    /// Subscribe this connection to the printer's own state object, `webhooks`
-    /// (`objects/subscribe`).
+    /// Subscribe this connection to what a front-end's status displays read
+    /// (`objects/subscribe`): the printer's own state object plus every MCU's
+    /// transfer counters.
     ///
     /// `webhooks` is the object the printer registers before anything else, and
     /// it reports the printer's `state` and `state_message`. It is what keeps a
     /// state display honest: the handshake's `info` says what the state was when
     /// the client connected and nothing ever repeats it, while a subscription
-    /// pushes every change. Called once per connection — a front-end that
-    /// reconnects has to call it again.
+    /// pushes every change.
     ///
-    /// Deliberately no notice: this is part of connecting, so a line on every
-    /// start would be noise, and the state updating is the feedback.
+    /// The `mcu` objects are asked for in the *same* request because a
+    /// connection has one subscription and a second `objects/subscribe`
+    /// replaces it: asking for the counters separately would silently stop the
+    /// state pushes. Their counters are cumulative since the transport opened,
+    /// so what a reader can use is their rate — `last_stats_time` is the date
+    /// that turns two reports into an interval.
+    ///
+    /// Called once per connection — a front-end that reconnects has to call it
+    /// again. Deliberately no notice: this is part of connecting, so a line on
+    /// every start would be noise, and the state updating is the feedback.
     ///
     /// # Errors
     /// Returns [`TransportError`] if the request cannot be sent.
-    pub async fn subscribe_webhooks(
-        &mut self,
-        out: &mut impl Output,
-    ) -> Result<(), TransportError> {
+    pub async fn subscribe_status(&mut self, out: &mut impl Output) -> Result<(), TransportError> {
+        let mut objects = Map::new();
         // `null` per object means "every field", so `state` and `state_message`
         // arrive without being named; the template names the pushes.
+        objects.insert("webhooks".to_string(), Value::Null);
+        for name in self.mcu_objects().await? {
+            objects.insert(name, json!(MCU_STATS_FIELDS));
+        }
+
         let mut params = Map::new();
-        params.insert("objects".to_string(), json!({"webhooks": null}));
+        params.insert("objects".to_string(), Value::Object(objects));
         params.insert(
             "response_template".to_string(),
             json!({"id": null, "method": "klippy:status"}),
         );
         self.request("objects/subscribe", params, out).await?;
         Ok(())
+    }
+
+    /// The printer's `mcu` object names, from `objects/list`.
+    ///
+    /// `mcu` is the main board and `mcu <name>` every other one, which is why
+    /// the list is asked for instead of assumed: a machine may have several.
+    /// An unanswered or refused list — a printer still coming up — leaves
+    /// nothing to subscribe to, and a front-end then has no counters to show,
+    /// which is a picture it knows how to draw without.
+    async fn mcu_objects(&mut self) -> Result<Vec<String>, TransportError> {
+        // Both entries go to a sink: this is the session asking itself which
+        // MCUs exist, and the answer is long enough to bury the log.
+        let mut quiet = Quiet;
+        let id = self.request("objects/list", Map::new(), &mut quiet).await?;
+        let reply = match self.await_reply(id, &mut quiet).await? {
+            Some(reply) if !reply.is_error() => reply,
+            _ => return Ok(Vec::new()),
+        };
+        Ok(reply
+            .result()
+            .and_then(|result| result.get("objects"))
+            .and_then(Value::as_array)
+            .map(|objects| {
+                objects
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|name| is_mcu_object(name))
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Restart the firmware (`gcode/firmware_restart`).
@@ -914,6 +992,41 @@ mod tests {
         }
     }
 
+    /// An `objects/list` for a machine with two boards, which is what the
+    /// status subscription has to find by name.
+    struct McuList;
+
+    impl Endpoint for McuList {
+        fn path(&self) -> &'static str {
+            "objects/list"
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Ok(json!({"objects": ["mcu", "mcu zboard", "toolhead"]})) })
+        }
+    }
+
+    /// An `objects/list` that refuses, as a printer still coming up does.
+    struct RefusingList;
+
+    impl Endpoint for RefusingList {
+        fn path(&self) -> &'static str {
+            "objects/list"
+        }
+
+        fn handle<'a>(
+            &'a self,
+            _request: &'a Request,
+            _context: &'a EndpointContext<'a>,
+        ) -> EndpointFuture<'a> {
+            Box::pin(async move { Err(ApiError::CommandError("Printer is not ready".to_string())) })
+        }
+    }
+
     /// Records what it was subscribed to, and pushes an update.
     struct Subscribe;
 
@@ -1107,6 +1220,24 @@ mod tests {
         let mut api = Api::new();
         api.register(Info).unwrap();
         api.register(query).unwrap();
+        let server = Server::bind(dir.target(), Arc::new(api))
+            .await
+            .expect("cannot bind");
+        tokio::spawn(async move {
+            let _ = server.run().await;
+        })
+    }
+
+    /// A server with `info`, an `objects/list` of one shape and the endpoint
+    /// that records a subscription.
+    async fn server_with_list<E: Endpoint + 'static>(
+        dir: &SocketDir,
+        list: E,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut api = Api::new();
+        api.register(Info).unwrap();
+        api.register(list).unwrap();
+        api.register(Subscribe).unwrap();
         let server = Server::bind(dir.target(), Arc::new(api))
             .await
             .expect("cannot bind");
@@ -1342,14 +1473,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_subscribing_to_webhooks_asks_for_that_object() {
+    async fn test_subscribing_to_the_status_asks_for_webhooks() {
         let dir = SocketDir::new("webhooks");
         let (mut session, mut out, task) = session(&dir).await;
 
-        session.subscribe_webhooks(&mut out).await.unwrap();
+        session.subscribe_status(&mut out).await.unwrap();
 
         // The request and nothing else: subscribing is part of connecting, so
-        // it says no notice of its own, and `texts()` covers every entry.
+        // it says no notice of its own, and `texts()` covers every entry. The
+        // `objects/list` the MCU names came from is the session's own business
+        // and went to a sink, so it is not one of these entries either.
         assert_eq!(out.texts().len(), 1, "{:?}", out.texts());
         let sent = out.sent();
         assert_eq!(sent.len(), 1);
@@ -1359,12 +1492,81 @@ mod tests {
             } => {
                 assert_eq!(method, "objects/subscribe");
                 // `null` means every field, so the pushes carry `state` and
-                // `state_message` without the client naming them.
+                // `state_message` without the client naming them. This machine
+                // lists no MCU objects, so `webhooks` is the whole selection.
                 assert_eq!(message["params"]["objects"], json!({"webhooks": null}));
                 assert_eq!(
                     message["params"]["response_template"]["method"],
                     "klippy:status"
                 );
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_subscribing_to_the_status_names_every_mcu() {
+        // A machine with two boards: both are subscribed to in the one request
+        // (a second `objects/subscribe` would replace the first), and the
+        // fields are named so the pushes carry the counters and nothing else.
+        let dir = SocketDir::new("mcus");
+        let task = server_with_list(&dir, McuList).await;
+        let mut session = Session::connect(dir.target())
+            .await
+            .expect("cannot connect");
+        session
+            .handshake(&mut Recording::default())
+            .await
+            .expect("handshake failed");
+        let mut out = Recording::default();
+
+        session.subscribe_status(&mut out).await.unwrap();
+
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1, "{:?}", out.texts());
+        match sent[0] {
+            Entry::Sent {
+                method, message, ..
+            } => {
+                assert_eq!(method, "objects/subscribe");
+                assert_eq!(
+                    message["params"]["objects"],
+                    json!({
+                        "webhooks": null,
+                        "mcu": MCU_STATS_FIELDS,
+                        "mcu zboard": MCU_STATS_FIELDS,
+                    })
+                );
+            }
+            other => panic!("expected a sent entry, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_printer_that_cannot_list_its_objects_still_subscribes() {
+        // The list is how the MCUs are named, so a printer still coming up has
+        // none to offer — which is no reason to leave the header without its
+        // state subscription.
+        let dir = SocketDir::new("nolist");
+        let task = server_with_list(&dir, RefusingList).await;
+        let mut session = Session::connect(dir.target())
+            .await
+            .expect("cannot connect");
+        session
+            .handshake(&mut Recording::default())
+            .await
+            .expect("handshake failed");
+        let mut out = Recording::default();
+
+        session.subscribe_status(&mut out).await.unwrap();
+
+        let sent = out.sent();
+        assert_eq!(sent.len(), 1, "{:?}", out.texts());
+        match sent[0] {
+            Entry::Sent { message, .. } => {
+                assert_eq!(message["params"]["objects"], json!({"webhooks": null}))
             }
             other => panic!("expected a sent entry, got {other:?}"),
         }

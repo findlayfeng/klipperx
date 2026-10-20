@@ -1,6 +1,6 @@
 //! The full-screen front-end: `klippy-client console` on a terminal.
 //!
-//! Three panes and a keyboard:
+//! Four rows and a log:
 //!
 //! ```text
 //! ● ready · Printer is ready
@@ -14,14 +14,45 @@
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
-//! happened, and the last line is the hint. Nothing is bordered: the window is
-//! usually a few dozen rows of printer output, and every column counts.
+//! happened, the row above the input line is what the link is carrying, and the
+//! last line is the hint. Nothing is bordered: the window is usually a few dozen
+//! rows of printer output, and every column counts.
 //!
 //! Everything the session does arrives as an [`Entry`] and is appended to the
 //! log pane; the window exists to make that log readable while the printer is
 //! running. Pushes are the reason: a subscription keeps printing under a line
 //! mode session too, but only a window can show it without fighting the prompt
 //! for the same line.
+//!
+//! # Traffic
+//!
+//! The row above the input line says what each MCU's link is carrying:
+//!
+//! ```text
+//! mcu  read 1.2 kB/s  write 820 B/s  ·  mcu z  read 12 B/s  write 40 B/s  retx 3
+//! ```
+//!
+//! The numbers the printer reports (`last_stats.bytes_read`, `bytes_write`) are
+//! cumulative since its transport was opened, so the only readable quantity is
+//! their **rate**: each report's growth over the interval `last_stats_time`
+//! gives, smoothed so a busy moment does not make the row flicker. Nothing has
+//! been measured until two reports have arrived, which is `—` and not `0` — a
+//! link that has carried nothing and one that has not been read are different
+//! facts.
+//!
+//! There is deliberately **no utilisation percentage**. A USB CDC link's baud is
+//! a negotiated number, not a line speed, so a share of it would be a figure
+//! that looks like a measurement and is not one. Without the percentage the row
+//! needs nothing but the counters, and a reader who knows their wire can divide
+//! by it themselves.
+//!
+//! `srtt`/`rto` and `bytes_retransmit` are shown when the printer reports them
+//! (this host's `mcu` object does not, yet); a field it never sends is asked
+//! for anyway and simply never arrives. The row is one line: a narrow window
+//! cuts the tail off rather than wrapping, because the log's rows are the
+//! reason the window exists. The pushes behind it are read and not reprinted —
+//! they arrive every 5 s, and a window that showed them would spend its log on
+//! them.
 //!
 //! ## Scrolling
 //!
@@ -178,6 +209,16 @@ const COMPLETION_ROWS: usize = 6;
 /// that does not has no list to offer this time round.
 const GCODE_COMMANDS_WINDOW: Duration = Duration::from_secs(2);
 
+/// How much of one interval's rate the shown rate takes on at each `stats`
+/// report.
+///
+/// The firmware reports `stats` every 5 s (`basecmd.c`), so an unsmoothed rate
+/// is one report's traffic over the five seconds since the one before it — a
+/// value that steps with whatever the machine happened to be doing. An
+/// exponential average over the intervals settles in a handful of reports and
+/// still follows a real change in the traffic.
+const RATE_SMOOTHING: f64 = 0.4;
+
 /// Open a window on `target`.
 ///
 /// # Errors
@@ -281,6 +322,10 @@ struct App {
     /// `info` reply, from the `objects/subscribe` reply's snapshot and from the
     /// `klippy:status` pushes after it.
     status: Status,
+    /// What each MCU's link is carrying, in the row above the input line. One
+    /// entry per `mcu` object, in the order the subscription named them; empty
+    /// when the printer named none (see [`Session::subscribe_status`]).
+    mcus: Vec<McuStats>,
     /// Set by a local command that asked to leave.
     quit: bool,
     /// `Esc` presses seen in the current gesture, and when that gesture stops
@@ -374,6 +419,135 @@ impl Render {
     };
 }
 
+/// One MCU's traffic, as its `mcu` object reports it, and the rates worked out
+/// from it.
+///
+/// The counters are cumulative, so they are kept only as the baseline the next
+/// report is differenced against (see [`RateMeter`]); what the row shows is the
+/// rates. `srtt`/`rto`/`bytes_retransmit` are `Option` because the printer may
+/// not report them at all — this host's `mcu` object does not, yet.
+#[derive(Debug, Default, Clone)]
+struct McuStats {
+    /// The object's name as the printer lists it: `mcu`, `mcu zboard`.
+    name: String,
+    /// Bytes per second the transport has been reading.
+    read: RateMeter,
+    /// Bytes per second it has been writing.
+    write: RateMeter,
+    /// Frames that had to go out again, when the printer counts them.
+    retransmit: Option<u64>,
+    /// Smoothed round trip, in seconds, when the printer reports it.
+    srtt: Option<f64>,
+    /// Retransmit timeout it implies, in seconds, when reported.
+    rto: Option<f64>,
+}
+
+impl McuStats {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// Take what one `mcu` status object says: the fields a fresh report
+    /// carries, and nothing for the ones it left out.
+    ///
+    /// A push carries only what changed, so a report that moved the counters
+    /// may arrive without the optional fields and vice versa — which is why the
+    /// optional ones are only replaced when they are there.
+    fn update(&mut self, status: &Value) {
+        // `last_stats` is the report; `last_stats_time` is the host's date for
+        // it, and the pair is what an interval needs. They change together, so
+        // both being there is the whole condition.
+        let report = status.get("last_stats");
+        let time = status.get("last_stats_time").and_then(Value::as_f64);
+        if let (Some(report), Some(time)) = (report, time) {
+            if let Some(read) = counter(report, "bytes_read") {
+                self.read.sample(time, read);
+            }
+            if let Some(write) = counter(report, "bytes_write") {
+                self.write.sample(time, write);
+            }
+        }
+        if let Some(retransmit) = counter(status, "bytes_retransmit") {
+            self.retransmit = Some(retransmit);
+        }
+        if let Some(srtt) = seconds(status, "srtt") {
+            self.srtt = Some(srtt);
+        }
+        if let Some(rto) = seconds(status, "rto") {
+            self.rto = Some(rto);
+        }
+    }
+}
+
+/// A counter a status object reports, taken from the object itself or from its
+/// `last_stats` — either place is real: the byte counts live inside
+/// `last_stats` (upstream's `serialqueue_get_stats`), while a retransmit count
+/// beside them is what a transport would report about itself.
+fn counter(value: &Value, name: &str) -> Option<u64> {
+    value
+        .get(name)
+        .or_else(|| value.get("last_stats").and_then(|stats| stats.get(name)))
+        .and_then(Value::as_u64)
+}
+
+/// A duration a status object reports in seconds, if it reports one.
+fn seconds(value: &Value, name: &str) -> Option<f64> {
+    value
+        .get(name)
+        .or_else(|| value.get("last_stats").and_then(|stats| stats.get(name)))
+        .and_then(Value::as_f64)
+}
+
+/// A cumulative counter's rate, smoothed.
+///
+/// One `stats` report gives a counter and a date; two give an interval, and the
+/// growth over it is a rate. That interval is 5 s long — the firmware's own
+/// report period — so the instantaneous rate is a five-second average that
+/// steps whenever the machine's traffic changes; each new one is folded into an
+/// exponential average instead ([`RATE_SMOOTHING`]).
+///
+/// `None` until there is an interval to divide by: the first report is only the
+/// baseline. It is also `None` again after a counter that went backwards, which
+/// is a transport that was reopened — the old average belongs to the old line.
+#[derive(Debug, Default, Clone)]
+struct RateMeter {
+    /// The previous report: its time, and the counter as it stood.
+    last: Option<(f64, u64)>,
+    rate: Option<f64>,
+}
+
+impl RateMeter {
+    fn sample(&mut self, time: f64, count: u64) {
+        let Some((last_time, last_count)) = self.last else {
+            self.last = Some((time, count));
+            return;
+        };
+        self.last = Some((time, count));
+        let interval = time - last_time;
+        if interval <= 0.0 {
+            // The same report twice, or a clock that did not move: nothing to
+            // divide by, and nothing has changed either.
+            return;
+        }
+        if count < last_count {
+            self.rate = None;
+            return;
+        }
+        let instant = (count - last_count) as f64 / interval;
+        self.rate = Some(match self.rate {
+            Some(smoothed) => smoothed + (instant - smoothed) * RATE_SMOOTHING,
+            None => instant,
+        });
+    }
+
+    fn rate(&self) -> Option<f64> {
+        self.rate
+    }
+}
+
 impl App {
     fn new() -> Self {
         Self {
@@ -389,6 +563,7 @@ impl App {
             dragging: false,
             mouse: true,
             status: Status::Unknown,
+            mcus: Vec::new(),
             quit: false,
             escape_streak: 0,
             escape_deadline: None,
@@ -797,26 +972,42 @@ impl App {
         })
     }
 
-    /// Move the header onto the printer state a `status` object reports.
+    /// Move the header and the traffic row onto the printer state a `status`
+    /// object reports.
     ///
     /// Both callers hand in the same shape — an `objects/…` `status` payload
-    /// holding a `webhooks` object — so the reading of it lives in one place.
-    /// Only a status that carries both fields is applied: the header shows a
-    /// state and its message together, and half of one says less than what is
-    /// already there.
+    /// holding the objects the subscription asked for — so the reading of it
+    /// lives in one place. The header only takes a `webhooks` entry that carries
+    /// both fields: it shows a state and its message together, and half of one
+    /// says less than what is already there. The `mcu` entries are taken as they
+    /// come, since a push reports only what changed.
     fn apply_status(&mut self, status: &Value) {
-        let Some(webhooks) = status.get("webhooks") else {
-            return;
-        };
-        let state = webhooks.get("state").and_then(Value::as_str);
-        let message = webhooks.get("state_message").and_then(Value::as_str);
-        if let (Some(state), Some(message)) = (state, message) {
-            self.status = Status::Connected {
-                state: state.to_string(),
-                // The header is a single row, so a multi-line message would
-                // fold it open.
-                message: message.replace('\n', " "),
+        if let Some(webhooks) = status.get("webhooks") {
+            let state = webhooks.get("state").and_then(Value::as_str);
+            let message = webhooks.get("state_message").and_then(Value::as_str);
+            if let (Some(state), Some(message)) = (state, message) {
+                self.status = Status::Connected {
+                    state: state.to_string(),
+                    // The header is a single row, so a multi-line message would
+                    // fold it open.
+                    message: message.replace('\n', " "),
+                };
+            }
+        }
+        // Every `mcu` object, whichever the machine has: `mcu` is the main board
+        // and `mcu <name>` each other one.
+        for (name, mcu) in status.as_object().into_iter().flatten() {
+            if !session::is_mcu_object(name) {
+                continue;
+            }
+            let index = match self.mcus.iter().position(|known| &known.name == name) {
+                Some(index) => index,
+                None => {
+                    self.mcus.push(McuStats::new(name));
+                    self.mcus.len() - 1
+                }
             };
+            self.mcus[index].update(mcu);
         }
     }
 }
@@ -864,6 +1055,13 @@ impl Output for App {
                 if let Some(status) = status {
                     self.apply_status(status);
                 }
+                // Read, and not reprinted: a push that is nothing but the
+                // traffic counters arrives on the firmware's own `stats`
+                // schedule — every 5 s — and would push the printer's output
+                // off the pane at the speed of the traffic itself.
+                if is_traffic_only(message) {
+                    return;
+                }
             }
             _ => (),
         }
@@ -878,6 +1076,28 @@ impl Output for App {
         }
         self.push(entry);
     }
+}
+
+/// Whether a push carries nothing but MCU objects — the traffic row's input
+/// rather than an entry of its own.
+///
+/// The status subscription refreshes every 0.25 s and pushes only changes, so
+/// the counters (`last_stats`, dated by `last_stats_time`) are the one thing in
+/// it that arrives on a schedule: the firmware reports `stats` every 5 s. A
+/// window that reprinted those would spend the log on them, and the log is for
+/// what the printer did.
+fn is_traffic_only(message: &Value) -> bool {
+    let Some(status) = message
+        .get("params")
+        .and_then(|params| params.get("status"))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    !status.is_empty()
+        && status
+            .keys()
+            .all(|name| session::is_mcu_object(name.as_str()))
 }
 
 /// Whether g-code mode drops `entry` from the log entirely.
@@ -967,7 +1187,9 @@ async fn event_loop(
     // The header would otherwise stand still at what the handshake's `info`
     // reply said: the printer reports every later state change through its
     // `webhooks` object, and nothing pushes that unless it is subscribed to.
-    session.subscribe_webhooks(&mut app).await?;
+    // The same subscription is what the traffic row reads — one request, since
+    // a connection has one subscription and a second replaces the first.
+    session.subscribe_status(&mut app).await?;
 
     let (mut keys, keyboard) = spawn_keyboard();
     // The window holds the mouse unless the reader has handed it back, and the
@@ -1188,16 +1410,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 /// The header's height is not fixed: a state message can be a sentence (a
 /// shutdown reason usually is), and the status bar is the only place it is
 /// shown, so it wraps and the log starts below it. It never takes so much that
-/// the log, the input and the footer lose their rows.
+/// the log, the traffic row, the input and the footer lose their rows.
 fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
+    // The traffic row exists only once the printer has named an MCU to report
+    // on: an empty row would take a log line and say nothing with it.
+    let traffic_height = if app.mcus.is_empty() { 0 } else { 1 };
+    let fixed_below = 3 + traffic_height;
     let mut header = header_lines(app, area.width as usize);
-    header.truncate(area.height.saturating_sub(3).max(1) as usize);
+    header.truncate(area.height.saturating_sub(fixed_below).max(1) as usize);
     let header_height = header.len() as u16;
 
-    let [header_area, log, input, footer] = Layout::vertical([
+    let [header_area, log, traffic, input, footer] = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
+        Constraint::Length(traffic_height),
         Constraint::Length(1),
         Constraint::Length(1),
     ])
@@ -1205,10 +1432,11 @@ fn draw(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Paragraph::new(Text::from(header)), header_area);
     draw_log(frame, app, log);
+    draw_traffic(frame, app, traffic);
     draw_input(frame, app, input);
     draw_footer(frame, app, footer);
     // Last, because it is an overlay: the candidate layer is drawn over the log
-    // rather than given rows of its own, and the four panes keep their sizes.
+    // rather than given rows of its own, and the fixed rows keep their sizes.
     draw_completions(frame, app, input, log);
 }
 
@@ -1312,6 +1540,96 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// The traffic row: what each MCU's link is carrying, above the input line.
+///
+/// It reads the state [`McuStats`] keeps, which the subscription's pushes move
+/// on their own — the row costs a `format` per frame and never touches the
+/// connection, so drawing cannot wait on a printer.
+fn draw_traffic(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(traffic_text(&app.mcus, area.width as usize)))
+            .style(Style::new().fg(Color::Gray)),
+        area,
+    );
+}
+
+/// One row of traffic, cut to `width` columns.
+///
+/// Per MCU: its name, then the two byte rates, then the retransmit count and
+/// the round trip if the printer reports them. The rates carry their own unit
+/// and nothing is scaled to a "line speed": a link's negotiated baud is not the
+/// rate it is carrying, so a percentage of it would be a number shaped like a
+/// fact that is not one.
+fn traffic_text(mcus: &[McuStats], width: usize) -> String {
+    let mut row = String::new();
+    for mcu in mcus {
+        if !row.is_empty() {
+            row.push_str("  ·  ");
+        }
+        row.push_str(&format!(
+            "{}  read {}  write {}",
+            mcu.name,
+            rate(mcu.read.rate()),
+            rate(mcu.write.rate())
+        ));
+        if let Some(retransmit) = mcu.retransmit {
+            row.push_str(&format!("  retx {retransmit}"));
+        }
+        if let Some(srtt) = mcu.srtt {
+            row.push_str(&format!("  srtt {}", milliseconds(srtt)));
+        }
+        if let Some(rto) = mcu.rto {
+            row.push_str(&format!("  rto {}", milliseconds(rto)));
+        }
+    }
+    clipped(&row, width)
+}
+
+/// A rate as a reader takes it: `—` when nothing has been measured yet, and
+/// bytes per second with the unit spelled out.
+///
+/// `—` is not `0 B/s`: a link whose traffic has not been read yet and one that
+/// carried nothing are different facts, and 0 would claim the second.
+fn rate(bytes_per_second: Option<f64>) -> String {
+    let Some(bytes) = bytes_per_second else {
+        return "—".to_string();
+    };
+    if bytes < 10.0 {
+        // A decimal here, or an idle link's trickle would round to `0`.
+        format!("{bytes:.1} B/s")
+    } else if bytes < 1_000.0 {
+        format!("{bytes:.0} B/s")
+    } else if bytes < 1_000_000.0 {
+        format!("{:.1} kB/s", bytes / 1_000.0)
+    } else {
+        format!("{:.2} MB/s", bytes / 1_000_000.0)
+    }
+}
+
+/// A duration the printer reports in seconds, as milliseconds.
+fn milliseconds(seconds: f64) -> String {
+    format!("{:.1}ms", seconds * 1_000.0)
+}
+
+/// `text` cut to `width` columns, with an ellipsis where it was cut.
+///
+/// The traffic row is one line and stays one: a window too narrow for it loses
+/// the tail rather than wrapping, because the rows below the log are the log's.
+fn clipped(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut cut: String = text.chars().take(width - 1).collect();
+    cut.push('…');
+    cut
+}
+
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     let prompt = if session::is_local(&app.input.text()) {
         // A local command is the client's own, so it is marked as such before it
@@ -1343,6 +1661,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
 /// the log instead of taking rows of its own, since the panes' heights are fixed
 /// in [`draw`] and the candidates are a passing thing; nothing is drawn when the
 /// log has no room for it, which costs the picture and not the feature.
+///
+/// Its rows stop at the top of the traffic row: the layer belongs to the input
+/// line, and the log's rows end there.
 fn draw_completions(frame: &mut Frame, app: &App, input: Rect, log: Rect) {
     let Some(completion) = app.completion.as_ref() else {
         return;
@@ -1361,10 +1682,13 @@ fn draw_completions(frame: &mut Frame, app: &App, input: Rect, log: Rect) {
         .max()
         .unwrap_or(0);
     let width = (widest + 2).min(input.width as usize);
-    if width == 0 || input.y < log.y.saturating_add(rows as u16) {
+    // The bottom of the log: whatever sits between it and the input line (the
+    // traffic row) is not the layer's to cover.
+    let bottom = log.y + log.height;
+    if width == 0 || bottom < log.y.saturating_add(rows as u16) {
         return;
     }
-    let area = Rect::new(input.x, input.y - rows as u16, width as u16, rows as u16);
+    let area = Rect::new(input.x, bottom - rows as u16, width as u16, rows as u16);
 
     // The log is behind the layer, and a `Paragraph` only writes the cells it
     // has text for: without this the log's own lines would show through the
@@ -5516,5 +5840,211 @@ mod tests {
             "the front has scrolled away: {text}"
         );
         assert!(rows[7].starts_with("gcode> M109"), "{rows:?}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Traffic
+    // -----------------------------------------------------------------------
+
+    /// One `klippy:status` push carrying an `mcu` object, as the subscription
+    /// delivers it: only the fields that changed.
+    fn mcu_push(name: &str, fields: Value) -> Entry {
+        let mut status = serde_json::Map::new();
+        status.insert(name.to_string(), fields);
+        Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "klippy:status",
+            "params": {"eventtime": 12.5, "status": status}
+        }))
+    }
+
+    /// One `stats` report: the two counters and the host's date for them.
+    fn stats_report(time: f64, read: u64, write: u64) -> Value {
+        serde_json::json!({
+            "last_stats": {
+                "mcu_tick_avg": 1.5e-6,
+                "mcu_tick_stddev": 2.0e-7,
+                "mcu_tick_awake": 0.25,
+                "bytes_read": read,
+                "bytes_write": write
+            },
+            "last_stats_time": time
+        })
+    }
+
+    #[test]
+    fn test_a_rate_is_a_dash_until_a_second_report_gives_an_interval() {
+        let mut meter = RateMeter::default();
+        // One report is a counter with no interval: 0 would say the link is
+        // idle, and nothing has been measured yet.
+        meter.sample(10.0, 1_000);
+        assert_eq!(meter.rate(), None);
+        assert_eq!(rate(meter.rate()), "—");
+
+        // Five seconds later, 5_000 bytes more: a kilobyte a second.
+        meter.sample(15.0, 6_000);
+        assert_eq!(meter.rate(), Some(1_000.0));
+        assert_eq!(rate(meter.rate()), "1.0 kB/s");
+    }
+
+    #[test]
+    fn test_a_rate_is_smoothed_between_reports() {
+        let mut meter = RateMeter::default();
+        meter.sample(0.0, 0);
+        meter.sample(5.0, 5_000); // 1_000 B/s
+        assert_eq!(meter.rate(), Some(1_000.0));
+
+        // A quiet five seconds: the instant rate is 0, and the shown one has
+        // moved most of the way there but not all of it in one step.
+        meter.sample(10.0, 5_000);
+        let quiet = meter.rate().unwrap();
+        assert!(quiet > 0.0 && quiet < 1_000.0, "{quiet}");
+        assert_eq!(
+            quiet,
+            1_000.0 - 1_000.0 * RATE_SMOOTHING,
+            "one step of the exponential average"
+        );
+
+        // A busy one: back up, again by a step.
+        meter.sample(15.0, 25_000); // 4_000 B/s
+        let busy = meter.rate().unwrap();
+        assert!(busy > quiet, "{busy} > {quiet}");
+        assert_eq!(busy, quiet + (4_000.0 - quiet) * RATE_SMOOTHING);
+    }
+
+    #[test]
+    fn test_a_counter_that_starts_over_forgets_its_rate() {
+        let mut meter = RateMeter::default();
+        meter.sample(0.0, 5_000);
+        meter.sample(5.0, 10_000);
+        assert!(meter.rate().is_some());
+
+        // The transport was reopened, so its counters start again: the old
+        // average belongs to the old line.
+        meter.sample(10.0, 10);
+        assert_eq!(meter.rate(), None);
+        meter.sample(15.0, 5_010);
+        assert_eq!(meter.rate(), Some(1_000.0));
+    }
+
+    #[test]
+    fn test_a_rate_keeps_its_unit_and_never_rounds_a_trickle_to_zero() {
+        assert_eq!(rate(None), "—");
+        assert_eq!(rate(Some(0.4)), "0.4 B/s");
+        assert_eq!(rate(Some(820.0)), "820 B/s");
+        assert_eq!(rate(Some(1_234.0)), "1.2 kB/s");
+        assert_eq!(rate(Some(2_500_000.0)), "2.50 MB/s");
+    }
+
+    #[test]
+    fn test_the_traffic_row_names_each_mcu_and_its_rates() {
+        let mut mcu = McuStats::new("mcu");
+        mcu.update(&stats_report(0.0, 0, 0));
+        mcu.update(&stats_report(5.0, 5_000, 1_000));
+        let mut second = McuStats::new("mcu z");
+        // A board the printer has not reported on yet: `—`, not a zero.
+        second.update(&serde_json::json!({}));
+
+        let row = traffic_text(&[mcu, second], 200);
+        assert_eq!(
+            row,
+            "mcu  read 1.0 kB/s  write 200 B/s  ·  mcu z  read —  write —"
+        );
+    }
+
+    #[test]
+    fn test_the_traffic_row_shows_the_retransmit_count_and_round_trip_when_reported() {
+        let mut mcu = McuStats::new("mcu");
+        mcu.update(&serde_json::json!({
+            "last_stats": {"bytes_read": 10, "bytes_write": 20},
+            "last_stats_time": 1.0,
+            "bytes_retransmit": 3,
+            "srtt": 0.00042,
+            "rto": 0.025
+        }));
+        // Nothing measured yet beyond that one report, but the extras are
+        // facts the printer did report.
+        let row = traffic_text(&[mcu], 200);
+        assert_eq!(row, "mcu  read —  write —  retx 3  srtt 0.4ms  rto 25.0ms");
+    }
+
+    #[test]
+    fn test_a_narrow_traffic_row_is_cut_instead_of_wrapping() {
+        assert_eq!(clipped("abcdef", 10), "abcdef");
+        assert_eq!(clipped("abcdef", 6), "abcdef");
+        assert_eq!(clipped("abcdef", 4), "abc…");
+        assert_eq!(clipped("abcdef", 1), "…");
+        assert_eq!(clipped("abcdef", 0), "");
+    }
+
+    #[test]
+    fn test_the_traffic_row_sits_above_the_input_line() {
+        let mut app = app_with(Vec::new());
+        app.write(mcu_push("mcu", stats_report(0.0, 0, 0)));
+        app.write(mcu_push("mcu", stats_report(5.0, 5_000, 0)));
+
+        // Header, log, traffic, input, hint — the traffic row is the third
+        // from the bottom, and the log keeps the rows above it.
+        let rows = render(&app, 60, 8);
+        assert!(rows[0].contains("ready"), "{rows:?}");
+        assert!(rows[5].starts_with("mcu  read 1.0 kB/s"), "{rows:?}");
+        assert!(rows[6].starts_with("klippy>"), "{rows:?}");
+        assert!(rows[7].contains("Enter send"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_traffic_push_is_read_but_not_reprinted() {
+        // The counters change every 5 s, so this push arrives on that schedule.
+        // It moves the row and leaves the log alone — which is the difference
+        // between a status display and a printer's output.
+        let mut app = app_with(vec![Entry::notice(Notice::Info, "Printer is ready")]);
+        let logged = app.entries.len();
+        app.write(mcu_push("mcu", stats_report(0.0, 100, 200)));
+        app.write(mcu_push("mcu", stats_report(5.0, 5_100, 400)));
+        assert_eq!(app.entries.len(), logged, "the log did not grow");
+        assert_eq!(app.mcus[0].read.rate(), Some(1_000.0), "the row did move");
+
+        // A push that also carries the printer's state is news and is shown.
+        let mut both = serde_json::Map::new();
+        both.insert(
+            "webhooks".to_string(),
+            serde_json::json!({"state": "ready", "state_message": "Printer is ready"}),
+        );
+        both.insert("mcu".to_string(), stats_report(10.0, 10_100, 600));
+        app.write(Entry::Push(serde_json::json!({
+            "id": null,
+            "method": "klippy:status",
+            "params": {"eventtime": 10.0, "status": both}
+        })));
+        assert_eq!(app.entries.len(), logged + 1, "this one is the log's");
+    }
+
+    #[test]
+    fn test_a_printer_with_no_mcu_row_keeps_the_log_its_extra_line() {
+        // Nothing has named an MCU, so there is no row to draw and the log
+        // takes the line: an empty row would cost a line and say nothing.
+        let rows = render(&app_with(Vec::new()), 60, 8);
+        assert!(!rows.join("\n").contains("read "), "{rows:?}");
+        assert!(rows[6].starts_with("klippy>"), "{rows:?}");
+    }
+
+    #[test]
+    fn test_a_subscribe_snapshot_fills_the_traffic_row_too() {
+        // The reply to the startup subscription is a full snapshot, so the row
+        // has a baseline before the first push arrives.
+        let mut app = App::new();
+        app.greeted = true;
+        app.write(Entry::Reply(crate::connection::Reply {
+            id: serde_json::json!(3),
+            method: Some("objects/subscribe".to_string()),
+            message: serde_json::json!({
+                "id": 3,
+                "result": {"eventtime": 0.0, "status": {"mcu": stats_report(22.0, 4_096, 8_192)}}
+            }),
+        }));
+        assert_eq!(app.mcus.len(), 1);
+        app.write(mcu_push("mcu", stats_report(24.0, 6_144, 12_288)));
+        assert_eq!(app.mcus[0].read.rate(), Some(1_024.0));
+        assert_eq!(app.mcus[0].write.rate(), Some(2_048.0));
     }
 }

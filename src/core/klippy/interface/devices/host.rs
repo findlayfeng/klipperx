@@ -447,6 +447,28 @@ impl Router {
         self.slots.lock().unwrap().insert(mcu_id, sender);
         receiver
     }
+
+    /// Take `mcu_id`'s slot out of the map, so the reader stops feeding it.
+    ///
+    /// The one place a slot is taken down: `HostDevice::shutdown` (the thread
+    /// stopping that reference). It is the muxed host path's counterpart of
+    /// `SharedSerialHandle`'s `unregister` — once the entry is gone,
+    /// [`push_unit`] finds no slot for this id and drops its units, which is the
+    /// serial side's failed-`Sender` behaviour for a shut-down handle.
+    ///
+    /// What it prevents is the same thing there: a stopped reference never reads
+    /// its slot again, and the map cannot tell an abandoned slot from a live one,
+    /// so a slot left behind collects this id's units in an unbounded queue
+    /// nobody drains — for as long as any **other** reference keeps the library
+    /// up. A reference that is merely **dropped** needs nothing: its receiver
+    /// goes with it, so `push_unit`'s send fails and the unit is dropped instead
+    /// of stored.
+    ///
+    /// Removal is by id alone, unlike the serial handle's `ptr_eq` check: the map
+    /// holds the `Sender` itself, not a slot a handle could compare against.
+    fn close_slot(&self, mcu_id: u32) {
+        self.slots.lock().unwrap().remove(&mcu_id);
+    }
 }
 
 impl HostLibrary {
@@ -1550,6 +1572,15 @@ impl Device for HostDevice {
     fn shutdown(&self) {
         if self.stopped.swap(true, Ordering::SeqCst) {
             return; // already shut down
+        }
+        // A muxed reference's slot goes with it: nothing reads it any more, and
+        // the reader would keep pushing this id's units into an unbounded queue
+        // nobody drains, for as long as the library stays up for its other
+        // references — the serial handle's `unregister`, for the same reason.
+        // Units for this id are dropped from here on. A bare reference has no
+        // slot to close: it reads the library's one output queue.
+        if let Some(mux) = &self.mux {
+            self.library.router.close_slot(mux.mcu_id);
         }
         // The reader keeps running — this only stops this reference: its
         // `receive` loop notices `stopped` within one wait interval, and the

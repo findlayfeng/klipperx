@@ -252,17 +252,6 @@ impl SerialDevice {
     }
 
     /// Write raw bytes straight to the open port, bounded by
-    /// [`WRITE_STALL_BOUND`] the way [`Device::send`](Self::send) is.
-    ///
-    /// The flashing tool's tty writes go through this: a `write_all` on the raw
-    /// descriptor parks inside the driver when the far end stops draining, and
-    /// the deadline the session puts around the whole frame can only fire
-    /// between writes — so the wait for room has to be bounded here, at the one
-    /// call that can block.
-    pub(crate) fn write_bounded(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        write_whole(&self.port, buf)
-    }
-
     /// Assert or deassert RTS on the open port.
     ///
     /// # Errors

@@ -54,6 +54,55 @@ pub use restart_method::McuRestartMethod;
 
 use events::McuEvents;
 
+/// What a session received with neither a pending call nor a callback.
+///
+/// Each name is logged once and then only counted. A report that nothing bound
+/// repeats on the firmware's own schedule — `stats` every five seconds
+/// (`src/basecmd.c:332-334`) — so a warning per arrival would bury every other
+/// line of a long session. The totals are printed when the stream ends, which is
+/// the one point where a count is complete.
+#[derive(Default)]
+struct Unhandled {
+    /// Messages in first-arrival order.
+    seen: Vec<UnhandledMessage>,
+}
+
+/// One message name nothing was bound to, with what it arrived under.
+struct UnhandledMessage {
+    name: String,
+    id: i16,
+    count: u64,
+}
+
+impl Unhandled {
+    /// Count one arrival, returning the total for this message so far.
+    ///
+    /// `1` is the first arrival of the name in this session — the only one the
+    /// receive task warns about.
+    fn record(&mut self, msg: &Msg) -> u64 {
+        if let Some(seen) = self.seen.iter_mut().find(|seen| seen.name == msg.name) {
+            seen.count += 1;
+            return seen.count;
+        }
+        self.seen.push(UnhandledMessage {
+            name: msg.name.clone(),
+            id: msg.id,
+            count: 1,
+        });
+        1
+    }
+
+    /// Print what repeated, one line per name, as the stream ends.
+    fn report_repeats(&self, board: &str) {
+        for seen in self.seen.iter().filter(|seen| seen.count > 1) {
+            warn!(
+                "[{board}] Discarded unhandled message {} (id={}) {} times this session",
+                seen.name, seen.id, seen.count
+            );
+        }
+    }
+}
+
 /// How many outbound commands the send queue holds.
 ///
 /// Upstream never refuses at all — its writer blocks on the port, so a host
@@ -2002,6 +2051,8 @@ impl Mcu {
             // test: no new number taken in yet is what says whether the firmware
             // was already running (`Wire::took_over`).
             let mut seen = 0u64;
+            // What nothing was bound to, named once and counted after that.
+            let mut unhandled = Unhandled::default();
 
             loop {
                 let received = interface_for_recv.receive().await;
@@ -2105,8 +2156,12 @@ impl Mcu {
                         debug!("Invoking callback for {} (id={})", msg.name, msg.id);
                         let mut cb = callback.lock().unwrap();
                         cb(params.as_slice());
-                    } else {
-                        // No callback and no pending call — discard with warning.
+                    } else if unhandled.record(&msg) == 1 {
+                        // No callback and no pending call: discarded. Only the
+                        // first arrival is named — the repeats raise its count
+                        // instead (`Unhandled::report_repeats`) — because a
+                        // message nothing bound repeats on the firmware's own
+                        // schedule.
                         warn!(
                             "[{board_for_recv}] Unhandled message {} (id={}), discarding",
                             msg.name, msg.id
@@ -2114,6 +2169,7 @@ impl Mcu {
                     }
                 }
             }
+            unhandled.report_repeats(&board_for_recv);
         });
 
         Self {
@@ -3125,6 +3181,7 @@ mod tests {
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
+    use tracing_subscriber::layer::SubscriberExt;
 
     fn make_frame(seq: u8, payload: &[u8]) -> Frame {
         Frame::new(seq, payload.to_vec())
@@ -3685,6 +3742,112 @@ mod tests {
         let sent = recorder.frames();
         let seqs: Vec<u8> = sent.iter().map(|frame| frame.seq()).collect();
         assert_eq!(seqs, [0, 1], "one block per exchange, at its own number");
+    }
+
+    // -----------------------------------------------------------------------
+    // Unhandled messages
+    // -----------------------------------------------------------------------
+
+    /// A report nothing is bound to is named once, then only counted.
+    ///
+    /// The firmware repeats its unsolicited reports on its own schedule —
+    /// `stats` every five seconds (`src/basecmd.c:332-334`), `trsync_state`
+    /// every `report_ticks` — so a warning per arrival buries every other line
+    /// of a long session. This is the log half of that: the message is named
+    /// once and the repeats only raise a count.
+    #[tokio::test]
+    async fn test_repeated_unhandled_messages_are_logged_once() {
+        // `unbound` is in the dictionary, so it decodes; nothing binds it. The
+        // bound `done` behind the three repeats is the test's own marker: it
+        // says all three were dispatched, so the count is not racing the
+        // receive task. Every frame carries the number the firmware took the
+        // block under (one block went out), which is how a real stream repeats
+        // its sequence until the next block is taken.
+        let device = FrameMock::new(vec![MappingEntry {
+            input: make_frame(0, &[4]),
+            outputs: vec![
+                make_frame(1, &[20, 1]),
+                make_frame(1, &[20, 2]),
+                make_frame(1, &[20, 3]),
+                make_frame(1, &[21]),
+            ],
+        }]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(
+            Dictionary::from_json(serde_json::json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"unbound x=%u": 20, "done": 21},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mcu.bind_callback("done", move |_| {
+            let _ = tx.send(());
+        })
+        .unwrap();
+        mcu.send_msg(&crate::core::klippy::cmd::uptime::GetUptime)
+            .unwrap();
+        let marker = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+        let logged = capture.text();
+        assert!(
+            marker.is_ok(),
+            "all three repeats must be dispatched within the budget: {logged}"
+        );
+        assert_eq!(
+            logged.matches("Unhandled message unbound").count(),
+            1,
+            "one line for three arrivals: {logged}"
+        );
+    }
+
+    /// A byte sink for the fmt layer above; `set_default` keeps the capture off
+    /// the process-wide subscriber, so tests stay independent of each other.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<StdMutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     // -----------------------------------------------------------------------

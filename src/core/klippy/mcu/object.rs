@@ -1863,29 +1863,14 @@ impl PrinterObject for McuObject {
             // this host sent is still in flight.
             self.bind_shutdown(&mcu)
                 .map_err(|err| KlippyError::Internal(err.to_string()))?;
-            // The firmware sends periodic `stats` reports (id=-12) with
-            // scheduler timing; keep the latest as `last_stats` (and log it) so
-            // `objects/query` can report the load.
-            let freq = mcu
-                .dictionary()
-                .and_then(|dictionary| dictionary.constant_f64("CLOCK_FREQ"));
-            let sumsq_base = mcu
-                .dictionary()
-                .and_then(|dictionary| dictionary.constant_f64("STATS_SUMSQ_BASE"));
-            match (freq, sumsq_base) {
-                (Some(freq), Some(sumsq_base)) => register_stats(
-                    &mcu,
-                    freq,
-                    sumsq_base,
-                    Arc::clone(&self.last_stats),
-                    self.printer.clone(),
-                )
-                .map_err(|err| KlippyError::Internal(err.to_string()))?,
-                _ => warn!(
-                    "MCU '{}' has no clock statistics constants; last_stats stays empty",
-                    self.chip.name()
-                ),
-            }
+            // The firmware sends periodic `stats` reports with scheduler
+            // timing; keep the latest as `last_stats` (and log it) so
+            // `objects/query` can report the load. Binding is unconditional: the
+            // report has to be consumed whether or not the dictionary publishes
+            // the two constants that turn its counters into seconds (a missing
+            // constant costs the tick numbers only, and is reported inside).
+            register_stats(&mcu, Arc::clone(&self.last_stats), self.printer.clone())
+                .map_err(|err| KlippyError::Internal(err.to_string()))?;
             self.set_status(&mcu);
             // This session is up: an MCU that had spent its one bridge-port
             // recovery has it back for the next time its port tty goes away.
@@ -2941,10 +2926,11 @@ mod tests {
         assert_eq!(status["last_stats_time"], 12.5);
     }
 
-    /// Frame carrying one `stats` report: id 12, then `count`, `sum`, `sumsq`.
+    /// Frame carrying one `stats` report: id -1 (the id the firmware's own
+    /// dictionary publishes, a signed VLQ byte), then `count`, `sum`, `sumsq`.
     fn stats_frame(seq: u8, count: u32, sum: u32, sumsq: u32) -> Frame {
         let mut payload = Payload::new();
-        payload.push_i16(12).unwrap();
+        payload.push_i16(-1).unwrap();
         payload.push_u32(count).unwrap();
         payload.push_u32(sum).unwrap();
         payload.push_u32(sumsq).unwrap();
@@ -2989,7 +2975,8 @@ mod tests {
         mcu.install_dictionary(
             Dictionary::from_json(json!({
                 "commands": {"get_uptime": 4},
-                "responses": {"stats count=%u sum=%u sumsq=%u": 12},
+                "responses": {"stats count=%u sum=%u sumsq=%u": -1},
+                "config": {"CLOCK_FREQ": 72000000, "STATS_SUMSQ_BASE": 4},
             }))
             .unwrap(),
         )
@@ -2997,8 +2984,6 @@ mod tests {
         object.chip.attach(Arc::clone(&mcu));
         register_stats(
             &mcu,
-            72_000_000.0,
-            4.0,
             Arc::clone(&object.last_stats),
             Arc::downgrade(printer),
         )
@@ -3098,7 +3083,8 @@ mod tests {
         mcu.install_dictionary(
             Dictionary::from_json(json!({
                 "commands": {"get_uptime": 4},
-                "responses": {"stats count=%u sum=%u sumsq=%u": 12},
+                "responses": {"stats count=%u sum=%u sumsq=%u": -1},
+                "config": {"CLOCK_FREQ": 72000000, "STATS_SUMSQ_BASE": 4},
             }))
             .unwrap(),
         )
@@ -3106,8 +3092,6 @@ mod tests {
         object.chip.attach(Arc::clone(&mcu));
         register_stats(
             &mcu,
-            72_000_000.0,
-            4.0,
             Arc::clone(&object.last_stats),
             Arc::downgrade(printer),
         )
@@ -3168,6 +3152,44 @@ mod tests {
                 .unwrap(),
             100.0 / 72_000_000.0
         );
+    }
+
+    #[tokio::test]
+    async fn test_one_stats_report_fills_every_tick_and_traffic_field() {
+        // What a client reads out of one report: the three tick numbers its
+        // `stats()` collector reports, the stamp this host dates them with, and
+        // the line's own byte counters. The counters are the firmware's; the
+        // other three are the host's arithmetic on them.
+        let (printer, clock) = printer_with_clock();
+        let object = McuObject::new(section(None), &printer).unwrap();
+        let pty = Pty::new();
+        let mcu = attached_over_a_line(&object, &printer, &pty, "mcu");
+
+        // A block of this host's own, written out before the report: that is
+        // what `bytes_write` counts, and what makes it distinguishable from a
+        // number read off the wrong field.
+        mcu.send_msg(&GetUptime).unwrap();
+        mcu.flush(Duration::from_secs(1)).await.unwrap();
+
+        let report = stats_frame(0, 100, 3000, 250_000).raw_bytes();
+        clock.advance(2.5);
+        (&pty.master).write_all(&report).unwrap();
+        let last = last_report_at(&object, 2.5).await;
+
+        let freq = 72_000_000.0;
+        let c = 1.0 / (100.0 * freq);
+        assert!((last.mcu_tick_avg - 3000.0 * c).abs() < 1e-18);
+        let variance = 100.0 * 250_000.0 * 4.0 - 3000.0f64.powi(2);
+        assert!((last.mcu_tick_stddev - c * variance.sqrt()).abs() < 1e-18);
+        assert!((last.mcu_tick_awake - 3000.0 / freq).abs() < 1e-18);
+        assert_eq!(last.eventtime, 2.5, "dated with the machine's clock");
+        assert_eq!(last.bytes_read, report.len() as u64);
+        assert!(
+            last.bytes_write > 0,
+            "the block sent above is on the line: {}",
+            last.bytes_write
+        );
+        assert_eq!(object.get_status(0.0)["last_stats_time"], 2.5);
     }
 
     #[tokio::test]

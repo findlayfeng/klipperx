@@ -22,13 +22,20 @@
 //! `last_stats` / `last_stats_time` pair `get_status` reports, so a client can
 //! see what the firmware thinks it is doing — and, with two reports, how fast
 //! its clock is running.
+//!
+//! Binding does **not** depend on the dictionary publishing the two conversion
+//! constants (`CLOCK_FREQ`, `STATS_SUMSQ_BASE`): a report that arrives is always
+//! consumed, because the host's half of it — when it arrived, and what the
+//! transport had carried by then — needs no firmware constant. A dictionary
+//! without them costs only the tick numbers, which stay zero (see
+//! [`tick_constants`]).
 
 use crate::core::klippy::cmd::Params;
 use crate::core::klippy::event::McuEvent;
 use crate::core::klippy::mcu::{Mcu, McuError};
 use crate::core::klippy::printer::Printer;
 use std::sync::{Arc, Mutex, Weak};
-use tracing::info;
+use tracing::{info, warn};
 
 /// `stats count=%u sum=%u sumsq=%u` — one timing report from `stats_update`.
 ///
@@ -144,6 +151,24 @@ impl LastStats {
         })
     }
 
+    /// The report's traffic half alone.
+    ///
+    /// Used when the dictionary does not publish the two conversion constants:
+    /// the three counters cannot be turned into seconds, so the tick numbers
+    /// are zero, while everything the host measured itself — the arrival time
+    /// and the transport's byte counts — is real. That is the half a port's
+    /// utilization is computed from, so it must not be lost with the ticks.
+    pub fn traffic_only(context: ReportContext) -> Self {
+        Self {
+            mcu_tick_avg: 0.0,
+            mcu_tick_stddev: 0.0,
+            mcu_tick_awake: 0.0,
+            eventtime: context.eventtime,
+            bytes_read: context.bytes_read,
+            bytes_write: context.bytes_write,
+        }
+    }
+
     /// The load and the traffic as `last_stats`.
     pub fn to_json(&self) -> serde_json::Value {
         serde_json::json!({
@@ -164,16 +189,32 @@ impl LastStats {
 /// [`Printer::eventtime`] — and a machine that is already gone stamps nothing,
 /// which is why the slot then keeps its previous report.
 ///
+/// The conversion constants are read here, from the same dictionary the bind
+/// resolves `stats` through, so no caller can gate the bind on them: a bound
+/// handler that never fires would leave the firmware's 5-second report logged
+/// as an unhandled message and `last_stats` empty. A dictionary that publishes
+/// neither constant still gets the handler, with the ticks zero.
+///
+/// A firmware that does not declare `stats` at all is not an error — there is
+/// simply nothing to subscribe to — so the slot stays empty and the reason is
+/// logged once.
+///
 /// # Errors
 /// Returns [`McuError`] when the MCU is not identified, or when its dictionary
-/// has no `stats` response.
+/// declares a `stats` response that cannot be bound.
 pub fn register_stats(
     mcu: &Arc<Mcu>,
-    mcu_freq: f64,
-    stats_sumsq_base: f64,
     slot: Arc<Mutex<Option<LastStats>>>,
     printer: Weak<Printer>,
 ) -> Result<(), McuError> {
+    if !mcu.has_message(Stats::NAME) {
+        warn!(
+            "MCU '{}' does not report `stats`; last_stats stays empty",
+            mcu.name()
+        );
+        return Ok(());
+    }
+    let constants = tick_constants(mcu);
     // A `Weak`, like the printer: the callback table belongs to the session and
     // a handler holding its own `Mcu` strongly would be another
     // `Mcu → events → handler → Mcu` edge for `clear_events` to break.
@@ -195,10 +236,63 @@ pub fn register_stats(
             bytes_read,
             bytes_write,
         };
-        if let Some(last) = LastStats::from_report(&stats, mcu_freq, stats_sumsq_base, context) {
+        let last = match constants {
+            Some(constants) => {
+                LastStats::from_report(&stats, constants.freq, constants.sumsq_base, context)
+            }
+            None => Some(LastStats::traffic_only(context)),
+        };
+        if let Some(last) = last {
             *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(last);
         }
     })
+}
+
+/// The two firmware constants a report's counters are converted with.
+///
+/// Both are dictionary constants read at identify: `CLOCK_FREQ` is the clock the
+/// counters are in, `STATS_SUMSQ_BASE` the scale `sumsq` was divided by. Neither
+/// is available from anywhere else, so a dictionary that publishes neither (or
+/// only one) leaves the counters unreadable.
+#[derive(Debug, Clone, Copy)]
+struct TickConstants {
+    /// `CLOCK_FREQ`, in Hz.
+    freq: f64,
+    /// `STATS_SUMSQ_BASE`.
+    sumsq_base: f64,
+}
+
+/// The conversion above, or `None` with one warning naming what is missing.
+///
+/// Warned here rather than per report: the constants belong to the session's
+/// dictionary, so an absence cannot change until the next connect, and a report
+/// arrives every five seconds.
+fn tick_constants(mcu: &Mcu) -> Option<TickConstants> {
+    // Not identified at all: `bind_event` is the one that reports that, and
+    // naming missing constants first would blame the wrong thing.
+    let dictionary = mcu.dictionary()?;
+    let freq = dictionary.constant_f64("CLOCK_FREQ");
+    let sumsq_base = dictionary.constant_f64("STATS_SUMSQ_BASE");
+    match (freq, sumsq_base) {
+        (Some(freq), Some(sumsq_base)) => Some(TickConstants { freq, sumsq_base }),
+        _ => {
+            let missing: Vec<&str> = [
+                ("CLOCK_FREQ", freq.is_none()),
+                ("STATS_SUMSQ_BASE", sumsq_base.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(name, absent)| absent.then_some(name))
+            .collect();
+            warn!(
+                "MCU '{}' dictionary has no {}; `stats` is still consumed, but \
+                 mcu_tick_avg/mcu_tick_stddev/mcu_tick_awake stay 0 — last_stats_time, \
+                 bytes_read and bytes_write are the host's own and stay valid",
+                mcu.name(),
+                missing.join(" or ")
+            );
+            None
+        }
+    }
 }
 
 // ===========================================================================
@@ -208,9 +302,55 @@ pub fn register_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::klippy::event::test_support::{dictionary, parser};
+    use crate::core::klippy::cmd::uptime::GetUptime;
+    use crate::core::klippy::event::test_support::{dictionary, frame, mcu, parser};
+    use crate::core::klippy::interface::devices::frame_mock::MappingEntry;
     use crate::core::klippy::msg::proto::ArgValue;
+    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
+    use std::io::Write;
     use std::sync::Arc;
+    use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// A device answering `get_uptime` with one `stats` report.
+    ///
+    /// A report is unsolicited on the wire; answering an unrelated command is
+    /// only how a test gets one to arrive (`event/mod.rs` does the same). The id
+    /// is the firmware's own — `stats count=%u sum=%u sumsq=%u: -1` in a real
+    /// dictionary, a signed VLQ byte.
+    fn device_answering_with_a_stats_report() -> Vec<MappingEntry> {
+        vec![MappingEntry {
+            input: frame(0, &[ArgValue::UInt8(4)]),
+            outputs: vec![frame(
+                0,
+                &[
+                    ArgValue::Int16(-1),
+                    ArgValue::UInt32(5),
+                    ArgValue::UInt32(100),
+                    ArgValue::UInt32(2500),
+                ],
+            )],
+        }]
+    }
+
+    /// Wait (bounded) until the slot holds a report.
+    async fn a_report_arrives(slot: &Arc<Mutex<Option<LastStats>>>) -> LastStats {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_until(
+                Duration::from_secs(1),
+                Duration::from_millis(5),
+                || slot.lock().unwrap_or_else(|p| p.into_inner()).is_some(),
+                "a `stats` report must arrive",
+            ),
+        )
+        .await
+        .expect("the wait is bounded");
+        slot.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .expect("just waited for it")
+    }
 
     #[test]
     fn test_stats_decodes_its_parameters_by_name() {
@@ -313,5 +453,104 @@ mod tests {
             }
         )
         .is_none());
+    }
+
+    /// A dictionary without the conversion constants still consumes the report.
+    ///
+    /// Binding must not depend on them: a handler gated on the constants left the
+    /// firmware's five-second report unhandled on a real board, with the ticks
+    /// unreadable _and_ the traffic counters (which need no firmware constant)
+    /// frozen with it.
+    #[tokio::test]
+    async fn test_a_report_without_the_tick_constants_still_stamps_the_traffic() {
+        // The fixture dictionary publishes neither `CLOCK_FREQ` nor
+        // `STATS_SUMSQ_BASE`.
+        let mcu = mcu(device_answering_with_a_stats_report());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let slot = Arc::new(Mutex::new(None));
+        register_stats(&mcu, Arc::clone(&slot), Arc::downgrade(&printer)).unwrap();
+
+        mcu.send_msg(&GetUptime).unwrap();
+        let last = a_report_arrives(&slot).await;
+
+        assert_eq!(
+            (last.mcu_tick_avg, last.mcu_tick_stddev, last.mcu_tick_awake),
+            (0.0, 0.0, 0.0),
+            "nothing to divide the counters by"
+        );
+        assert_eq!(last.eventtime, printer.eventtime());
+        let (bytes_read, bytes_write) = mcu.wire_bytes();
+        assert_eq!(
+            (last.bytes_read, last.bytes_write),
+            (bytes_read, bytes_write),
+            "the transport's own counters are real either way"
+        );
+    }
+
+    /// The missing constants are named once, at registration — not on every
+    /// report.
+    #[tokio::test]
+    async fn test_missing_tick_constants_are_reported_once_not_per_report() {
+        let mcu = mcu(device_answering_with_a_stats_report());
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let slot = Arc::new(Mutex::new(None));
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        register_stats(&mcu, Arc::clone(&slot), Arc::downgrade(&printer)).unwrap();
+        mcu.send_msg(&GetUptime).unwrap();
+        a_report_arrives(&slot).await;
+        // Reports repeat every five seconds on a real board; a second one adds
+        // nothing to the log.
+        let logged = capture.text();
+        assert_eq!(logged.matches("CLOCK_FREQ").count(), 1, "{logged}");
+        assert_eq!(logged.matches("STATS_SUMSQ_BASE").count(), 1, "{logged}");
+        assert!(logged.contains("stay valid"), "{logged}");
+    }
+
+    /// A byte sink for the fmt layer above; `set_default` keeps the capture off
+    /// the process-wide subscriber, so tests stay independent of each other.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }

@@ -243,11 +243,12 @@ impl McuStepper {
             .mcu()
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         let position: crate::core::klippy::cmd::stepper::StepperPosition = mcu
-            .call_msg::<
+            .call_msg_oid::<
                 crate::core::klippy::cmd::stepper::StepperGetPosition,
                 crate::core::klippy::cmd::stepper::StepperPosition,
             >(
                 &crate::core::klippy::cmd::stepper::StepperGetPosition { oid },
+                oid,
                 timeout,
             )
             .await?;

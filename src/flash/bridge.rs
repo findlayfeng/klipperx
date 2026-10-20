@@ -138,8 +138,11 @@ impl Read for TunnelReader {
     /// Copy the next bytes of the current block out, pulling the next block
     /// when it runs out. Never blocks: no block waiting answers
     /// [`WouldBlock`](io::ErrorKind::WouldBlock), which a session treats as
-    /// "no bytes in this window" until its own deadline, and a sink that has
-    /// been dropped reads as `0` (nothing more will arrive).
+    /// "no bytes in this window" until its own deadline. A sink that has been
+    /// dropped is a **broken pipe**, not end of stream: the bridge is still up
+    /// and the tunnel may come back, and reporting `0` would let the session
+    /// keep polling a window that can never fill — the failure has to end the
+    /// run instead.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -154,7 +157,12 @@ impl Read for TunnelReader {
                         "no tunnel block arrived yet",
                     ))
                 }
-                Err(TryRecvError::Disconnected) => return Ok(0),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "the bridge's tunnel sink is gone: no block can arrive any more",
+                    ))
+                }
             }
         }
         let take = buf.len().min(state.current.len());
@@ -308,8 +316,10 @@ mod tests {
         assert_eq!(reader.read(&mut one).unwrap(), 1);
         assert_eq!(one, [0xbb]);
 
-        // A dropped sink reads as end of stream.
+        // A dropped sink is a broken pipe, not end of stream: nothing more can
+        // arrive, and the session must end the run rather than poll on.
         drop(tx);
-        assert_eq!(reader.read(&mut buf).unwrap(), 0);
+        let err = reader.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 }

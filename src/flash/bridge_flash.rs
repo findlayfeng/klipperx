@@ -1313,14 +1313,18 @@ impl BridgeLink {
     /// its own error as the primary one.
     ///
     /// # Errors
-    /// [`BridgeFlashError::Unaddressable`] when the target's node id names no
-    /// arb, [`BridgeFlashError::Reset`] when the bridge could not be taken back
-    /// to a clean state, [`BridgeFlashError::Shutdown`] when the bridge's
-    /// firmware shuts down while the port is declared (its reason included),
-    /// [`BridgeFlashError::Bridge`] when a declaration, a reset or the tunnel
-    /// fails for any other reason (the pre-session assignment's refusals
-    /// included), [`BridgeFlashError::Session`] when the katapult session fails,
-    /// and [`BridgeFlashError::Teardown`] when only the tunnel clearing fails.
+    /// [`BridgeFlashError::EmptyPayload`] when `payload` carries no byte at all —
+    /// refused before the bridge is touched, because the session over an empty
+    /// payload writes no block and reports a `Summary` of 0 bytes, which reads as
+    /// a flash that succeeded. [`BridgeFlashError::Unaddressable`] when the
+    /// target's node id names no arb, [`BridgeFlashError::Reset`] when the bridge
+    /// could not be taken back to a clean state, [`BridgeFlashError::Shutdown`]
+    /// when the bridge's firmware shuts down while the port is declared (its
+    /// reason included), [`BridgeFlashError::Bridge`] when a declaration, a reset
+    /// or the tunnel fails for any other reason (the pre-session assignment's
+    /// refusals included), [`BridgeFlashError::Session`] when the katapult session
+    /// fails, and [`BridgeFlashError::Teardown`] when only the tunnel clearing
+    /// fails.
     pub async fn flash(
         &mut self,
         ports: &[BridgePort],
@@ -1330,6 +1334,14 @@ impl BridgeLink {
         cfg: &SessionConfig,
         mut progress: impl FnMut(&str),
     ) -> Result<Summary, BridgeFlashError> {
+        // Nothing to flash is not a flash of nothing: the session would run
+        // `CONNECT`, `EOF` and `COMPLETE` around zero blocks and report a Summary
+        // saying 0 bytes, which a caller reads as success. Refused here, before
+        // the bridge is reset or a port declared, so an empty image costs no
+        // bridge work at all.
+        if payload.is_empty() {
+            return Err(BridgeFlashError::EmptyPayload);
+        }
         let node_id = u32::from(target.node_id);
         let down_arb = assign::arb_id(node_id).ok_or(BridgeFlashError::Unaddressable {
             node_id: target.node_id,
@@ -1650,6 +1662,10 @@ pub enum BridgeFlashError {
     },
     /// The katapult session over the tunnel failed.
     Session(FlashError),
+    /// The payload is empty, so the run is refused before any bridge work: a
+    /// session over no byte writes no block and reports a `Summary` of 0 bytes,
+    /// which is the shape of a flash that succeeded.
+    EmptyPayload,
     /// The target's node id names no arb (only `1..=255` are addressable).
     Unaddressable {
         /// The id the plan named.
@@ -1728,6 +1744,11 @@ impl fmt::Display for BridgeFlashError {
                 path.display()
             ),
             BridgeFlashError::Session(e) => write!(f, "flashing: {e}"),
+            BridgeFlashError::EmptyPayload => write!(
+                f,
+                "refusing to flash an empty image: the payload is 0 bytes, so no block would be \
+                 written"
+            ),
             BridgeFlashError::Unaddressable { node_id } => write!(
                 f,
                 "target node id {node_id} names no arb (only 1..=255 are addressable)"
@@ -1749,6 +1770,7 @@ impl std::error::Error for BridgeFlashError {
             BridgeFlashError::Bridge(e) => Some(e),
             BridgeFlashError::Session(e) => Some(e),
             BridgeFlashError::Unaddressable { .. }
+            | BridgeFlashError::EmptyPayload
             | BridgeFlashError::Reset(_)
             | BridgeFlashError::AmbiguousBridge { .. }
             | BridgeFlashError::Shutdown { .. } => None,
@@ -1971,6 +1993,70 @@ mod tests {
                 }
             }
         })
+    }
+
+    /// An empty payload is refused at the door. A session over it has no block
+    /// between `EOF` and the verify reads and reports a `Summary` of 0 bytes,
+    /// which is the shape of a flash that succeeded — so the refusal comes before
+    /// the run's own reset, which the port's silent pty proves.
+    ///
+    /// No [`HOST_LIBRARY_TEST_LOCK`]: this test redirects no stderr and loads a
+    /// **private copy** of the library.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_empty_payload_is_refused_before_the_bridge_is_touched() {
+        let port = Pty::new();
+        let copy = klipperx_test_support::PrivateCopy::of(
+            &klipperx_test_support::klipper_host_mux_lib_path(),
+        )
+        .expect("the private library copy is made");
+        let library = copy.path().to_path_buf();
+        let path = library.display().to_string();
+
+        let mut link = BridgeLink::open_host_library(
+            Path::new(&path),
+            host_mux_for(&path),
+            BRIDGE_MCU_ID,
+            &[(0u8, port.path.display().to_string())],
+        )
+        .expect("the muxed library opens and attaches");
+
+        let fake = FakeBootloader::new();
+        let recorded = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pump = start_fake_pump(&port, &fake, Arc::clone(&recorded), Arc::clone(&stop));
+
+        let ports = [BridgePort {
+            baud: 250_000,
+            bitrate: CAN_BITRATE,
+            reset: PortReset::ResetPort,
+        }];
+        let target = BridgeTarget {
+            index: 0,
+            node_id: TARGET_NODE_ID,
+        };
+        let err = link
+            .flash(&ports, target, None, &[], &test_config(), |_| {})
+            .await
+            .expect_err("an empty payload is no flash at all");
+        assert!(matches!(err, BridgeFlashError::EmptyPayload), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "refusing to flash an empty image: the payload is 0 bytes, so no block would be \
+             written"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        stop.store(true, Ordering::Relaxed);
+        pump.join().expect("the pump thread");
+        assert!(
+            recorded.lock().unwrap().is_empty(),
+            "nothing reaches the port, not even a reset: {:?}",
+            recorded.lock().unwrap()
+        );
+        assert_eq!(fake.seen(command::CONNECT), 0, "no session ran");
+
+        link.close();
+        drop(link);
     }
 
     /// The whole bridge flash over a **real** host library: the mux library as

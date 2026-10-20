@@ -73,14 +73,19 @@ pub struct McuConfig {
     /// `None` and [`McuObject::connect`](crate::core::klippy::mcu::object::McuObject::connect)
     /// fills it from the id the object registered with at load.
     pub id: Option<u32>,
-    /// The baud this MCU shares its serial `serial:` path at, or `None` for an
-    /// exclusive port.
+    /// The rate this MCU's serial `serial:` path is opened at when the path is
+    /// addressed by id, or `None` for an exclusive port.
     ///
-    /// Set at load from the grouping pass (`mcu/serial_ports.rs`): when two or
-    /// more `[mcu]` sections name the same `serial:` path, the path is shared
-    /// and [`Transport::open`] takes the shared branch. `None` — the value
-    /// parsing leaves it at — means the path belongs to this MCU alone and the
-    /// transport opens it exactly as before.
+    /// Set at load from the grouping pass (`mcu/serial_ports.rs`): when the
+    /// path is addressed by id — two or more `[mcu]` sections name it, or a
+    /// bridge's link carries its downstream devices' frames —
+    /// [`Transport::open`] takes the shared branch. `Some` carries **the path's**
+    /// rate ([`SerialPorts::effective_baud`](crate::core::klippy::mcu::serial_ports::SerialPorts::effective_baud),
+    /// the lowest `baud` its sections write), which is what the port is attached
+    /// at; this section's own `Transport::Serial::baud` is only its vote on that
+    /// rate, never the criterion. `None` — the value parsing leaves it at — means
+    /// the path belongs to this MCU alone and the transport opens it exactly as
+    /// before.
     pub shared_baud: Option<u32>,
     /// What a muxed `host_library:` path attaches with, or `None` for a path the
     /// config does not call muxed.
@@ -1007,14 +1012,15 @@ impl Transport {
     ///
     /// `id` is the id the MCU was assigned at load (`mcu/ids.rs`): the CAN arm
     /// needs it to address the node, and a **shared** serial port needs it as
-    /// the source of its arbitration-id header. `shared_baud` is the baud the
-    /// path's MCUs share when two or more name this `serial:` path
-    /// (`mcu/serial_ports.rs`), or `None` when it is exclusive. The serial arm
-    /// splits on it:
+    /// the source of its arbitration-id header. `shared_baud` is the rate the
+    /// path is opened at when it is addressed by id (`mcu/serial_ports.rs` asks
+    /// that wider question — shared, or a bridge's link), or `None` when it is
+    /// exclusive. The serial arm splits on it:
     ///
-    /// - `Some(baud)` — the path is shared: the port is opened once for every
-    ///   MCU on it, and [`serial::attach`] performs the synchronous
-    ///   assignment handshake before the shared handle is returned. When the
+    /// - `Some(baud)` — the path is addressed by id, so it is opened as a shared
+    ///   port whatever this section wrote for `baud`: the rate comes from
+    ///   `baud` here (the path's — the lowest its sections write), never from the
+    ///   section's own, and the port is opened once for every MCU on it. When the
     ///   section also names a `uuid`, the handshake **starts by writing the
     ///   SET_NODEID unit that names the board** ([`serial::set_node_id_for`])
     ///   and only then re-confirms with the ordinary assignment request —
@@ -1059,23 +1065,28 @@ impl Transport {
         host_port_paths: &[(u8, String)],
         stop: Option<&dyn Fn() -> bool>,
     ) -> Result<Interface, String> {
-        match self {
-            Transport::Serial { path, baud, uuid } if shared_baud == Some(*baud) => {
-                // A shared port is addressed by id, so it cannot be opened
-                // before the allocator has handed one out (`mcu/ids.rs`).
-                let id =
-                    id.ok_or_else(|| format!("serial {path}: the MCU id has not been assigned"))?;
-                if !rts {
-                    warn!(
-                        "serial {path}: shared port ignores restart_method 'cheetah'; \
-                         RTS is not driven"
-                    );
-                }
-                let handle =
-                    serial::attach(Path::new(path), *baud, id, ASSIGN_ATTACH_TIMEOUT, *uuid)
-                        .map_err(|e| format!("serial {path}: shared port attach failed: {e}"))?;
-                Ok(Interface::shared_serial(handle))
+        // Being addressed by id is the load-time verdict `shared_baud` carries,
+        // together with the rate the path resolved to. That rate is what the
+        // port attaches at: this section's own `baud` is only its vote on it, so
+        // a section that wrote 250000 on a path resolved to 115200 joins the
+        // other MCUs on the one shared handle instead of opening the tty a
+        // second time as a private device.
+        if let (Transport::Serial { path, uuid, .. }, Some(baud)) = (self, shared_baud) {
+            // A shared port is addressed by id, so it cannot be opened before
+            // the allocator has handed one out (`mcu/ids.rs`).
+            let id =
+                id.ok_or_else(|| format!("serial {path}: the MCU id has not been assigned"))?;
+            if !rts {
+                warn!(
+                    "serial {path}: shared port ignores restart_method 'cheetah'; \
+                     RTS is not driven"
+                );
             }
+            let handle = serial::attach(Path::new(path), baud, id, ASSIGN_ATTACH_TIMEOUT, *uuid)
+                .map_err(|e| format!("serial {path}: shared port attach failed: {e}"))?;
+            return Ok(Interface::shared_serial(handle));
+        }
+        match self {
             // An exclusive port ignores its uuid: no SET_NODEID and no
             // assignment frame ever go out on it (see the doc comment above).
             Transport::Serial {
@@ -1896,12 +1907,39 @@ mod tests {
     // Shared vs exclusive serial ports (`shared_baud`).
     // -----------------------------------------------------------------------
 
-    /// Read exactly `want` bytes from the pty master (blocking).
+    /// How long a pty-side handshake read waits before the test fails.
+    ///
+    /// Bounded on purpose: a regression that leaves the port **exclusive** sends
+    /// no assignment frame at all, and a plain blocking read would park the
+    /// test's own runtime thread instead of failing it.
+    const HANDSHAKE_READ_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Read exactly `want` bytes from the pty master, failing after
+    /// [`HANDSHAKE_READ_BUDGET`].
     fn read_n(master: &std::fs::File, want: usize) -> Vec<u8> {
         let mut master = master;
         let mut out = Vec::with_capacity(want);
         let mut buf = [0u8; 64];
+        let deadline = std::time::Instant::now() + HANDSHAKE_READ_BUDGET;
         while out.len() < want {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "the port wrote {} of {want} bytes; the rest never arrived",
+                out.len()
+            );
+            let mut poll = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one `pollfd` for an fd the test holds open, for a bounded
+            // wait that both sides of the pair keep alive.
+            let ready = unsafe { libc::poll(&mut poll, 1, left.as_millis() as i32) };
+            assert!(ready >= 0, "poll: {}", std::io::Error::last_os_error());
+            if ready == 0 {
+                continue;
+            }
             let read = master.read(&mut buf).expect("pty master read");
             assert_ne!(read, 0, "the pty closed before {want} bytes arrived");
             out.extend_from_slice(&buf[..read]);
@@ -2156,6 +2194,76 @@ mod tests {
             .await
             .expect("a shared attach succeeds and ignores the cheetah RTS");
         interface.shutdown();
+    }
+
+    /// The criterion for the shared arm is **id addressing, not baud equality**:
+    /// two sections on one `serial:` path that write different rates are still
+    /// one shared port, and both attach at the rate the path resolved to (the
+    /// lowest, `115200` here). Comparing the path's rate with the section's own
+    /// sent the `250000` section down the exclusive arm — a second opener on a
+    /// tty another MCU already held, with bare frames.
+    #[tokio::test]
+    async fn test_a_shared_path_attaches_every_section_at_the_path_baud() {
+        let pty = Pty::new();
+        let path = pty.path.to_str().expect("a utf-8 pty path");
+        let text = format!(
+            "[mcu]\nserial: {path}\nbaud: 250000\n\
+             [mcu tool]\nserial: {path}\nbaud: 115200\n"
+        );
+
+        // Each section parses the way the loader parses it — whole config in
+        // hand — and keeps the rate it wrote; the two really differ.
+        let (first, _) = parse_shared(&text, "mcu");
+        let mut first = first.expect("the 250000 section parses");
+        let (second, _) = parse_shared(&text, "mcu tool");
+        let mut second = second.expect("the 115200 section parses");
+        assert!(
+            matches!(first.transport, Transport::Serial { baud: 250_000, .. }),
+            "the first section wrote 250000: {:?}",
+            first.transport
+        );
+        assert!(
+            matches!(second.transport, Transport::Serial { baud: 115_200, .. }),
+            "the second section wrote 115200: {:?}",
+            second.transport
+        );
+
+        // The load walk's stamp (`mcu/object.rs`, from `SerialPorts`): the path
+        // is addressed by id, and the rate it resolved to is the lowest its
+        // sections write — `test_a_shared_path_is_stamped_with_the_lowest_baud`
+        // pins the stamping itself.
+        let path_baud = 115_200;
+        first.id = Some(7);
+        first.shared_baud = Some(path_baud);
+        second.id = Some(8);
+        second.shared_baud = Some(path_baud);
+
+        let first_interface = open_answering_assignment(first, &pty, 7)
+            .await
+            .expect("the 250000 section attaches as a shared port");
+        let second_interface = open_answering_assignment(second, &pty, 8)
+            .await
+            .expect("the 115200 section attaches on the same port");
+
+        assert_eq!(
+            pty_baud(&pty),
+            path_baud,
+            "the port is opened at the path's rate, not the section's"
+        );
+        first_interface.shutdown();
+        second_interface.shutdown();
+    }
+
+    /// The line speed the pty pair was left at: what `set_raw_mode` programmed
+    /// with `BOTHER`, read back through `TCGETS2` on the master.
+    fn pty_baud(pty: &Pty) -> u32 {
+        // SAFETY: the fd is the open pty master, and `tio` is a plain struct the
+        // kernel fills in.
+        let mut tio: libc::termios2 = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::ioctl(pty.master.as_raw_fd(), libc::TCGETS2, &mut tio) };
+        assert_eq!(rc, 0, "TCGETS2: {}", std::io::Error::last_os_error());
+        assert_eq!(tio.c_cflag & libc::CBAUD, libc::BOTHER, "an arbitrary rate");
+        tio.c_ospeed
     }
 
     // -----------------------------------------------------------------------

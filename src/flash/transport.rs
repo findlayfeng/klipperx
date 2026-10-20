@@ -180,8 +180,8 @@ impl Write for TtyPort<'_> {
         // "transport took 0 of 76 bytes". The stall this module can act on is
         // "the session got nothing back in its read window", which it already
         // measures.
-        self.dev.borrow_mut().write(buf);
-        Ok(buf.len())
+        let written = self.dev.borrow_mut().write(buf)?;
+        Ok(written)
     }
 
     fn flush(&mut self) -> io::Result<()> {

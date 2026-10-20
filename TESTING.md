@@ -391,7 +391,7 @@ USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/de
 
 | 症状 | 根因 | 修复 |
 |---|---|---|
-| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`8c4a9bf`） |
+| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`cce26bf`） |
 | UART 下游每次会话后 mux 身份从 `97abe031988e` 变成 `7eabe031988e`，重连再也握不上手，须重新上电 | **上游 console bug**：`encode_acknak.min_size = 0`，`transmit_room()` 压缩后把 5 字节 ack 写到 `transmit_buf[96..100]`，帧尾 `0x7e` 落在 `mux_identity[0]`（250 kbaud 饱和链路几乎每个 ack 都走压缩分支） | `min_size = MESSAGE_MIN` + ack 短路遵守 `buf_size`（`df4ed17c`） |
 | CAN 下游 `identify` 永远超时；scan / 指派 / 送引导 / 隧道刷写全通 | CAN 侧 `can_decode_nodeid()` 给的是**仲裁 id**，被当成 node id 交给 mux 设备半 ⇒ 设备发出的帧头是 `mux_encode_header(0)`（`80 00`，没有地址），也拒收发给它的单元 | 交接米跑 wire 上的 node id（`7ca47634`） |
 | `[can_device]` 配置期 shutdown：`Pin PB8 reserved for CAN - can't reserve for bridge_can` | 端口型 build 同一对引脚被 `RESERVE_PINS_CAN` 与 `RESERVE_PINS_bridge_can` 各声明一次 | 引脚由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下只声明一次（`24cc4eba`） |
@@ -429,7 +429,7 @@ EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂
 | 周期检查 | 1 s 一次，`drv_status` 出现在 `tmc2209 stepper_x` 状态里 |
 | DIAG 接线 | 接上后空闲读引脚为**低**（`G28 X` 跑满行程报 `No trigger on x after full movement`）；未接时因内部上拉而"立刻触发" |
 
-**这一轮踩出并修掉的三个缺陷**（`a816520`、`1e0afc3`）：
+**这一轮踩出并修掉的三个缺陷**（`3cd3db4`、`a1062b6`）：
 
 1. **写必须等固件自己的应答**：固件对每一条 `tmcuart_send` 都回一个 `tmcuart_response`（写也回，
    载荷为空），那是"这一帧已发完"的完成信号。主机之前 fire-and-forget，于是只能靠 sleep 猜，

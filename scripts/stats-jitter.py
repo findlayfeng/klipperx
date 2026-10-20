@@ -43,13 +43,29 @@ TYPICAL CRITERIA (what "healthy" looked like on the F446@180MHz board)
 
 FAMILIES AND FREQUENCY
     A log with more than one MCU (or a config change mid-log) makes the 5 s
-    reports split by `count`: a faster MCU runs more rounds per window. By
-    default the report counts are clustered into two families (`kmeans2` on
-    `count`, split at the midpoint; a unimodal log stays one family). The
-    clock frequency itself is *not* guessed: two candidates are printed
-    (`F446@180MHz`, `F103@72MHz`) so the reader picks the one matching the
-    board. `--freq NAME=HZ` states it instead (repeatable), which is also how
-    to describe a board that is neither candidate.
+    reports split by `count`: a faster MCU runs more rounds per window. Two
+    steps get there, and neither of them guesses a clock:
+
+      1. activity spikes go first. A report whose `count` is above *3 x the
+         median* count is a startup/activity burst, not an MCU; the dropped
+         count and the threshold are printed, never dropped silently.
+      2. the remaining counts are cut once, at their *largest gap*. The cut
+         has to be real: each side needs 10% of the reports (and
+         MIN_FAMILY_REPORTS), and the gap itself needs 10% of the median count.
+         Otherwise the log is one family and one table is printed - a 2-count
+         step inside one board's jitter is not a second MCU.
+
+    k-means - the previous approach - is deliberately not used: seeded at
+    `min`/`max`, the centroid at `max` is handed to a handful of startup
+    spikes, and the converged cut then separates "8 spikes" from "everything
+    else". Both real MCUs stay in one centroid, so their avg/sd get mixed into
+    a number that describes neither board.
+
+    The family -> clock mapping is *not* deduced: without `--freq` both
+    candidates (`F446@180MHz`, `F103@72MHz`) are printed for every family, so
+    the board's crystal decides which row is real. `--freq NAME=HZ` states it
+    instead (repeatable), which is also how to describe a board that is
+    neither candidate.
 
 USAGE
     Use the repository interpreter, not a bare `python`:
@@ -90,6 +106,14 @@ REPORT_WINDOW_S = 5.0
 FREQ_CANDIDATES = (("F446@180MHz", 180_000_000.0), ("F103@72MHz", 72_000_000.0))
 # Below this many reports a family is too thin to describe.
 MIN_FAMILY_REPORTS = 5
+# A report whose count is above this multiple of the median count is a startup
+# or activity spike rather than an MCU family.
+SPIKE_FACTOR = 3.0
+# A plausible family holds at least this share of the (spike-free) reports.
+MIN_FAMILY_SHARE = 0.10
+# The cut only counts as a double peak when it is at least this share of the
+# median count: a 2-count step inside one board's own jitter is not two MCUs.
+MIN_GAP_SHARE = 0.10
 
 
 def venv_hint():
@@ -178,44 +202,49 @@ def percentile(values, fraction):
     return values[min(len(values) - 1, int(len(values) * fraction))]
 
 
-def kmeans2(values):
-    """Two 1-D centroids, seeded at min/max; None if the data will not split."""
-    low, high = min(values), max(values)
-    left, right = low, high
-    for _ in range(50):
-        near_left = [value for value in values if abs(value - left) <= abs(value - right)]
-        near_right = [value for value in values if abs(value - left) > abs(value - right)]
-        if not near_left or not near_right:
-            return None
-        new_left = sum(near_left) / len(near_left)
-        new_right = sum(near_right) / len(near_right)
-        if (new_left, new_right) == (left, right):
-            break
-        left, right = new_left, new_right
-    return sorted((left, right))
+def family_label(rows):
+    """`count <min>`–`<max>` - the measured spread of one family's reports."""
+    counts = [row[1] for row in rows]
+    return f"count {min(counts)}\u2013{max(counts)}"
 
 
 def split_families(rows):
-    """[(label, rows)] - one family when the counts are unimodal, else two."""
+    """Drop the activity spikes, then cut the counts once at their largest gap.
+
+    Returns (spike_floor, spikes, candidate, families):
+        spike_floor : count above which a report is an activity spike
+        spikes      : the reports dropped as spikes
+        candidate   : (lower_max, upper_min, gap) of the largest gap, or None
+                      when the kept reports have no gap at all
+        families    : [(label, rows)] - one entry when no double peak was found
+    """
     counts = [row[1] for row in rows]
-    if max(counts) - min(counts) <= 10:
-        return [("all reports", rows)]
-    centroids = kmeans2(counts)
-    if centroids is None:
-        return [("all reports", rows)]
-    threshold = (centroids[0] + centroids[1]) / 2.0
-    low = [row for row in rows if row[1] < threshold]
-    high = [row for row in rows if row[1] >= threshold]
-    if len(low) < MIN_FAMILY_REPORTS or len(high) < MIN_FAMILY_REPORTS:
-        return [("all reports", rows)]
-    return [
-        (f"count < {threshold:.0f}", low),
-        (f"count >= {threshold:.0f}", high),
+    spike_floor = SPIKE_FACTOR * statistics.median(counts)
+    # The median row is never above SPIKE_FACTOR x median, so `kept` is not empty.
+    spikes = [row for row in rows if row[1] > spike_floor]
+    ordered = sorted((row for row in rows if row[1] <= spike_floor), key=lambda r: r[1])
+    gap, at = 0, 0
+    for index in range(1, len(ordered)):
+        if ordered[index][1] - ordered[index - 1][1] > gap:
+            gap = ordered[index][1] - ordered[index - 1][1]
+            at = index
+    candidate = None if len(ordered) < 2 else (ordered[at - 1][1], ordered[at][1], gap)
+    single = (spike_floor, spikes, candidate, [(family_label(ordered), ordered)])
+    threshold = statistics.median(row[1] for row in ordered)
+    thin = max(MIN_FAMILY_REPORTS, MIN_FAMILY_SHARE * len(ordered))
+    if candidate is None or at < thin or len(ordered) - at < thin:
+        return single
+    if gap < MIN_GAP_SHARE * threshold:
+        return single
+    low, high = ordered[:at], ordered[at:]
+    return spike_floor, spikes, candidate, [
+        (family_label(low), low),
+        (family_label(high), high),
     ]
 
 
 def family_table(families, freqs):
-    """Per family and per candidate clock: n, avg/sd/awake of the reports."""
+    """Per family, and per clock inside it: n, avg/sd/awake of the reports."""
     header = (
         f"{'family':18s} {'clock':14s} {'n':>6s} {'avg_p50':>9s} {'avg_p90':>9s}"
         f" {'avg_max':>9s} {'sd_p50':>8s} {'sd_max':>8s}"
@@ -292,21 +321,47 @@ def parse_freq(spec):
     return name, freq
 
 
-def describe(path, rows, freqs, interval_min):
+def describe(path, rows, freqs, interval_min, stated_freq):
     print(f"=== {path}  ({len(rows)} stats reports) ===")
     counts = sorted(row[1] for row in rows)
+    median = statistics.median(counts)
     print(
-        f"reports per window: count min={counts[0]} p50={statistics.median(counts):.0f}"
+        f"reports per window: count min={counts[0]} p50={median:.0f}"
         f" max={counts[-1]}"
     )
-    families = split_families(rows)
-    if len(families) == 1:
-        print("report counts are unimodal -> one family")
+    spike_floor, spikes, candidate, families = split_families(rows)
+    if spikes:
+        print(
+            f"spikes: dropped {len(spikes)} of {len(rows)} reports with count >"
+            f" {spike_floor:.0f} ({SPIKE_FACTOR:g} x median {median:.0f}), leaving"
+            f" count {min(row[1] for row in spikes)}\u2013{max(row[1] for row in spikes)}"
+        )
     else:
         print(
-            "report counts are bimodal -> "
+            f"spikes: none (no report exceeds {SPIKE_FACTOR:g} x median count"
+            f" {spike_floor:.0f})"
+        )
+    if candidate is None or candidate[2] == 0:
+        print("families: no gap between the counts -> no double peak detected -> one family")
+    elif len(families) == 1:
+        print(
+            f"families: largest gap {candidate[0]} -> {candidate[1]}"
+            f" (gap {candidate[2]}) is too shallow to be a second MCU"
+            " -> no double peak detected -> one family"
+        )
+    else:
+        print(
+            f"families: cut at the largest gap {candidate[0]} -> {candidate[1]}"
+            f" (gap {candidate[2]}) -> "
             + " / ".join(f"{label}: {len(group)} reports" for label, group in families)
         )
+    if not stated_freq:
+        candidates = ", ".join(name for name, _ in FREQ_CANDIDATES)
+        print(
+            "clock: not stated, so every family is shown for both candidates"
+            f" ({candidates});"
+        )
+        print("       family -> clock mapping unknown: the board's crystal decides")
     family_table(families, freqs)
     bucket_table(families, interval_min)
 
@@ -326,6 +381,12 @@ def main(argv=None):
             "  venv/bin/python scripts/stats-jitter.py --freq F446@180MHz=180000000 klippy.log\n"
             "  venv/bin/python scripts/stats-jitter.py --interval 30 klippy.log\n"
             "\n"
+            "families: activity spikes go first (count > 3 x the median count), then the\n"
+            "remaining counts are cut once at their largest gap; if either side would be\n"
+            "under 10% of the reports, or the gap under 10% of the median count, there\n"
+            "is no double peak and one table is printed.\n"
+            "k-means is not used: seeded at min/max it gives one centroid to a few startup\n"
+            "spikes, so it splits spikes-vs-everything instead of MCU-vs-MCU.\n"
             "units: avg/sd in us per task round, awake in % of the 5 s report window.\n"
             "criteria: avg p50 ~5-8 us with p90/p50 < 1.5, sd p50 < ~2 us, awake < ~5%,\n"
             "and no bucket in the ticks table drifting by more than ~1.5x.\n"
@@ -345,8 +406,9 @@ def main(argv=None):
         action="append",
         metavar="NAME=HZ",
         help=(
-            "clock frequency of the MCU, repeatable"
-            " (default: print the candidates F446@180MHz and F103@72MHz)"
+            "clock frequency of the MCU, repeatable; stating it fixes which rows are"
+            " results (default: both candidates F446@180MHz and F103@72MHz per family,"
+            " family -> clock mapping then unknown)"
         ),
     )
     parser.add_argument(
@@ -372,7 +434,7 @@ def main(argv=None):
         if not rows:
             empty.append(path)
             continue
-        describe(path, rows, freqs, args.interval)
+        describe(path, rows, freqs, args.interval, stated_freq=bool(args.freq))
     if empty:
         print(
             f"\nno `stats count= sum= sumsq=` lines in: {', '.join(empty)}"

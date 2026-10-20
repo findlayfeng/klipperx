@@ -353,6 +353,9 @@ B=/dev/serial/by-id/usb-Klipper_stm32f103xe_39FFD7054D47323924610951-if00   # UA
 - 会话侧改回对应值：`[uart_device] uart_baud: 500000`，且**必须与下游固件编进去的波特率一致**，
   不一致的现象是 `identify` 超时（像设备挂了）。
 
+
+**操作顺序：先 `admin reset --bridge <tty>`，再 `admin bridge config`。** 前者不要求握手（attach 失败会退回 `attach_downstream` + 向 admin id `0x3f0` 发 `RESTART_DEVICE`），所以能把僵住的桥拉回来；后者必须先握手，桥不应答就 10 s 超时。反过来跑只会看到 `the bridge did not identify within 10s`。只有连 admin 单元都送不进去（USB 不再完成事务）才需要真断电。
+
 ## 固件重启方式（`restart_method`）
 
 系统重启时，主机需要决定怎么把 MCU 的**固件**复位。`restart_method` 就是这件事，写在 `[mcu]` 节里。它**只对串口 MCU 与桥端口子节有意义**：CAN 与 `host_library` 一律按 `command` 处理，配置里写了也会被忽略（并在日志里告警）。

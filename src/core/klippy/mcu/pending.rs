@@ -292,11 +292,11 @@ mod tests {
         calls.register("clock".to_string(), None, live_tx).await;
 
         assert!(calls.resolve("clock", &params()).await);
-        assert_eq!(
-            live_rx.await.unwrap(),
-            params(),
-            "the caller still waiting is the one that gets it"
-        );
+        let answer = tokio::time::timeout(std::time::Duration::from_millis(50), live_rx)
+            .await
+            .expect("the caller still waiting is the one that gets it")
+            .unwrap();
+        assert_eq!(answer, params());
         assert_eq!(calls.len().await, 0);
     }
 

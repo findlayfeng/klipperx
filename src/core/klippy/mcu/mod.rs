@@ -4579,6 +4579,118 @@ mod tests {
         assert!(recorder.frames().is_empty());
     }
 
+    /// A flush that cannot even be **queued** is bounded by its own timeout.
+    ///
+    /// The shape: a send task whose window is full of blocks the firmware never
+    /// answered stops taking anything off the queue, so a barrier queued behind
+    /// a full queue waits for room nobody will make. Only the timeout ends that
+    /// wait (`Mcu::flush`).
+    #[tokio::test]
+    async fn test_a_flush_that_cannot_be_queued_times_out() {
+        // One message per block — a payload this size never merges — and no
+        // answers at all, so the blocks stay in flight and fill the window. The
+        // list cycles the same frames because a retransmit puts a block back on
+        // the wire as it was: the window must keep its blocks, and an exhausted
+        // list is what would end the mock's wire (and with it the send task).
+        let payload = Payload::from_raw(vec![7; MESSAGE_PAYLOAD_MAX * 2 / 3]);
+        let mappings: Vec<MappingEntry> = (0..MAX_PENDING_BLOCKS * 6)
+            .map(|i| MappingEntry {
+                input: make_frame((i % MAX_PENDING_BLOCKS) as u8, payload.payload()),
+                outputs: vec![],
+            })
+            .collect();
+        let device = FrameMock::new(mappings);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+
+        // One block per message, plus the one the send task is holding when its
+        // window fills: nothing acknowledges them, so it parks there.
+        for _ in 0..=MAX_PENDING_BLOCKS {
+            mcu.send_payload(payload.clone()).await.expect("room");
+        }
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || {
+                recorder.frames().len() == MAX_PENDING_BLOCKS
+                    && mcu.send_buf_tx.capacity() == SEND_QUEUE_CAPACITY
+            },
+            "the send task writes the unanswered blocks and stops taking more",
+        )
+        .await;
+
+        // Nothing drains this queue any more: the task waits for answers that
+        // never come, and the barrier below finds no slot to land in.
+        while mcu.send_buf_tx.capacity() > 0 {
+            mcu.send_buf_tx
+                .try_send(SendItem::Payload(payload.clone()))
+                .expect("room was just checked");
+        }
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(5), mcu.flush(Duration::from_millis(50)))
+                .await
+                .expect("the flush is bounded")
+                .expect_err("the barrier never reaches the queue");
+        assert!(
+            matches!(error, McuError::Call(McuCallError::Timeout(_))),
+            "reports the timeout: {error}"
+        );
+    }
+
+    /// A write the transport refuses is not a success: the batch never reached
+    /// the wire, so the flush behind it fails instead of declaring it delivered
+    /// (`Sender::send_block`).
+    #[tokio::test]
+    async fn test_a_refused_write_fails_the_flush_behind_it() {
+        // No mappings: the mock refuses every block.
+        let device = FrameMock::new(vec![]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        let dictionary =
+            Dictionary::from_json(serde_json::json!({"commands": {"get_clock": 5}})).unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+
+        mcu.send("get_clock", &[]).expect("the command queues");
+        let error = tokio::time::timeout(Duration::from_secs(5), mcu.flush(Duration::from_secs(1)))
+            .await
+            .expect("the flush is bounded")
+            .expect_err("the barrier's batch never went out");
+        assert!(
+            matches!(error, McuError::Call(McuCallError::SendFailed(_))),
+            "the connection, not a timeout, is what failed it: {error}"
+        );
+        assert!(
+            recorder.frames().is_empty(),
+            "nothing reached the transport"
+        );
+    }
+
+    /// A retransmit the transport refuses keeps its block: the firmware is still
+    /// waiting for that sequence, and both callers had already taken the block
+    /// out of the window (`Sender::resend_block`).
+    #[tokio::test]
+    async fn test_a_refused_retransmit_keeps_its_block() {
+        // No mappings: the mock refuses every write.
+        let interface = Interface::new(FrameMock::new(vec![]));
+        let mut sender = Sender::new(Arc::new(Wire::default()));
+        sender
+            .in_flight
+            .push_back(in_flight_block(4, make_frame(4, &[5])));
+
+        sender.retransmit(&interface, "test_mcu").await;
+
+        assert_eq!(sender.in_flight.len(), 1, "the block is not dropped");
+        assert_eq!(
+            sender.in_flight[0].seq, 4,
+            "it keeps the number the firmware waits for"
+        );
+        assert!(
+            sender.retransmit_deadline().is_some(),
+            "the next wait puts it back on the wire"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Scheduling gates: min_clock / req_clock (`SendClocks`)
     // -----------------------------------------------------------------------

@@ -32,9 +32,10 @@
 
 use crate::core::klippy::cmd::Params;
 use crate::core::klippy::event::McuEvent;
-use crate::core::klippy::mcu::{Mcu, McuError};
+use crate::core::klippy::mcu::{Mcu, McuError, RoundTripTimes};
 use crate::core::klippy::printer::Printer;
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 use tracing::{info, warn};
 
 /// `stats count=%u sum=%u sumsq=%u` — one timing report from `stats_update`.
@@ -65,29 +66,35 @@ impl McuEvent for Stats {
 }
 
 /// The last `stats` report: the scheduler load it turns into, when it arrived,
-/// and how much traffic the transport had carried by then.
+/// how much traffic the transport had carried by then, and what the line had
+/// measured of its own round trip.
 ///
 /// Upstream's `MCUStatsHelper._handle_mcu_stats` (`klippy/mcu.py:931-941`),
-/// the three numbers its `stats()` collector reports and its `get_status`
-/// exposes as `last_stats`:
+/// the numbers its `stats()` collector reports (`klippy/mcu.py:968-975`), and
+/// what its `get_status` exposes as `last_stats`:
 ///
-/// - `mcu_tick_avg` — mean time in scheduled tasks, in seconds;
-/// - `mcu_tick_stddev` — its standard deviation, in seconds;
-/// - `mcu_tick_awake` — total time awake, in seconds.
+/// - `mcu_awake` — total time awake, in seconds;
+/// - `mcu_task_avg` — mean time in scheduled tasks, in seconds;
+/// - `mcu_task_stddev` — its standard deviation, in seconds.
+///
+/// The three are renamed at the wire boundary alone: upstream's own variables
+/// are `_mcu_tick_awake` / `_mcu_tick_avg` / `_mcu_tick_stddev`
+/// (`klippy/mcu.py:924-926`), but the keys a client reads are the `mcu_task_*`
+/// ones above, so that is what this host publishes.
 ///
 /// The rest is this host's, because the report carries only the three numbers
-/// above: `eventtime` stamps it with the machine's clock, and the byte counts
-/// are the transport's, not the firmware's. Upstream fills the same keys from
-/// its C serial queue (`serialqueue_get_stats`,
+/// above: `eventtime` stamps it with the machine's clock, the byte counts and
+/// the round-trip numbers are the transport's, not the firmware's. Upstream
+/// fills the same keys from its C serial queue (`serialqueue_get_stats`,
 /// `klippy/chelper/serialqueue.c:1040-1050`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LastStats {
     /// Mean task duration, seconds.
-    pub mcu_tick_avg: f64,
+    pub mcu_task_avg: f64,
     /// Standard deviation of the task duration, seconds.
-    pub mcu_tick_stddev: f64,
+    pub mcu_task_stddev: f64,
     /// Total time spent awake, seconds.
-    pub mcu_tick_awake: f64,
+    pub mcu_awake: f64,
     /// When the report arrived, in [`Printer::eventtime`] seconds.
     ///
     /// A counter delta means nothing without the interval it was measured
@@ -101,14 +108,21 @@ pub struct LastStats {
     pub bytes_read: u64,
     /// Bytes it had written: upstream's `bytes_write`.
     pub bytes_write: u64,
+    /// The line's round-trip numbers, `None` until one has been measured.
+    ///
+    /// All three or none: upstream's `srtt`/`rttvar`/`rto` are one estimator's
+    /// output, and before the first sample there is no `srtt` to report
+    /// (`serialqueue.c:222`) — so `last_stats` leaves the keys out rather than
+    /// publish the `MIN_RTO` floor as a measurement.
+    pub round_trip: Option<RoundTripTimes>,
 }
 
 /// What the host knows about a `stats` report besides the firmware's own
 /// numbers.
 ///
 /// Gathered at dispatch, on the receive task, so the reader inside
-/// [`from_report`](LastStats::from_report) needs no clock of its own and the
-/// two numbers below are a single point in time.
+/// [`from_report`](LastStats::from_report) needs no clock or transport handle
+/// of its own and the numbers below are a single point in time.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReportContext {
     /// [`Printer::eventtime`] seconds when the report arrived.
@@ -117,6 +131,8 @@ pub struct ReportContext {
     pub bytes_read: u64,
     /// Bytes it had written at that moment.
     pub bytes_write: u64,
+    /// What the line had measured of its round trip at that moment.
+    pub round_trip: Option<RoundTripTimes>,
 }
 
 impl LastStats {
@@ -142,43 +158,70 @@ impl LastStats {
         let tick_sumsq = f64::from(report.sumsq) * stats_sumsq_base;
         let diff = count * tick_sumsq - sum * sum;
         Some(Self {
-            mcu_tick_avg: sum * c,
-            mcu_tick_stddev: c * diff.max(0.0).sqrt(),
-            mcu_tick_awake: sum / mcu_freq,
+            mcu_task_avg: sum * c,
+            mcu_task_stddev: c * diff.max(0.0).sqrt(),
+            mcu_awake: sum / mcu_freq,
             eventtime: context.eventtime,
             bytes_read: context.bytes_read,
             bytes_write: context.bytes_write,
+            round_trip: context.round_trip,
         })
     }
 
     /// The report's traffic half alone.
     ///
     /// Used when the dictionary does not publish the two conversion constants:
-    /// the three counters cannot be turned into seconds, so the tick numbers
-    /// are zero, while everything the host measured itself — the arrival time
-    /// and the transport's byte counts — is real. That is the half a port's
-    /// utilization is computed from, so it must not be lost with the ticks.
+    /// the three counters cannot be turned into seconds, so the task numbers
+    /// are zero, while everything the host measured itself — the arrival time,
+    /// the transport's byte counts and the line's round trip — is real. That
+    /// is the half a port's utilization is computed from, so it must not be
+    /// lost with the ticks.
     pub fn traffic_only(context: ReportContext) -> Self {
         Self {
-            mcu_tick_avg: 0.0,
-            mcu_tick_stddev: 0.0,
-            mcu_tick_awake: 0.0,
+            mcu_task_avg: 0.0,
+            mcu_task_stddev: 0.0,
+            mcu_awake: 0.0,
             eventtime: context.eventtime,
             bytes_read: context.bytes_read,
             bytes_write: context.bytes_write,
+            round_trip: context.round_trip,
         }
     }
 
-    /// The load and the traffic as `last_stats`.
+    /// The load, the traffic and the round trip as `last_stats`.
+    ///
+    /// Every value is a JSON number, never a string, and the second-denominated
+    /// ones are seconds — the unit upstream's own report uses
+    /// (`mcu_awake=%.03f mcu_task_avg=%.06f` at `klippy/mcu.py:969`,
+    /// `srtt=%.3f rttvar=%.3f rto=%.3f` at `serialqueue.c:1043`).
+    /// `srtt`/`rttvar`/`rto` are absent until a round trip has been measured,
+    /// which is also how upstream's report reads (`serialqueue.c:222`).
     pub fn to_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "mcu_tick_avg": self.mcu_tick_avg,
-            "mcu_tick_stddev": self.mcu_tick_stddev,
-            "mcu_tick_awake": self.mcu_tick_awake,
+        let mut stats = serde_json::json!({
+            "mcu_task_avg": self.mcu_task_avg,
+            "mcu_task_stddev": self.mcu_task_stddev,
+            "mcu_awake": self.mcu_awake,
             "bytes_read": self.bytes_read,
             "bytes_write": self.bytes_write,
-        })
+        });
+        if let (Some(round_trip), Some(fields)) = (self.round_trip, stats.as_object_mut()) {
+            fields.insert("srtt".to_string(), seconds(round_trip.srtt));
+            fields.insert("rttvar".to_string(), seconds(round_trip.rttvar));
+            fields.insert("rto".to_string(), seconds(round_trip.rto));
+        }
+        stats
     }
+}
+
+/// A duration as upstream reports it: seconds, as a JSON number
+/// (`serialqueue_get_stats` prints `srtt=%.3f rttvar=%.3f rto=%.3f`,
+/// `serialqueue.c:1043`).
+///
+/// The three decimals there are printf's, not the quantity's resolution: the
+/// numbers upstream keeps are `double` seconds, and so is this, so the
+/// microseconds a `Duration` holds are kept rather than rounded away.
+fn seconds(duration: Duration) -> serde_json::Value {
+    serde_json::json!(duration.as_secs_f64())
 }
 
 /// Subscribe a handler that keeps the latest [`LastStats`] in `slot`.
@@ -235,6 +278,7 @@ pub fn register_stats(
             eventtime: printer.eventtime(),
             bytes_read,
             bytes_write,
+            round_trip: connection.wire_round_trip(),
         };
         let last = match constants {
             Some(constants) => {
@@ -285,8 +329,9 @@ fn tick_constants(mcu: &Mcu) -> Option<TickConstants> {
             .collect();
             warn!(
                 "MCU '{}' dictionary has no {}; `stats` is still consumed, but \
-                 mcu_tick_avg/mcu_tick_stddev/mcu_tick_awake stay 0 — last_stats_time, \
-                 bytes_read and bytes_write are the host's own and stay valid",
+                 mcu_task_avg/mcu_task_stddev/mcu_awake stay 0 — last_stats_time, \
+                 bytes_read, bytes_write and srtt/rttvar/rto are the host's own and \
+                 stay valid",
                 mcu.name(),
                 missing.join(" or ")
             );
@@ -421,18 +466,104 @@ mod tests {
             eventtime: 12.5,
             bytes_read: 1_024,
             bytes_write: 2_048,
+            round_trip: None,
         };
         let last = LastStats::from_report(&report, 72_000_000.0, 4.0, context).unwrap();
 
         // c = 1/(100 * 72e6); avg = sum * c; awake = sum / 72e6.
         assert_eq!(last.eventtime, 12.5, "stamped with the arrival time");
         assert_eq!((last.bytes_read, last.bytes_write), (1_024, 2_048));
-        assert!((last.mcu_tick_avg - 3000.0 / (100.0 * 72_000_000.0)).abs() < 1e-18);
-        assert!((last.mcu_tick_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
+        assert!((last.mcu_task_avg - 3000.0 / (100.0 * 72_000_000.0)).abs() < 1e-18);
+        assert!((last.mcu_awake - 3000.0 / 72_000_000.0).abs() < 1e-18);
         // stddev = c * sqrt(count*sumsq*base - sum^2).
         let expected =
             (100.0 * 250_000.0 * 4.0 - 3000.0f64.powi(2)).sqrt() / (100.0 * 72_000_000.0);
-        assert!((last.mcu_tick_stddev - expected).abs() < 1e-18);
+        assert!((last.mcu_task_stddev - expected).abs() < 1e-18);
+    }
+
+    /// The keys a client reads are upstream's, not the names of the variables
+    /// behind them (`klippy/mcu.py:924-926` vs `:969`).
+    #[test]
+    fn test_last_stats_publishes_upstreams_task_keys_and_not_its_own() {
+        let last = LastStats {
+            mcu_task_avg: 1.5e-6,
+            mcu_task_stddev: 2.5e-7,
+            mcu_awake: 0.25,
+            eventtime: 12.5,
+            bytes_read: 1_024,
+            bytes_write: 2_048,
+            round_trip: None,
+        };
+        let json = last.to_json();
+
+        assert_eq!(json["mcu_task_avg"], 1.5e-6);
+        assert_eq!(json["mcu_task_stddev"], 2.5e-7);
+        assert_eq!(json["mcu_awake"], 0.25);
+        for stale in ["mcu_tick_avg", "mcu_tick_stddev", "mcu_tick_awake"] {
+            assert!(json.get(stale).is_none(), "{stale} is not a key: {json}");
+        }
+    }
+
+    /// The round trip is reported in **seconds**, the unit upstream prints
+    /// (`serialqueue.c:1043`, with `MIN_RTO 0.025` / `MAX_RTO 5.000` for
+    /// scale at `:107-108`) — not in milliseconds or microseconds.
+    #[test]
+    fn test_last_stats_publishes_the_round_trip_in_seconds() {
+        let last = LastStats {
+            mcu_task_avg: 0.0,
+            mcu_task_stddev: 0.0,
+            mcu_awake: 0.0,
+            eventtime: 12.5,
+            bytes_read: 0,
+            bytes_write: 0,
+            round_trip: Some(RoundTripTimes {
+                srtt: Duration::from_millis(25),
+                rttvar: Duration::from_micros(2_500),
+                rto: Duration::from_micros(35_000),
+            }),
+        };
+        let json = last.to_json();
+
+        assert_eq!(json["srtt"], 0.025);
+        assert_eq!(json["rttvar"], 0.0025);
+        assert_eq!(json["rto"], 0.035);
+        // A fractional JSON number, not an integer and not a string: the shape
+        // a reader takes as a float, as upstream's `'.' in v` parse does
+        // (`klippy/mcu.py:974`).
+        for key in ["srtt", "rttvar", "rto"] {
+            let text = json[key].to_string();
+            assert!(text.contains('.'), "{key} = {text} reads as a float");
+        }
+    }
+
+    /// No sample yet: the three keys are absent, not zero — the floor a wait
+    /// starts at is not a measurement (`serialqueue.c:222`, `srtt == 0`).
+    #[test]
+    fn test_last_stats_omits_the_round_trip_until_one_is_measured() {
+        let report = Stats {
+            count: 100,
+            sum: 3000,
+            sumsq: 250_000,
+        };
+        let last = LastStats::from_report(
+            &report,
+            72_000_000.0,
+            4.0,
+            ReportContext {
+                eventtime: 12.5,
+                bytes_read: 0,
+                bytes_write: 0,
+                round_trip: None,
+            },
+        )
+        .unwrap();
+        let json = last.to_json();
+
+        for key in ["srtt", "rttvar", "rto"] {
+            assert!(json.get(key).is_none(), "{key} before a sample: {json}");
+        }
+        // The rest of the report is there either way.
+        assert!(json["mcu_awake"].as_f64().unwrap() > 0.0);
     }
 
     #[test]
@@ -450,6 +581,7 @@ mod tests {
                 eventtime: 12.5,
                 bytes_read: 0,
                 bytes_write: 0,
+                round_trip: None,
             }
         )
         .is_none());
@@ -474,7 +606,7 @@ mod tests {
         let last = a_report_arrives(&slot).await;
 
         assert_eq!(
-            (last.mcu_tick_avg, last.mcu_tick_stddev, last.mcu_tick_awake),
+            (last.mcu_task_avg, last.mcu_task_stddev, last.mcu_awake),
             (0.0, 0.0, 0.0),
             "nothing to divide the counters by"
         );
@@ -485,6 +617,26 @@ mod tests {
             (bytes_read, bytes_write),
             "the transport's own counters are real either way"
         );
+    }
+
+    /// The round trip is the host's own measurement, so a dictionary without
+    /// the conversion constants loses the task numbers and nothing else.
+    #[test]
+    fn test_traffic_only_keeps_the_round_trip_it_was_handed() {
+        let times = RoundTripTimes {
+            srtt: Duration::from_millis(25),
+            rttvar: Duration::from_micros(2_500),
+            rto: Duration::from_micros(35_000),
+        };
+        let last = LastStats::traffic_only(ReportContext {
+            eventtime: 12.5,
+            bytes_read: 1_024,
+            bytes_write: 2_048,
+            round_trip: Some(times),
+        });
+
+        assert_eq!(last.round_trip, Some(times));
+        assert_eq!(last.to_json()["rto"], 0.035);
     }
 
     /// The missing constants are named once, at registration — not on every

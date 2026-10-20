@@ -892,7 +892,8 @@ fn describe_bytes(bytes: &[u8]) -> String {
 /// blocks grow without end.
 const MAX_PENDING_BLOCKS: usize = 12;
 
-/// The sequence state one connection shares with the firmware.
+/// The sequence state one connection shares with the firmware, plus the
+/// round-trip numbers it publishes for `last_stats`.
 ///
 /// Klipper's firmware keeps one `next_sequence` (`third_party/klipper/src/command.c:16`):
 /// every frame it sends is stamped with it, a block is accepted only when it
@@ -909,6 +910,10 @@ const MAX_PENDING_BLOCKS: usize = 12;
 /// that never rebooted — or a block went missing. Upstream reads the number the
 /// same way, and adopts it for the same reason (`serialqueue.c:196-201`: "Got an
 /// ack for a message not sent; must be connection init").
+///
+/// The transport state that is not a sequence is here for the same reason: it
+/// is what one connection shares with whoever answers `get_status`, and the
+/// send task is its only writer (see [`Wire::round_trip`]).
 #[derive(Debug, Default)]
 struct Wire {
     /// The sequence the **next** new block will carry: the firmware's
@@ -948,6 +953,37 @@ struct Wire {
     /// never place the firmware's answer again — every frame from it is judged
     /// "a block this connection never sent" and dropped, for good.
     connection_init: AtomicBool,
+    /// The line's round-trip numbers as the send task last published them.
+    ///
+    /// The estimate itself belongs to the send task ([`RttEstimator`]), but
+    /// `last_stats` is answered from the object side, and upstream reports the
+    /// same three out of its queue's state
+    /// (`serialqueue_get_stats`, `serialqueue.c:1040-1048`). `None` until the
+    /// first round trip lands.
+    round_trip: StdMutex<Option<RoundTripTimes>>,
+}
+
+/// The line's round-trip numbers: upstream's `srtt`, `rttvar` and `rto`.
+///
+/// **Seconds**, as upstream keeps them: `srtt` is smoothed over samples of
+/// `eventtime` (a reactor monotonic clock in seconds, `serialqueue.c:218-227`),
+/// `rto` is clamped to `MIN_RTO 0.025` / `MAX_RTO 5.000`
+/// (`serialqueue.c:107-108,233-236`), and the three are printed with three
+/// decimals of seconds (`serialqueue.c:1043`). The `Duration` here is the
+/// same quantity; `as_secs_f64` is the unit conversion, applied once at
+/// serialization.
+///
+/// `rto` is the wait **in force**, not the bare estimate: a timeout doubles the
+/// same field upstream (`serialqueue.c:457-459`) and the stats report that
+/// value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RoundTripTimes {
+    /// Smoothed round trip (`srtt`).
+    pub srtt: Duration,
+    /// Mean deviation (`rttvar`).
+    pub rttvar: Duration,
+    /// Retransmit timeout in force (`rto`), back-off included.
+    pub rto: Duration,
 }
 
 /// What one received frame's sequence byte decides for the receive window.
@@ -1460,6 +1496,26 @@ impl Sender {
         self.sync_rto_to_estimate();
     }
 
+    /// Publish the estimate and the wait to the shared [`Wire`], where
+    /// `last_stats` reads them ([`Mcu::wire_round_trip`]).
+    ///
+    /// Called on every change of either: a sample moves all three numbers, and
+    /// a timeout moves `rto` alone. Nothing is published before the first
+    /// sample — `srtt` is unknown until then, and a report cannot say what it
+    /// has not measured.
+    fn publish_round_trip(&self) {
+        let published = self.rtt.srtt.map(|srtt| RoundTripTimes {
+            srtt,
+            rttvar: self.rtt.rttvar,
+            rto: self.rto,
+        });
+        *self
+            .wire
+            .round_trip
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = published;
+    }
+
     /// Bring the retransmit wait back to what the estimate says: [`MIN_RTO`]
     /// while no sample has landed, the estimator's clamped value from then on.
     ///
@@ -1468,6 +1524,7 @@ impl Sender {
     /// measured, not 25 ms by default.
     fn sync_rto_to_estimate(&mut self) {
         self.rto = self.estimated_rto();
+        self.publish_round_trip();
     }
 
     /// Put one block on the wire, carrying the sequence this connection is at, and
@@ -1584,6 +1641,9 @@ impl Sender {
             self.resend_block(interface, block.seq, block.frame).await;
         }
         self.rto = (self.rto * 2).min(MAX_RTO);
+        // `rto` is the field upstream's stats report, so the doubling shows up
+        // in `last_stats` like it does there (`serialqueue.c:457-459`).
+        self.publish_round_trip();
     }
 
     /// Take in what the firmware's counter has been seen at.
@@ -2233,6 +2293,21 @@ impl Mcu {
     /// `last_stats`/`last_stats_time` carries exactly that pair.
     pub fn wire_bytes(&self) -> (u64, u64) {
         (self.interface.bytes_read(), self.interface.bytes_write())
+    }
+
+    /// The line's round-trip numbers, `None` until one has been measured.
+    ///
+    /// Upstream reports the same three in `last_stats` in **seconds**
+    /// (`serialqueue.c:1043`, printed with three decimals); `None` is the
+    /// state upstream describes as `srtt == 0` (`serialqueue.c:222`) and is why
+    /// `last_stats` then omits the keys rather than report the `MIN_RTO`
+    /// floor as if it had been measured.
+    pub fn wire_round_trip(&self) -> Option<RoundTripTimes> {
+        *self
+            .wire
+            .round_trip
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Whether this connection had to take over a session that was already

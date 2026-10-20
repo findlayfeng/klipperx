@@ -2488,8 +2488,8 @@ impl Mcu {
 
     /// Send a **move-class** command: one whose firmware handler takes a slot
     /// from the board's move free list (`queue_step`, `set_next_step_dir`,
-    /// `queue_digital_out` — each `move_alloc()`s, `stepper.c:262` /
-    /// `gpiocmds.c:148`).
+    /// `queue_digital_out`, `queue_pwm_out` — each `move_alloc()`s,
+    /// `stepper.c:262` / `gpiocmds.c:148` / `pwmcmds.c:86`).
     ///
     /// The command enters this MCU's pool with `completion_clock` — when its
     /// last step (or its own scheduled instant) runs — which is what later

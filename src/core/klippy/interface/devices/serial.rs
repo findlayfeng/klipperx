@@ -227,6 +227,18 @@ impl SerialDevice {
         (&self.port).write(buf)
     }
 
+    /// Write raw bytes straight to the open port, bounded by
+    /// [`WRITE_STALL_BOUND`] the way [`Device::send`](Self::send) is.
+    ///
+    /// The flashing tool's tty writes go through this: a `write_all` on the raw
+    /// descriptor parks inside the driver when the far end stops draining, and
+    /// the deadline the session puts around the whole frame can only fire
+    /// between writes — so the wait for room has to be bounded here, at the one
+    /// call that can block.
+    pub(crate) fn write_bounded(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        write_whole(&self.port, buf)
+    }
+
     /// Assert or deassert RTS on the open port.
     ///
     /// # Errors
@@ -520,7 +532,7 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
 /// on the wire. A port that takes none of it within the bound returns
 /// [`std::io::ErrorKind::TimedOut`], which both write paths turn into
 /// [`InterfaceError::SendError`].
-fn write_whole(port: &File, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_whole(port: &File, bytes: &[u8]) -> std::io::Result<()> {
     let deadline = Instant::now() + WRITE_STALL_BOUND;
     for byte in bytes {
         wait_for_room(port, deadline)?;

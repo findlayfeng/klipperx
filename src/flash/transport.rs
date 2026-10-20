@@ -168,12 +168,14 @@ impl Read for TtyPort<'_> {
 
 impl Write for TtyPort<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // One pass-through write. The port is in blocking mode, so a `write`
-        // is indivisible; the deadline for the frame lives one level up, in
-        // `session::write_frame`, which bounds the whole frame by the try's
-        // window and fails with `TimedOut` when the transport stops taking
-        // bytes between slices.
-        self.dev.borrow_mut().write(buf)
+        // The deadline has to be **here**, not only around the frame: the port
+        // is in blocking mode, so a `write_all` parks inside the driver when the
+        // far end stops draining, and `session::write_frame`'s window can only
+        // be checked between writes. `write_bounded` waits for room under the
+        // serial device's own bound (`WRITE_STALL_BOUND`), the same one
+        // `Device::send` uses, and reports `TimedOut` when it expires.
+        self.dev.borrow_mut().write_bounded(buf)?;
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {

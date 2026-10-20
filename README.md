@@ -71,13 +71,13 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
    剩下 `sdcard_loop` 的 `SDCARD_LOOP_*` 与文件回放未接。
 2. **温度语义**：`M105` 的 gcode_id 表已接线（`heaters.rs:417` 的 `gcode_id_to_sensor`，
    没有登记传感器时才回 `T:0`）；`M190`/`M109` 按等待版本注册（`extruder.rs:263`、
-   `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`b5da84e`）。
+   `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`a802cdc`）。
 3. **运行时参数**：`M204`/`SET_VELOCITY_LIMIT` 已注册（2026-10-04），改完**同时**进状态与
    规划器；`SET_PRESSURE_ADVANCE` 会记录但**不作用于运动**（PA 只存值，运动层未消费）。
 4. **常见宏依赖**：`save_variables`（`SAVE_VARIABLE`）已落地（2026-10-04），宏可读写
    `printer.save_variables.variables`；`delayed_gcode`、`respond` 与 `gcode_macro` 的
    `rename_existing` 连接期换名（KAMP / `M600` 这类常见 `printer.cfg` 靠它）也都已落地
-   （2026-10-06，`8113056`）。仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
+   （2026-10-06，`5ba2356`）。仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
 5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），但
    `ToolHead.wait_moves` 不等待 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模、`send_wait_ack`
    还没有对应原语（`motion/toolhead.rs:440-470`、`mcu/mod.rs:2639-2650`），真机上尚未验证

@@ -562,12 +562,12 @@
 > 且本机缺 `probe_path`/`rapid_path`（探针调度路径未实现），上游另返回的 `probe_offsets` /
 > `axis_minimum` / `axis_maximum`（`bed_mesh.py:308-310`）本机未返回。
 > ② `mesh_args` 只作开关，其键不回灌配置（上游 `update_config` 的 per-command 覆盖未实现）。
-> ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`dc1dd1e`）**：`mesh_matrix` 现在是
+> ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`07072b9`）**：`mesh_matrix` 现在是
 > 插值后的 6 位小数网格（默认 `mesh_pps: 2` 把 2×2 探测点插成 4×4）；`mesh_params.algo` 报的是
 > `_verify_algorithm` 校验（并可能改写）后的值——两轴 `mesh_pps` 全 0 时它会被改写为 `direct`。
 > ④ `profiles` 恒为 `{}`（`BED_MESH_PROFILE` 未做）；`current_mesh.name` 报 `default`
 > （上游 `PROFILE` 默认值）。
-> ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`dc1dd1e`）**：圆床行按上游补齐成方阵。
+> ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`07072b9`）**：圆床行按上游补齐成方阵。
 > ⑥ 请求参数只有 `mesh_args`（参数表无 profile 名键，profile 名只出现在 `current_mesh.name`）。
 
 > 运行期状态也可通过 `objects/query` 查询 `bed_mesh` 对象：

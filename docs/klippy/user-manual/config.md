@@ -91,7 +91,7 @@ points: 100, 100
 
 空的续行与整行注释不参与连接，也不会终止多行值。
 
-**序列化与回写（2026-10-03，`0960f44`）**：写多行值时（`SAVE_CONFIG` 块与 `build_config_string`），
+**序列化与回写（2026-10-03，`3aab53c`）**：写多行值时（`SAVE_CONFIG` 块与 `build_config_string`），
 值内的换行落为 **tab 缩进续行**（与上游 `configparser` 逐字同形）；**空的首行被保留**——
 `key:`（值为空）后接缩进续行的配置，读回时值以 `\n` 开头（同 configparser；执行侧 gcode 逐行跑、
 空行无害）。块内形状示例：
@@ -687,10 +687,10 @@ sensor_type: temperature_host
 
 内层先按 `sensor_type` 建一个普通传感器（与 `[temperature_sensor]` 同一 `heaters` 工厂机制），
 本节再把它包成可 `objects/query` 的对象 `temperature_probe <name>`。核心与标定命令族
-均已落地（A `f6ea201`、B `dfaf418`——`calibration_position` / `calibration_bed_temp` /
+均已落地（A `19e7eb4`、B `65866da`——`calibration_position` / `calibration_bed_temp` /
 `calibration_extruder_temp` / `extruder_heating_z` / `resting_z` / `horizontal_move_z` / `speed`
 由 `TEMPERATURE_PROBE_*` 命令族消费）；漂移补偿 `EddyDriftCompensation` 也已落地
-（C `704ee0d`）：需**同名** `[probe_eddy_current <name>]` 段才会注册，`get_status` 的
+（C `1f0d623`）：需**同名** `[probe_eddy_current <name>]` 段才会注册，`get_status` 的
 `compensation_enabled` 是真实开关。
 
 | 参数 | 类型 | 必需 | 默认值 | 说明 |
@@ -1019,10 +1019,10 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `i2c_mcu` / `i2c_bus` / `i2c_address` | I2C 组（`setup_i2c` 共享读取） |
 | `sensor_type` | 传感器类型（语料 `eddy`） |
 | `z_offset` | 探针 Z 偏移 |
-| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**已接**——2026-10-03 `4caf425` 由 `PROBE_EDDY_CURRENT_CALIBRATE` 生成，`Z_OFFSET_APPLY_PROBE METHOD=tap` 写回 `tap_z_offset`） |
+| `calibrate` | 静态标定开关（`enable`/`enable_with_touch`；**已接**——2026-10-03 `a6004f7` 由 `PROBE_EDDY_CURRENT_CALIBRATE` 生成，`Z_OFFSET_APPLY_PROBE METHOD=tap` 写回 `tap_z_offset`） |
 | 采样组（`samples`/`sample_retract_dist`/`samples_tolerance`/`lift_speed`…） | 由 probe/`ProbePointsHelper` 读取 |
 
-段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 已实现（2026-10-03，`4caf425`）。
+段与对象已落地（2026-09-24 批 #3，`eddy.test` 转绿）；**同名 section 按上游 `strict=False` 后写覆盖合并**（本仓自 2026-09-24 起，eddy.cfg 双段即其用例）。静态标定与 `PROBE_EDDY_CURRENT_CALIBRATE`/`Z_OFFSET_APPLY_PROBE` 已实现（2026-10-03，`a6004f7`）。
 
 > 配置解析补充（批 #5）：除同名 section 合并外，`#*# SAVE_CONFIG` 自动保存块按上游 `_find_autosave_data` **读取合并**（header 逐字节识别、`#*# ` 前缀剥离、正文优先/块只补新、损坏行告警）——语料 `delta_calibrate.cfg` 的双段与高度数据即其用例（回写侧 `SAVE_CONFIG` 命令把待写项写回文件并重启）。
 
@@ -1067,7 +1067,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 |------|------|------|
 | `recover_velocity` | `50.0` | `RESUME` 未给 `VELOCITY=` 时的恢复速度（mm/s） |
 
-四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**SD 分支已接线**（2026-10-03，`0890669`）：回放中 `PAUSE` / `RESUME` / `CANCEL_PRINT` 真驱动 `virtual_sdcard`（这三支**不发** `action:*` 行，同上游；`RESUME` 撞上 `SD busy` 从命令冒出、`is_paused` 保留），空闲时仍走 `respond_info` 发 `action:paused` / `action:resumed` / `action:cancel`；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点已注册（`84a09e0`）。
+四条命令 `PAUSE` / `RESUME`（`VELOCITY=`）/ `CLEAR_PAUSE` / `CANCEL_PRINT` 与 `get_status` 的 `is_paused` 已落地（help 与状态文案逐字照上游）。**SD 分支已接线**（2026-10-03，`6cf2cd5`）：回放中 `PAUSE` / `RESUME` / `CANCEL_PRINT` 真驱动 `virtual_sdcard`（这三支**不发** `action:*` 行，同上游；`RESUME` 撞上 `SD busy` 从命令冒出、`is_paused` 保留），空闲时仍走 `respond_info` 发 `action:paused` / `action:resumed` / `action:cancel`；`pause_resume/{pause,resume,cancel}` 三个 webhooks 端点已注册（`922eadd`）。
 
 ### `[filament_switch_sensor <name>]` / `[filament_motion_sensor <name>]` — 断料检测（wave-2）
 

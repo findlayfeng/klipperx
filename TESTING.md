@@ -73,7 +73,7 @@
   发散、`verify_heater` 不误触发。**注意**：`M109`/`M190` 已会等到目标温度、`M105` 按
   gcode-id 表输出（2026-10-06 复核：`extras/extruder.rs:263`、`extras/heater_bed.rs:53`、
   `extras/heaters.rs:417`；此前本节「不等温、回 `T:0`」的说法已过时）；`TEMPERATURE_WAIT`
-  亦可等待（2026-10-03，`b5da84e`）。
+  亦可等待（2026-10-03，`a802cdc`）。
 
 - [ ] **R7 挤出机进料（E 轴）** —— 真实测试：热态下 `G1 E10`（配合 `M83`）送料，
   量实际挤出长度；冷态再发同一条。判定：进料量与 `rotation_distance`/齿轮比对账；
@@ -97,7 +97,7 @@
 - [ ] **R11 连续运行的真机时序** —— 真实测试：把 R1–R9 的最小任务**循环跑满一段较长
   时间**（分钟到小时级，或用 `stress --task step` 顶着上限压）。判定：无
   `Stepper too far in past` / `Timer too close`、无丢步、USB 不掉线；本项要暴露的
-  代码侧缺口：**宿主的 `ToolHead.wait_moves` 等待已落地（2026-10-06，`46d6e64`）**，但它按上游
+  代码侧缺口：**宿主的 `ToolHead.wait_moves` 等待已落地（2026-10-06，`a23a92b`）**，但它按上游
   `can_pause` 在 fileoutput 下短路，所以**真机路径（无 `debug_output`）仍未验证**——本项就是要验它。
   尚未建模的剩 `send_wait_ack`（消息的 `min_clock`/`req_clock` 闸**已建模**，见 `mcu/mod.rs:149-176`；
   `mcu/mod.rs:2639-2650` 自述只是 flush、不是「块被固件确认」）。
@@ -391,7 +391,7 @@ USB 刷入（684 块 + verify，rc=0）。夹具：`src/core/klippy/interface/de
 
 | 症状 | 根因 | 修复 |
 |---|---|---|
-| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`b2ee68a`） |
+| 换配置后的第二次连接必定 `Input/output error`，重连不起来 | 共享/mux 串口 reset 后把**死 port** 交回（旧 `Arc<Mcu>` 还活着，注册表按路径查回同一个 fd） | `resource_for` 跳过 stopped 资源；写失败即标 stopped；`serial::attach` 拿到新 fd（`8c4a9bf`） |
 | UART 下游每次会话后 mux 身份从 `97abe031988e` 变成 `7eabe031988e`，重连再也握不上手，须重新上电 | **上游 console bug**：`encode_acknak.min_size = 0`，`transmit_room()` 压缩后把 5 字节 ack 写到 `transmit_buf[96..100]`，帧尾 `0x7e` 落在 `mux_identity[0]`（250 kbaud 饱和链路几乎每个 ack 都走压缩分支） | `min_size = MESSAGE_MIN` + ack 短路遵守 `buf_size`（`df4ed17c`） |
 | CAN 下游 `identify` 永远超时；scan / 指派 / 送引导 / 隧道刷写全通 | CAN 侧 `can_decode_nodeid()` 给的是**仲裁 id**，被当成 node id 交给 mux 设备半 ⇒ 设备发出的帧头是 `mux_encode_header(0)`（`80 00`，没有地址），也拒收发给它的单元 | 交接米跑 wire 上的 node id（`7ca47634`） |
 | `[can_device]` 配置期 shutdown：`Pin PB8 reserved for CAN - can't reserve for bridge_can` | 端口型 build 同一对引脚被 `RESERVE_PINS_CAN` 与 `RESERVE_PINS_bridge_can` 各声明一次 | 引脚由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下只声明一次（`24cc4eba`） |
@@ -429,7 +429,7 @@ EN=PC13、UART=PC6（单线，收发同脚）、DIAG=PC3。下游 F103 照旧挂
 | 周期检查 | 1 s 一次，`drv_status` 出现在 `tmc2209 stepper_x` 状态里 |
 | DIAG 接线 | 接上后空闲读引脚为**低**（`G28 X` 跑满行程报 `No trigger on x after full movement`）；未接时因内部上拉而"立刻触发" |
 
-**这一轮踩出并修掉的三个缺陷**（`603565b6`、`d3c31b8f`）：
+**这一轮踩出并修掉的三个缺陷**（`a816520`、`1e0afc3`）：
 
 1. **写必须等固件自己的应答**：固件对每一条 `tmcuart_send` 都回一个 `tmcuart_response`（写也回，
    载荷为空），那是"这一帧已发完"的完成信号。主机之前 fire-and-forget，于是只能靠 sleep 猜，

@@ -196,7 +196,7 @@ connect_file(输出文件, 字典):
 | 因字典未构建跳过 | 2 | `printers.test` 中引用 `pru` 的两条运行（默认不编 `pru`） |
 | 因忽略列表跳过 | **0** | `IGNORED` 已清空 |
 | 实际执行 | **237** | 全部通过（下表列出各 `.test`，`printers.test` 一个文件 203 条运行） |
-| 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（b39750f 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`（2026-10-06 起走**真命令**与会话生命周期，此前是未知命令放行）、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
+| 其中早期转绿 | — | 逐批转绿的先后顺序（各批提交信息里可查）：`linuxtest.test`、`commands.test`、`out_of_bounds.test`（9ac97d0 移出）、`bed_mesh.test`、`z_virtual_endstop.test`（探针链路）、`z_tilt.test`、`quad_gantry_level.test`（调平族）、`bltouch.test`、`smart_effector.test`（探针族）、`multi_z.test`（发送队列水位）、`screws_tilt_adjust.test`（探测语义与亚纳米守卫）、`gcode_arcs.test`、`bed_screws.test`（2026-10-06 起走**真命令**与会话生命周期，此前是未知命令放行）、`pwm.test`、`temperature.test`、`macros.test`、`led.test`、`sdcard_loop.test`、`pressure_advance.test`、`eddy.test`、`dual_carriage.test`、`exclude_object.test`（宏体渲染）、`polar.test`、`delta.test`、`delta_calibrate.test`（运动学）、`hybrid_corexy_dual_carriage.test`（`[input_shaper]` 段）、`extruders.test`（filament 传感器段）、`manual_stepper.test`、`generic_cartesian_iqex.test`/`generic_cartesian_itex.test`，**全部通过** |
 
 上游 `configparser` 的 `optionxform = str.lower` 已对齐（`mod.rs` 存储侧小写 + `section.rs` 查询侧小写），`Option 'pid_Kp' … must be specified` 类的 49 次回归失败已归零；`must be specified` 错误文案保留调用方传入的大小写，`is not valid` 与 `Section '…' is not valid` 使用存储侧小写。
 
@@ -206,7 +206,7 @@ connect_file(输出文件, 字典):
 
 - 头两个转绿的用例：`linuxtest.test`（只需 `kinematics: none`、`heaters` 的传感器注册表、
   `temperature_sensor` 与 `ds18b20`，g-code 只是一次 `G4 P1000`）；随后 `gcode_move`（G4-1）与
-  `EXTRUDER` 默认项（e8bf2b7）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
+  `EXTRUDER` 默认项（8c76a33）让 `commands.test` 与 `out_of_bounds.test` 也过了守卫，移出忽略列表。
 - `KLIPPERX_UPSTREAM_ALL=1` 只去掉忽略列表这一层：默认构建下它会跑 237 条可用运行，其中
   **237 条通过、0 条失败**，`IGNORED` **已清空**（2026-09-25 收官；逐批转绿过程见各批提交信息与
   `TODO.md`）。另有 2 条运行声明 `DICTIONARY … pru.dict`，默认不构建 `pru`（需 `pru-gcc`），
@@ -239,7 +239,7 @@ connect_file(输出文件, 字典):
 - 看全部缺口（而不只是首次失败）：
   `cargo test -p klipperx --lib upstream_gap_report -- --nocapture`。
 - `out_of_bounds.test` 是唯一的 `SHOULD_FAIL`：验收时必须确认反转真的验的是**越界检查**，
-  而不是被一个配置装载错误「喂饱」（它已在 b39750f 移出并验证过一次）。
+  而不是被一个配置装载错误「喂饱」（它已在 9ac97d0 移出并验证过一次）。
 
 ## 本仓库的复用
 
@@ -327,7 +327,7 @@ harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字�
 - 只有 g-code 阶段的错误才反转成成功（`run_phases` 的两段返回值）。
 
 所以它的验收要点是：移出忽略列表前，配置必须先能装载——否则非零退出来自配置错误，反转就会被
-「喂饱」。这一条在 b39750f 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
+「喂饱」。这一条在 9ac97d0 移出时已满足（`gcode_move` 落地后 `example-cartesian.cfg` 可装载，
 反转验的正是 `G1 Y9999` 越界）。
 
 **2026-10-02 回退与修复**：生成式运行器一度报告该 case 「成功」，被误读为 move-bounds 未实现而

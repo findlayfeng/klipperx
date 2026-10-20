@@ -17,7 +17,7 @@
 
 ## 0. 口径
 
-- 源码基线：分支 `work` @ `266e18d5`，**以源码为准**；`TODO.md`/`TESTING.md` 只做交叉验证，
+- 源码基线：分支 `work` @ `3b51924`，**以源码为准**；`TODO.md`/`TESTING.md` 只做交叉验证，
   冲突记在 §7。
 - 证据标注：**✅复核** = main 亲手对过源码；**◻侦察** = 只读侦察产出、未逐行复核。
 - 硬件假设：CoreXY、`[stepper_z]`+`[stepper_z1]`+`[stepper_z2]`、电感/欧姆龙探针、热床 + 单挤出机、
@@ -131,13 +131,13 @@ Mainsail 的 HTTP/WS、`server.files`、`server.temperature_store`、`machine.*`
 
 | 项 | 状态 | 落点 |
 |---|---|---|
-| P0-1 电机自动使能 | ✅ 落地（`5fd2eee` 系列） | `motion/itersolve` 的 `check_active`、`motion/queuing` 的 `ActiveCallbacks`、`extras/stepper_enable` 的按 `print_time` 排期使能；TMC 虚拟使能由同一条链驱动（`toff` 回填有单测） |
-| P0-2 `TURN_OFF_HEATERS` | ✅ 落地（`73ee003`） | `extras/heaters.rs` 注册（ready 表，文案同上游），三种 heater 归零有测试；`config.md`/`gcode-commands.md` 已同步 |
-| P0-3 MCU 失联检测 | ✅ 落地（`2aa5bc0`） | 判据按上游实际实现（未答查询 > 4），不是「估计打印时间 vs 单调时钟」——侦察报告里的表述**有误**，已按 `mcu.py:897-905` 修正；挂在既有 1 s poll 上，file-output 不判 |
-| P0-4 串口打开重试 | ✅ 落地（`a1e5548` + `728972f`） | 5 s × 90 s，只包打开；**重试改在阻塞池执行**（原本同步睡在 async 里会停住 2 worker 运行时） |
-| P0-5 加热固件看门狗 | ✅ 落地（`73ee003`）；**第二半 2026-10-19 补齐** | `setup_max_duration(MAX_HEAT_TIME=3.0)`；`set_pwm` 的 `verify_mainthread_time` 那一半已做（5 s 截止戳 + 1 s 打戳定时器），并同批补了 `get_temp` 的 7 s 陈旧压制——两者都要求读数与 print time 同域，靠 `agents/feat-sensor-clock-domain` 把 ADC 样本时间统一到 print time 才解锁 |
-| A-1 轴范围 + 估计时间 | ✅ 落地（`68a92da`） | 按 Moonraker 源码复核后**降为 P2（UI）**：它不读这两个字段 |
-| L1 契约守卫 | ✅ 落地（`8198077`） | `info` 两路径字段、四态 `state`、`print_stats` 首帧 `state` 三条回归守卫 |
+| P0-1 电机自动使能 | ✅ 落地（`495259b` 系列） | `motion/itersolve` 的 `check_active`、`motion/queuing` 的 `ActiveCallbacks`、`extras/stepper_enable` 的按 `print_time` 排期使能；TMC 虚拟使能由同一条链驱动（`toff` 回填有单测） |
+| P0-2 `TURN_OFF_HEATERS` | ✅ 落地（`4348ec7`） | `extras/heaters.rs` 注册（ready 表，文案同上游），三种 heater 归零有测试；`config.md`/`gcode-commands.md` 已同步 |
+| P0-3 MCU 失联检测 | ✅ 落地（`1c0ff53`） | 判据按上游实际实现（未答查询 > 4），不是「估计打印时间 vs 单调时钟」——侦察报告里的表述**有误**，已按 `mcu.py:897-905` 修正；挂在既有 1 s poll 上，file-output 不判 |
+| P0-4 串口打开重试 | ✅ 落地（`a51ca5f` + `1c812bb`） | 5 s × 90 s，只包打开；**重试改在阻塞池执行**（原本同步睡在 async 里会停住 2 worker 运行时） |
+| P0-5 加热固件看门狗 | ✅ 落地（`4348ec7`）；**第二半 2026-10-19 补齐** | `setup_max_duration(MAX_HEAT_TIME=3.0)`；`set_pwm` 的 `verify_mainthread_time` 那一半已做（5 s 截止戳 + 1 s 打戳定时器），并同批补了 `get_temp` 的 7 s 陈旧压制——两者都要求读数与 print time 同域，靠 `agents/feat-sensor-clock-domain` 把 ADC 样本时间统一到 print time 才解锁 |
+| A-1 轴范围 + 估计时间 | ✅ 落地（`6206954`） | 按 Moonraker 源码复核后**降为 P2（UI）**：它不读这两个字段 |
+| L1 契约守卫 | ✅ 落地（`e206b33`） | `info` 两路径字段、四态 `state`、`print_stats` 首帧 `state` 三条回归守卫 |
 
 **Moonraker 对接结论（只读 `/home/fengcheng/project/klipperx.worktrees/moonraker` 源码）**：
 现成 Moonraker 可把本机当 klippy 用，L1 无阻塞项；握手链 `info` → `objects/*` → `gcode/subscribe_output`

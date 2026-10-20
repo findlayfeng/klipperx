@@ -258,15 +258,18 @@ pub fn register_stats(
         return Ok(());
     }
     let constants = tick_constants(mcu);
+    // The report has to be attributable. Two MCUs on one host each report every
+    // five seconds, and the two streams interleave in the log: without the name
+    // the only way to tell them apart is by guessing from the report rate (the
+    // log-mining script had to do exactly that). An owned copy, because the
+    // callback outlives this call and `Mcu::name()` borrows.
+    let name = mcu.name().to_string();
     // A `Weak`, like the printer: the callback table belongs to the session and
     // a handler holding its own `Mcu` strongly would be another
     // `Mcu → events → handler → Mcu` edge for `clear_events` to break.
     let connection = Arc::downgrade(mcu);
     mcu.bind_event::<Stats, _>(move |stats| {
-        info!(
-            "stats count={} sum={} sumsq={}",
-            stats.count, stats.sum, stats.sumsq
-        );
+        info!("{}", stats_log_line(&name, &stats));
         let Some(printer) = printer.upgrade() else {
             return;
         };
@@ -290,6 +293,21 @@ pub fn register_stats(
             *slot.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(last);
         }
     })
+}
+
+/// The `stats` log line, with the MCU's name in front.
+///
+/// The prefix is what makes the line attributable: two MCUs on one host each
+/// report every five seconds and both reset their counters every window, so the
+/// interleaved lines cannot be told apart from the counters alone. The rest of
+/// the line is the firmware's own wording, `stats count=%u sum=%u sumsq=%u`
+/// (`third_party/klipper/src/basecmd.c`), which is what the log-mining script
+/// anchors on.
+fn stats_log_line(name: &str, stats: &Stats) -> String {
+    format!(
+        "[{name}] stats count={} sum={} sumsq={}",
+        stats.count, stats.sum, stats.sumsq
+    )
 }
 
 /// The two firmware constants a report's counters are converted with.
@@ -449,6 +467,21 @@ mod tests {
         let err = Stats::decode(&Params::new(Arc::clone(msg), values)).unwrap_err();
 
         assert!(matches!(err, McuError::Decode(_)), "{err:?}");
+    }
+
+    /// The line has to say which MCU it came from, and has to keep the
+    /// firmware's own wording so the log-mining script still anchors on it.
+    #[test]
+    fn test_the_stats_log_line_names_the_mcu() {
+        let stats = Stats {
+            count: 3,
+            sum: 40,
+            sumsq: 500,
+        };
+        assert_eq!(
+            stats_log_line("downstream", &stats),
+            "[downstream] stats count=3 sum=40 sumsq=500"
+        );
     }
 
     #[test]

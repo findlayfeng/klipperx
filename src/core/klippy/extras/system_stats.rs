@@ -117,6 +117,12 @@ impl PrinterObject for SystemStats {
             "sysload": sysload(),
             "cputime": cputime(),
             "memavail": memavail(),
+            // Our own addition (upstream's `system_stats` has no log counters):
+            // records dropped because the writer's queue was full. A card-sized
+            // board writing to eMMC/SD is exactly where this can become
+            // non-zero, and a silent drop is what would make a log look
+            // complete while it is not.
+            "dropped_logs": crate::logging::dropped_records(),
             "dispatch": self.dispatch_status(),
         })
     }
@@ -289,6 +295,14 @@ mod tests {
                 dispatch[key]
             );
         }
+
+        // Our own addition: the log writer's drop counter. Monotonic and a
+        // whole number - a board writing to eMMC/SD is where it moves.
+        assert!(
+            status["dropped_logs"].is_u64(),
+            "dropped_logs must be a counter, was {}",
+            status["dropped_logs"]
+        );
     }
 
     #[test]

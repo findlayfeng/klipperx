@@ -394,7 +394,7 @@ impl LogSink {
 /// wait — the reactor loop and the MCU's receive task are not the place to spend
 /// a card's write latency. It blocks on the queue when there is nothing to write,
 /// which costs nothing.
-fn writer(mut commands: Receiver<Command>, mut file: Option<LogFile>, finished: Sender<()>) {
+fn writer(commands: Receiver<Command>, mut file: Option<LogFile>, finished: Sender<()>) {
     while let Ok(command) = commands.recv() {
         if let Command::Shutdown = command {
             // A shutdown is not a discarding stop: what is already queued is
@@ -970,6 +970,9 @@ mod tests {
             writer.write_all(b"hello\n").unwrap();
             writer.flush().unwrap();
         }
+        // `write_all` only queues the bytes; wait for the writer thread to have
+        // put them in the file before reading it back.
+        output.sink.sync();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
         let _ = std::fs::remove_file(&path);
@@ -977,10 +980,18 @@ mod tests {
 
     #[test]
     fn test_a_log_file_that_cannot_be_opened_degrades_to_stdout() {
-        // A bad `--logfile` must not stop the host: the writer exists and just
-        // has no file behind it.
-        let output = LogOutput::new(Some(Path::new("/nonexistent/dir/klippy.log")));
-        assert!(output.file.is_none());
+        // A bad `--logfile` must not stop the host: the sink still takes a
+        // record, and nothing is created at the path that could not be opened.
+        let dir = std::env::temp_dir().join(format!("klipperx-log-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("klippy.log");
+
+        let output = LogOutput::new(Some(&path));
+        // Not to stdout: what this test watches is what the sink does with it.
+        output.sink.submit(b"no file behind it\n", false);
+        output.sink.sync();
+
+        assert!(!path.exists(), "a log file appeared at {}", path.display());
     }
 
     #[test]
@@ -1106,6 +1117,9 @@ mod tests {
             .write_all(text.as_bytes())
             .expect("the record writes");
         writer.flush().expect("the record flushes");
+        // The bytes are queued, not written: wait for the writer thread so that
+        // the caller's next look at the file sees this record.
+        output.sink.sync();
     }
 
     /// The day boundary is what rotates the log: the first record after local
@@ -1239,8 +1253,9 @@ mod tests {
             let now = Arc::clone(&now);
             Arc::new(move || now.load(Ordering::SeqCst))
         };
+        // No `--logfile`: there is no file behind the sink, so a day boundary has
+        // nothing to rotate and nothing is written anywhere.
         let output = LogOutput::with_clock(None, clock);
-        assert!(output.file.is_none());
 
         append(&output, "no file\n");
         now.store(local(2026, 6, 11, 0, 0, 1), Ordering::SeqCst);

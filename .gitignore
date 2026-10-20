@@ -18,6 +18,10 @@
 # contents of Mainsail's dist/ are put here for a release build, not committed.
 /assets/mainsail/
 
+# 板级刷写配置（本地按板命名，`make FIRMWARE_CONFIG=` 指给它，不入库）。
+/*.config
+/*.config.old
+
 # Local scratch: logs and run artifacts (never committed).
 /.staging/
 

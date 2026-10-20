@@ -496,7 +496,7 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
   `SharedSerialPort`。
 - **写锁**：`send` 与握手请求共用一把写锁，保证「头 + 帧」整段不被交错。
 - **引用计数关闭**：`shutdown` 只停**本句柄**（其它 MCU 还在用）；**`shutdown` 与句柄析构都注销自己的槽**（守卫式 `unregister`：只有表里那个槽就是本句柄的才移除）（同 id 重 attach 不会看到陈旧积压）；最后一个持有者析构时才
-  置停、唤醒所有槽位、关 fd、join reader 线程（若这次析构正跑在 reader 线程上，则跳过自 join、由 reader 下一轮 `weak.upgrade()` 拿到 `None` 后自然退出）。
+  置停、唤醒所有槽位、关 fd、join reader 线程（若这次析构正跑在 reader 线程上，则跳过自 join、由 reader 下一轮 `weak.upgrade()` 拿到 `None` 后自然退出）。**唤醒一律在该槽的 `incoming` 锁内 `notify`**（`stop` 与句柄 `shutdown` 同形）：`receive` 是在同一把锁里先查停标志再 `cv.wait` 的，拿锁再叫才不会把唤唤醒发给还没停稳的读者（丢一次就是永久 park——能叫醒它的 reader 正跟着端口一起走）。
 - **baud**：同一路径多颗 MCU 的显式 `baud` 若不一致，装载期 `warn` 并**取最小值**（未写
   `baud` 的节跟着走）；不一致不再是配置错。
 - **复位语义**：`restart_method` 的线级复位（`arduino` 的 DTR 翻转、`cheetah`、`rpi_usb`

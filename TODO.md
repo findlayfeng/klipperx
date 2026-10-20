@@ -716,6 +716,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       [--interface can0] [--timeout 2]`（广播 `0x3f0/[0x00]`，收 `0x3f1` 的 `RESP_NEED_NODEID`，
       输出可粘进配置的 uuid）——**都不写回配置文件**（与上游 pinned 版一致）。
       **未做**：`canbus_stats.py`（总线错误计数/状态上报）；真总线上的行为未验证（见 testing.md）。
+- [ ] **CAN 的 `SET_NODEID` 没有身份校验（2026-10-20 评审发现，未修）**：上游发完 `SET_NODEID` 就调
+      `get_canbus_id` 把被测板的 uuid 读回来比对（`serialhdl.py:158-167`，不等就 `disconnect()` 重来，
+      90 s 预算）；`get_canbus_id` 是**字典消息**，而字典由 `identify` 交付，所以 open 阶段（那时只有
+      `0x3f0` 的 admin 帧、没有 msgid）拿不到应答语义。本仓现在只做**有界重发**兜丢帧：
+      `NODEID_ASSIGN_ATTEMPTS = 3`、`NODEID_ASSIGN_INTERVAL = 200 ms`（合计 ≤1 s），发完即开链路，
+      身份是否吻合留给 identify（`interface/devices/canserial.rs` 的 `open_with_wire` 自述）。
+      **后续项**：在 identify 拿到字典之后补一次 `get_canbus_id` 比对 + 不匹配则重连（上游同一判据），
+      届时「发出去的 `SET_NODEID` 到底落在哪块板」才有主机侧证据。
 - 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
   离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
 

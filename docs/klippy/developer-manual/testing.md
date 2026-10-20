@@ -190,7 +190,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 
 ### 闸门墙钟：128 s → 57 s，以及天花板在哪
 
-同机实测的全量 `cargo test -p klipperx --lib`（2026-10-19）：
+同机实测的全量 `cargo test -p klipperx --lib`（2026-10-19；末行 ⑩ 是 2026-10-20 的重核）：
 
 | 阶段 | 改动 | 墙钟 | 通过数 |
 |---|---|---|---|
@@ -202,6 +202,7 @@ helper），改成 `.await` 会把整条调用链染成 async。这类点一律�
 | ④ 传感器时钟域统一 | ADC 样本时间改 print time（含 32 位绕圈修复）+ 加热器 5 s 主线程护栏与 7 s 陈旧压制（+20 测）
 | ⑤ 加热 PWM 按上游排期 | `Sensor::get_report_time_delta` + `Heater::pwm_delay`，修掉真机 `[heater_generic]` 的 `Timer too close`（+4 测：排期时钟、迟到读数按 now 起算、告警限速、PWM 更新棘轮） | **57.4 s** | 3521 |
 | ⑨ 出真机前一批（6 lane） | exclude_object 变换链、探针触发时刻位置、bed_mesh profile 命令族、homing_override 接 G28、时钟映射频率、flash 锁改私有副本（+25 测；墙钟从 57.8 → 47.9 s，主要是最后一项） | **47.9 s** | 3557 |
+| ⑩ 出真机前的设备修复批（11 lane + 1 直提交，2026-10-20） | trsync 关闭语义（读 `can_trigger` + 广播触发）、`queue_pwm_out`/软 PWM 的 `queue_digital_out` 走 move-class、mux `stop` 的丢唤醒与停句柄的槽注销、有界 flush（写失败不再折叠成成功、重传不丢块、死登记不吃回话）、CAN 写 `SO_SNDTIMEO` 与 `SET_NODEID` 有界重发、i2c/spi/stepper/trigger_analog 的同步响应按 oid 过滤、串口写 `WRITE_STALL_BOUND`、刷写只复位目标端口的写截止与响应按 code 先分派、重连等待尊重退出请求（+23 个 `fn test_`） | **46.7 s** | 3581 |
 | ⑧ 串口重新枚举下的身份 | `same_file`（路径 `(dev,ino)` 对比）+ `attach` 重开 4×250 ms：板子复位重新枚举后同进程重连成功（此前 EIO 直接失败，+1 测） | **57.8 s** | 3527 |
 | ⑦ 真机 lane 支持 mux/桥 | `apply_id_addressed_transport`：`hardware_test`/`stress` 与装载期用同一分类（`serial_ports` + `NODEID_FIRST`），mux 固件板不再 identify 超时（+2 测 / 真机 R1/R2/R5/R11 跑通） | **57.6 s** | 3526 |
 | ⑥ PWM 更新棘轮（对齐上游） | `min_pwm_change = max_power × 5%` + `next_pwm_time`（≈每 2.1 s 一个发送窗口）：事件从 3.3 条/秒降到 0.5 条/秒，批次迟到不再把旧样本年龄写上线（+3 测） | **57.6 s** | 3524 |

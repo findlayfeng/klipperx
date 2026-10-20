@@ -9,14 +9,17 @@
 //!     "endpoints": ["list_endpoints"]
 //!   }
 //! < {"id": null, "method": "klippy:status", "params": {...}}
-//! klippy> objects/query {"objects": {"toolhead": ["position"]}}
 //! Enter send · Tab complete · ↑↓ history · PgUp/PgDn log · ^G g-code · Esc×3 stop · /help · ^C quit
+//! klippy> objects/query {"objects": {"toolhead": ["position"]}}
+//! mcu  read 1.2 kB/s  write 820 B/s
 //! ```
 //!
 //! The header tracks the printer's state, the log holds everything that
-//! happened, the row above the input line is what the link is carrying, and the
-//! last line is the hint. Nothing is bordered: the window is usually a few dozen
-//! rows of printer output, and every column counts.
+//! happened, the hint sits directly above the input line, and what the link is
+//! carrying is the very last line: the row you read at a glance is next to
+//! where you type, and the row that changes on its own is out of the way.
+//! Nothing is bordered: the window is usually a few dozen rows of printer
+//! output, and every column counts.
 //!
 //! Everything the session does arrives as an [`Entry`] and is appended to the
 //! log pane; the window exists to make that log readable while the printer is
@@ -26,7 +29,7 @@
 //!
 //! # Traffic
 //!
-//! The row above the input line says what each MCU's link is carrying:
+//! The bottom line says what each MCU's link is carrying:
 //!
 //! ```text
 //! mcu  read 1.2 kB/s  write 820 B/s  ·  mcu z  read 12 B/s  write 40 B/s  retx 3
@@ -1421,20 +1424,23 @@ fn draw(frame: &mut Frame, app: &App) {
     header.truncate(area.height.saturating_sub(fixed_below).max(1) as usize);
     let header_height = header.len() as u16;
 
-    let [header_area, log, traffic, input, footer] = Layout::vertical([
+    // The hint sits above the input and the traffic row is the very last line:
+    // the row you read at a glance (keys) is next to where you type, and the row
+    // that changes on its own (rates) is out of the way at the bottom.
+    let [header_area, log, hint, input, traffic] = Layout::vertical([
         Constraint::Length(header_height),
         Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Length(traffic_height),
-        Constraint::Length(1),
-        Constraint::Length(1),
     ])
     .areas(area);
 
     frame.render_widget(Paragraph::new(Text::from(header)), header_area);
     draw_log(frame, app, log);
-    draw_traffic(frame, app, traffic);
+    draw_footer(frame, app, hint);
     draw_input(frame, app, input);
-    draw_footer(frame, app, footer);
+    draw_traffic(frame, app, traffic);
     // Last, because it is an overlay: the candidate layer is drawn over the log
     // rather than given rows of its own, and the fixed rows keep their sizes.
     draw_completions(frame, app, input, log);
@@ -1540,7 +1546,7 @@ fn draw_log(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// The traffic row: what each MCU's link is carrying, above the input line.
+/// The traffic row: what each MCU's link is carrying, the window's last line.
 ///
 /// It reads the state [`McuStats`] keeps, which the subscription's pushes move
 /// on their own — the row costs a `format` per frame and never touches the
@@ -1682,8 +1688,9 @@ fn draw_completions(frame: &mut Frame, app: &App, input: Rect, log: Rect) {
         .max()
         .unwrap_or(0);
     let width = (widest + 2).min(input.width as usize);
-    // The bottom of the log: whatever sits between it and the input line (the
-    // traffic row) is not the layer's to cover.
+    // The bottom of the log: the hint row sits between it and the input line,
+    // and that row is not the layer's to cover — neither is the traffic row
+    // below the input. The layer therefore stops at the log's bottom edge.
     let bottom = log.y + log.height;
     if width == 0 || bottom < log.y.saturating_add(rows as u16) {
         return;
@@ -2952,6 +2959,13 @@ mod tests {
         app
     }
 
+    /// The hint row of a window with no MCU row: the hint sits directly above
+    /// the input line, and with nothing to report the input line is the last
+    /// row, so the hint is the one before it.
+    fn hint_row(rows: &[String]) -> &str {
+        &rows[rows.len() - 2]
+    }
+
     // -----------------------------------------------------------------------
     // Input
     // -----------------------------------------------------------------------
@@ -3265,19 +3279,19 @@ mod tests {
 
     #[test]
     fn test_the_hint_line_names_the_keys() {
-        // Rendered wider than the footer's own budget, so the width check below
+        // Rendered wider than the hint's own budget, so the width check below
         // measures the string instead of the terminal: `render` only collects
         // the cells the terminal has, which would cap every line at the width it
-        // was handed and make the check true whatever the footer says.
+        // was handed and make the check true whatever the hint says.
         let rows = render(&app_with(Vec::new()), 120, 6);
-        let footer = rows.last().unwrap();
-        assert!(footer.contains("Enter send"), "{footer}");
-        assert!(footer.contains("^C quit"), "{footer}");
+        let hint = hint_row(&rows);
+        assert!(hint.contains("Enter send"), "{hint}");
+        assert!(hint.contains("^C quit"), "{hint}");
         // The log's `Home/End` gave up their place here to `Tab complete`; the
-        // footer is one line and is kept inside 100 columns.
-        assert!(footer.contains("PgUp/PgDn"), "{footer}");
-        assert!(footer.contains("Tab complete"), "{footer}");
-        assert!(footer.chars().count() <= 100, "{footer}");
+        // hint is one line and is kept inside 100 columns.
+        assert!(hint.contains("PgUp/PgDn"), "{hint}");
+        assert!(hint.contains("Tab complete"), "{hint}");
+        assert!(hint.chars().count() <= 100, "{hint}");
     }
 
     #[test]
@@ -3286,13 +3300,13 @@ mod tests {
         assert!(app.mouse, "the window holds the mouse to begin with");
 
         // A captured mouse is the window's, so the terminal never sees a drag
-        // and cannot select. `/mouse` (and `^S`) hands it over; the footer is
+        // and cannot select. `/mouse` (and `^S`) hands it over; the hint is
         // where that is said, since a log line would land under the frozen pane.
         assert!(app.window_command("/mouse"));
         assert!(!app.mouse);
 
         let rows = render(&app, 60, 5);
-        assert!(rows.last().unwrap().contains("mouse released"), "{rows:?}");
+        assert!(hint_row(&rows).contains("mouse released"), "{rows:?}");
 
         // Asking again changes nothing: the mouse is already the terminal's.
         assert!(app.window_command("/mouse"));
@@ -3302,7 +3316,7 @@ mod tests {
         app.capture_mouse();
         assert!(app.mouse);
         let rows = render(&app, 60, 5);
-        assert!(!rows.last().unwrap().contains("mouse released"), "{rows:?}");
+        assert!(!hint_row(&rows).contains("mouse released"), "{rows:?}");
     }
 
     #[test]
@@ -3360,8 +3374,9 @@ mod tests {
             .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
             .collect();
         let mut app = app_with(entries);
-        // Five rows: header, two rows of log, input, hint. Eight one-line
-        // entries in a two-row pane: at the bottom we see lines 7 and 8.
+        // Five rows: header, two rows of log, the hint, the input line. Eight
+        // one-line entries in a two-row pane: at the bottom we see lines 7 and
+        // 8.
         assert_eq!(app.scroll, 0, "a fresh log follows the newest line");
         let rows = render(&app, 40, 5);
         assert!(rows[1].contains("line 7"), "{rows:?}");
@@ -3374,7 +3389,7 @@ mod tests {
         assert!(rows[1].contains("line 1"), "{rows:?}");
         assert!(rows[2].contains("line 2"), "{rows:?}");
         assert!(
-            rows.last().unwrap().contains("viewing older entries"),
+            hint_row(&rows).contains("viewing older entries"),
             "{rows:?}"
         );
 
@@ -3739,23 +3754,23 @@ mod tests {
 
         // At the bottom the hint is about typing, not about scrolling.
         let rows = render(&app, 60, 5);
-        assert!(rows.last().unwrap().contains("↑↓ history"), "{rows:?}");
+        assert!(hint_row(&rows).contains("↑↓ history"), "{rows:?}");
 
         // One line is worth saying: the thumb barely moves on a short track,
         // but the hint has the room to count.
         app.scroll = 1;
         let rows = render(&app, 60, 5);
-        assert!(rows.last().unwrap().contains("1 line back"), "{rows:?}");
+        assert!(hint_row(&rows).contains("1 line back"), "{rows:?}");
 
         app.scroll = 3;
         let rows = render(&app, 60, 5);
-        assert!(rows.last().unwrap().contains("3 lines back"), "{rows:?}");
+        assert!(hint_row(&rows).contains("3 lines back"), "{rows:?}");
 
         // Past the top the offset is the furthest back there is — eight lines
         // in a two-row pane — not `usize::MAX`.
         app.scroll = usize::MAX;
         let rows = render(&app, 60, 5);
-        assert!(rows.last().unwrap().contains("6 lines back"), "{rows:?}");
+        assert!(hint_row(&rows).contains("6 lines back"), "{rows:?}");
     }
 
     #[test]
@@ -3764,8 +3779,13 @@ mod tests {
         for character in "list_endpoints".chars() {
             app.input.edit(KeyCode::Char(character), false);
         }
+        // Nothing reports on an MCU here, so the traffic row takes no line and
+        // the input line is the window's last row.
         let rows = render(&app, 40, 5);
-        assert!(rows[3].starts_with("klippy> list_endpoints"), "{rows:?}");
+        assert!(
+            rows.last().unwrap().starts_with("klippy> list_endpoints"),
+            "{rows:?}"
+        );
 
         // A local command is marked as one before it is sent.
         app.input.edit(KeyCode::Char('u'), true);
@@ -3773,7 +3793,7 @@ mod tests {
             app.input.edit(KeyCode::Char(character), false);
         }
         let rows = render(&app, 40, 5);
-        assert!(rows[3].starts_with("local> /help"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("local> /help"), "{rows:?}");
     }
 
     #[test]
@@ -3785,13 +3805,13 @@ mod tests {
         }
 
         let rows = render(&app, 60, 5);
-        assert!(rows[3].starts_with("gcode> "), "{rows:?}");
-        assert!(rows.last().unwrap().contains("g-code mode"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("gcode> "), "{rows:?}");
+        assert!(hint_row(&rows).contains("g-code mode"), "{rows:?}");
 
         // Back to request mode.
         app.toggle_gcode();
         let rows = render(&app, 60, 5);
-        assert!(rows[3].starts_with("klippy> "), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("klippy> "), "{rows:?}");
 
         // A local command keeps its own prompt even in g-code mode.
         app.toggle_gcode();
@@ -3800,7 +3820,7 @@ mod tests {
             app.input.edit(KeyCode::Char(character), false);
         }
         let rows = render(&app, 60, 5);
-        assert!(rows[3].starts_with("local> /help"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("local> /help"), "{rows:?}");
     }
 
     #[test]
@@ -4373,7 +4393,7 @@ mod tests {
     }
 
     /// The gutter rows that belong to the log pane: everything between the
-    /// header row and the two rows the input line and the footer take.
+    /// header row and the two rows the hint and the input line take.
     fn log_gutter(app: &App, width: u16, height: u16) -> Vec<String> {
         scrollbar_column(app, width, height)[1..(height as usize - 2)].to_vec()
     }
@@ -5742,14 +5762,28 @@ mod tests {
         app.completion_key(KeyCode::Tab);
         app.completion_key(KeyCode::Tab); // pick `M104`, so the bar is somewhere
 
-        // Header row 0, the log to row 5, the input line at 6 and the footer at
-        // 7: the layer hangs off the input line and covers the log's last rows.
+        // Header row 0, the log to row 5, the hint at 6 and the input line at
+        // 7: the layer hangs off the log's bottom edge, covers its last rows and
+        // stops where the hint row begins.
         let rows = render(&app, 40, 8);
         assert!(rows[3].contains("M104"), "{rows:?}");
         assert!(rows[4].contains("M115"), "{rows:?}");
         assert!(rows[5].contains("M140"), "{rows:?}");
-        assert!(rows[6].starts_with("gcode> M104"), "{rows:?}");
+        assert!(
+            rows[6].contains("Enter send"),
+            "the hint keeps its row: {rows:?}"
+        );
+        assert!(rows[7].starts_with("gcode> M104"), "{rows:?}");
         assert!(!rows[0].contains("M1"), "the header is above it: {rows:?}");
+
+        // With an MCU reporting, the bottom line is the traffic row: the layer
+        // still stops at the log's bottom edge, so it cannot reach it.
+        app.write(mcu_push("mcu", stats_report(0.0, 0, 0)));
+        let rows = render(&app, 40, 9);
+        assert!(rows[5].contains("M140"), "{rows:?}");
+        assert!(rows[6].contains("Enter send"), "{rows:?}");
+        assert!(rows[7].starts_with("gcode> M104"), "{rows:?}");
+        assert!(rows[8].starts_with("mcu  read"), "{rows:?}");
     }
 
     #[test]
@@ -5758,7 +5792,7 @@ mod tests {
         type_line(&mut app, "m1");
         app.completion_key(KeyCode::Tab);
 
-        // Five rows: the header, two of log, the input line and the footer. The
+        // Five rows: the header, two of log, the hint and the input line. The
         // layer would cover the whole log, so it is not drawn — and the
         // candidates are still there, because the picture is not the feature.
         let rows = render(&app, 40, 5);
@@ -5831,7 +5865,7 @@ mod tests {
         assert_eq!(app.input.text(), "M109", "the last of the ten");
 
         // Six rows for ten candidates: the list has to have moved for the pick
-        // to be in it.
+        // to be in it, and the typed line is the last row below it.
         let rows = render(&app, 40, 9);
         let text = rows.join("\n");
         assert!(text.contains("M109"), "{text}");
@@ -5839,7 +5873,7 @@ mod tests {
             !text.contains("M100"),
             "the front has scrolled away: {text}"
         );
-        assert!(rows[7].starts_with("gcode> M109"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("gcode> M109"), "{rows:?}");
     }
 
     // -----------------------------------------------------------------------
@@ -5978,18 +6012,19 @@ mod tests {
     }
 
     #[test]
-    fn test_the_traffic_row_sits_above_the_input_line() {
+    fn test_the_traffic_row_is_the_bottom_line() {
         let mut app = app_with(Vec::new());
         app.write(mcu_push("mcu", stats_report(0.0, 0, 0)));
         app.write(mcu_push("mcu", stats_report(5.0, 5_000, 0)));
 
-        // Header, log, traffic, input, hint — the traffic row is the third
-        // from the bottom, and the log keeps the rows above it.
+        // Header, log, hint, input, traffic — the row that changes on its own
+        // is the window's last line, below the line the reader types on, and the
+        // log keeps the rows above it.
         let rows = render(&app, 60, 8);
         assert!(rows[0].contains("ready"), "{rows:?}");
-        assert!(rows[5].starts_with("mcu  read 1.0 kB/s"), "{rows:?}");
+        assert!(rows[5].contains("Enter send"), "{rows:?}");
         assert!(rows[6].starts_with("klippy>"), "{rows:?}");
-        assert!(rows[7].contains("Enter send"), "{rows:?}");
+        assert!(rows[7].starts_with("mcu  read 1.0 kB/s"), "{rows:?}");
     }
 
     #[test]
@@ -6021,11 +6056,26 @@ mod tests {
 
     #[test]
     fn test_a_printer_with_no_mcu_row_keeps_the_log_its_extra_line() {
-        // Nothing has named an MCU, so there is no row to draw and the log
-        // takes the line: an empty row would cost a line and say nothing.
-        let rows = render(&app_with(Vec::new()), 60, 8);
+        // Nothing has named an MCU, so there is no row to draw at the bottom and
+        // the log takes the line: an empty row would cost a line and say nothing
+        // of its own.
+        let entries: Vec<Entry> = (1..=8)
+            .map(|n| Entry::notice(Notice::Info, format!("line {n}")))
+            .collect();
+        let mut app = app_with(entries);
+        let rows = render(&app, 60, 8);
         assert!(!rows.join("\n").contains("read "), "{rows:?}");
-        assert!(rows[6].starts_with("klippy>"), "{rows:?}");
+        assert!(rows[1].contains("line 4"), "five log rows: {rows:?}");
+        assert!(rows[5].contains("line 8"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("klippy>"), "{rows:?}");
+
+        // The line is the log's, not merely left blank: once an MCU is named the
+        // traffic row takes it and the log gives up its top line.
+        app.write(mcu_push("mcu", stats_report(0.0, 0, 0)));
+        let rows = render(&app, 60, 8);
+        assert!(rows[1].contains("line 5"), "four log rows: {rows:?}");
+        assert!(rows[4].contains("line 8"), "{rows:?}");
+        assert!(rows.last().unwrap().starts_with("mcu  read"), "{rows:?}");
     }
 
     #[test]

@@ -211,6 +211,17 @@ canbus_nodeid: 4        # stress 需要它；正式 printer.cfg 里可以省，�
 
 TODO 里记着这些剩余项（**S1**；2026-10-06 后仅剩 `--task motion` 的假板 e2e 与真板双机验证）。
 
+## 收尾：饱和之后板子不会自愈
+
+`link gave out at <rate> req/s` 是**预期**的饱和终局（backlog 单调上升直到丢答），不是缺陷。但它之后：
+
+- 桥/板子可能停在僵态，`identify` 不再应答、日志出现 `Retransmit failed … Input/output error`；
+- **不要假设它活着**，也不必断电：先 `klipperx admin reset --bridge <tty> [--bridge-uuid <hex>]`
+  （不带 `--bootloader`）把它重启，再 `admin bridge config` 确认回来了。只有连 admin 单元都送不进去才需要真拔电。
+- `--task step` 会**真的驱动电机**：目标板要有 `[stepper_*]`/`[manual_stepper]` 段、电机接着、行程够。
+  空载（无电机）量不出有意义的上限，别把「没接电机」跑出来的数字当结论。
+- 宿主直连 CAN 的板子才需要 `txqueuelen 128`；经桥的 CAN 端口是桥内部的 CAN，不受这条约束。
+
 ---
 
 - [← 开发手册首页](README.md)

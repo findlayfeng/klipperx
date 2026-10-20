@@ -32,7 +32,7 @@ use crate::core::klippy::cmd::McuResponse;
 use crate::core::klippy::mcu::{query_slot, ConfigBuilder, Mcu, McuError};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{Adc, AdcCallback, PinError, PinParams, PrinterPins};
-use tracing::warn;
+use tracing::{error, warn};
 
 /// The format string of the older one-sample query (no `bytes_per_report`).
 ///
@@ -125,8 +125,15 @@ struct AdcState {
     last_value: Mutex<Option<(f64, f64)>>,
     /// Whether an undatable report has already been warned about.
     undated_reported: Mutex<bool>,
-    /// The consumer's callback.
-    callback: Mutex<Option<AdcCallback>>,
+    /// Why the post-init query was not armed, if it failed.
+    ///
+    /// Arming runs after the firmware accepted the configuration, where nothing
+    /// can fail the connect any more; without this record a dead input would
+    /// look exactly like one whose reports never arrive. The message is
+    /// escalated the first time a consumer touches the input.
+    arm_error: Mutex<Option<String>>,
+    /// The consumer's callback, shared so it can be cloned out before it runs.
+    callback: Mutex<Option<Arc<AdcCallback>>>,
 }
 
 /// One analog input on an MCU.
@@ -165,6 +172,7 @@ impl McuAdc {
             old_format: Mutex::new(true),
             last_value: Mutex::new(None),
             undated_reported: Mutex::new(false),
+            arm_error: Mutex::new(None),
             callback: Mutex::new(None),
         });
 
@@ -214,10 +222,14 @@ impl Adc for McuAdc {
     }
 
     fn setup_adc_callback(&self, callback: AdcCallback) {
-        *self.state.lock(|state| &state.callback) = Some(callback);
+        // A consumer attaching to an input that never armed is the first moment
+        // the dead sensor is attributable to somebody: escalate there.
+        self.state.report_arm_failure();
+        *self.state.lock(|state| &state.callback) = Some(Arc::new(callback));
     }
 
     fn get_last_value(&self) -> Option<(f64, f64)> {
+        self.state.report_arm_failure();
         *self.state.lock(|state| &state.last_value)
     }
 }
@@ -263,27 +275,33 @@ impl AdcState {
             return;
         };
         let old_format = *self.lock(|state| &state.old_format);
+        // `next_clock` is when the **next** report is due, so every sample of
+        // this one is dated backwards from it: the last sample of a batch sits
+        // one report period before `next_clock`, the first one `count` periods
+        // before (`klippy/mcu.py:635,644`).
+        let report_clock = i64::from(*self.lock(|state| &state.report_clock));
 
         let samples: Vec<(f64, f64)> = if old_format {
             let raw = match values.get(2) {
                 Some(ArgValue::UInt16(value)) => *value,
                 _ => return,
             };
-            vec![(mapping.print_time(next_clock), self.scale(raw))]
+            vec![(
+                mapping.print_time(next_clock - report_clock),
+                self.scale(raw),
+            )]
         } else {
             let bytes = match values.get(2) {
                 Some(ArgValue::Bytes(bytes)) => bytes,
                 _ => return,
             };
-            let report_clock = i64::from(*self.lock(|state| &state.report_clock));
             let count = bytes.len() / 2;
             let mut samples = Vec::with_capacity(count);
             for (index, pair) in bytes.chunks_exact(2).enumerate() {
                 let raw = u16::from_le_bytes([pair[0], pair[1]]);
-                // The last sample is the report; earlier ones are one report
-                // period apart. The back-off happens in the 64-bit domain, so
-                // the wrap cannot fold into a huge unsigned difference.
-                let clock = next_clock - (count - 1 - index) as i64 * report_clock;
+                // The back-off happens in the 64-bit domain, so a report that
+                // straddles the wrap cannot fold into a huge difference.
+                let clock = next_clock - (count - index) as i64 * report_clock;
                 samples.push((mapping.print_time(clock), self.scale(raw)));
             }
             samples
@@ -292,9 +310,29 @@ impl AdcState {
         if let Some(last) = samples.last() {
             *self.lock(|state| &state.last_value) = Some(*last);
         }
-        let callback = self.lock(|state| &state.callback);
-        if let Some(callback) = callback.as_ref() {
-            callback(&samples);
+        // Cloned out, then the lock is gone before the consumer runs: a std
+        // mutex is not reentrant, and a consumer that reads this input back
+        // from its callback (`get_last_value`) would deadlock on it.
+        let callback = self.lock(|state| &state.callback).clone();
+        if let Some(callback) = callback {
+            (*callback)(&samples);
+        }
+    }
+
+    /// Record that the post-init query could not be armed.
+    fn note_arm_failure(&self, failure: String) {
+        *self.lock(|state| &state.arm_error) = Some(failure);
+    }
+
+    /// Escalate a recorded arming failure to an error, once.
+    ///
+    /// Taken rather than read: a consumer polling [`Adc::get_last_value`] gets
+    /// `None` on every read, and repeating the reason each time would bury it.
+    fn report_arm_failure(&self) {
+        let failure = self.lock(|state| &state.arm_error).take();
+        if let Some(failure) = failure {
+            let oid = *self.lock(|state| &state.oid);
+            error!("ADC input oid={oid:?}: {failure}; it will not report samples");
         }
     }
 
@@ -390,7 +428,9 @@ impl AdcState {
         let state = Arc::clone(self);
         builder.register_post_init_callback(Box::new(move |mcu| {
             if let Err(err) = state.arm_query(mcu, oid) {
-                warn!("MCU '{}': could not arm the ADC query: {err}", mcu.name());
+                let failure = format!("MCU '{}': could not arm the ADC query: {err}", mcu.name());
+                warn!("{failure}");
+                state.note_arm_failure(failure);
                 return;
             }
             if let Err(err) = registry.register(mcu, oid, Arc::clone(&state)) {
@@ -416,8 +456,10 @@ impl AdcState {
     fn query_for(&self, oid: u8, clock: u32) -> Result<AdcQuery, McuError> {
         let sample_count = u8::try_from(*self.lock(|state| &state.sample_count))
             .map_err(|_| McuError::Config("ADC sample_count does not fit a byte".to_string()))?;
-        let range_check_count =
-            u8::try_from(*self.lock(|state| &state.range_check_count)).unwrap_or(u8::MAX);
+        let range_check_count = u8::try_from(*self.lock(|state| &state.range_check_count))
+            .map_err(|_| {
+                McuError::Config("ADC range_check_count does not fit a byte".to_string())
+            })?;
         let sample_ticks = *self.lock(|state| &state.sample_ticks);
         let rest_ticks = *self.lock(|state| &state.report_clock);
         let min_value = *self.lock(|state| &state.min_sample);
@@ -472,6 +514,63 @@ mod tests {
     use crate::core::klippy::msg::proto::Payload;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
+    use std::io::Write;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Run `body`, returning what it returned and the **error** lines it logged.
+    ///
+    /// A dead input has to be attributable in the log, and only an assertion on
+    /// the captured output can tell an `error!` from the `warn!` it replaced.
+    fn capturing_errors<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::ERROR)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let value = tracing::subscriber::with_default(subscriber, body);
+        (value, capture.text())
+    }
+
+    /// A byte sink for the fmt layer above; `with_default` keeps the capture off
+    /// the process-wide subscriber, so tests stay independent of each other.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// A dictionary whose query/response pair matches `batched`.
     fn dictionary(batched: bool) -> Dictionary {
@@ -610,6 +709,24 @@ mod tests {
         assert_eq!(query.args()[5], ArgValue::UInt8(2));
     }
 
+    #[test]
+    fn test_a_range_check_count_that_does_not_fit_a_byte_is_rejected() {
+        let state = armed_state(false, 4);
+        // The wire field is `%c`. Clamping to 255 would arm a different check
+        // than the one asked for, silently; upstream's format packing refuses.
+        *state.lock(|s| &s.range_check_count) = 256;
+
+        let Err(err) = state.query_for(0, 123) else {
+            panic!("a range_check_count of 256 was clamped into the query");
+        };
+
+        assert!(
+            err.to_string()
+                .contains("range_check_count does not fit a byte"),
+            "{err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_sample_count_zero_builds_nothing() {
         let (chip, pins) = chip();
@@ -722,26 +839,29 @@ mod tests {
             old_format: Mutex::new(old_format),
             last_value: Mutex::new(None),
             undated_reported: Mutex::new(false),
+            arm_error: Mutex::new(None),
             callback: Mutex::new(None),
         })
     }
 
     #[tokio::test]
-    async fn test_the_old_report_scales_the_single_value() {
+    async fn test_the_old_report_dates_the_sample_one_report_back() {
         let (chip, clock) = dated_clock(0);
+        // `next_clock` is when the next report is due, so the sample in this one
+        // is a report period older (`klippy/mcu.py:635`).
         let expected_time = chip.clock_to_print_time(5_000).unwrap();
         let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         state.handle(&[
             ArgValue::UInt8(0),
-            ArgValue::UInt32(5_000),
+            ArgValue::UInt32(2_005_000),
             ArgValue::UInt16(4095),
         ]);
 
@@ -757,16 +877,18 @@ mod tests {
         // Seeded just below the wrap, so both reports extend forwards from it:
         // the first stays at 0xffff_ff00, the second becomes 0x1_0000_0100.
         let (chip, clock) = dated_clock(0xffff_fe00);
-        let first = chip.clock_to_print_time(0xffff_ff00).unwrap();
-        let second = chip.clock_to_print_time(0x0001_0000_0100).unwrap();
+        let first = chip.clock_to_print_time(0xffff_ff00 - 2_000_000).unwrap();
+        let second = chip
+            .clock_to_print_time(0x0001_0000_0100 - 2_000_000)
+            .unwrap();
         let state = state(clock, true, 1.0 / 4095.0, 2_000_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         // The 32-bit report clock wraps between the two reports.
         state.handle(&[
@@ -782,29 +904,34 @@ mod tests {
 
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 2);
+        // Running past the wrap while the samples are dated.
         assert!(
             seen[1].0 > seen[0].0,
             "the second sample is dated before the first: {:?}",
             *seen
         );
-        // 0x200 ticks apart, both dates from the chip's own conversion.
+        // One report period back from each `next_clock`, from the chip's own
+        // conversion.
         assert_eq!([seen[0].0, seen[1].0], [first, second]);
     }
 
     #[tokio::test]
-    async fn test_the_batched_report_dates_each_sample() {
+    async fn test_the_batched_report_dates_each_sample_back_from_the_next_one() {
         let (chip, clock) = dated_clock(0);
-        let first = chip.clock_to_print_time(8_000).unwrap();
-        let last = chip.clock_to_print_time(9_000).unwrap();
+        // Two samples one report period (1000 ticks) apart, both dated back
+        // from the *next* report: 9_000 - 2 * 1000 and 9_000 - 1000.
+        let first = chip.clock_to_print_time(7_000).unwrap();
+        let last = chip.clock_to_print_time(8_000).unwrap();
         let state = state(clock, false, 1.0 / 4095.0, 1_000);
         let seen: Arc<Mutex<Vec<(f64, f64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
-        // Two samples, the report clock 1000 later: the first is one period back.
+            })));
+        // Two samples, the report clock 1000 apart: each is dated one period
+        // before the report that follows it.
         let bytes = vec![0xff, 0x0f, 0x00, 0x08]; // 4095, 2048
         state.handle(&[
             ArgValue::UInt8(0),
@@ -821,6 +948,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_a_consumer_is_called_with_the_callback_lock_released() {
+        let (_chip, clock) = dated_clock(0);
+        let state = state(clock, true, 1.0 / 4095.0, 1_000);
+        let probe = Arc::downgrade(&state);
+        let reentrant: Arc<Mutex<Option<bool>>> = Arc::new(Mutex::new(None));
+        let reentrant_for_callback = Arc::clone(&reentrant);
+        state
+            .lock(|state| &state.callback)
+            .replace(Arc::new(Box::new(move |_samples| {
+                let state = probe.upgrade().unwrap();
+                // A consumer may re-register itself from its own callback
+                // (`setup_adc_callback`), or touch any other field. A std mutex
+                // is not reentrant, so the callback lock has to be free here.
+                *reentrant_for_callback.lock().unwrap() = Some(state.callback.try_lock().is_ok());
+            })));
+
+        state.handle(&[
+            ArgValue::UInt8(0),
+            ArgValue::UInt32(2_000),
+            ArgValue::UInt16(4095),
+        ]);
+
+        assert_eq!(*reentrant.lock().unwrap(), Some(true));
+    }
+
     #[test]
     fn test_a_report_before_the_clock_mapping_is_dropped_whole() {
         let state = state(undated_clock(), false, 1.0 / 4095.0, 1_000);
@@ -828,9 +981,9 @@ mod tests {
         let seen_for_callback = Arc::clone(&seen);
         state
             .lock(|state| &state.callback)
-            .replace(Box::new(move |samples| {
+            .replace(Arc::new(Box::new(move |samples| {
                 seen_for_callback.lock().unwrap().extend_from_slice(samples);
-            }));
+            })));
 
         state.handle(&[
             ArgValue::UInt8(0),
@@ -846,5 +999,57 @@ mod tests {
             state.lock(|state| &state.last_value).as_ref().copied(),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // A query that never armed
+    // -----------------------------------------------------------------------
+
+    /// An input with a consumer-facing surface but no build behind it.
+    fn unbuilt_adc() -> McuAdc {
+        McuAdc::new(
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+            "mcu".to_string(),
+            Arc::new(AdcRegistry::new()),
+            PinParams {
+                chip_name: "mcu".to_string(),
+                pin: "PA1".to_string(),
+                invert: false,
+                pullup: 0,
+                share_type: None,
+            },
+            undated_clock(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_arming_is_escalated_once_a_consumer_touches_the_input() {
+        let adc = unbuilt_adc();
+        // The oid arming would have used: the escalation has to name the input.
+        *adc.state.lock(|state| &state.oid) = Some(0);
+        adc.state.note_arm_failure(
+            "MCU 'mcu': could not arm the ADC query: no clock estimate".to_string(),
+        );
+
+        // The consumer attaching is the first moment the dead input has an
+        // owner: the warning that was logged at arming time becomes an error.
+        let (_, log) = capturing_errors(|| adc.setup_adc_callback(Box::new(|_| {})));
+        assert!(
+            log.contains("could not arm the ADC query") && log.contains("oid=Some(0)"),
+            "the arming failure was not escalated: {log}"
+        );
+        assert!(log.contains("will not report samples"), "{log}");
+
+        // Once: a polling consumer must not get the same line on every read.
+        let (value, log) = capturing_errors(|| adc.get_last_value());
+        assert_eq!(value, None);
+        assert_eq!(log, "");
+
+        // The read path escalates too, when it is the first to touch the input.
+        adc.state
+            .note_arm_failure("MCU 'mcu': could not arm the ADC query".to_string());
+        let (_, log) = capturing_errors(|| adc.get_last_value());
+        assert!(log.contains("could not arm the ADC query"), "{log}");
     }
 }

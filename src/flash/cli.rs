@@ -1216,10 +1216,12 @@ fn run_bridge_flash(
             .map_err(|_| format!("the bridge did not identify within {IDENTIFY_TIMEOUT:?}"))??;
 
         // The plan the firmware numbers by arrival order: one entry per port up
-        // to and including the target. The target's own reset is the caller's
-        // choice; the ports before it are named the one way an unknown device
-        // is reset (a line pulse, which needs no admin channel), since the
-        // caller's plan describes the target's device and not theirs.
+        // to and including the target. Only the target's entry is reset — a
+        // session resets the target's port alone
+        // ([`super::bridge_session::reset_ports`]) — while the ports below it
+        // are here for the declaration, which is what makes the target's port
+        // exist at all. Their reset is unused, and a line pulse to a device the
+        // caller never named is exactly what this plan must not produce.
         let ports: Vec<BridgePort> = (0..=target.port)
             .map(|index| BridgePort {
                 baud: target.baud,
@@ -1500,16 +1502,21 @@ fn uuid_hex(uuid: [u8; 6]) -> String {
 /// [`reset_to_bootloader`](BridgeLink::reset_to_bootloader)
 /// `[REQUEST_BOOTLOADER][0xFF]`, and [`reset_port`](BridgeLink::reset_port) the
 /// port-level family), written straight to the admin channel. The dictionary
-/// identify delivers only names the **declaration** commands, so no reset needs
-/// it — while a bridge left in a previous session's state, which is exactly what
-/// a reset is for, may answer nothing to identify at all. The identify still
-/// runs where it belongs: after the bridge restarts itself, inside
-/// [`BridgeLink::reset`], as the confirmation that it came back.
+/// identify delivers only names the **declaration** commands, so no reset makes
+/// a round trip of it — while a bridge left in a previous session's state, which
+/// is exactly what a reset is for, may answer nothing to identify at all. The
+/// identify still runs where it belongs: after the bridge restarts itself, inside
+/// [`BridgeLink::reset`], as the confirmation that it came back. The one
+/// exception is `--port`'s own check, and it is bounded and best-effort
+/// ([`check_port_exists`]).
 ///
 /// The bridge's result line is the confirmation: its self-reset confirms itself
 /// by answering again ([`BridgeLink::reset`]'s bounded reopen + identify), while
-/// a port-level reset has no receipt and can only be reported as sent. The
-/// runtime is built here for the same reason [`run_bridge_flash`] builds one.
+/// a port-level reset has no receipt — and the bridge drops a port-level unit
+/// that names a port it does not have, in silence, so `--port` is checked
+/// against the bridge's own slot count before it is sent
+/// ([`check_port_exists`]). The runtime is built here for the same reason
+/// [`run_bridge_flash`] builds one.
 ///
 /// A direct CAN reset needs none of that: one admin frame on the bus is the
 /// whole of it, and it is sent by [`request_can_bootloader`] before any runtime
@@ -1543,6 +1550,7 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
                 report_reset_bridge_bootloader();
             }
             ResetTarget::Port { index, reset } => {
+                check_port_exists(&link, index).await?;
                 link.reset_port(index, reset, None)?;
                 report_reset_port(index, reset);
             }
@@ -1550,6 +1558,66 @@ pub fn run_reset(args: ResetArgs) -> Result<(), Box<dyn std::error::Error>> {
         link.close();
         Ok::<(), Box<dyn std::error::Error>>(())
     })
+}
+
+/// How long `admin reset --port` waits for the port count it checks its index
+/// against, before sending the unit anyway.
+///
+/// The count arrives with the dictionary identify installs, and a wedged bridge
+/// — the bridge this command is for — may answer nothing at all, so the check is
+/// bounded and its failure is not a refusal.
+const PORT_CHECK_IDENTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Refuse a `--port` index the bridge cannot have, before the unit goes out: the
+/// firmware drops a port-level command that names a port it does not have, in
+/// silence, so "sent with no receipt" would be a lie about a write nothing
+/// received.
+///
+/// The port table itself lives in the bridge's RAM and the host cannot read it
+/// back. What the firmware does publish is how many slots it numbers
+/// (`BRIDGE_UART_COUNT`, [`BridgeLink::uart_count`]), and a slot past that count
+/// cannot exist — the one refusal this side can make. The count comes from the
+/// dictionary identify installs, which this command otherwise never asks for
+/// (see [`run_reset`]), so the identify is **bounded and best-effort**: one
+/// short attempt, and a bridge that does not answer within
+/// [`PORT_CHECK_IDENTIFY_TIMEOUT`] is reset exactly as before. Only a bridge that
+/// does answer is held to its own count; a firmware that predates the constant
+/// publishes nothing to hold it to.
+///
+/// # Errors
+/// The refusal [`port_bounds_error`] spells: nothing is sent.
+async fn check_port_exists(link: &BridgeLink, index: u8) -> Result<(), Box<dyn std::error::Error>> {
+    let identified = tokio::time::timeout(
+        PORT_CHECK_IDENTIFY_TIMEOUT,
+        link.identify(PORT_CHECK_IDENTIFY_TIMEOUT),
+    )
+    .await;
+    let count = match identified {
+        Ok(Ok(())) => link.uart_count(),
+        Ok(Err(_)) | Err(_) => None,
+    };
+    match port_bounds_error(index, count) {
+        Some(message) => Err(message.into()),
+        None => Ok(()),
+    }
+}
+
+/// The message an index past the bridge's own slot count is refused with: the
+/// bridge has no such port, so the unit would be dropped rather than received.
+///
+/// `count` is what the bridge published ([`BridgeLink::uart_count`]); with
+/// nothing published there is nothing to check, and the index passes.
+fn port_bounds_error(index: u8, count: Option<u8>) -> Option<String> {
+    let count = count?;
+    if index < count {
+        return None;
+    }
+    Some(format!(
+        "--port {index} names a port the bridge does not have: its firmware numbers \
+         {count} port(s) (0..{last}), and it drops a port-level command that names a port \
+         it does not have, in silence. Nothing was sent.",
+        last = count.saturating_sub(1),
+    ))
 }
 
 /// Send a board on `interface` its bootloader request: one admin frame on the

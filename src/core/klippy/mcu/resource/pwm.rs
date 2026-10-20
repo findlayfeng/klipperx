@@ -663,6 +663,55 @@ mod tests {
         pwm.update_pwm(0.75).unwrap();
     }
 
+    /// Both duty handlers `move_alloc()` in the firmware (`pwmcmds.c:86`,
+    /// `gpiocmds.c:148`), so a queued change holds a slot in the move pool —
+    /// the plain send path would leave the pool empty.
+    #[tokio::test]
+    async fn test_a_queued_hardware_duty_enters_the_move_pool() {
+        let (chip, pins) = chip();
+        let pwm = pins.setup_pwm("PA1", None).unwrap();
+        pwm.setup_cycle_time(0.1, true);
+        pwm.setup_max_duration(0.0);
+        pwm.setup_start_value(0.0, 0.0);
+        let mcu = Arc::new(mcu_with_clock());
+        chip.config().build(mcu.as_ref()).unwrap();
+        chip.attach(Arc::clone(&mcu));
+
+        pwm.set_pwm(1_000_000, 0.75).unwrap();
+
+        let pending = mcu
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .pending
+            .len();
+        assert_eq!(pending, 1);
+    }
+
+    /// The software path's `queue_digital_out` is the same move-class command
+    /// a plain digital output sends (`resource/pin.rs`).
+    #[tokio::test]
+    async fn test_a_queued_software_duty_enters_the_move_pool() {
+        let (chip, pins) = chip();
+        let pwm = pins.setup_pwm("PB2", None).unwrap();
+        pwm.setup_cycle_time(0.1, false);
+        pwm.setup_max_duration(0.0);
+        pwm.setup_start_value(0.0, 0.0);
+        let mcu = Arc::new(mcu_with_clock());
+        chip.config().build(mcu.as_ref()).unwrap();
+        chip.attach(Arc::clone(&mcu));
+
+        pwm.set_pwm(1_000_000, 0.5).unwrap();
+
+        let pending = mcu
+            .move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .pending
+            .len();
+        assert_eq!(pending, 1);
+    }
+
     #[tokio::test]
     async fn test_update_pwm_before_connect_is_reported() {
         let (chip, pins) = chip();

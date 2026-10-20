@@ -570,11 +570,22 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
 /// [`InterfaceError::SendError`].
 pub(crate) fn write_whole(port: &File, bytes: &[u8]) -> std::io::Result<()> {
     let deadline = Instant::now() + WRITE_STALL_BOUND;
-    for byte in bytes {
+    let mut sent = 0;
+    while sent < bytes.len() {
         wait_for_room(port, deadline)?;
-        // One byte per report of room: see `wait_for_room` on why the report
-        // does not vouch for more than that.
-        (&*port).write_all(std::slice::from_ref(byte))?;
+        // **One write per report of room, not one byte per report.** A report
+        // that a byte can go is a report that the port is draining at all;
+        // writing the whole remainder then is what keeps a healthy CDC at one
+        // syscall per frame. Waiting per byte was the earlier shape and it
+        // wedged real katapult flashes: a CDC's room comes back one transfer
+        // at a time, so a 76-byte frame spent 76 polls and usually missed the
+        // deadline. A short write is normal here and just loops.
+        match (&*port).write(&bytes[sent..]) {
+            Ok(0) => continue,
+            Ok(n) => sent += n,
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
     Ok(())
 }

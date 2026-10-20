@@ -36,10 +36,14 @@ pub const NACK: u8 = 0xF1;
 pub const ACK_ERROR: u8 = 0xF2;
 pub const ACK_BUSY: u8 = 0xF3;
 
-/// Upper bound on a frame payload. Blocks are ≤ 512 B plus address words, so
-/// anything larger is garbage; refusing it lets the scanner slide past a bogus
-/// header instead of stalling while it waits for bytes that never come.
-const MAX_PAYLOAD: usize = 4096;
+/// Upper bound on a frame payload, checked against the word count a frame
+/// declares. The count is one byte, so a declared payload is at most 255 words
+/// = 1020 B — a 4096 B cap could never be reached and its check was dead. 256 B
+/// is above every frame katapult can build (its `MESSAGE_MAX` is 128 B, so 120 B
+/// of payload) with room to spare, and low enough that a bogus header claiming a
+/// huge payload slides past instead of holding the scanner for a frame that
+/// never comes.
+const MAX_PAYLOAD: usize = 256;
 
 /// CRC16-CCITT (init `0xFFFF`, reflected), the algorithm both `flashtool.py`
 /// and the katapult firmware use. Verified against an independent

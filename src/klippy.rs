@@ -11,6 +11,7 @@ use crate::core::klippy::api::{
 };
 use crate::core::klippy::config::build_config_string;
 use crate::core::klippy::config::Config;
+use crate::core::klippy::extras::system_stats;
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
 use crate::logging;
@@ -336,16 +337,19 @@ pub fn run(
     // The reactor is built over the machine runtime and handed to the printer
     // explicitly, so the machine never has to ask for the ambient runtime. The
     // dispatcher task is spawned here, on that handle, before the runtime is
-    // driven — it runs as soon as the driver thread starts.
-    let printer = Arc::new(Printer::new(Arc::new(TokioReactor::new(
-        machine_handle.clone(),
-    ))));
+    // driven — it runs as soon as the driver thread starts. Its round totals are
+    // kept before the reactor is erased to `dyn Reactor`, so `system_stats` can
+    // publish them.
+    let reactor = Arc::new(TokioReactor::new(machine_handle.clone()));
+    let dispatch_stats = Arc::clone(reactor.dispatch_stats());
+    let printer = Arc::new(Printer::new(reactor));
 
     // A diagnostic for the machine's own timing: if a dispatch round runs
     // longer than this, say so, naming the callbacks that ran in it. Upstream
     // wires the same notifier from its garbage collector
     // (`extras/garbage_collection.py`); we have none, so the warning is the
-    // whole point (TODO A1b).
+    // whole point (TODO A1b). The same threshold is what the round totals count
+    // as `over_threshold`, so the warning and the numbers agree.
     printer
         .reactor()
         .set_latency_notifier(LATENCY_WARNING, Arc::new(report_reactor_latency));
@@ -366,6 +370,14 @@ pub fn run(
         // `klippy/klippy.py:36-40`). The endpoint table itself is built after
         // the read, so the mux endpoints it collected can go into it.
         api::webhooks::install(&printer).map_err(RegistrationError::Status)?;
+
+        // The host's own load numbers (`system_stats`) are a host object too:
+        // upstream builds the same object from `load_config` as a library object
+        // (`extras/statistics.py:59`), and registering it here rather than from a
+        // section means it survives a restart and exists whatever the config
+        // says.
+        system_stats::SystemStats::install(&printer, dispatch_stats)
+            .map_err(RegistrationError::Status)?;
 
         // The start arguments are host data: the printer keeps a copy (upstream
         // `printer.start_args`, `klippy/klippy.py:30`) so that modules such as

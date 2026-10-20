@@ -130,6 +130,125 @@ pub struct LatencyReport {
 /// holding the lock that holds it.
 pub type LatencyCallback = Arc<dyn Fn(LatencyReport) + Send + Sync>;
 
+/// One dispatch round's numbers, as [`DispatchStats::record_round`] took them.
+///
+/// All times are nanoseconds; the dispatcher measures seconds and the counters
+/// are truncated on the way in, which is well below anything a round can
+/// resolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DispatchSnapshot {
+    /// How many rounds have run.
+    pub rounds: u64,
+    /// The total busy time of those rounds.
+    pub busy_sum_ns: u64,
+    /// The longest single round.
+    pub busy_max_ns: u64,
+    /// The summed lateness of the rounds' callbacks.
+    pub lateness_sum_ns: u64,
+    /// The worst single round's summed lateness.
+    pub lateness_max_ns: u64,
+    /// How many rounds took at least [`DispatchSnapshot::threshold_ns`].
+    pub over_threshold: u64,
+    /// The threshold those rounds were compared against, or `u64::MAX` when no
+    /// notifier (and so no threshold) is installed.
+    pub threshold_ns: u64,
+}
+
+/// The dispatcher's running totals: how many rounds ran, and how late they were.
+///
+/// Accumulated by the dispatcher in [`Dispatcher::report_if_late`], the one
+/// place every round passes through. Plain atomics on purpose: a round is the
+/// machine's hot path, so counting one must not take a lock or allocate, and a
+/// reader (`extras::system_stats`) may look at the numbers at any moment and get
+/// a self-consistent-enough picture for a statistic.
+///
+/// "Lateness" is the summed lateness of a round's callbacks, each measured
+/// against its own due time ([`CallbackRun::lateness`]): a round that started
+/// late because the dispatcher was busy before it shows up here.
+#[derive(Debug)]
+pub struct DispatchStats {
+    rounds: AtomicU64,
+    busy_sum_ns: AtomicU64,
+    busy_max_ns: AtomicU64,
+    lateness_sum_ns: AtomicU64,
+    lateness_max_ns: AtomicU64,
+    over_threshold: AtomicU64,
+    /// The threshold a round is compared against, in nanoseconds; `u64::MAX`
+    /// until [`Reactor::set_latency_notifier`] installs one, so nothing counts
+    /// as over the threshold before then.
+    threshold_ns: AtomicU64,
+}
+
+impl DispatchStats {
+    /// Zero counters, no threshold.
+    pub fn new() -> Self {
+        Self {
+            rounds: AtomicU64::new(0),
+            busy_sum_ns: AtomicU64::new(0),
+            busy_max_ns: AtomicU64::new(0),
+            lateness_sum_ns: AtomicU64::new(0),
+            lateness_max_ns: AtomicU64::new(0),
+            over_threshold: AtomicU64::new(0),
+            threshold_ns: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    /// Set the threshold a round is compared against, in seconds.
+    ///
+    /// The reactor calls this with the latency notifier's own threshold, so
+    /// "over the threshold" in the totals means exactly what the warning means.
+    pub fn set_threshold(&self, seconds: f64) {
+        self.threshold_ns.store(nanos(seconds), Ordering::Relaxed);
+    }
+
+    /// Count one dispatch round.
+    ///
+    /// `busy` is how long the round took and `lateness` how late it started,
+    /// both in seconds — exactly what the dispatcher hands to
+    /// [`Dispatcher::report_if_late`].
+    pub fn record_round(&self, busy: f64, lateness: f64) {
+        let busy_ns = nanos(busy);
+        let lateness_ns = nanos(lateness);
+        self.rounds.fetch_add(1, Ordering::Relaxed);
+        self.busy_sum_ns.fetch_add(busy_ns, Ordering::Relaxed);
+        self.busy_max_ns.fetch_max(busy_ns, Ordering::Relaxed);
+        self.lateness_sum_ns
+            .fetch_add(lateness_ns, Ordering::Relaxed);
+        self.lateness_max_ns
+            .fetch_max(lateness_ns, Ordering::Relaxed);
+        if busy_ns >= self.threshold_ns.load(Ordering::Relaxed) {
+            self.over_threshold.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Read the counters as they are now.
+    pub fn snapshot(&self) -> DispatchSnapshot {
+        DispatchSnapshot {
+            rounds: self.rounds.load(Ordering::Relaxed),
+            busy_sum_ns: self.busy_sum_ns.load(Ordering::Relaxed),
+            busy_max_ns: self.busy_max_ns.load(Ordering::Relaxed),
+            lateness_sum_ns: self.lateness_sum_ns.load(Ordering::Relaxed),
+            lateness_max_ns: self.lateness_max_ns.load(Ordering::Relaxed),
+            over_threshold: self.over_threshold.load(Ordering::Relaxed),
+            threshold_ns: self.threshold_ns.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl Default for DispatchStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Seconds as nanoseconds.
+///
+/// A negative value (a clock that reads a wake time in the future) counts as
+/// zero: the counters are a measure of delay, never of earliness.
+fn nanos(seconds: f64) -> u64 {
+    (seconds.max(0.0) * 1e9) as u64
+}
+
 /// The message a caught panic carried, for a log line.
 ///
 /// `panic!("literal")` carries a `&'static str` and a formatted one a `String`;
@@ -307,6 +426,9 @@ pub struct TokioReactor {
     origin: tokio::time::Instant,
     /// The timers, shared with the one dispatcher task that runs them.
     dispatcher: Arc<Dispatcher>,
+    /// The dispatcher's round totals, kept outside the dispatcher so a reader
+    /// can take a snapshot without touching it.
+    stats: Arc<DispatchStats>,
 }
 
 impl TokioReactor {
@@ -321,9 +443,19 @@ impl TokioReactor {
     /// dropped.
     pub fn new(handle: tokio::runtime::Handle) -> Self {
         let origin = tokio::time::Instant::now();
-        let dispatcher = Arc::new(Dispatcher::new());
+        let stats = Arc::new(DispatchStats::new());
+        let dispatcher = Arc::new(Dispatcher::new(Arc::clone(&stats)));
         handle.spawn(run_dispatcher(Arc::clone(&dispatcher), origin));
-        Self { origin, dispatcher }
+        Self {
+            origin,
+            dispatcher,
+            stats,
+        }
+    }
+
+    /// The dispatcher's running totals, for the object that publishes them.
+    pub fn dispatch_stats(&self) -> &Arc<DispatchStats> {
+        &self.stats
     }
 }
 
@@ -372,6 +504,9 @@ impl Reactor for TokioReactor {
     }
 
     fn set_latency_notifier(&self, latency: f64, callback: LatencyCallback) {
+        // The totals compare a round against the same threshold the warning
+        // uses, so "over the threshold" means one thing in both places.
+        self.stats.set_threshold(latency);
         *self
             .dispatcher
             .latency
@@ -395,6 +530,8 @@ struct Dispatcher {
     closed: AtomicBool,
     /// The latency notifier, once [`Reactor::set_latency_notifier`] was called.
     latency: Mutex<Option<LatencyNotifier>>,
+    /// The round totals, shared with the reactor that publishes them.
+    stats: Arc<DispatchStats>,
 }
 
 /// Told when a dispatch round ran past its threshold.
@@ -404,13 +541,14 @@ struct LatencyNotifier {
 }
 
 impl Dispatcher {
-    fn new() -> Self {
+    fn new(stats: Arc<DispatchStats>) -> Self {
         Self {
             timers: Mutex::new(BinaryHeap::new()),
             notify: tokio::sync::Notify::new(),
             seq: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             latency: Mutex::new(None),
+            stats,
         }
     }
 
@@ -425,11 +563,22 @@ impl Dispatcher {
             .push(entry);
     }
 
-    /// Call the latency notifier if a round ran past its threshold.
+    /// Count the round, and call the latency notifier if it ran past its
+    /// threshold.
+    ///
+    /// Every round the dispatcher runs ends here, so this is where the running
+    /// totals are kept (`DispatchStats`, lock-free) — the notifier is the
+    /// per-round detail, the totals the long view.
     ///
     /// The callback is cloned out of the lock first, so it may itself call
     /// `set_latency_notifier` (or do anything else) without deadlocking.
     fn report_if_late(&self, busy: f64, eventtime: f64, callbacks: Vec<CallbackRun>) {
+        // A round's lateness is the summed lateness of its callbacks: each
+        // started late against its own due time, so the sum is how much
+        // dispatching the round actually delayed.
+        let lateness: f64 = callbacks.iter().map(|run| run.lateness.max(0.0)).sum();
+        self.stats.record_round(busy, lateness);
+
         let callback = {
             let guard = self
                 .latency
@@ -1261,6 +1410,123 @@ mod tests {
                 return;
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The round totals (`DispatchStats`) — what `system_stats` publishes
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn test_dispatch_totals_count_only_rounds_at_or_over_the_threshold() {
+        let stats = DispatchStats::new();
+        stats.set_threshold(0.05);
+        stats.record_round(0.010, 0.0);
+        stats.record_round(0.050, 0.002);
+        stats.record_round(0.100, 0.005);
+
+        let totals = stats.snapshot();
+        assert_eq!(totals.rounds, 3, "every round counts");
+        assert_eq!(
+            totals.over_threshold, 2,
+            "only the rounds at or over 50 ms are over the threshold"
+        );
+        assert_eq!(totals.threshold_ns, 50_000_000);
+        assert_eq!(totals.busy_sum_ns, 160_000_000);
+        assert_eq!(totals.busy_max_ns, 100_000_000);
+        assert_eq!(totals.lateness_sum_ns, 7_000_000);
+        assert_eq!(totals.lateness_max_ns, 5_000_000);
+
+        // No threshold installed yet: nothing can be over it.
+        let fresh = DispatchStats::new();
+        fresh.record_round(10.0, 0.0);
+        assert_eq!(fresh.snapshot().rounds, 1);
+        assert_eq!(fresh.snapshot().over_threshold, 0);
+    }
+
+    #[tokio::test]
+    async fn test_a_round_over_the_threshold_is_counted_in_the_dispatch_totals() {
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+
+        // Registered at NOW: the dispatcher runs it as its first round, and it
+        // holds the dispatcher for 120 ms.
+        reactor.register_timer_named(
+            "slow",
+            Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(120));
+                None
+            }),
+            reactor.monotonic(),
+        );
+
+        // The warning is the evidence the round ran; the totals must have
+        // counted that same round.
+        let report = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the report must arrive")
+            .expect("the channel must be open");
+
+        let totals = reactor.dispatch_stats().snapshot();
+        assert_eq!(totals.rounds, 1, "exactly the one round ran");
+        assert_eq!(totals.over_threshold, 1, "the round was over the threshold");
+        assert_eq!(totals.threshold_ns, 50_000_000);
+        let busy_max = totals.busy_max_ns as f64 / 1e9;
+        assert!(
+            (busy_max - report.busy).abs() < 1e-6,
+            "busy_max_s was {busy_max}, the round took {}",
+            report.busy
+        );
+        assert!(totals.lateness_sum_ns > 0, "the round started late");
+    }
+
+    #[tokio::test]
+    async fn test_a_round_under_the_threshold_counts_a_round_but_not_an_overrun() {
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+        // A periodic timer that does nothing: several rounds, none of them near
+        // 50 ms.
+        reactor.register_timer_named(
+            "fast",
+            Box::new(|eventtime| Some(eventtime + 0.01)),
+            reactor.monotonic(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let deadline = std::time::Instant::now() + Duration::from_millis(300);
+            while reactor.dispatch_stats().snapshot().rounds < 3
+                && std::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the rounds must run");
+
+        let totals = reactor.dispatch_stats().snapshot();
+        assert!(totals.rounds >= 3, "rounds was {}", totals.rounds);
+        assert_eq!(
+            totals.over_threshold, 0,
+            "a fast round must not count as over the threshold"
+        );
+        assert!(
+            totals.busy_max_ns < 50_000_000,
+            "busy_max_ns was {}",
+            totals.busy_max_ns
+        );
+        assert!(totals.lateness_sum_ns <= totals.lateness_max_ns * totals.rounds);
+        assert!(rx.try_recv().is_err(), "a fast round must not be reported");
     }
 
     // ---------------------------------------------------------------------

@@ -96,6 +96,7 @@ pub mod static_pwm_clock;
 pub mod stepper;
 pub mod stepper_enable;
 pub mod sx1509;
+pub mod system_stats;
 pub mod temperature_combined;
 pub mod temperature_fan;
 pub mod temperature_host;

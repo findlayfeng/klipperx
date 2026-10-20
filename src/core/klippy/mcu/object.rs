@@ -162,8 +162,9 @@ pub struct McuObject {
     /// sequence). `None` only for an object built outside the loader, which is
     /// never the one a working machine connects.
     id: Mutex<Option<u32>>,
-    /// The baud this MCU shares its serial path at, when two or more `[mcu]`
-    /// sections name the same `serial:` path, or `None` for an exclusive one.
+    /// The rate this MCU's serial path is opened at, when the path is addressed
+    /// by id (two or more `[mcu]` sections name it, or a bridge's link carries
+    /// its downstream devices' frames), or `None` for an exclusive one.
     ///
     /// Stamped at load from the grouping pass (`mcu/serial_ports.rs`) and read
     /// back by `connect`, exactly as [`McuObject::id`] is: it is what tells the
@@ -2087,15 +2088,19 @@ pub fn load_config(
     // The id assigned at load is the one the machine connects with; `connect`
     // refuses to open a transport without it.
     object.set_id(id);
-    // Whether this MCU's `serial:` path is shared is a property of the whole
-    // config, resolved once for every `[mcu]` by the grouping pass. A path two
-    // or more sections name is shared, and the baud they agree on is stamped on
-    // the object so `connect` can hand it to the transport without
-    // reclassifying. A bridge's path is addressed by id too, even though one
-    // section names it, because its downstream devices' frames travel it
-    // (`SerialPorts::is_id_addressed`). A path neither shape covers stays
-    // exclusive (`None`), and its transport opens exactly as before — no
-    // assignment frame is sent.
+    // Whether this MCU's `serial:` path is addressed by id is a property of the
+    // whole config, resolved once for every `[mcu]` by the grouping pass — the
+    // verdict the transport splits on, and the rate the path resolved to (the
+    // lowest its sections write). A path two or more sections name is shared;
+    // a bridge's path is addressed by id too, even though one section names it,
+    // because its downstream devices' frames travel it
+    // (`SerialPorts::is_id_addressed`). Both are stamped on the object so
+    // `connect` can hand them to the transport without reclassifying, and the
+    // transport never compares the rate against a section's own `baud`: doing
+    // so sent a section that wrote the higher rate down the exclusive arm, a
+    // second opener on a tty another MCU already held. A path neither shape
+    // covers stays exclusive (`None`), and its transport opens exactly as
+    // before — no assignment frame is sent.
     let ports = serial_ports::ensure(printer, config)?;
     let shared_baud = match &parsed.transport {
         Transport::Serial { path, .. } if ports.is_id_addressed(path) => ports.effective_baud(path),

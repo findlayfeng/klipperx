@@ -43,8 +43,11 @@ TYPICAL CRITERIA (what "healthy" looked like on the F446@180MHz board)
 
 FAMILIES AND FREQUENCY
     A log with more than one MCU (or a config change mid-log) makes the 5 s
-    reports split by `count`: a faster MCU runs more rounds per window. Two
-    steps get there, and neither of them guesses a clock:
+    reports split. When the host writes the `[<mcu>]` prefix the split is
+    **exact** - one family per MCU, labelled with its name. Logs without the
+    prefix (older builds, upstream klippy) fall back to `count`: a faster MCU
+    runs more rounds per window. That fallback takes two steps, and neither
+    guesses a clock:
 
       1. activity spikes go first. A report whose `count` is above *3 x the
          median* count is a startup/activity burst, not an MCU; the dropped
@@ -93,7 +96,10 @@ SCRIPT = Path(__file__).name
 REPO_VENV_PYTHON = Path(__file__).resolve().parents[1] / "venv" / "bin" / "python"
 REQUIRED_MODULES = ("argparse", "calendar", "math", "re", "statistics")
 
-STATS_LINE = re.compile(r"stats count=(\d+) sum=(\d+) sumsq=(\d+)")
+STATS_LINE = re.compile(
+    r"(?:\[(?P<mcu>[^\]]+)\] )?stats count=(?P<count>\d+)"
+    r" sum=(?P<sum>\d+) sumsq=(?P<sumsq>\d+)"
+)
 TIMESTAMP = re.compile(
     r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?Z"
 )
@@ -163,7 +169,12 @@ def parse_ts(line):
 
 
 def load(path):
-    """One tuple per `stats` report: (epoch_or_None, count, sum, sumsq)."""
+    """One tuple per `stats` report: (epoch_or_None, count, sum, sumsq, mcu_or_None).
+
+    `mcu` is the name the host now puts in front of the line (`[downstream] stats
+    count=…`). Logs written before that prefix existed simply have `None` there,
+    which is what makes the count-gap fallback still reachable.
+    """
     rows = []
     with open(path, "r", errors="replace") as handle:
         for line in handle:
@@ -173,9 +184,10 @@ def load(path):
             rows.append(
                 (
                     parse_ts(line),
-                    int(match.group(1)),
-                    int(match.group(2)),
-                    int(match.group(3)),
+                    int(match.group("count")),
+                    int(match.group("sum")),
+                    int(match.group("sumsq")),
+                    match.group("mcu"),
                 )
             )
     return rows
@@ -203,13 +215,21 @@ def percentile(values, fraction):
 
 
 def family_label(rows):
-    """`count <min>`–`<max>` - the measured spread of one family's reports."""
+    """The MCU's name when the lines carry one, else `count <min>–<max>`."""
+    named = {row[4] for row in rows if row[4]}
+    if len(named) == 1:
+        return named.pop()
     counts = [row[1] for row in rows]
     return f"count {min(counts)}\u2013{max(counts)}"
 
 
 def split_families(rows):
-    """Drop the activity spikes, then cut the counts once at their largest gap.
+    """Drop the activity spikes, then split by MCU name or by count gap.
+
+    When the log lines carry the host's `[<mcu>]` prefix, the split is exact:
+    one family per MCU, and no guessing from the report rate. Older logs (and
+    firmware logs from upstream klippy) have no prefix, so the count gap is
+    still the fallback.
 
     Returns (spike_floor, spikes, candidate, families):
         spike_floor : count above which a report is an activity spike
@@ -223,6 +243,13 @@ def split_families(rows):
     # The median row is never above SPIKE_FACTOR x median, so `kept` is not empty.
     spikes = [row for row in rows if row[1] > spike_floor]
     ordered = sorted((row for row in rows if row[1] <= spike_floor), key=lambda r: r[1])
+
+    # A name on every kept row is the whole answer: no gap heuristic needed.
+    if ordered and all(row[4] for row in ordered):
+        names = sorted({row[4] for row in ordered})
+        families = [(name, [row for row in ordered if row[4] == name]) for name in names]
+        return spike_floor, spikes, None, families
+
     gap, at = 0, 0
     for index in range(1, len(ordered)):
         if ordered[index][1] - ordered[index - 1][1] > gap:
@@ -255,7 +282,7 @@ def family_table(families, freqs):
     print("-" * len(header))
     for label, rows in families:
         for clock, freq in freqs:
-            converted = [metrics(c, s, q, freq) for _, c, s, q in rows]
+            converted = [metrics(row[1], row[2], row[3], freq) for row in rows]
             avg = sorted(row[0] for row in converted)
             sd = sorted(row[1] for row in converted)
             awake = sorted(row[2] for row in converted)
@@ -285,7 +312,7 @@ def bucket_table(families, interval_min):
         print("  " + header)
         print("  " + "-" * len(header))
         buckets = {}
-        for epoch, count, total, squares in rows:
+        for epoch, count, total, squares, _mcu in rows:
             key = None if epoch is None else bucket_start(epoch, interval_min)
             buckets.setdefault(key, []).append((count, total, squares))
         for key in sorted(buckets, key=lambda k: (k is None, k or 0)):
@@ -341,7 +368,12 @@ def describe(path, rows, freqs, interval_min, stated_freq):
             f"spikes: none (no report exceeds {SPIKE_FACTOR:g} x median count"
             f" {spike_floor:.0f})"
         )
-    if candidate is None or candidate[2] == 0:
+    if candidate is None and all(row[4] for row in rows):
+        print(
+            "families: split by the `[<mcu>]` prefix the host puts on the line -> "
+            + " / ".join(f"{label}: {len(group)} reports" for label, group in families)
+        )
+    elif candidate is None or candidate[2] == 0:
         print("families: no gap between the counts -> no double peak detected -> one family")
     elif len(families) == 1:
         print(

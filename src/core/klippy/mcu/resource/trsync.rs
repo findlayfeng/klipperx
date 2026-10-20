@@ -22,7 +22,10 @@
 //!   `MCU_trsync.start`);
 //! * on each report the group recomputes the minimum acknowledged print time and
 //!   resends `trsync_set_timeout` when the extension is worth it
-//!   (`handle_trsync_state`, `chelper/trdispatch.c:70-140`).
+//!   (`handle_trsync_state`, `chelper/trdispatch.c:70-140`);
+//! * the report that ends a dispatch closes the group and broadcasts
+//!   `trsync_trigger` to every MCU in it, and a closed group takes no further
+//!   report ([`TriggerGroup`], `chelper/trdispatch.c:78-89`).
 //!
 //! Multi-MCU is the same code path: one `McuTrsync` per MCU, each with its own
 //! `McuChip` clock, and the group takes the slowest.

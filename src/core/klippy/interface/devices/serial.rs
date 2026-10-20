@@ -6,7 +6,7 @@
 //! rules: `send` writes a whole frame or reports an error, and `receive` only ever
 //! returns validated frames.
 //!
-//! Two details are specific to a tty:
+//! Three details are specific to a tty:
 //!
 //! * the line has to be raw (no echo, no CR/LF translation, no flow control the
 //!   protocol did not ask for), and the speed has to be set. Klipper's default is
@@ -15,6 +15,9 @@
 //! * reads use a short timeout (`VMIN=0`, `VTIME=1`) instead of blocking forever.
 //!   `shutdown` is therefore noticed within a tenth of a second, without closing
 //!   the descriptor out from under a thread that is blocked in `read`.
+//! * writes are bounded on the host side instead ([`WRITE_STALL_BOUND`]): the
+//!   descriptor stays blocking, so a port whose far end stopped draining its
+//!   input would otherwise park the writer inside the driver forever.
 //!
 //! # The shared serial mux
 //!
@@ -89,6 +92,21 @@ pub const OPEN_RETRY_BUDGET: Duration = Duration::from_millis(300);
 /// One sleep slice of a retry wait: a shutdown check runs between slices, so an
 /// exit request ends the wait well inside [`OPEN_RETRY_INTERVAL`].
 const OPEN_RETRY_SLICE: Duration = Duration::from_millis(50);
+
+/// The longest one write may wait for the port to take even a single byte.
+///
+/// An upper bound, not a link timeout: a healthy port hands the frame straight
+/// over and waits for nothing, so this value is only ever reached by a board
+/// that stopped draining its input (powered down, stuck in a loader, flow
+/// control asserted, adapter wedged). Without it the write parks inside the tty
+/// driver for good, because the descriptor is blocking — upstream has no such
+/// wait only because it keeps the port non-blocking
+/// (`klippy/chelper/serialqueue.c:731`), and this port stays blocking for the
+/// read side's `VMIN=0`/`VTIME=1` window ([`set_raw_mode`]). One second is long
+/// enough that a healthy but briefly busy port never trips it, and short enough
+/// that a wedged one is reported while the caller still cares — for the mux
+/// that caller holds `write_lock`, which every MCU on the port shares.
+const WRITE_STALL_BOUND: Duration = Duration::from_secs(1);
 
 /// A [`Device`] backed by a serial port.
 pub struct SerialDevice {
@@ -302,7 +320,7 @@ impl Device for SerialDevice {
 
         let bytes = frame.raw_bytes();
         trace!("tx frame [{}]: {}", self.id(), describe_frame(&bytes));
-        (&self.port).write_all(&bytes).map_err(|e| {
+        write_whole(&self.port, &bytes).map_err(|e| {
             InterfaceError::SendError(format!(
                 "serial write to {} failed: {e}",
                 self.path.display()
@@ -495,6 +513,71 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
     Ok(())
 }
 
+/// Write `bytes` whole, waiting at most [`WRITE_STALL_BOUND`] for the port to
+/// take them.
+///
+/// Whole is the frame contract: a short write is an error, not a shorter frame
+/// on the wire. A port that takes none of it within the bound returns
+/// [`std::io::ErrorKind::TimedOut`], which both write paths turn into
+/// [`InterfaceError::SendError`].
+fn write_whole(port: &File, bytes: &[u8]) -> std::io::Result<()> {
+    let deadline = Instant::now() + WRITE_STALL_BOUND;
+    for byte in bytes {
+        wait_for_room(port, deadline)?;
+        // One byte per report of room: see `wait_for_room` on why the report
+        // does not vouch for more than that.
+        (&*port).write_all(std::slice::from_ref(byte))?;
+    }
+    Ok(())
+}
+
+/// Wait until the port reports room in its output buffer, or `deadline` passes.
+///
+/// `poll` reports `POLLOUT` for a tty as soon as its driver has **some** room
+/// (`n_tty_poll` tests `write_room > 0`), and a blocking `write` of more than
+/// that room copies its head and then parks in the driver for the rest — the
+/// very wait [`WRITE_STALL_BOUND`] exists to bound. So the report is spent on a
+/// single byte, and a frame costs one report per byte; frames are a few dozen
+/// bytes, so the cost is bounded by the frame.
+///
+/// A hangup (`POLLHUP`/`POLLERR`/`POLLNVAL`, reported with `revents` outside
+/// `events`) is handed to the write, which returns the driver's `errno` for it;
+/// only running out of time is this function's own failure.
+fn wait_for_room(port: &File, deadline: Instant) -> std::io::Result<()> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "the port took none of the write",
+            ));
+        }
+        // Rounded up: `poll` with a zero timeout would only survey the port,
+        // and the loop above would then spin until the deadline.
+        let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut fds = libc::pollfd {
+            fd: port.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: `fds` is one descriptor entry this call owns, and it names a
+        // descriptor kept open by `port` for the duration of the call.
+        let ready = unsafe { libc::poll(&mut fds, 1, millis) };
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        if ready > 0 {
+            return Ok(());
+        }
+        // Timed out: the loop's own deadline check is what ends the wait, so a
+        // rounded-down nanosecond does not report a stall that never happened.
+    }
+}
+
 /// The current `errno` as an `InterfaceError`, naming the call that failed.
 pub(crate) fn last_error(call: &str) -> InterfaceError {
     InterfaceError::Other(format!(
@@ -558,7 +641,9 @@ mod tests {
     ///
     /// Every retry test sets a budget of its own; this is the bound that catches
     /// a loop which ignores it and would otherwise sit in the test harness.
-    fn bounded<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+    /// `pub(super)` for the mux tests below: a write with no bound would hang
+    /// the suite the same way.
+    pub(super) fn bounded<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(body());
@@ -708,9 +793,91 @@ mod tests {
 
         // What the port receives is the frame as it goes on the wire: header,
         // payload, CRC, SYNC. Raw mode means nothing was translated on the way.
+        // The writer hands a frame to the tty in pieces (see `write_whole`), so
+        // the read collects them rather than assuming one read returns all.
+        let wire = read_exactly(&pty.master, Frame::encode(3, &[1, 2, 3]).len());
+        assert_eq!(wire, Frame::encode(3, &[1, 2, 3]));
+    }
+
+    /// Read exactly `want` bytes from the pty master, within a two-second
+    /// window.
+    ///
+    /// A frame reaches the port in as many pieces as the writer handed the tty,
+    /// so a test that wants the whole frame reads until it has it — and the
+    /// window keeps a port that went quiet from parking the test.
+    fn read_exactly(master: &File, want: usize) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut master = master;
+        let mut out = Vec::with_capacity(want);
         let mut buf = [0u8; 64];
-        let read = (&pty.master).read(&mut buf).unwrap();
-        assert_eq!(&buf[..read], Frame::encode(3, &[1, 2, 3]));
+        while out.len() < want {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "only {} of {want} bytes arrived within the window",
+                out.len()
+            );
+            let mut fds = libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = remaining.as_millis().clamp(1, i32::MAX as u128) as i32;
+            let ready = unsafe { libc::poll(&mut fds, 1, millis) };
+            assert!(ready >= 0, "polling the pty master");
+            if ready == 0 {
+                continue;
+            }
+            let read = master.read(&mut buf).expect("pty master read");
+            assert_ne!(read, 0, "the pty closed before {want} bytes arrived");
+            out.extend_from_slice(&buf[..read]);
+        }
+        out
+    }
+
+    #[test]
+    fn test_send_reports_a_port_that_stopped_draining() {
+        // A board that is not reading — powered down, or sitting in a loader —
+        // leaves the tty's input buffer full, and the descriptor is blocking:
+        // an unbounded write parks inside the driver for good and takes the
+        // caller with it. Nothing drains the master here, so the frames fill
+        // the buffer and the send that finds no room has to report instead of
+        // waiting.
+        //
+        // `bounded` is the harness-level guard as well: a write with no bound
+        // would block this body's thread forever, and the test would fail
+        // rather than sit in the suite.
+        let (outcome, elapsed, path) = bounded(|| {
+            let pty = Pty::new();
+            let device = SerialDevice::open(&pty.path, DEFAULT_BAUD).unwrap();
+            let frame = Frame::new(1, vec![0u8; MESSAGE_MAX]);
+            let start = Instant::now();
+            let mut failure: Option<InterfaceError> = None;
+            // Enough frames to fill any plausible tty buffer (each is
+            // `MESSAGE_MAX` plus the header and trailer), so the loop ends on
+            // the buffer being full, not on the count.
+            for _ in 0..4_000 {
+                match device.send(&frame) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            (failure, start.elapsed(), pty.path.display().to_string())
+        });
+
+        let err = outcome.expect("a port that takes nothing must report it");
+        assert!(matches!(err, InterfaceError::SendError(_)), "{err:?}");
+        assert!(err.to_string().contains(&path), "{err}");
+        // Filling costs milliseconds; the one stalled frame costs the bound.
+        // The lower bound is the proof that the deadline is what reported — a
+        // write rejected for any other reason would come back at once.
+        assert!(
+            elapsed >= WRITE_STALL_BOUND && elapsed < WRITE_STALL_BOUND * 3,
+            "the failing send took {elapsed:?}"
+        );
     }
 
     #[test]
@@ -769,9 +936,8 @@ mod tests {
         let interface = Interface::serial(&pty.path, DEFAULT_BAUD).unwrap();
 
         interface.send(Frame::new(0, vec![7])).await.unwrap();
-        let mut buf = [0u8; 16];
-        let read = (&pty.master).read(&mut buf).unwrap();
-        assert_eq!(&buf[..read], Frame::encode(0, &[7]));
+        let wire = read_exactly(&pty.master, Frame::encode(0, &[7]).len());
+        assert_eq!(wire, Frame::encode(0, &[7]));
 
         let answer = Frame::encode(1, &[9]);
         (&pty.master).write_all(&answer).unwrap();
@@ -2250,7 +2416,7 @@ impl SharedSerialPort {
     /// it from the registry — the next attach opens the tty that exists now.
     fn write_unit(&self, unit: &[u8]) -> Result<(), InterfaceError> {
         let _writing = self.write_lock.lock().unwrap();
-        match (&*self.port).write_all(unit) {
+        match write_whole(&self.port, unit) {
             Ok(()) => Ok(()),
             Err(e) => {
                 self.stop();
@@ -3522,6 +3688,45 @@ mod mux_tests {
         ];
         expected.sort_by_key(|(arb, _)| *arb);
         assert_eq!(units, expected);
+    }
+
+    #[test]
+    fn a_write_the_port_never_takes_fails_and_stops_the_port() {
+        // The stall `test_send_reports_a_port_that_stopped_draining` sets up,
+        // on the shared port: `write_unit` holds `write_lock` across the whole
+        // write, so an unbounded one would not just hang its own caller — every
+        // MCU on the port would queue behind it. The failure has to arrive, and
+        // it has to stop the port, which is what retires it so the next attach
+        // opens the tty that exists now.
+        let (failure, elapsed, stopped) = super::tests::bounded(|| {
+            let pty = Pty::new();
+            let port = SharedSerialPort::open(&pty.path, DEFAULT_BAUD).unwrap();
+            // A full-size unit, so the buffer fills in a second or so of loop.
+            let unit = admin_unit(&[0u8; MESSAGE_MAX]);
+            let start = Instant::now();
+            let mut failure = None;
+            for _ in 0..4_000 {
+                match port.write_unit(&unit) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            let elapsed = start.elapsed();
+            let stopped = port.stopped.load(Ordering::SeqCst);
+            (failure, elapsed, stopped)
+        });
+
+        let err = failure.expect("a port that takes nothing must report it");
+        assert!(matches!(err, InterfaceError::SendError(_)), "{err:?}");
+        // The one unit that found no room spent the bound, no more.
+        assert!(
+            elapsed >= WRITE_STALL_BOUND && elapsed < WRITE_STALL_BOUND * 3,
+            "the failing write took {elapsed:?}"
+        );
+        assert!(stopped, "a failed write stops the port");
     }
 
     #[test]

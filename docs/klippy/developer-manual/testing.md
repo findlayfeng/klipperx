@@ -208,9 +208,9 @@ venv/bin/python scripts/stats-jitter.py ~/printer_data/logs/klippy.log
   本机 `kernel.sched_schedstats=0` 时 wait 字段**仍在累计**（实测可差分）；`/proc/<tid>/sched`
   没有 `sched_info` 块，所以只有均值、拿不到 `wait_max`。
 - `stats-jitter.py`：固件侧——把 `klippy.log` 里的 `stats count=/sum=/sumsq=` 换成每轮任务耗时的
-  avg/sd/awake（公式来自 `event/stats.rs` 与上游 `basecmd.c`）。它量的是**每轮任务耗时，
-  **不是**唤醒迟到；先剔活动尖峰、再按 count 最大间隙分族（双 MCU 时一板一族），
-  日志行不带 MCU 名，所以「哪族是哪块板」得靠晶振频率推。
+  avg/sd/awake（公式来自 `event/stats.rs` 与上游 `basecmd.c`）。它量的是**每轮任务耗时**，
+  **不是**唤醒迟到。日志行现在带 `[<mcu>]` 前缀，所以按 MCU 名分族（旧日志没前缀时回退到
+  「先剔活动尖峰、再按 count 最大间隙分族」）；分族后每族仍要自己给晶振频率，日志不记那个。
 
 **卡片机等价环境怎么造**（目标机是 RK3328 级：4×A53 + eMMC/SD）：
 

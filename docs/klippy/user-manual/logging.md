@@ -146,8 +146,9 @@ WARN  api: dropping malformed request (invalid JSON …): not json
 
 代价是两条，要用的时候心里有数：
 
-- **队列满时会丢日志，不会阻塞**。丢掉多少条可以用 `logging::dropped_records()` 读到（进程内
-  计数）。出现大批丢弃通常意味着盘极慢或日志级别开得过高（比如 `RUST_LOG=trace` 又跑压测），
+- **队列满时会丢日志，不会阻塞**。丢掉多少条可以直接查询：
+  `klipperx api objects/query '{"objects":{"system_stats":["dropped_logs"]}}'`（进程内计数，
+  单调递增）。出现大批丢弃通常意味着盘极慢或日志级别开得过高（比如 `RUST_LOG=trace` 又跑压测），
   而不是主机在等盘。
 - **进程被 `SIGKILL` 或机器掉电时，队列里还没写出去的最后几条会丢**。正常退出（Ctrl-C、
   `RESTART` 后的收尾、`exit`）会做一次**有界**排空（最多 500 ms），把已入队的写完再走；

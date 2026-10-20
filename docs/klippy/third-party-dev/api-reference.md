@@ -755,6 +755,9 @@
 | `last_stats` | object | 固件每 5 秒推送的统计（见下），首份报告到达前不存在 |
 | `last_stats_time` | float | 上表那份报告的到达时刻（宿主 `eventtime`，秒） |
 
+对应日志行带 MCU 名：`[<mcu>] stats count=… sum=… sumsq=…`（上游是裸的 `stats count=…`）。
+前缀是为了让双 MCU 的日志能归族——`scripts/stats-jitter.py` 优先按它分族。
+
 `last_stats` 的键名与上游 `klippy/mcu.py` 一致，方便按上游写的客户端直接读：
 
 | 键 | 单位 | 说明 |
@@ -779,6 +782,7 @@
 | `sysload` | float | `/proc/loadavg` 第一个字段（1 分钟平均负载） |
 | `cputime` | float | 本进程累计 CPU 时间（秒，`/proc/self/stat` 的 utime+stime） |
 | `memavail` | int | `/proc/meminfo` 的 `MemAvailable`（kB） |
+| `dropped_logs` | uint | 因日志队列满而丢掉的条数（本项目新增，上游没有；单调递增，卡上写 eMMC/SD 时才会动） |
 | `dispatch` | object | 本项目新增（上游没有）：reactor 分发的迟到统计 |
 
 `dispatch` 的字段（单位除计数外均为秒）：

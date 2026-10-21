@@ -17,9 +17,12 @@
 //!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` — and with them
-//!   `_swizzle_bits` and the font — are not ported; `set_glyphs` therefore has
+//! * **Text and glyph drawing.** The framework draws now — it calls
+//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
+//!   friends through [`display::draw_text`](super::display::draw_text) — but this
+//!   driver's half is a later unit: `write_text`/`write_glyph`/`write_graphics`
+//!   — and with them `_swizzle_bits` and the font — are not ported, so the trait
+//!   methods keep their draw-nothing defaults; `set_glyphs` therefore has
 //!   nothing to store, because upstream only caches the swizzled icons there
 //!   for `write_glyph` to draw later.
 //! * **`BACKGROUND_PRIORITY_CLOCK`** (`uc1701.py:11`): upstream sends every

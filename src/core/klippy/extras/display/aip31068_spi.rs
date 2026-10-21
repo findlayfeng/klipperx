@@ -25,10 +25,14 @@
 //!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` (`aip31068_spi.py:179-203`) are
-//!   not ported; [`Aip31068Spi::set_glyphs`] keeps the 5x8 icons because
-//!   upstream collects them there (`aip31068_spi.py:184-188`).
+//! * **Text and glyph drawing.** The framework draws now — it calls
+//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
+//!   friends through [`display::draw_text`](super::display::draw_text) — but this
+//!   driver's half is a later unit: `write_text`/`write_glyph`/`write_graphics`
+//!   (`aip31068_spi.py:179-203`) are not ported, so the trait methods keep their
+//!   draw-nothing defaults and this panel stays blank while the layout renders.
+//!   [`Aip31068Spi::set_glyphs`] keeps the 5x8 icons because upstream collects
+//!   them there (`aip31068_spi.py:184-188`).
 //! * **`minclock`** (`aip31068_spi.py:172-178`): upstream stamps each init group
 //!   with a clock deadline 100ms apart; this host's
 //!   [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no clock, so

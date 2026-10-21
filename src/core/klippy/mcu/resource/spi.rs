@@ -197,7 +197,8 @@ impl McuSpi {
     /// returned for the read part land in `data`; the preface's own echo is
     /// dropped. This is the shape of a protocol whose command byte and answer
     /// belong to one transaction (a flash JEDEC-ID read, a sensor register
-    /// read): `03 00 00 00` is `transfer_with_preface(&[0x03], &mut [0; 3])`.
+    /// read): `&[0x03]` plus a three-byte read is the one transfer
+    /// `03 00 00 00`.
     ///
     /// # Two-datagram protocols
     ///

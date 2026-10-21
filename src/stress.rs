@@ -2390,12 +2390,14 @@ fn read_stepper_options(
         None => (None, None),
     };
     let step_dist = read_step_dist(&config, section)?;
-    // Read at production's bounds (`extras/stepper.rs`, `kinematics/cartesian`):
-    // read for the travel bound only, so a section without one is not an error.
+    // Read for the travel bound only, and without adding a bound production does
+    // not have: a section's geometry is its own business, so a `position_max`
+    // that is not a usable length just leaves the ramp unbounded
+    // ([`travel_limit`] skips it) instead of rejecting the section.
     let position_max = if config.has("position_max") {
         Some(
             config
-                .get_float_bounded("position_max", None, None, None, Some(0.0), None)
+                .get_float("position_max", None)
                 .map_err(|err| err.to_string())?,
         )
     } else {

@@ -598,9 +598,13 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `extras/toolhead.rs` 把脉冲装到主 trapq 的每个 stepper，窗口取活跃轴脉冲极值、扫描窗随之变宽。
       无脉冲轴短路走内层（零开销）。
 - [ ] **`input_shaper` 的余项**：
-      1. `resonance_tester` 从不调 `disable_shaping`/`enable_shaping`——它的运动路径未落地，落地时需补；
-      2. 双滑车重指向（`dual_carriage:update_kinematics`）无人发送，整形层不会跟着换。
+      1. `resonance_tester` 从不调 `disable_shaping`/`enable_shaping`——它的运动路径未落地，落地时需补。
       （装/换整形前 **已 flush**；窗口越界的**裁剪口径已写进模块文档并给出与上游等价的证据**——2026-10-21。）
+      （双滑车重指向 **已于 2026-10-21 落地**：`idex_modes` 在滑车切换/恢复时锁外发
+      `dual_carriage:update_kinematics`，`input_shaper` 收到后 flush 步进、按当前活跃轴重装脉冲并重扫窗口。
+      注：本仓整形是装在每个 stepper 自己 solver 上的脉冲快照，不是上游 `is_sk → orig_sk` 的包装对象，
+      因此“重指向”的实测形式是“幂等重算窗口 + 重装同一组脉冲”；真正的 trapq swap / scale-offset 仍属
+      运动层 transform 缺口，不在本单元范围。）
 - [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
 - 依赖 F5/F6/F7、C1。
 
@@ -884,12 +888,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 | `homing:homing_move_end` | 回零移动结束 | 无 | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:2806` 等） |
 | `stepper:sync_mcu_position` | stepper 位置同步 | 无 | `klippy/stepper.py:227` | C1 |
 | `stepper:set_dir_inverted` | 方向反转设置 | 无 | `klippy/stepper.py:153` | C1 |
-| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | 无 | `klippy/kinematics/idex_modes.py:383` | C1 |
+| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | 无 | `klippy/kinematics/idex_modes.py:383` | ✅ 已触发（`extras/idex_modes.rs` 滑车切换/恢复，锁外） |
 
 > `homing:*` 四个已随 toolhead 产线触发（`extras/toolhead.rs:2316` `:3236` `:2734` `:2806`，
-> `G28` 路径；`homing_heaters` 也会发 move 对）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、
-> `dual_carriage:update_kinematics` 仍无触发点，分别随 stepper 位置同步、目录反转变更、
-> C1c 的 IDEX/双滑车落地。
+> `G28` 路径；`homing_heaters` 也会发 move 对）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`
+> 仍无触发点，分别随 stepper 位置同步与目录反转变更。
 
 ### idle_timeout 事件
 

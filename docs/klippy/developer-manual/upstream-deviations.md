@@ -126,7 +126,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | `TEMPLATE=` 形式的菜单/显示选项 | 未实现（菜单不渲染） | [配置手册](../user-manual/config.md) |
 | MCU `output` 表的异步投递等 | 见该页「当前未实现」 | [MCU 协议](mcu-protocol.md#当前未实现) |
 | IDEX 第二滑车（`idex_modes`）的步进 | **真实缺口**（2026-10-18 发现）：`[dual_carriage]` 的 `PrinterStepper` 从不调 `take_stepper()`、也从不进 `MotionQueuing`，所以它的 solver 没挂任何 trapq → **不但 `STEPPER_BUZZ` 不出步，这一路根本没有步进生成**。上游每个 `MCU_stepper` 建时即加入生成集，所以 IDEX 机器在那里是正常的。语料此前是「假绿」（只要求命令不报错） | `src/core/klippy/extras/idex_modes.rs`、[模块表](README.md) |
-| 事件名无发送方的其余项 | `stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` | [事件系统](event-system.md#22-覆盖范围) |
+| 事件名无发送方的其余项 | `stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit` | [事件系统](event-system.md#22-覆盖范围) |
 
 ## 4. 本仓特有（上游没有）
 

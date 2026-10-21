@@ -152,7 +152,7 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `idle_timeout:` | `ready`、`idle`、`printing`（批 #21） | — |
 | `probe:` | `update_results`（`probe`、`probe_eddy_current`、`axis_twist_compensation`；批 #36） | — |
 | `load_cell:` | `calibrate`、`tare`（批 #14） | — |
-| `menu:` / `dual_carriage:` | — | 对应 extras 模块尚未实现（H3/H6/H8/H9）；`dual_carriage:update_kinematics` 的变体已声明，`input_shaper.rs` 注明无人发送 |
+| `menu:` / `dual_carriage:` | `dual_carriage:update_kinematics`（`idex_modes` 在滑车切换/恢复时**锁外**发出；`input_shaper` 收到后 flush 步进、按当前活跃轴重装脉冲并重扫窗口，对齐上游 `input_shaper.py:153-168`） | `menu:populate`/`init`/`begin`/`exit`（菜单引擎落地时才有发送方，H8） |
 
 事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。
 
@@ -462,7 +462,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：34 个里 27 个已发出（逐项见 §2.2 表）。仍无发送方的 7 个：`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit`、`dual_carriage:update_kinematics` |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：34 个里 28 个已发出（逐项见 §2.2 表）。仍无发送方的 6 个：`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit` |
 
 ## 6. 与上游的差异
 

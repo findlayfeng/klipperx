@@ -1061,7 +1061,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `shaper_freq_<轴>` | 0（禁用） | 整形频率 Hz |
 | `damping_ratio_<轴>` | `0.1` | 阻尼比；超上限报 `Too high value of damping_ratio=…` |
 
-段与 `SET_INPUT_SHAPER` 已落地（wave-2，`hybrid_corexy_dual_carriage.test` 即其验收）；系数表与上游 `shaper_defs.rs` 逐位对齐（`pseudo_inverse` 已在 `mathutil`）。**整形已真的作用于运动（2026-10-21）**：`motion/shaper.rs` 按 `kin_shaper.c` 实现整形位置函数，脉冲装到主 trapq 的每个 stepper，生成窗口取活跃轴脉冲极值、`kin_flush_delay` 随之变宽；无脉冲轴零开销。**仍欠**：装/换整形前不 `flush_step_generation`；`resonance_tester` 的 `disable_shaping`/`enable_shaping` 未接（其运动路径未落地）；双滑车重指向不换整形层。`connect` 期若存在 `[dual_carriage]` 且任一整形器启用，报上游同文 config_error。
+段与 `SET_INPUT_SHAPER` 已落地（wave-2，`hybrid_corexy_dual_carriage.test` 即其验收）；系数表与上游 `shaper_defs.rs` 逐位对齐（`pseudo_inverse` 已在 `mathutil`）。**整形已真的作用于运动（2026-10-21）**：`motion/shaper.rs` 按 `kin_shaper.c` 实现整形位置函数，脉冲装到主 trapq 的每个 stepper，生成窗口取活跃轴脉冲极值、`kin_flush_delay` 随之变宽；无脉冲轴零开销。装/换整形前**已 `flush_step_generation`**；滑车切换/恢复时 `idex_modes` 发 `dual_carriage:update_kinematics`，整形层收到后 flush、按当前活跃轴重装脉冲并重扫窗口（对齐上游 `input_shaper.py:153-168`）。**仍欠**：`resonance_tester` 的 `disable_shaping`/`enable_shaping` 未接（其运动路径未落地）。`connect` 期若存在 `[dual_carriage]` 且任一整形器启用，报上游同文 config_error。
 
 ### `[adxl345]` / `[adxl345 <name>]` — 加速度计（wave-2）
 

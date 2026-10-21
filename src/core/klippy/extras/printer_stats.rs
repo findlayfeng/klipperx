@@ -1,5 +1,5 @@
 //! `printer_stats` — the once-a-second `Stats` line (upstream's `PrinterStats`,
-//! `klippy/extras/statistics.py:52-72`).
+//! `klippy/extras/statistics.py:52-74`).
 //!
 //! Every part that answers [`PrinterObject::stats`] is collected once, when the
 //! machine becomes ready, and one line per second is logged from those answers:
@@ -7,7 +7,7 @@
 //! to report, and the line is printed only when one of them does; a part that
 //! only contributes numbers adds them but never makes a line on its own — which
 //! is why a machine with nothing to announce is silent instead of chatty
-//! (`statistics.py:63-66`).
+//! (`statistics.py:67-69`).
 //!
 //! The numbers themselves belong to the parts:
 //! [`system_stats`](crate::core::klippy::extras::system_stats) always has them
@@ -18,7 +18,7 @@
 //! # The `debugoutput` gate
 //!
 //! Upstream arms the timer at ready only when
-//! `get_start_args().get('debugoutput') is None` (`statistics.py:61-62`): a run
+//! `get_start_args().get('debugoutput') is None` (`statistics.py:62-63`): a run
 //! that records or replays the MCU protocol is being watched at the protocol
 //! level, so it gets no timed chatter. Here the registration *is* the arming,
 //! so a `--debugoutput` run — what [`Printer::is_fileoutput`] reports — never
@@ -55,7 +55,7 @@ use crate::core::klippy::reactor::TimerHandle;
 /// in `objects/list` — and this host names its modules by what they do.
 pub const PRINTER_STATS_OBJECT: &str = "printer_stats";
 
-/// The period upstream returns from `generate_stats` (`statistics.py:72`): one
+/// The period upstream returns from `generate_stats` (`statistics.py:70`): one
 /// second, counted from the event time the tick was woken for.
 const STATS_INTERVAL: f64 = 1.0;
 
@@ -69,7 +69,7 @@ pub struct PrinterStats {
     printer: Weak<Printer>,
     /// The parts that answer [`PrinterObject::stats`], collected once at
     /// `klippy:ready` — upstream's `hasattr(o, 'stats')` filter
-    /// (`statistics.py:53-54`).
+    /// (`statistics.py:60-61`).
     ///
     /// Held strongly: these are the parts whose numbers this object publishes,
     /// and they are dropped with the printer along with this part. The list is
@@ -152,7 +152,7 @@ impl PrinterStats {
     }
 
     /// The line this tick would log, or `None` when no part has anything to
-    /// report — upstream's `if max([s[0] for s in stats])` (`statistics.py:63`).
+    /// report — upstream's `if max([s[0] for s in stats])` (`statistics.py:67`).
     fn line(&self, eventtime: f64) -> Option<String> {
         // The handles are cloned out so a part may reach back into the printer
         // (or into this object) while it is being asked.
@@ -189,7 +189,7 @@ impl PrinterObject for PrinterStats {
 }
 
 /// The line upstream logs: `Stats %.1f: …`, or `None` when nothing has anything
-/// to say (`statistics.py:64-66`).
+/// to say (`statistics.py:67-69`).
 ///
 /// The flag is or'ed over every part, and the printed body is the non-empty
 /// lines joined with spaces — so a silent part contributes numbers without
@@ -222,7 +222,7 @@ fn on_ready(printer: &Arc<Printer>, stats: &Arc<PrinterStats>) {
     );
 }
 
-/// Upstream's `load_config` for the `PrinterStats` half (`statistics.py:66-68`).
+/// Upstream's `load_config` for the `PrinterStats` half (`statistics.py:72-74`).
 ///
 /// The section reads no options — upstream reads none either, it only takes the
 /// printer and the reactor from the config — so the wrapper is unused. The other
@@ -375,7 +375,7 @@ mod tests {
         assert_eq!(stats_line(5.0, &[]), None);
     }
 
-    /// The period is upstream's `return eventtime + 1.` (`statistics.py:72`).
+    /// The period is upstream's `return eventtime + 1.` (`statistics.py:70`).
     #[test]
     fn the_timer_asks_to_be_woken_one_second_later() {
         let (printer, _reactor) = machine();
@@ -416,7 +416,7 @@ mod tests {
     }
 
     /// A `debugoutput` run arms no timer at all — upstream's
-    /// `get_start_args().get('debugoutput') is None` gate (`statistics.py:61`).
+    /// `get_start_args().get('debugoutput') is None` gate (`statistics.py:62`).
     #[test]
     fn a_debugoutput_run_arms_no_timer() {
         let (printer, reactor) = machine();
@@ -432,7 +432,7 @@ mod tests {
     }
 
     /// A second `klippy:ready` re-arms nothing: upstream updates the one timer
-    /// it registered (`statistics.py:56`, `:62`), so a doubled event must not
+    /// it registered (`statistics.py:56`, `:63`), so a doubled event must not
     /// double the line rate.
     #[test]
     fn a_second_ready_does_not_arm_a_second_timer() {

@@ -135,10 +135,6 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
       **两条兜底**——没有 `[printer]`（lookup 不到 `toolhead`）或资源不可调度
       （`min_schedule_time()` 为 `None`）时保留立即路径（`update_digital_out`/`update_pwm`）。
       **余项**：`heaters` 无队列化消费者待切（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7` 已于 2026-10-03 切换）。
-- [ ] **`output_pin` 的 `static_value` / `TEMPLATE` + `template_evaluator`**（display 模板，
-      `output_pin.py:88-170`）——与开关 GPIO 本身无关；`display_template` 机制已在（工厂表里有
-      `display_template`），缺的是把它接到 `SET_PIN TEMPLATE=`。**语料 0 处使用**，可按需再补
-      （`scale` 已随 T8 落地并归档）。
 
 ### S1 压力测试工具（`klipperx stress`）剩余
 
@@ -636,7 +632,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] 个别驱动的 `set_glyphs`：`uc1701`、`hd44780_spi`、`aip31068_spi` 自述未移植字形写入。
 - [ ] 菜单：`display/menu.py`、`display/menu_keys.py`、`display.cfg`、`menu.cfg`；
       事件 `menu:*`（`display/` 下无 menu 文件）。
-- [ ] 固件 `lcd_hd44780.c` / `lcd_st7920.c`。
 - 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
 
 ### H9 探测 / 调平 / 校准
@@ -708,9 +703,7 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
 - [ ] `extruder_stepper.py`：**段已落地**（2026-09-24 批 #2），宿主 step 同步的 toolhead 缝仍缺
       （不跟随 extruder 运动）。
-- [ ] **extra-axes 外围**：`GET_POSITION` ✅ 与动态 `axis_map` ✅ 已落地（2026-10-18；`G1 A…` 按字母寻址、进入规划器并有自己 trapq 的 `manual_stepper` 能真出步）。
-      余项：`MAX_AXES = 8` 的容量上限（E + 4 个字母轴，第 5 个不映射）；`G1_PARAMS` 静态表不为额外字母提供补全；`reset_last_position` 的尾巴沿用上一段（toolhead 只报 4 轴）。
-      （`stepper_enable.py` ✅ 已随 T2 落地并归档。）
+- [ ] **extra-axes 余项见 G4-2**（`MAX_AXES` 容量、`G1_PARAMS` 补全、`reset_last_position` 尾巴）——唯一登记处在那里。
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
       （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）
@@ -1087,8 +1080,6 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] `TunnelRegistry::register` 静默顶替同 id，且生产代码从不 `clear_tunnel_sink`（**后者是有意设计**：
       `bridge_flash.rs` 靠 drop receiver 隐式退订，注释已写明）；`UnitRegistry::has`/`deliver` 之间的
       TOCTOU 会丢单元（失败分支现在有 `debug!`，但没有 warn）。
-- [ ] CAN 的 `SET_NODEID` **没有身份校验**（本批已加有界重发 3×200 ms，但 uuid 比对未做）：上游 `serialhdl.py` 的 `get_canbus_id`
-      是字典报文，只能在 `identify` 之后做；现挂在 open 阶段拿不到 msgid。后续单元：在 `connect` 装好字典后比对 uuid。
 - [ ] 桥端口数上限与固件不符：主机允许 256、固件 `BRIDGE_MAX_PORTS 4`（`bridge_ports.rs` / `third_party/klipper/src/bridge.c`），
       超限只靠固件 shutdown 兜住且报错不点名额；固件把「槽号越界」与「tty 打不开」折叠成同一句 `config_uart: … could not be opened`，
       主机侧当成瞬时丢 tty 去走 10 s 恢复。

@@ -592,14 +592,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       被 `add_stepper` 重指回主 trapq（从未读自己的）、`ToolHead::set_position` 把 toolhead 坐标写进 extra axis。
 - [ ] **压力提前的余项（2026-10-21 收口时登记）**：
       1. 改值用 `get_last_move_time()` 落表，**不**走上游的 `register_lookahead_callback`；且 `smooth_time`
-         变更不 `flush_step_generation`——若无 ≥`hst` 的前瞻余量，可能改写 `hst` 内已生成位置、触发一次原地补步；
+         变更不 `flush_step_generation`（扫描窗记账已落地，能挡住大部分，但 flush 本身仍缺）；
       2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）；
       3. `find_past_position` 仍是 stub，pa 领先量不经 MCU 计数进 `motion_report`。
 - [ ] **`input_shaper` 未作用到运动**（单独一项）：`extras/input_shaper.rs` 现在只做参数校验/上报，
-      `update_input_shaping` 是空缝、`recompute_scan_windows()` 是文档化的 no-op——既不碰 trapq 也不碰
-      position function（上游 `kin_shaper.c` 的 `input_shaper_alloc`/`set_sk`/`update_sk` 未移植）。
-      **但窗口机制已就绪（2026-10-21）**：`StepKinematics::set_generation_window(pre, post)` 已落地，
-      shaper 落地时照 `shaper_note_generation_time` 把脉冲跨度写进去即可。
+      `update_input_shaping` 是空缝——既不碰 trapq 也不碰 position function（上游 `kin_shaper.c` 的
+      `input_shaper_alloc`/`set_sk`/`update_sk` 未移植）。**两侧地基都已就绪（2026-10-21）**：
+      `StepKinematics::set_generation_window(pre, post)` 写窗口、`ToolHead::recompute_scan_windows()` 记账，
+      shaper 落地时只需按脉冲跳度写窗口并在参数变更后调一次扫描。
 - [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
 - 依赖 F5/F6/F7、C1。
 
@@ -774,8 +774,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       - **“送出口径会让 step 晚到 0.106–0.115 s”是假结论——该证据的唯一来源是假固件模型漏算首拍 `interval`**
         （`simulator.rs` 的 running 分支，已修）；修后同样的真等待复现从 11 例红变 259/0 绿。
         真机送出口径是否存在同类偏差**无任何证据**，已降为待验假设，由 R11 观察。
-      - `MIN_KIN_TIME`/`kin_flush_delay` 地板**已对齐上游**（`calc_print_time`），
-        但在本仓 `BUFFER_TIME_START = 0.250` 远大于 `MIN_KIN_TIME + KIN_FLUSH_DELAY = 0.101` 的前提下
+      - `MIN_KIN_TIME`/`kin_flush_delay` 地板**已对齐上游**（`calc_print_time`），且 `kin_flush_delay` 现在是**运行期值**
+        （2026-10-21：`ToolHead::recompute_scan_windows` 取全部 stepper 的 pre/post 最大值；常量已改名为
+        `SDS_CHECK_TIME = 1e-3` 作为地板），但在本仓 `BUFFER_TIME_START = 0.250` 远大于
+        `MIN_KIN_TIME + kin_flush_delay`（常见 PA 下 `0.001 + 0.02`）的前提下
         **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
       **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
 

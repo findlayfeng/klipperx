@@ -82,9 +82,9 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
    仍缺 `M600`（需 `[pause_resume]` 的 `RESUME` 宏组合，属配置层）。
 5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），`M400` 现在真的等
    MCU 的估计时钟追上 `print_time`（有界四条出口），`MIN_KIN_TIME`/`kin_flush_delay` 也已对齐上游；
-   仍缺 `send_wait_ack`（现只是 flush）与 `kin_flush_delay` 的**窗口记账**（`motion_queuing` 的
-   `check_step_generation_scan_windows` 未移植）——后者让「改 PA/改运动学位置」在 `hst` 内可能撞
-   `Invalid sequence`。真机未验证，见 [`TESTING.md`](TESTING.md) 的 R11。
+   仍缺 `send_wait_ack`（现只是 flush）；`kin_flush_delay` 的**扫描窗记账**已落地（2026-10-21）：
+   `ToolHead::recompute_scan_windows` 取全部 stepper 的 pre/post 最大值，地板与 trapq 历史回收都读它；
+   剩下的差距是 `smooth_time` 变更仍不 `flush_step_generation`。真机未验证，见 [`TESTING.md`](TESTING.md) 的 R11。
 6. **硬件侧**：三轴 step/dir 与 endstop 接线、挤出机与加热器接线、以及按接线写一份 config。
 
 ## 快速上手

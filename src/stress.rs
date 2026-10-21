@@ -505,30 +505,42 @@ fn summary_line(mcu: &str, kind: &str, last_good: Option<f64>, unit: &str) -> St
     tagged(mcu, format!("last rate it {kind}: {rate}"))
 }
 
-/// The same result in the upstream Benchmarks.md caliber: the **whole
-/// machine's** step rate — every stepper the ramp drove, summed — rounded to
-/// the nearest K.
+/// The step ramp's closing line: how many motors the board drove, the
+/// measured per-motor rate, and the whole machine's rate converted in
+/// parentheses.
 ///
-/// Upstream bisects `ticks` in `console.py` and publishes
-/// `steppers × freq / ticks` (its `Benchmarks.md`: "the total number of steps
-/// per second is calculated by multiplying the number of active steppers with
-/// the nominal mcu frequency and dividing by the final ticks parameter …
-/// rounded to the nearest K"). This tool measures `freq / interval` — the same
-/// physical quantity **per stepper** — so the two calibers differ by exactly
-/// the stepper count. Printing both after a step ramp keeps the measured
-/// per-stepper number and makes the run directly comparable with the published
-/// tables.
+/// `339623 steps/s × 3 motors = 1.02M steps/s` — the parenthesised number is
+/// `steppers × freq / interval`, the same quantity upstream's `Benchmarks.md`
+/// publishes as `steppers × freq / ticks` rounded to K (`interval` **is**
+/// upstream's `ticks`), so a run here can be compared with that table without
+/// the tool having to name it.
 ///
-/// `rate` is the per-stepper rate the ramp survived ([`step_stress`]'s
-/// `last_good`); `steppers` is how many the board drove at once.
-fn upstream_caliber_line(mcu: &str, steppers: usize, rate: Option<f64>) -> String {
+/// `rate` is the per-motor rate the ramp survived ([`step_stress`]'s
+/// `last_good`); `motors` is how many the board drove at once.
+fn step_summary_line(mcu: &str, motors: usize, rate: Option<f64>) -> String {
+    let plural = if motors == 1 { "" } else { "s" };
     let text = rate
-        .map(|rate| format!("{:>4.0}K steps/s", steppers as f64 * rate / 1000.0))
-        .unwrap_or_else(|| "none".to_string());
-    tagged(
-        mcu,
-        format!("upstream Benchmarks.md caliber ({steppers} steppers): {text}"),
-    )
+        .map(|rate| {
+            let total = motors as f64 * rate;
+            format!(
+                "{rate:.0} steps/s × {motors} motor{plural} ({} steps/s)",
+                compact_rate(total)
+            )
+        })
+        .unwrap_or_else(|| format!("none ({motors} motor{plural})"));
+    tagged(mcu, format!("last rate it survived: {text}"))
+}
+
+/// A step rate in readable form: exact below 1 k, `K` from there, `M` from a
+/// million — the conversion a reader does in their head anyway.
+fn compact_rate(rate: f64) -> String {
+    if rate >= 1_000_000.0 {
+        format!("{:.2}M", rate / 1_000_000.0)
+    } else if rate >= 1_000.0 {
+        format!("{:.0}K", rate / 1_000.0)
+    } else {
+        format!("{rate:.0}")
+    }
 }
 
 /// Ramp the step rate until the MCU's step timer gives out.
@@ -666,11 +678,7 @@ async fn step_stress(
                 );
                 println!(
                     "{}",
-                    summary_line(&mcu_config.name, "survived", last_good, "steps/s")
-                );
-                println!(
-                    "{}",
-                    upstream_caliber_line(&mcu_config.name, oids.len(), last_good)
+                    step_summary_line(&mcu_config.name, oids.len(), last_good)
                 );
                 return Ok(BoardOutcome::Ran);
             }
@@ -690,11 +698,7 @@ async fn step_stress(
                 // Every way the ramp ends leaves one summary line behind.
                 println!(
                     "{}",
-                    summary_line(&mcu_config.name, "survived", last_good, "steps/s")
-                );
-                println!(
-                    "{}",
-                    upstream_caliber_line(&mcu_config.name, oids.len(), last_good)
+                    step_summary_line(&mcu_config.name, oids.len(), last_good)
                 );
                 return Ok(BoardOutcome::Ran);
             }
@@ -714,7 +718,7 @@ async fn step_stress(
     );
     println!(
         "{}",
-        upstream_caliber_line(&mcu_config.name, oids.len(), last_good)
+        step_summary_line(&mcu_config.name, oids.len(), last_good)
     );
     Ok(BoardOutcome::Ran)
 }
@@ -3014,17 +3018,22 @@ mod tests {
         // The upstream caliber multiplies the per-stepper rate by the stepper
         // count and rounds to the nearest K (Benchmarks.md's formula).
         assert_eq!(
-            upstream_caliber_line("zboard", 3, Some(339_623.0)),
-            "[zboard] upstream Benchmarks.md caliber (3 steppers): 1019K steps/s"
+            step_summary_line("zboard", 3, Some(339_623.0)),
+            "[zboard] last rate it survived: 339623 steps/s × 3 motors (1.02M steps/s)"
         );
         assert_eq!(
-            upstream_caliber_line("mcu", 1, Some(145_455.0)),
-            "[mcu] upstream Benchmarks.md caliber (1 steppers):  145K steps/s"
+            step_summary_line("mcu", 1, Some(145_455.0)),
+            "[mcu] last rate it survived: 145455 steps/s × 1 motor (145K steps/s)"
         );
         assert_eq!(
-            upstream_caliber_line("mcu", 3, None),
-            "[mcu] upstream Benchmarks.md caliber (3 steppers): none"
+            step_summary_line("mcu", 3, None),
+            "[mcu] last rate it survived: none (3 motors)"
         );
+
+        // The readable conversion: exact below 1 k, K, then M.
+        assert_eq!(compact_rate(999.0), "999");
+        assert_eq!(compact_rate(339_623.0), "340K");
+        assert_eq!(compact_rate(1_018_869.0), "1.02M");
     }
 
     // -----------------------------------------------------------------------

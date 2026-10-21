@@ -22,6 +22,18 @@
 //! be cleared by a `reset`, the ramp only goes up — the result is a bracket, kept
 //! tight by making each stage a small multiple of the one before.
 //!
+//! The ramp is bounded by the machine as well as by the MCU: it only ever steps one
+//! direction and reads no position back, so on a real printer it would walk the
+//! carriage into the end of its axis. A section that names its stroke
+//! (`position_max`) beside its geometry therefore bounds how many steps the run may
+//! queue — [`TRAVEL_FRACTION`] of the tightest axis's travel — and the ramp stops
+//! there with a line saying so, because running out of room is not a step-rate
+//! answer and must not read like one. A section that names no stroke (a
+//! `manual_stepper`) leaves the ramp unbounded, which the run says once rather than
+//! stopping. Three exits are told apart: the firmware shut down (**is** the
+//! measurement), the travel bound was reached (no measurement, still a success),
+//! and the board stopped answering (a lost link, which fails the command).
+//!
 //! This is a **bench tool**, not part of the host: it takes the MCU over (the
 //! config handshake resets a board carrying a different configuration) and leaves
 //! it shut down when it finds the limit. A real `printer.cfg` is not required —
@@ -85,6 +97,14 @@ use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::ManualReactor;
 
+/// How long to give the `stress` run's runtime to shut down before giving up on
+/// it.
+///
+/// The run is done by then and only cleanup is left: each board's send/receive
+/// tasks, and the blocking port read behind them that no cancellation reaches.
+/// The same bound as `hardware_test`'s machine teardown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The first step rate to try, in steps per second.
 ///
 /// Low enough that any Klipper MCU should survive it, so the ramp starts from a
@@ -107,6 +127,14 @@ const MAX_RATE: f64 = 20_000_000.0;
 /// enough to shut the firmware down, which is what makes a marginal rate show up
 /// as a failure instead of a pass.
 const STAGE_SECONDS: f64 = 0.5;
+
+/// The share of an axis's own stroke (`position_max`) one step ramp may travel.
+///
+/// The ramp only ever steps one direction and nothing homes the machine first,
+/// so the carriage can start anywhere in the stroke. Half of it is the room a
+/// run gives itself before it stops: whatever the start, the ramp has that much
+/// travel left before either end, and the rest of the stroke stays as margin.
+const TRAVEL_FRACTION: f64 = 0.5;
 
 /// Each `queue_step` command covers about this much time.
 ///
@@ -244,7 +272,14 @@ pub fn run(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(stress(args))
+    let outcome = runtime.block_on(stress(args));
+    // A run leaves the boards' send/receive tasks (and a port whose blocking read
+    // cannot be cancelled) behind, so the runtime is taken down with a bound: the
+    // implicit `Drop` waits for blocking work for ever, which would hang the
+    // command on a port that stopped answering. The run's own result is returned
+    // as it is — the shutdown is cleanup, not a second verdict.
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    outcome
 }
 
 async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -543,6 +578,32 @@ fn compact_rate(rate: f64) -> String {
     }
 }
 
+/// What the firmware's answer after a stage means for the ramp.
+///
+/// The three are deliberately not one exit: a firmware that shut down **is** the
+/// measurement (the step rate the MCU could not hold), while a firmware that did
+/// not answer at all says nothing about its step engine — the link gave out and
+/// the run has no step-rate answer to report. Folding the two together reads a
+/// dropped cable as "the limit", and leaves the command exiting 0 on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StageVerdict {
+    /// It answered and is still running: the stage survived.
+    Survived,
+    /// It answered from its shutdown state: this rate is the limit.
+    ShutDown,
+    /// It did not answer: the link, not the step engine, gave out.
+    LinkLost(String),
+}
+
+/// Read one stage's `get_config` answer as one of [`StageVerdict`].
+fn stage_verdict(answer: Result<ConfigState, McuError>) -> StageVerdict {
+    match answer {
+        Ok(state) if state.is_shutdown => StageVerdict::ShutDown,
+        Ok(_) => StageVerdict::Survived,
+        Err(err) => StageVerdict::LinkLost(err.to_string()),
+    }
+}
+
 /// Ramp the step rate until the MCU's step timer gives out.
 ///
 /// The board drives **every** stepper section it owns: each gets its own oid
@@ -600,15 +661,57 @@ async fn step_stress(
         )
     );
 
+    // The ramp's own travel bound, worked out from the geometry the sections
+    // name: without it a real machine would be stepped into the end of its axis.
+    let travel = travel_limit(&steppers);
+    match &travel {
+        Some(limit) => println!(
+            "{}",
+            tagged(
+                &mcu_config.name,
+                format!(
+                    "travel bound: {} steps ≈ {:.1} units on [{}] ({}× its {:.1}-unit position_max); the ramp stops there",
+                    limit.steps,
+                    limit.travel(limit.steps),
+                    limit.section,
+                    TRAVEL_FRACTION,
+                    limit.stroke
+                )
+            )
+        ),
+        None => println!(
+            "{}",
+            tagged(
+                &mcu_config.name,
+                "no position_max beside a step distance on any of its steppers: the ramp has no travel bound (only a warning, not a stop) — keep the axes clear"
+            )
+        ),
+    }
+
     // The ramp is ascending and stops at the first failure: once the firmware has
     // shut down, only a `reset` clears it, so there is no going back to a lower
     // rate. The answer is the bracket between the last rate that survived and the
     // first that did not.
     let mut rate = START_RATE;
     let mut last_good: Option<f64> = None;
+    let mut queued_steps: u64 = 0;
     while rate <= MAX_RATE {
         let stage = stage_for(rate, freq, args.stage_seconds);
         let actual_rate = freq / f64::from(stage.interval);
+
+        // Stop before the carriage can reach the end of an axis: this exit is
+        // the run's own room running out, not a measured step-rate limit.
+        if let Some(line) = travel
+            .as_ref()
+            .and_then(|limit| limit.stop_line(queued_steps, &stage, actual_rate))
+        {
+            println!("{}", tagged(&mcu_config.name, line));
+            println!(
+                "{}",
+                step_summary_line(&mcu_config.name, oids.len(), last_good)
+            );
+            return Ok(BoardOutcome::Ran);
+        }
 
         // The firmware refuses `reset_step_clock` while a move is loaded
         // (`Can't reset time when stepper active`, `src/stepper.c:311`), which
@@ -634,6 +737,7 @@ async fn step_stress(
             result?;
         }
         queue_stage(&mcu, &oids, &stage).await?;
+        queued_steps = queued_steps.saturating_add(stage.steps);
 
         let wait = Duration::from_micros(stage.duration_us)
             + Duration::from_millis(20)
@@ -661,11 +765,11 @@ async fn step_stress(
         // Let the stage run out, waking early if the firmware stops.
         sleep_until(wait, &shutdown_reason).await;
 
-        match mcu
-            .call_msg::<_, ConfigState>(&GetConfig, CALL_TIMEOUT)
-            .await
-        {
-            Ok(state) if state.is_shutdown => {
+        match stage_verdict(
+            mcu.call_msg::<_, ConfigState>(&GetConfig, CALL_TIMEOUT)
+                .await,
+        ) {
+            StageVerdict::ShutDown => {
                 println!(
                     "{}",
                     tagged(
@@ -682,25 +786,31 @@ async fn step_stress(
                 );
                 return Ok(BoardOutcome::Ran);
             }
-            Ok(_) => {
+            StageVerdict::Survived => {
                 last_good = Some(actual_rate);
             }
-            Err(err) => {
+            StageVerdict::LinkLost(err) => {
+                // Not the limit: the board is unreachable, so no step rate was
+                // measured. Reported as the board's failure, which fails the
+                // command (exit code 1) — the last rate that survived is still
+                // printed for the log.
                 println!(
                     "{}",
                     tagged(
                         &mcu_config.name,
                         format!(
-                            "  no answer at {actual_rate:.0} steps/s ({err}); treating it as the limit"
+                            "  link gave out at {actual_rate:.0} steps/s ({err}): no answer from the board, so this is not a step-rate limit"
                         )
                     )
                 );
-                // Every way the ramp ends leaves one summary line behind.
                 println!(
                     "{}",
                     step_summary_line(&mcu_config.name, oids.len(), last_good)
                 );
-                return Ok(BoardOutcome::Ran);
+                return Err(format!(
+                    "the link gave out at {actual_rate:.0} steps/s ({err}); no step-rate limit was measured"
+                )
+                .into());
             }
         }
 
@@ -904,6 +1014,91 @@ struct Stage {
     steps: u64,
     /// Stage length in microseconds, as an integer so it is exactly testable.
     duration_us: u64,
+}
+
+/// How far one step ramp may carry the board's axes before it stops.
+///
+/// The ramp queues steps without reading a position back, so on a real machine
+/// nothing stops it at the end of an axis — it would keep stepping into the
+/// mechanical end. Every stepper of the board moves the same number of steps
+/// (one schedule for all of them), so the bound is kept in steps: a section
+/// that knows both its stroke (`position_max`) and its step distance fits
+/// `position_max × TRAVEL_FRACTION / step_dist` steps inside [`TRAVEL_FRACTION`]
+/// of its travel, and the tightest such section bounds the whole ramp.
+#[derive(Debug, Clone, PartialEq)]
+struct TravelLimit {
+    /// The section whose stroke set the bound.
+    section: String,
+    /// Steps the ramp may queue before that section has used its share.
+    steps: u64,
+    /// That section's `position_max`, in the axis's own units.
+    stroke: f64,
+    /// That section's step distance, in those units per step.
+    step_dist: f64,
+}
+
+impl TravelLimit {
+    /// How far `steps` come to on the bounding section, in its units.
+    fn travel(&self, steps: u64) -> f64 {
+        steps as f64 * self.step_dist
+    }
+
+    /// The line that stops the ramp before `stage`, or `None` when `stage`
+    /// still fits inside the bound.
+    ///
+    /// The wording separates this exit from the firmware's: reaching the travel
+    /// bound means the run ran out of room, not that the firmware failed to
+    /// keep up, so it must not be read as a measured limit.
+    fn stop_line(&self, queued: u64, stage: &Stage, rate: f64) -> Option<String> {
+        let after = queued.saturating_add(stage.steps);
+        (after > self.steps).then(|| {
+            format!(
+                "  stopping at {rate:.0} steps/s: the next stage would take [{}] from {:.1} to {:.1} of its {:.1} units\
+                 of travel ({}× position_max); this is the run's travel bound, not the firmware's limit",
+                self.section,
+                self.travel(queued),
+                self.travel(after),
+                self.stroke,
+                TRAVEL_FRACTION,
+            )
+        })
+    }
+}
+
+/// The travel bound for one ramp: the tightest stepper of the board, or `None`
+/// when no section names both a stroke and a step distance.
+///
+/// A `manual_stepper` (and a bare stepper section) has no `position_max`, so a
+/// board whose only steppers are like that has nothing to bound the ramp with:
+/// the caller reports that instead of stopping, because the tool cannot know
+/// where such an axis ends.
+fn travel_limit(steppers: &[StepperSource]) -> Option<TravelLimit> {
+    let mut tightest: Option<TravelLimit> = None;
+    for section in steppers {
+        let (Some(stroke), Some(step_dist)) =
+            (section.options.position_max, section.options.step_dist)
+        else {
+            continue;
+        };
+        if !(stroke > 0.0) || !(step_dist > 0.0) {
+            continue;
+        }
+        let steps = (stroke * TRAVEL_FRACTION / step_dist).floor();
+        if !steps.is_finite() {
+            continue;
+        }
+        let candidate = TravelLimit {
+            section: section.name.clone(),
+            steps: steps as u64,
+            stroke,
+            step_dist,
+        };
+        match &tightest {
+            Some(current) if current.steps <= candidate.steps => {}
+            _ => tightest = Some(candidate),
+        }
+    }
+    tightest
 }
 
 /// Work out the interval and command mix for a target rate at `freq` ticks per
@@ -2152,6 +2347,11 @@ struct StepperOptions {
     /// what the `--task motion` smoke moves by. `None` when the section carries
     /// no production geometry at all (the step task needs none).
     step_dist: Option<f64>,
+    /// `position_max`, the length of this axis's travel when the section names
+    /// one: with [`StepperOptions::step_dist`] it is what bounds how far one
+    /// step ramp may carry the carriage. `None` for a section with no stroke to
+    /// know (`manual_stepper`, a bare stepper section).
+    position_max: Option<f64>,
 }
 
 /// The pulse width upstream uses when `step_pulse_duration` is absent
@@ -2202,11 +2402,25 @@ fn read_stepper_options(
         None => (None, None),
     };
     let step_dist = read_step_dist(&config, section)?;
+    // Read for the travel bound only, and without adding a bound production does
+    // not have: a section's geometry is its own business, so a `position_max`
+    // that is not a usable length just leaves the ramp unbounded
+    // ([`travel_limit`] skips it) instead of rejecting the section.
+    let position_max = if config.has("position_max") {
+        Some(
+            config
+                .get_float("position_max", None)
+                .map_err(|err| err.to_string())?,
+        )
+    } else {
+        None
+    };
     Ok(StepperOptions {
         step_pulse_duration,
         enable_pin,
         enable_chip,
         step_dist,
+        position_max,
     })
 }
 
@@ -2677,35 +2891,83 @@ fn bind_shutdown(mcu: &Mcu, slot: &Arc<Mutex<Option<String>>>) -> Result<(), std
     Ok(())
 }
 
+/// How often [`wait_for_idle`] reads the stepper's position.
+const IDLE_POLL: Duration = Duration::from_millis(5);
+
+/// How long the reported position has to stay unchanged before the stepper
+/// counts as idle.
+///
+/// Two readings that happen to be equal are not enough: the position also stands
+/// still **before** a queued stage starts stepping, so a stage still loaded can
+/// read as idle. The position has to hold for a window longer than the poll
+/// interval (four polls) before the move is taken as finished.
+const IDLE_SETTLE: Duration = Duration::from_millis(20);
+
+/// How long [`wait_for_idle`] waits for that before it gives up.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll `position` until two answers `settle` apart are equal, giving up after
+/// `timeout`.
+///
+/// The same shape as `test_util::wait_until` (poll to a deadline, then fail
+/// loudly) for a value instead of a predicate: a stepper that never stays put is
+/// a stepper that cannot keep up, and a silent "it is idle" there would send the
+/// next `reset_step_clock` into a still-loaded move — the firmware's
+/// `Can't reset time when stepper active` shutdown, which would then be read as
+/// a step-rate limit.
+async fn wait_until_still<F, Fut>(
+    settle: Duration,
+    poll: Duration,
+    timeout: Duration,
+    mut position: F,
+) -> Result<i32, std::io::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<i32, std::io::Error>>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last: Option<i32> = None;
+    let mut still_since = Instant::now();
+    loop {
+        let current = position().await?;
+        let now = Instant::now();
+        match last {
+            Some(previous) if previous == current => {
+                if now.duration_since(still_since) >= settle {
+                    return Ok(current);
+                }
+            }
+            _ => {
+                last = Some(current);
+                still_since = now;
+            }
+        }
+        if now >= deadline {
+            return Err(std::io::Error::other(format!(
+                "the stepper's position {} did not hold still for {settle:?} within {timeout:?}; it cannot keep up",
+                last.unwrap_or(current)
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// Wait until the stepper stops moving.
 ///
 /// `reset_step_clock` shuts the firmware down if a move is still loaded
 /// (`Can't reset time when stepper active`, `src/stepper.c:311`), so the stage
 /// before it must be completely done. The reported position moves while a move is
-/// loaded and stops when none is, so two equal readings in a row mean idle.
+/// loaded and stops when none is, so idle is "the position has not changed for
+/// [`IDLE_SETTLE`]" — polled every [`IDLE_POLL`], given up on after
+/// [`IDLE_TIMEOUT`] with an error rather than silently taken as idle.
 async fn wait_for_idle(mcu: &Arc<Mcu>, oid: u8) -> Result<i32, std::io::Error> {
-    const POLL: Duration = Duration::from_millis(5);
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    let deadline = Instant::now() + TIMEOUT;
-    let mut last: Option<i32> = None;
-    loop {
-        let position = mcu
-            .call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+    wait_until_still(IDLE_SETTLE, IDLE_POLL, IDLE_TIMEOUT, || async {
+        mcu.call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
             .await
-            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
-            .pos;
-        if last == Some(position) {
-            return Ok(position);
-        }
-        last = Some(position);
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::other(
-                "the stepper never went idle after a stage; it cannot keep up",
-            ));
-        }
-        tokio::time::sleep(POLL).await;
-    }
+            .map(|answer| answer.pos)
+            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))
+    })
+    .await
 }
 
 /// Sleep for `wait`, waking early if the firmware reports a shutdown.
@@ -2890,6 +3152,188 @@ mod tests {
         assert_eq!(stage.interval, 1);
         assert_eq!(stage.count, u16::MAX);
         assert_eq!(stage.commands, MOVE_SLOTS);
+    }
+
+    /// A stepper section as [`find_steppers`] hands it over, carrying the
+    /// geometry the travel bound is worked out from.
+    fn geometry_stepper(
+        name: &str,
+        step_dist: Option<f64>,
+        position_max: Option<f64>,
+    ) -> StepperSource {
+        StepperSource {
+            name: name.to_string(),
+            step_pin: "PA0".to_string(),
+            dir_pin: "PB0".to_string(),
+            numbers: (0, 1),
+            options: StepperOptions {
+                step_pulse_duration: DEFAULT_STEP_PULSE_DURATION,
+                enable_pin: None,
+                enable_chip: None,
+                step_dist,
+                position_max,
+            },
+        }
+    }
+
+    /// A stepper is idle once its position has held still for the settle
+    /// window — not as soon as two readings match: the position also stands
+    /// still before a queued stage starts stepping, and treating that as idle is
+    /// what made `reset_step_clock` shut the firmware down.
+    #[tokio::test]
+    async fn the_stepper_is_idle_only_once_its_position_holds_still() {
+        // Three equal readings inside the window, then a move: the early match
+        // must not count as idle, and the answer is the settled position.
+        let mut reads = 0u32;
+        let position = wait_until_still(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            || {
+                reads += 1;
+                let value = if reads <= 3 { 0 } else { 500 };
+                async move { Ok(value) }
+            },
+        )
+        .await
+        .expect("the position settles after the move");
+        assert_eq!(
+            position, 500,
+            "the stage that started is never read as idle"
+        );
+        assert!(reads > 3, "the equal readings at the start were not enough");
+
+        // A position that never holds still is an error, not a silent "idle".
+        let mut moving = 0i32;
+        let err = wait_until_still(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            || {
+                moving += 1;
+                let value = moving;
+                async move { Ok(value) }
+            },
+        )
+        .await
+        .expect_err("a stepper that never stops cannot be reported as idle");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not hold still for") && message.contains("cannot keep up"),
+            "{message}"
+        );
+    }
+
+    /// The bound is the tightest section's share of its **own** stroke, in the
+    /// steps every stepper of the board moves: 0.0125 mm/step over a 300 mm
+    /// stroke allows 12 000 steps, 0.01 mm/step over 100 mm only 5 000, so the
+    /// shorter-travelling one is what stops the ramp. A section with a stroke but
+    /// no step distance (or the other way round) cannot bound anything.
+    #[test]
+    fn the_travel_bound_is_the_tightest_axes_share_of_its_stroke() {
+        let steppers = vec![
+            geometry_stepper("stepper_x", Some(0.0125), Some(300.0)),
+            geometry_stepper("stepper_y", Some(0.01), Some(100.0)),
+            geometry_stepper("manual_stepper docking", Some(0.05), None),
+            geometry_stepper("stepper_z", None, Some(250.0)),
+        ];
+        assert_eq!(
+            travel_limit(&steppers),
+            Some(TravelLimit {
+                section: "stepper_y".to_string(),
+                steps: 5_000,
+                stroke: 100.0,
+                step_dist: 0.01,
+            })
+        );
+        assert_eq!(
+            travel_limit(&steppers[2..]),
+            None,
+            "no section names both a stroke and a step distance"
+        );
+        assert_eq!(
+            travel_limit(&[]),
+            None,
+            "a board with no stepper has no bound"
+        );
+    }
+
+    /// A stage that would carry an axis past its share stops the ramp with a line
+    /// that says it is the run's room running out — not the firmware's limit —
+    /// while a stage that fits is let through and the bound itself is inclusive.
+    #[test]
+    fn the_ramp_stops_a_stage_short_of_the_travel_bound() {
+        let limit = travel_limit(&[geometry_stepper("stepper_x", Some(0.0125), Some(300.0))])
+            .expect("a stroke beside a step distance bounds the ramp");
+        assert_eq!(limit.steps, 12_000, "half of 300 mm at 0.0125 mm/step");
+
+        // 100 kHz for 0.5 s is 50 000 steps = 625 mm: past the 150 mm share at once.
+        let stage = stage_for(100_000.0, 100_000_000.0, 0.5);
+        let line = limit
+            .stop_line(0, &stage, 100_000.0)
+            .expect("the very first stage already passes the bound");
+        assert!(line.contains("stopping at 100000 steps/s"), "{line}");
+        assert!(
+            line.contains("[stepper_x] from 0.0 to 625.0 of its 300.0 units"),
+            "{line}"
+        );
+        assert!(
+            line.contains("travel bound, not the firmware's limit"),
+            "{line}"
+        );
+
+        // 1 kHz for 0.5 s is 500 steps = 6.25 mm: 11 500 queued + 500 is exactly
+        // the bound and still fits; one step more does not.
+        let small = stage_for(1_000.0, 100_000_000.0, 0.5);
+        assert_eq!(small.steps, 500);
+        assert_eq!(limit.stop_line(0, &small, 1_000.0), None);
+        assert_eq!(limit.stop_line(11_500, &small, 1_000.0), None);
+        assert!(limit.stop_line(11_501, &small, 1_000.0).is_some());
+    }
+
+    /// A shutdown and a silent link are two different answers: the first **is**
+    /// the measurement (the rate the MCU could not hold), the second says nothing
+    /// about the step engine at all. Only the silence is a failure — so only it
+    /// turns into a non-zero exit code through [`final_error`].
+    #[test]
+    fn a_shutdown_and_a_silent_link_leave_by_different_exits() {
+        use crate::core::klippy::mcu::McuCallError;
+
+        let shutdown = ConfigState {
+            is_config: true,
+            crc: 7,
+            is_shutdown: true,
+            move_count: 64,
+        };
+        let running = ConfigState {
+            is_shutdown: false,
+            ..shutdown
+        };
+
+        assert_eq!(stage_verdict(Ok(running)), StageVerdict::Survived);
+        assert_eq!(
+            stage_verdict(Ok(shutdown)),
+            StageVerdict::ShutDown,
+            "a shutdown is the limit the ramp was looking for"
+        );
+        let silent = Err(McuError::Call(McuCallError::Timeout(
+            "get_config".to_string(),
+        )));
+        assert!(
+            matches!(stage_verdict(silent), StageVerdict::LinkLost(_)),
+            "a board that stopped answering is a lost link, not a measured limit"
+        );
+
+        // The exit code follows the distinction: reaching the limit is a
+        // success, losing the link is not.
+        assert_eq!(final_error(&[], 1, 1, Task::Step), None);
+        let lost = "mcu: the link gave out at 125000 steps/s (timeout: get_config); \
+                    no step-rate limit was measured"
+            .to_string();
+        assert!(
+            final_error(&[lost], 1, 1, Task::Step).is_some(),
+            "a lost link must fail the command"
+        );
     }
 
     /// A pin registry with a chip for every named board, the way a run builds
@@ -4007,6 +4451,79 @@ mod tests {
         // Whatever the ramp finds — the fake's step model can shut down, or the
         // ramp can reach its top — a shutdown is the measurement, not an error.
         outcome.expect("the step ramp ran to the end of the command");
+    }
+
+    /// A whole `--task step` run against a `test: dict=` fake whose axis is far
+    /// too short for the ramp: the section's `position_max` (1 unit at 0.0125
+    /// units/step = 80 steps of stroke, 40 in the ramp's half) is passed by the
+    /// very first stage, so the ramp stops on the travel bound and never queues
+    /// a step. The command is still a success: running out of room is not a
+    /// firmware failure, and the run says which exit it took.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_step_ramp_stops_at_the_travel_bound_of_a_short_axis() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let path = std::env::temp_dir().join(format!(
+            "klipperx-stress-step-bound-{}.cfg",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "[mcu]\ntest: dict={}\n\n\
+                 [stepper_x]\nstep_pin: PA0\ndir_pin: PB0\n\
+                 microsteps: 16\nrotation_distance: 40\nposition_max: 1\n",
+                dict.display()
+            ),
+        )
+        .expect("the config file is written");
+        let args = Cli::try_parse_from([
+            "stress",
+            path.to_str().expect("the temp path is utf-8"),
+            "--stage-seconds",
+            "0.01",
+        ])
+        .expect("a short stage parses")
+        .stress;
+        let outcome = stress(args).await;
+        let _ = std::fs::remove_file(&path);
+
+        outcome.expect("the ramp stops short of the axis end and still succeeds");
+
+        // The same geometry through `find_steppers`: the section's own
+        // `position_max` reaches the bound, and the ramp's first stage is
+        // already past it — this is the decision the run just took.
+        let (config, _) = Config::from_text(&format!(
+            "[mcu]\ntest: dict={}\n\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PB0\n\
+             microsteps: 16\nrotation_distance: 40\nposition_max: 1\n",
+            dict.display()
+        ))
+        .expect("a fake board parses");
+        let mcu_config = resolve_mcu(&config, "mcu").expect("the [mcu] section resolves");
+        let pins = build_pin_registry(&config).expect("the pin registry builds");
+        let mcu = connect(&mcu_config)
+            .await
+            .expect("the fake board identifies");
+        let (steppers, rejected) = find_steppers(&config, "mcu", &mcu, &pins);
+        assert_eq!(
+            rejected,
+            Vec::<String>::new(),
+            "the section is a driveable one"
+        );
+        let limit = travel_limit(&steppers).expect("position_max beside the geometry bounds it");
+        assert_eq!(limit.stroke, 1.0, "the section's own position_max was read");
+        assert_eq!(limit.steps, 40, "half of 1 unit at 0.0125 units/step");
+        let stage = stage_for(
+            START_RATE,
+            mcu.clock_freq().expect("the fake has a clock"),
+            0.01,
+        );
+        assert!(
+            limit.stop_line(0, &stage, START_RATE).is_some(),
+            "the first stage already passes the bound"
+        );
     }
 
     /// A whole `--task motion` smoke against a `test: dict=` fake: identify →

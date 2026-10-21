@@ -463,9 +463,11 @@ fn test_something_on_a_real_board() {
 > 回调强持 `Arc<Heater>`，而 `teardown` 从不取消 reactor 定时器）⇒ 串口读线程 park、`fd` 不关、
 > 下一条用例会二次打开同一串口。现已按既有 `Weak` 约定断环（同修的还有 `virtual_sdcard::do_resume` 的
 > 一次性定时器）；实测：同一探针从 `5.0005s a part was leaked` → `MCU DROP mcu` + 收尾 **0.94ms**。
-> **仍剩一处同类环未修**：`api/endpoints/objects_subscribe.rs` 的定时器回调强持 `Arc<Inner>`，
-> 而 `Inner{printer, reactor}` 持住两者（环 `reactor → heap → Inner → reactor`）——影响的是
-> **API 订阅**那条路径（就地重启后旧订阅会把旧 printer 活者），见 `TODO.md` 的 S5。
+> **第三处同类环已修（2026-10-21）**：`api/endpoints/objects_subscribe.rs` 的刷新定时器回调曾强持
+> `Arc<Inner>`，而 `Inner{printer, reactor}` 持住两者（环 `reactor → 定时器堆 → Inner → reactor`；
+> `teardown` 从不取消 reactor 定时器，所以无人拆）。现改持 `Weak<Inner>`：端点成了 `Inner` 的
+> 唯一强持有者，端点一没下一次 tick 就 `upgrade()` 失败并退订定时器。钉子用例
+> `teardown_releases_the_printer_through_the_refresh_timer`（回退成 `Arc::clone` 即红）。
 
 ## 格式化与提交
 
@@ -669,7 +671,7 @@ git config core.hooksPath .githooks
 | （主机侧）`endpoints/bed_mesh_dump.rs` | 路径名、`install` 后入 `list_endpoints`、无网格回 `{}`、有网格全形状（`current_mesh` 的 name/probed_matrix/mesh_matrix/mesh_params；**`mesh_matrix` 是插值网格、`probed_matrix` 仍是实测网格**）、传 `mesh_args` 加 `calibration`、`mesh_args` 类型错拒、无 `[bed_mesh]` 节时不注册该路径（回 `No registered callback`，与上游一致）（共 7 测） |
 | （主机侧）`endpoints/objects_list.rs` | 端点路径、没有组成部分的机器列表为空、按注册顺序列出多个对象、不看参数（上游的 handler 不读任何参数） |
 | （主机侧）`endpoints/objects_query.rs` | 端点路径、`null` 取全部字段 / 列表取指定字段 / 不存在的字段回 `null`、未知对象回 `{}`（不报错）、对象名与应答的 `eventtime` 一致且真的传给了源、服务器那个 `webhooks` 对象随机器 `startup`→`ready`→`shutdown` 变化、`objects` 缺失 / 非对象 / 值非 `null` 或字符串数组分别报三种错（文本对齐上游的 `Invalid argument`）、空字段列表取空、一次查询多个对象、空 `objects` 是空 `status` |
-| （主机侧）`endpoints/objects_subscribe.rs` | 订阅请求**立即**回一份全量快照（所有请求字段都返回）、0.25 s 后只推变化的字段、无变化不推、`response_template` 包住每次推送、`null` 字段列表展开为对象当时的字段、字段从缺到有会推而一直缺不推、未知对象回 `{}` 且不推、连接关闭后下一 tick 清理并自行停掉定时器（再没有 tick）、同一连接再订阅是替换不是追加、一个定时器服务多个订阅者、注册表按路径可达、参数校验与 `objects/query` 一致、`response_template` 非对象被拒 |
+| （主机侧）`endpoints/objects_subscribe.rs` | 订阅请求**立即**回一份全量快照（所有请求字段都返回）、0.25 s 后只推变化的字段、无变化不推、`response_template` 包住每次推送、`null` 字段列表展开为对象当时的字段、字段从缺到有会推而一直缺不推、未知对象回 `{}` 且不推、连接关闭后下一 tick 清理并自行停掉定时器（再没有 tick）、同一连接再订阅是替换不是追加、一个定时器服务多个订阅者、注册表按路径可达、参数校验与 `objects/query` 一致、`response_template` 非对象被拒；**定时器回调持 `Weak<Inner>`（2026-10-21）**：强持会闭成 `reactor → 定时器堆 → Inner → reactor`，`teardown` 后旧 `Printer` 连同每个 `Mcu` 一直活到进程结束；钉子用例 `teardown_releases_the_printer_through_the_refresh_timer` 用 `Weak::upgrade().is_none()` 钉死 |
 | （主机侧）`endpoints/gcode.rs` | 五条路径名；`gcode/help` 返回扁平命令表；`gcode/script` 执行并回 `{}`；处理器错误变成**不关停 klippy** 的 `ApiError::CommandError`；缺 `script` 报 `MissingArgument`；`gcode/firmware_restart` 走到内置命令并让 `run()` 返回 `firmware_restart`；`gcode/subscribe_output` 把 `// …` 输出按模板推到连接；`gcode/restart` / `gcode/firmware_restart` 在 `gcode` 缺席时回 `{}` 并让 `run()` 返回对应结果（`test_restart_without_a_dispatcher_still_restarts`、`test_firmware_restart_without_a_dispatcher_still_restarts`）；`gcode/script` 在 `gcode` 还没注册时仍报打印机状态 |
 | （主机侧）`endpoints/emergency_stop.rs` | 请求把打印机停机并回 `{}`（上游 `emergency_stop` 语义） |
 | （主机侧）`endpoints/query_endstops.rs` | 路径是上游那条 `query_endstops/status`；无 endstop 时回空对象 |

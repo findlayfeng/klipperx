@@ -156,10 +156,23 @@ impl ObjectsSubscribe {
         if state.timer.is_some() {
             return;
         }
-        let inner = Arc::clone(&self.inner);
+        // The timer callback holds a `Weak`: a strong `Arc<Inner>` in the
+        // reactor's timer heap would close the loop `reactor → timer → Inner →
+        // reactor` (`Inner` holds both the printer and the reactor). That cycle
+        // outlives `Printer::teardown` — which drops the parts but never cancels
+        // this timer — so the printer and every part it loaded, each `Mcu`
+        // among them, would leak with it. With a `Weak` the endpoint is the only
+        // strong owner; once it is gone the next tick finds nothing to upgrade
+        // and retires the timer.
+        let weak = Arc::downgrade(&self.inner);
         let handle = self.inner.reactor.register_timer_named(
             "objects/subscribe",
-            Box::new(move |eventtime| inner.tick(eventtime)),
+            Box::new(move |eventtime| {
+                let Some(inner) = weak.upgrade() else {
+                    return None;
+                };
+                inner.tick(eventtime)
+            }),
             self.inner.reactor.monotonic() + SUBSCRIPTION_REFRESH_TIME,
         );
         state.timer = Some(handle);

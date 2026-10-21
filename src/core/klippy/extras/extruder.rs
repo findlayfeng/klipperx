@@ -44,6 +44,7 @@ use crate::core::klippy::motion::extra::ExtraAxis;
 use crate::core::klippy::motion::itersolve::{extruder_active_flags, extruder_position_fn, Axis};
 use crate::core::klippy::motion::kinematics::MoveContext;
 use crate::core::klippy::motion::plan::Move;
+use crate::core::klippy::motion::pressure_advance::ExtruderPressureAdvance;
 use crate::core::klippy::motion::queuing::MotionQueuing;
 use crate::core::klippy::motion::stepper::Stepper;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
@@ -89,12 +90,14 @@ pub struct PrinterExtruder {
     /// `motion_queue`: the extruder this stepper is bound to via
     /// `SYNC_EXTRUDER_MOTION`. `Arc` so the command handler shares the slot.
     motion_queue: Arc<Mutex<Option<String>>>,
-    /// Pressure advance, for `SET_PRESSURE_ADVANCE` and status (no motion effect
-    /// yet: the smooth filter is part of the extruder solver, H6).
+    /// Pressure advance, for `SET_PRESSURE_ADVANCE` and status, shared with the
+    /// stepper's solver: the position function adds
+    /// `pressure_advance * velocity` and smooths it over `smooth_time`
+    /// (`chelper/kin_extruder.c`).
     ///
-    /// `Arc` so the command handler can own a handle to the same slot.
-    pressure_advance: Arc<Mutex<f64>>,
-    pressure_advance_smooth_time: Arc<Mutex<f64>>,
+    /// `Arc` so the command handler and the solver own handles to the same
+    /// parameters.
+    pressure_advance: Arc<ExtruderPressureAdvance>,
     /// The machine, to find the toolhead's limits at connect.
     printer: std::sync::Weak<Printer>,
 }
@@ -161,9 +164,9 @@ impl PrinterExtruder {
             None,
             None,
         )?;
-        let pressure_advance =
+        let pressure_advance_value =
             config.get_float_bounded("pressure_advance", Some(0.0), Some(0.0), None, None, None)?;
-        let pressure_advance_smooth_time = config.get_float_bounded(
+        let smooth_time = config.get_float_bounded(
             "pressure_advance_smooth_time",
             Some(0.040),
             None,
@@ -174,12 +177,16 @@ impl PrinterExtruder {
 
         // Upstream only builds the stepper when the section names one of the
         // motor options (`kinematics/extruder.py:172-177`).
+        let pressure_advance = ExtruderPressureAdvance::new(pressure_advance_value, smooth_time);
         let stepper = if config.section().has("step_pin")
             || config.section().has("dir_pin")
             || config.section().has("rotation_distance")
         {
             let stepper = Arc::new(PrinterStepper::new(config, printer, Axis::X, false)?);
             stepper.setup_itersolve(extruder_position_fn(), extruder_active_flags());
+            // The solver smooths its position with the parameters
+            // `SET_PRESSURE_ADVANCE` writes (`kin_extruder.c:124-136`).
+            stepper.setup_pressure_advance(Arc::clone(&pressure_advance));
             // A hidden object so the stepper's own `connect` runs and builds the
             // host `Stepper` the toolhead will take.
             printer.add_object(
@@ -209,8 +216,7 @@ impl PrinterExtruder {
             trapq: Mutex::new(None),
             last_position: Mutex::new(0.0),
             motion_queue: Arc::new(Mutex::new(None)),
-            pressure_advance: Arc::new(Mutex::new(pressure_advance)),
-            pressure_advance_smooth_time: Arc::new(Mutex::new(pressure_advance_smooth_time)),
+            pressure_advance,
             printer: Arc::downgrade(printer),
         };
         extruder.register_commands(printer)?;
@@ -292,13 +298,14 @@ impl PrinterExtruder {
             }
         }
 
-        // SET_PRESSURE_ADVANCE is a per-extruder mux command; it records the
-        // value for status. The smooth filter on the solver is H6.
+        // SET_PRESSURE_ADVANCE is a per-extruder mux command; the solver reads
+        // the new parameters from the print time the extruder has planned up
+        // to (`extruder.py:67-88`).
         {
             let pa = Arc::clone(&self.pressure_advance);
-            let smooth = Arc::clone(&self.pressure_advance_smooth_time);
+            let printer = Arc::downgrade(printer);
             let handler: CommandHandler =
-                sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa, &smooth));
+                sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa, &printer));
             gcode
                 .register_mux_command_with_params(
                     "SET_PRESSURE_ADVANCE",
@@ -417,17 +424,39 @@ impl PrinterExtruder {
 /// same body against a different extruder.
 const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 
-/// `SET_PRESSURE_ADVANCE`'s body: record both values and report them
-/// (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`).
+/// `SET_PRESSURE_ADVANCE`'s body: record both values for the solver and report
+/// them (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`,
+/// `kinematics/extruder.py:93-107`; the bounds are its `minval=0.` on `ADVANCE`
+/// and `minval=0., maxval=.200` on `SMOOTH_TIME`).
+///
+/// The new value is active from the print time the extruder has already
+/// planned up to — upstream hands it to `register_lookahead_callback`, which
+/// fires with exactly that time (`extruder.py:82-86`) — so segments the step
+/// generator has stepped over keep the value they were stepped with.
 fn set_pressure_advance(
     gcmd: &GcodeCommand,
-    advance: &Arc<Mutex<f64>>,
-    smooth_time: &Arc<Mutex<f64>>,
+    pressure_advance: &Arc<ExtruderPressureAdvance>,
+    printer: &std::sync::Weak<Printer>,
 ) -> Result<(), CommandError> {
-    let value = gcmd.get_float_default("ADVANCE", *PrinterExtruder::lock(advance))?;
-    let smooth = gcmd.get_float_default("SMOOTH_TIME", *PrinterExtruder::lock(smooth_time))?;
-    *PrinterExtruder::lock(advance) = value;
-    *PrinterExtruder::lock(smooth_time) = smooth;
+    let (advance, smooth_time) = pressure_advance.values();
+    let value = gcmd.get_float_default("ADVANCE", advance)?;
+    let smooth = gcmd.get_float_default("SMOOTH_TIME", smooth_time)?;
+    if value < 0.0 {
+        return Err(CommandError::new(format!(
+            "ADVANCE must be at least 0.0, got {value}"
+        )));
+    }
+    if !(0.0..=0.200).contains(&smooth) {
+        return Err(CommandError::new(format!(
+            "SMOOTH_TIME must be between 0.0 and 0.2, got {smooth}"
+        )));
+    }
+    let print_time = printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+        .map(|toolhead| toolhead.get_last_move_time())
+        .unwrap_or(0.0);
+    pressure_advance.set(print_time, value, smooth);
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
     ));
@@ -454,25 +483,16 @@ fn forward_pressure_advance(
     if extruder.stepper.is_none() {
         return Err(active("Active extruder does not have a stepper"));
     }
-    set_pressure_advance(
-        gcmd,
-        &extruder.pressure_advance,
-        &extruder.pressure_advance_smooth_time,
-    )
+    set_pressure_advance(gcmd, &extruder.pressure_advance, &Arc::downgrade(&printer))
 }
 
 impl PrinterObject for PrinterExtruder {
     fn get_status(&self, _eventtime: f64) -> Value {
         let mut status = self.heater.get_status();
         if let Value::Object(map) = &mut status {
-            map.insert(
-                "pressure_advance".to_string(),
-                json!(*Self::lock(&self.pressure_advance)),
-            );
-            map.insert(
-                "smooth_time".to_string(),
-                json!(*Self::lock(&self.pressure_advance_smooth_time)),
-            );
+            let (pressure_advance, smooth_time) = self.pressure_advance.values();
+            map.insert("pressure_advance".to_string(), json!(pressure_advance));
+            map.insert("smooth_time".to_string(), json!(smooth_time));
             map.insert("can_extrude".to_string(), json!(self.heater.can_extrude()));
             map.insert(
                 "motion_queue".to_string(),

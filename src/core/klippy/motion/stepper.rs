@@ -9,6 +9,7 @@
 use super::itersolve::{
     cartesian_active_flags, cartesian_position_fn, Axis, AxisFlags, PositionFn, StepKinematics,
 };
+use super::pressure_advance::ExtruderPressureAdvance;
 use super::stepcompress::{HistoryStep, StepCommand, StepCompressError, StepCompressor};
 use super::trapq::Trapq;
 use crate::core::klippy::mathutil::Xyz;
@@ -115,6 +116,15 @@ impl Stepper {
     /// The solver state.
     pub fn kinematics(&self) -> &StepKinematics {
         &self.kinematics
+    }
+
+    /// Drive the solver with pressure advance (`MCU_stepper.set_stepper_kinematics`
+    /// with the extruder solver, which owns the smoothing parameters).
+    pub fn set_pressure_advance(
+        &mut self,
+        pressure_advance: std::sync::Arc<ExtruderPressureAdvance>,
+    ) {
+        self.kinematics.set_pressure_advance(pressure_advance);
     }
 
     /// The solver state, to set a position on.

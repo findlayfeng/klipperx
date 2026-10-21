@@ -572,12 +572,14 @@ M107
 SET_PRESSURE_ADVANCE [EXTRUDER=<name>] [ADVANCE=<mm>] [SMOOTH_TIME=<s>]
 ```
 
-两个参数都缺省为该挤出机的当前值；`EXTRUDER=<name>` 亦可指向 `[extruder_stepper <名>]` 段注册的同名步进（按名挂值，批 #2）。回显两行：
+两个参数都缺省为该挤出机的当前值；`EXTRUDER=<name>` 亦可指向 `[extruder_stepper <名>]` 段注册的同名步进（按名挂值，批 #2，但该节的 PA 目前只记录/上报）。回显两行：
 
 ```
 // pressure_advance: 0.050000
 // pressure_advance_smooth_time: 0.040000
 ```
+
+**新值从「已规划运动的末端」起生效**，不改写已生成的步（否则已走过的段会被回头修改）。
 
 ### ACTIVATE_EXTRUDER — 切换活动挤出机（多路键 `EXTRUDER`）
 

@@ -65,7 +65,7 @@ use crate::core::klippy::motion::itersolve::{
     cartesian_active_flags, cartesian_position_fn, AxisFlags, PositionFn, PositionPost,
     PositionUnwrap,
 };
-use crate::core::klippy::motion::{Axis, HomingInfo, Stepper};
+use crate::core::klippy::motion::{Axis, ExtruderPressureAdvance, HomingInfo, Stepper};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
@@ -256,6 +256,10 @@ pub struct PrinterStepper {
     /// to the host solver at connect. `None` for every solver upstream runs
     /// without a `post_cb` (cartesian, corexy, extruder, polar's arm/z).
     hooks: Mutex<Option<SolverHooks>>,
+    /// The pressure-advance parameters an extruder owner installed at load
+    /// (`setup_pressure_advance`), applied to the host solver at connect —
+    /// upstream's extruder solver carries them (`extruder_stepper_alloc`).
+    pressure_advance: Mutex<Option<Arc<ExtruderPressureAdvance>>>,
     /// The step pulse width in seconds, or `None` while nobody has decided
     /// (upstream `MCU_stepper._step_pulse_duration`), paired with the
     /// step-on-both-edges request a driver made (`_req_step_both_edge`).
@@ -548,6 +552,7 @@ impl PrinterStepper {
             inner: Mutex::new(None),
             solver: Mutex::new(None),
             hooks: Mutex::new(None),
+            pressure_advance: Mutex::new(None),
             pulse_duration: Mutex::new((configured_step_pulse_duration, false)),
         })
     }
@@ -589,6 +594,20 @@ impl PrinterStepper {
             .hooks
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(SolverHooks { unwrap, post });
+    }
+
+    /// Install the extruder's pressure-advance parameters on the solver this
+    /// stepper will build at connect (`extruder_set_pressure_advance`,
+    /// `kin_extruder.c:138-139`).
+    ///
+    /// Called at load by `[extruder]` with the same `Arc` its status and
+    /// `SET_PRESSURE_ADVANCE` use, so the command reaches the step generator
+    /// on its next evaluation.
+    pub fn setup_pressure_advance(&self, pressure_advance: Arc<ExtruderPressureAdvance>) {
+        *self
+            .pressure_advance
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(pressure_advance);
     }
 
     /// Millimetres per step.
@@ -822,6 +841,16 @@ impl PrinterObject for PrinterStepper {
                 stepper
                     .kinematics_mut()
                     .set_hooks(Some(hooks.unwrap), Some(hooks.post));
+            }
+            // The extruder owner's pressure-advance parameters turn the plain
+            // axis reader into the smoothed `pa_position` solver.
+            let pressure_advance = self
+                .pressure_advance
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            if let Some(pressure_advance) = pressure_advance {
+                stepper.set_pressure_advance(pressure_advance);
             }
             // Read the board's step counter and align the solver with it, as
             // upstream's `_query_mcu_position` does at connect

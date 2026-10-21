@@ -25,6 +25,7 @@ pub mod generic_cartesian;
 pub mod itersolve;
 pub mod kinematics;
 pub mod plan;
+pub mod pressure_advance;
 pub mod queuing;
 pub mod rotary_delta;
 pub mod stepcompress;
@@ -36,13 +37,15 @@ pub mod winch;
 pub use extra::ExtraAxis;
 pub use itersolve::{
     cartesian_active_flags, cartesian_position_fn, corexy_active_flags, corexy_position_fn,
-    corexz_active_flags, corexz_position_fn, extruder_position_fn, Axis, AxisFlags, StepKinematics,
+    corexz_active_flags, corexz_position_fn, extruder_position_fn, Axis, AxisFlags, SegmentWindow,
+    StepKinematics,
 };
 pub use kinematics::{
     CartesianKinematics, CartesianTransform, DeltesianHome, HomeCoord, Homing, HomingHandle,
     HomingInfo, HomingState, Kinematics, KinematicsCalibration, MoveContext, NoneKinematics,
 };
 pub use plan::{LookAheadQueue, Move, MoveLimits};
+pub use pressure_advance::ExtruderPressureAdvance;
 pub use queuing::MotionQueuing;
 pub use stepcompress::{GracePolicy, HistoryStep, StepCommand, StepCompressError, StepCompressor};
 pub use stepper::Stepper;

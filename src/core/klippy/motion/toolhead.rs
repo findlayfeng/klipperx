@@ -242,6 +242,18 @@ impl ToolHead {
         self.motion_queuing.add_stepper(stepper);
     }
 
+    /// Add a stepper that drives its own trapq (an extra axis' motor) without
+    /// re-pointing it at the main one — the half of
+    /// [`ToolHeadObject::add_extra_axis_stepper`](crate::core::klippy::extras::toolhead::ToolHeadObject::add_extra_axis_stepper)
+    /// that runs with the connection lock already held.
+    ///
+    /// [`ToolHead::add_stepper`] is for the kinematic motors, which all read the
+    /// main trapq; an extra axis' stepper was already pointed at the trapq its
+    /// axis queues into.
+    pub fn add_extra_axis_stepper(&mut self, stepper: Stepper) {
+        self.motion_queuing.add_stepper(stepper);
+    }
+
     /// Add a non-kinematic axis (the extruder).
     ///
     /// The caller owns the axis' trapq and has already pointed its stepper at
@@ -810,7 +822,20 @@ impl ToolHead {
         if let Some(kinematics) = &mut self.kinematics {
             kinematics.set_position(newpos, homing_axes);
         }
+        // Each kinematic motor is told where the toolhead is. An extra axis'
+        // stepper is left alone: it tracks its own trapq, whose positions are
+        // the axis' own (the extrusion amount), and forcing the toolhead's
+        // coordinate into it would make it step the whole gap on the next
+        // range. Upstream's `ToolHead.set_position` (`toolhead.py:383-390`)
+        // likewise only rewrites the main trapq (`trapq_set_position`).
         for stepper in self.motion_queuing.steppers_mut() {
+            if self
+                .extra_axes
+                .iter()
+                .any(|axis| axis.name() == stepper.name())
+            {
+                continue;
+            }
             stepper.set_position(newpos.into());
         }
     }

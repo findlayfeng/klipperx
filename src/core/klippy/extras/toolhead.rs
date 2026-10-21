@@ -1911,6 +1911,19 @@ impl ToolHeadObject {
             .unwrap_or(0.0)
     }
 
+    /// The MCU's estimate of the print time *now* (`MCU.estimated_print_time`),
+    /// read fresh from the source [`ToolHeadObject::connect`] installed.
+    ///
+    /// This is the clock the motion queues are read at: `motion_report` asks for
+    /// the requested position "now" with it, the way upstream's
+    /// `mcu.estimated_print_time(eventtime)` does. `None` before connect, when
+    /// nothing has dated the firmware's clock yet.
+    pub fn estimated_print_time(&self) -> Option<f64> {
+        self.lock()
+            .as_ref()
+            .map(|connected| connected.toolhead.estimated_print_time())
+    }
+
     /// Flush the look-ahead into the trapq and return the print time it reached
     /// (`toolhead.get_last_move_time()`). Before connect this is `0.0`.
     ///

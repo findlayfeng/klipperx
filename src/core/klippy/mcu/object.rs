@@ -625,6 +625,12 @@ impl McuObject {
         self.chip.print_time_to_clock(print_time)
     }
 
+    /// Convert one of this MCU's clocks back to an absolute print time, once
+    /// connected (upstream's `Mcu.clock_to_print_time`).
+    pub fn clock_to_print_time(&self, clock: i64) -> Option<f64> {
+        self.chip.clock_to_print_time(clock)
+    }
+
     /// Extend a 32-bit clock reading into this MCU's 64-bit domain.
     pub fn clock32_to_clock64(&self, clock32: u32) -> Option<i64> {
         self.chip.clock32_to_clock64(clock32)
@@ -1499,6 +1505,9 @@ impl McuObject {
     /// firmware before sending the configuration).
     fn bind_shutdown(&self, mcu: &Mcu) -> Result<(), McuError> {
         let name = self.chip.name().to_string();
+        // The clock the shutdown report is dated with (upstream extends the
+        // firmware's 32-bit reading into this MCU's 64-bit domain).
+        let clock = self.chip.clock();
 
         if !mcu.has_message(Shutdown::NAME) {
             warn!(
@@ -1511,17 +1520,30 @@ impl McuObject {
             let printer = self.printer.clone();
             let name = name.clone();
             let is_shutdown = Arc::clone(&self.is_shutdown);
+            let clock = clock.clone();
             mcu.bind_event::<Shutdown, _>(move |event| {
                 if is_shutdown.swap(true, Ordering::SeqCst) {
                     return;
                 }
+                let shutdown_clock = event.clock.and_then(|clock32| {
+                    clock
+                        .as_ref()
+                        .map(|clock| clock.clock32_to_clock64(clock32))
+                });
                 let human = match event.clock {
                     Some(clock) => {
                         format!("MCU '{name}' shutdown: {} (clock {clock})", event.reason)
                     }
                     None => format!("MCU '{name}' shutdown: {}", event.reason),
                 };
-                report_mcu_shutdown(&printer, &name, &event.reason, "shutdown", &human);
+                report_mcu_shutdown(
+                    &printer,
+                    &name,
+                    &event.reason,
+                    "shutdown",
+                    shutdown_clock,
+                    &human,
+                );
             })?;
         }
         if mcu.has_message(IsShutdown::NAME) {
@@ -1531,7 +1553,7 @@ impl McuObject {
             mcu.bind_event::<IsShutdown, _>(move |event| {
                 is_shutdown.store(true, Ordering::SeqCst);
                 let human = format!("MCU '{name}' is shutdown: {}", event.reason);
-                report_mcu_shutdown(&printer, &name, &event.reason, "is_shutdown", &human);
+                report_mcu_shutdown(&printer, &name, &event.reason, "is_shutdown", None, &human);
             })?;
         }
         if mcu.has_message(Starting::NAME) {
@@ -2003,22 +2025,27 @@ fn report_shutdown(printer: &Weak<Printer>, msg: &str) {
 
 /// Report an MCU-halted stop the way upstream's `_handle_shutdown` does
 /// (`klippy/mcu.py:813-825`): the generic message `"MCU shutdown"` plus the
-/// details `error_mcu` needs to build the user-facing text.
+/// details `error_mcu` needs to build the user-facing text and `motion_report`
+/// needs to window its queues around the stop.
 fn report_mcu_shutdown(
     printer: &Weak<Printer>,
     name: &str,
     reason: &str,
     event_type: &str,
+    shutdown_clock: Option<i64>,
     human: &str,
 ) {
     warn!("{human}");
     if let Some(printer) = printer.upgrade() {
+        // `shutdown_clock` is upstream's detail of the same name: the print-time
+        // diagnostics in `motion_report` window the queues around it.
         printer.invoke_shutdown_with(
             "MCU shutdown",
             HashMap::from([
                 ("reason".to_string(), json!(reason)),
                 ("mcu".to_string(), json!(name)),
                 ("event_type".to_string(), json!(event_type)),
+                ("shutdown_clock".to_string(), json!(shutdown_clock)),
             ]),
         );
     }

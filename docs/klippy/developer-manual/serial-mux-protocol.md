@@ -442,7 +442,7 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
 
 一条共享串口路径（`by-id` 软链）在 USB 板复位后会指向**新的**设备节点，而已打开的描述符仍在旧节点上——写它只会得到 `EIO`。本仓的两层处理（2026-10-19，真机 R3 现场验证）：
 
-1. **判定失效**：`port_registry` 的复用判据是「未停机 **且** 路径当前解析到的 `(dev, ino)` 与已打开描述符一致」（`serial.rs` 的 `same_file`）。不一致 ⇒ 该条目不再算这条路径的端口，按需重开（旧端口继续服务仍持有它的引用）。
+1. **判定失效**：`port_registry` 的复用判据是「未停机 **且** 路径当前解析到的 `(dev, ino)` 与已打开描述符一致」（`serial.rs` 的 `same_file`）。不一致 ⇒ 该条目不再算这条路径的端口，按需重开（旧端口继续服务仍持有它的引用）。**读不到元数据时返回“同一文件”（判不了就沿用）**：`/dev/serial/by-id/*` 正被 udev 重建时，旧行为会把健康的 port 当成失效、同一 tty 上起第二个 reader。
 2. **attach 重试**：`attach` 在握手失败且端口已失效时重开（`ATTACH_REOPEN_ATTEMPTS = 4` × `ATTACH_REOPEN_DELAY = 250 ms`）；写错误本身不重试，因为失效描述符再写多少次都还是 `EIO`。
 
 实测：改一次配置 → 宿主 `reset` 板子 → USB 重新枚举（`ttyACM0 → ttyACM1`）→ 同一进程内重连成功（此前是 `serial write … Input/output error (os error 5)` 直接失败）。

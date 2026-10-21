@@ -7,7 +7,8 @@
 //! |---|---|---|
 //! | the panel | `lcd_type` picks a [`LcdChip`] | `display.py:16-22`, `:181` |
 //! | `[display_status]` | created on demand, whether or not the config names it | `display.py:188` |
-//! | the menu keys | the options are read, no menu is built | `menu.py:688-722`, `menu_keys.py:12-43` |
+//! | the menu | [`MenuManager`](super::menu::MenuManager), on the primary display only | `display.py:180-190` |
+//! | the menu keys | registered as buttons by the manager | `menu_keys.py:12-43` |
 //! | templates | the shipped `display.cfg` is merged into the `display_template` registry | `display.py:115-166` |
 //! | layouts | `display_data` groups | `display.py:56-87` |
 //! | glyphs | `display_glyph` sections | `display.py:103-114` |
@@ -31,8 +32,10 @@
 //!
 //! # What is not here
 //!
-//! * **Rendering and the menu.** See the parent module's docs; the panel is
-//!   cleared and flushed every `REDRAW_TIME`, and nothing is drawn.
+//! * **Rendering.** See the parent module's docs; the panel is cleared and
+//!   flushed every `REDRAW_TIME`, and nothing is drawn. The menu is wired in
+//!   (`MenuManager`), but its rows are computed, not painted — there is no
+//!   `draw_text`.
 //! * **`draw_text` / `draw_progress_bar`** (`display.py:247-264`): they are the
 //!   drawing half of a render step that does not run.
 //! * **The `display_template` parameter check.** Upstream raises `Invalid
@@ -62,6 +65,7 @@ use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
 use super::aip31068_spi::Aip31068Spi;
 use super::hd44780::Hd44780;
+use super::menu::MenuManager;
 use super::hd44780_spi::Hd44780Spi;
 use super::ssd1306::Ssd1306;
 use super::st7920::ST7920;
@@ -210,6 +214,8 @@ pub struct PrinterLCD {
     show_data_group: Mutex<String>,
     /// The template registry (`display.py:191`).
     display_templates: Arc<DisplayTemplates>,
+    /// The menu, on the primary display only (`display.py:184-188`).
+    menu: Mutex<Option<Arc<MenuManager>>>,
     /// The reactor the refresh timer lives on.
     reactor: Arc<dyn Reactor>,
     /// The refresh timer, registered at ready.
@@ -253,9 +259,9 @@ impl PrinterLCD {
         };
 
         // The `[display]` section is the only section that registers a display
-        // (`display.py:185-187`); the menu-key options below are therefore
-        // always read.
-        let _menu = read_menu_options(config)?;
+        // (`display.py:185-187`); the menu is therefore always built, and its
+        // key options are always read.
+        let menu_options = read_menu_options(config)?;
 
         ensure_display_status(printer)?;
 
@@ -280,12 +286,21 @@ impl PrinterLCD {
             display_data_groups,
             show_data_group: Mutex::new(dgroup),
             display_templates,
+            menu: Mutex::new(None),
             reactor: printer.reactor(),
             timer: Mutex::new(None),
             redraw_request_pending: AtomicBool::new(false),
             redraw_time: Mutex::new(0.0),
             self_ref: weak.clone(),
         });
+
+        // The menu is built after the panel, because it reads the panel's
+        // dimensions (`menu.py:704`).
+        let menu = MenuManager::new(config, printer, &menu_options, &display)?;
+        *display
+            .menu
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(menu);
 
         let ready = Arc::downgrade(&display);
         printer.register_event_handler(
@@ -355,15 +370,23 @@ impl PrinterLCD {
 
     /// One refresh (`display.py:222-241`).
     ///
-    /// Upstream renders the active group here and swallows whatever the render
-    /// raises; this host has no renderer, so the panel is blanked and flushed
-    /// and the group's items are left in [`PrinterLCD::display_data_groups`].
+    /// The menu is asked first, exactly as upstream: while it is open it owns
+    /// the screen and the group is not drawn. Neither half draws yet (module
+    /// docs), so the panel is cleared and flushed either way.
     fn screen_update_event(&self, eventtime: f64) -> Option<f64> {
         if self.redraw_request_pending.swap(false, Ordering::SeqCst) {
             *self.redraw_time.lock().unwrap_or_else(|p| p.into_inner()) =
                 eventtime + REDRAW_MIN_TIME;
         }
         self.lcd_chip.clear();
+        // `display.py:227-231`: the menu redraws the screen and asks for the
+        // regular period.
+        if let Some(menu) = self.menu() {
+            if menu.screen_update_event(eventtime) {
+                self.lcd_chip.flush();
+                return Some(eventtime + REDRAW_TIME);
+            }
+        }
         self.lcd_chip.flush();
         if self.redraw_request_pending.load(Ordering::SeqCst) {
             return Some(
@@ -408,6 +431,28 @@ impl PrinterLCD {
     /// The template registry this display reads.
     pub fn display_templates(&self) -> &Arc<DisplayTemplates> {
         &self.display_templates
+    }
+
+    /// The menu this display owns, if it was built.
+    pub fn menu(&self) -> Option<Arc<MenuManager>> {
+        self.menu
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// The panel's size in characters (`display.py:215-216`).
+    pub fn get_dimensions(&self) -> (usize, usize) {
+        self.lcd_chip.get_dimensions()
+    }
+
+    /// Ask for a redraw sooner than the next period (`request_redraw`,
+    /// `display.py:242-246`).
+    pub fn request_redraw(&self) {
+        if self.redraw_request_pending.load(Ordering::SeqCst) {
+            return;
+        }
+        self.redraw_request_pending.store(true, Ordering::SeqCst);
     }
 
     /// Every message the panel has handed to the firmware.
@@ -458,26 +503,63 @@ pub fn load_config(
 // The menu options
 // ===========================================================================
 
-/// What the menu options were read into. Nothing consumes them: the menu is not
-/// built (module docs), so the values only prove the section was read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the menu reads off the `[display]` section (`menu.py:689-722`).
+#[derive(Debug, Clone, PartialEq)]
 pub struct MenuOptions {
     /// `menu_timeout` (`menu.py:703`).
     pub timeout: i64,
     /// `menu_reverse_navigation` (`menu.py:705-707`).
     pub reverse_navigation: bool,
+    /// `menu_root`: the container the menu opens at (`menu.py:701`).
+    pub root: String,
+    /// The key options `menu_keys.py` reads.
+    pub keys: MenuKeysOptions,
 }
 
-/// Read the options the menu would consume.
+/// The key options (`MenuKeys.__init__`, `menu_keys.py:13-43`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MenuKeysOptions {
+    /// `encoder_pins`, as the two pin names written (`menu_keys.py:20-31`).
+    pub encoder_pins: Option<(String, String)>,
+    /// `encoder_steps_per_detent`: 2 or 4 (`menu_keys.py:21-22`).
+    pub encoder_steps_per_detent: u8,
+    /// `encoder_fast_rate`: the gap under which two ticks are a fast turn
+    /// (`menu_keys.py:32`).
+    pub encoder_fast_rate: f64,
+    /// `click_pin` (`menu_keys.py:38`).
+    pub click_pin: Option<String>,
+    /// `back_pin` (`menu_keys.py:40`).
+    pub back_pin: Option<String>,
+    /// `up_pin` (`menu_keys.py:41`).
+    pub up_pin: Option<String>,
+    /// `down_pin` (`menu_keys.py:42`).
+    pub down_pin: Option<String>,
+    /// `kill_pin` (`menu_keys.py:43`).
+    pub kill_pin: Option<String>,
+}
+
+impl MenuKeysOptions {
+    /// The pin an option name holds, when it is set.
+    pub fn pin(&self, option: &str) -> Option<String> {
+        match option {
+            "click_pin" => self.click_pin.clone(),
+            "back_pin" => self.back_pin.clone(),
+            "up_pin" => self.up_pin.clone(),
+            "down_pin" => self.down_pin.clone(),
+            "kill_pin" => self.kill_pin.clone(),
+            _ => None,
+        }
+    }
+}
+
+/// Read the options the menu consumes.
 ///
 /// Upstream reads them in `MenuManager.__init__` (`menu.py:689-722`) and
-/// `MenuKeys.__init__` (`menu_keys.py:13-43`); with no menu here, they are read
-/// because `check_unused` requires a reader for every option a config writes —
-/// `menu_timeout` and `menu_reverse_navigation` are in the corpus.
+/// `MenuKeys.__init__` (`menu_keys.py:13-43`); the manager here takes this
+/// struct, so the section is read once.
 ///
-/// The pins are read but never resolved: the buttons registry they would be
-/// registered with takes callbacks for a menu that does not exist, and a menu
-/// key does nothing on its own.
+/// The pins are read but not resolved: a pin string is handed to the buttons
+/// registry as written, as upstream hands it to `buttons.register_button*`.
 ///
 /// # Errors
 /// Upstream's wording: an unparseable `encoder_pins` (`Unable to parse
@@ -487,18 +569,25 @@ pub struct MenuOptions {
 pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigError> {
     let identifier = config.identifier();
     // `MenuManager.__init__` (`menu.py:689-722`).
-    let _menu_root = config.get("menu_root", Some("__main"))?;
+    let root = config.get("menu_root", Some("__main"))?;
     let timeout = config.get_int("menu_timeout", Some(0))?;
     let reverse_navigation = config.get_bool("menu_reverse_navigation", Some(false))?;
 
     // `MenuKeys.__init__` (`menu_keys.py:13-43`).
-    if let Some(pins) = config.get_str("encoder_pins") {
-        if pins.split(',').count() != 2 {
-            return Err(ConfigError::new("Unable to parse encoder_pins".to_string()));
+    let encoder_pins = match config.get_str("encoder_pins") {
+        None => None,
+        Some(pins) => {
+            let mut parts = pins.split(',');
+            let first = parts.next().unwrap_or("").trim().to_string();
+            match (parts.next().map(str::trim), parts.next()) {
+                (Some(second), None) => Some((first, second.to_string())),
+                _ => return Err(ConfigError::new("Unable to parse encoder_pins".to_string())),
+            }
         }
-    }
-    config.get_choice("encoder_steps_per_detent", &["2", "4"], Some("4"))?;
-    config.get_float_bounded(
+    };
+    let detent = config.get_choice("encoder_steps_per_detent", &["2", "4"], Some("4"))?;
+    let encoder_steps_per_detent = detent.parse::<u8>().unwrap_or(4);
+    let encoder_fast_rate = config.get_float_bounded(
         "encoder_fast_rate",
         Some(0.030),
         None,
@@ -509,9 +598,20 @@ pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigEr
 
     // `MenuKeys.register_button` (`menu_keys.py:45-61`): the button pins, each
     // optionally paired with an analog range and a pull-up resistor.
+    let click_pin = config.get_str("click_pin");
+    let back_pin = config.get_str("back_pin");
+    let up_pin = config.get_str("up_pin");
+    let down_pin = config.get_str("down_pin");
+    let kill_pin = config.get_str("kill_pin");
     let mut analog = false;
-    for option in ["click_pin", "back_pin", "up_pin", "down_pin", "kill_pin"] {
-        if config.get_str(option).is_none() {
+    for (option, pin) in [
+        ("click_pin", &click_pin),
+        ("back_pin", &back_pin),
+        ("up_pin", &up_pin),
+        ("down_pin", &down_pin),
+        ("kill_pin", &kill_pin),
+    ] {
+        if pin.is_none() {
             continue;
         }
         let range = format!("analog_range_{option}");
@@ -533,6 +633,17 @@ pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigEr
     Ok(MenuOptions {
         timeout,
         reverse_navigation,
+        root,
+        keys: MenuKeysOptions {
+            encoder_pins,
+            encoder_steps_per_detent,
+            encoder_fast_rate,
+            click_pin,
+            back_pin,
+            up_pin,
+            down_pin,
+            kill_pin,
+        },
     })
 }
 
@@ -962,7 +1073,18 @@ mod tests {
             options,
             MenuOptions {
                 timeout: 40,
-                reverse_navigation: true
+                reverse_navigation: true,
+                root: "__main".to_string(),
+                keys: MenuKeysOptions {
+                    encoder_pins: Some(("^PC4".to_string(), "^PC6".to_string())),
+                    encoder_steps_per_detent: 2,
+                    encoder_fast_rate: 0.030,
+                    click_pin: Some("^!PC2".to_string()),
+                    back_pin: None,
+                    up_pin: Some("^PA0".to_string()),
+                    down_pin: None,
+                    kill_pin: Some("^!PG0".to_string()),
+                },
             }
         );
         for option in [

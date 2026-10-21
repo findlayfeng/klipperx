@@ -565,8 +565,8 @@
 > ③ ~~`mesh_matrix` 当前等于 `probed_matrix`~~ **已闭合（2026-10-06，`07072b9`）**：`mesh_matrix` 现在是
 > 插值后的 6 位小数网格（默认 `mesh_pps: 2` 把 2×2 探测点插成 4×4）；`mesh_params.algo` 报的是
 > `_verify_algorithm` 校验（并可能改写）后的值——两轴 `mesh_pps` 全 0 时它会被改写为 `direct`。
-> ④ `profiles` 恒为 `{}`（`BED_MESH_PROFILE` 未做）；`current_mesh.name` 报 `default`
-> （上游 `PROFILE` 默认值）。
+> ④ ~~`profiles` 恒为 `{}`~~ **已闭合（2026-10-19）**：profile 命令族落地后，`profiles` 读的是 profile manager 的真实表（与 `bed_mesh` 对象的 `get_status().profiles` 同一个 map）；`current_mesh.name` 报 `default`（上游 `PROFILE` 默认值）。
+> ⑦ **`current_mesh.mesh_params` 的语义（2026-10-21）**：报的是**已装载网格**的探测点包围盒与计数——`BED_MESH_PROFILE LOAD=` 一份不同尺寸的 profile 后，这里跟着变；`calibration.config.mesh_min/mesh_max` 仍是**配置值**（上游 `dump_calibration` 同样如此）。
 > ⑤ ~~圆床的行按实测返回（可能非方阵）~~ **已闭合（2026-10-06，`07072b9`）**：圆床行按上游补齐成方阵。
 > ⑥ 请求参数只有 `mesh_args`（参数表无 profile 名键，profile 名只出现在 `current_mesh.name`）。
 

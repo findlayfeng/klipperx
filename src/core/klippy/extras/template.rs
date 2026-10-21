@@ -1101,113 +1101,10 @@ fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
 /// — the `\|printf` filter those calls name.
 ///
 /// Its one Python rule is the one the `%` spelling has: an integer conversion
-/// code (`d`, `i`, `u`, `o`, `x`, `X`) takes a float and truncates it toward
-/// zero (`"%d" % 2.7` is `"2"`, `"%d" % -2.7` is `"-2"`).
-///
-/// The `\|format` filter the rewrite used to emit carries the same rule from
-/// the menu's own tags ([`filter_format`], `menu.cfg:118`); the two exist side
-/// by side because that one is the port's older spelling and this one names the
-/// `%` spelling the rewrite produces. Neither touches Python's *other* spelling:
-/// `"{:d}".format(2.7)` still raises, which is [`string_method`]'s `format`.
-fn filter_printf(
-    state: &State,
-    format_str: &MjValue,
-    format_args: Rest<MjValue>,
-) -> Result<MjValue, MjError> {
-    let Rest(values) = format_args;
-    let values = printf_int_coercions(format_str.as_str().unwrap_or_default(), values);
-    minijinja::filters::format(state, format_str, Rest(values))
-}
-
-/// The floats a printf format reads with an integer code, truncated the way
-/// Python truncates them; every other argument is handed on unchanged.
-fn printf_int_coercions(format: &str, values: Vec<MjValue>) -> Vec<MjValue> {
-    let mut values = values;
-    for (index, conversion) in printf_argument_codes(format).into_iter().enumerate() {
-        let Some(code) = conversion else {
-            continue;
-        };
-        if !matches!(code, 'd' | 'i' | 'u' | 'o' | 'x' | 'X') {
-            continue;
-        }
-        let Some(value) = values.get_mut(index) else {
-            continue;
-        };
-        if value.kind() != ValueKind::Number {
-            continue;
-        }
-        // An integral float (`0.0`) is still a float, and the engine's
-        // `as_i64` answers one — so the value's JSON form is what tells the two
-        // apart, and only a float is truncated.
-        let Ok(Value::Number(number)) = serde_json::to_value(&*value) else {
-            continue;
-        };
-        if !number.is_f64() {
-            continue;
-        }
-        let Some(floating) = number.as_f64() else {
-            continue;
-        };
-        // Python truncates toward zero. A float past `i64`'s range saturates
-        // here rather than failing: the formatting still renders.
-        *value = MjValue::from(floating.trunc() as i64);
-    }
-    values
-}
-
-/// The conversion code each argument of a printf format is read by, in order:
-/// `None` for a `*` width or precision (which takes an argument too), `Some`
-/// for the code of the conversion it belongs to. `%%` takes no argument.
-///
-/// A `*` width is scanned even though the engine's `format` filter refuses that
-/// spec: the scan has to stay in step with the arguments, or a later integer
-/// code would truncate the wrong one.
-fn printf_argument_codes(format: &str) -> Vec<Option<char>> {
-    let chars: Vec<char> = format.chars().collect();
-    let mut conversions = Vec::new();
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] != '%' {
-            i += 1;
-            continue;
-        }
-        i += 1;
-        if chars.get(i) == Some(&'%') {
-            i += 1;
-            continue;
-        }
-        while matches!(chars.get(i), Some('#' | '0' | '-' | ' ' | '+')) {
-            i += 1;
-        }
-        if chars.get(i) == Some(&'*') {
-            conversions.push(None);
-            i += 1;
-        } else {
-            while chars.get(i).is_some_and(char::is_ascii_digit) {
-                i += 1;
-            }
-        }
-        if chars.get(i) == Some(&'.') {
-            i += 1;
-            if chars.get(i) == Some(&'*') {
-                conversions.push(None);
-                i += 1;
-            } else {
-                while chars.get(i).is_some_and(char::is_ascii_digit) {
-                    i += 1;
-                }
-            }
-        }
-        while matches!(chars.get(i), Some('h' | 'l' | 'L')) {
-            i += 1;
-        }
-        if let Some(code) = chars.get(i).copied() {
-            conversions.push(Some(code));
-            i += 1;
-        }
-    }
-    conversions
-}
+/// code (`d`, `i`, `u`, `o`, `x`, `X`, `c`) takes a float and truncates it
+/// toward zero (`"%d" % 2.7` is `"2"`, `"%d" % -2.7` is `"-2"`). It does not
+/// touch Python's *other* spelling: `"{:d}".format(2.7)` still raises, which is
+/// [`string_method`]'s `format`.
 
 // ===========================================================================
 // The environment
@@ -1237,7 +1134,6 @@ fn environment() -> Environment<'static> {
     env.add_filter("float", filter_float);
     env.add_filter("min", filter_min);
     env.add_filter("max", filter_max);
-    env.add_filter("format", filter_format);
     env.add_filter("printf", filter_printf);
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
@@ -1428,7 +1324,7 @@ fn filter_max(value: MjValue) -> Result<MjValue, MjError> {
 /// argument each `%d`/`%i`/`%u`/`%o`/`%x`/`%X`/`%c` conversion consumes is
 /// truncated to an integer first. An argument that is already an integer is
 /// passed through untouched.
-fn filter_format(
+fn filter_printf(
     state: &State,
     format_str: &MjValue,
     args: Rest<MjValue>,
@@ -4329,7 +4225,7 @@ STEPPER_RELEASE";
         // …while both printf filters truncate it, each from its own spelling:
         // `|format` for the menu's own tags (`menu.cfg:118`), `|printf` for the
         // calls `rewrite_printf_formatting` produces.
-        assert_eq!(ok(r#"{"%d"|format(2.7)}"#), "2");
+        assert_eq!(ok(r#"{"%d"|printf(2.7)}"#), "2");
         assert_eq!(ok(r#"{"%d"|printf(2.7)}"#), "2");
     }
 

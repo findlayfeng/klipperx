@@ -350,6 +350,25 @@ mod tests {
                 Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
             )
             .expect("gcode registers");
+        // The button's pin has to resolve at load time: `[buttons]` resolves it
+        // through the `pins` registry and fails the section when it cannot
+        // (upstream's `ppins.lookup_pin`, `buttons.py:309-336`), so the machine
+        // these tests load into needs that registry and one chip — as every
+        // real machine has.
+        let pins = Arc::new(crate::core::klippy::pins::PrinterPins::new());
+        printer
+            .add_object(
+                crate::core::klippy::pins::PINS_OBJECT,
+                Arc::clone(&pins) as Arc<dyn PrinterObject>,
+            )
+            .expect("the pins registry registers");
+        let chip = crate::core::klippy::mcu::McuChip::new(
+            "mcu".to_string(),
+            Arc::new(crate::core::klippy::mcu::ConfigBuilder::new()),
+            Arc::clone(&pins),
+        );
+        pins.register_chip("mcu", Arc::new(chip))
+            .expect("the main chip registers");
         printer.send_event(&KlippyEvent::KlippyReady);
         printer
     }

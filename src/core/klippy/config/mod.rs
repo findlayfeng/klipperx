@@ -608,13 +608,24 @@ impl Config {
         }
 
         let mut matches: Vec<PathBuf> = Vec::new();
-        match glob::glob(pattern) {
+        // A leading `.` in the pattern's last segment is literal in Python's
+        // `glob` (`*.cfg` skips `.hidden.cfg`, `.*.cfg` matches it). The crate
+        // can drop hidden entries, but it would drop them for the literal case
+        // too — so the rule is applied to the matches instead.
+        let last_segment = pattern.rsplit('/').next().unwrap_or(pattern);
+        let leading_dot_is_literal = !last_segment.starts_with('.');
+        // `require_literal_separator` is forced on by the filesystem glob: a
+        // `*` never crosses `/`, which is upstream's non-recursive `glob.glob`.
+        match glob::glob_with(pattern, glob::MatchOptions::new()) {
             Ok(paths) => {
                 for entry in paths {
                     // Upstream's `glob.glob` skips entries it cannot stat, so a
                     // directory the user cannot read narrows the set instead of
                     // failing the config load.
                     if let Ok(path) = entry {
+                        if leading_dot_is_literal && is_hidden(&path) {
+                            continue;
+                        }
                         matches.push(path);
                     }
                 }
@@ -645,6 +656,12 @@ impl Config {
 /// judges it (`*`, `?` or an opening `[`)?
 fn has_glob_magic(pattern: &str) -> bool {
     pattern.contains(['*', '?', '['])
+}
+
+/// Is the file name this path ends in hidden (a leading dot)?
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
 }
 
 impl Default for Config {
@@ -1391,6 +1408,34 @@ mod include_glob_tests {
         assert_eq!(
             config.get_section("printer").unwrap().get_str("kinematics"),
             Some("none")
+        );
+    }
+
+    /// `*` does not match a leading dot — Python's `glob` reads a leading `.`
+    /// as literal, so a `.hidden.cfg` beside the matches stays out.
+    #[test]
+    fn a_glob_include_does_not_pick_up_a_dotfile() {
+        let dir = TempDir::new("dotfile");
+        write(&dir.path(), ".hidden.cfg", "[glob_dot]\nhidden: 1\n");
+        write(&dir.path(), "shown.cfg", "[glob_shown]\nshown: 1\n");
+        let root = write(&dir.path(), "main.txt", "[include *.cfg]\n");
+
+        let (config, sources) = Config::from_file(&root).expect("the config parses");
+
+        assert!(config.get_section("glob_shown").is_some());
+        assert!(
+            config.get_section("glob_dot").is_none(),
+            "upstream's glob skips a leading dot"
+        );
+        assert_eq!(sources.len(), 2, "root plus the one non-hidden match");
+
+        // A pattern whose last segment starts with `.` is a literal dot: it
+        // does match the hidden file.
+        let dot_root = write(&dir.path(), "dots.txt", "[include .hidden.*]\n");
+        let (dot_config, _) = Config::from_file(&dot_root).expect("the dot pattern parses");
+        assert!(
+            dot_config.get_section("glob_dot").is_some(),
+            "a literal leading dot matches"
         );
     }
 

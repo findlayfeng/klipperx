@@ -979,12 +979,9 @@ mod tests {
     async fn test_a_ninth_pin_starts_a_second_firmware_object() {
         let world = world();
         for index in 0..9 {
-            world.buttons.register_buttons(
-                vec![format!("PA{index}")],
-                Box::new(move |_, _| {
-                    let _ = index;
-                }),
-            );
+            world
+                .buttons
+                .register_buttons(vec![format!("PA{index}")], Box::new(|_, _| {}));
         }
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));

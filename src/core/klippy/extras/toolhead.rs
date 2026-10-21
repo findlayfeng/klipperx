@@ -97,6 +97,7 @@ use crate::core::klippy::extras::carriage::{self, KinematicStepper};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
+use crate::core::klippy::extras::idex_modes::DUAL_CARRIAGE_OBJECT;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
@@ -1288,6 +1289,25 @@ impl PrinterObject for ToolHeadObject {
                     stepper.name().to_string(),
                     Arc::clone(stepper.mcu_stepper()),
                 );
+            }
+
+            // IDEX: the `[dual_carriage]` section's motor is a rail of the
+            // cartesian kinematics upstream — appended to `CartKinematics.rails`
+            // (`kinematics/cartesian.py:28-30`) and pointed at the main trapq
+            // with every other rail (`:37-38`) — so it joins the same set as the
+            // `[stepper_*]` rails. Gated on the claim: the bare section loads for
+            // every kinematics here, while upstream builds the carriage rail
+            // only inside `CartKinematics` (module docs of `idex_modes`).
+            if let Some(module) = self.printer.upgrade().and_then(|printer| {
+                printer.lookup_object_as::<idex_modes::DualCarriageModule>(DUAL_CARRIAGE_OBJECT)
+            }) {
+                if module.claimed_primary_rail().is_some() {
+                    let host = module.take_stepper().ok_or_else(|| {
+                        config_error("dual_carriage is not connected".to_string())
+                    })?;
+                    mcu_steppers.insert(host.name().to_string(), module.mcu_stepper());
+                    host_steppers.push(host);
+                }
             }
 
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;
@@ -2572,8 +2592,8 @@ impl ToolHeadObject {
     /// answers `Must home axis first`.
     ///
     /// A `stepper_name` the toolhead's motion queue does not hold — a
-    /// `[manual_stepper]` that has not taken a first `MOVE=` yet, or the IDEX
-    /// second carriage, which never joins the queue in this port — carries the
+    /// `[manual_stepper]` that has not taken a first `MOVE=` yet, or a
+    /// `[dual_carriage]` under a kinematics that does not claim it — carries the
     /// move on the timeline only, with a warning: nothing would generate its
     /// steps. See [`warn_unwired_stepper`] for why that is a warning rather
     /// than an error.
@@ -2825,19 +2845,20 @@ async fn flush_step_generation(state: &Arc<Mutex<Option<Connected>>>) -> Result<
 /// **Why this is a warning and not an error**: upstream's `STEPPER_BUZZ` is
 /// legal G-code for every registered stepper, and the upstream corpus exercises
 /// exactly that on a carriage this port cannot drive —
-/// `test/klippy/dual_carriage.test:49` and
-/// `hybrid_corexy_dual_carriage.test:42` run `STEPPER_BUZZ STEPPER=dual_carriage`
-/// and require it to succeed. Upstream gets steps there because every
-/// `MCU_stepper` allocates a syncemitter in `motion_queuing` as it is built
-/// (`klippy/stepper.py:50-56`), so its flush generates all of them; this port's
-/// queue holds the toolhead's and the extruders' steppers plus the ones
-/// [`ToolHeadObject::add_extra_axis_stepper`] installs, and a
+/// `test/klippy/hybrid_corexy_dual_carriage.test:42` runs `STEPPER_BUZZ
+/// STEPPER=dual_carriage` and requires it to succeed. Upstream gets steps there
+/// because every `MCU_stepper` allocates a syncemitter in `motion_queuing` as it
+/// is built (`klippy/stepper.py:50-56`), so its flush generates all of them;
+/// this port's queue holds the toolhead's and the extruders' steppers plus the
+/// ones [`ToolHeadObject::add_extra_axis_stepper`] installs, and a
 /// [`manual_stepper`](crate::core::klippy::extras::manual_stepper) installs
-/// there on its first `MOVE=`. The IDEX second carriage never does, which is a
-/// real gap of that module (not of `force_move`): the motor steps nowhere, for
-/// this command or any other. Reporting it as a command error would make this
-/// port's own defect punish legal upstream G-code, so the refusal is on the log
-/// and the command still answers.
+/// there on its first `MOVE=`. A `[dual_carriage]` joins as a rail of the
+/// **cartesian** kinematics (`CartKinematics` builds it,
+/// `kinematics/cartesian.py:28-30`); under a kinematics that does not claim the
+/// section (hybrid-corexy) the motor steps nowhere, for this command or any
+/// other — a real gap of `idex_modes`, not of `force_move`. Reporting it as a
+/// command error would make this port's own defect punish legal upstream
+/// G-code, so the refusal is on the log and the command still answers.
 ///
 /// Every call warns: the commands are rare, and a state that silently steps
 /// nothing is what made this look like "force_move produces no `queue_step` at
@@ -2879,9 +2900,10 @@ async fn manual_move(
     let (axis_r, accel_t, cruise_t, cruise_v) = calc_move_time(dist, speed, accel);
     let move_time = accel_t + cruise_t + accel_t;
     // The stepper to drive. A name the queue does not hold has no motor this
-    // port can generate for — the IDEX second carriage never joins it — so the
-    // move is carried on the timeline only, with a warning (see
-    // [`warn_unwired_stepper`] for why that is not a command error).
+    // port can generate for — a `[dual_carriage]` under a kinematics that does
+    // not claim it is one — so the move is carried on the timeline only, with a
+    // warning (see [`warn_unwired_stepper`] for why that is not a command
+    // error).
     let index = connected
         .toolhead
         .motion_queuing_mut()

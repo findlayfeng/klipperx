@@ -18,16 +18,37 @@
 //! [`claim`] hands the cartesian kinematics' primary rail for the carriage
 //! axis to the module, the seam upstream wires in `cartesian.py:31-34`.
 //!
-//! The stepper is built but **not driven**: it never joins the toolhead's
-//! rails, so no steps are generated for it. What the three commands *do*
-//! carry across is the **gcode coordinate**: switching or restoring parks the
-//! departing carriage's axis coordinate and re-anchors the toolhead on the
-//! arriving carriage's frame, the way upstream's `toggle_active_dc_rail`
-//! calls `toolhead.set_position(newpos)` (`idex_modes.py:101-115`) — the
-//! `toolhead:set_position` event re-anchors `gcode_move` with it, so the next
-//! move lands in the new carriage's frame and its range. The upstream
-//! behaviour still missing is listed below; the hybrid dual carriage unit
-//! builds on this seam.
+//! # The carriage's motor is a rail of the kinematics, not an extra axis
+//!
+//! The second carriage is driven the way upstream drives it: as a motor of the
+//! **cartesian kinematics**, reading the main trapq. Upstream appends the
+//! carriage rail to `CartKinematics.rails` (`cartesian.py:28-30`) and points
+//! every rail at `toolhead.get_trapq()` (`cartesian.py:37-38`), so the carriage
+//! motor and `stepper_x` generate from the same queue — each with its own
+//! solver, `cartesian_stepper_alloc(dc_axis)` for the carriage (`:29-30`), the
+//! same position function this port's [`PrinterStepper`] defaults to for its
+//! `axis`. It is **not** an extra axis: an extra axis carries a coordinate slot
+//! of its own and its own trapq
+//! ([`add_extra_axis_stepper`](crate::core::klippy::extras::toolhead::ToolHeadObject::add_extra_axis_stepper)),
+//! while this motor follows the toolhead's X (or Y) coordinate, which is
+//! exactly what the main trapq holds. Upstream's per-rail transform (the
+//! `dual_carriage` c-helper's scale/offset, `chelper/kin_idex.c`) is the mode
+//! layer listed under the gaps below.
+//!
+//! The handover happens at the toolhead's connect, gated on the claim: the bare
+//! `[dual_carriage]` section loads for every kinematics here, while upstream
+//! builds the carriage rail only inside `CartKinematics`, so
+//! [`DualCarriageModule::take_stepper`] answers only once a kinematics claimed
+//! the section.
+//!
+//! What the three commands *do* carry across in this port is the **gcode
+//! coordinate**: switching or restoring parks the departing carriage's axis
+//! coordinate and re-anchors the toolhead on the arriving carriage's frame, the
+//! way upstream's `toggle_active_dc_rail` calls `toolhead.set_position(newpos)`
+//! (`idex_modes.py:101-115`) — the `toolhead:set_position` event re-anchors
+//! `gcode_move` with it, so the next move lands in the new carriage's frame and
+//! its range. The upstream behaviour still missing is listed below; the hybrid
+//! dual carriage unit builds on this seam.
 //!
 //! The generic-cartesian family reaches the same module from the other side:
 //! upstream builds `idex_modes.DualCarriages` inside
@@ -41,13 +62,20 @@
 //!
 //! # Gaps this port does not close yet
 //!
-//! * **No carriage switching on the motion layer**: the active rail's trapq
-//!   swap, the scale/offset transform and `update_limits`
-//!   (`idex_modes.py:224-235`, `DualCarriagesRail.activate/inactivate`) are
-//!   not implemented — the coordinate handover teleports the toolhead onto
-//!   the new frame, but the steps still go to the primary rail, and the
-//!   active carriage's **range** stays the primary rail's (identical in the
-//!   corpus, where both carriages ride `[0, 200]`).
+//! * **No carriage switching on the motion layer**: the scale/offset transform
+//!   and `update_limits` (`idex_modes.py:224-235`,
+//!   `DualCarriagesRail.activate/inactivate`) are not implemented — the
+//!   coordinate handover teleports the toolhead onto the new frame, and both
+//!   carriage motors step off the main trapq (so the inactive carriage travels
+//!   with the active one instead of holding its stop), and the active
+//!   carriage's **range** stays the primary rail's (identical in the corpus,
+//!   where both carriages ride `[0, 200]`).
+//! * **The carriage rail is the cartesian family's alone**: a `[dual_carriage]`
+//!   under another kinematics builds the module (this loader loads the section
+//!   regardless) but no kinematics claims it, so its motor steps nowhere. The
+//!   hybrid-corexy family is the concrete case: upstream builds the rail with
+//!   `corexy_stepper_alloc(b'+')` (`kinematics/hybrid_corexy.py:31-36`), which
+//!   this port does not install for the section's stepper.
 //! * **`COPY` / `MIRROR` / `INACTIVE` modes are validated, not applied**
 //!   (`idex_modes.py:15-17`); upstream's homing/`PRIMARY`-first checks are
 //!   not enforced either.
@@ -55,9 +83,20 @@
 //!   modes (`PRIMARY`/`COPY`/`MIRROR`) are not modelled, the restore
 //!   re-anchors the coordinate instead of physically moving the carriages,
 //!   and `MOVE_SPEED` is read but unused (`idex_modes.py:285-310`).
-//! * **The second carriage's endstop is not in `query_endstops`**, and
-//!   `STEPPER_BUZZ STEPPER=dual_carriage` is not registered (both are silent
-//!   unknown-command answers, so the corpus does not care).
+//! * **The second carriage's endstop is not in `query_endstops`**: upstream
+//!   builds the rail with its own `endstop_pin` (`cartesian.py:25-29`), so
+//!   `QUERY_ENDSTOPS` reports it and `G28` homes both carriages
+//!   (`DualCarriages.home`, `idex_modes.py:116-132`). Here the section's
+//!   endstop drives its trigger but is not queryable, and only the primary
+//!   carriage homes.
+//! * **`G28` drives the second carriage without its endstop stopping it**: the
+//!   homing move is the X (or Y) coordinate, and both carriage motors read it
+//!   off the main trapq, so the second carriage travels the whole move while
+//!   only the primary rail's endstop is in the trigger (`stepper_x`). Upstream
+//!   homes the carriages **one at a time**, each with its own endstop armed
+//!   (`idex_modes.py:116-132`). On a real IDEX machine the untriggered carriage
+//!   therefore runs the full homing move instead of stopping on its own
+//!   `position_endstop`.
 //! * **A config with two extruders ([`dual_carriage.cfg`](crate and its T0/T1
 //!   macros) puts **both** extruders in the motion path**: a `Move` carries one
 //!   position slot per extra axis (`Move::extra_start`/`extra_end`, with
@@ -83,7 +122,8 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::Coord;
-use crate::core::klippy::motion::Axis;
+use crate::core::klippy::mcu::McuStepper;
+use crate::core::klippy::motion::{Axis, Stepper};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // Both forms load in the generic walk, in the order upstream's
@@ -236,10 +276,10 @@ pub struct DualCarriageModule {
     #[allow(dead_code)]
     safe_distance: Option<f64>,
     /// The second carriage's motor, built from this section the way upstream's
-    /// `LookupMultiRail(dc_config)` is (`cartesian.py:25-29`). Held so the
-    /// firmware resource stays alive; not driven yet (module docs).
-    #[allow(dead_code)]
-    stepper: PrinterStepper,
+    /// `LookupMultiRail(dc_config)` is (`cartesian.py:25-29`). The kinematics'
+    /// claim is what makes it a motor of the machine: the toolhead takes it
+    /// through [`DualCarriageModule::take_stepper`] (module docs).
+    stepper: Arc<PrinterStepper>,
     /// The primary rail for `axis`, once the cartesian kinematics claims it
     /// (`cartesian.py:31-34`).
     primary_rail: Mutex<Option<Arc<Rail>>>,
@@ -278,6 +318,25 @@ impl DualCarriageModule {
             .unwrap_or_else(|poison| poison.into_inner())
             .as_ref()
             .map(|rail| rail.name().to_string())
+    }
+
+    /// Take the second carriage's host stepper, for the toolhead to drive from
+    /// the main trapq (`cartesian.py:28-30,37-38`; module docs).
+    ///
+    /// `None` before connect and after the toolhead took it, as
+    /// [`PrinterStepper::take_stepper`] answers. The caller decides *whether*
+    /// the carriage is a motor of the machine at all: only the cartesian family
+    /// claims the section ([`claim`]), which is upstream's gate for building the
+    /// rail at all.
+    pub fn take_stepper(&self) -> Option<Stepper> {
+        self.stepper.take_stepper()
+    }
+
+    /// The firmware stepper resource of the second carriage (the name the
+    /// toolhead's `mcu_steppers` map and `queue_step` batches go by is the
+    /// section's: `dual_carriage`).
+    pub fn mcu_stepper(&self) -> Arc<McuStepper> {
+        Arc::clone(self.stepper.mcu_stepper())
     }
 }
 
@@ -371,7 +430,17 @@ pub fn load_config(
     // The section doubles as a stepper section: upstream reads it through
     // `stepper.LookupMultiRail(dc_config)` (`cartesian.py:25-29`), which is
     // exactly what building the primary stepper here reads.
-    let stepper = PrinterStepper::new(config, printer, axis, true)?;
+    let stepper = Arc::new(PrinterStepper::new(config, printer, axis, true)?);
+    // A hidden object so the stepper's own `connect` runs and builds the host
+    // `Stepper` the toolhead takes at its own connect — the same shape
+    // `[extruder]` uses for its stepper (`extruder_stepper <name>`) and
+    // `[manual_stepper]` for its own (`manual_stepper_stepper <name>`). Without
+    // it the section's `PrinterStepper` is never connected, so its host solver
+    // (and with it any step generation) does not exist at all.
+    printer.add_object(
+        &format!("dual_carriage_stepper {identifier}"),
+        Arc::clone(&stepper) as Arc<dyn PrinterObject>,
+    )?;
 
     let shared = Arc::new(Mutex::new(Shared::for_section(
         axis_index(axis),
@@ -1253,5 +1322,218 @@ mod tests {
         assert_eq!(*second.checked.lock().unwrap(), [4, 4]);
         assert_eq!(*second.junctions.lock().unwrap(), [4]);
         assert_eq!(*second.queued.lock().unwrap(), [4, 4]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The second carriage on the motion layer: end to end, fake firmware
+    // -----------------------------------------------------------------------
+
+    /// The corpus' `dual_carriage.cfg` machine over the fake firmware
+    /// (`[mcu] test: dict=…`), minus the heaters, the second extruder and the
+    /// servo: the cartesian IDEX shape whose second carriage used to be built
+    /// and then left out of every queue.
+    fn idex_machine_config(dict: &std::path::Path) -> Config {
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: cartesian\nmax_velocity: 300\nmax_accel: 3000\n\
+             max_z_velocity: 5\nmax_z_accel: 100\n\
+             [stepper_x]\nstep_pin: PF0\ndir_pin: PF1\nenable_pin: !PD7\nmicrosteps: 16\n\
+             rotation_distance: 40\nendstop_pin: ^PE5\nposition_endstop: 0\nposition_max: 200\nhoming_speed: 50\n\
+             [dual_carriage]\naxis: x\nsafe_distance: 50\nstep_pin: PH1\ndir_pin: PH0\nenable_pin: !PA1\n\
+             microsteps: 16\nrotation_distance: 40\nendstop_pin: ^PE4\nposition_endstop: 200\n\
+             position_max: 200\nhoming_speed: 50\n\
+             [stepper_y]\nstep_pin: PF6\ndir_pin: !PF7\nenable_pin: !PF2\nmicrosteps: 16\n\
+             rotation_distance: 40\nendstop_pin: ^PJ1\nposition_endstop: 0\nposition_max: 200\nhoming_speed: 50\n\
+             [stepper_z]\nstep_pin: PL3\ndir_pin: PL1\nenable_pin: !PK0\nmicrosteps: 16\n\
+             rotation_distance: 8\nendstop_pin: ^PD3\nposition_endstop: 0\nposition_max: 200\nhoming_speed: 20\n",
+            dict.display()
+        );
+        Config::from_text(&text).expect("the config parses").0
+    }
+
+    /// Bring that machine up against the fake firmware, as the corpus harness
+    /// does (`upstream::run_case` → `printer.bring_up`).
+    async fn up_idex_machine(dict: &std::path::Path) -> (Arc<Printer>, Result<(), String>) {
+        let config = idex_machine_config(dict);
+        let reactor = Arc::new(crate::core::klippy::reactor::TokioReactor::new(
+            tokio::runtime::Handle::current(),
+        ));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "dual_carriage.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        let setup = async {
+            printer.load_config(&config).map_err(|e| e.to_string())?;
+            if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != crate::core::klippy::printer::PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+            Ok(())
+        }
+        .await;
+        (printer, setup)
+    }
+
+    /// The `queue_step` batches this stepper's compressor has emitted so far.
+    fn step_batches(toolhead: &Arc<ToolHeadObject>, name: &str) -> usize {
+        toolhead
+            .stepper_step_history(name, 1000, 0, u64::MAX)
+            .map(|history| history.steps.len())
+            .unwrap_or(0)
+    }
+
+    /// The net steps this stepper's compressor has emitted.
+    fn net_steps(toolhead: &Arc<ToolHeadObject>, name: &str) -> i64 {
+        toolhead
+            .stepper_step_history(name, 1000, 0, u64::MAX)
+            .map(|history| history.steps.iter().map(|step| step.step_count).sum())
+            .unwrap_or(0)
+    }
+
+    /// Poll `pred` until it holds, for at most `deadline`; `false` when the
+    /// budget runs out.
+    ///
+    /// A planned move's steps are generated on the background flush tick, not
+    /// while the `G1` is being read, so a test has to wait for them — polling to
+    /// a deadline rather than sleeping a fixed window, the shape
+    /// `test_util::wait_until` uses, but answering instead of panicking so the
+    /// test can still tear the printer down.
+    async fn wait_for<F: FnMut() -> bool>(deadline: std::time::Duration, mut pred: F) -> bool {
+        let limit = std::time::Instant::now() + deadline;
+        while !pred() {
+            if std::time::Instant::now() >= limit {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// The second carriage is a motor of the machine, not a dangling
+    /// `PrinterStepper`: it is in the toolhead's stepper set with its own oid,
+    /// and a move on its carriage axis produces `queue_step` batches for it —
+    /// the same count `stepper_x` produces, because both read the carriage's
+    /// coordinate off the main trapq with the same step distance.
+    ///
+    /// A move on the *other* axis steps it not at all: that is what pins the
+    /// wiring to the main trapq and to the carriage axis' solver, rather than to
+    /// some queue that happens to `queue_step` whenever the machine moves.
+    ///
+    /// Skipped when the dictionary was not built (`KLIPPERX_ARCHES`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_second_carriage_generates_steps_on_its_carriage_axis() {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        if !dict.is_file() {
+            return;
+        }
+        let (printer, setup) = up_idex_machine(&dict).await;
+        let outcome = async {
+            setup?;
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            // In the toolhead's stepper set, which is the set the motion queue
+            // generates and sends for — with the carriage's own oid, not a
+            // share of the primary rail's.
+            let carriage = toolhead.mcu_stepper("dual_carriage").ok_or_else(|| {
+                "the second carriage is not in the toolhead's stepper set".to_string()
+            })?;
+            let primary = toolhead
+                .mcu_stepper("stepper_x")
+                .ok_or_else(|| "stepper_x is not in the toolhead's stepper set".to_string())?;
+            if carriage.oid().map_err(|err| err.to_string())?
+                == primary.oid().map_err(|err| err.to_string())?
+            {
+                return Err("the second carriage shares stepper_x's oid".to_string());
+            }
+            if net_steps(&toolhead, "dual_carriage") != 0 {
+                return Err("the second carriage stepped before the machine moved".to_string());
+            }
+
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .ok_or_else(|| "the g-code dispatcher is not registered".to_string())?;
+            gcode
+                .run_script("SET_KINEMATIC_POSITION X=0 Y=0 Z=0")
+                .await
+                .map_err(|err| err.to_string())?;
+
+            // A move off the carriage's axis leaves it alone.
+            let y_before = net_steps(&toolhead, "stepper_y");
+            let idle_batches = step_batches(&toolhead, "dual_carriage");
+            gcode
+                .run_script("G1 Y5 F600")
+                .await
+                .map_err(|err| format!("G1 Y5: {err}"))?;
+            if !wait_for(std::time::Duration::from_secs(5), || {
+                net_steps(&toolhead, "stepper_y") != y_before
+            })
+            .await
+            {
+                return Err("the Y move generated no steps on stepper_y".to_string());
+            }
+            if step_batches(&toolhead, "dual_carriage") != idle_batches {
+                return Err("a Y move stepped the X carriage".to_string());
+            }
+
+            // A move along the carriage's axis steps it, one for one with
+            // `stepper_x`: 10 mm at 40 mm / 16 microsteps = 400 steps each.
+            let before = (
+                net_steps(&toolhead, "stepper_x"),
+                net_steps(&toolhead, "dual_carriage"),
+                step_batches(&toolhead, "dual_carriage"),
+            );
+            gcode
+                .run_script("G1 X10 F600")
+                .await
+                .map_err(|err| format!("G1 X10: {err}"))?;
+            if !wait_for(std::time::Duration::from_secs(5), || {
+                net_steps(&toolhead, "dual_carriage") != before.1
+            })
+            .await
+            {
+                return Err(format!(
+                    "the X move produced no queue_step for the second carriage \
+                     (stepper_x stepped {})",
+                    net_steps(&toolhead, "stepper_x") - before.0
+                ));
+            }
+            let after = (
+                net_steps(&toolhead, "stepper_x"),
+                net_steps(&toolhead, "dual_carriage"),
+                step_batches(&toolhead, "dual_carriage"),
+            );
+            let primary_steps = after.0 - before.0;
+            let carriage_steps = after.1 - before.1;
+            if carriage_steps <= 0 {
+                return Err(format!(
+                    "the X move produced no queue_step for the second carriage \
+                     (stepper_x stepped {primary_steps})"
+                ));
+            }
+            if primary_steps != carriage_steps {
+                return Err(format!(
+                    "the carriages stepped differently on one move: stepper_x \
+                     {primary_steps}, dual_carriage {carriage_steps}"
+                ));
+            }
+            if after.2 == before.2 {
+                return Err("no queue_step batch was emitted for the second carriage".to_string());
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
     }
 }

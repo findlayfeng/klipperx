@@ -19,7 +19,6 @@ use crate::core::klippy::mathutil::Xyz;
 pub struct Stepper {
     name: String,
     oid: u32,
-    step_dist: f64,
     kinematics: StepKinematics,
     compressor: StepCompressor,
     /// Which trapq this stepper reads, as a [`MotionQueuing`](super::queuing::MotionQueuing)
@@ -43,7 +42,6 @@ impl Stepper {
         Self {
             name: name.into(),
             oid,
-            step_dist,
             kinematics: StepKinematics::new(step_dist, position, active_flags),
             compressor: StepCompressor::new(oid, mcu_freq),
             trapq: Some(0),
@@ -96,8 +94,13 @@ impl Stepper {
     }
 
     /// Millimetres per step.
+    ///
+    /// Read from the solver, which is the copy the step generation converts
+    /// with (`StepKinematics::step_dist`): one state, so a rotation-distance
+    /// change (`ToolHeadObject::set_stepper_step_dist`) moves the reporting and
+    /// the conversion together.
     pub fn step_dist(&self) -> f64 {
-        self.step_dist
+        self.kinematics.step_dist
     }
 
     /// The frequency that turns print seconds into this stepper's clock ticks
@@ -151,7 +154,7 @@ impl Stepper {
     /// The firmware step counter the solver's position corresponds to
     /// (`MCU_stepper.get_mcu_position`).
     pub fn mcu_position(&self) -> i64 {
-        (self.kinematics.commanded_pos() / self.step_dist).round() as i64
+        (self.kinematics.commanded_pos() / self.kinematics.step_dist).round() as i64
     }
 
     /// The step position at a past print time

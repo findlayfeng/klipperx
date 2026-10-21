@@ -1212,6 +1212,78 @@ mod tests {
                 (taken - 227.0).abs() <= 2.0,
                 "1 mm at 14.1 mm/(200·16) is ~227 steps, got {taken}"
             );
+            // The distance has one copy: what motion reports, the counter it
+            // derives and the conversion the generation uses are the same
+            // value (`motion::Stepper::step_dist` reads it from the solver).
+            let new_step_dist = 14.1 / (200.0 * 16.0);
+            let history = toolhead
+                .stepper_step_history("extruder_stepper my_extra_stepper", 256, 0, u64::MAX)
+                .expect("the stepper is in the motion queue");
+            assert!((history.step_dist - new_step_dist).abs() < 1e-12);
+            let commanded = toolhead
+                .stepper_commanded_position("extruder_stepper my_extra_stepper")
+                .expect("the stepper is in the motion queue");
+            let counter = toolhead
+                .stepper_mcu_position("extruder_stepper my_extra_stepper")
+                .expect("the stepper is in the motion queue");
+            assert_eq!(
+                counter,
+                (commanded / new_step_dist).round() as i64,
+                "the reported counter must use the distance now in force"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `SET_KINEMATIC_POSITION` (as `G28` does through the same
+    /// `ToolHead::set_position`) rewrites the **kinematic** motors only: a
+    /// stepper following another axis' queue keeps its own position there.
+    ///
+    /// The pin: the toolhead's coordinate is `(0,0,0,0)` while the motor sits at
+    /// 1 mm of filament on the extruder's trapq. A `set_position` that rewrites
+    /// every queued stepper writes the toolhead's coordinate into it, and the
+    /// next range then steps the whole gap at zero interval — the corpus case's
+    /// `stepcompress … c=124 a=0: Invalid sequence` (`G28` had it at −0.0039
+    /// instead of E≈7).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_kinematic_position_does_not_move_the_synced_stepper() {
+        let Some(board) = board() else {
+            return;
+        };
+        let printer = up_machine(&board, SYNCED_SECTION).await;
+        let outcome = async {
+            let toolhead = the_toolhead(&printer);
+            run_and_flush(&printer, "G92 E0\nG1 E1 F600").await;
+            let (before, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let position = toolhead
+                .stepper_commanded_position("extruder_stepper my_extra_stepper")
+                .expect("the stepper is in the motion queue");
+            assert!(
+                (position - 1.0).abs() < 0.05,
+                "1 mm of extrusion put the motor at {position}"
+            );
+
+            run_and_flush(&printer, "SET_KINEMATIC_POSITION X=0 Y=0 Z=0").await;
+            let after = toolhead
+                .stepper_commanded_position("extruder_stepper my_extra_stepper")
+                .expect("the stepper is in the motion queue");
+            assert!(
+                (after - position).abs() < 1e-9,
+                "the toolhead coordinate must not reach the synced stepper: {position} -> {after}"
+            );
+
+            // …and the following extrusion still steps from there, not from the
+            // rewritten position (a zero-interval burst would error out).
+            run_and_flush(&printer, "G1 E2 F600").await;
+            let (later, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let taken = (later - before) as f64;
+            assert!(
+                (taken - 113.5).abs() <= 2.0,
+                "1 mm more at 28.2 mm/(200·16) is ~113.5 steps, got {taken}"
+            );
             Ok::<(), String>(())
         }
         .await;

@@ -2511,10 +2511,10 @@ impl ToolHeadObject {
     /// the conversion changes (upstream additionally re-derives its counter
     /// offset, `_set_mcu_position`, `:186-189`).
     ///
-    /// The stepper's other copy of the distance — what motion reporting calls
-    /// its mm/step, and what its own counter is derived from — keeps the value
-    /// it was built with: that counter is the firmware's step count, which is
-    /// not a distance.
+    /// The solver's is the stepper's **only** copy of the distance: reporting
+    /// ([`Stepper::step_dist`](crate::core::klippy::motion::stepper::Stepper::step_dist))
+    /// and the firmware counter (`mcu_position`) read it from there too, so this
+    /// write moves all three together.
     ///
     /// # Errors
     /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"

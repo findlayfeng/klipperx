@@ -1,15 +1,15 @@
 //! `[tuning_tower]` — adjust a parameter at each Z height (upstream
 //! `klippy/extras/tuning_tower.py`).
 //!
-//! The section reads **no options** (`tuning_tower.py:14-23`); what it does at
+//! The section reads **no options** (`tuning_tower.py:11-22`); what it does at
 //! load is register `TUNING_TOWER` and subscribe to the events below.
 //!
 //! `TUNING_TOWER COMMAND=… PARAMETER=…` starts a test: the module takes
 //! `gcode_move`'s move-transform slot and, on every extrusion move at a new Z,
 //! re-evaluates the parameter from the current **g-code** Z and runs the
-//! command when the value changed (`tuning_tower.py:71-92`).
+//! command when the value changed (`tuning_tower.py:77-97`).
 //!
-//! | word | meaning (`tuning_tower.py:27-38`) |
+//! | word | meaning (`tuning_tower.py:28-35`) |
 //! |---|---|
 //! | `COMMAND` | required; the command to run, e.g. `SET_VELOCITY_LIMIT` |
 //! | `PARAMETER` | required; the word that command's value goes in, e.g. `ACCEL` |
@@ -22,17 +22,17 @@
 //!
 //! The emitted line is upstream's `command_fmt`: a traditional command gets
 //! `COMMAND PARAMETER<value>`, an extended one `COMMAND PARAMETER=<value>`,
-//! the value with nine decimals (`tuning_tower.py:41-44`).
+//! the value with nine decimals (`tuning_tower.py:42-45`).
 //!
 //! A move that extrudes more than 2mm of Z **below** the last one is the start
 //! of another print, so the test ends (`CANCEL_Z_DELTA`,
-//! `tuning_tower.py:6,75-78`): the slot goes back to the transform the tower
+//! `tuning_tower.py:8,83-85`): the slot goes back to the transform the tower
 //! displaced and `Ending tuning test mode` is reported.
 //!
 //! # What is not here
 //!
 //! - **The parameter command runs detached.** Upstream runs it synchronously
-//!   inside `move()` (`tuning_tower.py:89-90`) so the boundary move is already
+//!   inside `move()` (`tuning_tower.py:93-94`) so the boundary move is already
 //!   planned with the new value. `GCodeDispatch::run_script_from_command` is
 //!   `async` here while a move transform is not, so the line is run on the
 //!   host's runtime (`tokio::spawn`, the pattern of `delayed_gcode` and
@@ -40,7 +40,7 @@
 //!   value. A host with no runtime to spawn on logs a warning instead.
 //! - **`exclude_object`'s tuning-tower guard is not wired.** Upstream refuses
 //!   to register the exclusion transform while a tower is active
-//!   (`exclude_object.py:38-42`); [`TuningTower::is_active`] is the answer that
+//!   (`exclude_object.py:40-41`); [`TuningTower::is_active`] is the answer that
 //!   guard asks for, and `exclude_object.rs`'s module docs still record the
 //!   gap.
 
@@ -64,17 +64,17 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// A move this far below the last one is the start of another print
-/// (`tuning_tower.py:6`).
+/// (`tuning_tower.py:8`).
 const CANCEL_Z_DELTA: f64 = 2.0;
 
 /// The Z the first extrusion move has to clear (`tuning_tower.py:48`).
 const NEVER_Z: f64 = -99999999.9;
 
-/// `TUNING_TOWER`'s help text, verbatim (`tuning_tower.py:26`).
+/// `TUNING_TOWER`'s help text, verbatim (`tuning_tower.py:23`).
 const TUNING_TOWER_HELP: &str = "Tool to adjust a parameter at each Z height";
 
 /// The words `TUNING_TOWER` reads, in upstream's order
-/// (`tuning_tower.py:29-38`).
+/// (`tuning_tower.py:28-35`).
 const TUNING_TOWER_PARAMS: &[&str] = &[
     "COMMAND",
     "PARAMETER",
@@ -89,7 +89,7 @@ const TUNING_TOWER_PARAMS: &[&str] = &[
 section!("tuning_tower", order = 30, load = load_config);
 
 /// What one move asks the tower to do besides forwarding it
-/// (`tuning_tower.py:71-92`).
+/// (`tuning_tower.py:77-97`).
 enum Step {
     /// Nothing to do: not an extrusion move at a new Z, or the value did not
     /// change.
@@ -101,21 +101,21 @@ enum Step {
 }
 
 /// The test state, behind one lock the move transform and the command share
-/// (`tuning_tower.py:15-22`).
+/// (`tuning_tower.py:13-18`).
 struct TowerState {
     /// Whether a test is running — upstream's `normal_transform is not None`
-    /// (`tuning_tower.py:97-98`).
+    /// (`tuning_tower.py:102-103`).
     active: bool,
     /// The transform the tower displaced from `gcode_move`'s slot (upstream
     /// `normal_transform`); `None` when the slot was empty.
     displaced: Option<Arc<dyn MoveTarget>>,
     /// The toolhead captured at `klippy:connect`, the chain's end when the
-    /// slot was empty (`tuning_tower.py:18-19`).
+    /// slot was empty (`tuning_tower.py:46-47`).
     toolhead: Option<Arc<dyn MoveTarget>>,
     /// The position of the last move or query, toolhead coordinates
-    /// (`tuning_tower.py:17`).
+    /// (`tuning_tower.py:14`).
     last_position: Coord,
-    /// The Z of the last extrusion move (`tuning_tower.py:18`).
+    /// The Z of the last extrusion move (`tuning_tower.py:15`).
     last_z: f64,
     start: f64,
     factor: f64,
@@ -123,10 +123,10 @@ struct TowerState {
     step_delta: f64,
     step_height: f64,
     skip: f64,
-    /// The value last handed to the command (`tuning_tower.py:20`).
+    /// The value last handed to the command (`tuning_tower.py:16`).
     last_command_value: Option<f64>,
     /// Upstream's `command_fmt` without the `%.9f`
-    /// (`tuning_tower.py:41-44`).
+    /// (`tuning_tower.py:17,42-45`).
     command_prefix: String,
 }
 
@@ -157,7 +157,7 @@ impl TowerState {
         self.displaced.clone().or_else(|| self.toolhead.clone())
     }
 
-    /// Upstream's `calc_value` (`tuning_tower.py:63-69`): the parameter value
+    /// Upstream's `calc_value` (`tuning_tower.py:68-76`): the parameter value
     /// for a g-code Z.
     fn calc_value(&self, z: f64) -> f64 {
         let z = if self.skip != 0.0 {
@@ -177,7 +177,7 @@ impl TowerState {
         self.start + z * self.factor
     }
 
-    /// Upstream's `move()` test (`tuning_tower.py:73-74`): an extrusion move
+    /// Upstream's `move()` test (`tuning_tower.py:79-80`): an extrusion move
     /// (E grew) at a Z height the test has not seen, with the position moved.
     fn is_tuning_move(&self, newpos: &Coord) -> bool {
         newpos.axis(E_AXIS) > self.last_position.axis(E_AXIS)
@@ -185,11 +185,11 @@ impl TowerState {
             && (0..=Z_AXIS).any(|axis| newpos.axis(axis) != self.last_position.axis(axis))
     }
 
-    /// Upstream's `move()` body (`tuning_tower.py:71-92`): decide what the
+    /// Upstream's `move()` body (`tuning_tower.py:77-97`): decide what the
     /// move does to the test, updating `last_z`/`last_command_value`.
     ///
     /// `last_position` is left to the caller, which sets it after the decision
-    /// (`tuning_tower.py:91`).
+    /// (`tuning_tower.py:96`).
     fn plan_move(&mut self, newpos: &Coord, gcode_move: &GCodeMove) -> Step {
         if !self.active {
             // No test running: the slot is still this tower's only because
@@ -217,7 +217,7 @@ impl TowerState {
 }
 
 /// Upstream's `self.gcode_move.get_status()['gcode_position'].z`
-/// (`tuning_tower.py:80`).
+/// (`tuning_tower.py:88`).
 fn gcode_position_z(gcode_move: &GCodeMove) -> f64 {
     gcode_move.status()["gcode_position"]
         .get(Z_AXIS)
@@ -225,7 +225,7 @@ fn gcode_position_z(gcode_move: &GCodeMove) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// The `[tuning_tower]` section (`tuning_tower.py:TuningTower`).
+/// The `[tuning_tower]` section (`tuning_tower.py:10`).
 pub struct TuningTower {
     printer: Weak<Printer>,
     gcode: Arc<GCodeDispatch>,
@@ -245,7 +245,7 @@ impl std::fmt::Debug for TuningTower {
 }
 
 impl TuningTower {
-    /// Read the section — upstream reads no options (`tuning_tower.py:14-23`),
+    /// Read the section — upstream reads no options (`tuning_tower.py:11-22`),
     /// so the bare `[tuning_tower]` is all a config carries.
     fn new(
         _config: &ConfigWrapper,
@@ -270,14 +270,16 @@ impl TuningTower {
     }
 
     /// Whether a test is running — upstream's `is_active`
-    /// (`tuning_tower.py:97-98`), which `exclude_object` consults.
+    /// (`tuning_tower.py:102-103`), which `exclude_object` consults.
     pub fn is_active(&self) -> bool {
         self.lock().active
     }
 
-    /// Upstream's `_handle_connect` (`tuning_tower.py:18-19` resolves the
-    /// toolhead at `printer.lookup_object` time): capture the toolhead, the
-    /// chain's end when `gcode_move`'s slot was still empty.
+    /// Upstream resolves the chain below at construction — `gcode_move`
+    /// (`tuning_tower.py:18`), whose `get_position` is the toolhead's
+    /// (`:46-47`) — so there is always something to hand the slot back to.
+    /// Here the toolhead is captured at `klippy:connect`, the chain's end when
+    /// `gcode_move`'s slot was still empty.
     fn handle_connect(&self) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -287,7 +289,7 @@ impl TuningTower {
         }
     }
 
-    /// Upstream's `end_test` (`tuning_tower.py:93-96`): hand the move-transform
+    /// Upstream's `end_test` (`tuning_tower.py:98-101`): hand the move-transform
     /// slot back to the transform the tower displaced and say so.
     fn end_test(&self) {
         let chain = self.lock().chain();
@@ -319,7 +321,7 @@ impl TuningTower {
         }
     }
 
-    /// Register `TUNING_TOWER` (`tuning_tower.py:23-25`).
+    /// Register `TUNING_TOWER` (`tuning_tower.py:19-22`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -339,7 +341,7 @@ impl TuningTower {
             .map_err(ConfigError::new)
     }
 
-    /// Upstream's `TUNING_TOWER` handler (`tuning_tower.py:27-61`).
+    /// Upstream's `TUNING_TOWER` handler (`tuning_tower.py:24-63`).
     fn start_test(object: &Arc<TuningTower>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         if object.is_active() {
             object.end_test();
@@ -347,7 +349,7 @@ impl TuningTower {
         let command = gcmd.get_str("COMMAND")?;
         let parameter = gcmd.get_str("PARAMETER")?;
         // `gcmd.get_float('START', 0.)` and friends; the `minval=0.` bounds are
-        // the three heights and steps (`tuning_tower.py:29-37`).
+        // the three heights and steps (`tuning_tower.py:30-35`).
         let start = gcmd.get("START", Some(0.0), parse_float, None, None, None, None)?;
         let factor = gcmd.get("FACTOR", Some(0.0), parse_float, None, None, None, None)?;
         let band = gcmd.get("BAND", Some(0.0), parse_float, Some(0.0), None, None, None)?;
@@ -373,7 +375,7 @@ impl TuningTower {
             ));
         }
         // `"%s %s%%.9f"` for a traditional command, `"%s %s=%%.9f"` for an
-        // extended one (`tuning_tower.py:41-44`).
+        // extended one (`tuning_tower.py:42-45`).
         let command_prefix = if is_traditional_gcode(&command) {
             format!("{command} {parameter}")
         } else {
@@ -404,7 +406,7 @@ impl TuningTower {
             state.last_command_value = None;
             state.command_prefix = command_prefix;
         }
-        // Upstream's `self.get_position()` (`tuning_tower.py:49`): anchor
+        // Upstream's `self.get_position()` (`tuning_tower.py:50`): anchor
         // `last_position` to where the chain below says the toolhead is.
         object.position();
 
@@ -441,7 +443,7 @@ impl PrinterObject for TuningTower {
 }
 
 impl MoveTarget for TuningTower {
-    /// Upstream's `move` (`tuning_tower.py:71-92`): update the parameter on an
+    /// Upstream's `move` (`tuning_tower.py:77-97`): update the parameter on an
     /// extrusion move at a new Z, then forward the move down the chain.
     ///
     /// The chain below is captured before `end_test` can clear it, so the move
@@ -466,7 +468,7 @@ impl MoveTarget for TuningTower {
         }
     }
 
-    /// Upstream's `get_position` (`tuning_tower.py:57-60`): the chain below's
+    /// Upstream's `get_position` (`tuning_tower.py:64-67`): the chain below's
     /// position, which is also what the test tracks as `last_position`.
     fn position(&self) -> Coord {
         let Some(chain) = self.lock().chain() else {
@@ -492,10 +494,10 @@ impl MoveTarget for ToolheadMove {
     }
 }
 
-/// The factory `section!` names (`tuning_tower.py:100-101`).
+/// The factory `section!` names (`tuning_tower.py:105-106`).
 ///
 /// `gcode_move::ensure` stands in for upstream's
-/// `printer.load_object(config, 'gcode_move')` (`tuning_tower.py:19`).
+/// `printer.load_object(config, 'gcode_move')` (`tuning_tower.py:18`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,
@@ -516,7 +518,7 @@ pub fn load_config(
     Ok(object)
 }
 
-/// `TUNING_TOWER` (`tuning_tower.py:27-61`).
+/// `TUNING_TOWER` (`tuning_tower.py:24-63`).
 fn cmd_tuning_tower(object: &Arc<TuningTower>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     TuningTower::start_test(object, gcmd)
 }
@@ -625,7 +627,7 @@ mod tests {
         }
     }
 
-    /// Upstream reads no options (`tuning_tower.py:14-23`): the bare
+    /// Upstream reads no options (`tuning_tower.py:11-22`): the bare
     /// `[tuning_tower]` loads, `section!` registers the id, the command
     /// carries upstream's help text, and the object stays out of `objects/list`
     /// like any module without a `get_status`.
@@ -645,7 +647,7 @@ mod tests {
     }
 
     /// Every word defaults the way `gcmd.get_float(NAME, default)` spells it
-    /// (`tuning_tower.py:29-37`), and the test starts inactive until the
+    /// (`tuning_tower.py:30-35`), and the test starts inactive until the
     /// command arms it.
     #[test]
     fn the_words_take_upstreams_defaults() {
@@ -669,7 +671,7 @@ mod tests {
     }
 
     /// The start line is upstream's `message_parts` join
-    /// (`tuning_tower.py:50-56`): a factor test reports factor (and band),
+    /// (`tuning_tower.py:51-63`): a factor test reports factor (and band),
     /// a step test reports both steps, and `skip` rides along.
     #[test]
     fn the_starting_message_matches_upstream() {
@@ -693,7 +695,7 @@ mod tests {
             )
             .unwrap();
         // A second `TUNING_TOWER` ends the first test first
-        // (`tuning_tower.py:28-29`), so the step line is the last one.
+        // (`tuning_tower.py:25-26`), so the step line is the last one.
         assert_eq!(
             lines(&log).last().map(String::as_str),
             Some(
@@ -706,7 +708,7 @@ mod tests {
         assert!(object.lock().displaced.is_none());
     }
 
-    /// `calc_value` (`tuning_tower.py:63-69`): the ramp, the band's midpoint
+    /// `calc_value` (`tuning_tower.py:68-76`): the ramp, the band's midpoint
     /// step, the step function, and each of them shifting by `SKIP`.
     #[test]
     fn calc_value_follows_upstreams_formula() {
@@ -746,7 +748,7 @@ mod tests {
     /// The trigger itself: extrusion moves at new Z heights, with `BAND=1`,
     /// run one command per band and nothing inside a band — the emitted script
     /// is `COMMAND PARAMETER=<value>` with nine decimals
-    /// (`tuning_tower.py:41-44,71-92`).
+    /// (`tuning_tower.py:42-45,77-97`).
     #[tokio::test]
     async fn crossing_a_band_runs_the_parameter_command_once() {
         let (_printer, gcode, _object) = machine();
@@ -820,7 +822,7 @@ mod tests {
     }
 
     /// A traditional command gets upstream's space-separated form
-    /// (`tuning_tower.py:41-42`): `M999 S<value>`, not `M999 S=<value>`.
+    /// (`tuning_tower.py:42-43`): `M999 S<value>`, not `M999 S=<value>`.
     #[tokio::test]
     async fn a_traditional_command_takes_a_bare_value() {
         let (_printer, gcode, _object) = machine();
@@ -852,8 +854,8 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["M999 S0.500000000"]);
     }
 
-    /// The twice-stated conflicts (`tuning_tower.py:38-40`) and the `minval=0.`
-    /// bounds (`:33-37`).
+    /// The twice-stated conflicts (`tuning_tower.py:36-40`) and the `minval=0.`
+    /// bounds (`:32-35`).
     #[test]
     fn invalid_words_keep_upstreams_wording() {
         let (_printer, gcode, _object) = machine();
@@ -886,7 +888,7 @@ mod tests {
     }
 
     /// A move far below the last one is the start of another print, so the
-    /// test ends (`tuning_tower.py:75-78,93-96`): the slot goes back to the
+    /// test ends (`tuning_tower.py:83-85,98-101`): the slot goes back to the
     /// transform the tower displaced and the move still forwards.
     #[tokio::test]
     async fn a_move_far_below_the_last_one_ends_the_test() {
@@ -922,7 +924,7 @@ mod tests {
     }
 
     /// The tower chains over the transform it displaced while a test runs
-    /// (`tuning_tower.py:16,45-47,71-92`): the move reaches `bed_mesh`-like
+    /// (`tuning_tower.py:46-47,77-97`): the move reaches `bed_mesh`-like
     /// occupied slot rather than the toolhead, and `position()` reports the
     /// chain's position.
     #[test]

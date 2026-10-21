@@ -637,6 +637,22 @@ impl MoveSlots {
             .map(|completion| Self::free_at(completion, freq))
     }
 
+    /// Give back the entry [`MoveSlots::record`] took for `completion`, for a
+    /// move whose message never made it into the queue
+    /// ([`Mcu::release_move_slot`]).
+    ///
+    /// Entries with the same completion clock are interchangeable — the pool
+    /// counts them, reads their completions, and nothing else distinguishes them
+    /// — so dropping the first match gives back exactly one slot even if another
+    /// move recorded the same clock in between. Entries `record` pruned as
+    /// already freed stay pruned: they were free on their own clock, not because
+    /// of this move.
+    fn unrecord(&mut self, completion: u64) {
+        if let Some(index) = self.pending.iter().position(|&known| known == completion) {
+            self.pending.remove(index);
+        }
+    }
+
     /// How full the pool is, as the enqueue line reports it: entries waiting
     /// for their completion clocks, and the firmware's `move_count` once the
     /// handshake armed it (`"unarmed"` until then).
@@ -2471,13 +2487,29 @@ impl Mcu {
     }
 
     /// Convert seconds to firmware clock ticks, as upstream's
-    /// `MCU.seconds_to_clock` (`klippy/mcu.py:1184-1185`).
+    /// `MCU.seconds_to_clock` (`klippy/mcu.py:1140-1141`, handed on at
+    /// `mcu.py:1184-1185`).
+    ///
+    /// A duration only means something as a finite, non-negative number of
+    /// seconds. Upstream's `int(time * freq)` raises on a NaN and keeps the
+    /// sign of a negative one; here the `as u64` cast would quietly fold both
+    /// to `0` — a clock that has already passed, so the firmware runs the
+    /// command at once instead of the caller seeing its own arithmetic bug.
+    /// The check is here, at the one entry every conversion goes through; a
+    /// caller whose value has a floor of its own applies it before the call and
+    /// says why there (`McuStepper`'s pulse width, `resource/stepper.rs`).
     ///
     /// # Errors
-    /// As [`Mcu::clock_freq`].
+    /// As [`Mcu::clock_freq`], plus [`McuError::Config`] when `seconds` is
+    /// negative or not finite.
     pub fn seconds_to_clock(&self, seconds: f64) -> Result<u64, McuError> {
         let freq = self.clock_freq()?;
-        Ok((seconds * freq).max(0.0) as u64)
+        if !seconds.is_finite() || seconds < 0.0 {
+            return Err(McuError::Config(format!(
+                "seconds_to_clock: {seconds} is not a finite, non-negative number of seconds"
+            )));
+        }
+        Ok((seconds * freq) as u64)
     }
 
     /// Minimum time the host needs to get scheduled events queued into the
@@ -2700,6 +2732,7 @@ impl Mcu {
             None,
             self.move_clocks(start_clock, completion_clock),
         )
+        .inspect_err(|_| self.release_move_slot(completion_clock))
     }
 
     /// [`Mcu::send_move`] for an already-encoded payload — the stepper's flush
@@ -2707,7 +2740,8 @@ impl Mcu {
     /// (`McuStepper::send_steps_async`).
     ///
     /// The pool entry is taken here, before the payload waits for room, so the
-    /// slot accounting is in step with the queue.
+    /// slot accounting is in step with the queue; a send that does not make it
+    /// gives the entry back ([`Mcu::release_move_slot`]).
     ///
     /// # Errors
     /// As [`Mcu::send_payload`].
@@ -2744,11 +2778,33 @@ impl Mcu {
         // Same headroom wait as `send_payload`: a long step batch must not
         // starve the synchronous senders (`SYNC_SEND_HEADROOM`), and the same
         // bound reports a send task that stopped draining (`PAYLOAD_ROOM_WAIT`).
-        queue_awaiting_room(&self.send_buf_tx, SendItem::Clocked(payload, clocks)).await
+        queue_awaiting_room(&self.send_buf_tx, SendItem::Clocked(payload, clocks))
+            .await
+            .inspect_err(|_| self.release_move_slot(completion_clock))
+    }
+
+    /// Give back the pool entry a move took when its message never reached the
+    /// queue ([`MoveSlots::unrecord`]).
+    ///
+    /// The pool only prunes an entry once its completion clock is behind the
+    /// estimate, and it does so on the next [`MoveSlots::record`] — so an entry
+    /// taken for a move that was never sent stays in `pending` for good and
+    /// holds a slot the firmware never heard of. Both move senders roll back
+    /// through here on failure; nothing else can remove it.
+    fn release_move_slot(&self, completion_clock: u64) {
+        self.move_slots
+            .lock()
+            .expect("move slots lock poisoned")
+            .unrecord(completion_clock);
     }
 
     /// The gates for one move-class command: the pool's floor for its
     /// `min_clock`, its start clock for `req_clock` (`Mcu::send_move`).
+    ///
+    /// The entry is recorded here, before the message is queued, and the callers
+    /// give it back on [`Mcu::release_move_slot`] if the queue refuses the
+    /// message: the floor has to be computed against the pool as it will be
+    /// once this move is in it.
     fn move_clocks(&self, start_clock: u64, completion_clock: u64) -> SendClocks {
         let min_clock = self
             .move_slots
@@ -5315,6 +5371,60 @@ mod tests {
             None,
             "the freed entries were pruned, so the pool has room again"
         );
+    }
+
+    /// A move whose message never reaches the queue keeps no slot: the entry
+    /// [`Mcu::move_clocks`] took is given back through
+    /// [`Mcu::release_move_slot`]. The pool only drops an entry when a later
+    /// `record` finds its completion clock behind the estimate, so a ghost entry
+    /// is never pruned — it holds a slot the firmware never handed out, and once
+    /// `pending` is over capacity it pushes the floor onto clocks that have long
+    /// passed. Both move senders take their clocks from `move_clocks`, so both
+    /// are checked here; the session is closed to make the send refuse.
+    #[tokio::test]
+    async fn test_a_move_that_never_queues_gives_its_slot_back() {
+        const BASE: u64 = 1_000_000;
+        let (mcu, _recorder) = gate_mcu(vec![], BASE);
+        mcu.set_move_slot_capacity(1);
+        let pending = || {
+            mcu.move_slots
+                .lock()
+                .expect("move slots lock poisoned")
+                .report()
+                .0
+        };
+
+        // One move goes in: the pool holds its entry.
+        mcu.send_move("get_clock", &[], BASE, BASE + 1_600_000)
+            .unwrap();
+        assert_eq!(pending(), 1, "the queued move does not hold a slot");
+
+        // The session ends, so every later send is refused at the door.
+        mcu.close();
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || mcu.send_buf_tx.is_closed(),
+            "the send task did not go away",
+        )
+        .await;
+
+        let err = mcu
+            .send_move("get_clock", &[], BASE, BASE + 3_200_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        assert_eq!(pending(), 1, "the refused move kept its slot");
+
+        // The step path's already-encoded payload takes its slot the same way.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_move_payload(Payload::from_raw(vec![5]), BASE, BASE + 4_800_000),
+        )
+        .await
+        .expect("a refused payload send must not wait for room")
+        .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        assert_eq!(pending(), 1, "the refused payload kept its slot");
     }
 
     /// ③ The safety window around a slot-starved send: with the pool full, the

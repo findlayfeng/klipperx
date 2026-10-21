@@ -89,6 +89,14 @@
 //!   (`DualCarriages.home`, `idex_modes.py:116-132`). Here the section's
 //!   endstop drives its trigger but is not queryable, and only the primary
 //!   carriage homes.
+//! * **`G28` drives the second carriage without its endstop stopping it**: the
+//!   homing move is the X (or Y) coordinate, and both carriage motors read it
+//!   off the main trapq, so the second carriage travels the whole move while
+//!   only the primary rail's endstop is in the trigger (`stepper_x`). Upstream
+//!   homes the carriages **one at a time**, each with its own endstop armed
+//!   (`idex_modes.py:116-132`). On a real IDEX machine the untriggered carriage
+//!   therefore runs the full homing move instead of stopping on its own
+//!   `position_endstop`.
 //! * **A config with two extruders ([`dual_carriage.cfg`](crate and its T0/T1
 //!   macros) puts **both** extruders in the motion path**: a `Move` carries one
 //!   position slot per extra axis (`Move::extra_start`/`extra_end`, with

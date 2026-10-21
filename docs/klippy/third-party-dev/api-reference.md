@@ -604,7 +604,7 @@
 | `motion_report/dump_trapq` | `name` | trapq 名 | 已实现 | 梯形运动队列 |
 | `tmc/stallguard_dump` | `name` | 步进电机名 | 未实现 | TMC StallGuard 数据 |
 | `load_cell/dump_force` | `load_cell` | load cell 名 | 已实现 | 四列表头 `time, force (g), counts, tare_counts`，未校准列 `null` |
-| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 未实现 | 探针敲击事件 |
+| `load_cell_probe/dump_taps` | `load_cell_probe` | 名称 | 已实现 | 探针敲击事件（单列表头 `probe_tap_event`；每次 `run_tap` 拟合后推 `{time, force, is_valid}`） |
 
 **请求示例（订阅 ADXL345 数据）：**
 

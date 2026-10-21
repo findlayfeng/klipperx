@@ -207,13 +207,13 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
-- [ ] **G4-2 外围**：extra-axes 的 `axis_map` 已落地（`gcode_move` 随 `toolhead:update_extra_axes` 重建，`G1 A…` 按字母寻址并进入规划器；2026-10-18），
-      额外轴出步也已落地（`manual_stepper` 自有 trapq，`MOVE=` 与 `G1 A…` 都真出步）。
-      仍缺 **`Coord` 的定容上限**：`MAX_AXES = 8`（E + 4 个字母轴，第 5 个不映射）、
-      `G1_PARAMS` 静态表不为额外字母提供补全、`reset_last_position` 的尾巴沿用上一段（toolhead 只报 4 轴）；
-      上游 `ToolHead.manual_move` / `ToolHead.add_extra_axis` 的其余调用方（`toolhead:manual_move` 由 `safe_z_home` 发、
-      `toolhead:update_extra_axes` 由 `ToolHeadObject` 发，见下表；`extruder:activate_extruder` 已由 `ACTIVATE_EXTRUDER` 发出）、
-      `bed_mesh`（`set_move_transform` 已实现，`bed_tilt` / `exclude_object` 在用）。
+- [x] **G4-2 外围（2026-10-21 收官）**：extra-axes 的 `axis_map`（`gcode_move` 随 `toolhead:update_extra_axes` 重建，`G1 A…` 按字母寻址并进入规划器）、
+      额外轴出步（`manual_stepper` 自有 trapq，`MOVE=` 与 `G1 A…` 都真出步）、**容量与补全**均已落地：
+      `MAX_AXES` 8 → 16（E + 12 个字母轴），超容量重建 `axis_map` 时一次性 `tracing::error!` 列出被丢弃的字母
+      （不再静默）、`G0`/`G1` 的 `G1_PARAMS` 补齐 20 个自由字母（A–Z 去 X/Y/Z/E/F/N，客户端内建参数表随之再生成，
+      注册点计数 98 → 99）、`reset_last_position` 按 `base_position.len()` 一次重建全部轴（四轴 + 全部额外轴，截到 `MAX_AXES`），
+      不再靠后续 `resize` 补尾巴。另有 `toolhead:manual_move`（`safe_z_home`）、`toolhead:update_extra_axes`（`ToolHeadObject`）、
+      `extruder:activate_extruder`（`ACTIVATE_EXTRUDER`）三个发送方与 `bed_mesh` 的 `set_move_transform`（`bed_tilt` / `exclude_object` 在用）。
 
 ### B4 其余端点（机制部分 FW9）
 
@@ -222,8 +222,9 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 - [ ] **dump 端点家族残余**（mux 机制已就绪，实例随各自 extras 落地）。已落地：
       `bed_mesh/dump_mesh`、`motion_report/dump_trapq` 与 `dump_stepper`、`adxl345`/`ldc1612`/`mpu9250`
-      （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`tmc/stallguard_dump`。
-      仍缺：`load_cell_probe/dump_taps`（tap 事件未实现）、`icm20948`/`bmi160`/`lis2dw`/`angle` 四个
+      （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`load_cell_probe/dump_taps`（2026-10-21）、
+      `tmc/stallguard_dump`。
+      仍缺：`icm20948`/`bmi160`/`lis2dw`/`angle` 四个
       dump（随未移植的 extras 缺席），以及 `motion_report` 的 `get_status`
       （`live_position`/`live_velocity`/`live_extruder_velocity`，现返回 `{}`）与其 shutdown 诊断窗口转储。
 
@@ -577,7 +578,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
   - [ ] **真机 PROBE 用例**（触发即停 + 无 MONITOR）——本机无 load cell，接线后才写得安全且有意义；
   - [ ] **多 MCU 共享 Z 轴**：`add_stepper` 会拒，上游报配置错，本仓因事件总线隔离处理器而只能
         `tracing::error!` 后继续 bring-up（已登记为与上游的差异，见 `upstream-deviations.md`）；
-  - [ ] `dump_taps` / `LOAD_CELL_TEST_TAP` 仍未接（`load_cell_probe` 的探测结果族）。
+  - [x] `dump_taps` / `LOAD_CELL_TEST_TAP` **已接（2026-10-21）**：`run_tap` 拟合后先推 `{'tap': {time, force, is_valid}}`
+        再写结果，mux 端点 `load_cell_probe/dump_taps`（key `load_cell_probe`）+ `LOAD_CELL_TEST_TAP`（`TAPS` 1–10 默认 3、
+        `TIMEOUT` 1–120 默认 30，帮助文案与三句 `respond_info` 逐字照上游，含上游 typo `Test timeout out`）。
 
 - [ ] **`angle`**（磁编码传感器）——无文件、无 section。
 - [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `sensor_icm20948.c` /
@@ -590,8 +593,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `Arc<ExtruderPressureAdvance>`；`pa = 0` 有逐点回归保护。同批修了两个既有静默错：挤出机 stepper
       被 `add_stepper` 重指回主 trapq（从未读自己的）、`ToolHead::set_position` 把 toolhead 坐标写进 extra axis。
 - [ ] **压力提前的余项**：
-      1. 改**值**（`ADVANCE=`）仍用 `get_last_move_time()` 落表、不走上游的 `register_lookahead_callback`
-         （`smooth_time` 变更**已按上游 flush**，2026-10-21）；
+      1. ~~改**值**（`ADVANCE=`）仍用 `get_last_move_time()` 落表~~ **已修（2026-10-21）**：改值只写上报值，
+         落表排队到 `register_lookahead_callback`（队列非空 ⇒ 在该 move 末尾的 print_time 生效；队列空 ⇒ 立即）；
+         `smooth_time` 变更仍走上游的 flush + 从头重算（2026-10-21）；
       2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）。
 - [x] **`input_shaper` 已作用到运动（2026-10-21）**：`motion/shaper.rs` 移植 `kin_shaper.c` 的整形位置函数
       （脉冲归一化 + 重心归零、按 `SegmentWindow` 定位、`DUMMY_T` 合成段喂内层 solver），
@@ -706,7 +710,8 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
 - [ ] `extruder_stepper.py`：**段已落地**（2026-09-24 批 #2），宿主 step 同步的 toolhead 缝仍缺
       （不跟随 extruder 运动）。
-- [ ] **extra-axes 余项见 G4-2**（`MAX_AXES` 容量、`G1_PARAMS` 补全、`reset_last_position` 尾巴）——唯一登记处在那里。
+- [x] **extra-axes 余项已于 2026-10-21 收官**：`MAX_AXES` 16、`G1_PARAMS` 补全、`reset_last_position` 尾巴——
+      唯一登记处仍是 G4-2。
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
       `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
       （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）

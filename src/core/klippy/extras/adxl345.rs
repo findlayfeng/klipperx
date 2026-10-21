@@ -7,6 +7,8 @@
 //! | [`read_axes_map`] | `adxl345.read_axes_map` (reused by `[mpu9250]`) |
 //! | [`AccelQueryHelper`] / [`AccelMeasurement`] | `adxl345.AccelQueryHelper` (reused by `[mpu9250]`) |
 //! | [`Adxl345::start_internal_client`] | `ADXL345.start_internal_client` — the accelerometer interface `resonance_tester` looks for |
+//! | [`convert_samples`] | `ADXL345._convert_samples` |
+//! | [`setup_writes`] / `read_reg_frame` / `set_reg_frame` | `_start_measurements`' register traffic |
 //! | `adxl345/dump_adxl345` mux endpoint (key `sensor`) | `batch_bulk.add_mux_endpoint(…)` |
 //! | `config_adxl345` / `query_adxl345` | [`crate::core::klippy::cmd::adxl345`] |
 //!
@@ -26,20 +28,19 @@
 //! [`AccelQueryHelper`] the same way upstream's `mpu9250.py` imports them from
 //! `adxl345.py`.
 //!
-//! # Gap: the bulk sample path is not wired
+//! # The sample path
 //!
-//! Everything above registers, but **no samples flow**: this host's shared
-//! [`FixedFreqReader`](super::bulk_sensor::FixedFreqReader) is currently
-//! ldc1612-specific — it decodes 4-byte `">I"` samples and queries the fixed
-//! `query_status_ldc1612` — while the ADXL345 needs 5-byte `"BBBBB"` samples
-//! and `query_adxl345_status` (and `[mpu9250]` needs 6-byte `">hhh"` and
-//! `query_mpu9250_status`). Generalizing the reader is shared infrastructure and
-//! is left to the parent to do once the accelerometer lanes have landed; until
-//! then the batch helper's start/stop/batch callbacks are deliberately inert,
-//! [`Adxl345::start_internal_client`]'s client stays empty, and the chip's
-//! register setup / `_convert_samples` scale conversion are not implemented
-//! here. What is real: section loading, option validation, the SPI resource,
-//! the two config commands, the mux endpoint, and the client-side windowing.
+//! Samples flow through the shared
+//! [`FixedFreqReader`](super::bulk_sensor::FixedFreqReader), parameterized with
+//! the chip's 5-byte `"BBBBB"` layout and the `query_adxl345_status` clock
+//! query — same reader as the ldc1612's, only the payload differs (`[i32; 5]`
+//! instead of the single-word `u32`). `_start_measurements`' register sequence
+//! ([`setup_writes`]), the read/write frames, and `_convert_samples`' ±2g
+//! ten-bit packing plus `axes_map` ([`convert_samples`]) follow upstream.
+//!
+//! One batch message carries `data` rows of `[time, x, y, z]` in mm/s², the
+//! accumulated `errors` count (samples the chip flagged and the conversion
+//! dropped) and `overflows`.
 
 use std::fs;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,12 +51,12 @@ use serde_json::{json, Value};
 use crate::core::klippy::cmd::adxl345::{ConfigAdxl345, QueryAdxl345};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
-    BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
+    BatchBulkHelper, BatchCb, FixedFreqReader, LifecycleCb,
 };
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::McuObject;
+use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, McuObject, McuSpi};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // Loaded after `[board_pins]` (order 30) so an alias or a software bus can name
@@ -102,6 +103,41 @@ const SCALE_Z: f64 = 0.003906 * FREEFALL_ACCEL;
 /// The toolhead's registered name (upstream `lookup_object('toolhead')`).
 const TOOLHEAD_OBJECT: &str = "toolhead";
 
+// The chip's register map (`adxl345.py`'s `REG_*`).
+const REG_DEVID: u8 = 0x00;
+const REG_BW_RATE: u8 = 0x2C;
+const REG_POWER_CTL: u8 = 0x2D;
+const REG_DATA_FORMAT: u8 = 0x31;
+const REG_FIFO_CTL: u8 = 0x38;
+
+/// The read bit of a register address (`REG_MOD_READ`).
+const REG_MOD_READ: u8 = 0x80;
+
+/// The id a working ADXL345 answers with (`ADXL345_DEV_ID`).
+const ADXL345_DEV_ID: u8 = 0xe5;
+
+/// `DATA_FORMAT` for the ±2g full-resolution ten-bit samples
+/// (`set_reg(REG_DATA_FORMAT, 0x0B)`).
+const SET_DATA_FORMAT: u8 = 0x0B;
+
+/// `FIFO_CTL` in stream mode (`SET_FIFO_CTL`).
+const SET_FIFO_CTL: u8 = 0x90;
+
+/// `POWER_CTL` bit 3: leave standby and measure.
+const POWER_CTL_MEASURE: u8 = 0x08;
+
+/// Seconds between batch callbacks and the smoothing span's unit
+/// (upstream `adxl345.BATCH_UPDATES` — the accelerometers process batches five
+/// times as often as the shared [`BATCH_INTERVAL`] default).
+const ADXL_BATCH_UPDATES: f64 = 0.100;
+
+/// The fields one sample unpacks (upstream's 5-byte `"BBBBB"`).
+const SAMPLE_FIELDS: usize = 5;
+
+/// One converted reading: `[time, x, y, z]`, the `data` row of a batch
+/// message (upstream's `Accel_Measurement` as a JSON row).
+pub type AccelSample = [f64; 4];
+
 /// Cap on the batch messages one client holds (`len(self.msgs) >= 10000`).
 const MAX_MESSAGES: usize = 10000;
 
@@ -146,6 +182,99 @@ pub fn read_axes_map(
         map.push(entry);
     }
     Ok(map)
+}
+
+// ===========================================================================
+// Sample conversion and chip setup (unit-tested directly)
+// ===========================================================================
+
+/// Python's `round(value, digits)` for the sample timestamps/values.
+fn round(value: f64, digits: i32) -> f64 {
+    let scale = 10_f64.powi(digits);
+    (value * scale).round() / scale
+}
+
+/// The `BW_RATE` register code for a supported `rate` (`QUERY_RATES[rate]`).
+fn bw_rate_code(data_rate: u32) -> Option<u8> {
+    QUERY_RATES
+        .iter()
+        .position(|rate| *rate == data_rate)
+        .map(|index| 0x8 + index as u8)
+}
+
+/// The register writes `_start_measurements` performs before arming the bulk
+/// stream, in order: standby, ten-bit full resolution, an empty FIFO, the
+/// requested sample rate, then FIFO stream mode.
+///
+/// `None` when `data_rate` is not one of [`QUERY_RATES`] — [`Adxl345::new`]
+/// refuses those, so the start path only sees this if a section was built
+/// some other way.
+fn setup_writes(data_rate: u32) -> Option<[(u8, u8); 5]> {
+    Some([
+        (REG_POWER_CTL, 0x00),
+        (REG_DATA_FORMAT, SET_DATA_FORMAT),
+        (REG_FIFO_CTL, 0x00),
+        (REG_BW_RATE, bw_rate_code(data_rate)?),
+        (REG_FIFO_CTL, SET_FIFO_CTL),
+    ])
+}
+
+/// The bytes `read_reg` clocks out: the address with its read bit set, then a
+/// dummy byte whose reply carries the value (upstream's
+/// `spi_transfer([reg | REG_MOD_READ, 0x00])`).
+fn read_reg_frame(reg: u8) -> [u8; 2] {
+    [reg | REG_MOD_READ, 0x00]
+}
+
+/// The value a [`read_reg_frame`] reply carries: the byte after the echoed
+/// address, or `None` when the reply is short.
+fn read_reg_value(response: &[u8]) -> Option<u8> {
+    response.get(1).copied()
+}
+
+/// The bytes `set_reg` shifts out (upstream's `spi_send([reg, val & 0xFF])`).
+fn set_reg_frame(reg: u8, value: u8) -> [u8; 2] {
+    [reg, value]
+}
+
+/// Map raw ADXL345 samples to scaled acceleration (`ADXL345._convert_samples`).
+///
+/// One raw sample is the five fields the `"BBBBB"` format unpacks — `xlow`,
+/// `ylow`, `zlow`, `xzhigh`, `yzhigh` — which pack into the chip's three
+/// ten-bit axis words. A sample with bit 7 of `yzhigh` set is the chip's error
+/// flag: it is dropped and counted into `error_count` (upstream's
+/// `last_error_count`, accumulated across a measurement). `axes_map` gives
+/// each output axis its source component and signed scale.
+pub fn convert_samples(
+    axes_map: &[(usize, f64)],
+    raw: &[(f64, [i32; SAMPLE_FIELDS])],
+    error_count: &mut u64,
+) -> Vec<AccelSample> {
+    let (x_pos, x_scale) = axes_map[0];
+    let (y_pos, y_scale) = axes_map[1];
+    let (z_pos, z_scale) = axes_map[2];
+    let mut out = Vec::with_capacity(raw.len());
+    for (ptime, fields) in raw {
+        let [xlow, ylow, zlow, xzhigh, yzhigh] = *fields;
+        if yzhigh & 0x80 != 0 {
+            *error_count += 1;
+            continue;
+        }
+        // Each axis is ten bits, the high bits split across the two trailing
+        // bytes; subtracting the sign bit's weight sign-extends the word.
+        let raw_xyz = [
+            (xlow | ((xzhigh & 0x1f) << 8)) - ((xzhigh & 0x10) << 9),
+            (ylow | ((yzhigh & 0x1f) << 8)) - ((yzhigh & 0x10) << 9),
+            (zlow | ((xzhigh & 0xe0) << 3) | ((yzhigh & 0xe0) << 6)) - ((yzhigh & 0x40) << 7),
+        ];
+        out.push([
+            round(*ptime, 6),
+            round(f64::from(raw_xyz[x_pos]) * x_scale, 6),
+            round(f64::from(raw_xyz[y_pos]) * y_scale, 6),
+            round(f64::from(raw_xyz[z_pos]) * z_scale, 6),
+        ]);
+    }
+    out
 }
 
 // ===========================================================================
@@ -211,9 +340,8 @@ impl AccelQueryHelper {
     /// Close the measurement window (`finish_measurements`).
     ///
     /// Upstream also calls `toolhead.wait_moves()`; this host has no synchronous
-    /// `wait_moves` seam on [`ToolHeadObject`], and the bulk stream that would
-    /// populate `msgs` is not wired yet (see the module gap), so only the
-    /// window's end is recorded.
+    /// `wait_moves` seam on [`ToolHeadObject`], so only the window's end is
+    /// recorded.
     pub fn finish_measurements(&self) {
         let end = self
             .printer
@@ -406,12 +534,28 @@ impl Adxl345 {
                 ConfigError::new(format!("Section '{identifier}': unknown MCU '{mcu_name}'"))
             })?;
         let builder = mcu_object.config();
+        let oid = builder
+            .create_oid()
+            .map_err(|err| ConfigError::new(err.to_string()))?;
 
+        // Samples per second the clock regression expects, smoothed over two
+        // batch windows (`chip_smooth = self.data_rate * BATCH_UPDATES * 2`).
+        // Upstream's `BATCH_UPDATES` is 0.100 for the accelerometers.
+        let chip_smooth = f64::from(data_rate) * ADXL_BATCH_UPDATES * 2.;
         let state = Arc::new(Adxl345State {
             name,
             axes_map,
             data_rate,
-            oid: Mutex::new(None),
+            oid,
+            spi,
+            mcu_object: Arc::clone(&mcu_object),
+            ffreader: FixedFreqReader::with_payload_format(
+                chip_smooth,
+                "BBBBB",
+                "query_adxl345_status oid=%c",
+            )
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
+            last_error_count: Mutex::new(0),
             printer: Arc::downgrade(printer),
             batch_bulk: Mutex::new(None),
         });
@@ -419,29 +563,49 @@ impl Adxl345 {
         // The build callback must follow the SPI resource's own callback: the
         // device oid only exists once that has run.
         let build_state = Arc::downgrade(&state);
-        let build_spi = Arc::clone(&spi);
         let build_identifier = identifier.clone();
         builder
-            .register_config_callback(Box::new(move |builder, _mcu| {
-                let spi_oid = build_spi.oid()?;
-                let oid = builder.create_oid()?;
-                builder.add_config_cmd(&ConfigAdxl345 { oid, spi_oid })?;
-                // Upstream arms nothing at config time: `query_adxl345` is added
-                // `on_restart`, so a firmware restart leaves the chip disarmed.
-                builder.add_restart_cmd(&QueryAdxl345 { oid, rest_ticks: 0 })?;
+            .register_config_callback(Box::new(move |builder, mcu| {
                 if let Some(state) = build_state.upgrade() {
-                    *state.oid.lock().unwrap_or_else(|p| p.into_inner()) = Some(oid);
+                    state.build(builder, mcu)?;
                 }
                 Ok(())
             }))
             .map_err(|err| ConfigError::new(format!("{build_identifier}: {err}")))?;
 
-        // The batch helper owns the mux endpoint. Its callbacks are inert until
-        // the sample path is wired (see the module gap).
-        let batch_cb: BatchCb = Arc::new(|_eventtime| Box::pin(async { Ok(None) }));
-        let start_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
-        let stop_cb: LifecycleCb = Arc::new(|| Box::pin(async { Ok(()) }));
-        let batch_bulk = BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, BATCH_INTERVAL);
+        // The batch helper owns the mux endpoint and drives start/stop/batch.
+        let start_state = Arc::downgrade(&state);
+        let start_cb: LifecycleCb = Arc::new(move || {
+            let start_state = start_state.clone();
+            Box::pin(async move {
+                let state = start_state
+                    .upgrade()
+                    .ok_or_else(|| "adxl345 is gone".to_string())?;
+                state.start_measurements().await
+            })
+        });
+        let stop_state = Arc::downgrade(&state);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let stop_state = stop_state.clone();
+            Box::pin(async move {
+                let state = stop_state
+                    .upgrade()
+                    .ok_or_else(|| "adxl345 is gone".to_string())?;
+                state.finish_measurements().await
+            })
+        });
+        let batch_state = Arc::downgrade(&state);
+        let batch_cb: BatchCb = Arc::new(move |eventtime| {
+            let batch_state = batch_state.clone();
+            Box::pin(async move {
+                let state = batch_state
+                    .upgrade()
+                    .ok_or_else(|| "adxl345 is gone".to_string())?;
+                state.process_batch(eventtime).await
+            })
+        });
+        let batch_bulk =
+            BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, ADXL_BATCH_UPDATES);
         batch_bulk.add_mux_endpoint(
             DUMP_ENDPOINT,
             DUMP_KEY,
@@ -456,7 +620,10 @@ impl Adxl345 {
     /// Open a measurement client (`ADXL345.start_internal_client`).
     ///
     /// This is the accelerometer interface `resonance_tester` looks for; see the
-    /// module docs. Until the bulk path is wired the client receives no batches.
+    /// module docs. Registering the client starts the chip's measurement stream
+    /// (upstream's `batch_bulk.add_client`, whose first client runs
+    /// `_start_measurements`) and dropping it — by returning `false` from
+    /// [`AccelQueryHelper::handle_batch`] — stops it.
     pub fn start_internal_client(&self) -> Arc<AccelQueryHelper> {
         let printer = self.state.printer.upgrade();
         let helper = Arc::new(AccelQueryHelper::new(printer.as_ref()));
@@ -520,12 +687,163 @@ struct Adxl345State {
     axes_map: Vec<(usize, f64)>,
     /// Samples per second the chip is configured for.
     data_rate: u32,
-    /// The oid the firmware assigned, set at build time.
-    oid: Mutex<Option<u8>>,
+    /// The oid the firmware assigned.
+    oid: u8,
+    /// The SPI bus, shared with the chip's register traffic.
+    spi: Arc<McuSpi>,
+    /// The MCU the chip is on (the SPI bus's).
+    mcu_object: Arc<McuObject>,
+    /// The reader: 5-byte `"BBBBB"` samples, `query_adxl345_status` queries.
+    ffreader: FixedFreqReader<[i32; SAMPLE_FIELDS]>,
+    /// Samples the chip flagged as errors since the last start
+    /// (`last_error_count`).
+    last_error_count: Mutex<u64>,
     /// The machine, for [`Adxl345::start_internal_client`].
     printer: Weak<Printer>,
     /// The batch helper that owns the mux endpoint.
     batch_bulk: Mutex<Option<Arc<BatchBulkHelper>>>,
+}
+
+impl Adxl345State {
+    /// The build-time half: the chip's config command, its disarmed-at-restart
+    /// query, and the reader's data binding (`_build_config`).
+    fn build(&self, builder: &ConfigBuilder, mcu: &Mcu) -> Result<(), McuError> {
+        builder.add_config_cmd(&ConfigAdxl345 {
+            oid: self.oid,
+            spi_oid: self.spi.oid()?,
+        })?;
+        // Upstream arms nothing at config time: `query_adxl345` is added
+        // `on_restart`, so a firmware restart leaves the chip disarmed.
+        builder.add_restart_cmd(&QueryAdxl345 {
+            oid: self.oid,
+            rest_ticks: 0,
+        })?;
+        self.ffreader.bind(mcu, &self.mcu_object, self.oid)?;
+        Ok(())
+    }
+
+    /// Read one register (`read_reg`): the byte the reply carries after the
+    /// echoed address.
+    async fn read_reg(&self, reg: u8) -> Result<u8, String> {
+        let response = self
+            .spi
+            .transfer(&read_reg_frame(reg))
+            .await
+            .map_err(|err| err.to_string())?;
+        read_reg_value(&response).ok_or_else(|| {
+            format!(
+                "adxl345 register 0x{reg:02x}: short read ({} byte(s))",
+                response.len()
+            )
+        })
+    }
+
+    /// Write one register and read it back (`set_reg`): a mismatch means the
+    /// chip did not take the setting.
+    async fn set_reg(&self, reg: u8, value: u8) -> Result<(), String> {
+        self.spi
+            .send(&set_reg_frame(reg, value))
+            .map_err(|err| err.to_string())?;
+        let stored = self.read_reg(reg).await?;
+        if stored != value {
+            return Err(format!(
+                "Failed to set ADXL345 register [0x{reg:02x}] to 0x{value:02x}: got 0x{stored:02x}. \
+                 This is generally indicative of connection problems\n\
+                 (e.g. faulty wiring) or a faulty adxl345 chip."
+            ));
+        }
+        Ok(())
+    }
+
+    /// The connected MCU, or why the sensor cannot reach it.
+    fn connected_mcu(&self) -> Result<Arc<Mcu>, String> {
+        self.mcu_object
+            .mcu()
+            .ok_or_else(|| "adxl345's MCU is not connected".to_string())
+    }
+
+    /// Bring the chip up and arm the bulk stream (`_start_measurements`).
+    async fn start_measurements(&self) -> Result<(), String> {
+        // In case of miswiring, the device id tells a real chip from noise.
+        let dev_id = self.read_reg(REG_DEVID).await?;
+        if dev_id != ADXL345_DEV_ID {
+            return Err(format!(
+                "Invalid adxl345 id (got {dev_id:x} vs {ADXL345_DEV_ID:x}).\n\
+                 This is generally indicative of connection problems\n\
+                 (e.g. faulty wiring) or a faulty adxl345 chip."
+            ));
+        }
+        let writes = setup_writes(self.data_rate)
+            .ok_or_else(|| format!("Invalid rate parameter: {}", self.data_rate))?;
+        for (reg, value) in writes {
+            self.set_reg(reg, value).await?;
+        }
+
+        // Start bulk reading: one report every four samples.
+        let mcu = self.connected_mcu()?;
+        let rest_ticks = mcu
+            .seconds_to_clock(4. / f64::from(self.data_rate))
+            .map_err(|err| err.to_string())? as u32;
+        mcu.send_msg(&QueryAdxl345 {
+            oid: self.oid,
+            rest_ticks,
+        })
+        .map_err(|err| err.to_string())?;
+        self.set_reg(REG_POWER_CTL, POWER_CTL_MEASURE).await?;
+
+        tracing::info!("ADXL345 starting '{}' measurements", self.name);
+        // Initialize clock tracking.
+        self.ffreader
+            .note_start()
+            .await
+            .map_err(|err| err.to_string())?;
+        *self
+            .last_error_count
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = 0;
+        Ok(())
+    }
+
+    /// Halt the bulk stream (`_finish_measurements`).
+    async fn finish_measurements(&self) -> Result<(), String> {
+        self.set_reg(REG_POWER_CTL, 0x00).await?;
+        // Upstream's `send_wait_ack` blocks for the ack; the queued messages
+        // ahead of this one (including the register write above) preserve the
+        // order, so the fire-and-forget send is enough here.
+        let mcu = self.connected_mcu()?;
+        mcu.send_msg(&QueryAdxl345 {
+            oid: self.oid,
+            rest_ticks: 0,
+        })
+        .map_err(|err| err.to_string())?;
+        self.ffreader.note_end();
+        tracing::info!("ADXL345 finished '{}' measurements", self.name);
+        Ok(())
+    }
+
+    /// One batch: pull, convert, report (`_process_batch`).
+    async fn process_batch(&self, _eventtime: f64) -> Result<Option<Value>, String> {
+        let raw = self
+            .ffreader
+            .pull_samples()
+            .await
+            .map_err(|err| err.to_string())?;
+        let mut error_count = self
+            .last_error_count
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let data = convert_samples(&self.axes_map, &raw, &mut error_count);
+        let errors = *error_count;
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let overflows = self.ffreader.get_last_overflows();
+        Ok(Some(json!({
+            "data": data,
+            "errors": errors,
+            "overflows": overflows,
+        })))
+    }
 }
 
 /// Upstream's `load_config` for a bare `[adxl345]`.
@@ -622,6 +940,106 @@ mod tests {
     fn test_an_unknown_axis_is_refused() {
         let err = read_axes_map(&wrap(None, &[("axes_map", "x,y,w")]), 1., 1., 1.).unwrap_err();
         assert_eq!(err.to_string(), "Invalid axes_map parameter");
+    }
+
+    /// The identity `axes_map` with unit scales, so a conversion asserts the
+    /// ten-bit packing alone.
+    fn unit_axes() -> Vec<(usize, f64)> {
+        vec![(0, 1.0), (1, 1.0), (2, 1.0)]
+    }
+
+    #[test]
+    fn test_convert_samples_unpacks_the_ten_bit_axes() {
+        let mut errors = 0;
+        // xlow=0x34, ylow=0x12, zlow=0x56, xzhigh=0x03 (x bits 8..12).
+        let raw = vec![(1.5, [0x34, 0x12, 0x56, 0x03, 0x00])];
+        let rows = convert_samples(&unit_axes(), &raw, &mut errors);
+        assert_eq!(rows, vec![[1.5, 820.0, 18.0, 86.0]]);
+        assert_eq!(errors, 0);
+
+        // All bits set: each axis word is signed, so -1 on every axis.
+        let raw = vec![(2.0, [0xff, 0xff, 0xff, 0xff, 0x7f])];
+        let rows = convert_samples(&unit_axes(), &raw, &mut errors);
+        assert_eq!(rows, vec![[2.0, -1.0, -1.0, -1.0]]);
+    }
+
+    #[test]
+    fn test_convert_samples_applies_the_axes_map_and_scale() {
+        // The corpus `input_shaper.cfg` setting, `-x,-y,z`, at the chip's ±2g
+        // full scale (x/y 1/265 g/LSB, z 1/256 g/LSB).
+        let axes_map = vec![(0, -SCALE_XY), (1, -SCALE_XY), (2, SCALE_Z)];
+        let mut errors = 0;
+        let raw = vec![(1.0, [0x34, 0x12, 0x56, 0x03, 0x00])];
+        let rows = convert_samples(&axes_map, &raw, &mut errors);
+        assert_eq!(rows[0][0], 1.0);
+        assert!((rows[0][1] + 820.0 * SCALE_XY).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][2] + 18.0 * SCALE_XY).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - 86.0 * SCALE_Z).abs() < 1e-6, "{rows:?}");
+
+        // A permuted map reads the components from other axes.
+        let swapped = vec![(2, SCALE_Z), (0, SCALE_XY), (1, SCALE_XY)];
+        let rows = convert_samples(&swapped, &raw, &mut errors);
+        assert!((rows[0][1] - 86.0 * SCALE_Z).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][2] - 820.0 * SCALE_XY).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - 18.0 * SCALE_XY).abs() < 1e-6, "{rows:?}");
+    }
+
+    #[test]
+    fn test_convert_samples_drops_error_flagged_samples() {
+        let mut errors = 0;
+        // yzhigh bit 7 is the chip's error flag; the next sample is fine.
+        let raw = vec![
+            (1.0, [0x10, 0x00, 0x00, 0x00, 0x80]),
+            (2.0, [0x01, 0x00, 0x00, 0x00, 0x00]),
+        ];
+        let rows = convert_samples(&unit_axes(), &raw, &mut errors);
+        assert_eq!(rows, vec![[2.0, 1.0, 0.0, 0.0]]);
+        assert_eq!(errors, 1);
+        // The count accumulates over batches (upstream's `last_error_count`).
+        convert_samples(&unit_axes(), &raw, &mut errors);
+        assert_eq!(errors, 2);
+    }
+
+    #[test]
+    fn test_the_register_setup_sequence_is_upstreams() {
+        assert_eq!(
+            setup_writes(3200).expect("a supported rate"),
+            [
+                (0x2d, 0x00), // POWER_CTL: standby
+                (0x31, 0x0b), // DATA_FORMAT: ±2g full resolution
+                (0x38, 0x00), // FIFO_CTL: empty the FIFO
+                (0x2c, 0x0f), // BW_RATE: 3200 Hz
+                (0x38, 0x90), // FIFO_CTL: stream mode
+            ]
+        );
+        // The rate codes are upstream's `QUERY_RATES` table.
+        for (rate, code) in [
+            (25, 0x8),
+            (50, 0x9),
+            (100, 0xa),
+            (200, 0xb),
+            (400, 0xc),
+            (800, 0xd),
+            (1600, 0xe),
+            (3200, 0xf),
+        ] {
+            assert_eq!(bw_rate_code(rate), Some(code), "rate {rate}");
+            assert_eq!(setup_writes(rate).expect("supported")[3], (0x2c, code));
+        }
+        assert_eq!(bw_rate_code(1234), None);
+        assert!(setup_writes(1234).is_none());
+    }
+
+    #[test]
+    fn test_register_frames_set_and_clear_the_read_bit() {
+        // `read_reg` clocks the address with `REG_MOD_READ` set plus a dummy
+        // byte out; the reply's second byte is the register's value.
+        assert_eq!(read_reg_frame(REG_DEVID), [0x80, 0x00]);
+        assert_eq!(read_reg_frame(REG_POWER_CTL), [0xad, 0x00]);
+        assert_eq!(read_reg_value(&[0x80, 0xe5]), Some(0xe5));
+        assert_eq!(read_reg_value(&[0x80]), None);
+        // `set_reg` shifts the plain address and the value.
+        assert_eq!(set_reg_frame(REG_DATA_FORMAT, 0x0b), [0x31, 0x0b]);
     }
 
     #[test]

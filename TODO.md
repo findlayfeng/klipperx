@@ -65,7 +65,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| F6 | SPI 总线剩余：`spi_transfer_with_preface` / `setup_shutdown_msg` | F1、F2 |
+| F6 | SPI 总线 —— **✅ 收官（2026-10-21）**：`spi_transfer_with_preface`（一次 block 两条消息、一个 ack）与 `setup_shutdown_msg` 均落地 | — |
 | F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」✅（2026-10-03，`330c212`） | F1、F2、C1 |
 | F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / lcd / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地）。宿主侧已建：`extras/led.rs` 的 `led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`、`extras/buttons.rs`（固件查询未接）、`cmd/trigger_analog.rs` 资源层（宿主节未建） | F1–F7 |
 
@@ -253,8 +253,14 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 上游 `MCU_SPI`（`klippy/extras/bus.py:42-155`）：
 
-- [ ] `spi_transfer_with_preface` 与 `setup_shutdown_msg`：`ConfigSpiShutdown` 命令
-      已定义，但资源/消费者未接（设备需要在 shutdown 时发消息时才用得上）。
+- [x] **`spi_transfer_with_preface` 与 `setup_shutdown_msg` —— 已落地（2026-10-21）**：
+      上游形状照抄——preface 走 `spi_send`（固件不应答）、读走 `spi_transfer`，两者编码后**并进同一个 block**、
+      只等**一个** ack（`mcu.py:104-111`；固件仍按每条消息各派发一次，`spicmds.c:113-132` ⇒ 两次片选）。
+      为此新增 `Mcu::call_two`：`encode(a) ++ encode(b)` 用 `Payload::try_merge`，超过一个 block 上限就**报错**
+      而不是悄悄拆成两块两 ack；`call_gated_oid` 拆出 `call_gated_block`，登记/入队/等待/失败取消全是原来那段代码。
+      `setup_shutdown_msg` 立即分配 handler oid 并在 config 包里发 `config_spi_shutdown{oid, spi_oid, msg}`，
+      build 之后拒绝新调用。**注意**：`tmc_spi` 的收发路径**未切**（仍 `spi_send` + `spi_transfer` 两个 ack），
+      收敛判据是「片选次数不变」，留作后续单元。
 
 已落地：`cmd/spi.rs`（命令层，`%*s` 走二进制 `ArgType::Bytes`）、
 `mcu/resource/spi.rs`（`McuSpi` 资源 + `SpiMode`，片选由固件驱动）、

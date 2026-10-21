@@ -575,7 +575,7 @@ git config core.hooksPath .githooks
 | `shutdown.rs` | `emergency_stop` / `clear_shutdown` 两个无参命令的线上 id |
 | `clock.rs` | 读取时钟、32 位回绕值、握手前失败、超时；另有不依赖 MCU 的 `ClockSync` 实现，验证 trait 作为测试缝可用（文件随 `pub mod clock;` 一并编译）；查询喂时钟估计（`test_a_query_feeds_the_mcu_clock_estimate`） |
 | `debug.rs` | `debug_read` / `debug_write` / `debug_ping` / `debug_nop` 与固件格式一致；`debug_result` / `pong` 解码（缺参数报错）；读/写/ping/nop 各自走虚拟 MCU 的整条往返与上线 |
-| `spi.rs` | `config_spi`（含 active-high、无片选两变体）/ `spi_set_bus` / `spi_set_sw_bus` 编码；新旧软件总线命令的优先选择（这三例是 async 真调，`mcu_with` + `FrameMock`）、两个都没有时报错；`spi_send` / `spi_transfer` 的编码与 `spi_transfer` 响应解码；`config_spi_shutdown` |
+| `spi.rs` | `config_spi`（含 active-high、无片选两变体）/ `spi_set_bus` / `spi_set_sw_bus` 编码；新旧软件总线命令的优先选择（这三例是 async 真调，`mcu_with` + `FrameMock`）、两个都没有时报错；`spi_send` / `spi_transfer` 的编码与 `spi_transfer` 响应解码；`config_spi_shutdown` |；**`transfer_with_preface`（2026-10-21）**：一个 block 里两条消息（`spi_send` preface + `spi_transfer` 读）只消费一个 ack、超过 block 上限即报错不拆块、超时与发送失败后待答登记归零
 | `i2c.rs` | `config_i2c` / `i2c_set_bus` / `i2c_set_software_bus` 编码；新旧软件总线命令选择（async 真调）；`i2c_transfer` / `i2c_write` / `i2c_read` 的编码与响应解码（`i2c_response` / `i2c_read_response` / `i2c_bus_status`） |
 | `thermocouple.rs` | 命令与固件格式一致；芯片类型号与固件枚举对齐；`thermocouple_result` 解码；整条经虚拟 MCU 的往返（等回调用 **1 s 有界轮询**，不再固定睡 20 ms——那个固定窗口在全量闸门满载下会被错过，让本来能过的测试假失败） |
 | `stepper.rs` | `config_stepper` / `queue_step` 的 `args()` 与固件参数序一致（编码后解码回同一组值） |

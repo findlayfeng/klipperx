@@ -816,9 +816,21 @@ impl CanSerialDevice {
                 self.id(),
                 describe_can_frame(can_frame.id(), can_frame.data())
             );
-            (&self.socket)
-                .write_all(can_frame.to_abi(self.wire)?.as_bytes())
-                .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))?;
+            let written = can_frame.to_abi(self.wire).and_then(|record| {
+                (&self.socket)
+                    .write_all(record.as_bytes())
+                    .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))
+            });
+            if let Err(e) = written {
+                // A block goes onto the bus one frame at a time, so a failure
+                // part way through leaves a fragment no MCU can reassemble into a
+                // message — and whatever it did get is enough to knock the node's
+                // reassembly out of step with the byte stream. The link stops here
+                // rather than writing further blocks onto a bus already out of
+                // step.
+                self.stopped.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
         }
         debug!(
             "sent {} bytes as {} CAN frame(s) to {:#x}",
@@ -2489,6 +2501,103 @@ mod tests {
 
         assert_eq!(device.receive(), Some(block));
         assert_eq!(device.bytes_read(), CAN_DATA_BYTES as u64);
+    }
+
+    /// A pipe of `room` free bytes, standing in for the socket: its free room is
+    /// exact to the byte, which is what makes a *particular* frame's write fail.
+    ///
+    /// The write end is non-blocking, so a write that cannot fit reports
+    /// `EAGAIN` instead of waiting for room that never comes. Returns the two ends
+    /// and the pipe's capacity, which is what is already in it once filled.
+    #[cfg(test)]
+    fn pipe_with_room_for(room: usize) -> (File, File, usize) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` writes two fds into an array of two.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "a pipe: {}", std::io::Error::last_os_error());
+        // SAFETY: both fds are fresh and owned here, each taken into a `File`
+        // exactly once.
+        let (read_end, write_end) =
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        // The smallest pipe the kernel allows, so that filling it stays bounded.
+        // SAFETY: a plain (fd, command, argument) call on an fd owned above.
+        unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        // SAFETY: `F_GETPIPE_SZ` takes no argument and returns the capacity.
+        let capacity = unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        assert!(capacity > 0, "the pipe's capacity is readable");
+        let capacity = capacity as usize;
+        assert!(
+            capacity >= 2 * room,
+            "a {capacity} byte pipe has room for a fill plus {room} bytes"
+        );
+        (&write_end)
+            .write_all(&vec![0u8; capacity - room])
+            .expect("filling the pipe up to `room` free bytes");
+        (read_end, write_end, capacity)
+    }
+
+    #[test]
+    fn test_a_block_whose_write_fails_part_way_stops_the_link() {
+        // A block goes onto the bus one frame at a time, so a write that fails
+        // half way leaves a fragment no MCU can reassemble — and the link must
+        // not go on writing more blocks onto it. Here the fake socket has room
+        // for exactly one sixteen byte record, so the block's first frame lands
+        // and its second one fails.
+        let (read_end, write_end, capacity) = pipe_with_room_for(CAN_FRAME_SIZE);
+        let device = CanSerialDevice::test_device_on(write_end, 7, CanWire::Classical);
+
+        // Eighteen bytes: two full frames and a two byte tail, three records.
+        let block = message(1, &[0u8; 13]);
+        assert_eq!(block.raw_bytes().len(), 18);
+
+        let err = device
+            .send(&block)
+            .expect_err("the second frame has nowhere to go");
+        assert!(matches!(err, InterfaceError::SendError(_)), "{err:?}");
+        assert!(
+            device.stopped.load(Ordering::Relaxed),
+            "a half written block stops the link"
+        );
+        assert_eq!(
+            device.bytes_write(),
+            0,
+            "the block is not counted as written"
+        );
+
+        // The pipe's filler, then exactly one record: the block's first frame and
+        // nothing of the two after it.
+        let mut wire = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match (&read_end).read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => wire.extend_from_slice(&chunk[..read]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("reading the fake bus failed: {e}"),
+            }
+        }
+        assert_eq!(
+            wire.len(),
+            capacity,
+            "the pipe holds its filler plus one record, so one frame was written"
+        );
+        let first_frame = CanFrame::new(
+            device.link.lock().unwrap().tx_id(),
+            &block.raw_bytes()[..CAN_DATA_BYTES],
+        )
+        .unwrap();
+        assert_eq!(
+            &wire[capacity - CAN_FRAME_SIZE..],
+            first_frame.to_abi(CanWire::Classical).unwrap().as_bytes(),
+            "the fragment is the block's first frame"
+        );
+
+        // The link is not used again: the next block is refused before a byte of
+        // it can join the fragment on the bus.
+        assert!(matches!(
+            device.send(&message(2, &[1, 2])),
+            Err(InterfaceError::ConnectionLost)
+        ));
     }
 
     #[test]

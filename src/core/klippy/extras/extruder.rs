@@ -793,6 +793,15 @@ mod tests {
         extruder_config("").replace("kinematics: cartesian", "kinematics: none")
     }
 
+    /// Run one g-code line under an overall bound: an await a test hangs on is
+    /// a CI hang.
+    async fn run_bounded(gcode: &GCodeDispatch, script: &str) {
+        tokio::time::timeout(Duration::from_secs(30), gcode.run_script(script))
+            .await
+            .unwrap_or_else(|_| panic!("{script} did not finish within the bound"))
+            .unwrap_or_else(|error| panic!("{script}: {error}"));
+    }
+
     /// `commands.test` sends `SET_PRESSURE_ADVANCE ADVANCE=.002
     /// SMOOTH_TIME=.001` with **no** `EXTRUDER=` word. Upstream answers that
     /// through the `EXTRUDER` default — registered only by the extruder
@@ -858,7 +867,7 @@ mod tests {
         );
 
         // Only `ADVANCE` moves now: the smooth time is unchanged, so the new
-        // value is dated by the planner's horizon and nothing is flushed.
+        // value rides a lookahead callback and nothing is flushed.
         gcode
             .run_script("SET_PRESSURE_ADVANCE ADVANCE=.003 SMOOTH_TIME=.04")
             .await
@@ -920,6 +929,142 @@ mod tests {
             gcode.run_script(script).await.expect("the line applies");
             assert_eq!(flushes.load(Ordering::SeqCst), expected, "after {script}");
         }
+    }
+
+    /// A **value-only** change is dated by the lookahead callback, not by the
+    /// command (`kinematics/extruder.py:83-86` → `klippy/toolhead.py:526-531`):
+    /// with a move still queued the schedule the solver reads is untouched when
+    /// the command returns, and the new value lands at that move's end time
+    /// when the look-ahead flushes.
+    ///
+    /// Positions are a pure function of that schedule (see the
+    /// `pressure_advance` module docs), so an unchanged schedule is an
+    /// unchanged position for every segment — including every segment the step
+    /// generator has already stepped over.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_value_only_change_waits_for_the_lookahead_flush() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        // Pressure advance on, with a smooth time: the fixture a value-only
+        // change then has to leave alone.
+        extruder.pressure_advance.set(0.0, 0.05, 0.04);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        // One move is queued when the command runs, so the callback has a move
+        // to park on.
+        toolhead
+            .move_to(Coord::new(10.0, 0.0, 0.0, 0.0), 100.0)
+            .expect("the move is planned");
+        let before = extruder.pressure_advance.schedule();
+
+        run_bounded(&gcode, "SET_PRESSURE_ADVANCE ADVANCE=.02").await;
+
+        assert_eq!(
+            extruder.pressure_advance.schedule(),
+            before,
+            "nothing the solver reads changes before the flush point"
+        );
+        // What the command *reports* moves at once (`extruder.py:87-88`).
+        assert_eq!(extruder.pressure_advance.values(), (0.02, 0.04));
+
+        // Flushing the look-ahead is what fires the callback.
+        let flush_time = toolhead.get_last_move_time();
+        let schedule = extruder.pressure_advance.schedule();
+        assert_eq!(schedule.len(), before.len() + 1, "the entry is recorded");
+        let landed = schedule.last().expect("the new entry is the last one");
+        assert!(
+            (landed.print_time - flush_time).abs() < 1e-9,
+            "dated at the queued move's end time: {} vs {flush_time}",
+            landed.print_time
+        );
+        assert_eq!((landed.pressure_advance, landed.smooth_time), (0.02, 0.04));
+        // The solver's lookup takes the last entry at or before a segment's own
+        // print time (`pa_move_integrate`): the segment generated at the flush
+        // time and every later one reads the new value, the ones before it keep
+        // the old.
+        let in_force = |print_time: f64| {
+            schedule
+                .iter()
+                .rev()
+                .find(|entry| entry.print_time <= print_time)
+                .map(|entry| entry.pressure_advance)
+        };
+        assert_eq!(in_force(flush_time), Some(0.02));
+        assert_eq!(in_force(flush_time - 1e-6), Some(0.05));
+    }
+
+    /// With the look-ahead empty, `register_lookahead_callback` fires **at
+    /// once**, with the last move time (`klippy/toolhead.py:526-531`) — so a
+    /// value-only change on an idle planner is in force as soon as the command
+    /// returns, and dated at that same time rather than at zero.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_value_only_change_with_nothing_queued_lands_at_the_last_move_time() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        extruder.pressure_advance.set(0.0, 0.05, 0.04);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        let last_move_time = toolhead.get_last_move_time();
+        run_bounded(&gcode, "SET_PRESSURE_ADVANCE ADVANCE=.02").await;
+
+        let schedule = extruder.pressure_advance.schedule();
+        let landed = schedule.last().expect("the new entry is the last one");
+        assert_eq!((landed.pressure_advance, landed.smooth_time), (0.02, 0.04));
+        assert!(
+            (landed.print_time - last_move_time).abs() < 1e-9,
+            "the empty look-ahead fires at once with the last move time: {} vs {last_move_time}",
+            landed.print_time
+        );
+        assert_eq!(extruder.pressure_advance.values(), (0.02, 0.04));
+    }
+
+    /// The other branch is untouched: a **changed smooth time** still flushes
+    /// step generation and dates the new parameters at time zero
+    /// (`kinematics/extruder.py:75-83`), not at the look-ahead's flush point.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_smooth_time_change_still_lands_at_time_zero() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        // The configured `ADVANCE` is 0, so the old *effective* smooth time is
+        // 0 and enabling pressure advance is a smooth time change.
+        run_bounded(&gcode, "SET_PRESSURE_ADVANCE ADVANCE=.05 SMOOTH_TIME=.02").await;
+
+        let schedule = extruder.pressure_advance.schedule();
+        assert_eq!(schedule.len(), 1, "the flushed write replaces the schedule");
+        assert_eq!(schedule[0].print_time, 0.0, "dated at time zero");
+        assert_eq!(
+            (schedule[0].pressure_advance, schedule[0].smooth_time),
+            (0.05, 0.02)
+        );
     }
 
     /// With a default registered, a key that names something else still has to

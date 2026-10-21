@@ -5,8 +5,8 @@
 //! either a **hardware bus** (`spi_set_bus`, using the MCU's SPI peripheral) or
 //! a **software bus** (`spi_set_sw_bus`, bit-banging on GPIO pins). After that,
 //! bytes move with `spi_send` (write only) or `spi_transfer` (full duplex);
-//! `transfer_with_preface` folds a command and the read that follows it into
-//! one transfer.
+//! `transfer_with_preface` sends a preface and the read that follows it as one
+//! block, upstream's two-message shape.
 //!
 //! # Chip select
 //!
@@ -190,49 +190,73 @@ impl McuSpi {
         Ok(response.response)
     }
 
-    /// Shift `preface` out and read `data` back, in **one** transfer.
+    /// Shift `preface` out, then read `data` back, as upstream's
+    /// `spi_transfer_with_preface`: two messages in **one** block, one
+    /// acknowledgement.
     ///
-    /// The device sees a single chip-select pulse: the preface bytes, then
-    /// `data.len()` zero bytes during which the answer is clocked in. The bytes
-    /// returned for the read part land in `data`; the preface's own echo is
-    /// dropped. This is the shape of a protocol whose command byte and answer
-    /// belong to one transaction (a flash JEDEC-ID read, a sensor register
-    /// read): `&[0x03]` plus a three-byte read is the one transfer
-    /// `03 00 00 00`.
+    /// The block is `spi_send`(preface) followed by `spi_transfer`(zeros for the
+    /// read), which is exactly what upstream encodes into one send
+    /// (`klippy/extras/bus.py:117-122`: the preface is `spi_send_cmd`, the read
+    /// is `spi_transfer_cmd`, both handed to `send_with_preface`,
+    /// `klippy/mcu.py:104-111`). The firmware still runs each message on its
+    /// own — two `spidev_transfer` calls, so **two chip-select pulses**
+    /// (`src/spicmds.c:113-132`) — but they are adjacent on the wire with no
+    /// host round trip and no other message between them, and the pair costs
+    /// **one** ack instead of two.
     ///
-    /// # Two-datagram protocols
+    /// The preface must be a write the device does not answer: `spi_send` emits
+    /// no response (`src/spicmds.c:125-132`), so the only answer the block
+    /// produces is the read's. That is why the preface is not a second
+    /// `spi_transfer` — one of those always answers, and the preface's echo
+    /// would be the answer this call decoded.
     ///
-    /// A device that needs the chip-select edge *between* the two frames (a
-    /// TMC register write, whose write frame is latched by that edge) cannot
-    /// use this: it is [`McuSpi::send`] followed by [`McuSpi::transfer`].
-    /// Upstream's `spi_transfer_with_preface` (`klippy/extras/bus.py:117-122`)
-    /// is that two-message shape — it encodes the preface as `spi_send` and the
-    /// read as `spi_transfer` and puts both in one acknowledgement
-    /// (`klippy/mcu.py:104-107`), which the firmware still runs as two
-    /// `spidev_transfer` calls (`src/spicmds.c:113-132`), one per message.
+    /// The read segment clocks zeros out, and the answer lands in `data` (it is
+    /// `data.len()` bytes). An empty preface sends an empty `spi_send`, which is
+    /// what upstream does too: a caller with no preface uses
+    /// [`McuSpi::transfer`].
     ///
     /// # Errors
     /// What [`McuSpi::transfer`] reports, plus [`McuError::Decode`] when the
-    /// answer is not as long as the transfer
-    /// (`preface.len() + data.len()` bytes).
+    /// answer is not `data.len()` bytes long, and [`McuError::Msg`] when the two
+    /// messages together exceed one wire block (see [`Mcu::call_two`]).
     pub async fn transfer_with_preface(
         &self,
         preface: &[u8],
         data: &mut [u8],
     ) -> Result<(), McuError> {
-        let mut wire = Vec::with_capacity(preface.len() + data.len());
-        wire.extend_from_slice(preface);
-        wire.resize(preface.len() + data.len(), 0);
+        let mcu = self.connected_mcu()?;
+        let oid = self.oid()?;
 
-        let response = self.transfer(&wire).await?;
-        if response.len() != wire.len() {
+        let response: SpiTransferResponse = tokio::time::timeout(
+            TRANSFER_TIMEOUT,
+            mcu.call_two(
+                &SpiSend {
+                    oid,
+                    data: preface.to_vec(),
+                },
+                &SpiTransfer {
+                    oid,
+                    data: vec![0; data.len()],
+                },
+                oid,
+                TRANSFER_TIMEOUT,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            McuError::Call(crate::core::klippy::mcu::McuCallError::Timeout(
+                "spi_transfer timed out".to_string(),
+            ))
+        })??;
+
+        if response.response.len() != data.len() {
             return Err(McuError::Decode(format!(
-                "spi_transfer answered {} bytes for a {} byte transfer",
-                response.len(),
-                wire.len()
+                "spi_transfer answered {} bytes for a {} byte read",
+                response.response.len(),
+                data.len()
             )));
         }
-        data.copy_from_slice(&response[preface.len()..]);
+        data.copy_from_slice(&response.response);
         Ok(())
     }
 
@@ -435,8 +459,10 @@ mod tests {
     use serde_json::json;
     use std::time::Duration;
 
-    /// The `spi_transfer` message id in [`dictionary`], pinned in the wire
+    /// The `spi_send` message id in [`dictionary`], pinned in the wire
     /// assertions below.
+    const SPI_SEND_ID: i16 = 54;
+    /// The `spi_transfer` message id in [`dictionary`].
     const SPI_TRANSFER_ID: i16 = 55;
     /// The `spi_transfer_response` message id in [`dictionary`].
     const SPI_TRANSFER_RESPONSE_ID: i16 = 56;
@@ -547,14 +573,28 @@ mod tests {
             .clone()
     }
 
-    /// Script the answer to a full-duplex transfer of `data` on `oid`.
-    fn answer(wire: &RecordingWire, oid: u8, data: &[u8], response: &[u8]) {
+    /// The block `transfer_with_preface(preface, read_len)` puts on the wire:
+    /// `spi_send`(preface) immediately followed by `spi_transfer`(zeros).
+    fn preface_block(oid: u8, preface: &[u8], read_len: usize) -> Vec<u8> {
+        let mut block = wire_bytes(
+            "spi_send oid=%c data=%*s",
+            SPI_SEND_ID,
+            &[ArgValue::UInt8(oid), ArgValue::Bytes(preface.to_vec())],
+        );
+        block.extend(wire_bytes(
+            "spi_transfer oid=%c data=%*s",
+            SPI_TRANSFER_ID,
+            &[ArgValue::UInt8(oid), ArgValue::Bytes(vec![0; read_len])],
+        ));
+        block
+    }
+
+    /// Script the answer to `request`: one `spi_transfer_response`, because the
+    /// block's other message is a `spi_send` and a `spi_send` answers nothing
+    /// (`src/spicmds.c:125-132`).
+    fn answer(wire: &RecordingWire, oid: u8, request: Vec<u8>, response: &[u8]) {
         wire.reply_to(
-            wire_bytes(
-                "spi_transfer oid=%c data=%*s",
-                SPI_TRANSFER_ID,
-                &[ArgValue::UInt8(oid), ArgValue::Bytes(data.to_vec())],
-            ),
+            request,
             wire_bytes(
                 "spi_transfer_response oid=%c response=%*s",
                 SPI_TRANSFER_RESPONSE_ID,
@@ -563,23 +603,19 @@ mod tests {
         );
     }
 
-    /// ① `transfer_with_preface` is **one** `spi_transfer` whose bytes are the
-    /// preface followed by the (zero) read segment; the read part of the answer
-    /// lands in `data` and the preface's echo is dropped.
+    /// `transfer_with_preface` is upstream's shape (`bus.py:117-122`): the
+    /// preface and the read are two messages in **one** block — one ack, one
+    /// round trip — and the firmware still runs each message on its own, so the
+    /// pair is two chip-select pulses.
     #[tokio::test]
-    async fn test_transfer_with_preface_is_one_transfer_of_preface_then_read() {
+    async fn test_transfer_with_preface_is_two_messages_in_one_block() {
         let harness = harness();
         harness.builder.build(&harness.mcu).unwrap();
         let oid = harness.device.oid().unwrap();
-
-        // What a W25 answers to a JEDEC-ID read: its command echoed, then
-        // `ef 40 17`.
-        answer(
-            &harness.wire,
-            oid,
-            &[0x9f, 0x00, 0x00, 0x00],
-            &[0x9f, 0xef, 0x40, 0x17],
-        );
+        let request = preface_block(oid, &[0x9f], 3);
+        // A W25's answer to a JEDEC-ID read: `ef 40 17`. The preface is a
+        // `spi_send`, so it echoes nothing into this answer.
+        answer(&harness.wire, oid, request.clone(), &[0xef, 0x40, 0x17]);
 
         let mut data = [0u8; 3];
         tokio::time::timeout(
@@ -590,13 +626,19 @@ mod tests {
         .expect("the transfer is bounded")
         .expect("the canned answer arrives");
 
-        assert_eq!(data, [0xef, 0x40, 0x17], "the read part, preface dropped");
+        assert_eq!(data, [0xef, 0x40, 0x17]);
 
         let sends = sends(&harness.sent);
-        assert_eq!(sends.len(), 1, "one message, not a send plus a transfer");
-        // `37` = message id 55, then the oid, the `%*s` length, and the bytes:
-        // the preface `9f` followed by the three bytes the read clocks out.
-        assert_eq!(hex(&sends[0]), "3700049f000000");
+        assert_eq!(
+            sends.len(),
+            1,
+            "one block: one acknowledgement, no second round trip"
+        );
+        // `36` = `spi_send` (id 54) with the preface, then `37` = `spi_transfer`
+        // (id 55) with the three bytes the read clocks out: both message
+        // headers are in one frame.
+        assert_eq!(hex(&sends[0]), "3600019f370003000000");
+        assert_eq!(sends[0], request, "the block is exactly what was scripted");
 
         let mut parser = Parser::new();
         harness
@@ -606,52 +648,30 @@ mod tests {
             .install(&mut parser)
             .unwrap();
         let decoded = parser.decode(Payload::from_raw(sends[0].clone())).unwrap();
-        assert_eq!(decoded.len(), 1, "one command, not two");
-        assert_eq!(decoded[0].0.name, "spi_transfer");
+        assert_eq!(
+            decoded
+                .iter()
+                .map(|(msg, _)| msg.name.as_str())
+                .collect::<Vec<_>>(),
+            ["spi_send", "spi_transfer"],
+            "two messages, run by the firmware as two `spidev_transfer` calls \
+             (`src/spicmds.c:113-132`): one chip-select pulse each"
+        );
         assert_eq!(
             decoded[0].1,
+            vec![ArgValue::UInt8(oid), ArgValue::Bytes(vec![0x9f])]
+        );
+        assert_eq!(
+            decoded[1].1,
             vec![
                 ArgValue::UInt8(oid),
-                ArgValue::Bytes(vec![0x9f, 0x00, 0x00, 0x00]),
+                ArgValue::Bytes(vec![0x00, 0x00, 0x00])
             ]
         );
-    }
-
-    /// ③ With no preface the call is a plain [`McuSpi::transfer`] of the read
-    /// segment: the same bytes on the wire, the same answer, one message.
-    #[tokio::test]
-    async fn test_transfer_without_a_preface_is_a_plain_transfer() {
-        let harness = harness();
-        harness.builder.build(&harness.mcu).unwrap();
-        let oid = harness.device.oid().unwrap();
-        // The read segment clocks zeros out, so an empty preface is a plain
-        // transfer of four zero bytes.
-        let zeros = [0u8; 4];
-        let expected = [0x00, 0xef, 0x40, 0x17];
-        answer(&harness.wire, oid, &zeros, &expected);
-
-        let mut data = [0u8; 4];
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            harness.device.transfer_with_preface(&[], &mut data),
-        )
-        .await
-        .expect("the transfer is bounded")
-        .expect("the canned answer arrives");
-        let plain = tokio::time::timeout(Duration::from_secs(5), harness.device.transfer(&zeros))
-            .await
-            .expect("the transfer is bounded")
-            .expect("the canned answer arrives");
-
-        assert_eq!(data, expected, "with no preface the whole answer is data");
-        assert_eq!(plain, expected.to_vec());
-
-        let sends = sends(&harness.sent);
-        assert_eq!(sends.len(), 2);
-        assert_eq!(hex(&sends[0]), "37000400000000");
         assert_eq!(
-            sends[0], sends[1],
-            "no preface: the same bytes as `transfer` puts on the wire"
+            harness.mcu.pending_call_count().await,
+            0,
+            "the answer took the one registration with it"
         );
     }
 

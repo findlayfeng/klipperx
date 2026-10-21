@@ -35,11 +35,12 @@
 //!
 //! # What is not here
 //!
-//! * **Drawing onto the panel.** The framework has no `draw_text` (see
-//!   `display.rs`'s module docs), so the rows a container lays out are
-//!   [`MenuManager::screen_rows`] and nothing paints them: the state machine,
-//!   the viewport and the scroller run, the panel keeps its blank screen. This
-//!   is the gap `display_data` has as well.
+//! * **Drawing onto the panel.** The framework has
+//!   [`display::draw_text`](super::display::draw_text) and
+//!   [`display::draw_progress_bar`](super::display::draw_progress_bar) now, but
+//!   nothing hands the menu's rows to them yet: a container lays its rows out
+//!   into [`MenuManager::screen_rows`] and the panel keeps the cleared screen.
+//!   A `display_data` layout does draw (see `display.rs`'s module docs).
 //! * **The `menu:*` printer events** (`begin`, `init`, `populate`, `exit`).
 //!   This host's event bus is a generated enum and no part subscribes to them.
 //! * **`menu.back()` / `menu.exit()` inside a script** (`menu.py:679-684`): a
@@ -1634,7 +1635,8 @@ impl MenuManager {
 
     /// The rows the panel would show now (`MenuList.draw_container`).
     ///
-    /// The framework has no `draw_text`, so the rows are computed and handed
+    /// The framework can draw ([`display::draw_text`](super::display::draw_text)),
+    /// but nothing calls it for these rows yet, so they are computed and handed
     /// back instead of painted; they carry the cursor, the folder marker and the
     /// scrolled name exactly as a drawing would.
     pub fn screen_rows(&self) -> Vec<MenuRow> {

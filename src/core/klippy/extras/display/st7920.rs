@@ -25,10 +25,15 @@
 //! * **`emulated_st7920`** (`st7920.py:209-256`): the software-SPI variant that
 //!   shifts each byte as two nibbles and toggles an enable pin. Not implemented;
 //!   `lcd_type` reports it as a gap.
-//! * **Text and glyph drawing.** [`super::display`] never draws, so the
-//!   `write_text`/`write_glyph`/`write_graphics` half of `DisplayBase` is not
-//!   ported. The glyph framebuffer is still filled by [`ST7920::set_glyphs`],
-//!   because upstream caches the animated icons at load time.
+//! * **Text and glyph drawing.** The framework draws now — it calls
+//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
+//!   friends through [`display::draw_text`](super::display::draw_text) — but the
+//!   `write_text`/`write_glyph`/`write_graphics` half of upstream's
+//!   `DisplayBase` is a later unit: it needs the font (`font8x14.VGA_FONT`) and
+//!   the `CharGlyphs` table, so this driver keeps the draw-nothing defaults and
+//!   the panel stays blank while the layout renders. The glyph framebuffer is
+//!   still filled by [`ST7920::set_glyphs`], because upstream caches the
+//!   animated icons at load time.
 //! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:10,184`): upstream
 //!   sends with `reqclock=0x7fffffff00000000` and orders startup writes by clock;
 //!   this host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no

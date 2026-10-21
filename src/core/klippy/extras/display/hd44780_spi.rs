@@ -36,12 +36,15 @@
 //!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` (`hd44780_spi.py:95-119`) —
-//!   and with them the `TextGlyphs` table that maps `right_arrow` to `0x7e`
-//!   (`hd44780_spi.py:14`) — are not ported; [`Hd44780Spi::set_glyphs`] keeps
-//!   the 5x8 icons because upstream collects them there
-//!   (`hd44780_spi.py:100-104`).
+//! * **Text and glyph drawing.** The framework draws now — it calls
+//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
+//!   friends through [`display::draw_text`](super::display::draw_text) — but this
+//!   driver's half is a later unit: `write_text`/`write_glyph`/`write_graphics`
+//!   (`hd44780_spi.py:95-119`) and the `TextGlyphs` table that maps
+//!   `right_arrow` to `0x7e` (`hd44780_spi.py:14`) are not ported, so the trait
+//!   methods keep their draw-nothing defaults and this panel stays blank while
+//!   the layout renders. [`Hd44780Spi::set_glyphs`] keeps the 5x8 icons because
+//!   upstream collects them there (`hd44780_spi.py:100-104`).
 //! * **`minclock`** (`hd44780_spi.py:82-83,92`): upstream orders the init groups
 //!   by a clock deadline 100ms apart, computed from the MCU's estimated print
 //!   time. This host's [`McuCommand`](crate::core::klippy::cmd::McuCommand)

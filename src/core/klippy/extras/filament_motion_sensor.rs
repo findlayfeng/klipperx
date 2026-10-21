@@ -14,10 +14,6 @@
 //!   comparison against `filament_runout_pos` are not wired. On the corpus's
 //!   fake firmware no encoder event is generated either, so the runout check is
 //!   never reached.
-//! * A bound `[extruder_stepper]`'s past position: the host stepper it wraps is
-//!   owned by the toolhead after connect and exposes no position, so
-//!   [`ExtruderSource::find_past_position`] returns `0.0` for that case — the
-//!   same H10 motion-sync gap the extra stepper itself carries.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -56,9 +52,8 @@ enum ExtruderSource {
 }
 
 impl ExtruderSource {
-    /// The position at a past print time (`find_past_position`). The extra
-    /// stepper has no reachable host position after connect (see the module
-    /// docs), so it reports `0.0`.
+    /// The position at a past print time (`find_past_position`): both kinds
+    /// answer from their own stepper's step compressor.
     fn find_past_position(&self, print_time: f64) -> f64 {
         match self {
             Self::Extruder(extruder) => extruder.find_past_position(print_time),

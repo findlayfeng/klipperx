@@ -47,7 +47,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::cmd::mpu9250::{ConfigMpu9250, QueryMpu9250};
+use crate::core::klippy::cmd::mpu9250::{
+    ConfigMpu9250, QueryMpu9250, QUERY_MPU9250_STATUS_MSGFORMAT,
+};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, FixedFreqReader, LifecycleCb,
@@ -556,7 +558,7 @@ impl Mpu9250 {
             ffreader: FixedFreqReader::with_payload_format(
                 rate as f64 * MPU_BATCH_UPDATES * 2.,
                 ">hhh",
-                "query_mpu9250_status oid=%c",
+                QUERY_MPU9250_STATUS_MSGFORMAT,
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
             last_error_count: Mutex::new(0),

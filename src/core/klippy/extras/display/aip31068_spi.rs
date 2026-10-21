@@ -15,6 +15,9 @@
 //! | `clear()` | blank both text framebuffers | `aip31068_spi.py:204-207` |
 //! | `flush()` | batch the framebuffer differences and send them | `aip31068_spi.py:150-171` |
 //! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `aip31068_spi.py:184-188` |
+//! | `write_text()` | copy the bytes into the row's text framebuffer | `aip31068_spi.py:179-182` |
+//! | `write_glyph()` | write the slot and its CGRAM bits, or the arrow character | `aip31068_spi.py:189-201` |
+//! | `write_graphics()` | nothing — only the eight CGRAM glyphs exist | `aip31068_spi.py:202-203` |
 //!
 //! As `hd44780`, the framebuffers are the two text buffers of `2*line_length`
 //! bytes — each of the panel's four rows is one half of one buffer — plus the
@@ -25,14 +28,9 @@
 //!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** The framework draws now — it calls
-//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
-//!   friends through [`display::draw_text`](super::display::draw_text) — but this
-//!   driver's half is a later unit: `write_text`/`write_glyph`/`write_graphics`
-//!   (`aip31068_spi.py:179-203`) are not ported, so the trait methods keep their
-//!   draw-nothing defaults and this panel stays blank while the layout renders.
-//!   [`Aip31068Spi::set_glyphs`] keeps the 5x8 icons because upstream collects
-//!   them there (`aip31068_spi.py:184-188`).
+//! * **`write_graphics`.** Upstream's is `pass` (`aip31068_spi.py:202-203`): the
+//!   panel has only the eight CGRAM glyphs, so a layout's `draw_progress_bar`
+//!   paints nothing on it.
 //! * **`minclock`** (`aip31068_spi.py:172-178`): upstream stamps each init group
 //!   with a clock deadline 100ms apart; this host's
 //!   [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no clock, so
@@ -325,6 +323,59 @@ impl LcdChip for Aip31068Spi {
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
     }
+
+    /// Upstream's `aip31068_spi.write_text` (`aip31068_spi.py:179-182`): a run
+    /// that does not fit is cut at the panel's right edge, and the row's other
+    /// half lives in the second text framebuffer.
+    fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+        let line_length = self.line_length;
+        // `data[:self.line_length - min(x, self.line_length)]`: empty once the
+        // write starts at or past the edge.
+        let text = if x + text.len() > line_length {
+            &text[..line_length - x.min(line_length)]
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
+        let pos = x + ((row & 0x02) >> 1) * line_length;
+        let mut framebuffers = self.framebuffers();
+        framebuffers.text[row & 1].data[pos..pos + text.len()].copy_from_slice(text);
+    }
+
+    /// Upstream's `aip31068_spi.write_glyph` (`aip31068_spi.py:189-201`): a
+    /// glyph with an icon writes its CGRAM slot as the character and the icon's
+    /// bits into the generator buffer; `right_arrow` is written as its own
+    /// character; any other name draws nothing and costs no cell.
+    fn write_glyph(&self, x: usize, row: usize, name: &str) -> usize {
+        let icon = self
+            .icons
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(name)
+            .cloned();
+        if let Some((slot, bits)) = icon {
+            self.write_text(x, row, &[slot]);
+            let mut framebuffers = self.framebuffers();
+            let start = slot as usize * 8;
+            let written = bits.len().min(8);
+            framebuffers.glyph.data[start..start + written].copy_from_slice(&bits[..written]);
+            return 1;
+        }
+        match text_glyph(name) {
+            Some(character) => {
+                self.write_text(x, row, &[character]);
+                1
+            }
+            None => 0,
+        }
+    }
+
+    /// Upstream's `aip31068_spi.write_graphics` is `pass`
+    /// (`aip31068_spi.py:202-203`): the panel has only the eight CGRAM glyphs,
+    /// so a progress bar paints nothing here.
+    fn write_graphics(&self, _x: usize, _row: usize, _data: &[u8]) {}
 }
 
 impl PrinterObject for Aip31068Spi {
@@ -344,6 +395,17 @@ impl std::fmt::Debug for Aip31068Spi {
         f.debug_struct("Aip31068Spi")
             .field("line_length", &self.line_length)
             .finish_non_exhaustive()
+    }
+}
+
+/// The glyph names a text panel draws as a plain character
+/// (`aip31068_spi.py:22`): the right arrow is the panel's own `0x7e`. Every
+/// other glyph comes from a `[display_glyph]`'s `hd44780_data` and is drawn
+/// through the character generator instead.
+fn text_glyph(name: &str) -> Option<u8> {
+    match name {
+        "right_arrow" => Some(0x7e),
+        _ => None,
     }
 }
 
@@ -734,6 +796,108 @@ mod tests {
             *chip.icons.lock().unwrap(),
             HashMap::from([("thermometer".to_string(), (3u8, vec![0x0e; 8]))])
         );
+    }
+
+    /// A framebuffer's bytes as lowercase hex, for byte-pinned assertions.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// A chip with the default 20-character panel.
+    fn chip_20() -> Aip31068Spi {
+        let printer = printer();
+        let section = display_section(AIP31068_SECTION);
+        Aip31068Spi::new(&ConfigWrapper::untracked(&section), &printer).expect("the section loads")
+    }
+
+    #[test]
+    fn test_write_text_cuts_at_the_right_edge_and_picks_the_quarter_rows() {
+        // `aip31068_spi.py:179-182`: the run is cut at `line_length`, and row
+        // `y` is byte `x + ((y & 2) >> 1) * line_length` of text framebuffer
+        // `y & 1` — rows 0 and 1 in the first buffer, 2 and 3 in the second
+        // half of it.
+        let chip = chip_20();
+
+        chip.write_text(18, 0, b"abc");
+        chip.write_text(0, 2, b"row2");
+        chip.write_text(19, 1, b"z");
+        // At or past the edge the cut leaves nothing to write.
+        chip.write_text(20, 0, b"x");
+
+        let framebuffers = chip.framebuffers();
+        assert_eq!(
+            hex(&framebuffers.text[0].data),
+            format!(
+                "{}{}{}{}",
+                "20".repeat(18),
+                "6162",
+                "726f7732",
+                "20".repeat(16)
+            )
+        );
+        assert_eq!(
+            hex(&framebuffers.text[1].data),
+            format!("{}{}{}", "20".repeat(19), "7a", "20".repeat(20))
+        );
+    }
+
+    #[test]
+    fn test_write_glyph_writes_the_cgram_slot_its_bits_and_the_arrow() {
+        // `aip31068_spi.py:189-201`: an icon writes its slot as the character
+        // and its eight bits at `slot * 8` in the generator buffer; the arrow
+        // is a plain character; anything else costs no cell.
+        let chip = chip_20();
+        let bits = vec![0x0e, 0x11, 0x11, 0x0e, 0x04, 0x0e, 0x1f, 0x00];
+        let mut glyphs: BTreeMap<String, Glyph> = BTreeMap::new();
+        glyphs.insert(
+            "thermometer".to_string(),
+            Glyph {
+                icon16x16: None,
+                icon5x8: Some((3, bits.clone())),
+            },
+        );
+        chip.set_glyphs(&glyphs);
+
+        assert_eq!(chip.write_glyph(2, 1, "thermometer"), 1);
+        assert_eq!(chip.write_glyph(5, 3, "right_arrow"), 1);
+        assert_eq!(chip.write_glyph(0, 0, "fan1"), 0);
+
+        let framebuffers = chip.framebuffers();
+        // Row 1 is text framebuffer 1 at `x`, row 3 is the same buffer at
+        // `x + line_length`.
+        assert_eq!(framebuffers.text[0].data, vec![b' '; 40]);
+        assert_eq!(
+            hex(&framebuffers.text[1].data),
+            format!(
+                "{}{}{}{}{}",
+                "20".repeat(2),
+                "03",
+                "20".repeat(22),
+                "7e",
+                "20".repeat(14)
+            )
+        );
+        // Slot 3 is bytes 24..32 of the 64-byte generator buffer; the unknown
+        // glyph left the rest of it alone.
+        assert_eq!(
+            hex(&framebuffers.glyph.data),
+            format!("{}{}{}", "00".repeat(24), hex(&bits), "00".repeat(32))
+        );
+    }
+
+    #[test]
+    fn test_write_graphics_paints_nothing() {
+        // Upstream's is `pass` (`aip31068_spi.py:202-203`): only the eight
+        // CGRAM glyphs exist, so a progress bar leaves the framebuffers as
+        // they are.
+        let chip = chip_20();
+
+        chip.write_graphics(0, 0, &[0u8; 16]);
+
+        let framebuffers = chip.framebuffers();
+        assert_eq!(framebuffers.text[0].data, vec![b' '; 40]);
+        assert_eq!(framebuffers.text[1].data, vec![b' '; 40]);
+        assert_eq!(framebuffers.glyph.data, vec![0; 64]);
     }
 
     // -- the flush plan ------------------------------------------------------

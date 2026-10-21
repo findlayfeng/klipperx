@@ -586,7 +586,7 @@ impl PrinterButtons {
         self.register_buttons(
             vec![pin.to_string()],
             Box::new(move |eventtime, state| handler.button_handler(eventtime, state)),
-        );
+        )?;
         Ok(())
     }
 
@@ -601,14 +601,23 @@ impl PrinterButtons {
     ///
     /// Infallible because its callers' signatures are: upstream raises these as
     /// config errors, here they are logged and the registration is not made.
-    pub fn register_buttons(&self, pins: Vec<String>, callback: ButtonCallback) {
-        match self.setup_buttons(&pins, callback) {
-            Ok(()) => self
-                .lock()
-                .registrations
-                .push(pins.iter().map(|pin| pin.to_string()).collect()),
-            Err(err) => error!("buttons: {err}"),
-        }
+    pub fn register_buttons(
+        &self,
+        pins: Vec<String>,
+        callback: ButtonCallback,
+    ) -> Result<(), ConfigError> {
+        self.setup_buttons(&pins, callback).map_err(|err| {
+            // Upstream raises these from `register_buttons` itself
+            // (`buttons.py:309-336`: `ppins.lookup_pin` and its "pins must be on
+            // the same mcu" check), so a config that names a pin the machine
+            // cannot resolve fails the load instead of coming up with a button
+            // that will never report.
+            ConfigError::new(err)
+        })?;
+        self.lock()
+            .registrations
+            .push(pins.iter().map(|pin| pin.to_string()).collect());
+        Ok(())
     }
 
     /// Resolve `pins`, find the firmware object that has room for them and

@@ -128,7 +128,7 @@ impl EncoderSensor {
                     handler.note_filament_present(eventtime, true);
                 }
             }),
-        );
+        )?;
 
         Ok(Self {
             name,

@@ -132,7 +132,8 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
-/// an entry. `tuning_tower` has no implementation here; `statistics` and
+/// an entry. `tuning_tower` loads only when its section is present (upstream
+/// loads it unconditionally, for `exclude_object`'s guard); `statistics` and
 /// `garbage_collection` exist only in part (the `system_stats` object and the
 /// reactor's latency warning stand in for their log summaries).
 const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
@@ -512,6 +513,7 @@ mod tests {
                 "temperature_host",
                 "temperature_probe",
                 "temperature_sensor",
+                "tuning_tower",
                 "virtual_sdcard",
                 "z_tilt",
                 "static_digital_output",

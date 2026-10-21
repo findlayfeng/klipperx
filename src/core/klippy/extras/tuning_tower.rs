@@ -191,6 +191,12 @@ impl TowerState {
     /// `last_position` is left to the caller, which sets it after the decision
     /// (`tuning_tower.py:91`).
     fn plan_move(&mut self, newpos: &Coord, gcode_move: &GCodeMove) -> Step {
+        if !self.active {
+            // No test running: the slot is still this tower's only because
+            // there was no chain below to hand it back to (`end_test`), and
+            // moves pass through untouched.
+            return Step::Nothing;
+        }
         if !self.is_tuning_move(newpos) {
             return Step::Nothing;
         }
@@ -378,6 +384,12 @@ impl TuningTower {
             .gcode_move
             .set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true)
             .map_err(|error| CommandError::new(error.to_string()))?;
+        // A slot that was empty could not be handed back by `end_test` (`chain`
+        // has no toolhead to restore in a machine without one), so it may still
+        // hold this tower: taking it as the chain below would forward every
+        // move to ourselves.
+        let this: Arc<dyn MoveTarget> = Arc::clone(object) as Arc<dyn MoveTarget>;
+        let displaced = displaced.filter(|previous| !Arc::ptr_eq(previous, &this));
         {
             let mut state = object.lock();
             state.active = true;
@@ -507,4 +519,468 @@ pub fn load_config(
 /// `TUNING_TOWER` (`tuning_tower.py:27-61`).
 fn cmd_tuning_tower(object: &Arc<TuningTower>, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     TuningTower::start_test(object, gcmd)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use crate::core::klippy::config::Config;
+    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
+
+    /// The machine with just `[tuning_tower]`, as the loader builds it: the
+    /// factory claims the section, `TUNING_TOWER` registers, and the object
+    /// lands under the section's own name.
+    fn machine() -> (Arc<Printer>, Arc<GCodeDispatch>, Arc<TuningTower>) {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (config, _) = Config::from_text("[tuning_tower]\n").expect("the section parses");
+        printer.load_config(&config).expect("the section loads");
+        // The dispatcher refuses scripts before ready (`gcode.rs` state
+        // check); `fan.rs`'s machine lights the ready lamp the same way.
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher is registered");
+        let object = printer
+            .lookup_object_as::<TuningTower>("tuning_tower")
+            .expect("the object is registered");
+        (printer, gcode, object)
+    }
+
+    /// Capture every line the dispatcher emits.
+    fn capture(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        gcode.register_output_handler(Arc::new(move |line: &str| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string());
+        }));
+        log
+    }
+
+    /// The lines captured so far, copied out.
+    fn lines(log: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+        log.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A command that records the lines the tower runs, so a test can assert
+    /// the emitted script as the client would see it.
+    fn register_capture_command(gcode: &Arc<GCodeDispatch>) -> Arc<Mutex<Vec<String>>> {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(gcmd.commandline().to_string());
+            Ok(())
+        });
+        gcode
+            .register_command_with_params(
+                "CAPTURE_VALUE",
+                handler,
+                Some("capture the tuning tower value"),
+                &["VALUE"],
+                false,
+            )
+            .expect("the capture command registers");
+        seen
+    }
+
+    /// A move target that records what it was asked and stands where it was
+    /// last told to.
+    struct FakeTarget {
+        moves: Mutex<Vec<(Coord, f64)>>,
+        position: Mutex<Coord>,
+    }
+
+    impl FakeTarget {
+        fn new() -> Self {
+            Self {
+                moves: Mutex::new(Vec::new()),
+                position: Mutex::new(Coord::new(0.0, 0.0, 0.0, 0.0)),
+            }
+        }
+
+        fn moves(&self) -> Vec<(Coord, f64)> {
+            self.moves.lock().unwrap().clone()
+        }
+    }
+
+    impl MoveTarget for FakeTarget {
+        fn move_to(&self, position: Coord, speed: f64) -> Result<(), CommandError> {
+            *self.position.lock().unwrap() = position;
+            self.moves.lock().unwrap().push((position, speed));
+            Ok(())
+        }
+
+        fn position(&self) -> Coord {
+            *self.position.lock().unwrap()
+        }
+    }
+
+    /// Upstream reads no options (`tuning_tower.py:14-23`): the bare
+    /// `[tuning_tower]` loads, `section!` registers the id, the command
+    /// carries upstream's help text, and the object stays out of `objects/list`
+    /// like any module without a `get_status`.
+    #[test]
+    fn a_bare_section_loads_and_registers_the_command() {
+        assert!(
+            crate::core::klippy::load::known_section_ids().contains(&"tuning_tower"),
+            "the section! declaration reached the generated factory table"
+        );
+        let (_printer, gcode, object) = machine();
+        assert_eq!(
+            gcode.command_help().get("TUNING_TOWER").map(String::as_str),
+            Some("Tool to adjust a parameter at each Z height")
+        );
+        assert!(!object.is_queryable(), "upstream defines no get_status");
+        assert_eq!(object.get_status(0.0), json!({}));
+    }
+
+    /// Every word defaults the way `gcmd.get_float(NAME, default)` spells it
+    /// (`tuning_tower.py:29-37`), and the test starts inactive until the
+    /// command arms it.
+    #[test]
+    fn the_words_take_upstreams_defaults() {
+        let (_printer, gcode, object) = machine();
+        assert!(!object.is_active());
+
+        gcode
+            .run_script_sync("TUNING_TOWER COMMAND=SET_VELOCITY_LIMIT PARAMETER=ACCEL")
+            .expect("the bare command starts a test");
+        let state = object.lock();
+        assert!(state.active);
+        assert_eq!(state.start, 0.0);
+        assert_eq!(state.factor, 0.0);
+        assert_eq!(state.band, 0.0);
+        assert_eq!(state.step_delta, 0.0);
+        assert_eq!(state.step_height, 0.0);
+        assert_eq!(state.skip, 0.0);
+        assert_eq!(state.last_z, NEVER_Z);
+        assert_eq!(state.last_command_value, None);
+        assert_eq!(state.command_prefix, "SET_VELOCITY_LIMIT ACCEL=");
+    }
+
+    /// The start line is upstream's `message_parts` join
+    /// (`tuning_tower.py:50-56`): a factor test reports factor (and band),
+    /// a step test reports both steps, and `skip` rides along.
+    #[test]
+    fn the_starting_message_matches_upstream() {
+        let (_printer, gcode, object) = machine();
+        let log = capture(&gcode);
+
+        gcode
+            .run_script_sync(
+                "TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE START=0.1 \
+                 FACTOR=0.05 BAND=0.2 SKIP=1.5",
+            )
+            .unwrap();
+        assert_eq!(
+            lines(&log),
+            vec!["// Starting tuning test (start=0.100000 factor=0.050000 band=0.200000 skip=1.500000)"]
+        );
+
+        gcode
+            .run_script_sync(
+                "TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE STEP_DELTA=5 STEP_HEIGHT=1",
+            )
+            .unwrap();
+        // A second `TUNING_TOWER` ends the first test first
+        // (`tuning_tower.py:28-29`), so the step line is the last one.
+        assert_eq!(
+            lines(&log).last().map(String::as_str),
+            Some(
+                "// Starting tuning test (start=0.000000 step_delta=5.000000 step_height=1.000000)"
+            )
+        );
+        // The slot it took back is this tower's own (there is no toolhead in
+        // this machine), so it is not kept as the chain below — otherwise every
+        // move would forward to itself.
+        assert!(object.lock().displaced.is_none());
+    }
+
+    /// `calc_value` (`tuning_tower.py:63-69`): the ramp, the band's midpoint
+    /// step, the step function, and each of them shifting by `SKIP`.
+    #[test]
+    fn calc_value_follows_upstreams_formula() {
+        let mut state = TowerState {
+            start: 0.2,
+            factor: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(state.calc_value(0.0), 0.2);
+        assert_eq!(state.calc_value(1.5), 15.2);
+
+        // A band evaluates its middle, so a whole band shares one value.
+        state.band = 1.0;
+        assert_eq!(state.calc_value(0.2), 0.2 + 0.5 * 10.0);
+        assert_eq!(state.calc_value(0.99), 0.2 + 0.5 * 10.0);
+        assert_eq!(state.calc_value(1.2), 0.2 + 1.5 * 10.0);
+
+        // SKIP holds the value down over the first millimetres.
+        state.band = 0.0;
+        state.skip = 2.0;
+        assert_eq!(state.calc_value(1.0), 0.2);
+        assert_eq!(state.calc_value(3.0), 10.2);
+
+        // A step test ignores FACTOR: start + delta * floor(z / height).
+        let stepped = TowerState {
+            start: 1.0,
+            step_delta: 0.5,
+            step_height: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(stepped.calc_value(0.0), 1.0);
+        assert_eq!(stepped.calc_value(1.999), 1.0);
+        assert_eq!(stepped.calc_value(2.0), 1.5);
+        assert_eq!(stepped.calc_value(5.5), 2.0);
+    }
+
+    /// The trigger itself: extrusion moves at new Z heights, with `BAND=1`,
+    /// run one command per band and nothing inside a band — the emitted script
+    /// is `COMMAND PARAMETER=<value>` with nine decimals
+    /// (`tuning_tower.py:41-44,71-92`).
+    #[tokio::test]
+    async fn crossing_a_band_runs_the_parameter_command_once() {
+        let (_printer, gcode, _object) = machine();
+        let seen = register_capture_command(&gcode);
+        gcode
+            .run_script("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE FACTOR=1 BAND=1")
+            .await
+            .unwrap();
+
+        // Extruding moves at rising heights; the last two stay in their band.
+        for (z, e) in [(0.2, 1), (0.5, 2), (1.2, 3), (1.5, 4)] {
+            gcode
+                .run_script(&format!("G1 X10 Z{z} E{e} F600"))
+                .await
+                .unwrap();
+        }
+
+        let captured = Arc::clone(&seen);
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            move || captured.lock().unwrap().len() >= 2,
+            "the two band values were never run",
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "CAPTURE_VALUE VALUE=0.500000000".to_string(),
+                "CAPTURE_VALUE VALUE=1.500000000".to_string(),
+            ]
+        );
+    }
+
+    /// Without `BAND` the value ramps, so every new height changes it and runs
+    /// the command — the same moves that produced two commands above produce
+    /// four.
+    #[tokio::test]
+    async fn without_a_band_every_new_height_runs_the_command() {
+        let (_printer, gcode, _object) = machine();
+        let seen = register_capture_command(&gcode);
+        gcode
+            .run_script("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE FACTOR=1")
+            .await
+            .unwrap();
+
+        for (z, e) in [(0.2, 1), (0.5, 2), (1.2, 3), (1.5, 4)] {
+            gcode
+                .run_script(&format!("G1 X10 Z{z} E{e} F600"))
+                .await
+                .unwrap();
+        }
+
+        let captured = Arc::clone(&seen);
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            move || captured.lock().unwrap().len() >= 4,
+            "the four ramped values were never run",
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "CAPTURE_VALUE VALUE=0.200000000".to_string(),
+                "CAPTURE_VALUE VALUE=0.500000000".to_string(),
+                "CAPTURE_VALUE VALUE=1.200000000".to_string(),
+                "CAPTURE_VALUE VALUE=1.500000000".to_string(),
+            ]
+        );
+    }
+
+    /// A traditional command gets upstream's space-separated form
+    /// (`tuning_tower.py:41-42`): `M999 S<value>`, not `M999 S=<value>`.
+    #[tokio::test]
+    async fn a_traditional_command_takes_a_bare_value() {
+        let (_printer, gcode, _object) = machine();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            sink.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(gcmd.commandline().to_string());
+            Ok(())
+        });
+        gcode
+            .register_command_with_params("M999", handler, Some("capture"), &["S"], false)
+            .expect("the traditional capture command registers");
+        gcode
+            .run_script("TUNING_TOWER COMMAND=M999 PARAMETER=S START=0.5")
+            .await
+            .unwrap();
+        gcode.run_script("G1 X10 Z0.1 E1 F600").await.unwrap();
+
+        let captured = Arc::clone(&seen);
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            move || !captured.lock().unwrap().is_empty(),
+            "the traditional command was never run",
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), vec!["M999 S0.500000000"]);
+    }
+
+    /// The twice-stated conflicts (`tuning_tower.py:38-40`) and the `minval=0.`
+    /// bounds (`:33-37`).
+    #[test]
+    fn invalid_words_keep_upstreams_wording() {
+        let (_printer, gcode, _object) = machine();
+
+        let error = gcode
+            .run_script_sync(
+                "TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE FACTOR=2 STEP_HEIGHT=1",
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Cannot specify both FACTOR and STEP_DELTA/STEP_HEIGHT"
+        );
+
+        let error = gcode
+            .run_script_sync("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE STEP_DELTA=1")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Must specify both STEP_DELTA and STEP_HEIGHT"
+        );
+
+        let error = gcode
+            .run_script_sync("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE BAND=-1")
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("BAND must have minimum of 0"),
+            "{error}"
+        );
+    }
+
+    /// A move far below the last one is the start of another print, so the
+    /// test ends (`tuning_tower.py:75-78,93-96`): the slot goes back to the
+    /// transform the tower displaced and the move still forwards.
+    #[tokio::test]
+    async fn a_move_far_below_the_last_one_ends_the_test() {
+        let (printer, gcode, object) = machine();
+        let log = capture(&gcode);
+        let displaced = Arc::new(FakeTarget::new());
+        let gcode_move = gcode_move::ensure(&printer).expect("gcode_move registers");
+        gcode_move
+            .set_move_transform(Arc::clone(&displaced) as Arc<dyn MoveTarget>, false)
+            .unwrap();
+        gcode
+            .run_script("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE FACTOR=1")
+            .await
+            .unwrap();
+        assert!(object.is_active());
+
+        gcode.run_script("G1 X10 Z10 E1 F600").await.unwrap();
+        gcode.run_script("G1 X20 Z5 E2 F600").await.unwrap();
+        assert!(!object.is_active());
+        assert!(
+            lines(&log)
+                .iter()
+                .any(|line| line == "// Ending tuning test mode"),
+            "upstream's end-of-test line"
+        );
+
+        // The slot is back on the displaced transform: a further move lands
+        // there once, not twice.
+        let before = displaced.moves().len();
+        gcode.run_script("G1 X30 Z6 E3 F600").await.unwrap();
+        assert_eq!(displaced.moves().len(), before + 1);
+        assert_eq!(displaced.moves().last().unwrap().0.x(), 30.0);
+    }
+
+    /// The tower chains over the transform it displaced while a test runs
+    /// (`tuning_tower.py:16,45-47,71-92`): the move reaches `bed_mesh`-like
+    /// occupied slot rather than the toolhead, and `position()` reports the
+    /// chain's position.
+    #[test]
+    fn a_test_chains_over_the_displaced_transform() {
+        let (printer, gcode, object) = machine();
+        let displaced = Arc::new(FakeTarget::new());
+        let gcode_move = gcode_move::ensure(&printer).expect("gcode_move registers");
+        gcode_move
+            .set_move_transform(Arc::clone(&displaced) as Arc<dyn MoveTarget>, false)
+            .unwrap();
+
+        gcode
+            .run_script_sync("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE")
+            .unwrap();
+        *displaced.position.lock().unwrap() = Coord::new(1.0, 2.0, 3.0, 4.0);
+        assert_eq!(object.position(), Coord::new(1.0, 2.0, 3.0, 4.0));
+
+        gcode.run_script_sync("G1 X7 Z3 E4 F600").unwrap();
+        assert_eq!(displaced.moves().len(), 1);
+        assert_eq!(displaced.moves()[0].0.x(), 7.0);
+    }
+
+    /// A machine with no chain below leaves the tower holding the move slot
+    /// after `end_test` — and a move through that slot is forwarded untouched
+    /// instead of tuning again.
+    #[tokio::test]
+    async fn a_move_after_the_test_ended_stops_tuning() {
+        let (_printer, gcode, object) = machine();
+        let seen = register_capture_command(&gcode);
+        gcode
+            .run_script("TUNING_TOWER COMMAND=CAPTURE_VALUE PARAMETER=VALUE FACTOR=1")
+            .await
+            .unwrap();
+        gcode.run_script("G1 X10 Z10 E1 F600").await.unwrap();
+
+        let captured = Arc::clone(&seen);
+        wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(10),
+            move || !captured.lock().unwrap().is_empty(),
+            "the first value was never run",
+        )
+        .await;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["CAPTURE_VALUE VALUE=10.000000000"]
+        );
+
+        // More than `CANCEL_Z_DELTA` below: the test ends.
+        gcode.run_script("G1 X20 Z1 E2 F600").await.unwrap();
+        assert!(!object.is_active());
+        gcode.run_script("G1 X30 Z2 E3 F600").await.unwrap();
+        // Nothing else is spawned by these two moves.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a move after the test ended ran no command"
+        );
+    }
 }

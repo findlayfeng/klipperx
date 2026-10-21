@@ -119,6 +119,7 @@ pub mod tmc_spi;
 pub mod tmc_uart;
 pub mod toolhead;
 pub mod trigger_analog;
+pub mod tsl1401cl_filament_width_sensor;
 pub mod tuning_tower;
 pub mod verify_heater;
 pub mod virtual_sdcard;

@@ -165,7 +165,7 @@ pub struct StepKinematics {
     post: Option<PositionPost>,
     /// The pressure-advance parameters, when this is an extruder stepper
     /// (`struct extruder_stepper`'s `pa_list`): the position function becomes
-    /// the smoothed `pa_position` (`kin_extruder.c:118-135`).
+    /// the smoothed `pa_position` (`kin_extruder.c:124-136`).
     pressure_advance: Option<Arc<ExtruderPressureAdvance>>,
 }
 
@@ -186,7 +186,7 @@ impl StepKinematics {
     }
 
     /// Drive this stepper's position function with pressure advance
-    /// (`extruder_set_pressure_advance`, `kin_extruder.c:147`): the solver
+    /// (`extruder_set_pressure_advance`, `kin_extruder.c:138-139`): the solver
     /// reads the shared parameters on every evaluation, so a
     /// `SET_PRESSURE_ADVANCE` is seen without reinstalling anything.
     pub fn set_pressure_advance(&mut self, pressure_advance: Arc<ExtruderPressureAdvance>) {

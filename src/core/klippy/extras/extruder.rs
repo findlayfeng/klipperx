@@ -185,7 +185,7 @@ impl PrinterExtruder {
             let stepper = Arc::new(PrinterStepper::new(config, printer, Axis::X, false)?);
             stepper.setup_itersolve(extruder_position_fn(), extruder_active_flags());
             // The solver smooths its position with the parameters
-            // `SET_PRESSURE_ADVANCE` writes (`kin_extruder.c:118-135`).
+            // `SET_PRESSURE_ADVANCE` writes (`kin_extruder.c:124-136`).
             stepper.setup_pressure_advance(Arc::clone(&pressure_advance));
             // A hidden object so the stepper's own `connect` runs and builds the
             // host `Stepper` the toolhead will take.

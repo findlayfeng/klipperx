@@ -598,7 +598,7 @@ impl PrinterStepper {
 
     /// Install the extruder's pressure-advance parameters on the solver this
     /// stepper will build at connect (`extruder_set_pressure_advance`,
-    /// `kin_extruder.c:147`).
+    /// `kin_extruder.c:138-139`).
     ///
     /// Called at load by `[extruder]` with the same `Arc` its status and
     /// `SET_PRESSURE_ADVANCE` use, so the command reaches the step generator

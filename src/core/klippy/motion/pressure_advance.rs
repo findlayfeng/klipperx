@@ -15,7 +15,7 @@
 //! ```
 //!
 //! which is then "smoothed" over `smooth_time` with a triangular window
-//! (`kin_extruder.c:18-25`):
+//! (`kin_extruder.c:28-32`):
 //!
 //! ```text
 //! smooth_position(t) = definitive_integral(pa_position(x) * (smooth_time/2 - |t-x|) * dx,
@@ -27,7 +27,7 @@
 //! quadratic `base + t*(start_v + t*half_accel)`, so the weighted integral is
 //! closed-form per segment and the window is clipped at segment boundaries,
 //! walking into the neighbouring segments (`pa_range_integrate`,
-//! `kin_extruder.c:81-116`). That keeps the result a pure function of time,
+//! `kin_extruder.c:89-116`). That keeps the result a pure function of time,
 //! which is what lets the solver's secant search ask for positions at
 //! arbitrary, non-monotonic times.
 //!
@@ -37,8 +37,8 @@
 //! from a print time (the end of the motion already planned), and each trapq
 //! segment uses the value that was in force at that segment's own print time —
 //! upstream's `pa_list` lookup in `pa_move_integrate`
-//! (`kin_extruder.c:59-69`) and `extruder_set_pressure_advance`
-//! (`:147-186`). Without that, changing `pressure_advance` would shift the
+//! (`kin_extruder.c:68-78`) and `extruder_set_pressure_advance`
+//! (`kin_extruder.c:138-172`). Without that, changing `pressure_advance` would shift the
 //! position of segments the step generator has already stepped over, and the
 //! solver would try to make up the difference in one clock tick.
 //!
@@ -53,7 +53,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use super::trapq::MoveSegment;
 
 /// The parameters one stretch of the trapq uses
-/// (upstream's `struct pa_params`, `kin_extruder.c:11-14`).
+/// (upstream's `struct pa_params`, `kin_extruder.c:16-19`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PressureAdvanceEntry {
     /// The print time this value becomes active at.
@@ -121,7 +121,7 @@ impl ExtruderPressureAdvance {
     }
 
     /// Record new values, in force from print time `print_time` on
-    /// (`extruder_set_pressure_advance`, `kin_extruder.c:147-155`).
+    /// (`extruder_set_pressure_advance`, `kin_extruder.c:167-172`).
     ///
     /// Segments that start before `print_time` keep the value they had — they
     /// may already have been stepped. Entries later than `print_time` are
@@ -152,7 +152,7 @@ impl ExtruderPressureAdvance {
     }
 
     /// Where the extruder stepper is `move_time` seconds into `cuts[index]`
-    /// (`extruder_calc_position`, `kin_extruder.c:118-135`).
+    /// (`extruder_calc_position`, `kin_extruder.c:124-136`).
     ///
     /// `cuts` is the trapq's segments around the one being generated, oldest
     /// first (`itersolve::SegmentWindow`); the smoothing window reads its
@@ -169,7 +169,7 @@ impl ExtruderPressureAdvance {
         let segment = &cuts[index];
         let hst = half_smooth_time(schedule);
         if hst == 0.0 {
-            // Pressure advance not enabled (`kin_extruder.c:122-125`).
+            // Pressure advance not enabled (`kin_extruder.c:129-132`).
             return nominal_position(segment, move_time);
         }
         let area = range_integrate(cuts, index, move_time, hst, schedule);
@@ -178,7 +178,7 @@ impl ExtruderPressureAdvance {
 }
 
 /// Half the smoothing window, from the newest schedule entry — upstream keeps
-/// one `half_smooth_time` per solver (`kin_extruder.c:149-151`) — or zero when
+/// one `half_smooth_time` per solver (`kin_extruder.c:143-145`) — or zero when
 /// pressure advance is off.
 fn half_smooth_time(schedule: &[PressureAdvanceEntry]) -> f64 {
     match schedule.last() {
@@ -189,7 +189,7 @@ fn half_smooth_time(schedule: &[PressureAdvanceEntry]) -> f64 {
 
 /// The pressure advance in force at `print_time`: the entry with the largest
 /// active time at or before it (`pa_move_integrate`'s walk back through
-/// `pa_list`, `kin_extruder.c:59-68`).
+/// `pa_list`, `kin_extruder.c:68-78`).
 fn pressure_advance_at(schedule: &[PressureAdvanceEntry], print_time: f64) -> f64 {
     let mut pressure_advance = 0.0;
     for entry in schedule {
@@ -203,14 +203,14 @@ fn pressure_advance_at(schedule: &[PressureAdvanceEntry], print_time: f64) -> f6
 
 /// The nominal extruder position `move_time` seconds into `segment`: the
 /// extrusion amount, `m->start_pos.x + move_get_distance(m, move_time)`
-/// (`kin_extruder.c:134`). The extruder trapq's x direction cosine is 1
+/// (`kin_extruder.c:132`). The extruder trapq's x direction cosine is 1
 /// (`extruder::PrinterExtruder::process_move` appends `(1, can_pa, 0)`).
 fn nominal_position(segment: &MoveSegment, move_time: f64) -> f64 {
     segment.start_pos.x() + segment.distance(move_time)
 }
 
 /// The definitive integral of the motion formula
-/// (`extruder_integrate`, `kin_extruder.c:29-38`):
+/// (`extruder_integrate`, `kin_extruder.c:34-44`):
 ///
 /// ```text
 /// ∫ position(t) dt  for  position(t) = base + t * (start_v + t * half_accel)
@@ -224,7 +224,7 @@ fn integrate(base: f64, start_v: f64, half_accel: f64, start: f64, end: f64) -> 
 }
 
 /// The definitive integral of time-weighted position
-/// (`extruder_integrate_time`, `kin_extruder.c:40-50`):
+/// (`extruder_integrate_time`, `kin_extruder.c:46-57`):
 ///
 /// ```text
 /// ∫ t * position(t) dt  for  position(t) = base + t * (start_v + t * half_accel)
@@ -240,7 +240,7 @@ fn integrate_time(base: f64, start_v: f64, half_accel: f64, start: f64, end: f64
 
 /// The window-weighted integral of one segment's pressure-advanced position
 /// over `start..end`, measured against `time_offset`
-/// (`pa_move_integrate`, `kin_extruder.c:52-79`):
+/// (`pa_move_integrate`, `kin_extruder.c:59-87`):
 ///
 /// ```text
 /// ∫ (t - time_offset) * pa_position(t) dt
@@ -276,7 +276,7 @@ fn move_integrate(
 }
 
 /// The window-weighted integral around `move_time` over a range of segments
-/// (`pa_range_integrate`, `kin_extruder.c:81-116`).
+/// (`pa_range_integrate`, `kin_extruder.c:89-116`).
 ///
 /// The current segment contributes `∫(x - start)*pos(x) - ∫(x - end)*pos(x)`,
 /// which is `∫(hst - |t-x|)*pos(x) dx` over the window; neighbours continue the
@@ -384,7 +384,8 @@ mod tests {
     }
 
     /// The old position function read the trapq's x
-    /// (`extruder_position_fn`, `chelper/kin_extruder.c:134`'s nominal path).
+    /// (`extruder_position_fn`, `chelper/kin_extruder.c:130-132`'s nominal
+    /// path).
     /// With pressure advance off, point for point the same.
     #[test]
     fn test_pressure_advance_off_keeps_the_nominal_position() {
@@ -483,7 +484,7 @@ mod tests {
     /// `SET_PRESSURE_ADVANCE` writes the shared parameters: the next segment
     /// stepper uses them, with no solver reinstall, and segments that start
     /// earlier keep the value they had (`extruder.py:67-88`,
-    /// `kin_extruder.c:147-186`).
+    /// `kin_extruder.c:138-172`).
     #[test]
     fn test_set_pressure_advance_takes_effect_on_the_next_segment() {
         let cuts = [
@@ -511,7 +512,7 @@ mod tests {
     }
 
     /// The smoothed position is the documented weighted average of the
-    /// pressure-advanced position (`kin_extruder.c:18-25`), checked against a
+    /// pressure-advanced position (`kin_extruder.c:28-32`), checked against a
     /// numerical integration of that formula.
     #[test]
     fn test_the_smoothing_is_the_documented_weighted_average() {

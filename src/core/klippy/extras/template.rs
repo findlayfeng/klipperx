@@ -48,18 +48,24 @@
 //! - `Rt::Printer` becomes the [`PrinterView`] object: `printer.<name>` and
 //!   `printer["<name>"]` are one registered object's status, cached for the
 //!   render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`),
-//!   and `'<name>' in printer` asks whether that object is registered
-//!   (`GetStatusWrapper.__contains__`, `:33-37`) — the engine's containment
-//!   check on a map object *is* its lookup, so an unregistered name is absent,
-//!   not an error. The view is not enumerable, so a `{% for %}` over `printer`
-//!   is refused rather than silently walking every object the machine
-//!   registered.
-//! - `printer.objects` is the reflection onto that same view: an enumerable
-//!   map from object name to status, holding the objects `objects/list`
-//!   reports ([`Printer::queryable_objects`]) in registration order. Each
-//!   lookup is the cached status `printer['<name>']` returns, and a name that
-//!   is unregistered or reports no status is absent — Strict then fails the
-//!   render if the body uses it.
+//!   and `'<name>' in printer` asks whether that object is registered **and**
+//!   reports a status (`GetStatusWrapper.__contains__`, `:33-37`, through a
+//!   `__getitem__` that raises `KeyError` unless `hasattr(po, 'get_status')`,
+//!   `:24-26`) — the engine's containment check on a map object *is* its
+//!   lookup, so a name that fails either test is absent, not an error.
+//!   Iterating the view walks the object names, as upstream's wrapper does
+//!   ([`PrinterView::enumerate`], `GetStatusWrapper.__iter__`,
+//!   `gcode_macro.py:40-43`): `{% for name in printer %}` yields the names
+//!   `objects/list` reports, in registration order, and reads no status.
+//! - `printer.objects` is this port's map-shaped spelling of that same
+//!   reflection: an enumerable map from object name to status, holding the
+//!   objects `objects/list` reports ([`Printer::queryable_objects`]) in
+//!   registration order. Each lookup is the cached status `printer['<name>']`
+//!   returns, and a name that is unregistered or reports no status is absent —
+//!   Strict then fails the render if the body uses it. It is an extension
+//!   (upstream's `GetStatusWrapper` has no `objects` key; a body ported from
+//!   upstream writes `{% for name in printer %}`), the name the TODO tracks the
+//!   capability under.
 //! - **Only a `printer` status array** becomes a [`Coord`]: klippy reports
 //!   `Coord` namedtuples (`klippy/gcode.py`) whose fields are `x y z e`
 //!   (`mathutil.rs`), this host's statuses are JSON arrays, and a body reads
@@ -92,6 +98,7 @@
 //! | `\|min`, `\|max` on an empty sequence | `Undefined` (renders blank) | an error (`min() arg is an empty sequence`); there is no `Undefined` to hand back and a blank line would be silent |
 //! | `range(a, b, step)` | 1–3 arguments | same (the old subset took exactly one) |
 //! | a missing status object (`printer.nope`) | `Undefined` | same: undefined, which Strict then fails on if it is used |
+//! | `printer.objects` | `Undefined`: the template's `printer` is a `GetStatusWrapper`, which has no `objects` key (the reflection upstream is iteration, `{% for name in printer %}`) | this port adds the key as the same reflection in map shape: the names `{% for %}` walks, with each object's cached status under it, so a body may read `printer.objects['mcu'].<status key>` or hold the view; `\|length` counts them on both spellings (upstream's wrapper has no `__len__`) |
 //! | trailing newline | one newline dropped | kept (`set_keep_trailing_newline(true)`), because `idle_timeout`'s default script and the corpus' bodies are written to keep theirs |
 //! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
 //! | a container joined with `~` | `str()` of it, elements `repr`-quoted: `'x' ~ {'call': 'PAUSE'}` is `x{'call': 'PAUSE'}` | the engine's `Display`, elements unquoted: `'x' ~ {'call': 'PAUSE'}` is `x{call: PAUSE}` — `~` joins through `Display` before the formatter sees a string, so only a whole tag (`{ … }`) gets Python's spelling |
@@ -125,7 +132,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value as MjValue, ValueKind};
@@ -246,12 +253,19 @@ impl fmt::Debug for Builtin {
 /// `printer.<name>` / `printer["<name>"]` — one object's status, cached for
 /// the render the way `GetStatusWrapper.cache` caches it (`gcode_macro.py:20-33`).
 ///
+/// Iterating the view yields the names `objects/list` reports
+/// (`GetStatusWrapper.__iter__`, `gcode_macro.py:40-43`), and
+/// [`ObjectsView`] — `printer.objects` — is the same list as a map.
+///
 /// The cache is a `Mutex` because the engine requires its objects to be `Sync`;
 /// the view is `Clone` so a [`Rt`] can be cloned into a render.
 #[derive(Clone)]
 pub struct PrinterView {
     printer: Arc<Printer>,
     cache: Arc<Mutex<HashMap<String, MjValue>>>,
+    /// The names iteration walks, snapshotted once per view so `printer` and
+    /// `printer.objects` hand out the *same* list.
+    names: Arc<OnceLock<Arc<Vec<String>>>>,
 }
 
 impl fmt::Debug for PrinterView {
@@ -269,17 +283,26 @@ impl PrinterView {
         Self {
             printer,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            names: Arc::new(OnceLock::new()),
         }
     }
 
     /// One object's status (`GetStatusWrapper.__getitem__`, `:19-32`), as the
-    /// templates read it: `None` for a name nobody registered, which is what
-    /// makes `'name' in printer` a registration test.
+    /// templates read it: `None` for a name nobody registered **and** for a
+    /// part that reports no status, which is what makes `'name' in printer`
+    /// upstream's `<name> is queryable` test — its `__getitem__` raises
+    /// `KeyError` unless `hasattr(po, 'get_status')` (`:24-26`). The object is
+    /// asked for status after the registry lock is released, as
+    /// [`Printer::status_of`] does.
     fn status(&self, name: &str) -> Option<MjValue> {
         if let Some(cached) = self.lock().get(name) {
             return Some(cached.clone());
         }
-        let status = status_value(&self.printer.status_of(name, self.printer.eventtime())?);
+        let object = self.printer.lookup_object(name)?;
+        if !object.is_queryable() {
+            return None;
+        }
+        let status = status_value(&object.get_status(self.printer.eventtime()));
         self.lock().insert(name.to_string(), status.clone());
         Some(status)
     }
@@ -290,13 +313,28 @@ impl PrinterView {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
+    /// The queryable names, in registration order — the list `objects/list`
+    /// reports ([`Printer::queryable_objects`]), snapshotted on first use so
+    /// every spelling of the reflection walks one list.
+    fn names(&self) -> Arc<Vec<String>> {
+        Arc::clone(
+            self.names
+                .get_or_init(|| Arc::new(self.printer.queryable_objects())),
+        )
+    }
+
+    /// The enumerator `{% for name in printer %}` and `printer.objects` both
+    /// walk: the names as the engine's values, so a loop yields strings.
+    fn names_enumerator(&self) -> Enumerator {
+        Enumerator::Values(self.names().iter().cloned().map(MjValue::from).collect())
+    }
+
     /// The reflection view `printer.objects` reads: this view again (one
-    /// cache for both spellings) over the queryable names in registration
-    /// order.
+    /// cache and one name list for both spellings).
     fn objects(&self) -> ObjectsView {
         ObjectsView {
             printer: self.clone(),
-            names: Arc::new(self.printer.queryable_objects()),
+            names: self.names(),
         }
     }
 }
@@ -308,48 +346,53 @@ impl Object for PrinterView {
 
     fn get_value(self: &Arc<Self>, key: &MjValue) -> Option<MjValue> {
         let name = key.as_str()?;
-        // The reflection view, which the todo tracks as `printer.objects`.
-        // Reserved on purpose: no machine registers a part under this name,
-        // and a body that reads it wants the reflection, not a lookup.
+        // The reflection view `printer.objects` — this port's convenience
+        // spelling of what iteration already yields. Reserved on purpose: no
+        // machine registers a part under this name, and a body that reads it
+        // wants the reflection, not a lookup.
         if name == OBJECTS_KEY {
             return Some(MjValue::from_object(self.objects()));
         }
         self.status(name)
     }
 
-    /// Not enumerable: upstream's wrapper is a `__getitem__`-only mapping, so
-    /// `{% for %}` over `printer` is refused, while containment (a map lookup)
-    /// and truthiness still work. [`ObjectsView`] is the enumerable side.
+    /// Enumerable the way upstream's wrapper is: `GetStatusWrapper.__iter__`
+    /// (`gcode_macro.py:40-43`) yields every registered name it can look up a
+    /// status for, in registration order — `{% for name in printer %}`. Here
+    /// that is [`Printer::queryable_objects`], the same list `objects/list`
+    /// reports and [`ObjectsView`] holds. Iterating reads no status.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        Enumerator::NonEnumerable
+        self.names_enumerator()
+    }
+
+    /// Always true, as upstream's wrapper is: it defines no `__len__`/`__bool__`,
+    /// so a machine that has registered nothing queryable yet is still truthy
+    /// (the enumerable view's own length would say `0`).
+    fn is_true(self: &Arc<Self>) -> bool {
+        true
     }
 }
 
 /// The key a body reads the reflection view under: `printer.objects`.
 const OBJECTS_KEY: &str = "objects";
 
-/// `printer.objects` — the reflection over the machine's registered objects.
+/// `printer.objects` — this port's map-shaped view of the reflection.
 ///
-/// Upstream's wrappers reach the same set through the registry
-/// (`printer.lookup_objects()`, `klippy.py:81-88`; `GetStatusWrapper.__iter__`
-/// walks it, `gcode_macro.py:34-40`), and `objects/list` reports only the
-/// parts that answer a status ([`Printer::queryable_objects`], upstream's
-/// `hasattr(o, 'get_status')` filter). This port binds that set as a map from
-/// name to status, in **registration order** — the order `objects/list` and
-/// upstream's `OrderedDict` use.
+/// Upstream spells the reflection as iteration over the template's `printer`
+/// itself (`GetStatusWrapper.__iter__`, `gcode_macro.py:40-43`), and
+/// `objects/list` reports only the parts that answer a status
+/// ([`Printer::queryable_objects`], upstream's `hasattr(o, 'get_status')`
+/// filter). This view is the same list under a name a body can hold: a map
+/// from object name to status, in **registration order** — the order
+/// `objects/list`, upstream's `OrderedDict` and `printer`'s own iteration use.
 ///
-/// The spelling is this port's: upstream's `GetStatusWrapper` has no `objects`
-/// key (its iterable reflection is `{% for name in printer %}`), while here
-/// `printer` stays a plain `__getitem__` map and the reflection hangs off
-/// `printer.objects`, the name the TODO tracks it under. What a body gets is
-/// the iterable side upstream's `__iter__` provides: the object names, and a
-/// status for each.
-///
-/// The names are snapshotted when a body reads `printer.objects`, and the
-/// statuses go through the render's [`PrinterView`] cache: `printer.objects
-/// ['mcu']` and `printer['mcu']` answer the same value, and `get_status` runs
-/// at most once per object per render. Both are what keeps a render off the
-/// reactor: nothing here blocks, and nothing is recomputed per read.
+/// The names are the very list [`PrinterView`] iterates, snapshotted once per
+/// render view, and the statuses go through the render's [`PrinterView`]
+/// cache: `printer.objects['mcu']`, `printer['mcu']` and `printer.mcu` answer
+/// the same value, and `get_status` runs at most once per object per render.
+/// Both are what keeps a render off the reactor: nothing here blocks, and
+/// nothing is recomputed per read. Iterating either spelling reads no status
+/// at all.
 #[derive(Clone)]
 pub struct ObjectsView {
     /// The view the lookups go through, shared with the body's `printer` so
@@ -390,7 +433,7 @@ impl Object for ObjectsView {
     /// iterates its keys; `|items` / `|dictsort` read the pairs through
     /// [`ObjectsView::get_value`]. The length is known, so `|length` works.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
-        Enumerator::Values(self.names.iter().cloned().map(MjValue::from).collect())
+        self.printer.names_enumerator()
     }
 }
 
@@ -2228,7 +2271,8 @@ mod tests {
     /// A **status** array is read the way klippy's `Coord` namedtuple is
     /// (`klippy/gcode.py`): `.x`/`.y`/`.z`/`.e`, integer subscripts, and
     /// iteration — the bridge `macros.cfg:34` needs. `printer` itself answers
-    /// containment by registration, and is not iterable.
+    /// containment by queryable registration (`GetStatusWrapper.__contains__`)
+    /// and iterates the object names (`__iter__`), never a status.
     #[test]
     fn printer_status_arrays_expose_coordinate_fields() {
         let printer = printer_with(
@@ -2256,7 +2300,8 @@ mod tests {
             .expect("renders"),
             "1.5 2.5 3.5 4.5 "
         );
-        // `'name' in printer` is registration (`GetStatusWrapper.__contains__`).
+        // `'name' in printer` is registration and a status
+        // (`GetStatusWrapper.__contains__` through `__getitem__`).
         assert_eq!(
             render(
                 "{% if 'toolhead' in printer %}yes{% else %}no{% endif %}",
@@ -2411,6 +2456,88 @@ mod tests {
             .expect("renders"),
             "no"
         );
+    }
+
+    /// The upstream spelling of the same reflection: `{% for name in printer %}`
+    /// walks the names `printer.objects` holds — same list, same registration
+    /// order, same count (`GetStatusWrapper.__iter__`, `gcode_macro.py:40-43`).
+    #[test]
+    fn printer_iteration_walks_the_same_names_as_the_objects_view() {
+        let (printer, _calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        let walked = render("{% for name in printer %}{name} {% endfor %}", &mut context)
+            .expect("printer iterates");
+        let mapped = render(
+            "{% for name in printer.objects %}{name} {% endfor %}",
+            &mut context,
+        )
+        .expect("renders");
+
+        assert_eq!(walked, mapped);
+        // Pinned, so "same sequence" cannot drift into "both empty": the
+        // machine registered three parts and `pins` reports no status.
+        assert_eq!(walked, "toolhead motion_report ");
+        assert_eq!(
+            render("{printer|length}", &mut context).expect("renders"),
+            "2"
+        );
+    }
+
+    /// Containment is upstream's `__contains__` (`gcode_macro.py:33-37`): the
+    /// name has to be lookable up through `__getitem__`, which refuses an
+    /// object without a status (`:24-26`) — so a registered-but-unqueryable
+    /// part (`pins`) is absent, and both spellings agree about it.
+    #[test]
+    fn printer_containment_needs_a_status_not_just_registration() {
+        let (printer, _calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        assert_eq!(
+            render(
+                "{% if 'pins' in printer %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "no"
+        );
+        assert_eq!(
+            render(
+                "{% if 'toolhead' in printer %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "yes"
+        );
+        // A lookup that misses is `Undefined`, not a status: `pins` still
+        // registered, just not queryable.
+        let error = render("{printer.pins}", &mut context).expect_err("not queryable");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+        let error = render("{printer['pins']}", &mut context).expect_err("not queryable");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+    }
+
+    /// Walking the reflection reads no status: iteration only asks the
+    /// registry for names, so a body that loops first and looks one object up
+    /// pays exactly that one `get_status` (and its cache, as
+    /// [`printer_objects_lookup_reads_the_cached_status`] pins).
+    #[test]
+    fn printer_iteration_reads_no_status() {
+        let (printer, calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        for body in [
+            "{% for name in printer %}{name} {% endfor %}",
+            "{% for name in printer.objects %}{name} {% endfor %}",
+        ] {
+            render(body, &mut context).expect("renders");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        render("{printer.motion_report.live_velocity}", &mut context).expect("renders");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        render("{% for name in printer %}{name} {% endfor %}", &mut context).expect("renders");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// An array outside `printer` keeps its JSON meaning: `params`,

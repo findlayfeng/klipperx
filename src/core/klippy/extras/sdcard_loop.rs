@@ -179,16 +179,9 @@ fn cmd_sdcard_loop_begin(
     object: &Arc<SDCardLoop>,
     gcmd: &GcodeCommand,
 ) -> Result<(), CommandError> {
-    // `gcmd.get_int("COUNT", minval=0)`: default 1, no repeats below zero.
-    let count = gcmd.get(
-        "COUNT",
-        Some(1),
-        |s: &str| s.parse::<i64>().ok(),
-        Some(0),
-        None,
-        None,
-        None,
-    )?;
+    // `gcmd.get_int("COUNT", minval=0)` (`sdcard_loop.py:26`): a required
+    // integer, no repeats below zero (0 is the infinite loop).
+    let count = gcmd.get_int_bounded("COUNT", Some(0), None)?;
     let sdcard = object.sdcard()?;
     if !object.loop_begin(&*sdcard, count) {
         return Err(CommandError::new("Only permitted in SD file."));
@@ -363,7 +356,7 @@ mod tests {
         assert_eq!(
             commands["SDCARD_LOOP_BEGIN"]["parameters"],
             json!(["COUNT"]),
-            "`COUNT` is the only parameter, defaulting to 1"
+            "`COUNT` is the only parameter"
         );
         assert_eq!(
             commands["SDCARD_LOOP_END"]["help"].as_str(),
@@ -380,6 +373,34 @@ mod tests {
         assert!(
             commands["SDCARD_LOOP_DESIST"].get("parameters").is_none(),
             "`_DESIST` declares no parameter"
+        );
+    }
+
+    /// `COUNT` is required and never negative — upstream
+    /// `gcmd.get_int("COUNT", minval=0)` passes no default
+    /// (`sdcard_loop.py:26`; `gcode.py:91-92`), so the argument is parsed
+    /// before the SD-file context is looked at.
+    #[test]
+    fn count_is_required_and_never_negative() {
+        let printer = load("[sdcard_loop]\n");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+
+        let err = gcode
+            .run_script_sync("SDCARD_LOOP_BEGIN")
+            .expect_err("COUNT has no default");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'SDCARD_LOOP_BEGIN': missing COUNT"
+        );
+
+        let err = gcode
+            .run_script_sync("SDCARD_LOOP_BEGIN COUNT=-1")
+            .expect_err("a repeat count below zero is refused");
+        assert_eq!(
+            err.to_string(),
+            "Error on 'SDCARD_LOOP_BEGIN COUNT=-1': COUNT must have minimum of 0"
         );
     }
 

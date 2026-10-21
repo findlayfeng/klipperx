@@ -806,6 +806,48 @@ mod tests {
         assert_eq!(printer.objects(), ["chip", "first"]);
     }
 
+    /// The toolhead-only half of upstream's unconditional list follows the
+    /// config, not a list: `TOOLHEAD_MODULES` needs a `[printer]` to attach to.
+    ///
+    /// Upstream never has to say so — `_read_config` calls
+    /// `toolhead.add_printer_objects` unconditionally and its first line builds
+    /// `ToolHead(config)` from `[printer]`'s options, so a config without
+    /// `[printer]` does not boot at all. This host accepts `[mcu]`-only configs
+    /// (`klippyx stress`, `admin`, the scan path), so the precondition is stated
+    /// here instead: without a printer there is no toolhead, and `tuning_tower`
+    /// has nothing to take a move-transform slot from.
+    #[test]
+    fn test_the_toolhead_modules_need_a_printer_section() {
+        // No `[printer]`: the always-on half loads, the toolhead half does not.
+        let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
+        result.unwrap();
+        assert!(printer.lookup_object("idle_timeout").is_some());
+        assert!(printer.lookup_object("tuning_tower").is_none());
+
+        // With one, both are there and `TUNING_TOWER` is registered — that is
+        // the whole point of loading it without a `[tuning_tower]` section.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        result.expect("a printer-only config loads");
+        assert!(
+            printer.lookup_object("tuning_tower").is_some(),
+            "the toolhead half did not load"
+        );
+        // `TUNING_TOWER` is a ready-only command, so light the ready lamp the way
+        // a real session does before asking the dispatcher what it carries.
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
+        let status = printer
+            .lookup_object("gcode")
+            .expect("the dispatcher is registered")
+            .get_status(0.0);
+        assert!(
+            !status["commands"]["TUNING_TOWER"].is_null(),
+            "`TUNING_TOWER` was not registered"
+        );
+    }
+
     #[test]
     fn test_the_main_mcu_section_becomes_the_mcu_object() {
         let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
@@ -978,7 +1020,12 @@ mod tests {
                 "manual_probe",
                 "toolhead",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                // The toolhead-only half of upstream's unconditional list
+                // (`toolhead.py:611-612`): loaded here because this config has a
+                // `[printer]`, which is the precondition upstream never has to
+                // state.
+                "tuning_tower"
             ]
         );
         // The steppers are registered but not client-visible; the toolhead is.

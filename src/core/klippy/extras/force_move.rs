@@ -40,13 +40,14 @@
 //!   rewind them onto moves already generated.
 //! * a stepper `force_move` knows but the toolhead's motion queue does not is
 //!   carried on the timeline only, **with a warning**: nothing generates its
-//!   steps, so the motor does not move. This port builds a `PrinterStepper` for
-//!   the IDEX second carriage without putting it in the motion queue (a real
-//!   gap of `idex_modes`, registered in `TODO.md`), and a `[manual_stepper]`
-//!   joins only on its first `MOVE=`; upstream, where every `MCU_stepper`
-//!   registers a syncemitter when it is built (`klippy/stepper.py:50-56`),
-//!   moves either. The command still answers because upstream's corpus requires
-//!   that (`test/klippy/dual_carriage.test:49` runs `STEPPER_BUZZ
+//!   steps, so the motor does not move. A `[manual_stepper]` joins only on its
+//!   first `MOVE=`, and a `[dual_carriage]` under a kinematics that does not
+//!   claim the section (hybrid-corexy) is built without being driven (a real
+//!   gap of `idex_modes`, registered in `TODO.md`); upstream, where every
+//!   `MCU_stepper` registers a syncemitter when it is built
+//!   (`klippy/stepper.py:50-56`), moves all of them. The command still answers
+//!   because upstream's corpus requires that
+//!   (`test/klippy/hybrid_corexy_dual_carriage.test:42` runs `STEPPER_BUZZ
 //!   STEPPER=dual_carriage`) — an error here would make this port's own gap
 //!   punish legal upstream G-code. The warning is the part that keeps the gap
 //!   from looking like "force_move produces no `queue_step` at all" in silence.
@@ -876,7 +877,9 @@ mod tests {
     /// A `[manual_stepper]` is not in the toolhead's motion queue until its
     /// first `MOVE=` installs it, so a force move on it has no motor to drive:
     /// both commands still answer (upstream's corpus requires that —
-    /// `dual_carriage.test:49`), but they generate no steps and the log says so.
+    /// `hybrid_corexy_dual_carriage.test:42`), but they generate no steps and
+    /// the log says so.
+    ///
     /// One `MANUAL_STEPPER … MOVE=` installs the stepper, and the same buzz then
     /// really steps it; a planned `G1` works throughout.
     #[tokio::test(flavor = "multi_thread")]

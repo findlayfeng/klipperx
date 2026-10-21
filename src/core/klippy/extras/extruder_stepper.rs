@@ -28,6 +28,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::stepper::PrinterStepper;
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -378,12 +379,23 @@ pub fn load_config_prefix(
 }
 
 /// The wrapped stepper's position at a past print time (upstream's
-/// `PrinterExtruderStepper.find_past_position`). The host stepper is owned by
-/// the toolhead after connect and exposes no position, so this reports
-/// `0.0` — the same H10 motion-sync gap the module docs describe.
+/// `PrinterExtruderStepper.find_past_position`).
 impl PrinterExtruderStepper {
-    pub fn find_past_position(&self, _print_time: f64) -> f64 {
-        0.0
+    pub fn find_past_position(&self, print_time: f64) -> f64 {
+        // Upstream's `mcu_to_commanded_position(get_past_mcu_position(t))`; the
+        // host stepper belongs to the toolhead after connect, so both halves
+        // are reached through it.
+        self.printer
+            .upgrade()
+            .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+            .and_then(|toolhead| {
+                self.stepper
+                    .get_past_mcu_position(&toolhead, print_time)
+                    .map(|mcu_pos| self.stepper.mcu_to_commanded_position(mcu_pos))
+            })
+            // Before connect there is no compressor to ask; nothing has been
+            // generated, so no position has been reached yet.
+            .unwrap_or(0.0)
     }
 }
 

@@ -1923,6 +1923,18 @@ impl ToolHeadObject {
             .unwrap_or(0.0)
     }
 
+    /// Whether [`ToolHeadObject::connect`] has produced a planner and nothing
+    /// (a homing run, [`ToolHeadObject::flush_step_generation`]) is holding it
+    /// at this instant.
+    ///
+    /// A command that has to flush before it changes something checks this
+    /// first: before connect there is nothing to flush, and a command that is
+    /// not allowed to fail on an empty slot (one that runs before the machine
+    /// is ready) can skip the flush instead.
+    pub fn is_connected(&self) -> bool {
+        self.lock().is_some()
+    }
+
     /// The MCU's estimate of the print time *now* (`MCU.estimated_print_time`),
     /// read fresh from the source [`ToolHeadObject::connect`] installed.
     ///
@@ -2518,6 +2530,25 @@ impl ToolHeadObject {
             .iter()
             .find(|stepper| stepper.name() == name)
             .map(|stepper| stepper.commanded_position())
+    }
+
+    /// One motion stepper's firmware step counter at a past print time
+    /// (`MCU_stepper.get_past_mcu_position`), found by section name.
+    ///
+    /// The counter comes from the stepper's own step compressor, so it answers
+    /// for the steps already **generated**: a time past the last generation
+    /// holds the counter it reached. `None` under the same conditions as
+    /// [`ToolHeadObject::stepper_mcu_position`].
+    pub fn stepper_past_mcu_position(&self, name: &str, print_time: f64) -> Option<i64> {
+        let mut guard = self.lock();
+        let connected = guard.as_mut()?;
+        connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers()
+            .iter()
+            .find(|stepper| stepper.name() == name)
+            .map(|stepper| stepper.past_mcu_position(print_time))
     }
 
     /// Drive one stepper `dist` millimetres in its own coordinates, outside the

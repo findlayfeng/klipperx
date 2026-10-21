@@ -35,6 +35,7 @@ use crate::core::klippy::extras::extruder_stepper::{
 use crate::core::klippy::extras::heaters::{self, Heater};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::z_tilt::block_in_command;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -433,6 +434,12 @@ const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 /// planned up to — upstream hands it to `register_lookahead_callback`, which
 /// fires with exactly that time (`extruder.py:82-86`) — so segments the step
 /// generator has stepped over keep the value they were stepped with.
+///
+/// A changed **smooth time** is the exception: the smoothing filter's width is
+/// part of how a segment is stepped, so upstream flushes step generation first
+/// and applies the new parameters from time zero (`extruder.py:75-83`). The
+/// values upstream compares are the *effective* smooth times — either side is
+/// zero when its pressure advance is zero (`:67-74`).
 fn set_pressure_advance(
     gcmd: &GcodeCommand,
     pressure_advance: &Arc<ExtruderPressureAdvance>,
@@ -454,23 +461,42 @@ fn set_pressure_advance(
     let toolhead = printer
         .upgrade()
         .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
-    let print_time = toolhead
-        .as_ref()
-        .map(|toolhead| toolhead.get_last_move_time())
-        .unwrap_or(0.0);
+    // Upstream's two "effective" smooth times (`kinematics/extruder.py:67-74`).
+    let old_smooth_time = if advance == 0.0 { 0.0 } else { smooth_time };
+    let new_smooth_time = if value == 0.0 { 0.0 } else { smooth };
+    let smooth_time_changed = new_smooth_time != old_smooth_time;
+    // "Need full kinematic flush to change the smooth time"
+    // (`kinematics/extruder.py:79-80`): the width of the smoothing filter is
+    // part of how a segment is stepped, so every segment planned with the old
+    // one has to be generated before the new one starts. Nothing is queued
+    // before connect, so there is nothing to flush there.
+    if smooth_time_changed {
+        if let Some(toolhead) = toolhead.as_ref().filter(|toolhead| toolhead.is_connected()) {
+            block_in_command(toolhead.flush_step_generation())?;
+        }
+    }
+    // With the plan generated, upstream dates the new value at time zero
+    // (`espa(sk, 0., …)`, `:81`); without a smooth time change it lands at the
+    // print time the planner has reached (`:83-86`).
+    let print_time = if smooth_time_changed {
+        0.0
+    } else {
+        toolhead
+            .as_ref()
+            .map(|toolhead| toolhead.get_last_move_time())
+            .unwrap_or(0.0)
+    };
     pressure_advance.set(print_time, value, smooth);
     // The extruder stepper's step generation window is half its smooth time, so
-    // a changed smooth time changes how far generated steps are still open to
-    // rewriting: rescan and update the flush delay
+    // only a changed smooth time changes how far generated steps are still open
+    // to rewriting: rescan and update the flush delay
     // (`motion_queuing.check_step_generation_scan_windows`,
     // `kinematics/extruder.py:82`; the detach/bind scan at `:57,66` has no
-    // counterpart here yet). Upstream also flushes step generation first when
-    // the smooth time changed (`kinematics/extruder.py:79`); this host has no
-    // equivalent (a flush here would need the flush task), so only the
-    // bookkeeping moves — the wider window holds the print-time floor and the
-    // history expiry back instead.
-    if let Some(toolhead) = &toolhead {
-        toolhead.recompute_scan_windows();
+    // counterpart here yet).
+    if smooth_time_changed {
+        if let Some(toolhead) = &toolhead {
+            toolhead.recompute_scan_windows();
+        }
     }
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
@@ -619,10 +645,25 @@ impl ExtraAxis for PrinterExtruder {
         *Self::lock(&self.last_position) = move_.end_axis(ea_index);
     }
 
-    fn find_past_position(&self, _print_time: f64) -> f64 {
-        // Needs the host stepper, which the toolhead owns; only a motion report
-        // asks for this, and it is not wired yet.
-        *Self::lock(&self.last_position)
+    fn find_past_position(&self, print_time: f64) -> f64 {
+        // Upstream: `mcu_pos = stepper.get_past_mcu_position(print_time)` then
+        // `stepper.mcu_to_commanded_position(mcu_pos)`
+        // (`kinematics/extruder.py:47-49`). The host stepper belongs to the
+        // toolhead after connect, so both halves are reached through it.
+        let past = self
+            .printer
+            .upgrade()
+            .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+            .zip(self.stepper.as_ref())
+            .and_then(|(toolhead, stepper)| {
+                stepper
+                    .get_past_mcu_position(&toolhead, print_time)
+                    .map(|mcu_pos| stepper.mcu_to_commanded_position(mcu_pos))
+            });
+        // Before connect there is no compressor to ask: the planned position is
+        // the only answer, and it is what `add_extra_axis` seeds the axis slot
+        // with (nothing has been generated yet, so it holds either way).
+        past.unwrap_or_else(|| *Self::lock(&self.last_position))
     }
 
     fn get_status(&self) -> Value {
@@ -702,11 +743,14 @@ pub(crate) fn load_config(
 mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
     use crate::core::klippy::mathutil::{Coord, E_AXIS};
     use crate::core::klippy::motion::plan::MoveLimits;
     use crate::core::klippy::motion::Move;
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// A cartesian printer config with one extruder.
     fn extruder_config(extra: &str) -> String {
@@ -728,6 +772,13 @@ mod tests {
         let (config, _) = Config::from_text(text).expect("the config parses");
         printer.load_config(&config).expect("the config loads");
         printer
+    }
+
+    /// `extruder_config` with a `kinematics: none` toolhead: nothing is planned,
+    /// so a flush only runs the registered flush callbacks — the fixture a test
+    /// that counts flushes needs.
+    fn extruder_config_none_kinematics() -> String {
+        extruder_config("").replace("kinematics: cartesian", "kinematics: none")
     }
 
     /// `commands.test` sends `SET_PRESSURE_ADVANCE ADVANCE=.002
@@ -753,6 +804,110 @@ mod tests {
         let status = PrinterObject::get_status(&*extruder, 0.0);
         assert_eq!(status["pressure_advance"], 0.002);
         assert_eq!(status["smooth_time"], 0.001);
+    }
+
+    /// A **changed smooth time** flushes step generation before the new value
+    /// is recorded; a value-only change does not (`kinematics/extruder.py:79-86`:
+    /// "Need full kinematic flush to change the smooth time").
+    ///
+    /// The spy is a flush callback ([`ToolHeadObject::register_flush_callback`]),
+    /// which fires on every step generation — including one that produces no
+    /// steps — so with `kinematics: none` the count is exactly the number of
+    /// flushes the command ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_changed_smooth_time_flushes_step_generation_first() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let flushes = Arc::new(AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        // Enabling pressure advance with a smooth time is a smooth time change
+        // (the configured `ADVANCE` is 0, so it started out as 0).
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.002 SMOOTH_TIME=.04")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a changed smooth time flushes the plan"
+        );
+
+        // Only `ADVANCE` moves now: the smooth time is unchanged, so the new
+        // value is dated by the planner's horizon and nothing is flushed.
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.003 SMOOTH_TIME=.04")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a value-only change flushes nothing"
+        );
+
+        // A different smooth time is a different filter width: flush first.
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.002 SMOOTH_TIME=.01")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            2,
+            "a changed smooth time flushes the plan exactly once"
+        );
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        let status = PrinterObject::get_status(&*extruder, 0.0);
+        assert_eq!(status["smooth_time"], 0.01);
+    }
+
+    /// Upstream compares the **effective** smooth times: with pressure advance
+    /// 0 the smooth time counts as 0 (`kinematics/extruder.py:67-74`), so
+    /// turning `ADVANCE` off flushes even though the `SMOOTH_TIME` word did not
+    /// move — and turning it back on flushes again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_switching_pressure_advance_off_flushes_the_smoothing_away() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let flushes = Arc::new(AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        for (script, expected) in [
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 0),
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 0),
+            ("SET_PRESSURE_ADVANCE ADVANCE=.05 SMOOTH_TIME=.04", 1),
+            ("SET_PRESSURE_ADVANCE ADVANCE=.05 SMOOTH_TIME=.04", 1),
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 2),
+        ] {
+            gcode.run_script(script).await.expect("the line applies");
+            assert_eq!(flushes.load(Ordering::SeqCst), expected, "after {script}");
+        }
     }
 
     /// With a default registered, a key that names something else still has to
@@ -1006,5 +1161,158 @@ mod tests {
             .lookup_object_as::<PrinterExtruder>("extruder")
             .expect("the extruder is registered");
         assert_eq!(extruder.heater().target_temp(), 180.0);
+    }
+
+    /// The `atmega2560` dictionary a fake board serves, or `None` when
+    /// `build.rs` did not build it (`KLIPPERX_ARCHES` decides which exist), so a
+    /// test skips instead of failing on a product it never got.
+    fn board() -> Option<ResponderMcu> {
+        ResponderMcu::new("mcu", "atmega2560.dict")
+    }
+
+    /// A `[extruder]` over the fake firmware, with `kinematics: none` — the
+    /// extruder's moves queue on its own trapq, which is all a past-position
+    /// lookup needs.
+    fn machine_config(board: &ResponderMcu) -> String {
+        format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n\
+             [extruder]\nstep_pin: PF2\ndir_pin: PF3\nmicrosteps: 16\n\
+             rotation_distance: 33.500\nnozzle_diameter: 0.400\nfilament_diameter: 1.750\n\
+             heater_pin: PB4\nsensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\n\
+             control: pid\npid_Kp: 22.2\npid_Ki: 1.08\npid_Kd: 114\n\
+             min_temp: 0\nmax_temp: 300\nmin_extrude_temp: 0\n",
+            board.dict().display()
+        )
+    }
+
+    /// Load and bring the machine up; `Err` says why it did not come up.
+    async fn up_machine(board: &ResponderMcu) -> (Arc<Printer>, Result<(), String>) {
+        let config = Config::from_text(&machine_config(board))
+            .expect("the config parses")
+            .0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "extruder.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        let setup = async {
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            let state = printer.get_state_message();
+            if state.category != PrinterState::Ready {
+                return Err(format!("not ready: {}", state.message));
+            }
+            Ok(())
+        }
+        .await;
+        (printer, setup)
+    }
+
+    /// `find_past_position` answers from the stepper's step compressor, as
+    /// upstream's `mcu_to_commanded_position(get_past_mcu_position(t))` does
+    /// (`kinematics/extruder.py:47-49`): before a move it is the position the
+    /// motor started at, mid-move it is where the generated steps had reached,
+    /// and at the move's end it is the end position. A stub returning
+    /// `last_position` (the planned end) or `0.0` fails the first two or the
+    /// last check.
+    ///
+    /// The move is short (1 mm at F600 = 0.1 s) so that it sits inside the step
+    /// generation window: a time past the last generation holds the counter it
+    /// reached, by design.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_find_past_position_follows_the_generated_steps() {
+        use crate::core::klippy::motion::extra::ExtraAxis;
+
+        let Some(board) = board() else {
+            return;
+        };
+        let (printer, setup) = up_machine(&board).await;
+        let outcome = async {
+            setup?;
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .expect("the loader registers `gcode`")
+                .clone();
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .ok_or_else(|| "the toolhead is not registered".to_string())?;
+            let run = |script: &'static str| {
+                let gcode = Arc::clone(&gcode);
+                let toolhead = Arc::clone(&toolhead);
+                async move {
+                    tokio::time::timeout(Duration::from_secs(10), gcode.run_script(script))
+                        .await
+                        .map_err(|_| format!("`{script}` timed out"))?
+                        .map_err(|err| format!("`{script}`: {err}"))?;
+                    tokio::time::timeout(Duration::from_secs(10), toolhead.flush_step_generation())
+                        .await
+                        .map_err(|_| format!("`{script}` flush timed out"))?
+                        .map_err(|err| err.to_string())
+                }
+            };
+
+            run("G92 E0").await?;
+            run("G1 E1 F600").await?;
+            let extruder = printer
+                .lookup_object_as::<PrinterExtruder>("extruder")
+                .ok_or_else(|| "the extruder is not registered".to_string())?;
+            // The move's own span, from the extruder's trapq: the gap before it
+            // is a null move that does not travel (its `axes_r` is zero).
+            let trapq = extruder
+                .trapq()
+                .ok_or_else(|| "the extruder has no trapq".to_string())?;
+            let segments: Vec<_> = toolhead
+                .trapq_extract(trapq, 64, 0.0, 1e18)
+                .ok_or_else(|| "the toolhead is not connected".to_string())?
+                .into_iter()
+                .filter(|segment| segment.axes_r.x() != 0.0)
+                .collect();
+            let (start, end) = match (
+                segments
+                    .iter()
+                    .map(|segment| segment.print_time)
+                    .reduce(f64::min),
+                segments
+                    .iter()
+                    .map(|segment| segment.end_time())
+                    .reduce(f64::max),
+            ) {
+                (Some(start), Some(end)) => (start, end),
+                _ => return Err("the move is not in the extruder's trapq".to_string()),
+            };
+            let at = |time: f64| ExtraAxis::find_past_position(&*extruder, time);
+
+            // Before the move: the stepper had not stepped yet.
+            let before = at(start - 0.01);
+            if before.abs() > 0.02 {
+                return Err(format!("before the move the position is {before}, not 0"));
+            }
+            // Half way along: about half a millimetre of filament.
+            let middle = at(start + 0.5 * (end - start));
+            if (middle - 0.5).abs() > 0.05 {
+                return Err(format!("mid-move the position is {middle}, not ~0.5"));
+            }
+            // At the move's end: the full millimetre (to the last whole step).
+            let after = at(end);
+            if (after - 1.0).abs() > 0.02 {
+                return Err(format!("at the move's end the position is {after}, not 1"));
+            }
+            Ok(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
     }
 }

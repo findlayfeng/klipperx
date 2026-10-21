@@ -18,6 +18,26 @@
 //! itself — the neighbourhood the solver was given as a [`SegmentWindow`],
 //! which is how a shifted time finds its segment.
 //!
+//! A shifted time that runs off either end of that neighbourhood reads the
+//! **endpoint position, held flat**: the coordinate of the first segment's
+//! start, or of the last segment's end. Upstream reaches the same values
+//! through the trapq's sentinel moves. Before the first real move sits a null
+//! move at least a second long with `axes_r` 0 and the following move's
+//! `start_pos` (`trapq_add_move`, `trapq.c:96-116`), and the tail sentinel is a
+//! `NEVER_TIME` move whose `start_pos` is the last move's end (`trapq.c:51-55`,
+//! `trapq_check_sentinels` `:76-93`), so `calc_position`'s two walks
+//! (`kin_shaper.c:87-116`) read a constant position there — the same two
+//! values the clip returns.
+//!
+//! The clip is not a shortcut around a case that can come up mid-print: the
+//! impulse reach is the stepper's step generation window, and the trapq history
+//! is kept back to the flush time less the widest window
+//! (`kin_flush_delay`, `motion_queuing.py:145-155`), so `cuts[0]` is only ever
+//! reached at the trapq's own first segment. Mirroring the sentinels as extra
+//! segments would change no value, and upstream's head sentinel is a
+//! `move_t`-0 move its backward walk (`while (t < 0.)`) cannot step over — a
+//! shape this port deliberately does not copy.
+//!
 //! The shaped coordinate then goes into the solver that was decorated, as a
 //! synthetic move that does not travel (`is->m` with `DUMMY_T`,
 //! `kin_shaper.c:132-187`): a delta's tower length or a polar's angle is
@@ -150,7 +170,8 @@ impl ShaperPulses {
     /// move list from the segment being generated, in both directions, because
     /// a pulse time is either sign; `cuts` is that neighbourhood and `index` the
     /// segment being generated. A time running off either end of `cuts` is
-    /// clipped there, where upstream would walk into the trapq's sentinels.
+    /// clipped to that end's position, which is the constant position upstream's
+    /// sentinel moves hold (see the module doc).
     fn position(&self, cuts: &[MoveSegment], index: usize, move_time: f64, axis: Axis) -> f64 {
         let shaped_time = cuts[index].print_time + move_time;
         let mut position = 0.0;
@@ -280,8 +301,10 @@ fn axis_position(segment: &MoveSegment, move_time: f64, axis: Axis) -> f64 {
 /// it (`calc_position`'s two walks, `kin_shaper.c:87-116`).
 ///
 /// The walk starts at `index`, the segment being generated, because a shifted
-/// time is only a few milliseconds away. A time before the first segment or
-/// after the last one is clipped to it.
+/// time is only a few milliseconds away. A time before the first segment is
+/// clipped to its start (`0.0` into it) and one after the last to its end
+/// (`move_t` into it): both are the flat endpoint positions upstream's sentinel
+/// moves give (see the module doc).
 fn locate(cuts: &[MoveSegment], index: usize, abs_time: f64) -> (&MoveSegment, f64) {
     let mut index = index;
     while abs_time < cuts[index].print_time {
@@ -504,6 +527,50 @@ mod tests {
             &inner,
         );
         assert!(shaped > unshaped + 0.1, "{shaped} should lead {unshaped}");
+    }
+
+    /// Impulses that reach outside the segments being generated read the
+    /// **endpoint positions, held flat** — the values upstream's sentinel moves
+    /// hold (see the module doc): the first segment's start for a time before
+    /// it, the last segment's end for a time after it.
+    #[test]
+    fn an_impulse_past_either_end_reads_the_endpoint_position() {
+        // 0 → 50 mm at 100 mm/s over 0.5 s, with a symmetric ±0.4 s shaper.
+        let cuts = [segment(0.0, 0.5, 0.0, 100.0, 0.0)];
+        let pulses = ShaperPulses::new(&[0.5, 0.5], &[0.0, 0.8]).unwrap();
+        assert!(
+            (pulses.pulses()[0].t + 0.4).abs() < 1e-12
+                && (pulses.pulses()[1].t - 0.4).abs() < 1e-12,
+            "the shaper reaches ±0.4 s: {:?}",
+            pulses.pulses()
+        );
+        let shaper = KinematicShaper::new([Some(pulses.clone()), None, None]);
+        let inner = cartesian_position_fn(Axis::X);
+
+        // At 0.2 s the impulses sample −0.2 s (before the segment) and 0.6 s
+        // (past its end): the start position and the end position.
+        let start = cuts[0].coord(0.0).x();
+        let end = cuts[0].coord(cuts[0].move_t).x();
+        assert!((start - 0.0).abs() < 1e-12 && (end - 50.0).abs() < 1e-9);
+        let shaped = shaper.position(SegmentWindow::new(&cuts, 0, &[]), 0.2, AxisFlags::X, &inner);
+        assert!(
+            (shaped - 0.5 * (start + end)).abs() < 1e-9,
+            "{shaped} is not half way between the endpoint positions"
+        );
+
+        // Near the end, only the forward impulse runs off: the backward one
+        // still samples the segment itself (0.05 s in, 5 mm).
+        let inside = cuts[0].coord(0.05).x();
+        let shaped = shaper.position(
+            SegmentWindow::new(&cuts, 0, &[]),
+            0.45,
+            AxisFlags::X,
+            &inner,
+        );
+        assert!(
+            (shaped - 0.5 * (inside + end)).abs() < 1e-9,
+            "{shaped} is not half way between {inside} and {end}"
+        );
     }
 
     /// The shaped coordinate goes into the decorated solver as a position, not

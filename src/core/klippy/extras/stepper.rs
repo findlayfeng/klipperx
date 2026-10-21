@@ -733,6 +733,16 @@ impl PrinterStepper {
         toolhead.stepper_mcu_position(&self.name)
     }
 
+    /// The firmware step counter at a past print time (upstream
+    /// `MCU_stepper.get_past_mcu_position`, `klippy/stepper.py:175-180`).
+    ///
+    /// Read through the toolhead by section name for the same reason as
+    /// [`PrinterStepper::get_mcu_position`]; `None` before connect, or when the
+    /// toolhead does not know this stepper.
+    pub fn get_past_mcu_position(&self, toolhead: &ToolHeadObject, print_time: f64) -> Option<i64> {
+        toolhead.stepper_past_mcu_position(&self.name, print_time)
+    }
+
     /// The host position a firmware step count corresponds to (upstream
     /// `MCU_stepper.mcu_to_commanded_position`, `klippy/stepper.py:183-184`).
     ///

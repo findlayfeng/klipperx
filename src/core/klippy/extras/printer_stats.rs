@@ -100,6 +100,16 @@ impl PrinterStats {
         let Some(printer) = self.printer.upgrade() else {
             return;
         };
+        // A second ready is not a second timer: upstream re-arms the one it
+        // registered in `__init__` (`update_timer`), so this does the same.
+        if self
+            .timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .is_some()
+        {
+            return;
+        }
         let parts: Vec<Arc<dyn PrinterObject>> = printer
             .lookup_objects(None)
             .into_iter()
@@ -419,6 +429,19 @@ mod tests {
 
         assert!(stats.timer.lock().expect("not poisoned").is_none());
         assert_eq!(reactor.advance(5.0), 0, "nothing was armed");
+    }
+
+    /// A second `klippy:ready` re-arms nothing: upstream updates the one timer
+    /// it registered (`statistics.py:56`, `:62`), so a doubled event must not
+    /// double the line rate.
+    #[test]
+    fn a_second_ready_does_not_arm_a_second_timer() {
+        let (printer, reactor) = machine();
+        let _stats = object(&printer);
+        printer.send_event(&KlippyEvent::KlippyReady);
+        printer.send_event(&KlippyEvent::KlippyReady);
+
+        assert_eq!(reactor.run_due(), 1, "one timer, not two");
     }
 
     /// The object is registered but not client-visible, upstream's "no

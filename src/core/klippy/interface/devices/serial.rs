@@ -672,9 +672,14 @@ mod tests {
             "the path moved to another node, so the held descriptor is stale"
         );
 
-        // And a path that vanished entirely is stale too.
+        // A path that vanished entirely is not evidence of a move: udev removes
+        // a `by-id` link before recreating it, and the port under it is healthy.
+        // Nothing can be compared, so what is held is kept.
         std::fs::remove_file(&link).expect("the link goes");
-        assert!(!same_file(&opened, &link));
+        assert!(
+            same_file(&opened, &link),
+            "a path nobody can look up must not retire a healthy port"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2166,13 +2171,23 @@ pub fn serial_query_unassigned(
 /// old one, where writes fail with `EIO`. Comparing the path's current
 /// `(device, inode)` with the open descriptor's is how a port tells "still the
 /// port I opened" from "the tty went away under me".
+///
+/// Either metadata read failing answers `true` — "the same file" — because a
+/// lookup that cannot be made is not evidence that the tty moved: udev rebuilds
+/// a `by-id` symlink by removing it and creating it again, so `path` is briefly
+/// absent under a perfectly healthy port. Reporting a move there would have the
+/// registry stop handing the live port out, and the next attach on the same tty
+/// would start a second reader on a line this one is already reading. The stale
+/// case is still caught: a path that now names another node compares unequal,
+/// and one that never comes back fails its next write with `EIO`, which stops
+/// the port ([`SharedSerialPort::write_unit`]).
 pub(crate) fn same_file(opened: &std::fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(current) = std::fs::metadata(path) else {
-        return false;
+        return true;
     };
     let Ok(held) = opened.metadata() else {
-        return false;
+        return true;
     };
     current.dev() == held.dev() && current.ino() == held.ino()
 }

@@ -185,18 +185,18 @@ struct StepChain {
     dir: bool,
     /// How many steps this firmware has been handed, signed by the direction
     /// they were queued in — the firmware's `s->position` as
-    /// `stepper_get_position` reports it (`stepper.c:317-330`). A batch adds
+    /// `stepper_get_position` reports it (`stepper.c:319-334`). A batch adds
     /// its `count` while [`StepChain::dir`] is high and subtracts it while
     /// low; the firmware instead negates the accumulated position when the
     /// direction changes (`stepper.c:81`, the top bit as a reverse flag), which
-    /// reports the same signed sum (`:326-329` flips the sign back). Nothing
+    /// reports the same signed sum (`:329-331` flips the sign back). Nothing
     /// here clears it: `reset_step_clock` re-anchors the clock only
-    /// (`stepper.c:305-315`), so the count runs across move boundaries and
+    /// (`stepper.c:304-316`), so the count runs across move boundaries and
     /// across a session's restart list.
     ///
     /// Steps are counted when the batch is queued, not when they fire: the
     /// timer-driven unstep that makes real firmware report only the steps
-    /// already taken (`stepper.c:320-324` subtracting `s->count`) has no
+    /// already taken (`stepper.c:323-328` subtracting `s->count`) has no
     /// equivalent here, so a readback already sees a queued move's whole span.
     position: i32,
 }
@@ -452,7 +452,7 @@ impl SimulatorDevice {
     /// What a batch of `count` steps adds to a chain's position when queued
     /// with [`StepChain::dir`] high (forward) or low (reverse) — the firmware's
     /// `s->position` movement at `stepper.c:80-81`, signed the way
-    /// `stepper_get_position` reports it (`:317-330`).
+    /// `stepper_get_position` reports it (`:319-334`).
     fn signed_steps(dir: bool, count: u16) -> i32 {
         let count = i32::from(count);
         if dir {
@@ -577,7 +577,7 @@ impl SimulatorDevice {
                 }
                 "stepper_get_position" => {
                     // `stepper_get_position oid=%c` — the firmware's own step
-                    // count for that oid (`stepper.c:317-346`), which the host
+                    // count for that oid (`stepper.c:319-346`), which the host
                     // reconciles a move against (the connect-time sync and R5's
                     // distance check). An oid no `config_stepper` named has no
                     // chain: report zero, as this fake did before it had a step
@@ -2095,7 +2095,7 @@ mod tests {
         );
 
         // A fresh chain reports zero: `s->position = -POSITION_BIAS` reads as
-        // `0` through `stepper_get_position` (`stepper.c:230`, `:317-330`).
+        // `0` through `stepper_get_position` (`stepper.c:230`, `:319-334`).
         assert_eq!(position(&device), 0);
 
         // The first batch: a far `interval`, so the first shot clears the
@@ -2114,8 +2114,8 @@ mod tests {
     /// The count is **signed**: `set_next_step_dir` picks the direction the
     /// next batch steps in (`stepper.c:294-302`), so a reverse batch subtracts
     /// from what the forward ones added — the sign the host reconciles against
-    /// (`stepper.py:213-226`) and the one the firmware's reverse-flag position
-    /// reports (`stepper.c:326-329`).
+    /// (`stepper.py:212-228`) and the one the firmware's reverse-flag position
+    /// reports (`stepper.c:329-331`).
     #[test]
     fn a_direction_change_subtracts_the_next_batch() {
         let device = armed_device();
@@ -2145,7 +2145,7 @@ mod tests {
     }
 
     /// `reset_step_clock` re-anchors the clock, not the count
-    /// (`stepper.c:305-315` touches `next_step_time`/`waketime` only): a host's
+    /// (`stepper.c:304-316` touches `next_step_time`/`waketime` only): a host's
     /// restart list sends one per session and between moves, so clearing the
     /// position there would lose every step already taken. A fresh
     /// `config_stepper` — `oid_alloc` over the oid — is what zeroes it
@@ -2165,7 +2165,7 @@ mod tests {
 
         // The re-anchor has to arrive on an idle chain: a running one is the
         // firmware's `Can't reset time when stepper active` (`stepper.c:
-        // 310-313`), so let the batches run out first.
+        // 310-311`), so let the batches run out first.
         advance_ticks(&device, 1_200_000);
         issue(
             &device,

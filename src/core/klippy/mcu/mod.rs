@@ -3083,7 +3083,10 @@ impl Mcu {
     ///
     /// `oid` is `None` for the plain call and `Some` for [`Mcu::call_oid`]; it
     /// goes into the registration so the receive task can tell the answers
-    /// apart, and it is part of what gets cancelled on every failure path.
+    /// apart. The registration's token comes back from
+    /// [`PendingCalls::register`] and identifies this call's own entry on every
+    /// failure path — a concurrent call for the same `oid` has its own token and
+    /// is left alone.
     ///
     /// The typed calls in [`cmd`](crate::core::klippy::cmd) pass their
     /// [`SendClocks`] through here — the homing query paths gate
@@ -3111,8 +3114,10 @@ impl Mcu {
         // 2. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
 
-        // 3. Register the pending call — with its `oid`, when it has one.
-        self.pending_calls
+        // 3. Register the pending call — with its `oid`, when it has one. The
+        // token it returns is this call's handle for the cleanup paths below.
+        let token = self
+            .pending_calls
             .register(response_name.to_string(), oid, tx)
             .await;
 
@@ -3120,7 +3125,7 @@ impl Mcu {
         if let Err(e) = self.enqueue(command, args, Some(response_name), clocks) {
             warn!("Failed to send command '{}': {e}", command);
             // Clean up the pending call on send failure.
-            self.pending_calls.cancel(response_name, oid).await;
+            self.pending_calls.cancel(token).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
 
@@ -3132,7 +3137,7 @@ impl Mcu {
             Ok(Ok(params)) => Ok(params),
             Ok(Err(_recv)) => {
                 // Receiver dropped (shouldn't happen in normal flow).
-                self.pending_calls.cancel(response_name, oid).await;
+                self.pending_calls.cancel(token).await;
                 error!(
                     "[{}] Response receiver dropped for '{}'",
                     self.name, response_name
@@ -3143,7 +3148,7 @@ impl Mcu {
             }
             Err(_) => {
                 // Timeout — clean up the pending call.
-                self.pending_calls.cancel(response_name, oid).await;
+                self.pending_calls.cancel(token).await;
                 warn!(
                     "[{}] Timeout waiting for response '{}'",
                     self.name, response_name

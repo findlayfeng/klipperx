@@ -9,12 +9,26 @@
 //! orchestration code never touches the mutex directly.
 
 use crate::core::klippy::msg::proto::ArgValue;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tracing::debug;
 
+/// Identifies one registration among its siblings in the registry.
+///
+/// A call is keyed by response name and `oid`, which are not unique: two
+/// concurrent calls for the same `oid` (the same peripheral asked twice) hold
+/// registrations that look identical. The token is what tells them apart, so
+/// the cleanup after a timeout drops **its own** registration and not the
+/// answer another in-flight call is still waiting for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingCallToken(u64);
+
 /// A single synchronous call waiting for a response from the MCU.
 struct PendingCall {
+    /// This registration's handle, handed back by [`PendingCalls::register`]
+    /// and required to cancel exactly this one.
+    token: PendingCallToken,
     /// Name of the response message to match against.
     response_name: String,
     /// The `oid` this call's response must carry, when the answer is told
@@ -38,6 +52,9 @@ fn carries_oid(params: &[ArgValue], oid: u8) -> bool {
 #[derive(Clone, Default)]
 pub(crate) struct PendingCalls {
     calls: Arc<Mutex<Vec<PendingCall>>>,
+    /// Source of [`PendingCallToken`]s; shared with every clone, like the
+    /// registry itself, so tokens are unique across all handles.
+    next_token: Arc<AtomicU64>,
 }
 
 impl PendingCalls {
@@ -48,17 +65,24 @@ impl PendingCalls {
 
     /// Register a call that is waiting for `response_name`, optionally told
     /// apart from its siblings by `oid`.
+    ///
+    /// Returns the registration's [`PendingCallToken`]: the caller keeps it and
+    /// passes it to [`PendingCalls::cancel`] on its failure paths, so cleanup
+    /// after a timeout cannot take a concurrent sibling's registration with it.
     pub(crate) async fn register(
         &self,
         response_name: String,
         oid: Option<u8>,
         response_tx: oneshot::Sender<Vec<ArgValue>>,
-    ) {
+    ) -> PendingCallToken {
+        let token = PendingCallToken(self.next_token.fetch_add(1, Ordering::Relaxed));
         self.calls.lock().await.push(PendingCall {
+            token,
             response_name,
             oid,
             response_tx,
         });
+        token
     }
 
     /// Deliver `params` to the call waiting for `response_name` it belongs to.
@@ -135,18 +159,22 @@ impl PendingCalls {
         calls.clear();
     }
 
-    /// Drop the oldest call registered for `response_name` and `oid`, if any.
+    /// Drop the registration `token` belongs to, if it is still there.
     ///
     /// Used to clean up after a send failure, a dropped receiver, or a timeout,
     /// so that a late response is not mis-delivered to a stale registration.
-    /// The `oid` is part of the key: a call cancelled for `oid` 1 leaves the one
-    /// waiting for `oid` 2 alone.
-    pub(crate) async fn cancel(&self, response_name: &str, oid: Option<u8>) {
+    ///
+    /// The token — not the name/`oid` pair — is the key: two concurrent calls
+    /// for the same `oid` are indistinguishable by name and `oid`, and matching
+    /// on those would let the first one to time out delete the other's
+    /// registration, whose answer would then be dropped and whose caller would
+    /// sit out its own deadline for nothing. A token that resolves (the call was
+    /// answered) or that was already cancelled is simply not found, which is not
+    /// an error: a successful [`PendingCalls::resolve`] consumed the
+    /// registration before any cleanup runs.
+    pub(crate) async fn cancel(&self, token: PendingCallToken) {
         let mut calls = self.calls.lock().await;
-        if let Some(idx) = calls
-            .iter()
-            .position(|call| call.response_name == response_name && call.oid == oid)
-        {
+        if let Some(idx) = calls.iter().position(|call| call.token == token) {
             calls.remove(idx);
         }
     }
@@ -240,24 +268,89 @@ mod tests {
         let calls = PendingCalls::new();
         let (tx, _rx) = oneshot::channel();
 
-        calls.register("clock".to_string(), None, tx).await;
-        calls.cancel("clock", None).await;
+        let token = calls.register("clock".to_string(), None, tx).await;
+        calls.cancel(token).await;
 
         assert_eq!(calls.len().await, 0);
         assert!(!calls.resolve("clock", &params()).await);
     }
 
+    /// The defect this token fixes: two concurrent calls for the same response
+    /// name and the same `oid` — the same peripheral asked twice — have
+    /// registrations that name and `oid` cannot tell apart. The one that times
+    /// out *first* is the later registration here, and cancelling by name/`oid`
+    /// would have dropped the earlier call's entry instead ("first match" is the
+    /// older registration), leaving this one to be answered and that one to sit
+    /// out its own deadline for nothing. With the token each cancel takes its
+    /// own entry, and the call still waiting gets its answer.
     #[tokio::test]
-    async fn test_cancel_only_removes_one_registration() {
+    async fn test_cancel_removes_only_its_own_registration() {
         let calls = PendingCalls::new();
-        let (tx1, _rx1) = oneshot::channel();
-        let (tx2, _rx2) = oneshot::channel();
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
 
-        calls.register("clock".to_string(), None, tx1).await;
-        calls.register("clock".to_string(), None, tx2).await;
-        calls.cancel("clock", None).await;
+        let first = calls
+            .register("tmc_uart_read_response".to_string(), Some(1), first_tx)
+            .await;
+        let second = calls
+            .register("tmc_uart_read_response".to_string(), Some(1), second_tx)
+            .await;
+        assert_ne!(first, second, "each registration has its own token");
 
-        assert_eq!(calls.len().await, 1);
+        // The later call is the one that gives up.
+        calls.cancel(second).await;
+
+        assert_eq!(calls.len().await, 1, "the sibling is still waiting");
+        assert!(
+            calls
+                .resolve("tmc_uart_read_response", &tmc_response(1))
+                .await
+        );
+        let answer = tokio::time::timeout(std::time::Duration::from_millis(50), first_rx)
+            .await
+            .expect("the surviving call gets its own answer")
+            .unwrap();
+        assert_eq!(answer, tmc_response(1));
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(50), second_rx)
+            .await
+            .expect("the cancelled call's receiver returns at once");
+        assert!(outcome.is_err(), "its sender was dropped by the cancel");
+        assert_eq!(calls.len().await, 0);
+    }
+
+    /// Cleanup runs on paths a registration may already be gone from: a
+    /// successful [`PendingCalls::resolve`] consumes it first, and a retry may
+    /// cancel twice. Neither may touch another call's registration, and a
+    /// token issued by a different registry is nobody here.
+    #[tokio::test]
+    async fn test_cancel_of_an_unissued_token_leaves_every_registration_alone() {
+        let calls = PendingCalls::new();
+        let other_registry = PendingCalls::new();
+        let (tx, _rx) = oneshot::channel();
+        let (answered_tx, answered_rx) = oneshot::channel();
+
+        // Registered first, so `resolve` spends this one and leaves `token`
+        // live — the state a cleanup path finds after a successful answer.
+        let answered = calls.register("clock".to_string(), None, answered_tx).await;
+        let token = calls.register("clock".to_string(), None, tx).await;
+        assert!(calls.resolve("clock", &params()).await, "first comes first");
+        let answer = tokio::time::timeout(std::time::Duration::from_millis(50), answered_rx)
+            .await
+            .expect("the answered call returns at once")
+            .unwrap();
+        assert_eq!(answer, params());
+        assert_eq!(calls.len().await, 1, "the second call is still waiting");
+        // `answered` is spent, `other_registry`'s token was never issued here.
+        calls.cancel(answered).await;
+        let (foreign_tx, _foreign_rx) = oneshot::channel();
+        let foreign = other_registry
+            .register("clock".to_string(), None, foreign_tx)
+            .await;
+        calls.cancel(foreign).await;
+
+        assert_eq!(calls.len().await, 1, "the live registration is untouched");
+        calls.cancel(token).await;
+        assert_eq!(calls.len().await, 0);
     }
 
     /// A registration whose receiver is gone is no waiter at all: it is
@@ -374,7 +467,7 @@ mod tests {
         let calls = PendingCalls::new();
         let (tx, rx) = oneshot::channel();
 
-        calls
+        let token = calls
             .register("tmc_uart_read_response".to_string(), Some(1), tx)
             .await;
         assert!(
@@ -390,7 +483,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        calls.cancel("tmc_uart_read_response", Some(1)).await;
+        calls.cancel(token).await;
         assert_eq!(calls.len().await, 0);
     }
 
@@ -419,14 +512,14 @@ mod tests {
         let (tx1, _rx1) = oneshot::channel();
         let (tx2, _rx2) = oneshot::channel();
 
-        calls
+        let oid1 = calls
             .register("tmc_uart_read_response".to_string(), Some(1), tx1)
             .await;
         calls
             .register("tmc_uart_read_response".to_string(), Some(2), tx2)
             .await;
 
-        calls.cancel("tmc_uart_read_response", Some(1)).await;
+        calls.cancel(oid1).await;
 
         assert_eq!(calls.len().await, 1);
         // oid 1's answer now has no claimant: it is dropped, and oid 2's call is

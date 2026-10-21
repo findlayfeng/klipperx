@@ -35,6 +35,7 @@ use crate::core::klippy::extras::extruder_stepper::{
 use crate::core::klippy::extras::heaters::{self, Heater};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::z_tilt::block_in_command;
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -433,6 +434,12 @@ const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 /// planned up to — upstream hands it to `register_lookahead_callback`, which
 /// fires with exactly that time (`extruder.py:82-86`) — so segments the step
 /// generator has stepped over keep the value they were stepped with.
+///
+/// A changed **smooth time** is the exception: the smoothing filter's width is
+/// part of how a segment is stepped, so upstream flushes step generation first
+/// and applies the new parameters from time zero (`extruder.py:75-83`). The
+/// values upstream compares are the *effective* smooth times — either side is
+/// zero when its pressure advance is zero (`:67-74`).
 fn set_pressure_advance(
     gcmd: &GcodeCommand,
     pressure_advance: &Arc<ExtruderPressureAdvance>,
@@ -454,23 +461,42 @@ fn set_pressure_advance(
     let toolhead = printer
         .upgrade()
         .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
-    let print_time = toolhead
-        .as_ref()
-        .map(|toolhead| toolhead.get_last_move_time())
-        .unwrap_or(0.0);
+    // Upstream's two "effective" smooth times (`kinematics/extruder.py:67-74`).
+    let old_smooth_time = if advance == 0.0 { 0.0 } else { smooth_time };
+    let new_smooth_time = if value == 0.0 { 0.0 } else { smooth };
+    let smooth_time_changed = new_smooth_time != old_smooth_time;
+    // "Need full kinematic flush to change the smooth time"
+    // (`kinematics/extruder.py:79-80`): the width of the smoothing filter is
+    // part of how a segment is stepped, so every segment planned with the old
+    // one has to be generated before the new one starts. Nothing is queued
+    // before connect, so there is nothing to flush there.
+    if smooth_time_changed {
+        if let Some(toolhead) = toolhead.as_ref().filter(|toolhead| toolhead.is_connected()) {
+            block_in_command(toolhead.flush_step_generation())?;
+        }
+    }
+    // With the plan generated, upstream dates the new value at time zero
+    // (`espa(sk, 0., …)`, `:81`); without a smooth time change it lands at the
+    // print time the planner has reached (`:83-86`).
+    let print_time = if smooth_time_changed {
+        0.0
+    } else {
+        toolhead
+            .as_ref()
+            .map(|toolhead| toolhead.get_last_move_time())
+            .unwrap_or(0.0)
+    };
     pressure_advance.set(print_time, value, smooth);
     // The extruder stepper's step generation window is half its smooth time, so
-    // a changed smooth time changes how far generated steps are still open to
-    // rewriting: rescan and update the flush delay
+    // only a changed smooth time changes how far generated steps are still open
+    // to rewriting: rescan and update the flush delay
     // (`motion_queuing.check_step_generation_scan_windows`,
     // `kinematics/extruder.py:82`; the detach/bind scan at `:57,66` has no
-    // counterpart here yet). Upstream also flushes step generation first when
-    // the smooth time changed (`kinematics/extruder.py:79`); this host has no
-    // equivalent (a flush here would need the flush task), so only the
-    // bookkeeping moves — the wider window holds the print-time floor and the
-    // history expiry back instead.
-    if let Some(toolhead) = &toolhead {
-        toolhead.recompute_scan_windows();
+    // counterpart here yet).
+    if smooth_time_changed {
+        if let Some(toolhead) = &toolhead {
+            toolhead.recompute_scan_windows();
+        }
     }
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
@@ -730,6 +756,13 @@ mod tests {
         printer
     }
 
+    /// `extruder_config` with a `kinematics: none` toolhead: nothing is planned,
+    /// so a flush only runs the registered flush callbacks — the fixture a test
+    /// that counts flushes needs.
+    fn extruder_config_none_kinematics() -> String {
+        extruder_config("").replace("kinematics: cartesian", "kinematics: none")
+    }
+
     /// `commands.test` sends `SET_PRESSURE_ADVANCE ADVANCE=.002
     /// SMOOTH_TIME=.001` with **no** `EXTRUDER=` word. Upstream answers that
     /// through the `EXTRUDER` default — registered only by the extruder
@@ -753,6 +786,110 @@ mod tests {
         let status = PrinterObject::get_status(&*extruder, 0.0);
         assert_eq!(status["pressure_advance"], 0.002);
         assert_eq!(status["smooth_time"], 0.001);
+    }
+
+    /// A **changed smooth time** flushes step generation before the new value
+    /// is recorded; a value-only change does not (`kinematics/extruder.py:79-86`:
+    /// "Need full kinematic flush to change the smooth time").
+    ///
+    /// The spy is a flush callback ([`ToolHeadObject::register_flush_callback`]),
+    /// which fires on every step generation — including one that produces no
+    /// steps — so with `kinematics: none` the count is exactly the number of
+    /// flushes the command ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_changed_smooth_time_flushes_step_generation_first() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let flushes = Arc::new(AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        // Enabling pressure advance with a smooth time is a smooth time change
+        // (the configured `ADVANCE` is 0, so it started out as 0).
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.002 SMOOTH_TIME=.04")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a changed smooth time flushes the plan"
+        );
+
+        // Only `ADVANCE` moves now: the smooth time is unchanged, so the new
+        // value is dated by the planner's horizon and nothing is flushed.
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.003 SMOOTH_TIME=.04")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            1,
+            "a value-only change flushes nothing"
+        );
+
+        // A different smooth time is a different filter width: flush first.
+        gcode
+            .run_script("SET_PRESSURE_ADVANCE ADVANCE=.002 SMOOTH_TIME=.01")
+            .await
+            .expect("the line applies");
+        assert_eq!(
+            flushes.load(Ordering::SeqCst),
+            2,
+            "a changed smooth time flushes the plan exactly once"
+        );
+
+        let extruder = printer
+            .lookup_object_as::<PrinterExtruder>("extruder")
+            .expect("[extruder] is registered");
+        let status = PrinterObject::get_status(&*extruder, 0.0);
+        assert_eq!(status["smooth_time"], 0.01);
+    }
+
+    /// Upstream compares the **effective** smooth times: with pressure advance
+    /// 0 the smooth time counts as 0 (`kinematics/extruder.py:67-74`), so
+    /// turning `ADVANCE` off flushes even though the `SMOOTH_TIME` word did not
+    /// move — and turning it back on flushes again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_switching_pressure_advance_off_flushes_the_smoothing_away() {
+        let printer = load_ok(&extruder_config_none_kinematics());
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        let flushes = Arc::new(AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the loader registers `gcode`");
+
+        for (script, expected) in [
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 0),
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 0),
+            ("SET_PRESSURE_ADVANCE ADVANCE=.05 SMOOTH_TIME=.04", 1),
+            ("SET_PRESSURE_ADVANCE ADVANCE=.05 SMOOTH_TIME=.04", 1),
+            ("SET_PRESSURE_ADVANCE ADVANCE=0 SMOOTH_TIME=.04", 2),
+        ] {
+            gcode.run_script(script).await.expect("the line applies");
+            assert_eq!(flushes.load(Ordering::SeqCst), expected, "after {script}");
+        }
     }
 
     /// With a default registered, a key that names something else still has to

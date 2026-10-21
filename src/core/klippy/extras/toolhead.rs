@@ -1923,6 +1923,18 @@ impl ToolHeadObject {
             .unwrap_or(0.0)
     }
 
+    /// Whether [`ToolHeadObject::connect`] has produced a planner and nothing
+    /// (a homing run, [`ToolHeadObject::flush_step_generation`]) is holding it
+    /// at this instant.
+    ///
+    /// A command that has to flush before it changes something checks this
+    /// first: before connect there is nothing to flush, and a command that is
+    /// not allowed to fail on an empty slot (one that runs before the machine
+    /// is ready) can skip the flush instead.
+    pub fn is_connected(&self) -> bool {
+        self.lock().is_some()
+    }
+
     /// The MCU's estimate of the print time *now* (`MCU.estimated_print_time`),
     /// read fresh from the source [`ToolHeadObject::connect`] installed.
     ///

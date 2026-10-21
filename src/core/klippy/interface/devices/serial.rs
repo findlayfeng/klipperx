@@ -2306,9 +2306,10 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
 /// the port is left as it was found.
 ///
 /// # Errors
-/// [`InterfaceError::Other`] for an id the wire format cannot carry or a port
-/// that cannot be opened, [`InterfaceError::ConnectionLost`] if the port dies
-/// mid-handshake, [`InterfaceError::Timeout`] if no answer arrives.
+/// [`InterfaceError::Other`] for an id the wire format cannot carry, for an id
+/// that is **already attached** on this port, or for a port that cannot be
+/// opened; [`InterfaceError::ConnectionLost`] if the port dies mid-handshake,
+/// [`InterfaceError::Timeout`] if no answer arrives.
 pub fn attach(
     path: &Path,
     baud: u32,
@@ -2325,8 +2326,7 @@ pub fn attach(
     let mut reopened = 0u32;
     loop {
         let port = port_for(path, baud)?;
-        let slot = Arc::new(McuSlot::new());
-        port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+        let slot = register_slot(&port, mcu_id)?;
         let handle = Arc::new(SharedSerialHandle {
             port: Arc::clone(&port),
             mcu_id,
@@ -2344,7 +2344,8 @@ pub fn attach(
         if let Err(e) = handshake {
             // The slot this attach opened goes down through the same guarded
             // unregister the teardown paths use; the `ptr_eq` check only removes
-            // the slot this handle registered.
+            // the slot this handle registered — which, with the duplicate
+            // refused in `register_slot`, is always the one still in the map.
             handle.unregister();
             // A **stale** port is worth one more open: the descriptor belongs to
             // a device node the path no longer names (the board reset and
@@ -2379,8 +2380,9 @@ pub fn attach(
 ///
 /// # Errors
 /// [`InterfaceError::Other`] for an id outside `1..=MAX_MCU_ID` — the same
-/// rejection [`attach`] makes — and for a port that cannot be opened;
-/// [`InterfaceError::ConnectionLost`] when the port is already stopped.
+/// rejection [`attach`] makes — for an id already attached on this port, and
+/// for a port that cannot be opened; [`InterfaceError::ConnectionLost`] when
+/// the port is already stopped.
 pub fn attach_downstream(
     path: impl AsRef<Path>,
     baud: u32,
@@ -2397,14 +2399,38 @@ pub fn attach_downstream(
         return Err(InterfaceError::ConnectionLost);
     }
 
-    let slot = Arc::new(McuSlot::new());
-    port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+    let slot = register_slot(&port, mcu_id)?;
     Ok(Arc::new(SharedSerialHandle {
         port,
         mcu_id,
         slot,
         stopped: AtomicBool::new(false),
     }))
+}
+
+/// Register a fresh slot for `mcu_id` on `port`, refusing an id that already has
+/// one.
+///
+/// One MCU id is one device: a second registration under it would **replace**
+/// the live slot, and the frames the older handle's `receive` is waiting for
+/// would then arrive in a slot nobody reads — while every later teardown of the
+/// older handle finds it is no longer the map's entry (the `ptr_eq` guard in
+/// [`SharedSerialHandle::unregister`]) and leaves the id with a slot whose only
+/// reader has gone. The attach that did it also looks successful, which is why
+/// the refusal has to be here rather than left to the handshake: a duplicate id
+/// is a wiring mistake (the same `[mcu]` twice on one port) and is reported as
+/// one.
+fn register_slot(port: &SharedSerialPort, mcu_id: u32) -> Result<Arc<McuSlot>, InterfaceError> {
+    let mut slots = port.slots.lock().unwrap();
+    if slots.contains_key(&mcu_id) {
+        return Err(InterfaceError::Other(format!(
+            "mcu id {mcu_id} is already attached on {}",
+            port.path.display()
+        )));
+    }
+    let slot = Arc::new(McuSlot::new());
+    slots.insert(mcu_id, Arc::clone(&slot));
+    Ok(slot)
 }
 
 /// Wait up to `timeout` for the reader to record an assignment answer.
@@ -4308,19 +4334,75 @@ mod mux_tests {
             .expect("the receiving thread must not hang");
     }
 
+    /// A second attach under an id that already has a slot on the port is
+    /// **refused**, and the live handle keeps its slot.
+    ///
+    /// The registration used to be a plain `insert`: the second attach took the
+    /// first handle's slot out of the map without a word, so the frames the
+    /// live handle's `receive` was waiting for went to a slot nobody read, and a
+    /// later teardown of that handle found it was no longer the entry and left
+    /// the id registered with no reader behind it.
+    #[test]
+    fn attaching_an_already_attached_id_is_refused() {
+        let pty = Pty::new();
+        let live = attach_with_reply(&pty, 4);
+        let port = Arc::clone(&live.port);
+
+        let path = pty.path.clone();
+        let err = super::tests::bounded(move || {
+            attach(&path, DEFAULT_BAUD, 4, ASSIGN_ATTACH_TIMEOUT, None)
+        })
+        .expect_err("a second attach on the same id must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("mcu id 4 is already attached"),
+            "the error must name the id and the reason: {message}"
+        );
+
+        // Nothing was written: the refusal comes before the handshake.
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "a refused attach must not put an assignment request on the wire"
+        );
+
+        // The live handle still owns the id: its slot is the map's entry and is
+        // still fed.
+        {
+            let slots = port.slots.lock().unwrap();
+            let registered = slots
+                .get(&4)
+                .expect("the live handle's slot must still be registered");
+            assert!(
+                Arc::ptr_eq(registered, &live.slot),
+                "a refused attach must leave the live slot in place"
+            );
+        }
+        master_write(&pty.master, &device_unit(4, &Frame::encode(3, b"live")));
+        assert!(
+            wait_for_frame(
+                &live.slot,
+                &Frame::new(3, b"live".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the live handle must still be fed after the refused attach"
+        );
+    }
+
     /// The `ptr_eq` guard keeps a **stale** handle from unregistering a slot a
-    /// newer attach owns: every attach replaces the map entry, so the older
-    /// handle's `shutdown` (and its later `Drop`) must leave the live one
-    /// alone. Both the `shutdown` teardown and the guarded attach-failure path
-    /// depend on that branch.
+    /// newer attach owns.
+    ///
+    /// A shut-down handle's slot leaves the map at the shutdown while the handle
+    /// itself lives on in its owner's `Arc`, so the id is free again and a second
+    /// attach registers a slot of its own. The first handle's `Drop` then runs
+    /// `unregister`, which must not take the newer slot down with it.
     #[test]
     fn a_stale_handle_leaves_the_newer_attachs_slot_alone() {
         let pty = Pty::new();
         let first = attach_with_reply(&pty, 4);
+        first.shutdown();
         let second = attach_with_reply(&pty, 4);
         let port = Arc::clone(&second.port);
 
-        first.shutdown();
         {
             let slots = port.slots.lock().unwrap();
             let live = slots

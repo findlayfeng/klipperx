@@ -402,7 +402,9 @@ impl MenuItem {
         };
         let mut context = manager.base_context();
         manager.bind_menu(&mut context, &self.ns, event, input);
-        template.render(&mut context).map_err(|error| error.to_string())
+        template
+            .render(&mut context)
+            .map_err(|error| error.to_string())
     }
 
     /// Render `template` without `menu.input`, the context `enable` and an
@@ -414,7 +416,9 @@ impl MenuItem {
     ) -> Result<String, MenuError> {
         let mut context = manager.base_context();
         manager.bind_menu(&mut context, &self.ns, None, None);
-        template.render(&mut context).map_err(|error| error.to_string())
+        template
+            .render(&mut context)
+            .map_err(|error| error.to_string())
     }
 
     /// Evaluate `enable` (`eval_enable`, `menu.py:113-118`).
@@ -478,7 +482,10 @@ impl MenuItem {
             data.scroll.last_heartbeat = Some(eventtime);
             if eventtime >= data.scroll.next {
                 data.scroll.next = eventtime + SCROLL_DELAY;
-                let editing = data.input().map(|input| input.value.is_some()).unwrap_or(false);
+                let editing = data
+                    .input()
+                    .map(|input| input.value.is_some())
+                    .unwrap_or(false);
                 if !editing {
                     match (data.scroll.pos, data.scroll.request) {
                         (None, Some(true)) => data.scroll.pos = Some(0),
@@ -651,7 +658,9 @@ impl MenuItem {
     /// (`_get_input_step`, `menu.py:498-502`).
     fn input_step(&self, fast_rate: bool) -> f64 {
         let data = self.lock();
-        let Some(input) = data.input() else { return 0.0 };
+        let Some(input) = data.input() else {
+            return 0.0;
+        };
         let span = (input.max - input.min) / input.step;
         if fast_rate && span > 100.0 {
             10.0 * input.step
@@ -663,7 +672,9 @@ impl MenuItem {
     fn change_value(&self, delta: f64) {
         let mut data = self.lock();
         let last_heartbeat = data.scroll.last_heartbeat;
-        let Some(input) = data.input_mut() else { return };
+        let Some(input) = data.input_mut() else {
+            return;
+        };
         let Some(value) = input.value else { return };
         let next = (value + delta).max(input.min).min(input.max);
         if next != value {
@@ -754,7 +765,9 @@ impl MenuItem {
     fn update_items(&self) {
         let allitems = {
             let data = self.lock();
-            data.list().map(|list| list.allitems.clone()).unwrap_or_default()
+            data.list()
+                .map(|list| list.allitems.clone())
+                .unwrap_or_default()
         };
         let enabled: Vec<(Arc<MenuItem>, String)> = allitems
             .into_iter()
@@ -844,7 +857,9 @@ impl MenuItem {
         }
         let children = {
             let data = self.lock();
-            data.list().map(|list| list.items.clone()).unwrap_or_default()
+            data.list()
+                .map(|list| list.items.clone())
+                .unwrap_or_default()
         };
         for child in children {
             if child.is_container() && child.index_of_direct(item).is_some() {
@@ -1160,7 +1175,13 @@ impl MenuManager {
     /// Build one item from its section (`MenuElement.__init__` +
     /// `menu_items[type](self, cfg)`).
     fn build_item(&self, config: &ConfigWrapper, kind: &str) -> Result<Arc<MenuItem>, ConfigError> {
-        let ns = config.section().sub.clone().unwrap_or_default().trim().to_string();
+        let ns = config
+            .section()
+            .sub
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let index = config.get_optional_int("index")?;
         let enable = load_enable(config)?;
         let name = load_name(config, &self.gcode_macro)?;
@@ -1175,9 +1196,9 @@ impl MenuManager {
             }),
         };
         let gcode = match element {
-            Element::Command | Element::Input(_) => {
-                Some(Arc::new(self.gcode_macro.load_template(config, "gcode", Some(""))?))
-            }
+            Element::Command | Element::Input(_) => Some(Arc::new(
+                self.gcode_macro.load_template(config, "gcode", Some(""))?,
+            )),
             _ => None,
         };
         let data = ItemData {
@@ -1265,7 +1286,11 @@ impl MenuManager {
     /// The children of a container, in insertion order (`lookup_children`,
     /// `menu.py:1029-1032`).
     fn lookup_children(&self, ns: &str) -> Vec<String> {
-        self.registry().children.get(ns).cloned().unwrap_or_default()
+        self.registry()
+            .children
+            .get(ns)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// How many items the tree holds (tests and diagnostics).
@@ -1290,7 +1315,9 @@ impl MenuManager {
         }
         let buttons = PrinterButtons::ensure(&self.printer)?;
         for (option, event) in KEY_PINS {
-            let Some(pin) = keys.pin(option) else { continue };
+            let Some(pin) = keys.pin(option) else {
+                continue;
+            };
             let analog = format!("analog_range_{option}");
             if config.has(&analog) {
                 tracing::warn!(
@@ -1305,7 +1332,9 @@ impl MenuManager {
             buttons.register_buttons(
                 vec![pin],
                 Box::new(move |eventtime, state| {
-                    let Some(manager) = weak.upgrade() else { return };
+                    let Some(manager) = weak.upgrade() else {
+                        return;
+                    };
                     if is_click {
                         manager.click_callback(eventtime, state);
                     } else if state {
@@ -1429,7 +1458,10 @@ impl MenuManager {
             }),
             self.reactor.monotonic(),
         );
-        *self.timer.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
+        *self
+            .timer
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(handle);
     }
 
     /// Count the idle seconds and close the menu when `menu_timeout` runs out
@@ -1556,7 +1588,9 @@ impl MenuManager {
     /// The selected row of the innermost container, or `None` (tests and
     /// diagnostics).
     pub fn selected_namespace(&self) -> Option<String> {
-        self.stack_peek(0)?.selected_item().map(|item| item.ns().to_string())
+        self.stack_peek(0)?
+            .selected_item()
+            .map(|item| item.ns().to_string())
     }
 
     // -- the screen ---------------------------------------------------------
@@ -2034,8 +2068,7 @@ mod tests {
     use std::time::Duration;
 
     /// The corpus's `lcd_type: st7920` shape.
-    const ST7920_SECTION: &str =
-        "lcd_type: st7920\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n";
+    const ST7920_SECTION: &str = "lcd_type: st7920\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n";
 
     fn machine() -> Arc<Printer> {
         Arc::new(Printer::new(ManualReactor::shared()))
@@ -2044,9 +2077,8 @@ mod tests {
     /// A machine with one display and the menu sections `sections`, whose
     /// `[display]` also carries `options`.
     fn load(options: &str, sections: &str) -> Arc<Printer> {
-        let text = format!(
-            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}{options}\n{sections}"
-        );
+        let text =
+            format!("[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}{options}\n{sections}");
         let config = Config::from_text(&text).expect("the config parses").0;
         let printer = machine();
         printer
@@ -2117,8 +2149,7 @@ mod tests {
     /// The shipped `menu.cfg` is a copy; this is the guard that says so.
     #[test]
     fn test_the_vendored_menu_has_not_drifted() {
-        let upstream =
-            klipperx_test_support::klipper_dir().join("klippy/extras/display/menu.cfg");
+        let upstream = klipperx_test_support::klipper_dir().join("klippy/extras/display/menu.cfg");
         let Ok(text) = std::fs::read_to_string(&upstream) else {
             return;
         };
@@ -2163,11 +2194,16 @@ mod tests {
         // The shipped tree is there, and the config's section replaced the
         // shipped `__main __tune` instead of adding a second one.
         assert!(menu.lookup_menuitem("__main __setup __dump").is_some());
-        let tune = menu.lookup_menuitem("__main __tune").expect("the tuned item");
+        let tune = menu
+            .lookup_menuitem("__main __tune")
+            .expect("the tuned item");
         assert_eq!(tune.name_text(), "Overridden");
         let children = menu.lookup_children("__main");
         assert_eq!(
-            children.iter().filter(|name| *name == "__main __tune").count(),
+            children
+                .iter()
+                .filter(|name| *name == "__main __tune")
+                .count(),
             1
         );
         // 82 shipped items, plus `__test` and `__test __cmd`; the override adds
@@ -2178,9 +2214,7 @@ mod tests {
     /// An unknown `menu_root` is refused, and so is an unknown item type.
     #[test]
     fn test_a_bad_root_and_a_bad_type_are_reported() {
-        let text = format!(
-            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __nope\n"
-        );
+        let text = format!("[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __nope\n");
         let config = Config::from_text(&text).expect("the config parses").0;
         let err = machine().load_config(&config).unwrap_err();
         assert_eq!(err.to_string(), "Unknown menuitem '__nope'");
@@ -2252,7 +2286,10 @@ mod tests {
     /// `menu_reverse_navigation` swaps the two arrows (`menu.py:848-873`).
     #[test]
     fn test_reverse_navigation_swaps_the_arrows() {
-        let printer = load("menu_root: __test\nmenu_reverse_navigation: True\n", TEST_TREE);
+        let printer = load(
+            "menu_root: __test\nmenu_reverse_navigation: True\n",
+            TEST_TREE,
+        );
         let menu = menu_of(&printer);
         menu.key_event("click", 0.0);
         assert_eq!(selected_name(&menu), "..");
@@ -2303,7 +2340,10 @@ mod tests {
                 .render(&mut context)
                 .unwrap_or_else(|error| panic!("{error}"))
         }
-        assert_eq!(rendered("Speed: {'%3d' % (menu.input*100)}%"), "Speed: 999%");
+        assert_eq!(
+            rendered("Speed: {'%3d' % (menu.input*100)}%"),
+            "Speed: 999%"
+        );
         // A negative float truncates toward zero, as Python's `%d` does.
         assert_eq!(rendered("{'%d' % (0 - 3.7)}"), "-3");
         // An integer argument is untouched.
@@ -2524,10 +2564,7 @@ mod tests {
         .await
         .expect("the script runs");
 
-        assert_eq!(
-            outcome,
-            vec![("MENU_TEST".to_string(), "7".to_string())]
-        );
+        assert_eq!(outcome, vec![("MENU_TEST".to_string(), "7".to_string())]);
         assert!(menu.queued_gcode().is_empty());
     }
 
@@ -2596,4 +2633,3 @@ mod tests {
         assert_eq!(display.get_dimensions(), (16, 4));
     }
 }
-

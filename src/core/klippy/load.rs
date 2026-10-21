@@ -132,17 +132,34 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
-/// an entry. `tuning_tower` is unconditional upstream (`TUNING_TOWER` exists
-/// without the section) but **not** here: loading it unconditionally makes a
-/// machine that has a `[printer]` hang after `teardown` — `load_config` itself
-/// completes and `TUNING_TOWER` registers, so the stall is at object teardown
-/// or runtime shutdown, in the same family as the `Weak`-capture rings fixed in
-/// `virtual_sdcard`/`pause_button`/`gcode_button` (that module's command handler
-/// captures a strong `Arc<Self>`). Until that is settled the command exists only
-/// when `[tuning_tower]` is written; `TODO.md` carries it. `statistics` and
-/// `garbage_collection` exist only in part (the `system_stats` object and the
-/// reactor's latency warning stand in for their log summaries).
+/// an entry. `statistics` and `garbage_collection` exist only in part (the
+/// `system_stats` object and the reactor's latency warning stand in for their
+/// log summaries).
 const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
+
+/// The rest of upstream's unconditional list: modules that reach into the
+/// toolhead at load time, so they are built only when the config has a
+/// `[printer]` — which is exactly when upstream's list runs.
+///
+/// Upstream has no choice about that: `_read_config` calls
+/// `toolhead.add_printer_objects` unconditionally (`klippy.py:124-125`), and its
+/// first line builds `ToolHead(config)` from `[printer]`'s options, so a config
+/// without `[printer]` never boots at all. Here a `[mcu]`-only config is
+/// legitimate (`klippyx stress`, `admin`, the scan path), so the precondition
+/// has to be stated instead of assumed: with no `[printer]` there is no
+/// toolhead, no `gcode_move` move-transform slot, and a module that expects one
+/// has nothing to attach to.
+///
+/// `tuning_tower` is the first entry: it takes `gcode_move`'s transform slot at
+/// load time so `TUNING_TOWER` works without a `[tuning_tower]` section. It could
+/// only be made unconditional after its command handler stopped capturing a
+/// strong `Arc<Self>`: `TuningTower` holds the dispatcher, so the strong capture
+/// closed `TuningTower → dispatcher → command table → TuningTower`, and that ring
+/// outlived `teardown` — the machine then never dropped its parts, the fake
+/// MCU's blocking read stayed parked, and the runtime's shutdown waited forever
+/// (a test that loads it hung with nothing left to print). The `Weak` capture is
+/// the same convention `VirtualSdCard`/`GCodeButton`/`pause_resume` follow.
+const TOOLHEAD_MODULES: &[&str] = &["tuning_tower"];
 
 /// Every section id this host knows, in load order.
 ///
@@ -333,22 +350,46 @@ impl Printer {
         // section, which is what upstream's `getsection` hands it — every option
         // these modules read has a default.
         for id in DEFAULT_MODULES {
-            let Some((_, entry)) = factories.iter().find(|(known, _)| *known == *id) else {
-                // The table is the schema: a module this host does not know
-                // cannot be loaded from a name alone.
-                continue;
-            };
-            let Some(load) = entry.load_config else {
-                continue;
-            };
-            if config.get_section(id).is_some() {
-                continue;
+            self.load_default(factories, config, access, &mut claimed, id)?;
+        }
+
+        // ...and the ones that need a toolhead to attach to (`TOOLHEAD_MODULES`).
+        // Upstream runs its whole list at the end of `toolhead.add_printer_objects`
+        // (`toolhead.py:604-614`), which only happens through `[printer]`; here a
+        // `[mcu]`-only config is legitimate, so those modules are built only when
+        // the config actually has a printer to hook into.
+        if config.get_section("printer").is_some() {
+            for id in TOOLHEAD_MODULES {
+                self.load_default(factories, config, access, &mut claimed, id)?;
             }
-            let absent = ConfigSection::new(id, None);
-            self.register(load, entry, &absent, config, access, &mut claimed)?;
         }
 
         Ok(claimed)
+    }
+
+    /// Build one module from [`DEFAULT_MODULES`] / [`TOOLHEAD_MODULES`], from its
+    /// own section when the config has one and from an empty section otherwise.
+    fn load_default(
+        self: &Arc<Self>,
+        factories: &[(&str, Factories)],
+        config: &Config,
+        access: &Arc<AccessTracking>,
+        claimed: &mut Vec<String>,
+        id: &str,
+    ) -> Result<(), ConfigError> {
+        let Some((_, entry)) = factories.iter().find(|(known, _)| *known == id) else {
+            // The table is the schema: a module this host does not know cannot be
+            // loaded from a name alone.
+            return Ok(());
+        };
+        let Some(load) = entry.load_config else {
+            return Ok(());
+        };
+        if config.get_section(id).is_some() {
+            return Ok(());
+        }
+        let absent = ConfigSection::new(id, None);
+        self.register(load, entry, &absent, config, access, claimed)
     }
 
     /// Build and register one section, recording it as claimed.
@@ -772,6 +813,48 @@ mod tests {
         assert_eq!(printer.objects(), ["chip", "first"]);
     }
 
+    /// The toolhead-only half of upstream's unconditional list follows the
+    /// config, not a list: `TOOLHEAD_MODULES` needs a `[printer]` to attach to.
+    ///
+    /// Upstream never has to say so — `_read_config` calls
+    /// `toolhead.add_printer_objects` unconditionally and its first line builds
+    /// `ToolHead(config)` from `[printer]`'s options, so a config without
+    /// `[printer]` does not boot at all. This host accepts `[mcu]`-only configs
+    /// (`klippyx stress`, `admin`, the scan path), so the precondition is stated
+    /// here instead: without a printer there is no toolhead, and `tuning_tower`
+    /// has nothing to take a move-transform slot from.
+    #[test]
+    fn test_the_toolhead_modules_need_a_printer_section() {
+        // No `[printer]`: the always-on half loads, the toolhead half does not.
+        let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
+        result.unwrap();
+        assert!(printer.lookup_object("idle_timeout").is_some());
+        assert!(printer.lookup_object("tuning_tower").is_none());
+
+        // With one, both are there and `TUNING_TOWER` is registered — that is
+        // the whole point of loading it without a `[tuning_tower]` section.
+        let (printer, result) = load(
+            "[mcu]\nserial: /dev/not-opened-yet\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        result.expect("a printer-only config loads");
+        assert!(
+            printer.lookup_object("tuning_tower").is_some(),
+            "the toolhead half did not load"
+        );
+        // `TUNING_TOWER` is a ready-only command, so light the ready lamp the way
+        // a real session does before asking the dispatcher what it carries.
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
+        let status = printer
+            .lookup_object("gcode")
+            .expect("the dispatcher is registered")
+            .get_status(0.0);
+        assert!(
+            !status["commands"]["TUNING_TOWER"].is_null(),
+            "`TUNING_TOWER` was not registered"
+        );
+    }
+
     #[test]
     fn test_the_main_mcu_section_becomes_the_mcu_object() {
         let (printer, result) = load("[mcu]\nserial: /dev/not-opened-yet\n");
@@ -944,7 +1027,12 @@ mod tests {
                 "manual_probe",
                 "toolhead",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                // The toolhead-only half of upstream's unconditional list
+                // (`toolhead.py:611-612`): loaded here because this config has a
+                // `[printer]`, which is the precondition upstream never has to
+                // state.
+                "tuning_tower"
             ]
         );
         // The steppers are registered but not client-visible; the toolhead is.

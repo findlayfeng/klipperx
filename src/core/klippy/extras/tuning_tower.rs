@@ -326,10 +326,19 @@ impl TuningTower {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let handler: CommandHandler = {
-            let object = Arc::clone(self);
-            sync(move |gcmd| cmd_tuning_tower(&object, gcmd))
-        };
+        // Weakly: this object keeps the dispatcher (`gcode`), so a strong capture
+        // here would close the loop `TuningTower → dispatcher → command table →
+        // TuningTower`. That loop outlives `teardown`, and with it every part the
+        // table captured — each `Mcu` among them, whose `Drop` is what releases
+        // the parked blocking read — so the runtime's shutdown waits forever
+        // (the same shape as `VirtualSdCard`/`GCodeButton`/`pause_resume`).
+        let weak = Arc::downgrade(self);
+        let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
+            let Some(object) = weak.upgrade() else {
+                return Err(CommandError::new("the tuning_tower object is gone"));
+            };
+            cmd_tuning_tower(&object, gcmd)
+        });
         gcode
             .register_command_with_params(
                 "TUNING_TOWER",

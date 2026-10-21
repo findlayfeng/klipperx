@@ -484,14 +484,13 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
 - [ ] 已知偏差（2026-10-18 审出，客服端宏会踩）：无 `[extruder]` 时上游 `printer.toolhead.extruder` 是 `''`（`DummyExtruder.get_name()`），本仓恒为 `"extruder"`，于是 `_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_EXTRUDE` 那类 `!= ''` 守卫在本仓拦不住、直接去查未注册的 `printer['extruder']`。有挤出机时两者一致。
-- [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，本仓 `DEFAULT_MODULES` 只收 `idle_timeout`
-      （`gcode_move`/`manual_probe` 由 toolhead 工厂 `ensure` 无条件建立，不经该表）。逐项现状：
-      `tuning_tower` 已落地（2026-10-21，`extras/tuning_tower.rs`），但**只在自己节存在时装载**：
-      上游是无条件加载（`TUNING_TOWER` 不写节也能用），本仓的工厂在装载期就调 `gcode_move::ensure`
-      （会建 toolhead），在没有 `[printer]` 的配置上会挂——要做到无条件，需把该查询延到 `klippy:connect`；
-      `statistics` 只缺 1 Hz 汇总日志（对象已落地，
-      见 H11）；`garbage_collection` 只缺日志汇总（Rust 无 GC 冻结机制，只有延迟告警）；
-      `homing` **不是缺口**（功能在 `motion/kinematics.rs` 的 `Homing` 与 toolhead 内，只是没有同名模块）。
+- [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，本仓分两组：`DEFAULT_MODULES`（`idle_timeout`，始终加载）
+      与 `TOOLHEAD_MODULES`（`tuning_tower`，**仅在有 `[printer]` 时**）。`gcode_move`/`manual_probe` 由 toolhead 工厂
+      `ensure` 无条件建立，`homing` 是运动学层而非可装载模块——这三者不需条目。
+      **为什么不能整体无条件**：上游 `[printer]` 是硬前提（`klippy.py:124-125` 无条件建 `ToolHead(config)`），
+      本仓的 `[mcu]`-only 配置是合法的，没有 toolhead 就没有可挂的 move-transform 槽。
+      剩下的差：`statistics` 只缺 1 Hz 汇总日志（对象已落地，见 H11）；`garbage_collection` 只缺日志汇总
+      （Rust 无 GC 冻结机制，只有延迟告警）。
 
 - [x] **归零丢报告不再锁死（2026-10-18 真机）**：`trsync_state` 路由器提前到会话 `attach` 安装、无主 oid 静默、
       `on_restart` 发 `trsync_start(oid,0,0,0)` 断掉被杀进程留下的周期报告；等触发加 5 s 兜底

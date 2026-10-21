@@ -335,6 +335,53 @@ impl std::io::Read for SerialDevice {
     }
 }
 
+impl DiscoveryPort for SerialDevice {
+    /// Stale input goes before the scan's query: a leftover unit from the
+    /// previous conversation would otherwise be cut and read as an answer.
+    fn discard_stale_input(&mut self) -> std::io::Result<()> {
+        // SAFETY: the descriptor belongs to `self.port`, which is open here.
+        if unsafe { libc::tcflush(self.port.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Wait in `poll` for what is left of the scan's window.
+    ///
+    /// `poll` is the only way to wait on a descriptor for a duration: a
+    /// non-blocking port has no `VTIME` window to spend and would spin on
+    /// `WouldBlock`, and a blocking one would sit in its 100 ms cycle until the
+    /// deadline. A hang-up counts as ready, so the read behind it sees the end of
+    /// the line.
+    fn wait_for_bytes(&mut self, window: Duration) -> std::io::Result<bool> {
+        // Rounded up: `poll` with a zero timeout would only survey the port, and
+        // the scan's loop would then spin until the deadline.
+        let millis = window.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut fds = libc::pollfd {
+            fd: self.port.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fds` is one descriptor entry this call owns, and it names the
+        // descriptor `self.port` keeps open.
+        let ready = unsafe { libc::poll(&mut fds, 1, millis) };
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                return Ok(true); // let the read decide rather than ending the scan
+            }
+            return Err(e);
+        }
+        Ok(ready > 0)
+    }
+
+    /// A zero read on a tty is the far end closing the line: the wait for bytes
+    /// is [`DiscoveryPort::wait_for_bytes`]'s job now, not a zero read's.
+    fn zero_read_is_eof(&self) -> bool {
+        true
+    }
+}
+
 impl std::io::Write for SerialDevice {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         SerialDevice::write(self, buf)
@@ -2120,17 +2167,26 @@ impl UnitStream {
 /// can print answers while the window is still open.
 ///
 /// The `timeout` is a **deadline**, measured from the moment the query goes
-/// out, like CAN's scan window: every read is bounded by what is left of it,
-/// and the scan ends when that runs out, whatever has arrived by then. A
-/// blocking port says “no bytes in this read window” with a zero read, a
-/// non-blocking one with `WouldBlock`/`TimedOut`; both just mean the loop has
-/// to check the deadline, and any other read error is returned as it is.
+/// out, like CAN's scan window: every read waits for at most what is left of it
+/// (`poll` on the port's descriptor), and the scan ends when that runs out,
+/// whatever has arrived by then. A zero read is the far end closing the line, not
+/// “no bytes yet” — the wait for bytes is the deadline's job now — so it ends the
+/// scan instead of spinning on it, and any other read error is returned as it
+/// is.
+///
+/// Whatever the line carried before the query is dropped first: it cannot be an
+/// answer to a query that had not been sent yet, and left in the queue it would
+/// be framed as part of the first one.
+///
 /// Returns how many boards were found.
 pub fn serial_query_unassigned(
-    port: &mut (impl std::io::Read + std::io::Write),
+    port: &mut impl DiscoveryPort,
     timeout: Duration,
     mut report: impl FnMut(UnassignedNode),
 ) -> std::io::Result<usize> {
+    // Stale input goes: a leftover unit from the previous conversation would be
+    // cut and fed to this scan as if a board had answered this query.
+    port.discard_stale_input()?;
     port.write_all(&discovery_query())?;
     let deadline = Instant::now() + timeout;
     let mut scan = UnassignedScan::new();
@@ -2141,7 +2197,16 @@ pub fn serial_query_unassigned(
         if remaining.is_zero() {
             break;
         }
+        // The wait between reads is the stream's own: a tty waits in `poll` for
+        // what is left of the window — there is nothing else to wait on in a
+        // non-blocking port, and a blocking one would otherwise sit in its own
+        // `VTIME` cycle — while a stream that has no descriptor waits as it
+        // always did.
+        if !port.wait_for_bytes(remaining)? {
+            break;
+        }
         match port.read(&mut buf) {
+            Ok(0) if port.zero_read_is_eof() => break,
             Ok(0) => continue,
             Ok(read) => {
                 stream.feed(&buf[..read]);
@@ -2153,7 +2218,8 @@ pub fn serial_query_unassigned(
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 continue;
             }
@@ -2161,6 +2227,32 @@ pub fn serial_query_unassigned(
         }
     }
     Ok(scan.total())
+}
+
+/// A byte stream a discovery scan reads: how it drops what the line carried
+/// before the query, and how it waits between reads.
+///
+/// A **tty** answers both from its descriptor — `tcflush` for what is stale,
+/// `poll` for what is left of the window — and a zero read there is the far end
+/// closing the line. A stream without a descriptor (klipper's host library, whose
+/// reads already wait a short window of their own) keeps the defaults: nothing to
+/// flush, no wait of its own, and a zero read meaning “nothing yet” rather than
+/// the end of the line.
+pub trait DiscoveryPort: std::io::Read + std::io::Write {
+    /// Drop whatever the line carried before the scan's query.
+    fn discard_stale_input(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Wait until a read will return bytes, or `window` closes (`Ok(false)`).
+    fn wait_for_bytes(&mut self, _window: Duration) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether a zero-byte read is the far end closing the line.
+    fn zero_read_is_eof(&self) -> bool {
+        false
+    }
 }
 
 /// A physical serial port, its one reader thread, and a slot per attached MCU.
@@ -6196,6 +6288,69 @@ mod mux_tests {
         });
         assert_eq!(total, 1);
         assert_eq!(reported[0].uuid, [0x11; 6]);
+    }
+
+    /// What the line carried **before** the query is not this scan's answer.
+    ///
+    /// An answer left in the input queue by an earlier conversation frames
+    /// perfectly well, so without the flush the scan reports a board that
+    /// answered something else — a leftover that also shifts every real answer
+    /// behind it.
+    #[test]
+    fn a_scan_flushes_what_the_line_carried_before_its_query() {
+        let pty = Pty::new();
+        let mut device = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("a pty opens");
+        // A stale answer sits in the raw port's queue before the query goes out.
+        master_write(&pty.master, &admin_answer([0x11; 6], None));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut reported = Vec::new();
+        let total = serial_query_unassigned(&mut device, Duration::from_millis(200), |node| {
+            reported.push(node)
+        })
+        .expect("the pty does not fail");
+        assert_eq!(total, 0, "a leftover answer is not this scan's finding");
+        assert!(reported.is_empty());
+    }
+
+    /// A line that closes under the scan ends it there, not at its deadline.
+    #[test]
+    fn a_scan_ends_when_the_line_closes_instead_of_waiting_out_its_window() {
+        let pty = Pty::new();
+        let mut device = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("a pty opens");
+        let query = discovery_query();
+        let master = pty.master.try_clone().expect("the pty master clones");
+
+        let window = Duration::from_secs(10);
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = serial_query_unassigned(&mut device, window, |_| {});
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+
+        // The far end has the query and then goes away, closing the line.
+        assert_eq!(
+            read_n_within(&master, query.len(), Duration::from_secs(5)),
+            query,
+            "the scan must send the discovery query verbatim"
+        );
+        drop(master);
+        drop(pty);
+
+        let (outcome, elapsed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a closed line must end the scan");
+        assert!(
+            elapsed < window / 2,
+            "the closed line ends the scan, not the window: {elapsed:?}"
+        );
+        // A closed line is the end of input, not a finding: the tty reports it
+        // either as an empty read or as an error, and neither is a board.
+        assert!(
+            matches!(outcome, Ok(0) | Err(_)),
+            "a closed line finds no board: {outcome:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

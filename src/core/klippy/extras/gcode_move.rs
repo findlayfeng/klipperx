@@ -616,6 +616,18 @@ impl GCodeMove {
         state.base_position.set_axis(E_AXIS, base);
     }
 
+    /// Upstream's `gcode_move.cmd_G1(gcmd)`: run a move whose command was
+    /// built with [`GCodeDispatch::create_gcode_command`] through the `G1`
+    /// handler, which is how `gcode_arcs` sends each arc segment
+    /// (`gcode_arcs.py:172-173`).
+    ///
+    /// # Errors
+    /// As `G1`: an unparseable word, a non-positive `F`, or whatever the move
+    /// target refuses.
+    pub fn cmd_g1(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        cmd_g1(self, gcmd)
+    }
+
     /// Upstream's `GCodeMove.get_status`.
     pub fn status(&self) -> Value {
         let state = self.lock();

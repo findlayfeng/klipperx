@@ -30,14 +30,7 @@
 //!
 //! # Differences from upstream
 //!
-//! Upstream flushes step generation before putting new impulses into the
-//! steppers (`toolhead.flush_step_generation()`, `input_shaper.py:157,170`).
-//! There is no flush from a g-code command here (it needs the flush task — the
-//! same gap `SET_PRESSURE_ADVANCE` has), so only the bookkeeping moves: the
-//! widened window holds the print-time floor and the history expiry back, but
-//! steps generated *before* the change are not rewritten by it.
-//!
-//! Upstream also re-points the shaper when a dual carriage changes the
+//! Upstream re-points the shaper when a dual carriage changes the
 //! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
 //! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
 //! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
@@ -59,6 +52,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::shaper_defs;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::extras::z_tilt::block_in_command;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
@@ -347,12 +341,14 @@ impl InputShaper {
             }
             return;
         }
-        self.update_input_shaping();
+        self.update_input_shaping().unwrap_or_else(|err| {
+            printer.set_error_state(&err.to_string());
+        });
     }
 
-    /// Upstream's `_update_input_shaping` (`input_shaper.py:169-190`): put the
-    /// shapers' impulses into the toolhead's steppers, then rescan their step
-    /// generation windows.
+    /// Upstream's `_update_input_shaping` (`input_shaper.py:169-190`): flush the
+    /// steps planned without the new impulses, put them into the toolhead's
+    /// steppers, then rescan their step generation windows.
     ///
     /// Upstream swaps each stepper's kinematics for a shaper one; here the same
     /// snapshot of impulses is handed to every stepper's solver, which decorates
@@ -360,21 +356,36 @@ impl InputShaper {
     /// shapes no axis has no impulses to apply: the steppers are given no shaper
     /// at all (which also takes one off again after `SET_INPUT_SHAPER` set every
     /// frequency to 0), so their position functions are the plain ones.
-    fn update_input_shaping(&self) {
+    ///
+    /// # Errors
+    /// A failure from the flush (step generation or the transport).
+    fn update_input_shaping(&self) -> Result<(), CommandError> {
         let shapers = self.lock();
-        self.apply_shapers(&shapers);
+        self.apply_shapers(&shapers)
     }
 
     /// [`InputShaper::update_input_shaping`] for a caller that already holds the
     /// shapers' lock (`cmd_set_input_shaper` does; the lock is not reentrant).
-    fn apply_shapers(&self, shapers: &[AxisInputShaper]) {
+    ///
+    /// The flush comes first, as upstream's does: the impulses change how every
+    /// segment still to be generated is stepped, so the segments planned
+    /// without them have to be generated first (`input_shaper.py:170`). Before
+    /// connect there is no planner and nothing to flush.
+    ///
+    /// # Errors
+    /// A failure from the flush (step generation or the transport).
+    fn apply_shapers(&self, shapers: &[AxisInputShaper]) -> Result<(), CommandError> {
         let Some(printer) = self.printer.upgrade() else {
-            return;
+            return Ok(());
         };
         let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>("toolhead") else {
-            return;
+            return Ok(());
         };
+        if toolhead.is_connected() {
+            block_in_command(toolhead.flush_step_generation())?;
+        }
         toolhead.set_input_shaper(self.shaping(shapers));
+        Ok(())
     }
 
     /// The snapshot the steppers are handed: one impulse list per axis, `None`
@@ -397,7 +408,7 @@ impl InputShaper {
             for shaper in shapers.iter_mut() {
                 shaper.update(gcmd)?;
             }
-            self.apply_shapers(&shapers);
+            self.apply_shapers(&shapers)?;
         }
         for (index, shaper) in shapers.iter().enumerate() {
             if index < 2 || shaper.is_enabled() {
@@ -578,6 +589,72 @@ mod tests {
             .0
             .expect("the line applies");
         assert!(object.shaping(&object.lock()).is_none());
+    }
+
+    /// Installing new impulses flushes step generation first: the segments
+    /// planned without them have to be generated with the solver they were
+    /// planned for (`input_shaper.py:170`, `_update_input_shaping` opens with
+    /// `self.toolhead.flush_step_generation()`), and a `SET_INPUT_SHAPER` that
+    /// changes nothing flushes nothing.
+    ///
+    /// The spy is a flush callback ([`ToolHeadObject::register_flush_callback`]),
+    /// which fires on every step generation — including one that produces no
+    /// steps — so with `kinematics: none` the count is exactly the number of
+    /// flushes the command ran.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn set_input_shaper_flushes_step_generation_first() {
+        let printer = printer(&[]);
+        let toolhead = {
+            let mut section = ConfigSection::new("printer", None);
+            for (key, value) in [
+                ("kinematics", "none"),
+                ("max_velocity", "300"),
+                ("max_accel", "3000"),
+            ] {
+                section
+                    .parameters
+                    .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+            }
+            let object = ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
+                .expect("kinematics: none builds");
+            printer.add_object("toolhead", Arc::new(object)).unwrap();
+            let toolhead = printer
+                .lookup_object_as::<ToolHeadObject>("toolhead")
+                .expect("the toolhead is registered");
+            toolhead.connect().await.expect("the toolhead connects");
+            toolhead
+        };
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher");
+        let count = || flushes.load(std::sync::atomic::Ordering::SeqCst);
+
+        // A line with no parameter applies nothing, so it flushes nothing.
+        gcode
+            .run_script("SET_INPUT_SHAPER")
+            .await
+            .expect("the line applies");
+        assert_eq!(count(), 0, "a report-only SET_INPUT_SHAPER flushes nothing");
+
+        gcode
+            .run_script("SET_INPUT_SHAPER SHAPER_TYPE_X=mzv SHAPER_FREQ_X=50")
+            .await
+            .expect("the line applies");
+        assert_eq!(count(), 1, "installing a shaper flushes the plan once");
+
+        // Taking the impulses back out is the same change in reverse.
+        gcode
+            .run_script("SET_INPUT_SHAPER SHAPER_FREQ_X=0")
+            .await
+            .expect("the line applies");
+        assert_eq!(count(), 2, "removing the shaper flushes too");
     }
 
     /// Run `script` and return the error, if any, together with the lines the

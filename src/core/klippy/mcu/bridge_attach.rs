@@ -869,6 +869,32 @@ mod tests {
         assert!(text.contains("0..=3"), "{text}");
     }
 
+    /// The host's copy of the firmware's port count is the firmware's.
+    ///
+    /// `BRIDGE_MAX_PORTS` is not a dictionary constant, so the host mirrors it
+    /// (`mcu/object.rs`); a submodule that changes the firmware's number has to
+    /// fail here rather than leave the host validating against a count the
+    /// bridge no longer has.
+    #[test]
+    fn the_host_port_limit_is_the_firmwares() {
+        use crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS;
+
+        let source =
+            std::fs::read_to_string(klipperx_test_support::klipper_dir().join("src/bridge.c"))
+                .expect("the klipper submodule's bridge.c is readable");
+        let declared: u8 = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("#define BRIDGE_MAX_PORTS "))
+            .expect("bridge.c defines BRIDGE_MAX_PORTS")
+            .trim()
+            .parse()
+            .expect("BRIDGE_MAX_PORTS is a number");
+        assert_eq!(
+            BRIDGE_MAX_PORTS, declared,
+            "the host's port limit is the firmware's (third_party/klipper/src/bridge.c:65)"
+        );
+    }
+
     /// A `can:` device resolves like a named uart one: the CAN port section the
     /// host created at configuration time **is** the route, so the old "a CAN
     /// downstream port does not exist yet" refusal is gone.

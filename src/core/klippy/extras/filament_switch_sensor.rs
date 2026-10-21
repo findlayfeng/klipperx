@@ -220,6 +220,18 @@ impl RunoutHelper {
         *self.lock(&self.sensor_enabled)
     }
 
+    /// Turn the sensor on or off, as `SET_FILAMENT_SENSOR ENABLE=` does.
+    ///
+    /// The write entry for `sensor_enabled`: the switch sensor's own command is
+    /// not its only consumer — `[hall_filament_width_sensor]` sets the same flag
+    /// from its `enable` option and from `ENABLE`/`DISABLE_FILAMENT_WIDTH_SENSOR`
+    /// (`hall_filament_width_sensor.py:78,145,216,229`), and its status reports
+    /// this flag as `enabled`. Writing it changes nothing else: the runout
+    /// action reads it on the next state change.
+    pub fn set_sensor_enabled(&self, enabled: bool) {
+        *self.lock(&self.sensor_enabled) = enabled;
+    }
+
     /// The machine's monotonic clock, or `0.0` before the printer is reachable.
     fn now(&self) -> f64 {
         self.printer
@@ -442,6 +454,30 @@ mod tests {
         gcode
             .run_script_sync("QUERY_FILAMENT_SENSOR SENSOR=runout_switch")
             .expect("the command runs");
+    }
+
+    /// `sensor_enabled` is one flag with two writers: the `SET_FILAMENT_SENSOR`
+    /// command and [`RunoutHelper::set_sensor_enabled`] (the width sensor sets it
+    /// from `enable` and from `ENABLE`/`DISABLE_FILAMENT_WIDTH_SENSOR`). Both
+    /// land in the same field, and the status follows it.
+    #[test]
+    fn test_setting_sensor_enabled_moves_the_status() {
+        let printer = load_ok(&config("switch_pin: PD4\n"));
+        let helper = the_sensor(&printer).runout_helper().clone();
+
+        helper.set_sensor_enabled(false);
+        assert!(!helper.sensor_enabled());
+        assert_eq!(
+            PrinterObject::get_status(&*the_sensor(&printer), 0.0)["enabled"],
+            false
+        );
+
+        helper.set_sensor_enabled(true);
+        assert!(helper.sensor_enabled());
+        assert_eq!(
+            PrinterObject::get_status(&*the_sensor(&printer), 0.0)["enabled"],
+            true
+        );
     }
 
     /// A state change inside the ready window is ignored; after it, a change

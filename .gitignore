@@ -24,6 +24,8 @@
 
 # Local scratch: logs and run artifacts (never committed).
 /.staging/
+# Per-task git worktrees (AGENTS 的「一个任务一条分支」)：每条并发 lane 一个，不入库。
+/.worktrees/
 # `scripts/host-stability.sh` defaults to `$PWD/host-stability-<timestamp>/`.
 /host-stability-*/
 # `cargo build --timings` reports people copy into the tree.

@@ -604,7 +604,8 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       1. ~~改**值**（`ADVANCE=`）仍用 `get_last_move_time()` 落表~~ **已修（2026-10-21）**：改值只写上报值，
          落表排队到 `register_lookahead_callback`（队列非空 ⇒ 在该 move 末尾的 print_time 生效；队列空 ⇒ 立即）；
          `smooth_time` 变更仍走上游的 flush + 从头重算（2026-10-21）；
-      2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）。
+      2. ~~`[extruder_stepper <name>]` 自己的 `pressure_advance` 未接求解器~~ **已修（2026-10-21）**：参数自有（上游 `kinematics/extruder.py:12-16` 不继承 `[extruder]`），装载时 `0` 时刻落表，
+         `SET_PRESSURE_ADVANCE` 与主挤出机共用 `apply_pressure_advance`，`pa = 0` 逐点名义位置不变。
 - [x] **`input_shaper` 已作用到运动（2026-10-21）**：`motion/shaper.rs` 移植 `kin_shaper.c` 的整形位置函数
       （脉冲归一化 + 重心归零、按 `SegmentWindow` 定位、`DUMMY_T` 合成段喂内层 solver），
       `extras/toolhead.rs` 把脉冲装到主 trapq 的每个 stepper，窗口取活跃轴脉冲极值、扫描窗随之变宽。

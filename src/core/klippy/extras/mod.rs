@@ -88,6 +88,7 @@ pub mod screws_tilt_adjust;
 pub mod sdcard_loop;
 pub mod servo;
 pub mod shaper_defs;
+pub mod skew_correction;
 pub mod smart_effector;
 pub mod spi_device;
 pub mod spi_temperature;

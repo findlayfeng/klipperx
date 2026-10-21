@@ -57,6 +57,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ),
     ("BLTOUCH_DEBUG", &["COMMAND"]),
     ("BLTOUCH_STORE", &["MODE"]),
+    ("CALC_MEASURED_SKEW", &["AC", "BD", "AD"]),
     ("CANCEL_PRINT", &[]),
     ("CLEAR_PAUSE", &[]),
     (
@@ -110,6 +111,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("G90", &[]),
     ("G91", &[]),
     ("G92", &["X", "Y", "Z", "E"]),
+    ("GET_CURRENT_SKEW", &[]),
     ("GET_POSITION", &[]),
     ("GET_RETRACTION", &[]),
     ("IIC_READ", &["DEVICE", "WRITE", "READ_LEN"]),
@@ -316,6 +318,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         ],
     ),
     ("SET_SERVO", &["SERVO", "WIDTH", "ANGLE"]),
+    ("SET_SKEW", &["XY", "XZ", "YZ", "CLEAR"]),
     (
         "SET_SMART_EFFECTOR",
         &["SENSITIVITY", "ACCEL", "RECOVERY_TIME"],
@@ -344,6 +347,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         "SHAPER_CALIBRATE",
         &["AXIS", "CHIPS", "MAX_SMOOTHING", "NAME"],
     ),
+    ("SKEW_PROFILE", &["LOAD", "SAVE", "REMOVE"]),
     ("SPI_SEND", &["DEVICE", "DATA"]),
     ("SPI_TRANSFER", &["DEVICE", "DATA"]),
     ("SYNC_EXTRUDER_MOTION", &["EXTRUDER", "MOTION_QUEUE"]),

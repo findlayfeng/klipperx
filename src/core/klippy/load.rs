@@ -508,6 +508,7 @@ mod tests {
                 "save_variables",
                 "screws_tilt_adjust",
                 "sdcard_loop",
+                "skew_correction",
                 "smart_effector",
                 "temperature_fan",
                 "temperature_host",

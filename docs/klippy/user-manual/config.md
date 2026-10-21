@@ -1157,7 +1157,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `display_group` | `_default_16x4` | 组来自随模块发布的 `display.cfg`（20 列时默认 `_default_20x4`）；未知组报 `Unknown display_data group '%s'` |
 | 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` —— 2026-10-21 起**菜单引擎已消费**（`display/menu.rs`） |
 
-现状（2026-10-21 重核）：**渲染通路已落地**——`screen_update_event` 先问菜单、再按 `display_data` 组的 layout 渲染每项模板（`render(name,**kw)` 与 `draw_progress_bar(row,col,width,value)` 作为宿主可调用注入）→ `draw_text`（`~glyph~` 走 `write_glyph`）→ `flush()`，失败项只记日志并保留已画帧；**菜单引擎也已落地**（`menu` 对象、四个 `menu:*` 事件、嵌入 `menu.cfg` 在内置默认之上被 `printer.cfg` 同名覆盖，只在主 `[display]` 挂载；按键选项已消费）。**余项**：六个驱动里只有 `hd44780` 会画（其余缺各自字库表，layout 会渲染但面板空白）；菜单行已算出但还没写进面板；`[display_data]`/`[display_glyph]` 仍无主配置 factory（出货 `display.cfg` 是唯一 layout 来源）。随模块发布的 `display.cfg`/`menu.cfg` 为 **vendored 副本**（各带漂移守卫测试）。
+现状（2026-10-21 重核）：**渲染通路已落地**——`screen_update_event` 先问菜单、再按 `display_data` 组的 layout 渲染每项模板（`render(name,**kw)` 与 `draw_progress_bar(row,col,width,value)` 作为宿主可调用注入）→ `draw_text`（`~glyph~` 走 `write_glyph`）→ `flush()`，失败项只记日志并保留已画帧；**菜单引擎也已落地**（`menu` 对象、四个 `menu:*` 事件、嵌入 `menu.cfg` 在内置默认之上被 `printer.cfg` 同名覆盖，只在主 `[display]` 挂载；按键选项已消费）。**余项**：六个驱动里只有 `hd44780` 会画（其余缺各自字库表，layout 会渲染但面板空白）；菜单行**已画进面板**（打开菜单时逐行写入，选中/编辑/容器/滚动标记照上游）；`[display_data]`/`[display_glyph]` 仍无主配置 factory（出货 `display.cfg` 是唯一 layout 来源）。随模块发布的 `display.cfg`/`menu.cfg` 为 **vendored 副本**（各带漂移守卫测试）。
 
 ### `[fan_generic <name>]` — 通用风扇（批 #18）
 

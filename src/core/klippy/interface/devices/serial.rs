@@ -2683,6 +2683,13 @@ impl Drop for SharedSerialPort {
 }
 
 /// Read the port and dispatch whole units until stopped.
+///
+/// Every way out of this loop leaves the port **stopped**, a panic inside
+/// [`dispatch`] included: the port is what holds `stopped` for every handle on
+/// it, and a reader that dies without setting it leaves sessions believing their
+/// link is live while nothing reads the tty for them any more. A panic is caught
+/// around the dispatch, logged, and stops the port like a failed read does — the
+/// descriptor is unusable through the same poisoned state that raised it.
 fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
     let mut buf = [0u8; READ_CHUNK];
     // Partial unit carried across reads, and whether the stream is
@@ -2697,13 +2704,28 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
                 pending.extend_from_slice(&buf[..read]);
                 let Some(port) = weak.upgrade() else { return };
                 port.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
-                dispatch(&port, &mut pending, &mut needs_sync);
+                // `dispatch` takes the port's locks, so a panic in there (a
+                // poisoned mutex, a broken invariant) would kill this thread and
+                // leave every handle on a port nothing reads.
+                let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(&port, &mut pending, &mut needs_sync);
+                }));
+                if dispatched.is_err() {
+                    warn!(
+                        "shared serial reader for {} panicked; stopping the port",
+                        port.path.display()
+                    );
+                    port.stop();
+                }
                 // Drop the strong reference before blocking in `read` again, or
                 // the last handle could never bring the port down. This drop
                 // can be the one that destroys the port — see `Drop for
                 // SharedSerialPort` for why running that on this thread is
                 // safe.
                 drop(port);
+                if dispatched.is_err() {
+                    return;
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -4793,6 +4815,73 @@ mod mux_tests {
                 .all(|(thread, _)| !readers.iter().any(|reader| reader == thread)),
             "a reader thread ended in a panic — the port was dropped by the reader and joined \
              itself: {panics:?}"
+        );
+    }
+
+    /// A panic inside [`dispatch`] stops the port, instead of killing the reader
+    /// while every handle still believes the link is live.
+    ///
+    /// The panic is produced the way the reader's own `unwrap`s are: the slot map
+    /// is left **poisoned**, and a whole unit for the attached id makes `dispatch`
+    /// lock it. Without the catch the thread died silently and `stopped` stayed
+    /// false, so sessions on the port waited on a link nothing was reading.
+    #[test]
+    fn a_panic_in_dispatch_stops_the_port_instead_of_killing_the_reader() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+        let port = Arc::clone(&handle.port);
+
+        let stopped = record_panics_during(|| {
+            let fixture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = port.slots.lock().unwrap();
+                panic!("poison the slot map");
+            }));
+            assert!(fixture.is_err(), "the fixture must poison the map");
+            assert!(port.slots.is_poisoned(), "the slot map must be poisoned");
+
+            master_write(&pty.master, &device_unit(4, &Frame::encode(1, b"boom")));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !port.stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            port.stopped.load(Ordering::SeqCst)
+        })
+        .0;
+        assert!(
+            stopped,
+            "a panicking dispatch must stop the port, not leave it live"
+        );
+
+        // And the reader is gone rather than parked: the port has no reader left
+        // to serve its handles.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let finished = port
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            port.reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "the reader must end after the panic, not stay parked on the tty"
+        );
+
+        // A stopped port is retired from the registry: the next attach on the
+        // path opens the tty again instead of handing the dead one back.
+        let fresh = attach_with_reply(&pty, 4);
+        assert!(
+            !Arc::ptr_eq(&fresh.port, &port),
+            "a port whose reader panicked must not be handed out again"
         );
     }
 

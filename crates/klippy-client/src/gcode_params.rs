@@ -355,6 +355,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         &["AXIS", "CHIPS", "POINT", "OUTPUT", "NAME"],
     ),
     ("UPDATE_DELAYED_GCODE", &["ID", "DURATION"]),
+    ("ZERO_REFERENCE", &["X", "Y"]),
     ("Z_ENDSTOP_CALIBRATE", &["SPEED"]),
     ("Z_OFFSET_APPLY_PROBE", &["METHOD"]),
     (

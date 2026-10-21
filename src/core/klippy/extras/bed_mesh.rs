@@ -39,11 +39,11 @@
 //!   mesh), `BED_MESH_MAP` (the grid as one `mesh_map_output` JSON line) and
 //!   `BED_MESH_OFFSET` (`X=`/`Y=` move the mesh lookup, `ZFADE=` the Z the fade
 //!   measures from).
+//! - `ZERO_REFERENCE` (`X=`/`Y=`): shift both stored grids so the mesh reads
+//!   zero at that point (`ZMesh.set_zero_reference`, `bed_mesh.py:1405-1413`).
 //!
 //! **Not implemented yet** (tracked in `TODO.md` H9, next units):
 //!
-//! - the zero reference (`ZERO_REFERENCE`): nothing calls
-//!   `set_zero_reference`;
 //! - faulty-region substitution (`_process_faulty_regions`): the regions are
 //!   parsed and probed like any other point.
 //!
@@ -844,6 +844,17 @@ impl ZMesh {
             .collect()
     }
 
+    /// Subtract `offset` from every sampled value — the interpolation-grid
+    /// half of upstream's `ZMesh.set_zero_reference` (`bed_mesh.py:1410-1413`),
+    /// whose loop walks both matrices.
+    fn shift_z(&mut self, offset: f64) {
+        for row in &mut self.mesh_matrix {
+            for value in row.iter_mut() {
+                *value -= offset;
+            }
+        }
+    }
+
     /// The mesh's smallest and largest sampled Z — upstream's `get_z_range`
     /// over the interpolation grid (`bed_mesh.py:1438-1444`), which `set_mesh`
     /// checks `fade_target` and the fade distance against.
@@ -1187,6 +1198,24 @@ pub struct LoadedMesh {
 }
 
 impl LoadedMesh {
+    /// Upstream's `ZMesh.set_zero_reference` (`bed_mesh.py:1405-1413`): shift
+    /// both grids — the probed matrix and the interpolation grid sampled from
+    /// it — so the mesh reads zero at `(x, y)` and every other point keeps its
+    /// height relative to that one.
+    fn set_zero_reference(&mut self, x: f64, y: f64) {
+        let offset = self.z_mesh.calc_z(x, y);
+        info!(
+            "bed_mesh: setting zero reference at ({:.2}, {:.2}, {:.6})",
+            x, y, offset
+        );
+        for row in &mut self.rows {
+            for value in row.iter_mut() {
+                *value -= offset;
+            }
+        }
+        self.z_mesh.shift_z(offset);
+    }
+
     /// The probed grid rounded to 6 decimals — upstream's `get_probed_matrix`
     /// (`bed_mesh.py:1365-1369`), which `BED_MESH_MAP` serializes.
     fn get_probed_matrix(&self) -> Vec<Vec<f64>> {
@@ -1724,6 +1753,23 @@ impl MeshState {
         Ok(())
     }
 
+    /// `ZERO_REFERENCE`: shift the loaded grid so it reads zero at
+    /// `(x, y)` — upstream's `cmd_ZERO_REFERENCE` → `ZMesh.set_zero_reference`
+    /// (`bed_mesh.py:1405-1413`).
+    ///
+    /// The splitter carries its own copy of the mesh, so it is re-initialized
+    /// after the shift, as [`MeshState::set_mesh_offsets`] does for a moved
+    /// lookup.
+    fn set_zero_reference(&mut self, x: f64, y: f64) -> bool {
+        let Some(mesh) = self.mesh.as_mut() else {
+            return false;
+        };
+        mesh.set_zero_reference(x, y);
+        let z_mesh = mesh.z_mesh.clone();
+        self.splitter.initialize(Some(z_mesh), self.fade_target);
+        true
+    }
+
     /// `BED_MESH_OFFSET`: move the mesh lookup by `offsets` and, when
     /// `tool_offset` is given, change the Z the fade measures from —
     /// `cmd_BED_MESH_OFFSET` (`bed_mesh.py:278-289`).
@@ -1986,6 +2032,13 @@ impl BedMesh {
         )
         .map_err(ConfigError::new)?;
         register(
+            "ZERO_REFERENCE",
+            cmd_zero_reference,
+            "Set the zero reference for the mesh",
+            &["X", "Y"],
+        )
+        .map_err(ConfigError::new)?;
+        register(
             "BED_MESH_PROFILE",
             cmd_bed_mesh_profile,
             "Bed Mesh Persistent Storage management",
@@ -2243,6 +2296,26 @@ fn cmd_bed_mesh_offset(
     // The g-code position was anchored to the old lookup (`bed_mesh.py:288-289`).
     if let Some(gcode_move) = printer.lookup_object_as::<GCodeMove>(GCODE_MOVE_OBJECT) {
         gcode_move.reset_last_position();
+    }
+    Ok(())
+}
+
+/// `ZERO_REFERENCE` (`cmd_ZERO_REFERENCE`, `bed_mesh.py:1405-1413`): shift the
+/// loaded grid so the mesh reads zero at `X=`, `Y=`.
+///
+/// With no mesh there is nothing to shift; the command says so, like its
+/// siblings `BED_MESH_OUTPUT` / `BED_MESH_MAP` (`Bed has not been probed`).
+fn cmd_zero_reference(
+    _printer: &Arc<Printer>,
+    state: &Arc<Mutex<MeshState>>,
+    gcmd: &GcodeCommand,
+) -> Result<(), CommandError> {
+    let xpos = gcmd.get_float("X")?;
+    let ypos = gcmd.get_float("Y")?;
+    let mut state = lock(state);
+    if !state.set_zero_reference(xpos, ypos) {
+        drop(state);
+        gcmd.respond_info("Bed has not been probed");
     }
     Ok(())
 }
@@ -4205,6 +4278,64 @@ mod tests {
         // Loading a mesh resets the offset (`set_mesh`, `bed_mesh.py:164`).
         gcode.run_script_sync("BED_MESH_CLEAR").unwrap();
         assert_eq!(bed.lock_state().tool_offset, 0.0);
+    }
+
+    /// `ZERO_REFERENCE X=`/`Y=` shifts **both** grids — the probed one and the
+    /// interpolation grid sampled from it — so the mesh reads zero where it is
+    /// aimed while every other point keeps its height relative to it
+    /// (`bed_mesh.py:1405-1413`); the move transform follows the shift.
+    #[test]
+    fn zero_reference_shifts_both_matrices_and_the_move_transform() {
+        let (_printer, gcode, _configfile, bed) =
+            command_machine("[bed_mesh]\nmesh_min: 0,0\nmesh_max: 100,100\nprobe_count: 3,3\n");
+        let log = capture(&gcode);
+        let fake = Arc::new(FakeTarget::new(Coord::default()));
+        *bed.target.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::clone(&fake) as Arc<dyn MoveTarget>);
+
+        // Nothing loaded: there is no grid to shift.
+        gcode.run_script_sync("ZERO_REFERENCE X=50 Y=50").unwrap();
+        assert_eq!(lines(&log), vec!["// Bed has not been probed"]);
+
+        // `z = x / 100` over the mesh, so the centre reads 0.5.
+        bed.store_mesh_for_test("default", ramp_rows());
+        let (before_rows, before_mesh) = {
+            let loaded = bed.loaded_mesh().expect("the mesh is stored");
+            (loaded.rows.clone(), loaded.z_mesh.get_mesh_matrix())
+        };
+        assert!((bed.lock_state().calc_z(50.0, 50.0) - 0.5).abs() < 1e-12);
+        // The default `mesh_pps: 2` makes the interpolation grid 7×7, so the
+        // two matrices are not the same grid.
+        assert_eq!(before_mesh.len(), 7);
+
+        gcode.run_script_sync("ZERO_REFERENCE X=50 Y=50").unwrap();
+
+        let loaded = bed.loaded_mesh().expect("the mesh stays loaded");
+        let offset = 0.5;
+        // Every probed value moved by the reference's own Z …
+        for (row, before) in loaded.rows.iter().zip(&before_rows) {
+            for (value, previous) in row.iter().zip(before) {
+                assert!((value - (previous - offset)).abs() < 1e-12);
+            }
+        }
+        // … and so did every sampled value of the interpolation grid.
+        let shifted = loaded.z_mesh.get_mesh_matrix();
+        assert_eq!(shifted.len(), 7);
+        for (row, before) in shifted.iter().zip(&before_mesh) {
+            for (value, previous) in row.iter().zip(before) {
+                assert!((value - (previous - offset)).abs() < 1e-12);
+            }
+        }
+        // The reference point reads zero; the rest keep their relative heights.
+        assert!(loaded.z_mesh.calc_z(50., 50.).abs() < 1e-12);
+        assert!((loaded.z_mesh.calc_z(0., 0.) + 0.5).abs() < 1e-12);
+        assert!((loaded.z_mesh.calc_z(100., 100.) - 0.5).abs() < 1e-12);
+
+        // The transform's copy of the mesh was shifted too: a Z=0 move to the
+        // reference needs no correction any more (it read 0.5 there before).
+        gcode.run_script_sync("G1 X50 Z0 F600").unwrap();
+        let last = fake.moves().last().cloned().unwrap();
+        assert!(last.0.z().abs() < 1e-9, "got {last:?}");
     }
 
     /// A `[bed_mesh <name>]` section the config carries is read at load and

@@ -217,9 +217,11 @@ fn cmd_sdcard_loop_desist(
     Ok(())
 }
 
+/// A command handler: the object plus the command it was given.
+type CommandFn = fn(&Arc<SDCardLoop>, &GcodeCommand) -> Result<(), CommandError>;
+
 /// The three registrations (`sdcard_loop.py:14-22`), with the parameter
 /// tables upstream's `get_int`/`get` calls declare.
-type CommandFn = fn(&Arc<SDCardLoop>, &GcodeCommand) -> Result<(), CommandError>;
 const COMMANDS: &[(&str, CommandFn, &str, &[&str])] = &[
     (
         "SDCARD_LOOP_BEGIN",

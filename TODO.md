@@ -85,7 +85,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*）——**✅ 收官**（传感器族、`M105` gcode-id 表、`TEMPERATURE_WAIT`、`M109`/`M190` 等待、eddy 校准工具均已落地，见 H1 节） | — |
 | H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`replicape` 与 `pwm_tool` 的 `maximum_mcu_duration` 中间更新（见 H2 节） | F3、F4、F6、F7 |
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——三者主体**均已落地**（含单测）；`rename_existing` 连接期换名已落地（2026-10-06，`5ba2356`），余项＝`printer.objects` 的可枚举反射（Q5），见 H3 节 | G1b、Q5 |
-| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
+| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——**均已落地**（`sdcard_loop` 的三条命令与 `SdCardFile` 接缝 2026-10-21），见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前的 pre/post 活跃窗口等四条余项（PA 本身已驱动运动，2026-10-21），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
@@ -99,7 +99,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| S1 | 压力测试工具（`klipperx stress`）：**已收官（2026-10-06，`5ada3ce`）**——真资源/别名/假板 e2e 均已落地；余项仅 `--task motion` 假板 e2e（假件位置恒答 0。无法做）与真板双机并发验证 | — |
+| S1 | 压力测试工具（`klipperx stress`）：**已收官**——真资源/别名/假板 e2e（含 `--task motion`，2026-10-21）均已落地；余项仅真板双机并发验证 | — |
 | S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
 | S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
 | S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**）；R8 回放 | S3、Q11 |
@@ -169,8 +169,10 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
       `resolve_pin`）解析；取反是**前导** `!`（`!PA0` / `!mcu:alias`；`mcu:!PA0` 是非法描述）。
 - [x] **端到端测试（同上）**：假板（`test: dict=` 的 `SimulatorDevice`）上的 step ramp、comm ramp、
       `ResetRequired` 重连各有用例；另加一条解码线上 `config_stepper` 的用例（验 `invert_step`/
-      `step_pulse_ticks` 真从节里来）。**余项**：`--task motion` 的假板 e2e 做不了（假件
-      `stepper_get_position` 恒答 0，位置断言无法通过）；真板双机并发项仍需上真板。
+      `step_pulse_ticks` 真从节里来）。**假板 `--task motion` e2e 已落地（2026-10-21）**：假件按 oid 累积有符号步进位置
+      （`set_next_step_dir` 换向、`queue_step` 累加、`reset_step_clock` 不清零，对齐 `stepper.c` 的
+      `stepper_get_position` 语义），`a_motion_smoke_runs_end_to_end_against_a_fake_board` 断言读回步数 ==
+      距离/`step_dist`（回退成恒答 0 即红）。**剩余真板项**：双机并发压测。
 
 ### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
 
@@ -508,10 +510,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] `print_stats.py`（**2026-10-02**；省略 `_handle_activate_extruder`，事件未 fire）、`display_status.py`（`M73`/`M117`）。
 - [x] `pause_resume.py` 的节、四条命令与 `pause_resume/*` 三个端点（批 #15 + 2026-10-03）；命令表改握 `Weak`（2026-10-18）：它与 `[virtual_sdcard]` 同场时曾成环 `dispatcher → 命令表 → pause_resume → sd 卡 → dispatcher`，跨 `teardown` 钉住整张表（连带各 `Mcu`）——单测 `teardown_releases_the_sd_card_and_pause_resume` 钉死。
 - [x] `exclude_object.py`（段+四命令落地，**2026-09-24 批 #4 随引擎转绿**，含排除区 E 补偿）、`firmware_retraction.py`（G10/G11，**批 #32 已落地**）。
-- [ ] `sdcard_loop.py`：**栈语义已落地**（`extras/sdcard_loop.rs` 的 `loop_begin`/`loop_end`/`loop_desist` 与单测），
-      **命令未注册**（`load_config` 只建对象）、与 `virtual_sdcard` 回放循环的
-      「当前命令来自 SD 文件 / 读写文件游标」接缝（`SdCardFile` trait 无实现体）也未接——语料里
-      `SDCARD_LOOP_DESIST` 目前以未知命令放行。
+- [x] `sdcard_loop.py` —— **已落地（2026-10-21）**：三条命令在 `sdcard_loop::load_config` 注册（`COUNT` 照上游为必填、`minval 0`；上下文错误文案逐字同上游）、
+      `virtual_sdcard` 实现 `SdCardFile`（`file_position`= `next_file_position`，`loop_end` 经 `set_file_position` 回卷），
+      回放环在派发 `BEGIN` 行前把游标推到循环体首行。三条回放级测试钉住 `COUNT=2` 执行两遍、空栈、上下文规则。
 - 依赖 F9（固件 `sdiocmds.c` 的 sdcard 资源）、C1（`gcode_move` 的位置恢复）。
 
 ### H5 TMC 步进驱动

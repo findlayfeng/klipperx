@@ -671,7 +671,8 @@ mod tests {
                 "gcode_move",
                 "gcode_arcs",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
         let object = printer

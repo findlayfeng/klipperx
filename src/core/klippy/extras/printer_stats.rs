@@ -377,23 +377,32 @@ mod tests {
     }
 
     /// The timer never outlives the object it reports for: the callback holds a
-    /// `Weak`, so dropping the parts' handle drops the object, and the next tick
-    /// retires the timer instead of leaking it.
+    /// `Weak`, so dropping the parts' handle drops the object, and the timer it
+    /// armed goes with it instead of leaking into the reactor's heap.
     #[test]
     fn the_timer_does_not_keep_the_object_alive() {
         let (printer, reactor) = machine();
         let stats = unregistered(&printer);
 
-        // The armed timer fires, from the object's own handle.
+        // Armed at ready: it runs immediately (upstream arms with `NOW`) and
+        // asks to be woken a second later.
+        assert_eq!(reactor.run_due(), 1, "the armed timer ran on arrival");
+
+        // The callback holds a `Weak`, so this test holds the only strong
+        // handle, and dropping it drops the object...
         let weak = Arc::downgrade(&stats);
         drop(stats);
         assert!(
             weak.upgrade().is_none(),
             "the timer must not hold a strong reference to the object"
         );
-        assert_eq!(reactor.advance(1.0), 1, "the armed timer ran once");
-        // It found nothing to upgrade and retired itself.
-        assert_eq!(reactor.advance(5.0), 0, "the timer retired with the object");
+        // ...and the timer goes with it rather than firing for a part that is
+        // no longer there.
+        assert_eq!(
+            reactor.advance(5.0),
+            0,
+            "the timer is retired with the object"
+        );
     }
 
     /// A `debugoutput` run arms no timer at all — upstream's

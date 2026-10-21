@@ -185,6 +185,19 @@ CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build --release 2>&1 | g
    产物落在 `out/cross/<triple>/`（二进制 + sha256 + `file` 判定），不碰 `target/`。
    缺 rust target 或交叉 gcc 时脚本会跳过并打印该装的包。
 
+   **要 gnu（为了 `host_library:` 的 `dlopen`）就钉住 glibc 下限**：`*-gnu` 的产物要求
+   ≥ 链接时 sysroot 的 glibc，构建机比目标新就会 `GLIBC_x.y not found`。脚本给了 `--glibc X.Y`，
+   按可用工具自动选路：
+   ```bash
+   scripts/build-target.sh --target aarch64-unknown-linux-gnu --glibc 2.36
+   # 有 zig + cargo-zigbuild ⇒ cargo zigbuild --target aarch64-unknown-linux-gnu.2.36（精确、无容器）
+   # 只有 docker         ⇒ debian:bookworm 容器里编（2.36 = DietPi 12 那一版）
+   # 都没有              ⇒ 跳过并告诉你要装什么
+   ```
+   版本→镜像的映射：`2.28→buster`、`2.31→bullseye`、`2.36→bookworm`、`2.41→trixie`；不在表里就
+   自己指定匹配的 `--target` 工具链。容器路线不需要宿主机装交叉 gcc，也不需要宿主机有 rust
+   target（容器里现装）。
+
    **`gnu` 还是 `musl` 比架构更重要**：`*-gnu` 链的是**构建机**的 glibc，在新发行版上编出来的
    二进制到 Debian 12（glibc 2.36）会直接 `GLIBC_2.38 not found`。脚本会给每个 gnu 产物打印
    它要求的最低 `GLIBC_x.y`，拿去和卡上 `ldd --version` 对。`*-musl` 是静态的、哪都能跑，

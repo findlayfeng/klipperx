@@ -30,6 +30,7 @@ REPO=$(cd "$(dirname "$0")/.." && pwd)
 OUT=${OUT:-$REPO/out/cross}
 JOBS=${JOBS:-}
 PROFILE=release
+GLIBC=""
 DRY=0
 TARGETS=()
 
@@ -45,6 +46,7 @@ while [ $# -gt 0 ]; do
         --jobs) JOBS=$2; shift 2 ;;
         --out) OUT=$2; shift 2 ;;
         --profile) PROFILE=$2; shift 2 ;;
+        --glibc) GLIBC=$2; shift 2 ;;
         --dry-run) DRY=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -90,6 +92,76 @@ install_hint() {
     esac
 }
 
+# A glibc floor is a property of the sysroot used at link time, not of the
+# architecture. With `--glibc X.Y` the build runs somewhere whose libc is that
+# version: `cargo-zigbuild` (exact, no container) or a Debian container of the
+# matching release (docker). Without it, the floor is whatever this machine's
+# cross sysroot has, which is why every gnu product prints its own requirement.
+debian_for_glibc() {
+    case "$1" in
+        2.36) echo bookworm ;;
+        2.31) echo bullseye ;;
+        2.28) echo buster ;;
+        2.41) echo trixie ;;
+        *) echo "" ;;
+    esac
+}
+
+# Run the gnu build through a container of the Debian release that ships $GLIBC.
+# Called only from the target loop; $1=$TRIPLE, $2=linker, $3=codename.
+build_in_container() {
+    local triple=$1 linker=$2 codename=$3 rel=${0#./}
+    docker run --rm -v "$REPO:/w" -w /w "debian:$codename" bash -lc "
+      set -e
+      apt-get update -qq >/dev/null
+      apt-get install -y -qq gcc-aarch64-linux-gnu gcc-x86-64-linux-gnu curl ca-certificates >/dev/null 2>&1 || apt-get install -y -qq gcc-aarch64-linux-gnu curl ca-certificates >/dev/null
+      if ! command -v cargo >/dev/null 2>&1; then
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
+      fi
+      . \\$HOME/.cargo/env
+      rustup target add $triple >/dev/null
+      $rel --target $triple
+    "
+}
+
+# Copy the built binaries out of target/<triple> into out/cross/<triple>, with
+# the size, hash and linkage each one has. Shared by every build path.
+copy_products() {
+    local TRIPLE=$1 DEST=$OUT/$1 found=0 bin size sha kind need
+    mkdir -p "$DEST"
+    found=0
+    for bin in klipperx klippy klippy-client; do
+        src=$REPO/target/$TRIPLE/$PROFILE/$bin
+        [ -f "$src" ] || continue
+        cp "$src" "$DEST/$bin"
+        size=$(stat -c %s "$DEST/$bin")
+        sha=$(sha256sum "$DEST/$bin" | cut -d' ' -f1)
+        if ldd "$DEST/$bin" 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
+            kind="static ($(file -b "$DEST/$bin" | cut -d, -f2 | sed 's/^ *//'))"
+        else
+            kind="dynamic: $(ldd "$DEST/$bin" 2>/dev/null | awk '{print $1}' | paste -sd' ' - | cut -c1-60)"
+        fi
+        printf '   %-14s %8.1f MB  %s\n' "$bin" "$(awk -v s="$size" 'BEGIN{printf "%.1f", s/1048576}')" "$kind"
+        printf '   %-14s sha256 %s\n' "" "$sha"
+        SUMMARY="$SUMMARY$TRIPLE $bin $(awk -v s="$size" 'BEGIN{printf "%.1f", s/1048576}')MB $sha\n"
+        found=$((found + 1))
+        # A gnu binary carries a glibc floor; say which, so it is compared with
+        # the target's `ldd --version` before someone copies it over.
+        case "$TRIPLE" in
+            *-gnu)
+                need=$(readelf --version-info "$DEST/$bin" 2>/dev/null \
+                       | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+                [ -n "$need" ] && echo "   requires at least $need (check on the target: ldd --version)"
+                ;;
+            *-musl)
+                echo "   static musl: runs on any glibc; cannot dlopen, so host_library: is unavailable"
+                ;;
+        esac
+    done
+    [ "$found" -eq 0 ] && { echo "   FAILED: no binaries in target/$TRIPLE/$PROFILE"; FAILED=$((FAILED + 1)); }
+    [ "$found" -eq 0 ] && { echo "   FAILED: no binaries in target/$TRIPLE/$PROFILE"; FAILED=$((FAILED + 1)); }
+}
+
 FAILED=0
 SKIPPED=0
 SUMMARY=""
@@ -97,6 +169,39 @@ SUMMARY=""
 for TRIPLE in "${TARGETS[@]}"; do
     LINKER=$(linker_for "$TRIPLE")
     echo "== $TRIPLE"
+    if [ -n "$GLIBC" ] && [ "${TRIPLE%-gnu}" != "$TRIPLE" ]; then
+        if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
+            echo "   path: cargo-zigbuild, glibc floor $GLIBC"
+            if [ "$DRY" = "1" ]; then
+                echo "   would run: cargo zigbuild --profile $PROFILE --target $TRIPLE.$GLIBC"
+                continue
+            fi
+            if ! cargo zigbuild --profile "$PROFILE" --target "$TRIPLE.$GLIBC"; then
+                echo "   FAILED: cargo zigbuild"
+                FAILED=$((FAILED + 1)); continue
+            fi
+            copy_products
+            continue
+        fi
+        codename=$(debian_for_glibc "$GLIBC")
+        if [ -n "$codename" ] && command -v docker >/dev/null 2>&1; then
+            echo "   path: debian:$codename container (glibc $GLIBC), linker $LINKER"
+            if [ "$DRY" = "1" ]; then
+                echo "   would run: docker run --rm -v \$PWD:/w -w /w debian:$codename … $0 --target $TRIPLE"
+                continue
+            fi
+            if ! build_in_container "$TRIPLE" "$LINKER" "$codename"; then
+                echo "   FAILED: container build"
+                FAILED=$((FAILED + 1)); continue
+            fi
+            copy_products
+            continue
+        fi
+        echo "   skipped: cannot pin glibc $GLIBC here — install zig+cargo-zigbuild (exact),"
+        echo "            or docker (Debian container), or pass a matching --target toolchain"
+        SKIPPED=$((SKIPPED + 1)); continue
+    fi
+
     if [ -z "$LINKER" ]; then
         echo "   skipped: no linker mapping in this script for that triple"
         SKIPPED=$((SKIPPED + 1))
@@ -140,38 +245,7 @@ for TRIPLE in "${TARGETS[@]}"; do
         continue
     fi
 
-    DEST=$OUT/$TRIPLE
-    mkdir -p "$DEST"
-    found=0
-    for bin in klipperx klippy klippy-client; do
-        src=$REPO/target/$TRIPLE/$PROFILE/$bin
-        [ -f "$src" ] || continue
-        cp "$src" "$DEST/$bin"
-        size=$(stat -c %s "$DEST/$bin")
-        sha=$(sha256sum "$DEST/$bin" | cut -d' ' -f1)
-        if ldd "$DEST/$bin" 2>&1 | grep -q 'not a dynamic executable\|statically linked'; then
-            kind="static ($(file -b "$DEST/$bin" | cut -d, -f2 | sed 's/^ *//'))"
-        else
-            kind="dynamic: $(ldd "$DEST/$bin" 2>/dev/null | awk '{print $1}' | paste -sd' ' - | cut -c1-60)"
-        fi
-        printf '   %-14s %8.1f MB  %s\n' "$bin" "$(awk -v s="$size" 'BEGIN{printf "%.1f", s/1048576}')" "$kind"
-        printf '   %-14s sha256 %s\n' "" "$sha"
-        SUMMARY="$SUMMARY$TRIPLE $bin $(awk -v s="$size" 'BEGIN{printf "%.1f", s/1048576}')MB $sha\n"
-        found=$((found + 1))
-        # A gnu binary carries a glibc floor; say which, so it is compared with
-        # the target's `ldd --version` before someone copies it over.
-        case "$TRIPLE" in
-            *-gnu)
-                need=$(readelf --version-info "$DEST/$bin" 2>/dev/null \
-                       | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
-                [ -n "$need" ] && echo "   requires at least $need (check on the target: ldd --version)"
-                ;;
-            *-musl)
-                echo "   static musl: runs on any glibc; cannot dlopen, so host_library: is unavailable"
-                ;;
-        esac
-    done
-    [ "$found" -eq 0 ] && { echo "   FAILED: no binaries in target/$TRIPLE/$PROFILE"; FAILED=$((FAILED + 1)); }
+    copy_products "$TRIPLE"
 done
 
 echo

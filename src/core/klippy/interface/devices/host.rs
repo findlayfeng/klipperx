@@ -88,6 +88,7 @@ use crate::core::klippy::assign;
 use crate::core::klippy::frame::Frame;
 #[cfg(debug_assertions)]
 use crate::core::klippy::frame::FrameStream;
+use crate::core::klippy::interface::devices::serial::DiscoveryPort;
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
@@ -1520,6 +1521,13 @@ impl std::io::Write for HostDevice {
         // console buffer whole.
         Ok(())
     }
+}
+
+impl DiscoveryPort for HostDevice {
+    // The defaults: there is no descriptor to flush or poll, and a zero read is
+    // `HostDevice::read`'s own `OUTPUT_WAIT_MS` window elapsing rather than the
+    // end of the stream — the library's reader stays alive for as long as the
+    // library is loaded.
 }
 
 impl fmt::Debug for HostDevice {

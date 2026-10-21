@@ -267,6 +267,12 @@ impl Frame {
 /// * a read containing no SYNC at all is dropped entirely, and the stream stays
 ///   desynchronised until a SYNC shows up.
 ///
+/// A stream created with [`FrameStream::with_bound`] also drops what arrives once
+/// its buffer would pass that many bytes: a reader serving a consumer that
+/// stopped draining must not grow without bound, and must not block either —
+/// the reader of a serial port serves every MCU on the line. That is the
+/// "drop frames, never stall the link" policy of upstream's ring buffer.
+///
 /// # Examples
 ///
 /// ```
@@ -276,23 +282,58 @@ impl Frame {
 /// assert_eq!(stream.next_frame(), Some(Frame::new(1, b"hello".to_vec())));
 /// assert_eq!(stream.next_frame(), None); // nothing buffered, nothing claimed
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct FrameStream {
     buffer: Vec<u8>,
     /// Set when an error was seen and no SYNC followed it: until the next SYNC,
     /// every byte in the stream is garbage.
     needs_sync: bool,
+    /// The most bytes `buffer` may hold; arrivals past it are dropped.
+    bound: usize,
+}
+
+impl Default for FrameStream {
+    /// An unbounded stream — what [`FrameStream::new`] makes.
+    fn default() -> Self {
+        Self::with_bound(usize::MAX)
+    }
 }
 
 impl FrameStream {
-    /// An empty stream.
+    /// An empty, unbounded stream.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// An empty stream that drops arrivals once `bound` bytes would be held.
+    pub fn with_bound(bound: usize) -> Self {
+        Self {
+            buffer: Vec::new(),
+            needs_sync: false,
+            bound,
+        }
+    }
+
     /// Add bytes as they arrive.
-    pub fn push(&mut self, bytes: &[u8]) {
+    ///
+    /// `true` when they were **dropped**: the buffer was at its bound, so it was
+    /// emptied and the stream left resynchronising on the next SYNC. A consumer
+    /// that is not draining loses the frames it did not take — the alternative is
+    /// a reader that either grows without bound or blocks every other reader on
+    /// the line.
+    pub fn push(&mut self, bytes: &[u8]) -> bool {
+        if self.buffer.len() + bytes.len() > self.bound {
+            self.buffer.clear();
+            self.needs_sync = true;
+            return true;
+        }
         self.buffer.extend_from_slice(bytes);
+        false
+    }
+
+    /// Bytes buffered and not yet claimed as frames.
+    pub fn buffered_bytes(&self) -> usize {
+        self.buffer.len()
     }
 
     /// Take the next complete frame, if one has arrived.
@@ -477,6 +518,57 @@ mod tests {
             }
         }
         frames
+    }
+
+    /// A bounded stream drops what arrives once its buffer is full, and picks the
+    /// stream up again at the next SYNC.
+    ///
+    /// The point is the memory: a consumer that stopped draining must not turn
+    /// the line into an ever-growing buffer, and a reader serving other consumers
+    /// must not block instead.
+    #[test]
+    fn a_bounded_stream_drops_at_its_bound_and_resynchronises() {
+        let first = Frame::encode(1, b"one");
+        let second = Frame::encode(2, b"two");
+        // Room for one frame and no more.
+        let mut stream = FrameStream::with_bound(first.len());
+
+        assert!(!stream.push(&first), "the frame fits");
+        assert_eq!(stream.buffered_bytes(), first.len());
+        assert_eq!(stream.next_frame(), Some(Frame::new(1, b"one".to_vec())));
+        assert_eq!(stream.buffered_bytes(), 0);
+
+        // A second frame with the first still unclaimed is one too many: it is
+        // dropped and the stream is left looking for the next SYNC.
+        assert!(!stream.push(&first), "the frame fits again");
+        assert!(
+            stream.push(&second),
+            "a frame past the bound is dropped, not buffered"
+        );
+        assert_eq!(
+            stream.buffered_bytes(),
+            0,
+            "the buffer is emptied rather than left to grow"
+        );
+
+        // The dropped frame is gone and the stream picks up again after the next
+        // SYNC: the resync eats its way to the trailer of the first frame, so that
+        // frame is lost too, and the one behind it is read whole.
+        stream.push(&first);
+        assert_eq!(
+            stream.next_frame(),
+            None,
+            "the resync consumes bytes up to the next SYNC"
+        );
+        stream.push(&second);
+        assert_eq!(stream.next_frame(), Some(Frame::new(2, b"two".to_vec())));
+
+        // An unbounded stream is the default and keeps everything.
+        let mut unbounded = FrameStream::new();
+        for _ in 0..64 {
+            assert!(!unbounded.push(&first));
+        }
+        assert_eq!(unbounded.buffered_bytes(), 64 * first.len());
     }
 
     #[test]

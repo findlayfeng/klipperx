@@ -203,6 +203,7 @@ impl SerialDevice {
                     path.display()
                 ))
             })?;
+        lock_serial_port(&port, &path)?;
 
         set_raw_mode(&port, baud)?;
         clear_nonblocking(&port)?;
@@ -335,6 +336,53 @@ impl std::io::Read for SerialDevice {
     }
 }
 
+impl DiscoveryPort for SerialDevice {
+    /// Stale input goes before the scan's query: a leftover unit from the
+    /// previous conversation would otherwise be cut and read as an answer.
+    fn discard_stale_input(&mut self) -> std::io::Result<()> {
+        // SAFETY: the descriptor belongs to `self.port`, which is open here.
+        if unsafe { libc::tcflush(self.port.as_raw_fd(), libc::TCIFLUSH) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Wait in `poll` for what is left of the scan's window.
+    ///
+    /// `poll` is the only way to wait on a descriptor for a duration: a
+    /// non-blocking port has no `VTIME` window to spend and would spin on
+    /// `WouldBlock`, and a blocking one would sit in its 100 ms cycle until the
+    /// deadline. A hang-up counts as ready, so the read behind it sees the end of
+    /// the line.
+    fn wait_for_bytes(&mut self, window: Duration) -> std::io::Result<bool> {
+        // Rounded up: `poll` with a zero timeout would only survey the port, and
+        // the scan's loop would then spin until the deadline.
+        let millis = window.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let mut fds = libc::pollfd {
+            fd: self.port.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `fds` is one descriptor entry this call owns, and it names the
+        // descriptor `self.port` keeps open.
+        let ready = unsafe { libc::poll(&mut fds, 1, millis) };
+        if ready < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                return Ok(true); // let the read decide rather than ending the scan
+            }
+            return Err(e);
+        }
+        Ok(ready > 0)
+    }
+
+    /// A zero read on a tty is the far end closing the line: the wait for bytes
+    /// is [`DiscoveryPort::wait_for_bytes`]'s job now, not a zero read's.
+    fn zero_read_is_eof(&self) -> bool {
+        true
+    }
+}
+
 impl std::io::Write for SerialDevice {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         SerialDevice::write(self, buf)
@@ -431,6 +479,7 @@ impl ModemLines {
                     path.display()
                 ))
             })?;
+        lock_serial_port(&port, &path)?;
         set_raw_mode(&port, baud)?;
         Ok(Self { port, path })
     }
@@ -547,6 +596,39 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
         return Err(last_error("F_SETFL"));
     }
+    Ok(())
+}
+
+/// Take the port for this process, so no other program opens it at the same
+/// time.
+///
+/// `flock(LOCK_EX | LOCK_NB)` is the only exclusion a tty supports: `O_EXCL` has
+/// no meaning for a device node, which always exists. Without it two programs —
+/// a slicer left open, a second klipperx — open the same board and each reads
+/// half of one conversation, which shows up as garbage frames and a link that
+/// keeps timing out.
+///
+/// The lock belongs to the open file description, so it goes away with the
+/// port: there is nothing to unlock, and closing is the release. A filesystem or
+/// a sandbox that cannot lock at all is **not** a reason to refuse a board — the
+/// lock guards against another program, it is not a requirement — so a failure
+/// other than “someone else has it” is logged and the port is used anyway.
+fn lock_serial_port(port: &File, path: &Path) -> Result<(), InterfaceError> {
+    // SAFETY: `flock` takes only the descriptor and a flag word.
+    if unsafe { libc::flock(port.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == ErrorKind::WouldBlock {
+        return Err(InterfaceError::Other(format!(
+            "serial port {} is already open in another process",
+            path.display()
+        )));
+    }
+    warn!(
+        "could not take the exclusive lock on serial port {} ({e}); using it nonetheless",
+        path.display()
+    );
     Ok(())
 }
 
@@ -672,9 +754,14 @@ mod tests {
             "the path moved to another node, so the held descriptor is stale"
         );
 
-        // And a path that vanished entirely is stale too.
+        // A path that vanished entirely is not evidence of a move: udev removes
+        // a `by-id` link before recreating it, and the port under it is healthy.
+        // Nothing can be compared, so what is held is kept.
         std::fs::remove_file(&link).expect("the link goes");
-        assert!(!same_file(&opened, &link));
+        assert!(
+            same_file(&opened, &link),
+            "a path nobody can look up must not retire a healthy port"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -830,6 +917,45 @@ mod tests {
         let pty = Pty::new();
         let lines = ModemLines::open(&pty.path, 2400).unwrap();
         lines.drain();
+    }
+
+    /// A port someone already holds is not opened a second time.
+    ///
+    /// Two opens on one tty — another program, or a second device in this one —
+    /// each read the same stream, so both see half a conversation. The second
+    /// open is refused with a message naming the port, and the first keeps
+    /// working; the lock goes with the port, so it opens again afterwards.
+    #[test]
+    fn test_a_port_someone_holds_is_not_opened_twice() {
+        let pty = Pty::new();
+        let held =
+            SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("the first open takes the port");
+
+        let err = SerialDevice::open(&pty.path, DEFAULT_BAUD)
+            .expect_err("the second open must be refused");
+        assert!(
+            err.to_string().contains("already open in another process"),
+            "the refusal names the port and the reason: {err}"
+        );
+        assert!(err.to_string().contains(&pty.path.display().to_string()));
+
+        // The reset handle opens the tty for itself, so it is refused too.
+        assert!(
+            ModemLines::open(&pty.path, 2400).is_err(),
+            "a port that is held cannot be taken over for the reset sequence"
+        );
+
+        // The holder is unaffected.
+        held.send(&Frame::new(1, vec![0xab]))
+            .expect("the open port still writes");
+
+        // Closing releases the lock.
+        drop(held);
+        let again = SerialDevice::open(&pty.path, DEFAULT_BAUD)
+            .expect("the lock goes away with the port that held it");
+        again
+            .send(&Frame::new(2, vec![0xcd]))
+            .expect("it is usable");
     }
 
     #[test]
@@ -1103,6 +1229,25 @@ pub const CAN_ASSIGN_CONFIRM_WINDOW: Duration = Duration::from_millis(300);
 /// How many bytes one `read` may bring in. Bounds the reader's stack buffer;
 /// larger reads simply take another turn.
 const READ_CHUNK: usize = 1024;
+
+/// How many units one listener's queue holds before the link starts dropping.
+///
+/// A listener that stops draining must neither grow the reader's memory without
+/// bound nor **block** it: the one reader serves every MCU on the port, so a stuck
+/// scan or tunnel would stall the whole line. Dropping is upstream's policy when
+/// its buffers are full. The bound is generous enough that a scan's answers and a
+/// flashing session's acknowledgements are read as they come.
+const LISTENER_QUEUE_BOUND: usize = 64;
+
+/// How many bytes one MCU's reassembly buffer holds before the reader drops and
+/// resynchronises.
+///
+/// Same reason as [`LISTENER_QUEUE_BOUND`], one level down: a handle that stopped
+/// calling `receive` (or was shut down a moment ago) must not turn the line's
+/// traffic into unbounded memory. Sixty-four maximal frames is far more than a
+/// reading handle ever holds, and a buffer that did fill loses frames it was
+/// never going to read — the next SYNC re-frames the stream.
+const MCU_SLOT_BUFFER_BOUND: usize = 64 * crate::core::klippy::frame::MESSAGE_MAX;
 
 // ===========================================================================
 // The frame header and the assignment pseudo-frame
@@ -1681,21 +1826,40 @@ pub(crate) fn tunnel_block(unit: &[u8]) -> Option<&[u8]> {
 /// reassembles one itself. The receiving end is the [`mpsc::Receiver`]
 /// [`TunnelSink::channel`] returns; dropping it is how a listener leaves, and
 /// the link notices on the next delivery (see [`TunnelRegistry::deliver`]).
+///
+/// The queue is **bounded** ([`LISTENER_QUEUE_BOUND`] blocks): a sink nobody
+/// drains costs the link a dropped block and a warning, never the reader's
+/// memory or its progress — one stuck consumer must not stall every other MCU on
+/// the port.
 #[derive(Debug, Clone)]
 pub struct TunnelSink {
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl TunnelSink {
     /// A sink and the receiver it hands whole katapult blocks to.
     pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
-        let (frames, receiver) = mpsc::channel();
+        let (frames, receiver) = mpsc::sync_channel(LISTENER_QUEUE_BOUND);
         (Self { frames }, receiver)
     }
 
     /// Hand one whole tunnel block over; `false` when the receiver is gone.
-    fn deliver(&self, frame: &[u8]) -> bool {
-        self.frames.send(frame.to_vec()).is_ok()
+    ///
+    /// A full queue drops the block and answers `true`: the listener is still
+    /// there, it is just behind — the link does not wait for it.
+    fn deliver(&self, arb: u32, frame: &[u8]) -> bool {
+        match self.frames.try_send(frame.to_vec()) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "tunnel listener for arb {arb:#x} is {LISTENER_QUEUE_BOUND} blocks behind; \
+                     dropping one {}-byte block",
+                    frame.len()
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
@@ -1730,12 +1894,13 @@ impl TunnelRegistry {
 
     /// Hand one whole tunnel frame to `arb`'s listener, if any.
     ///
-    /// `true` when it was delivered. `false` when nobody listens — including a
-    /// listener whose receiver has been dropped, which is removed here so a
-    /// later delivery does not try it again.
+    /// `true` when the listener took it (a queue that is full drops the frame and
+    /// warns — the listener is still there, just behind). `false` when nobody
+    /// listens — including a listener whose receiver has been dropped, which is
+    /// removed here so a later delivery does not try it again.
     pub(crate) fn deliver(&self, arb: u32, frame: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
-        let delivered = sinks.get(&arb).map(|sink| sink.deliver(frame));
+        let delivered = sinks.get(&arb).map(|sink| sink.deliver(arb, frame));
         match delivered {
             Some(true) => true,
             Some(false) => {
@@ -1756,21 +1921,40 @@ impl TunnelRegistry {
 /// [`SharedSerialHandle::set_unit_sink`] gets each one whole — header included,
 /// the shape [`UnassignedScan::feed`] takes — on the receiver
 /// [`UnitSink::channel`] returns; dropping it is how a listener leaves.
+///
+/// The queue is bounded like [`TunnelSink`]'s ([`LISTENER_QUEUE_BOUND`]): an
+/// answer nobody reads is dropped with a warning rather than growing the reader's
+/// memory, and a scan that stopped reading cannot stall the port.
 #[derive(Debug, Clone)]
 pub struct UnitSink {
-    units: mpsc::Sender<Vec<u8>>,
+    units: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl UnitSink {
     /// A sink and the receiver it hands whole units to.
     pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
-        let (units, receiver) = mpsc::channel();
+        let (units, receiver) = mpsc::sync_channel(LISTENER_QUEUE_BOUND);
         (Self { units }, receiver)
     }
 
     /// Hand one whole unit over; `false` when the receiver is gone.
-    fn deliver(&self, unit: &[u8]) -> bool {
-        self.units.send(unit.to_vec()).is_ok()
+    ///
+    /// A full queue drops the unit — a scan behind by
+    /// [`LISTENER_QUEUE_BOUND`] answers has more than it can use anyway — and
+    /// answers `true`, because the listener is still there.
+    fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
+        match self.units.try_send(unit.to_vec()) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "unit listener for arb {arb:#x} is {LISTENER_QUEUE_BOUND} units behind; \
+                     dropping one {}-byte unit",
+                    unit.len()
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
@@ -1812,10 +1996,11 @@ impl UnitRegistry {
 
     /// Hand one whole unit to `arb`'s listener, if any. `false` when nobody
     /// listens — including a listener whose receiver has been dropped, which is
-    /// removed here so a later delivery does not try it again.
+    /// removed here so a later delivery does not try it again. A listener whose
+    /// queue is full keeps its registration and loses the unit.
     pub(crate) fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
-        match sinks.get(&arb).map(|sink| sink.deliver(unit)) {
+        match sinks.get(&arb).map(|sink| sink.deliver(arb, unit)) {
             Some(true) => true,
             Some(false) => {
                 sinks.remove(&arb);
@@ -2115,17 +2300,26 @@ impl UnitStream {
 /// can print answers while the window is still open.
 ///
 /// The `timeout` is a **deadline**, measured from the moment the query goes
-/// out, like CAN's scan window: every read is bounded by what is left of it,
-/// and the scan ends when that runs out, whatever has arrived by then. A
-/// blocking port says “no bytes in this read window” with a zero read, a
-/// non-blocking one with `WouldBlock`/`TimedOut`; both just mean the loop has
-/// to check the deadline, and any other read error is returned as it is.
+/// out, like CAN's scan window: every read waits for at most what is left of it
+/// (`poll` on the port's descriptor), and the scan ends when that runs out,
+/// whatever has arrived by then. A zero read is the far end closing the line, not
+/// “no bytes yet” — the wait for bytes is the deadline's job now — so it ends the
+/// scan instead of spinning on it, and any other read error is returned as it
+/// is.
+///
+/// Whatever the line carried before the query is dropped first: it cannot be an
+/// answer to a query that had not been sent yet, and left in the queue it would
+/// be framed as part of the first one.
+///
 /// Returns how many boards were found.
 pub fn serial_query_unassigned(
-    port: &mut (impl std::io::Read + std::io::Write),
+    port: &mut impl DiscoveryPort,
     timeout: Duration,
     mut report: impl FnMut(UnassignedNode),
 ) -> std::io::Result<usize> {
+    // Stale input goes: a leftover unit from the previous conversation would be
+    // cut and fed to this scan as if a board had answered this query.
+    port.discard_stale_input()?;
     port.write_all(&discovery_query())?;
     let deadline = Instant::now() + timeout;
     let mut scan = UnassignedScan::new();
@@ -2136,7 +2330,16 @@ pub fn serial_query_unassigned(
         if remaining.is_zero() {
             break;
         }
+        // The wait between reads is the stream's own: a tty waits in `poll` for
+        // what is left of the window — there is nothing else to wait on in a
+        // non-blocking port, and a blocking one would otherwise sit in its own
+        // `VTIME` cycle — while a stream that has no descriptor waits as it
+        // always did.
+        if !port.wait_for_bytes(remaining)? {
+            break;
+        }
         match port.read(&mut buf) {
+            Ok(0) if port.zero_read_is_eof() => break,
             Ok(0) => continue,
             Ok(read) => {
                 stream.feed(&buf[..read]);
@@ -2148,7 +2351,8 @@ pub fn serial_query_unassigned(
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
             {
                 continue;
             }
@@ -2156,6 +2360,32 @@ pub fn serial_query_unassigned(
         }
     }
     Ok(scan.total())
+}
+
+/// A byte stream a discovery scan reads: how it drops what the line carried
+/// before the query, and how it waits between reads.
+///
+/// A **tty** answers both from its descriptor — `tcflush` for what is stale,
+/// `poll` for what is left of the window — and a zero read there is the far end
+/// closing the line. A stream without a descriptor (klipper's host library, whose
+/// reads already wait a short window of their own) keeps the defaults: nothing to
+/// flush, no wait of its own, and a zero read meaning “nothing yet” rather than
+/// the end of the line.
+pub trait DiscoveryPort: std::io::Read + std::io::Write {
+    /// Drop whatever the line carried before the scan's query.
+    fn discard_stale_input(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Wait until a read will return bytes, or `window` closes (`Ok(false)`).
+    fn wait_for_bytes(&mut self, _window: Duration) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    /// Whether a zero-byte read is the far end closing the line.
+    fn zero_read_is_eof(&self) -> bool {
+        false
+    }
 }
 
 /// A physical serial port, its one reader thread, and a slot per attached MCU.
@@ -2166,13 +2396,23 @@ pub fn serial_query_unassigned(
 /// old one, where writes fail with `EIO`. Comparing the path's current
 /// `(device, inode)` with the open descriptor's is how a port tells "still the
 /// port I opened" from "the tty went away under me".
+///
+/// Either metadata read failing answers `true` — "the same file" — because a
+/// lookup that cannot be made is not evidence that the tty moved: udev rebuilds
+/// a `by-id` symlink by removing it and creating it again, so `path` is briefly
+/// absent under a perfectly healthy port. Reporting a move there would have the
+/// registry stop handing the live port out, and the next attach on the same tty
+/// would start a second reader on a line this one is already reading. The stale
+/// case is still caught: a path that now names another node compares unequal,
+/// and one that never comes back fails its next write with `EIO`, which stops
+/// the port ([`SharedSerialPort::write_unit`]).
 pub(crate) fn same_file(opened: &std::fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     let Ok(current) = std::fs::metadata(path) else {
-        return false;
+        return true;
     };
     let Ok(held) = opened.metadata() else {
-        return false;
+        return true;
     };
     current.dev() == held.dev() && current.ino() == held.ino()
 }
@@ -2230,7 +2470,7 @@ struct McuSlot {
 impl McuSlot {
     fn new() -> Self {
         Self {
-            incoming: Mutex::new(FrameStream::new()),
+            incoming: Mutex::new(FrameStream::with_bound(MCU_SLOT_BUFFER_BOUND)),
             cv: Condvar::new(),
             ack: Mutex::new(None),
             ack_cv: Condvar::new(),
@@ -2290,10 +2530,19 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
 /// straight to the request. On failure the slot this opened is unregistered, so
 /// the port is left as it was found.
 ///
+/// A handshake that fails on a **stale** port — the path now names another node
+/// than the one the descriptor holds, which is what a board that reset looks
+/// like — is retried up to [`ATTACH_REOPEN_ATTEMPTS`] times, each round opening
+/// the node the path names now. A round whose open fails (the node is briefly
+/// gone before udev's `by-id` link is back) spends a round like an unanswered
+/// handshake does, and when the rounds are spent the caller gets the handshake
+/// error the reopens started from.
+///
 /// # Errors
-/// [`InterfaceError::Other`] for an id the wire format cannot carry or a port
-/// that cannot be opened, [`InterfaceError::ConnectionLost`] if the port dies
-/// mid-handshake, [`InterfaceError::Timeout`] if no answer arrives.
+/// [`InterfaceError::Other`] for an id the wire format cannot carry, for an id
+/// that is **already attached** on this port, or for a port that cannot be
+/// opened; [`InterfaceError::ConnectionLost`] if the port dies mid-handshake,
+/// [`InterfaceError::Timeout`] if no answer arrives.
 pub fn attach(
     path: &Path,
     baud: u32,
@@ -2308,10 +2557,35 @@ pub fn attach(
     }
 
     let mut reopened = 0u32;
+    // The handshake error the reopen rounds started from: what the caller is told
+    // when a round cannot even open the node, because it names the conversation
+    // that failed rather than a node that is briefly gone.
+    let mut handshake_error: Option<InterfaceError> = None;
     loop {
-        let port = port_for(path, baud)?;
-        let slot = Arc::new(McuSlot::new());
-        port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+        let port = match port_for(path, baud) {
+            Ok(port) => port,
+            Err(open_error) => {
+                // A node that cannot be opened consumes a round the same way an
+                // unanswered handshake does: a board that reset re-enumerates, so
+                // the path is briefly missing and comes back on its own, and a
+                // round spent here must not cut the wait short. The **first**
+                // open is not retried — nothing has failed on this path yet, and
+                // a path that never opens is reported at once. Once the rounds
+                // are spent the caller gets the handshake error the reopens
+                // started from: the port that would not answer is the failure
+                // that matters, not the node that was missing between attempts.
+                let Some(original) = handshake_error.clone() else {
+                    return Err(open_error);
+                };
+                if reopened >= ATTACH_REOPEN_ATTEMPTS {
+                    return Err(original);
+                }
+                reopened += 1;
+                std::thread::sleep(ATTACH_REOPEN_DELAY);
+                continue;
+            }
+        };
+        let slot = register_slot(&port, mcu_id)?;
         let handle = Arc::new(SharedSerialHandle {
             port: Arc::clone(&port),
             mcu_id,
@@ -2329,8 +2603,10 @@ pub fn attach(
         if let Err(e) = handshake {
             // The slot this attach opened goes down through the same guarded
             // unregister the teardown paths use; the `ptr_eq` check only removes
-            // the slot this handle registered.
+            // the slot this handle registered — which, with the duplicate
+            // refused in `register_slot`, is always the one still in the map.
             handle.unregister();
+            handshake_error.get_or_insert_with(|| e.clone());
             // A **stale** port is worth one more open: the descriptor belongs to
             // a device node the path no longer names (the board reset and
             // re-enumerated), so every write to it fails and waiting on the same
@@ -2364,8 +2640,9 @@ pub fn attach(
 ///
 /// # Errors
 /// [`InterfaceError::Other`] for an id outside `1..=MAX_MCU_ID` — the same
-/// rejection [`attach`] makes — and for a port that cannot be opened;
-/// [`InterfaceError::ConnectionLost`] when the port is already stopped.
+/// rejection [`attach`] makes — for an id already attached on this port, and
+/// for a port that cannot be opened; [`InterfaceError::ConnectionLost`] when
+/// the port is already stopped.
 pub fn attach_downstream(
     path: impl AsRef<Path>,
     baud: u32,
@@ -2382,8 +2659,7 @@ pub fn attach_downstream(
         return Err(InterfaceError::ConnectionLost);
     }
 
-    let slot = Arc::new(McuSlot::new());
-    port.slots.lock().unwrap().insert(mcu_id, Arc::clone(&slot));
+    let slot = register_slot(&port, mcu_id)?;
     Ok(Arc::new(SharedSerialHandle {
         port,
         mcu_id,
@@ -2392,13 +2668,47 @@ pub fn attach_downstream(
     }))
 }
 
+/// Register a fresh slot for `mcu_id` on `port`, refusing an id that already has
+/// one.
+///
+/// One MCU id is one device: a second registration under it would **replace**
+/// the live slot, and the frames the older handle's `receive` is waiting for
+/// would then arrive in a slot nobody reads — while every later teardown of the
+/// older handle finds it is no longer the map's entry (the `ptr_eq` guard in
+/// [`SharedSerialHandle::unregister`]) and leaves the id with a slot whose only
+/// reader has gone. The attach that did it also looks successful, which is why
+/// the refusal has to be here rather than left to the handshake: a duplicate id
+/// is a wiring mistake (the same `[mcu]` twice on one port) and is reported as
+/// one.
+fn register_slot(port: &SharedSerialPort, mcu_id: u32) -> Result<Arc<McuSlot>, InterfaceError> {
+    let mut slots = port.slots.lock().unwrap();
+    if slots.contains_key(&mcu_id) {
+        return Err(InterfaceError::Other(format!(
+            "mcu id {mcu_id} is already attached on {}",
+            port.path.display()
+        )));
+    }
+    let slot = Arc::new(McuSlot::new());
+    slots.insert(mcu_id, Arc::clone(&slot));
+    Ok(slot)
+}
+
 /// Wait up to `timeout` for the reader to record an assignment answer.
-fn wait_for_ack(slot: &McuSlot, timeout: Duration) -> Option<u32> {
+///
+/// A port that **stops** while the wait is on ends it here: nothing can answer a
+/// dead port, and `stop` notifies `ack_cv`, so the waiter wakes and reports “no
+/// answer” at once instead of sitting out the rest of its `timeout`. The caller
+/// (`run_handshake`) turns that into [`InterfaceError::ConnectionLost`] on the
+/// `stopped` check it makes next.
+fn wait_for_ack(port: &SharedSerialPort, slot: &McuSlot, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     let mut ack = slot.ack.lock().unwrap();
     loop {
         if let Some(id) = *ack {
             return Some(id);
+        }
+        if port.stopped.load(Ordering::SeqCst) {
+            return None;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -2425,24 +2735,34 @@ fn wait_for_ack(slot: &McuSlot, timeout: Duration) -> Option<u32> {
 /// port may be talking, and its answer is not this board's confirmation. A unit
 /// that does not parse as an answer, or names another UUID, is dropped and the
 /// wait goes on.
+///
+/// `Ok(false)` is the window running out with no answer — the ordinary outcome
+/// for a device that adopts its assignment in silence. A receiver that is
+/// **disconnected** is not an empty window: the sender lives in the port's
+/// listener table, so its going away means the port (or the listener) was taken
+/// down under the wait, which is [`InterfaceError::ConnectionLost`] and must not
+/// be read as "the board is silent".
 pub(crate) fn answers_for(
     answers: &std::sync::mpsc::Receiver<Vec<u8>>,
     uuid: [u8; 6],
     window: Duration,
-) -> bool {
+) -> Result<bool, InterfaceError> {
     let deadline = Instant::now() + window;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return Ok(false);
         }
         match answers.recv_timeout(remaining) {
             Ok(unit) => {
                 if UnassignedNode::from_unit(&unit).is_some_and(|node| node.uuid == uuid) {
-                    return true;
+                    return Ok(true);
                 }
             }
-            Err(_) => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(false),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(InterfaceError::ConnectionLost)
+            }
         }
     }
 }
@@ -2588,6 +2908,13 @@ impl Drop for SharedSerialPort {
 }
 
 /// Read the port and dispatch whole units until stopped.
+///
+/// Every way out of this loop leaves the port **stopped**, a panic inside
+/// [`dispatch`] included: the port is what holds `stopped` for every handle on
+/// it, and a reader that dies without setting it leaves sessions believing their
+/// link is live while nothing reads the tty for them any more. A panic is caught
+/// around the dispatch, logged, and stops the port like a failed read does — the
+/// descriptor is unusable through the same poisoned state that raised it.
 fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
     let mut buf = [0u8; READ_CHUNK];
     // Partial unit carried across reads, and whether the stream is
@@ -2602,13 +2929,28 @@ fn reader_loop(weak: Weak<SharedSerialPort>, file: Arc<File>) {
                 pending.extend_from_slice(&buf[..read]);
                 let Some(port) = weak.upgrade() else { return };
                 port.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
-                dispatch(&port, &mut pending, &mut needs_sync);
+                // `dispatch` takes the port's locks, so a panic in there (a
+                // poisoned mutex, a broken invariant) would kill this thread and
+                // leave every handle on a port nothing reads.
+                let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    dispatch(&port, &mut pending, &mut needs_sync);
+                }));
+                if dispatched.is_err() {
+                    warn!(
+                        "shared serial reader for {} panicked; stopping the port",
+                        port.path.display()
+                    );
+                    port.stop();
+                }
                 // Drop the strong reference before blocking in `read` again, or
                 // the last handle could never bring the port down. This drop
                 // can be the one that destroys the port — see `Drop for
                 // SharedSerialPort` for why running that on this thread is
                 // safe.
                 drop(port);
+                if dispatched.is_err() {
+                    return;
+                }
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => {
@@ -2754,7 +3096,13 @@ fn push_frame(port: &SharedSerialPort, mcu_id: u32, frame: &[u8]) {
     match slot {
         Some(slot) => {
             let mut incoming = slot.incoming.lock().unwrap();
-            incoming.push(frame);
+            if incoming.push(frame) {
+                warn!(
+                    "shared serial {}: mcu {mcu_id}'s frame buffer is full ({MCU_SLOT_BUFFER_BOUND} \
+                     bytes); dropping frames and resynchronising",
+                    port.path.display()
+                );
+            }
             slot.cv.notify_all();
         }
         None => debug!(
@@ -3048,7 +3396,7 @@ impl SharedSerialHandle {
         loop {
             *self.slot.ack.lock().unwrap() = None;
             self.port.write_unit(&request)?;
-            if wait_for_ack(&self.slot, timeout) == Some(self.mcu_id) {
+            if wait_for_ack(&self.port, &self.slot, timeout) == Some(self.mcu_id) {
                 return Ok(());
             }
             if self.port.stopped.load(Ordering::SeqCst) {
@@ -3095,8 +3443,9 @@ impl SharedSerialHandle {
     /// # Errors
     /// [`InterfaceError::Other`] for an id the wire cannot address,
     /// [`InterfaceError::ConnectionLost`] when the port or this handle has been
-    /// shut down, and [`InterfaceError::SendError`] when the write fails. A
-    /// silent device is not an error.
+    /// shut down, or when the listener is taken down under the wait, and
+    /// [`InterfaceError::SendError`] when the write fails. A silent device is not
+    /// an error.
     pub fn name_can_device(&self, uuid: [u8; 6], mcu_id: u32) -> Result<bool, InterfaceError> {
         let unit = set_node_id_for(uuid, mcu_id).ok_or_else(|| {
             InterfaceError::Other(format!(
@@ -3112,10 +3461,12 @@ impl SharedSerialHandle {
         let written = self.send_admin(&unit[HEADER_BYTES..]);
         // Nothing is waited for when nothing was written: a refused write is the
         // caller's error, and a full window behind it would only hide it.
-        let answered = written.is_ok() && answers_for(&answers, uuid, CAN_ASSIGN_CONFIRM_WINDOW);
+        let answered = match written {
+            Ok(()) => answers_for(&answers, uuid, CAN_ASSIGN_CONFIRM_WINDOW),
+            Err(e) => Err(e),
+        };
         self.clear_unit_sink(ADMIN_REPLY);
-        written?;
-        Ok(answered)
+        answered
     }
 
     /// Take this handle's slot out of the port's map — only when the entry
@@ -3126,14 +3477,16 @@ impl SharedSerialHandle {
     /// this handle) and [`attach`]'s failure path (the attaching thread) all
     /// come here, each before the handle's last reference goes. The `ptr_eq`
     /// check keeps a handle from taking down a slot a later attach on the same
-    /// id registered: two attaches on one id are not supported, but the
-    /// failure path runs after a handshake another thread can race past, so the
-    /// guard has to be the same everywhere.
+    /// id registered: [`register_slot`] refuses an id that still has a slot, but a
+    /// handle that was **shut down** has already left the map while its owner may
+    /// still hold it, so the id is free again for an attach whose slot the stale
+    /// handle's `Drop` must leave alone.
     ///
     /// Once the entry is gone, `push_frame` finds no slot for this id and drops
     /// its frames — the "a failed `Sender` drops the frame" behaviour of the
-    /// host side, and what keeps a shut-down handle's stream from growing
-    /// unbounded (`FrameStream` is an unbounded `Vec`).
+    /// host side. That is also what keeps a shut-down handle's stream from
+    /// filling up: a slot nobody owns any more stops collecting at
+    /// [`MCU_SLOT_BUFFER_BOUND`] even before this runs.
     fn unregister(&self) {
         let Ok(mut slots) = self.port.slots.lock() else {
             return; // a poisoned map is not repaired from a teardown
@@ -3207,8 +3560,8 @@ impl Device for SharedSerialHandle {
         self.stopped.store(true, Ordering::SeqCst);
         // A stopped handle never reads its slot again (`receive` returns `None`),
         // so the slot goes with it: otherwise `push_frame` would keep pushing
-        // this id's frames into a stream nobody drains, for as long as the port
-        // lives (`FrameStream` is an unbounded `Vec`). Frames for this id are
+        // this id's frames into a stream nobody drains, and its own bound would
+        // drop them one by one (`MCU_SLOT_BUFFER_BOUND`). Frames for this id are
         // dropped from here on, like a failed `Sender` on the host side.
         self.unregister();
         let _guard = self.slot.incoming.lock().unwrap();
@@ -3475,6 +3828,43 @@ mod mux_tests {
         // attach on the same path completes a handshake.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(1, vec![0xab])).is_ok());
+    }
+
+    /// A port that stops while a handshake is waiting for its answer ends that
+    /// wait **at once** with [`InterfaceError::ConnectionLost`].
+    ///
+    /// Without the `stopped` check inside the wait, a dead port cost the whole
+    /// timeout — three attempts of it, since the handshake retries — for an
+    /// answer, and then reported a plain `Timeout`.
+    #[test]
+    fn a_stopped_port_ends_the_wait_for_an_ack_at_once() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+        let request = assignment_request(4).expect("a valid mcu id");
+
+        let waiting = Arc::clone(&handle);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // Long enough that waiting it out cannot be mistaken for the bound.
+            let _ = tx.send(waiting.run_handshake(None, Duration::from_secs(10)));
+        });
+        assert!(
+            readable_within(&pty.master, ATTACH_REQUEST_WINDOW),
+            "the handshake must send its request"
+        );
+        let seen = read_n(&pty.master, request.len());
+        assert_eq!(seen, request, "the request goes out verbatim");
+
+        // The tty goes away under the session: the reader stops the port.
+        handle.port.stop();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a stopped port must end the wait at once");
+        assert_eq!(
+            outcome,
+            Err(InterfaceError::ConnectionLost),
+            "a dead port is a lost connection, not a timeout"
+        );
     }
 
     /// A downstream device attaches with **no handshake at all**: the peer never
@@ -3836,6 +4226,42 @@ mod mux_tests {
         );
     }
 
+    /// The answer wait tells a silent device from a listener that went away.
+    ///
+    /// A window that runs out is `Ok(false)` — a device adopting its assignment
+    /// without answering — while a receiver whose sender is gone is the port's
+    /// listener table losing the sink under the wait, and that is a lost
+    /// connection rather than silence.
+    #[test]
+    fn the_answer_wait_tells_silence_from_a_listener_that_went_away() {
+        let uuid = [1, 2, 3, 4, 5, 6];
+        let window = Duration::from_millis(50);
+
+        let (sink, answers) = UnitSink::channel();
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Ok(false),
+            "a silent device is not an error"
+        );
+        assert!(
+            sink.deliver(ADMIN_REPLY, &admin_answer(uuid, None)),
+            "the listener is still there"
+        );
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Ok(true),
+            "an answer naming this uuid is the confirmation"
+        );
+
+        // The port's registry dropping the sink is what disconnects the wait.
+        drop(sink);
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Err(InterfaceError::ConnectionLost),
+            "a listener that went away is a lost connection, not silence"
+        );
+    }
+
     #[test]
     fn two_mcus_share_one_port_without_crosstalk() {
         let pty = Pty::new();
@@ -4027,6 +4453,75 @@ mod mux_tests {
         drop(stale);
         drop(fresh);
         let _ = std::fs::remove_file(&link);
+    }
+
+    /// A reopen round whose **open** fails spends a round, and the caller is told
+    /// the handshake error the reopens started from — not the error of a node
+    /// that was missing between two attempts.
+    ///
+    /// The path is re-pointed at a **regular file** once the handshake has run
+    /// out: `same_file` sees a move (so `attach` reopens), while opening it fails
+    /// in `set_raw_mode` — a tty ioctl on something that is not a tty. That is the
+    /// node that is briefly absent when a board re-enumerates, and before the
+    /// rounds covered it the error came straight back: the reopen budget only
+    /// ever applied to unanswered handshakes, so a node that was not back yet cut
+    /// the wait short with a message about a device node instead of the board
+    /// that would not answer.
+    #[test]
+    fn a_reopen_round_that_cannot_open_reports_the_handshake_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "klipperx-attach-open-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let link = dir.join("port");
+        let not_a_tty = dir.join("not-a-tty");
+        std::fs::write(&not_a_tty, b"").expect("the fixture file");
+        let _ = std::fs::remove_file(&link);
+
+        let pty = Pty::new();
+        std::os::unix::fs::symlink(&pty.path, &link).expect("the link to the tty");
+
+        let request = assignment_request(4).expect("a valid mcu id");
+        let path = link.clone();
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        thread::spawn(move || {
+            let _ = tx.send(attach(&path, DEFAULT_BAUD, 4, ASSIGN_ATTACH_TIMEOUT, None));
+        });
+
+        // The request proves the attach is on the tty. The path then moves under
+        // it, to a node that cannot be put into raw mode — what a reopen round
+        // finds while the board is still re-enumerating.
+        assert!(
+            readable_within(&pty.master, ATTACH_REQUEST_WINDOW),
+            "attach must send the assignment request"
+        );
+        let seen = read_n(&pty.master, request.len());
+        assert_eq!(seen, request, "the request goes out verbatim");
+        std::fs::remove_file(&link).expect("the old link goes");
+        std::os::unix::fs::symlink(&not_a_tty, &link).expect("the link to the plain file");
+
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("attach returns within its retry budget")
+            .expect_err("an unanswered handshake must fail the attach");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            err,
+            InterfaceError::Timeout,
+            "the caller must get the handshake error, not the node's"
+        );
+        assert!(
+            elapsed
+                >= ASSIGN_ATTACH_TIMEOUT * ASSIGN_ATTACH_ATTEMPTS
+                    + ATTACH_REOPEN_DELAY * ATTACH_REOPEN_ATTEMPTS,
+            "every reopen round must spend its delay: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Whether the port for `path` has been **stopped** within `window` — how a
@@ -4293,19 +4788,75 @@ mod mux_tests {
             .expect("the receiving thread must not hang");
     }
 
+    /// A second attach under an id that already has a slot on the port is
+    /// **refused**, and the live handle keeps its slot.
+    ///
+    /// The registration used to be a plain `insert`: the second attach took the
+    /// first handle's slot out of the map without a word, so the frames the
+    /// live handle's `receive` was waiting for went to a slot nobody read, and a
+    /// later teardown of that handle found it was no longer the entry and left
+    /// the id registered with no reader behind it.
+    #[test]
+    fn attaching_an_already_attached_id_is_refused() {
+        let pty = Pty::new();
+        let live = attach_with_reply(&pty, 4);
+        let port = Arc::clone(&live.port);
+
+        let path = pty.path.clone();
+        let err = super::tests::bounded(move || {
+            attach(&path, DEFAULT_BAUD, 4, ASSIGN_ATTACH_TIMEOUT, None)
+        })
+        .expect_err("a second attach on the same id must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("mcu id 4 is already attached"),
+            "the error must name the id and the reason: {message}"
+        );
+
+        // Nothing was written: the refusal comes before the handshake.
+        assert!(
+            !readable_within(&pty.master, Duration::from_millis(100)),
+            "a refused attach must not put an assignment request on the wire"
+        );
+
+        // The live handle still owns the id: its slot is the map's entry and is
+        // still fed.
+        {
+            let slots = port.slots.lock().unwrap();
+            let registered = slots
+                .get(&4)
+                .expect("the live handle's slot must still be registered");
+            assert!(
+                Arc::ptr_eq(registered, &live.slot),
+                "a refused attach must leave the live slot in place"
+            );
+        }
+        master_write(&pty.master, &device_unit(4, &Frame::encode(3, b"live")));
+        assert!(
+            wait_for_frame(
+                &live.slot,
+                &Frame::new(3, b"live".to_vec()),
+                Duration::from_secs(2)
+            ),
+            "the live handle must still be fed after the refused attach"
+        );
+    }
+
     /// The `ptr_eq` guard keeps a **stale** handle from unregistering a slot a
-    /// newer attach owns: every attach replaces the map entry, so the older
-    /// handle's `shutdown` (and its later `Drop`) must leave the live one
-    /// alone. Both the `shutdown` teardown and the guarded attach-failure path
-    /// depend on that branch.
+    /// newer attach owns.
+    ///
+    /// A shut-down handle's slot leaves the map at the shutdown while the handle
+    /// itself lives on in its owner's `Arc`, so the id is free again and a second
+    /// attach registers a slot of its own. The first handle's `Drop` then runs
+    /// `unregister`, which must not take the newer slot down with it.
     #[test]
     fn a_stale_handle_leaves_the_newer_attachs_slot_alone() {
         let pty = Pty::new();
         let first = attach_with_reply(&pty, 4);
+        first.shutdown();
         let second = attach_with_reply(&pty, 4);
         let port = Arc::clone(&second.port);
 
-        first.shutdown();
         {
             let slots = port.slots.lock().unwrap();
             let live = slots
@@ -4497,6 +5048,73 @@ mod mux_tests {
                 .all(|(thread, _)| !readers.iter().any(|reader| reader == thread)),
             "a reader thread ended in a panic — the port was dropped by the reader and joined \
              itself: {panics:?}"
+        );
+    }
+
+    /// A panic inside [`dispatch`] stops the port, instead of killing the reader
+    /// while every handle still believes the link is live.
+    ///
+    /// The panic is produced the way the reader's own `unwrap`s are: the slot map
+    /// is left **poisoned**, and a whole unit for the attached id makes `dispatch`
+    /// lock it. Without the catch the thread died silently and `stopped` stayed
+    /// false, so sessions on the port waited on a link nothing was reading.
+    #[test]
+    fn a_panic_in_dispatch_stops_the_port_instead_of_killing_the_reader() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+        let port = Arc::clone(&handle.port);
+
+        let stopped = record_panics_during(|| {
+            let fixture = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = port.slots.lock().unwrap();
+                panic!("poison the slot map");
+            }));
+            assert!(fixture.is_err(), "the fixture must poison the map");
+            assert!(port.slots.is_poisoned(), "the slot map must be poisoned");
+
+            master_write(&pty.master, &device_unit(4, &Frame::encode(1, b"boom")));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !port.stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            port.stopped.load(Ordering::SeqCst)
+        })
+        .0;
+        assert!(
+            stopped,
+            "a panicking dispatch must stop the port, not leave it live"
+        );
+
+        // And the reader is gone rather than parked: the port has no reader left
+        // to serve its handles.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let finished = port
+                .reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            port.reader
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(std::thread::JoinHandle::is_finished),
+            "the reader must end after the panic, not stay parked on the tty"
+        );
+
+        // A stopped port is retired from the registry: the next attach on the
+        // path opens the tty again instead of handing the dead one back.
+        let fresh = attach_with_reply(&pty, 4);
+        assert!(
+            !Arc::ptr_eq(&fresh.port, &port),
+            "a port whose reader panicked must not be handed out again"
         );
     }
 
@@ -5813,6 +6431,69 @@ mod mux_tests {
         assert_eq!(reported[0].uuid, [0x11; 6]);
     }
 
+    /// What the line carried **before** the query is not this scan's answer.
+    ///
+    /// An answer left in the input queue by an earlier conversation frames
+    /// perfectly well, so without the flush the scan reports a board that
+    /// answered something else — a leftover that also shifts every real answer
+    /// behind it.
+    #[test]
+    fn a_scan_flushes_what_the_line_carried_before_its_query() {
+        let pty = Pty::new();
+        let mut device = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("a pty opens");
+        // A stale answer sits in the raw port's queue before the query goes out.
+        master_write(&pty.master, &admin_answer([0x11; 6], None));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut reported = Vec::new();
+        let total = serial_query_unassigned(&mut device, Duration::from_millis(200), |node| {
+            reported.push(node)
+        })
+        .expect("the pty does not fail");
+        assert_eq!(total, 0, "a leftover answer is not this scan's finding");
+        assert!(reported.is_empty());
+    }
+
+    /// A line that closes under the scan ends it there, not at its deadline.
+    #[test]
+    fn a_scan_ends_when_the_line_closes_instead_of_waiting_out_its_window() {
+        let pty = Pty::new();
+        let mut device = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("a pty opens");
+        let query = discovery_query();
+        let master = pty.master.try_clone().expect("the pty master clones");
+
+        let window = Duration::from_secs(10);
+        let started = Instant::now();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let outcome = serial_query_unassigned(&mut device, window, |_| {});
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+
+        // The far end has the query and then goes away, closing the line.
+        assert_eq!(
+            read_n_within(&master, query.len(), Duration::from_secs(5)),
+            query,
+            "the scan must send the discovery query verbatim"
+        );
+        drop(master);
+        drop(pty);
+
+        let (outcome, elapsed) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a closed line must end the scan");
+        assert!(
+            elapsed < window / 2,
+            "the closed line ends the scan, not the window: {elapsed:?}"
+        );
+        // A closed line is the end of input, not a finding: the tty reports it
+        // either as an empty read or as an error, and neither is a board.
+        assert!(
+            matches!(outcome, Ok(0) | Err(_)),
+            "a closed line finds no board: {outcome:?}"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // The tunnel unit: golden vectors (the byte-for-byte contract with the
     // firmware's mux.c, which mirrors these), the shared cut rule's bad cases,
@@ -6189,6 +6870,89 @@ mod mux_tests {
             "cleared means no listener"
         );
         assert!(frames.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// A listener that stopped draining loses blocks instead of stalling the
+    /// line: its queue is bounded, and a full one drops the block while the
+    /// listener stays registered.
+    #[test]
+    fn a_listener_that_stopped_draining_loses_blocks_instead_of_stalling_the_link() {
+        let registry = TunnelRegistry::new();
+        let arb = assign::reply_arb_id(4).expect("a valid mcu id");
+        let (sink, frames) = TunnelSink::channel();
+        registry.register(arb, sink);
+
+        for _ in 0..LISTENER_QUEUE_BOUND {
+            assert!(
+                registry.deliver(arb, &TUNNEL_ACK),
+                "the queue holds {LISTENER_QUEUE_BOUND} blocks"
+            );
+        }
+        // The one past the bound is dropped — and delivery still answers, because
+        // the listener is there, just behind.
+        assert!(
+            registry.deliver(arb, &TUNNEL_ACK),
+            "a full queue drops the block, it does not lose the listener"
+        );
+
+        // Exactly the bounded number of blocks is waiting.
+        let mut got = 0;
+        while frames.recv_timeout(Duration::from_millis(200)).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, LISTENER_QUEUE_BOUND);
+    }
+
+    /// A slot nobody drains stops collecting at its bound, and the frames it
+    /// could not hold cost the reader nothing.
+    #[test]
+    fn a_slot_nobody_drains_stops_collecting_at_its_bound() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+
+        // More frames than the slot can hold, all pushed by the reader without a
+        // single `receive`: this is a handle that stopped draining.
+        let frame = Frame::encode(1, b"0123456789abcdef");
+        let per_frame = device_unit(4, &frame).len();
+        let count = MCU_SLOT_BUFFER_BOUND / per_frame + 8;
+        let mut wire = Vec::with_capacity(count * per_frame);
+        for _ in 0..count {
+            wire.extend_from_slice(&device_unit(4, &frame));
+        }
+        master_write(&pty.master, &wire);
+
+        // Wait for the reader to be done with it: the buffer stops changing.
+        let mut last = usize::MAX;
+        let mut stable = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && stable < 3 {
+            thread::sleep(Duration::from_millis(10));
+            let buffered = handle.slot.incoming.lock().unwrap().buffered_bytes();
+            if buffered == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = buffered;
+            }
+        }
+
+        let buffered = handle.slot.incoming.lock().unwrap().buffered_bytes();
+        assert!(
+            buffered <= MCU_SLOT_BUFFER_BOUND,
+            "a slot never holds more than its bound: {buffered}"
+        );
+        assert!(
+            buffered < count * per_frame,
+            "the surplus is dropped, not buffered: {buffered} of {}",
+            count * per_frame
+        );
+
+        // The reader is alive and the port still up: the drop is a frame's, never
+        // the link's.
+        assert!(
+            !handle.port.stopped.load(Ordering::SeqCst),
+            "a full slot must not stop the port"
+        );
     }
 
     #[test]

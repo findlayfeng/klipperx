@@ -1045,22 +1045,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 来源：出真机前的 20 lane 设备代码评审（报告口径与证据见评审会话的 `.staging/device-review/REPORT.md`，不入库）。
 每条都复核过 file:line；**均不阻塞真机**，撞上了按这里直接改。
 
-- [ ] `same_file` 把「元数据读失败」折成「不是同一个文件」（`interface/devices/serial.rs` 的 `same_file`）：
-      `/dev/serial/by-id/*` 正被 udev 重建时会摘掉健康的 port，同一 tty 出现两个 reader。修法：metadata 出错返回 `true`（判不了就沿用）。
-- [ ] 同一 `mcu_id` 二次 `attach` 静默顶掉存活 handle 的 slot，且失败后该 id 无 slot（`serial.rs` 的 `attach`/`attach_downstream`）。
-      修法：insert 前查重，已有条目返回 `Other("mcu id … is already attached")`。
-- [ ] `attach` 重开循环里 `port_for(..)?` 在节点缺失时以 ENOENT 提前结束，把真实握手失败换成打开错误（`serial.rs` 的 `attach`）。
-      修法：重开失败也算一轮重试，耗尽后返回**原握手错误**。
-- [ ] `wait_for_ack` 不查端口 `stopped`，死端口上的握手要熬满 timeout 才报 `ConnectionLost`（`serial.rs`）。
-- [ ] `answers_for` 把 `Receiver` 断开折成「设备没回答」（`serial.rs`）；`TunnelRegistry::register` 静默顶替同 id 且生产代码从不
-      `clear_tunnel_sink`；`UnitRegistry::has`/`deliver` 之间的 TOCTOU 会丢单元且无日志。
-- [ ] reader 线程 panic 不置 `stopped`，端口仍被判 live（`serial.rs` 的 `reader_loop`）。修法：`catch_unwind` + 退出前一律 `stop()`。
-- [ ] `scan` 的 read 本身无上界（只靠调用方恰好 `VMIN=0/VTIME=1`），`Ok(0)`/`WouldBlock` 无 EOF 判定，且**发查询前不清 tty 输入队列**
-      ⇒ 上一窗口的残留应答会被当成这次发现的板子（`serial.rs` 的 `serial_query_unassigned`）。
-- [ ] 丢失上游的排他打开（无 `O_EXCL`/`flock`）：同一 tty 可被第二个 fd 打开并改写线路参数（`serial.rs` 的 `open_once`/`ModemLines::open`）。
-- [ ] `TunnelSink`/`UnitSink` 用无界 channel，`push_frame` 的 `FrameStream` 无 cap（`serial.rs`）：消费者停摆时无界堆积。
-- [ ] CAN FD wire 把 classical 帧当短读静默丢弃，且与两处注释矛盾（`interface/devices/canserial.rs` 的 `receive`）。修法：按读回长度选解析 wire。
-- [ ] CAN 多帧块写到一半失败：半块留在总线上而 `stopped` 不置位，流继续被使用（`canserial.rs` 的 `send_bytes`）。
+- [x] **`same_file` / 重复 attach / 重开轮次 / 停端口握手 / `answers_for` / reader panic / scan 读窗口 / 排他打开 / 无界 channel —— 均已修（2026-10-21）**：
+      共 9 条，按本节的修法方向全部落地（`serial.rs` + `frame.rs`），每条带改前必红的用例。
+- [ ] `TunnelRegistry::register` 静默顶替同 id，且生产代码从不 `clear_tunnel_sink`（**后者是有意设计**：
+      `bridge_flash.rs` 靠 drop receiver 隐式退订，注释已写明）；`UnitRegistry::has`/`deliver` 之间的
+      TOCTOU 会丢单元（失败分支现在有 `debug!`，但没有 warn）。
 - [ ] CAN 的 `SET_NODEID` **没有身份校验**（本批已加有界重发 3×200 ms，但 uuid 比对未做）：上游 `serialhdl.py` 的 `get_canbus_id`
       是字典报文，只能在 `identify` 之后做；现挂在 open 阶段拿不到 msgid。后续单元：在 `connect` 装好字典后比对 uuid。
 - [ ] 桥端口数上限与固件不符：主机允许 256、固件 `BRIDGE_MAX_PORTS 4`（`bridge_ports.rs` / `third_party/klipper/src/bridge.c`），

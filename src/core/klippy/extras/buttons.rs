@@ -2,11 +2,14 @@
 //! `klippy/extras/buttons.py`).
 //!
 //! The module object a consumer loads by name (`printer.load_object(config,
-//! 'buttons')`) rather than from a section of its own. Two entry points, one
+//! 'buttons')`) rather than from a section of its own. Three entry points, one
 //! per consumer shape: [`PrinterButtons::register_debounce_button`] (a single
-//! debounced switch, the filament *switch* sensor and `gcode_button`) and
+//! debounced switch, the filament *switch* sensor and `gcode_button`),
 //! [`PrinterButtons::register_buttons`] (one or more pins sharing a callback,
-//! the filament *motion* sensor's encoder).
+//! the filament *motion* sensor's encoder), and the analog pair
+//! [`PrinterButtons::register_adc_button`] /
+//! [`PrinterButtons::register_debounce_adc_button`] (an `analog_range` band on
+//! an analog input — `[gcode_button]` and the menu's `analog_range_*` keys).
 //!
 //! # The firmware side
 //!
@@ -53,11 +56,21 @@
 //! host's [`DebounceButton`] (`debounce_delay`, default `0.`), which holds a
 //! change for the configured time before it reaches the consumer.
 //!
+//! # The analog side
+//!
+//! An `analog_range` button does not use the pin query at all: upstream builds
+//! an `MCU_ADC_buttons` (`buttons.py:94-166`) on top of the ADC resource, which
+//! is what [`McuAdcButtons`] here is. One object per **pin** (`adc_buttons`,
+//! `buttons.py:286-295`): the input is configured for a fast periodic sample,
+//! every registered band is another entry in it, and a sample is converted to a
+//! resistance through the pull-up before it is matched against the bands. The
+//! registration also names the input `adc_button:<pin>` in the `query_adc`
+//! object (`buttons.py:113-114`), which is what `QUERY_ADC` reports.
+//!
 //! # What is not here
 //!
-//! The ADC button path (`register_adc_button`, `analog_range` sections): it is
-//! a different object in upstream (`MCU_ADC_buttons`) on top of `query_adc`, not
-//! a pin query. `[gcode_button]` refuses `analog_range` for that reason.
+//! The rotary encoder (`register_rotary_encoder`, `buttons.py:337-349`): no
+//! corpus config drives one, and the menu warns about `encoder_pins` instead.
 //!
 //! A registration whose pin cannot be resolved (no such chip, a pin already in
 //! use, or pins from two MCUs in one registration) is not sent to any firmware:
@@ -74,6 +87,7 @@ use crate::core::klippy::cmd::buttons::{
     ButtonsAck, ButtonsAdd, ButtonsQuery, ButtonsState, ConfigButtons,
 };
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
+use crate::core::klippy::extras::query_adc::QueryAdc;
 use crate::core::klippy::mcu::{pin_number, query_slot, ConfigBuilder, Mcu, McuChip, McuError};
 use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -100,6 +114,23 @@ const RETRANSMIT_COUNT: u8 = 50;
 /// The firmware's per-object pin limit (`src/buttons.c:76-78`): one report byte
 /// is one bit per pin.
 const MAX_BUTTONS: usize = 8;
+
+/// The sampling an analog button input is configured with — upstream's
+/// `ADC_REPORT_TIME`, `ADC_SAMPLE_TIME`, `ADC_SAMPLE_COUNT` and
+/// `ADC_BATCH_COUNT` (`buttons.py:88-92`).
+const ADC_REPORT_TIME: f64 = 0.010;
+const ADC_SAMPLE_TIME: f64 = 0.001;
+const ADC_SAMPLE_COUNT: u32 = 6;
+const ADC_BATCH_COUNT: u32 = 5;
+
+/// How long a sample has to stay in one band before the change counts as a
+/// press or release (`ADC_DEBOUNCE_TIME`, `buttons.py:89`).
+const ADC_DEBOUNCE_TIME: f64 = 0.025;
+
+/// The sample clamp the pull-up divider is applied to (`buttons.py:117`): a
+/// report at either rail would divide by zero or invert.
+const MIN_ADC: f64 = 0.00001;
+const MAX_ADC: f64 = 0.99999;
 
 /// The state one callback is interested in: which bits of a report belong to
 /// it, and where its own pins start in the byte.
@@ -520,6 +551,189 @@ impl DebounceButton {
     }
 }
 
+/// One analog input's buttons — upstream's `MCU_ADC_buttons` (`buttons.py:94-166`).
+///
+/// One per pin: the pin is one ADC resource, and every `analog_range` a section
+/// registered on it is another band in this object. A sample becomes a
+/// resistance through the pull-up, is matched against the bands, and a band
+/// change becomes a press (the new band) or a release (the old one) once it has
+/// held for [`ADC_DEBOUNCE_TIME`].
+struct McuAdcButtons {
+    printer: Weak<Printer>,
+    /// The `analog_pullup_resistor` of the pin's **first** registration;
+    /// upstream keeps that one for the whole input (`buttons.py:101-102,
+    /// 290-295`).
+    pullup: f64,
+    state: Mutex<AdcButtonsState>,
+}
+
+/// The registered bands and the press tracking of one analog input.
+struct AdcButtonsState {
+    /// `(min, max, callback)` in registration order. A sample belongs to the
+    /// first band that holds it strictly.
+    buttons: Vec<(f64, f64, Arc<dyn Fn(f64, bool) + Send + Sync>)>,
+    /// The widest band the registrations cover, as the gate a sample has to
+    /// pass before the bands are searched at all.
+    min_value: f64,
+    max_value: f64,
+    /// The band the last sample landed in.
+    last_button: Option<usize>,
+    /// The band whose press has been reported, until it is released.
+    last_pressed: Option<usize>,
+    /// The sample time the current candidate band started at.
+    last_debouncetime: f64,
+}
+
+impl Default for AdcButtonsState {
+    fn default() -> Self {
+        Self {
+            buttons: Vec::new(),
+            // No band yet, so no sample passes `min_value <= v <= max_value`;
+            // `setup_button` widens both before any sample is looked at.
+            min_value: f64::INFINITY,
+            max_value: f64::NEG_INFINITY,
+            last_button: None,
+            last_pressed: None,
+            last_debouncetime: 0.0,
+        }
+    }
+}
+
+impl McuAdcButtons {
+    /// Configure the input at `pin` for periodic sampling, install the handler
+    /// and name it in `query_adc` — upstream's `MCU_ADC_buttons.__init__`
+    /// (`buttons.py:95-114`).
+    ///
+    /// # Errors
+    /// A pin that cannot be resolved to an analog input, or a `query_adc`
+    /// object that cannot be created.
+    fn new(printer: &Arc<Printer>, pin: &str, pullup: f64) -> Result<Arc<Self>, String> {
+        let pins = printer
+            .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+            .ok_or_else(|| "the machine has no pins object".to_string())?;
+        let adc = pins.setup_adc(pin, None).map_err(|err| format!("{err}"))?;
+        let query_adc = QueryAdc::ensure(printer).map_err(|err| format!("{err}"))?;
+        // Upstream passes `batch_num` by keyword and leaves `minval`/`maxval`/
+        // `range_check_count` at their defaults (`buttons.py:109-110`).
+        adc.setup_adc_sample(
+            ADC_REPORT_TIME,
+            ADC_SAMPLE_TIME,
+            ADC_SAMPLE_COUNT,
+            ADC_BATCH_COUNT,
+            0.0,
+            1.0,
+            0,
+        );
+        let object = Arc::new_cyclic(|weak: &Weak<McuAdcButtons>| {
+            let samples = weak.clone();
+            adc.setup_adc_callback(Box::new(move |batch| {
+                if let Some(buttons) = samples.upgrade() {
+                    buttons.handle_samples(batch);
+                }
+            }));
+            Self {
+                printer: Arc::downgrade(printer),
+                pullup,
+                state: Mutex::new(AdcButtonsState::default()),
+            }
+        });
+        // `pin.strip()` is the name's tail, so a pin written with padding still
+        // registers as `adc_button:<pin>` (`buttons.py:114`).
+        query_adc.register_adc(&format!("adc_button:{}", pin.trim()), adc);
+        Ok(object)
+    }
+
+    /// Add one band — upstream's `setup_button` (`buttons.py:116-119`).
+    fn setup_button(
+        &self,
+        min_value: f64,
+        max_value: f64,
+        callback: Arc<dyn Fn(f64, bool) + Send + Sync>,
+    ) {
+        let mut state = self.lock();
+        state.min_value = state.min_value.min(min_value);
+        state.max_value = state.max_value.max(max_value);
+        state.buttons.push((min_value, max_value, callback));
+    }
+
+    /// Fold one batch of samples in — upstream's `adc_callback`
+    /// (`buttons.py:121-152`).
+    ///
+    /// The debounce is dated in the **sample** time (`read_time`), not in the
+    /// host's; the consumer's callback is then deferred to the reactor with the
+    /// host's time, which is where upstream's `register_async_callback` puts it
+    /// (`buttons.py:148-151`) — a consumer runs g-code or asks the MCU
+    /// something, which this receive-task callback must not do.
+    fn handle_samples(&self, samples: &[(f64, f64)]) {
+        let mut calls: Vec<(Arc<dyn Fn(f64, bool) + Send + Sync>, bool)> = Vec::new();
+        {
+            let mut state = self.lock();
+            for &(read_time, read_value) in samples {
+                let adc = read_value.clamp(MIN_ADC, MAX_ADC);
+                let value = self.pullup * adc / (1.0 - adc);
+                let button = state.band_at(value);
+                // A new band restarts the debounce window.
+                if button != state.last_button {
+                    state.last_debouncetime = read_time;
+                }
+                if read_time - state.last_debouncetime >= ADC_DEBOUNCE_TIME
+                    && state.last_button == button
+                    && state.last_pressed != button
+                {
+                    // Release what was pressed before pressing what is now.
+                    if let Some(pressed) = state.last_pressed {
+                        if let Some((_, _, callback)) = state.buttons.get(pressed) {
+                            calls.push((Arc::clone(callback), false));
+                        }
+                        state.last_pressed = None;
+                    }
+                    if let Some(index) = button {
+                        if let Some((_, _, callback)) = state.buttons.get(index) {
+                            calls.push((Arc::clone(callback), true));
+                        }
+                        state.last_pressed = Some(index);
+                    }
+                }
+                state.last_button = button;
+            }
+        }
+        if calls.is_empty() {
+            return;
+        }
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        printer.reactor().call_later(
+            0.,
+            Box::new(move |eventtime| {
+                for (callback, state) in calls {
+                    callback(eventtime, state);
+                }
+            }),
+        );
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AdcButtonsState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+impl AdcButtonsState {
+    /// The band `value` falls in, if any — upstream's two-step lookup
+    /// (`buttons.py:121-127`): the widest band is checked inclusively, the
+    /// individual bands strictly, first match wins.
+    fn band_at(&self, value: f64) -> Option<usize> {
+        if value < self.min_value || value > self.max_value {
+            return None;
+        }
+        self.buttons
+            .iter()
+            .position(|(min_value, max_value, _)| *min_value < value && value < *max_value)
+    }
+}
+
 /// The `[buttons]` module object (upstream's `PrinterButtons`).
 pub struct PrinterButtons {
     printer: Weak<Printer>,
@@ -536,6 +750,11 @@ struct ButtonsRegistry {
     /// The pins of each registration, in registration order (tests and
     /// diagnostics).
     registrations: Vec<Vec<String>>,
+    /// One analog input per pin — upstream's `adc_buttons` (`buttons.py:286`).
+    adc_buttons: HashMap<String, Arc<McuAdcButtons>>,
+    /// The pins of each analog registration, in registration order (tests and
+    /// diagnostics).
+    adc_registrations: Vec<String>,
 }
 
 impl PrinterButtons {
@@ -548,6 +767,9 @@ impl PrinterButtons {
         if let Some(existing) = printer.lookup_object_as::<PrinterButtons>(BUTTONS_OBJECT) {
             return Ok(existing);
         }
+        // Upstream loads `query_adc` from here (`buttons.py:287`), so an analog
+        // registration always has its registry to name the input in.
+        QueryAdc::ensure(printer)?;
         let object = Arc::new(PrinterButtons {
             printer: Arc::downgrade(printer),
             state: Mutex::new(ButtonsRegistry::default()),
@@ -574,6 +796,26 @@ impl PrinterButtons {
         pin: &str,
         callback: ButtonCallback,
     ) -> Result<(), ConfigError> {
+        let debounce = self.debounce(config, callback)?;
+        let handler = Arc::clone(&debounce);
+        self.register_buttons(
+            vec![pin.to_string()],
+            Box::new(move |eventtime, state| handler.button_handler(eventtime, state)),
+        )?;
+        Ok(())
+    }
+
+    /// A [`DebounceButton`] over this section's `debounce_delay` — upstream's
+    /// `DebounceButton(config, callback)` (`buttons.py:257`), which both the
+    /// digital and the analog registration wrap their consumer in.
+    ///
+    /// # Errors
+    /// A negative or unparsable `debounce_delay`.
+    fn debounce(
+        &self,
+        config: &ConfigWrapper,
+        callback: ButtonCallback,
+    ) -> Result<Arc<DebounceButton>, ConfigError> {
         let delay =
             config.get_float_bounded("debounce_delay", Some(0.0), Some(0.0), None, None, None)?;
         let reactor = self
@@ -581,13 +823,72 @@ impl PrinterButtons {
             .upgrade()
             .map(|printer| printer.reactor())
             .ok_or_else(|| ConfigError::new("the buttons registry outlived the printer"))?;
-        let debounce = DebounceButton::new(reactor, delay, callback);
-        let handler = Arc::clone(&debounce);
-        self.register_buttons(
-            vec![pin.to_string()],
-            Box::new(move |eventtime, state| handler.button_handler(eventtime, state)),
-        )?;
+        Ok(DebounceButton::new(reactor, delay, callback))
+    }
+
+    /// Upstream's `register_adc_button` (`buttons.py:290-295`): one
+    /// `analog_range` band on the analog input at `pin`.
+    ///
+    /// The first registration of a pin builds the input (its sampling and the
+    /// `query_adc` name); later ones on the same pin only add a band, and keep
+    /// the first one's `pullup`, as upstream keeps one input per pin.
+    ///
+    /// # Errors
+    /// A pin that cannot be built as an analog input, or a `query_adc` object
+    /// that cannot be created.
+    pub fn register_adc_button(
+        &self,
+        pin: &str,
+        min_value: f64,
+        max_value: f64,
+        pullup: f64,
+        callback: ButtonCallback,
+    ) -> Result<(), ConfigError> {
+        let printer = self
+            .printer
+            .upgrade()
+            .ok_or_else(|| ConfigError::new("the buttons registry outlived the printer"))?;
+        let existing = self.lock().adc_buttons.get(pin).cloned();
+        let group = match existing {
+            Some(group) => group,
+            None => {
+                let group = McuAdcButtons::new(&printer, pin, pullup).map_err(ConfigError::new)?;
+                self.lock()
+                    .adc_buttons
+                    .insert(pin.to_string(), Arc::clone(&group));
+                group
+            }
+        };
+        group.setup_button(min_value, max_value, Arc::from(callback));
+        self.lock().adc_registrations.push(pin.to_string());
         Ok(())
+    }
+
+    /// Upstream's `register_debounce_adc_button` (`buttons.py:299-303`): the
+    /// analog registration behind the section's host debounce — what
+    /// `[gcode_button]`'s `analog_range` registers.
+    ///
+    /// # Errors
+    /// A negative or unparsable `debounce_delay`, or as
+    /// [`PrinterButtons::register_adc_button`].
+    pub fn register_debounce_adc_button(
+        &self,
+        config: &ConfigWrapper,
+        pin: &str,
+        min_value: f64,
+        max_value: f64,
+        pullup: f64,
+        callback: ButtonCallback,
+    ) -> Result<(), ConfigError> {
+        let debounce = self.debounce(config, callback)?;
+        let handler = Arc::clone(&debounce);
+        self.register_adc_button(
+            pin,
+            min_value,
+            max_value,
+            pullup,
+            Box::new(move |eventtime, state| handler.button_handler(eventtime, state)),
+        )
     }
 
     /// Upstream's `register_buttons` (`buttons.py:309-336`): one or more pins
@@ -691,6 +992,17 @@ impl PrinterButtons {
         self.lock().registrations.clone()
     }
 
+    /// How many analog bands have been registered (tests and diagnostics).
+    pub fn adc_registration_count(&self) -> usize {
+        self.lock().adc_registrations.len()
+    }
+
+    /// The pins of the analog registrations, in registration order (tests and
+    /// diagnostics).
+    pub fn registered_adc_pins(&self) -> Vec<String> {
+        self.lock().adc_registrations.clone()
+    }
+
     fn lock(&self) -> MutexGuard<'_, ButtonsRegistry> {
         self.state
             .lock()
@@ -703,7 +1015,9 @@ impl std::fmt::Debug for PrinterButtons {
         let state = self.lock();
         f.debug_struct("PrinterButtons")
             .field("registrations", &state.registrations.len())
+            .field("adc_registrations", &state.adc_registrations.len())
             .field("groups", &state.groups.len())
+            .field("adc_buttons", &state.adc_buttons.len())
             .finish()
     }
 }
@@ -722,6 +1036,8 @@ impl PrinterObject for PrinterButtons {
 mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::extras::query_adc::{QueryAdc, QUERY_ADC_OBJECT};
+    use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
     use crate::core::klippy::interface::devices::frame_mock::RecordingWire;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{BuiltConfig, ConfigBuilder, Dictionary, Mcu};
@@ -807,6 +1123,15 @@ mod tests {
     fn world() -> World {
         let reactor = Arc::new(ManualReactor::new());
         let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        // `[buttons]` loads `query_adc`, which registers `QUERY_ADC` in the
+        // command table, so the machine has to have the dispatcher the loader
+        // builds before any section.
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .expect("gcode registers once");
         let pins = Arc::new(PrinterPins::new());
         printer
             .add_object(PINS_OBJECT, Arc::clone(&pins) as Arc<dyn PrinterObject>)
@@ -885,6 +1210,219 @@ mod tests {
         for callback in built.take_post_init() {
             callback(mcu);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The analog path
+    // -----------------------------------------------------------------------
+
+    /// The raw sample that reports as the resistance `value` across the
+    /// pull-up, which is what a report carries after the ADC's scaling:
+    /// `value = pullup * adc / (1 - adc)` inverted.
+    fn sample_for(value: f64, pullup: f64) -> f64 {
+        value / (pullup + value)
+    }
+
+    /// A recorder of `(eventtime, state)` calls, as the consumer side sees them.
+    fn recorder() -> (ButtonCallback, Arc<Mutex<Vec<(f64, bool)>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&calls);
+        (
+            Box::new(move |eventtime, state| {
+                record
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push((eventtime, state));
+            }),
+            calls,
+        )
+    }
+
+    /// The analog input object a pin registered, for the state-machine tests.
+    fn the_adc_group(buttons: &Arc<PrinterButtons>, pin: &str) -> Arc<McuAdcButtons> {
+        let state = buttons.lock();
+        let group = state
+            .adc_buttons
+            .get(pin)
+            .expect("the pin has an analog input");
+        Arc::clone(group)
+    }
+
+    fn calls_of(calls: &Arc<Mutex<Vec<(f64, bool)>>>) -> Vec<(f64, bool)> {
+        calls.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// ② A sample inside a band becomes a press only after it has held for
+    /// `ADC_DEBOUNCE_TIME` (`buttons.py:139-145`), leaves the band as a release,
+    /// and the callback is dated by the reactor (`buttons.py:148-151`).
+    #[test]
+    fn test_an_analog_button_debounces_its_band_and_calls_back() {
+        let world = world();
+        let (callback, calls) = recorder();
+        world
+            .buttons
+            .register_adc_button("PA0", 0.0, 1000.0, 4700.0, callback)
+            .expect("the band registers");
+        let group = the_adc_group(&world.buttons, "PA0");
+        assert_eq!(world.buttons.adc_registration_count(), 1);
+        assert_eq!(world.buttons.registered_adc_pins(), vec!["PA0".to_string()]);
+
+        // In the band, but the window has not run out yet: nothing is reported.
+        let in_band = sample_for(500.0, 4700.0);
+        group.handle_samples(&[(0.000, in_band), (0.010, in_band)]);
+        world.reactor.run_due();
+        assert!(calls_of(&calls).is_empty(), "{:?}", calls_of(&calls));
+
+        // `ADC_DEBOUNCE_TIME` (0.025 s) after the band was entered: the press.
+        group.handle_samples(&[(0.025, in_band)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&calls), vec![(0.0, true)]);
+
+        // Out of the band (> the widest band's max): the window restarts, then
+        // the same callback is released.
+        let out = sample_for(2500.0, 4700.0);
+        group.handle_samples(&[(0.030, out)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&calls), vec![(0.0, true)]);
+        group.handle_samples(&[(0.055, out)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&calls), vec![(0.0, true), (0.0, false)]);
+    }
+
+    /// ② Two bands on one pin: the sample's band decides which callback is
+    /// pressed, and moving between the bands releases the old one first
+    /// (`buttons.py:139-145`).
+    #[test]
+    fn test_an_analog_button_switches_between_its_bands() {
+        let world = world();
+        let (first, first_calls) = recorder();
+        let (second, second_calls) = recorder();
+        world
+            .buttons
+            .register_adc_button("PA0", 0.0, 1000.0, 4700.0, first)
+            .expect("the first band registers");
+        world
+            .buttons
+            .register_adc_button("PA0", 1000.0, 2000.0, 4700.0, second)
+            .expect("the second band registers");
+        // One input per pin, however many bands it holds (`buttons.py:290-295`).
+        assert_eq!(
+            world.buttons.registered_adc_pins(),
+            vec!["PA0".to_string(), "PA0".to_string()]
+        );
+        assert_eq!(world.buttons.lock().adc_buttons.len(), 1);
+        let group = the_adc_group(&world.buttons, "PA0");
+
+        // Press the first band.
+        let low = sample_for(500.0, 4700.0);
+        group.handle_samples(&[(0.000, low), (0.025, low)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&first_calls), vec![(0.0, true)]);
+
+        // Straight into the second band: the first is released and the second
+        // pressed once the new band has held, with no release in between.
+        let high = sample_for(1500.0, 4700.0);
+        group.handle_samples(&[(0.030, high)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&second_calls), Vec::new());
+        group.handle_samples(&[(0.055, high)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&first_calls), vec![(0.0, true), (0.0, false)]);
+        assert_eq!(calls_of(&second_calls), vec![(0.0, true)]);
+    }
+
+    /// ② The sample is a fraction of the rail, not a resistance: it reaches the
+    /// bands only after `pullup * adc / (1 - adc)` (`buttons.py:117-118`), so a
+    /// sample of 0.5 with a 4700 ohm pull-up is 4700 ohms — outside a band that
+    /// tops out at 1000.
+    #[test]
+    fn test_an_analog_button_applies_the_pullup_divider() {
+        let world = world();
+        let (callback, calls) = recorder();
+        // The same band twice, at two pull-up values: the divider decides which
+        // of them the raw 0.5 falls in.
+        world
+            .buttons
+            .register_adc_button("PA0", 0.0, 1000.0, 4700.0, callback)
+            .expect("the band registers");
+        let group = the_adc_group(&world.buttons, "PA0");
+
+        group.handle_samples(&[(0.000, 0.5), (0.025, 0.5)]);
+        world.reactor.run_due();
+        assert!(
+            calls_of(&calls).is_empty(),
+            "a raw 0.5 is 4700 ohms across a 4700 pull-up: {:?}",
+            calls_of(&calls)
+        );
+
+        // A pull-up of 1000 turns a raw 0.4 into 667 ohms — inside the band.
+        let (small_callback, small_calls) = recorder();
+        world
+            .buttons
+            .register_adc_button("PA1", 0.0, 1000.0, 1000.0, small_callback)
+            .expect("the second pin registers");
+        let small = the_adc_group(&world.buttons, "PA1");
+        small.handle_samples(&[(0.000, 0.4), (0.025, 0.4)]);
+        world.reactor.run_due();
+        assert_eq!(calls_of(&small_calls), vec![(0.0, true)]);
+    }
+
+    /// The band edges are strict inside the band and inclusive on the widest
+    /// band, as upstream's two comparisons are (`buttons.py:123-126`).
+    #[test]
+    fn test_an_analog_band_edge_is_strict_inside_and_inclusive_on_the_outside() {
+        let noop: Arc<dyn Fn(f64, bool) + Send + Sync> = Arc::new(|_, _| {});
+        let state = AdcButtonsState {
+            buttons: vec![(0.0, 1000.0, Arc::clone(&noop)), (1000.0, 2000.0, noop)],
+            min_value: 0.0,
+            max_value: 2000.0,
+            ..AdcButtonsState::default()
+        };
+        // Exactly on the shared edge: no band holds it (`min < v < max`).
+        assert_eq!(state.band_at(1000.0), None);
+        assert_eq!(state.band_at(999.999), Some(0));
+        assert_eq!(state.band_at(1000.001), Some(1));
+        // The widest band is inclusive, so the rail values pass the gate but
+        // still land in no band.
+        assert_eq!(state.band_at(0.0), None);
+        assert_eq!(state.band_at(2000.0), None);
+        // Outside it, not even searched.
+        assert_eq!(state.band_at(2000.001), None);
+        // No registration at all: the default gate holds no sample.
+        assert_eq!(AdcButtonsState::default().band_at(500.0), None);
+    }
+
+    /// The registration names the input in `query_adc` as `adc_button:<pin>`
+    /// (`buttons.py:113-114`), once per pin however many bands it holds.
+    #[test]
+    fn test_an_analog_button_registers_its_name_in_query_adc() {
+        let world = world();
+        let (callback, _calls) = recorder();
+        world
+            .buttons
+            .register_adc_button(" PA0 ", 0.0, 1000.0, 4700.0, callback)
+            .expect("the band registers");
+        let query_adc = world
+            .printer
+            .lookup_object_as::<QueryAdc>(QUERY_ADC_OBJECT)
+            .expect("buttons loaded query_adc");
+        // The name is the pin with its padding stripped (`pin.strip()`).
+        assert_eq!(query_adc.names(), vec!["adc_button:PA0".to_string()]);
+    }
+
+    /// A pin that is not an analog input fails the registration with the pin
+    /// layer's message instead of coming up as a button that never reports.
+    #[test]
+    fn test_an_analog_button_needs_a_resolvable_pin() {
+        let world = world();
+        let (callback, _calls) = recorder();
+        let err = world
+            .buttons
+            .register_adc_button("nosuchchip:PA0", 0.0, 1000.0, 4700.0, callback)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nosuchchip"), "{err}");
+        assert_eq!(world.buttons.adc_registration_count(), 0);
     }
 
     // -----------------------------------------------------------------------

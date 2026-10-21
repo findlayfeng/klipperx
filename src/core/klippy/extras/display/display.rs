@@ -703,7 +703,7 @@ pub fn read_menu_options(config: &ConfigWrapper) -> Result<MenuOptions, ConfigEr
 ///
 /// The wrapper has no float-list getter; this is `getfloatlist(count=2)`
 /// (`klippy/configfile.py:115`) with its two error wordings.
-fn parse_float_list(
+pub(super) fn parse_float_list(
     config: &ConfigWrapper,
     option: &str,
     identifier: &str,

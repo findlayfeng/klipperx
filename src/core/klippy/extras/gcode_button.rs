@@ -10,8 +10,8 @@
 //! | `press_gcode` | — (required) | the template rendered on press (`:25`) |
 //! | `release_gcode` | `""` | the template rendered on release (`:26-27`) |
 //! | `debounce_delay` | `0.`, minimum `0.` | read by the button registration (`buttons.py:257`) |
-//! | `analog_range` | — | parsed, then refused — see below |
-//! | `analog_pullup_resistor` | `4700.`, above `0.` | read only alongside `analog_range`, then refused |
+//! | `analog_range` | — | the band of an analog button — see below |
+//! | `analog_pullup_resistor` | `4700.`, above `0.` | read only alongside `analog_range` |
 //!
 //! [`GCodeButton::button_callback`] is upstream's `button_callback`
 //! (`gcode_button.py:37-48`): the new state is recorded, then the press template
@@ -20,30 +20,29 @@
 //! / `RELEASED` (`:50-53`), and `QUERY_BUTTON BUTTON=<name>` reports the same
 //! (`:34-35`).
 //!
-//! # Gaps this port does not close yet
+//! # The two button kinds
 //!
-//! * **The button event** is live (2026-10-21): the registration goes to the
-//!   `buttons` module (`:17-18`), whose firmware query (`buttons.py`'s
-//!   `MCU_buttons` — `config_buttons`/`buttons_add`/`buttons_query`/
-//!   `buttons_ack`/`buttons_state`) fires this callback on a pin change, with
-//!   upstream's host debounce in between. The corpus only *loads*
-//!   `[gcode_button lcd_button]` (`printer-biqu-bx-2021.cfg:185`) and never
-//!   presses it, so the corpus exercises the registration alone.
-//! * **`analog_range`.** Upstream's analog branch (`gcode_button.py:19-23`)
-//!   registers through `buttons.register_debounce_adc_button`, which rests on
-//!   the `query_adc` object — absent from this host, the same reason
-//!   [`adc_scaled`](crate::core::klippy::extras::adc_scaled) skips it. The two
-//!   options are still read and validated (so their wording and the section's
-//!   option check match upstream), but a section that sets `analog_range` is
-//!   then refused with [`ANALOG_UNSUPPORTED`] rather than silently registered
-//!   as a digital button.
+//! * **Digital.** The registration goes to the `buttons` module (`:17-18`),
+//!   whose firmware query (`buttons.py`'s `MCU_buttons` — `config_buttons`/
+//!   `buttons_add`/`buttons_query`/`buttons_ack`/`buttons_state`) fires this
+//!   callback on a pin change, with upstream's host debounce in between. The
+//!   corpus only *loads* `[gcode_button lcd_button]`
+//!   (`printer-biqu-bx-2021.cfg:185`) and never presses it, so the corpus
+//!   exercises the registration alone.
+//! * **Analog.** With `analog_range`, upstream (`gcode_button.py:19-23`) reads
+//!   the band and the pull-up resistor and registers through
+//!   `buttons.register_debounce_adc_button`: the input is sampled periodically
+//!   and a sample inside the band is the "pressed" state (see
+//!   [`buttons`](crate::core::klippy::extras::buttons)' `McuAdcButtons`), with
+//!   the same `debounce_delay` on top. This port does the same; the input is
+//!   also nameable through `QUERY_ADC NAME=adc_button:<pin>`.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
-use crate::core::klippy::extras::buttons::PrinterButtons;
+use crate::core::klippy::extras::buttons::{ButtonCallback, PrinterButtons};
 use crate::core::klippy::extras::gcode_macro::PrinterGCodeMacro;
 use crate::core::klippy::extras::template::{
     Builtin, Context, PrinterView, Rt, Template, TemplateError,
@@ -60,11 +59,14 @@ section!("gcode_button", order = 30, prefix = load_config_prefix);
 /// `cmd_QUERY_BUTTON_help` (`gcode_button.py:33`).
 const QUERY_BUTTON_HELP: &str = "Report on the state of a button";
 
-/// Why a section that sets `analog_range` is refused: the analog button path
-/// needs `query_adc` / ADC-button infrastructure this host does not have (see
-/// the module docs).
-const ANALOG_UNSUPPORTED: &str =
-    "is not supported: this host has no query_adc / ADC-button infrastructure";
+/// The analog half of the section: the band a sample has to fall in to count
+/// as pressed, and the resistor that turns the sample into a resistance
+/// (`gcode_button.py:16-22`).
+struct AnalogRange {
+    min: f64,
+    max: f64,
+    pullup: f64,
+}
 
 /// One `[gcode_button <name>]` (upstream `GCodeButton`).
 pub struct GCodeButton {
@@ -85,6 +87,8 @@ pub struct GCodeButton {
     printer: Weak<Printer>,
     /// The dispatcher a button script is run through (`:28`).
     gcode: Arc<GCodeDispatch>,
+    /// The `analog_range` band and pull-up, when the section sets one (`:19-22`).
+    analog: Option<AnalogRange>,
 }
 
 impl GCodeButton {
@@ -92,10 +96,9 @@ impl GCodeButton {
     /// (`gcode_button.py:10-31`).
     ///
     /// # Errors
-    /// A missing `pin` / `press_gcode`, a template
-    /// [`template`](crate::core::klippy::extras::template) refuses to compile, or a
-    /// section that sets `analog_range` (read and validated first, then
-    /// refused — see the module docs).
+    /// A missing `pin` / `press_gcode`, a malformed `analog_range` pair, an
+    /// `analog_pullup_resistor` that is not above 0, or a template
+    /// [`template`](crate::core::klippy::extras::template) refuses to compile.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
         let name = config
             .section()
@@ -106,23 +109,26 @@ impl GCodeButton {
         // Upstream loads the `buttons` module even before it branches on
         // `analog_range` (`gcode_button.py:15-16`).
         PrinterButtons::ensure(printer)?;
-        if config.get_str("analog_range").is_some() {
-            // Read both values the way upstream reads them (`:20-21`), so their
-            // wording and the section's option check match, then report the gap.
-            parse_float_list(config, "analog_range", 2)?;
-            config.get_float_bounded(
-                "analog_pullup_resistor",
-                Some(4700.0),
-                None,
-                None,
-                Some(0.0),
-                None,
-            )?;
-            return Err(ConfigError::new(format!(
-                "Option 'analog_range' in section '{}' {ANALOG_UNSUPPORTED}",
-                config.identifier()
-            )));
-        }
+        let analog = match config.get_str("analog_range") {
+            None => None,
+            Some(_) => {
+                // Upstream's analog branch, in its order (`:20-21`).
+                let values = parse_float_list(config, "analog_range", 2)?;
+                let pullup = config.get_float_bounded(
+                    "analog_pullup_resistor",
+                    Some(4700.0),
+                    None,
+                    None,
+                    Some(0.0),
+                    None,
+                )?;
+                Some(AnalogRange {
+                    min: values[0],
+                    max: values[1],
+                    pullup,
+                })
+            }
+        };
         let gcode_macro = PrinterGCodeMacro::ensure(printer)?;
         let press_template = gcode_macro.load_template(config, "press_gcode", None)?;
         let release_template = gcode_macro.load_template(config, "release_gcode", Some(""))?;
@@ -137,6 +143,7 @@ impl GCodeButton {
             release_template,
             printer: Arc::downgrade(printer),
             gcode,
+            analog,
         })
     }
 
@@ -147,7 +154,8 @@ impl GCodeButton {
     ///
     /// # Errors
     /// A negative `debounce_delay` (read here, as upstream's `DebounceButton`
-    /// reads it), or a taken command name.
+    /// reads it), a pin that cannot be built as an analog input, or a taken
+    /// command name.
     fn attach(
         self: &Arc<Self>,
         config: &ConfigWrapper,
@@ -155,13 +163,20 @@ impl GCodeButton {
     ) -> Result<(), ConfigError> {
         let buttons = PrinterButtons::ensure(printer)?;
         let button = Arc::clone(self);
-        buttons.register_debounce_button(
-            config,
-            &self.pin,
-            Box::new(move |eventtime, state| {
-                button.button_callback(eventtime, state);
-            }),
-        )?;
+        let callback: ButtonCallback = Box::new(move |eventtime, state| {
+            button.button_callback(eventtime, state);
+        });
+        match &self.analog {
+            Some(range) => buttons.register_debounce_adc_button(
+                config,
+                &self.pin,
+                range.min,
+                range.max,
+                range.pullup,
+                callback,
+            )?,
+            None => buttons.register_debounce_button(config, &self.pin, callback)?,
+        }
 
         // Weakly: this object keeps the dispatcher (`gcode`), so a strong
         // capture here would close the loop `GCodeButton → dispatcher → command
@@ -336,6 +351,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::{AccessTracking, Config};
     use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::query_adc::QueryAdc;
     use crate::core::klippy::reactor::ManualReactor;
 
     /// A printer with `gcode` registered, as the loader builds it.
@@ -574,11 +590,12 @@ mod tests {
         assert!(err.contains("must have minimum of 0"), "{err}");
     }
 
-    /// A section that sets `analog_range` has both analog options read and
-    /// validated first, then is refused with the gap message (see the module
-    /// docs).
+    /// A section that sets `analog_range` registers an **analog** button: the
+    /// band and the pull-up are read (`gcode_button.py:20-21`) and the
+    /// registration goes through `register_debounce_adc_button`, which also
+    /// names the input in `query_adc` (`buttons.py:113-114, 299-303`).
     #[test]
-    fn test_analog_range_is_read_then_refused() {
+    fn test_analog_range_registers_an_adc_button() {
         let printer = printer();
 
         let (result, access) = build(
@@ -586,20 +603,31 @@ mod tests {
             "[gcode_button lcd_button]\npin: PH8\npress_gcode:\n    M117 x\n\
              analog_range: 1, 2\nanalog_pullup_resistor: 4700\n",
         );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains(
-                "Option 'analog_range' in section 'gcode_button lcd_button' is not supported: \
-                 this host has no query_adc / ADC-button infrastructure"
-            ),
-            "{err}"
-        );
+        let button = result.expect("the analog section loads");
         assert!(access.contains("gcode_button lcd_button", "analog_range"));
         assert!(access.contains("gcode_button lcd_button", "analog_pullup_resistor"));
+        // `debounce_delay` is still read, by the debounce the analog
+        // registration wraps its callback in.
+        assert!(access.contains("gcode_button lcd_button", "debounce_delay"));
+
+        let range = button.analog.as_ref().expect("the section is analog");
+        assert_eq!((range.min, range.max, range.pullup), (1.0, 2.0, 4700.0));
+        let buttons = printer
+            .lookup_object_as::<PrinterButtons>(
+                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
+            )
+            .expect("buttons is loaded");
+        assert_eq!(buttons.registered_adc_pins(), vec!["PH8".to_string()]);
+        // Not a digital registration: nothing went to the firmware query.
+        assert_eq!(buttons.registration_count(), 0);
+        let query_adc = printer
+            .lookup_object_as::<QueryAdc>(crate::core::klippy::extras::query_adc::QUERY_ADC_OBJECT)
+            .expect("buttons loaded query_adc");
+        assert_eq!(query_adc.names(), vec!["adc_button:PH8".to_string()]);
     }
 
-    /// The two analog options keep upstream's parse and bound wording, reported
-    /// before the gap message (`configfile.py:88-102`, `gcode_button.py:20-21`).
+    /// The two analog options keep upstream's parse and bound wording
+    /// (`configfile.py:88-102`, `gcode_button.py:20-21`).
     #[test]
     fn test_analog_options_keep_upstream_wording() {
         let printer = printer();

@@ -52,9 +52,7 @@
 //!   absent. `menu.cfg` never calls them.
 //! * **The rotary encoder.** `menu_keys.py:19-48` calls
 //!   `buttons.register_rotary_encoder`; this host's `buttons` registry has no
-//!   encoder, so `encoder_pins` is accepted and reported as unwired. The key
-//!   pins are registered as press buttons; an analog range on one is reported
-//!   rather than silently read as a digital input.
+//!   encoder, so `encoder_pins` is accepted and reported as unwired.
 //! * **`menuitem_from`** — building an item from keywords instead of a config
 //!   section. Upstream uses it for the list's `..` item and the SD-card files
 //!   only; here those are [`Element::Back`] and [`MenuManager::command_item`].
@@ -66,7 +64,7 @@ use serde_json::{json, Map, Value};
 
 use crate::core::klippy::config::{Config, ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
-use crate::core::klippy::extras::buttons::PrinterButtons;
+use crate::core::klippy::extras::buttons::{ButtonCallback, PrinterButtons};
 use crate::core::klippy::extras::gcode_macro::PrinterGCodeMacro;
 use crate::core::klippy::extras::py_literal;
 use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
@@ -75,7 +73,7 @@ use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
-use super::display::{draw_text, LcdChip, MenuOptions, PrinterLCD};
+use super::display::{draw_text, parse_float_list, LcdChip, MenuOptions, PrinterLCD};
 
 /// The shipped menu layout (`klippy/extras/display/menu.cfg`).
 ///
@@ -115,6 +113,44 @@ const KEY_PINS: &[(&str, &str)] = &[
     ("up_pin", "up"),
     ("down_pin", "down"),
 ];
+
+/// Register one key pin — upstream's `MenuKeys.register_button`
+/// (`menu_keys.py:45-61`).
+///
+/// An `analog_range_<option>` turns the key into an analog band on that pin
+/// (`buttons.register_adc_button`, `menu_keys.py:58-61`); without one the pin is
+/// a digital press button (`buttons.register_buttons`, `menu_keys.py:50-57`).
+/// The callback sees a press and a release in both cases, so the ones upstream
+/// registers push-only ignore the release themselves.
+///
+/// The two analog options are validated by `read_menu_options` before the menu is
+/// built; they are read again here for their values.
+///
+/// # Errors
+/// A malformed `analog_range_<option>` pair, an `analog_pullup_resistor` that is
+/// not above 0, or a pin the button registry cannot resolve.
+fn register_key(
+    buttons: &PrinterButtons,
+    config: &ConfigWrapper,
+    option: &str,
+    pin: &str,
+    callback: ButtonCallback,
+) -> Result<(), ConfigError> {
+    let range = format!("analog_range_{option}");
+    if config.has(&range) {
+        let values = parse_float_list(config, &range, &config.identifier(), 2)?;
+        let pullup = config.get_float_bounded(
+            "analog_pullup_resistor",
+            Some(4700.0),
+            None,
+            None,
+            Some(0.0),
+            None,
+        )?;
+        return buttons.register_adc_button(pin, values[0], values[1], pullup, callback);
+    }
+    buttons.register_buttons(vec![pin.to_string()], callback)
+}
 
 /// A failure in the menu engine, as the text a log line or a config error
 /// carries.
@@ -1362,43 +1398,31 @@ impl MenuManager {
             let Some(pin) = keys.pin(option) else {
                 continue;
             };
-            let analog = format!("analog_range_{option}");
-            if config.has(&analog) {
-                tracing::warn!(
-                    "menu: '{analog}' is configured; analog buttons are not implemented in this \
-                     host, so '{option}' is not registered"
-                );
-                continue;
-            }
             let weak = self.self_ref.clone();
             let event = event.to_string();
             let is_click = event == "click";
-            buttons.register_buttons(
-                vec![pin],
-                Box::new(move |eventtime, state| {
-                    let Some(manager) = weak.upgrade() else {
-                        return;
-                    };
-                    if is_click {
-                        manager.click_callback(eventtime, state);
-                    } else if state {
-                        manager.key_event(&event, eventtime);
-                    }
-                }),
-            )?;
+            let callback: ButtonCallback = Box::new(move |eventtime, state| {
+                let Some(manager) = weak.upgrade() else {
+                    return;
+                };
+                if is_click {
+                    manager.click_callback(eventtime, state);
+                } else if state {
+                    manager.key_event(&event, eventtime);
+                }
+            });
+            register_key(&buttons, config, option, &pin, callback)?;
         }
         if let Some(pin) = &keys.kill_pin {
             let printer = Arc::downgrade(&self.printer);
-            buttons.register_buttons(
-                vec![pin.clone()],
-                Box::new(move |_, state| {
-                    if state {
-                        if let Some(printer) = printer.upgrade() {
-                            printer.invoke_shutdown("Shutdown due to kill button!");
-                        }
+            let callback: ButtonCallback = Box::new(move |_, state| {
+                if state {
+                    if let Some(printer) = printer.upgrade() {
+                        printer.invoke_shutdown("Shutdown due to kill button!");
                     }
-                }),
-            )?;
+                }
+            });
+            register_key(&buttons, config, "kill_pin", pin, callback)?;
         }
         Ok(())
     }
@@ -1679,6 +1703,50 @@ impl MenuManager {
             Some(container) => container.draw_rows(self, eventtime),
             None => Vec::new(),
         }
+    }
+
+    // -- the key buttons ----------------------------------------------------
+
+    /// An `analog_range_<key>` turns that key into an analog band on its pin
+    /// (`menu_keys.py:58-61`): the analog registration, not the pin query, and
+    /// the input is named in `query_adc` (`buttons.py:113-114`).
+    #[test]
+    fn test_an_analog_key_registers_an_adc_button() {
+        let printer = load(
+            "up_pin: PA0\nanalog_range_up_pin: 100, 1000\nanalog_pullup_resistor: 4700\n",
+            "",
+        );
+        let buttons = printer
+            .lookup_object_as::<PrinterButtons>(
+                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
+            )
+            .expect("the menu registers its keys through buttons");
+        assert_eq!(buttons.registered_adc_pins(), vec!["PA0".to_string()]);
+        assert_eq!(
+            buttons.registration_count(),
+            0,
+            "an analog key is not a pin query"
+        );
+        let query_adc = printer
+            .lookup_object_as::<crate::core::klippy::extras::query_adc::QueryAdc>(
+                crate::core::klippy::extras::query_adc::QUERY_ADC_OBJECT,
+            )
+            .expect("buttons loaded query_adc");
+        assert_eq!(query_adc.names(), vec!["adc_button:PA0".to_string()]);
+    }
+
+    /// A key without an `analog_range_*` stays a digital pin query
+    /// (`menu_keys.py:50-57`).
+    #[test]
+    fn test_a_key_without_an_analog_range_is_a_digital_button() {
+        let printer = load("up_pin: PA0\n", "");
+        let buttons = printer
+            .lookup_object_as::<PrinterButtons>(
+                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
+            )
+            .expect("the menu registers its keys through buttons");
+        assert_eq!(buttons.registered_pins(), vec![vec!["PA0".to_string()]]);
+        assert_eq!(buttons.adc_registration_count(), 0);
     }
 
     // -- navigation ---------------------------------------------------------

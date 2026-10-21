@@ -151,7 +151,14 @@ const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
 /// has nothing to attach to.
 ///
 /// `tuning_tower` is the first entry: it takes `gcode_move`'s transform slot at
-/// load time so `TUNING_TOWER` works without a `[tuning_tower]` section.
+/// load time so `TUNING_TOWER` works without a `[tuning_tower]` section. It could
+/// only be made unconditional after its command handler stopped capturing a
+/// strong `Arc<Self>`: `TuningTower` holds the dispatcher, so the strong capture
+/// closed `TuningTower → dispatcher → command table → TuningTower`, and that ring
+/// outlived `teardown` — the machine then never dropped its parts, the fake
+/// MCU's blocking read stayed parked, and the runtime's shutdown waited forever
+/// (a test that loads it hung with nothing left to print). The `Weak` capture is
+/// the same convention `VirtualSdCard`/`GCodeButton`/`pause_resume` follow.
 const TOOLHEAD_MODULES: &[&str] = &["tuning_tower"];
 
 /// Every section id this host knows, in load order.

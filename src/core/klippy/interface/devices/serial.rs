@@ -1230,6 +1230,25 @@ pub const CAN_ASSIGN_CONFIRM_WINDOW: Duration = Duration::from_millis(300);
 /// larger reads simply take another turn.
 const READ_CHUNK: usize = 1024;
 
+/// How many units one listener's queue holds before the link starts dropping.
+///
+/// A listener that stops draining must neither grow the reader's memory without
+/// bound nor **block** it: the one reader serves every MCU on the port, so a stuck
+/// scan or tunnel would stall the whole line. Dropping is upstream's policy when
+/// its buffers are full. The bound is generous enough that a scan's answers and a
+/// flashing session's acknowledgements are read as they come.
+const LISTENER_QUEUE_BOUND: usize = 64;
+
+/// How many bytes one MCU's reassembly buffer holds before the reader drops and
+/// resynchronises.
+///
+/// Same reason as [`LISTENER_QUEUE_BOUND`], one level down: a handle that stopped
+/// calling `receive` (or was shut down a moment ago) must not turn the line's
+/// traffic into unbounded memory. Sixty-four maximal frames is far more than a
+/// reading handle ever holds, and a buffer that did fill loses frames it was
+/// never going to read — the next SYNC re-frames the stream.
+const MCU_SLOT_BUFFER_BOUND: usize = 64 * crate::core::klippy::frame::MESSAGE_MAX;
+
 // ===========================================================================
 // The frame header and the assignment pseudo-frame
 // ===========================================================================
@@ -1807,21 +1826,40 @@ pub(crate) fn tunnel_block(unit: &[u8]) -> Option<&[u8]> {
 /// reassembles one itself. The receiving end is the [`mpsc::Receiver`]
 /// [`TunnelSink::channel`] returns; dropping it is how a listener leaves, and
 /// the link notices on the next delivery (see [`TunnelRegistry::deliver`]).
+///
+/// The queue is **bounded** ([`LISTENER_QUEUE_BOUND`] blocks): a sink nobody
+/// drains costs the link a dropped block and a warning, never the reader's
+/// memory or its progress — one stuck consumer must not stall every other MCU on
+/// the port.
 #[derive(Debug, Clone)]
 pub struct TunnelSink {
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl TunnelSink {
     /// A sink and the receiver it hands whole katapult blocks to.
     pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
-        let (frames, receiver) = mpsc::channel();
+        let (frames, receiver) = mpsc::sync_channel(LISTENER_QUEUE_BOUND);
         (Self { frames }, receiver)
     }
 
     /// Hand one whole tunnel block over; `false` when the receiver is gone.
-    fn deliver(&self, frame: &[u8]) -> bool {
-        self.frames.send(frame.to_vec()).is_ok()
+    ///
+    /// A full queue drops the block and answers `true`: the listener is still
+    /// there, it is just behind — the link does not wait for it.
+    fn deliver(&self, arb: u32, frame: &[u8]) -> bool {
+        match self.frames.try_send(frame.to_vec()) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "tunnel listener for arb {arb:#x} is {LISTENER_QUEUE_BOUND} blocks behind; \
+                     dropping one {}-byte block",
+                    frame.len()
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
@@ -1856,12 +1894,13 @@ impl TunnelRegistry {
 
     /// Hand one whole tunnel frame to `arb`'s listener, if any.
     ///
-    /// `true` when it was delivered. `false` when nobody listens — including a
-    /// listener whose receiver has been dropped, which is removed here so a
-    /// later delivery does not try it again.
+    /// `true` when the listener took it (a queue that is full drops the frame and
+    /// warns — the listener is still there, just behind). `false` when nobody
+    /// listens — including a listener whose receiver has been dropped, which is
+    /// removed here so a later delivery does not try it again.
     pub(crate) fn deliver(&self, arb: u32, frame: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
-        let delivered = sinks.get(&arb).map(|sink| sink.deliver(frame));
+        let delivered = sinks.get(&arb).map(|sink| sink.deliver(arb, frame));
         match delivered {
             Some(true) => true,
             Some(false) => {
@@ -1882,21 +1921,40 @@ impl TunnelRegistry {
 /// [`SharedSerialHandle::set_unit_sink`] gets each one whole — header included,
 /// the shape [`UnassignedScan::feed`] takes — on the receiver
 /// [`UnitSink::channel`] returns; dropping it is how a listener leaves.
+///
+/// The queue is bounded like [`TunnelSink`]'s ([`LISTENER_QUEUE_BOUND`]): an
+/// answer nobody reads is dropped with a warning rather than growing the reader's
+/// memory, and a scan that stopped reading cannot stall the port.
 #[derive(Debug, Clone)]
 pub struct UnitSink {
-    units: mpsc::Sender<Vec<u8>>,
+    units: mpsc::SyncSender<Vec<u8>>,
 }
 
 impl UnitSink {
     /// A sink and the receiver it hands whole units to.
     pub fn channel() -> (Self, mpsc::Receiver<Vec<u8>>) {
-        let (units, receiver) = mpsc::channel();
+        let (units, receiver) = mpsc::sync_channel(LISTENER_QUEUE_BOUND);
         (Self { units }, receiver)
     }
 
     /// Hand one whole unit over; `false` when the receiver is gone.
-    fn deliver(&self, unit: &[u8]) -> bool {
-        self.units.send(unit.to_vec()).is_ok()
+    ///
+    /// A full queue drops the unit — a scan behind by
+    /// [`LISTENER_QUEUE_BOUND`] answers has more than it can use anyway — and
+    /// answers `true`, because the listener is still there.
+    fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
+        match self.units.try_send(unit.to_vec()) {
+            Ok(()) => true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                warn!(
+                    "unit listener for arb {arb:#x} is {LISTENER_QUEUE_BOUND} units behind; \
+                     dropping one {}-byte unit",
+                    unit.len()
+                );
+                true
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => false,
+        }
     }
 }
 
@@ -1938,10 +1996,11 @@ impl UnitRegistry {
 
     /// Hand one whole unit to `arb`'s listener, if any. `false` when nobody
     /// listens — including a listener whose receiver has been dropped, which is
-    /// removed here so a later delivery does not try it again.
+    /// removed here so a later delivery does not try it again. A listener whose
+    /// queue is full keeps its registration and loses the unit.
     pub(crate) fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
-        match sinks.get(&arb).map(|sink| sink.deliver(unit)) {
+        match sinks.get(&arb).map(|sink| sink.deliver(arb, unit)) {
             Some(true) => true,
             Some(false) => {
                 sinks.remove(&arb);
@@ -2411,7 +2470,7 @@ struct McuSlot {
 impl McuSlot {
     fn new() -> Self {
         Self {
-            incoming: Mutex::new(FrameStream::new()),
+            incoming: Mutex::new(FrameStream::with_bound(MCU_SLOT_BUFFER_BOUND)),
             cv: Condvar::new(),
             ack: Mutex::new(None),
             ack_cv: Condvar::new(),
@@ -3037,7 +3096,13 @@ fn push_frame(port: &SharedSerialPort, mcu_id: u32, frame: &[u8]) {
     match slot {
         Some(slot) => {
             let mut incoming = slot.incoming.lock().unwrap();
-            incoming.push(frame);
+            if incoming.push(frame) {
+                warn!(
+                    "shared serial {}: mcu {mcu_id}'s frame buffer is full ({MCU_SLOT_BUFFER_BOUND} \
+                     bytes); dropping frames and resynchronising",
+                    port.path.display()
+                );
+            }
             slot.cv.notify_all();
         }
         None => debug!(
@@ -3412,14 +3477,16 @@ impl SharedSerialHandle {
     /// this handle) and [`attach`]'s failure path (the attaching thread) all
     /// come here, each before the handle's last reference goes. The `ptr_eq`
     /// check keeps a handle from taking down a slot a later attach on the same
-    /// id registered: two attaches on one id are not supported, but the
-    /// failure path runs after a handshake another thread can race past, so the
-    /// guard has to be the same everywhere.
+    /// id registered: [`register_slot`] refuses an id that still has a slot, but a
+    /// handle that was **shut down** has already left the map while its owner may
+    /// still hold it, so the id is free again for an attach whose slot the stale
+    /// handle's `Drop` must leave alone.
     ///
     /// Once the entry is gone, `push_frame` finds no slot for this id and drops
     /// its frames — the "a failed `Sender` drops the frame" behaviour of the
-    /// host side, and what keeps a shut-down handle's stream from growing
-    /// unbounded (`FrameStream` is an unbounded `Vec`).
+    /// host side. That is also what keeps a shut-down handle's stream from
+    /// filling up: a slot nobody owns any more stops collecting at
+    /// [`MCU_SLOT_BUFFER_BOUND`] even before this runs.
     fn unregister(&self) {
         let Ok(mut slots) = self.port.slots.lock() else {
             return; // a poisoned map is not repaired from a teardown
@@ -3493,8 +3560,8 @@ impl Device for SharedSerialHandle {
         self.stopped.store(true, Ordering::SeqCst);
         // A stopped handle never reads its slot again (`receive` returns `None`),
         // so the slot goes with it: otherwise `push_frame` would keep pushing
-        // this id's frames into a stream nobody drains, for as long as the port
-        // lives (`FrameStream` is an unbounded `Vec`). Frames for this id are
+        // this id's frames into a stream nobody drains, and its own bound would
+        // drop them one by one (`MCU_SLOT_BUFFER_BOUND`). Frames for this id are
         // dropped from here on, like a failed `Sender` on the host side.
         self.unregister();
         let _guard = self.slot.incoming.lock().unwrap();
@@ -4177,7 +4244,7 @@ mod mux_tests {
             "a silent device is not an error"
         );
         assert!(
-            sink.deliver(&admin_answer(uuid, None)),
+            sink.deliver(ADMIN_REPLY, &admin_answer(uuid, None)),
             "the listener is still there"
         );
         assert_eq!(
@@ -6803,6 +6870,89 @@ mod mux_tests {
             "cleared means no listener"
         );
         assert!(frames.recv_timeout(Duration::from_millis(200)).is_err());
+    }
+
+    /// A listener that stopped draining loses blocks instead of stalling the
+    /// line: its queue is bounded, and a full one drops the block while the
+    /// listener stays registered.
+    #[test]
+    fn a_listener_that_stopped_draining_loses_blocks_instead_of_stalling_the_link() {
+        let registry = TunnelRegistry::new();
+        let arb = assign::reply_arb_id(4).expect("a valid mcu id");
+        let (sink, frames) = TunnelSink::channel();
+        registry.register(arb, sink);
+
+        for _ in 0..LISTENER_QUEUE_BOUND {
+            assert!(
+                registry.deliver(arb, &TUNNEL_ACK),
+                "the queue holds {LISTENER_QUEUE_BOUND} blocks"
+            );
+        }
+        // The one past the bound is dropped — and delivery still answers, because
+        // the listener is there, just behind.
+        assert!(
+            registry.deliver(arb, &TUNNEL_ACK),
+            "a full queue drops the block, it does not lose the listener"
+        );
+
+        // Exactly the bounded number of blocks is waiting.
+        let mut got = 0;
+        while frames.recv_timeout(Duration::from_millis(200)).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, LISTENER_QUEUE_BOUND);
+    }
+
+    /// A slot nobody drains stops collecting at its bound, and the frames it
+    /// could not hold cost the reader nothing.
+    #[test]
+    fn a_slot_nobody_drains_stops_collecting_at_its_bound() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+
+        // More frames than the slot can hold, all pushed by the reader without a
+        // single `receive`: this is a handle that stopped draining.
+        let frame = Frame::encode(1, b"0123456789abcdef");
+        let per_frame = device_unit(4, &frame).len();
+        let count = MCU_SLOT_BUFFER_BOUND / per_frame + 8;
+        let mut wire = Vec::with_capacity(count * per_frame);
+        for _ in 0..count {
+            wire.extend_from_slice(&device_unit(4, &frame));
+        }
+        master_write(&pty.master, &wire);
+
+        // Wait for the reader to be done with it: the buffer stops changing.
+        let mut last = usize::MAX;
+        let mut stable = 0;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && stable < 3 {
+            thread::sleep(Duration::from_millis(10));
+            let buffered = handle.slot.incoming.lock().unwrap().buffered_bytes();
+            if buffered == last {
+                stable += 1;
+            } else {
+                stable = 0;
+                last = buffered;
+            }
+        }
+
+        let buffered = handle.slot.incoming.lock().unwrap().buffered_bytes();
+        assert!(
+            buffered <= MCU_SLOT_BUFFER_BOUND,
+            "a slot never holds more than its bound: {buffered}"
+        );
+        assert!(
+            buffered < count * per_frame,
+            "the surplus is dropped, not buffered: {buffered} of {}",
+            count * per_frame
+        );
+
+        // The reader is alive and the port still up: the drop is a frame's, never
+        // the link's.
+        assert!(
+            !handle.port.stopped.load(Ordering::SeqCst),
+            "a full slot must not stop the port"
+        );
     }
 
     #[test]

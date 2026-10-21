@@ -8,6 +8,7 @@
 //! | the panel | `lcd_type` picks a [`LcdChip`] | `display.py:16-22`, `:181` |
 //! | `[display_status]` | created on demand, whether or not the config names it | `display.py:188` |
 //! | the menu | [`MenuManager`](super::menu::MenuManager), on the primary display only | `display.py:180-190` |
+//! | the menu's frame | while it is open, each of its rows is painted as one line from column 0 | `menu.py:601-660`, `:842-853` |
 //! | the menu keys | registered as buttons by the manager | `menu_keys.py:12-43` |
 //! | templates | the shipped `display.cfg` is merged into the `display_template` registry | `display.py:115-166` |
 //! | layouts | `display_data` groups | `display.py:56-87` |
@@ -33,13 +34,6 @@
 //!
 //! # What is not here
 //!
-//! # What is not here
-//!
-//! * **The menu's rows are computed, not painted.** The menu is wired in
-//!   ([`MenuManager`]) and owns the frame while it is open
-//!   (`display.py:227-231`), but [`MenuManager::screen_rows`] hands back the
-//!   rows it would draw — nothing paints them yet, so an open menu shows the
-//!   cleared screen. [`draw_text`] is what a later unit paints them with.
 //! * **`[display_data]` / `[display_glyph]` in the main config.** Only the
 //!   shipped `display.cfg` is read; a config's own layouts and glyphs have no
 //!   factory, so the loader still rejects them (see the parent module's docs).
@@ -398,26 +392,27 @@ impl PrinterLCD {
         *self.timer.lock().unwrap_or_else(|p| p.into_inner()) = Some(handle);
     }
 
-    /// One refresh (`display.py:222-241`).
+    /// One refresh (`display.py:222-241`), into `chip`.
     ///
-    /// The menu is asked first, exactly as upstream: while it is open it owns
-    /// the screen and the group is not drawn (`display.py:227-231`). Otherwise
-    /// the frame is the active layout redrawn from scratch — clear, render and
-    /// draw the group's items, flush — and what the render raises is swallowed
-    /// and logged (`display.py:234-237`), so a broken layout shows the part it
-    /// managed to draw instead of stopping the printer. The menu's own rows are
-    /// still only computed (module docs).
-    fn screen_update_event(&self, eventtime: f64) -> Option<f64> {
+    /// The panel is an argument rather than `self.lcd_chip` so that a frame can
+    /// be drawn into another [`LcdChip`] — that is how a test reads one back.
+    /// The rest is upstream's order: the menu is asked first, and while it is
+    /// open it owns the screen and the group is not drawn (`display.py:227-231`).
+    /// Otherwise the frame is the active layout redrawn from scratch — clear,
+    /// render and draw the group's items, flush — and what the render raises is
+    /// swallowed and logged (`display.py:234-237`), so a broken layout shows the
+    /// part it managed to draw instead of stopping the printer.
+    fn draw_screen(&self, chip: &Arc<dyn LcdChip>, eventtime: f64) -> Option<f64> {
         if self.redraw_request_pending.swap(false, Ordering::SeqCst) {
             *self.redraw_time.lock().unwrap_or_else(|p| p.into_inner()) =
                 eventtime + REDRAW_MIN_TIME;
         }
-        self.lcd_chip.clear();
+        chip.clear();
         // `display.py:227-231`: the menu redraws the screen and asks for the
         // regular period.
         if let Some(menu) = self.menu() {
-            if menu.screen_update_event(eventtime) {
-                self.lcd_chip.flush();
+            if menu.screen_update_event(chip, eventtime) {
+                chip.flush();
                 return Some(eventtime + REDRAW_TIME);
             }
         }
@@ -425,16 +420,11 @@ impl PrinterLCD {
         // raises is swallowed here (`display.py:234-237`).
         let group = self.show_data_group();
         if let Some(group) = self.display_data_groups.get(&group) {
-            if let Err(err) = show_group(
-                &self.lcd_chip,
-                group,
-                &self.display_templates,
-                &self.printer,
-            ) {
+            if let Err(err) = show_group(chip, group, &self.display_templates, &self.printer) {
                 warn!("Error during display screen update: {err}");
             }
         }
-        self.lcd_chip.flush();
+        chip.flush();
         if self.redraw_request_pending.load(Ordering::SeqCst) {
             return Some(
                 *self
@@ -444,6 +434,11 @@ impl PrinterLCD {
             );
         }
         Some(eventtime + REDRAW_TIME)
+    }
+
+    /// One refresh of this display's own panel (`display.py:222-241`).
+    fn screen_update_event(&self, eventtime: f64) -> Option<f64> {
+        self.draw_screen(&self.lcd_chip, eventtime)
     }
 
     /// `SET_DISPLAY_GROUP` (`display.py:266-271`).
@@ -2126,5 +2121,146 @@ mod tests {
     /// reports them.
     fn row_columns(row: usize, col: usize, width: usize) -> Vec<(usize, usize)> {
         (col..col + width).map(|x| (row, x)).collect()
+    }
+
+    // -- the menu's frame ---------------------------------------------------
+
+    /// The layout machine plus a small menu the panel can paint: a list whose
+    /// first row is its `..`, then a command and a container.
+    fn menu_machine() -> Arc<Printer> {
+        struct Stub(Value);
+        impl PrinterObject for Stub {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                self.0.clone()
+            }
+        }
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __test\n\
+             [menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __a]\n\
+             type: command\n\
+             name: A\n\
+             gcode: M117 a\n\
+             [menu __test __sub]\n\
+             type: list\n\
+             name: Sub\n"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let printer = machine();
+        printer.load_config(&config).expect("the config loads");
+        printer
+            .add_object("gcode_move", Arc::new(Stub(json!({ "speed_factor": 1.0 }))))
+            .expect("the name is free");
+        printer
+            .add_object(
+                "toolhead",
+                Arc::new(Stub(json!({
+                    "extruder": "extruder",
+                    "position": { "x": 0.0, "y": 0.0, "z": 0.0 },
+                    "estimated_print_time": 0.0,
+                }))),
+            )
+            .expect("the name is free");
+        printer
+    }
+
+    /// One refresh of `display` into `panel`, as the four rows it holds after.
+    fn frame(display: &Arc<PrinterLCD>, panel: &Arc<FakePanel>, eventtime: f64) -> Vec<String> {
+        let chip: Arc<dyn LcdChip> = Arc::clone(panel) as Arc<dyn LcdChip>;
+        display
+            .draw_screen(&chip, eventtime)
+            .expect("a refresh always asks for the next frame");
+        (0..4).map(|row| panel.row(row)).collect()
+    }
+
+    /// A frame's rows as hex, two digits a byte, so they are pinned byte for
+    /// byte.
+    fn hex_frame(frame: &[String]) -> Vec<String> {
+        frame
+            .iter()
+            .map(|row| row.bytes().map(|byte| format!("{byte:02x}")).collect())
+            .collect()
+    }
+
+    /// The open menu's frame: every row of the container is painted from
+    /// column 0 — the `..` row first with the cursor on it, the names padded to
+    /// the panel, the container's `>` in the last cell — and a `down` moves the
+    /// cursor, the next frame following it.
+    #[test]
+    fn test_the_open_menu_paints_its_rows_and_moves_the_cursor() {
+        let printer = menu_machine();
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        let menu = display.menu().expect("the primary display owns the menu");
+        let panel = FakePanel::new();
+
+        menu.begin(0.0);
+        let open = hex_frame(&frame(&display, &panel, 1.0));
+        assert_eq!(
+            open,
+            [
+                // ">..                 " — cursor on the `..` row
+                "3e2e2e2020202020202020202020202020202020".to_string(),
+                // " A                  "
+                "2041202020202020202020202020202020202020".to_string(),
+                // " Sub           >    " — the container's marker, last
+                // cell of the 16-column row
+                "2053756220202020202020202020203e20202020".to_string(),
+                // the row past the container is blank
+                "2020202020202020202020202020202020202020".to_string(),
+            ]
+        );
+
+        // `down` selects `A`: the row above loses the cursor, the row below
+        // gains it, and nothing else changes.
+        menu.down(false);
+        let moved = hex_frame(&frame(&display, &panel, 2.0));
+        assert_eq!(
+            moved,
+            [
+                // " ..                 "
+                "202e2e2020202020202020202020202020202020".to_string(),
+                // ">A                  "
+                "3e41202020202020202020202020202020202020".to_string(),
+                // " Sub           >    "
+                "2053756220202020202020202020203e20202020".to_string(),
+                "2020202020202020202020202020202020202020".to_string(),
+            ]
+        );
+    }
+
+    /// Closing the menu hands the frame back to the active `display_data`
+    /// group: the next refresh is the `_default_16x4` layout, not the menu's
+    /// rows.
+    #[test]
+    fn test_closing_the_menu_returns_the_panel_to_the_display_group() {
+        let printer = menu_machine();
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        let menu = display.menu().expect("the primary display owns the menu");
+        let panel = FakePanel::new();
+
+        menu.begin(0.0);
+        let open = frame(&display, &panel, 1.0);
+        menu.exit(true);
+        let closed = hex_frame(&frame(&display, &panel, 2.0));
+
+        assert_ne!(closed, hex_frame(&open), "the menu's frame is gone");
+        assert_eq!(
+            closed,
+            [
+                "2020202020202020202020202020202020202020".to_string(),
+                // "          #100%     " — the feedrate glyph and its speed
+                "2020202020202020202023313030252020202020".to_string(),
+                // "    0%     00:00    " — the progress and the clock
+                "202020203025202020202030303a303020202020".to_string(),
+                // "Ready               "
+                "5265616479202020202020202020202020202020".to_string(),
+            ]
+        );
     }
 }

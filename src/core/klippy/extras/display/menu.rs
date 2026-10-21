@@ -14,7 +14,7 @@
 //! |---|---|---|
 //! | [`MenuManager`] | `MenuManager` (`menu.py:586`) | the stack, the key events, the script queue, the `menu` object |
 //! | [`MenuItem`] | `MenuElement` and its subclasses (`menu.py:17`) | one item: `disabled`, `command`, `input`, `list`, `vsdlist` |
-//! | [`MenuRow`] | `MenuList.draw_container` (`menu.py:499`) | one laid-out screen row |
+//! | [`MenuRow`] | `MenuList.draw_container` (`menu.py:601`) | one laid-out screen row, and the line it is drawn as |
 //! | `menu_keys` | `menu_keys.py` | the key names, and the buttons that send them |
 //!
 //! # Templates
@@ -33,14 +33,18 @@
 //! `{printer.idle_timeout.state == "Printing"}` renders `True`/`False` and the
 //! item is enabled on the first.
 //!
+//! # Drawing
+//!
+//! While the menu is open it owns the frame: its refresh hook
+//! ([`MenuManager::screen_update_event`]) lays the open container's rows out
+//! and paints each of them as one line from column 0 with
+//! [`display::draw_text`](super::display::draw_text) — the [`MenuRow`]'s cursor,
+//! name and folder marker, exactly as `MenuList.draw_container` writes them
+//! (`menu.py:601-660`). A container that lays nothing out (upstream's
+//! `MenuContainer.draw_container` is `pass`) leaves the cleared screen.
+//!
 //! # What is not here
 //!
-//! * **Drawing onto the panel.** The framework has
-//!   [`display::draw_text`](super::display::draw_text) and
-//!   [`display::draw_progress_bar`](super::display::draw_progress_bar) now, but
-//!   nothing hands the menu's rows to them yet: a container lays its rows out
-//!   into [`MenuManager::screen_rows`] and the panel keeps the cleared screen.
-//!   A `display_data` layout does draw (see `display.rs`'s module docs).
 //! * **The `menu:*` printer events** (`begin`, `init`, `populate`, `exit`).
 //!   This host's event bus is a generated enum and no part subscribes to them.
 //! * **`menu.back()` / `menu.exit()` inside a script** (`menu.py:679-684`): a
@@ -71,7 +75,7 @@ use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
-use super::display::{MenuOptions, PrinterLCD};
+use super::display::{draw_text, LcdChip, MenuOptions, PrinterLCD};
 
 /// The shipped menu layout (`klippy/extras/display/menu.cfg`).
 ///
@@ -274,7 +278,7 @@ impl ItemData {
     }
 }
 
-/// One rendered screen row (`MenuList.draw_container`).
+/// One rendered screen row (`MenuList.draw_container`, `menu.py:601-660`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MenuRow {
     /// The selection cursor (`>`; `*` while the row is being edited; otherwise
@@ -285,6 +289,23 @@ pub struct MenuRow {
     pub text: String,
     /// The folder marker (`>` for a container).
     pub suffix: String,
+}
+
+impl MenuRow {
+    /// The row as the one line it is drawn as: the cursor, the name and the
+    /// folder marker side by side, `cols` characters wide.
+    ///
+    /// `draw_container` writes the three parts at columns `0`, `plen` and
+    /// `cols - slen` (`menu.py:641-657`); they do not overlap, so one write of
+    /// the concatenation fills the same cells.
+    pub fn line(&self) -> String {
+        let mut line =
+            String::with_capacity(self.prefix.len() + self.text.len() + self.suffix.len());
+        line.push_str(&self.prefix);
+        line.push_str(&self.text);
+        line.push_str(&self.suffix);
+        line
+    }
 }
 
 // ===========================================================================
@@ -889,7 +910,7 @@ impl MenuItem {
             .map(|index| index as isize)
     }
 
-    /// Lay the container's visible rows out (`draw_container`, `menu.py:499-566`).
+    /// Lay the container's visible rows out (`draw_container`, `menu.py:601-660`).
     fn draw_rows(&self, manager: &MenuManager, eventtime: f64) -> Vec<MenuRow> {
         let nrows = manager.rows();
         let cols = manager.cols();
@@ -949,7 +970,7 @@ impl MenuItem {
             let width = cols.saturating_sub(prefix_len + suffix_len);
             let text_len = text.chars().count();
             // `draw_text` answers the column after the text, so the scroller
-            // starts when that column is past the panel (`menu.py:548-555`).
+            // starts when that column is past the panel (`menu.py:645-653`).
             let text_column = prefix_len + text_len.max(width);
             let scroller = selected && text_column > cols && current.is_scrollable();
             current.need_scroller(if scroller { Some(true) } else { None });
@@ -1621,24 +1642,33 @@ impl MenuManager {
 
     // -- the screen ---------------------------------------------------------
 
-    /// The refresh hook (`screen_update_event`, `menu.py:835-846`): `true`
-    /// while the menu owns the screen.
-    pub fn screen_update_event(&self, eventtime: f64) -> bool {
+    /// The refresh hook (`screen_update_event`, `menu.py:842-853`): paint the
+    /// open container's rows into `chip` and answer `true` while the menu owns
+    /// the screen.
+    ///
+    /// Upstream's manager draws through `self.display` and its containers call
+    /// `display.draw_text` row by row (`MenuList.draw_container`,
+    /// `menu.py:601-660`); the panel is this call's argument instead, because
+    /// the frame being painted is the caller's (see [`PrinterLCD`]'s refresh).
+    pub fn screen_update_event(&self, chip: &Arc<dyn LcdChip>, eventtime: f64) -> bool {
         if !self.is_running() {
             return false;
         }
         if let Some(container) = self.stack_peek(0) {
             container.heartbeat(eventtime);
+            for (row, line) in container.draw_rows(self, eventtime).iter().enumerate() {
+                draw_text(&**chip, row, 0, &line.line());
+            }
         }
         true
     }
 
-    /// The rows the panel would show now (`MenuList.draw_container`).
+    /// The rows the panel shows now, laid out without painting them
+    /// (`MenuList.draw_container`).
     ///
-    /// The framework can draw ([`display::draw_text`](super::display::draw_text)),
-    /// but nothing calls it for these rows yet, so they are computed and handed
-    /// back instead of painted; they carry the cursor, the folder marker and the
-    /// scrolled name exactly as a drawing would.
+    /// [`MenuManager::screen_update_event`] paints the same rows; this hands
+    /// them back for tests and diagnostics. They carry the cursor, the folder
+    /// marker and the scrolled name exactly as the drawing does.
     pub fn screen_rows(&self) -> Vec<MenuRow> {
         let eventtime = self.printer.eventtime();
         self.screen_rows_at(eventtime)
@@ -2088,12 +2118,36 @@ fn eval_template_number(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::extras::display::display::{Glyph, SentMessage};
     use crate::core::klippy::gcode::{sync, CommandError, CommandHandler};
     use crate::core::klippy::reactor::ManualReactor;
     use crate::core::klippy::test_util::wait_until;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
+
+    /// A panel that takes the menu's writes and keeps nothing: the refresh hook
+    /// paints into whichever panel it is handed, and `display`'s tests are the
+    /// ones that read a frame back from a recording panel.
+    struct BlankPanel;
+
+    impl LcdChip for BlankPanel {
+        fn init(&self) {}
+
+        fn clear(&self) {}
+
+        fn flush(&self) {}
+
+        fn get_dimensions(&self) -> (usize, usize) {
+            (16, 4)
+        }
+
+        fn set_glyphs(&self, _glyphs: &BTreeMap<String, Glyph>) {}
+
+        fn sent_messages(&self) -> Vec<SentMessage> {
+            Vec::new()
+        }
+    }
 
     /// The corpus's `lcd_type: st7920` shape.
     const ST7920_SECTION: &str = "lcd_type: st7920\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n";
@@ -2697,9 +2751,10 @@ mod tests {
         let display = printer
             .lookup_object_as::<PrinterLCD>("display")
             .expect("the display");
-        assert!(!menu.screen_update_event(0.0));
+        let chip: Arc<dyn LcdChip> = Arc::new(BlankPanel);
+        assert!(!menu.screen_update_event(&chip, 0.0));
         menu.key_event("click", 0.0);
-        assert!(menu.screen_update_event(0.0));
+        assert!(menu.screen_update_event(&chip, 0.0));
         assert_eq!(display.get_dimensions(), (16, 4));
     }
 }

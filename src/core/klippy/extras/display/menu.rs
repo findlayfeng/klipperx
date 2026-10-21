@@ -211,6 +211,18 @@ enum Element {
     List(ListData),
 }
 
+/// What kind of item this is, read without holding an item's lock
+/// (`Element` stripped of its state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementKind {
+    Disabled,
+    Command,
+    Back,
+    SdFile,
+    Input,
+    List,
+}
+
 /// Everything one item holds (`MenuElement`'s attributes and its subclass
 /// state).
 struct ItemData {
@@ -267,7 +279,8 @@ pub struct MenuRow {
     /// The selection cursor (`>`; `*` while the row is being edited; otherwise
     /// a space, so the names line up).
     pub prefix: String,
-    /// The item's name, padded to the row's width and possibly scrolled.
+    /// The item's name as the panel would show it: cut and padded to the row's
+    /// width, and scrolled while it is too long.
     pub text: String,
     /// The folder marker (`>` for a container).
     pub suffix: String,
@@ -365,15 +378,42 @@ impl MenuItem {
     }
 
     /// Render `template` in this item's context (`get_context`, `menu.py:104-109`).
+    ///
+    /// An input item's `menu.input` is the value being edited, or — while it is
+    /// not being edited — what its `input` option evaluates to
+    /// (`MenuInput.get_context`, `menu.py:483-490`).
     fn render(
         &self,
         manager: &Arc<MenuManager>,
         template: &Template,
         event: Option<&str>,
     ) -> Result<String, MenuError> {
-        let input = self.lock().input().and_then(|input| input.value);
+        let (editing, value_tpl) = {
+            let data = self.lock();
+            match data.input() {
+                Some(input) => (input.value, Some(Arc::clone(&input.value_tpl))),
+                None => (None, None),
+            }
+        };
+        let input = match (editing, value_tpl) {
+            (Some(value), _) => Some(value),
+            (None, Some(template)) => Some(eval_template_number(manager, &self.ns, &template)?),
+            (None, None) => None,
+        };
         let mut context = manager.base_context();
         manager.bind_menu(&mut context, &self.ns, event, input);
+        template.render(&mut context).map_err(|error| error.to_string())
+    }
+
+    /// Render `template` without `menu.input`, the context `enable` and an
+    /// input's own bounds are evaluated in (`MenuElement.get_context`).
+    fn render_plain(
+        &self,
+        manager: &Arc<MenuManager>,
+        template: &Template,
+    ) -> Result<String, MenuError> {
+        let mut context = manager.base_context();
+        manager.bind_menu(&mut context, &self.ns, None, None);
         template.render(&mut context).map_err(|error| error.to_string())
     }
 
@@ -394,7 +434,7 @@ impl MenuItem {
             return false;
         };
         match self
-            .render(&manager, &enable, None)
+            .render_plain(&manager, &enable)
             .and_then(|text| literal_truth(&text))
         {
             Ok(value) => value,
@@ -508,8 +548,11 @@ impl MenuItem {
     /// What a press does on a non-container item (`MenuManager.press`,
     /// `menu.py:919-942`).
     fn press(&self, event: &str) {
-        match self.lock().element {
-            Element::Input(_) => {
+        // The kind is read and the lock dropped before anything acts: an
+        // action below locks this item again.
+        let kind = self.kind();
+        match kind {
+            ElementKind::Input => {
                 if self.is_editing() {
                     self.run_gcode(Some(event));
                 }
@@ -520,15 +563,27 @@ impl MenuItem {
                     self.start_editing();
                 }
             }
-            Element::Command | Element::SdFile => {
+            ElementKind::Command | ElementKind::SdFile => {
                 self.run_gcode(Some(event));
             }
-            Element::Back => {
+            ElementKind::Back => {
                 if let Some(manager) = self.manager.upgrade() {
                     manager.back(false, true);
                 }
             }
-            Element::Disabled | Element::List(_) => {}
+            ElementKind::Disabled | ElementKind::List => {}
+        }
+    }
+
+    /// Which kind of item this is, without holding the lock.
+    fn kind(&self) -> ElementKind {
+        match self.lock().element {
+            Element::Disabled => ElementKind::Disabled,
+            Element::Command => ElementKind::Command,
+            Element::Back => ElementKind::Back,
+            Element::SdFile => ElementKind::SdFile,
+            Element::Input(_) => ElementKind::Input,
+            Element::List(_) => ElementKind::List,
         }
     }
 
@@ -576,7 +631,7 @@ impl MenuItem {
     }
 
     fn eval_number(&self, manager: &Arc<MenuManager>, template: &Template, what: &str) -> f64 {
-        let text = match self.render(manager, template, None) {
+        let text = match self.render_plain(manager, template) {
             Ok(text) => text,
             Err(error) => {
                 tracing::error!("menu '{}': {what}: {error}", self.ns);
@@ -692,15 +747,6 @@ impl MenuItem {
         };
         if recursive {
             tracing::error!("menu: recursive relation of '{}' container", child.ns);
-        }
-    }
-
-    /// Add one child by name (`_insert_item`, `menu.py:271-291`).
-    #[cfg(test)]
-    fn insert_item(&self, item: Arc<MenuItem>, name: String, index: usize) {
-        let mut data = self.lock();
-        if let Some(list) = data.list_mut() {
-            list.allitems.insert(index, (item, name));
         }
     }
 
@@ -885,7 +931,7 @@ impl MenuItem {
             current.need_scroller(if scroller { Some(true) } else { None });
             rows.push(MenuRow {
                 prefix,
-                text: pad_to(&text, width),
+                text: pad_to(&truncate_to(&text, width), width),
                 suffix,
             });
         }
@@ -1885,6 +1931,11 @@ fn stripliterals(text: &str) -> String {
     text.to_string()
 }
 
+/// Cut `text` to `width` characters, the way a panel stops at its edge.
+fn truncate_to(text: &str, width: usize) -> String {
+    text.chars().take(width).collect()
+}
+
 /// Pad `text` with spaces to `width` characters (Python's `str.ljust`).
 fn pad_to(text: &str, width: usize) -> String {
     let len = text.chars().count();
@@ -1952,3 +2003,597 @@ fn literal_number(text: &str) -> Result<f64, MenuError> {
         other => Err(format!("not a number: {other}")),
     }
 }
+
+/// Evaluate a number template without `menu.input` — what `MenuInput._eval_min`,
+/// `_eval_max` and `_eval_value` do on `MenuElement.get_context`'s context.
+fn eval_template_number(
+    manager: &MenuManager,
+    ns: &str,
+    template: &Template,
+) -> Result<f64, MenuError> {
+    let mut context = manager.base_context();
+    manager.bind_menu(&mut context, ns, None, None);
+    let rendered = template
+        .render(&mut context)
+        .map_err(|error| error.to_string())?;
+    literal_number(&rendered)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::gcode::{sync, CommandError, CommandHandler};
+    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::test_util::wait_until;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// The corpus's `lcd_type: st7920` shape.
+    const ST7920_SECTION: &str =
+        "lcd_type: st7920\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n";
+
+    fn machine() -> Arc<Printer> {
+        Arc::new(Printer::new(ManualReactor::shared()))
+    }
+
+    /// A machine with one display and the menu sections `sections`, whose
+    /// `[display]` also carries `options`.
+    fn load(options: &str, sections: &str) -> Arc<Printer> {
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}{options}\n{sections}"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let printer = machine();
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|error| panic!("the config loads: {error}"));
+        printer
+    }
+
+    fn menu_of(printer: &Arc<Printer>) -> Arc<MenuManager> {
+        printer
+            .lookup_object_as::<MenuManager>(MENU_OBJECT)
+            .expect("the menu object is registered")
+    }
+
+    /// The name of the row the cursor is on.
+    fn selected_name(menu: &MenuManager) -> String {
+        menu.stack_peek(0)
+            .expect("a container is open")
+            .selected_item()
+            .expect("a row is selected")
+            .name_text()
+    }
+
+    /// A temporary directory that removes itself on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "klipperx-menu-{}-{}-{}",
+                std::process::id(),
+                name,
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("cannot create the test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const TEST_TREE: &str = "[menu __test]\n\
+                            type: list\n\
+                            name: Test\n\
+                            [menu __test __a]\n\
+                            type: command\n\
+                            name: A\n\
+                            gcode: M117 a\n\
+                            [menu __test __sub]\n\
+                            type: list\n\
+                            name: Sub\n\
+                            [menu __test __sub __b]\n\
+                            type: command\n\
+                            name: B\n\
+                            gcode: M117 b\n";
+
+    // -- the tree -----------------------------------------------------------
+
+    /// The shipped `menu.cfg` is a copy; this is the guard that says so.
+    #[test]
+    fn test_the_vendored_menu_has_not_drifted() {
+        let upstream =
+            klipperx_test_support::klipper_dir().join("klippy/extras/display/menu.cfg");
+        let Ok(text) = std::fs::read_to_string(&upstream) else {
+            return;
+        };
+        assert_eq!(
+            MENU_CFG,
+            text,
+            "{} is out of date with the shipped menu.cfg",
+            upstream.display()
+        );
+    }
+
+    /// A main config's `[menu ...]` sections join the shipped tree, and a
+    /// section the shipped file also defines replaces it in place.
+    #[test]
+    fn test_the_shipped_layout_and_the_main_config_build_one_tree() {
+        let published = published_config()
+            .expect("the shipped layout parses")
+            .get_sections_by_id("menu")
+            .len();
+        assert_eq!(published, 82, "the shipped menu.cfg holds 82 items");
+
+        let printer = load(
+            "menu_root: __test\n",
+            "[menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __cmd]\n\
+             type: command\n\
+             name: Cmd\n\
+             gcode: M117 cmd\n\
+             [menu __main __tune]\n\
+             type: command\n\
+             name: Overridden\n\
+             gcode: M117 over\n",
+        );
+        let menu = menu_of(&printer);
+
+        let root = menu.lookup_menuitem("__test").expect("the root item");
+        assert!(root.is_container());
+        assert_eq!(menu.lookup_children("__test"), vec!["__test __cmd"]);
+
+        // The shipped tree is there, and the config's section replaced the
+        // shipped `__main __tune` instead of adding a second one.
+        assert!(menu.lookup_menuitem("__main __setup __dump").is_some());
+        let tune = menu.lookup_menuitem("__main __tune").expect("the tuned item");
+        assert_eq!(tune.name_text(), "Overridden");
+        let children = menu.lookup_children("__main");
+        assert_eq!(
+            children.iter().filter(|name| *name == "__main __tune").count(),
+            1
+        );
+        // 82 shipped items, plus `__test` and `__test __cmd`; the override adds
+        // no item of its own.
+        assert_eq!(menu.item_count(), published + 2);
+    }
+
+    /// An unknown `menu_root` is refused, and so is an unknown item type.
+    #[test]
+    fn test_a_bad_root_and_a_bad_type_are_reported() {
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __nope\n"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let err = machine().load_config(&config).unwrap_err();
+        assert_eq!(err.to_string(), "Unknown menuitem '__nope'");
+
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}\n[menu __x]\ntype: nope\nname: X\n"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let err = machine().load_config(&config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Choice 'nope' for option 'type' in section 'menu __x' is not a valid choice"
+        );
+    }
+
+    // -- navigation ---------------------------------------------------------
+
+    /// A click opens the menu; the arrows move the selection; a click on a
+    /// container opens it, on a command runs it, on `..` steps back out.
+    #[test]
+    fn test_the_keys_open_move_and_press() {
+        let printer = load("menu_root: __test\n", TEST_TREE);
+        let menu = menu_of(&printer);
+        assert!(!menu.is_running());
+
+        // Not running: the first click opens the menu at the root.
+        menu.key_event("click", 0.0);
+        assert!(menu.is_running());
+        assert_eq!(menu.stack_namespace(), vec!["__test"]);
+        // A list's first row is its `..` item (`MenuList._populate`).
+        assert_eq!(selected_name(&menu), "..");
+
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "A");
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "Sub");
+        menu.key_event("up", 0.0);
+        assert_eq!(selected_name(&menu), "A");
+
+        // Enter the container.
+        menu.key_event("down", 0.0);
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.stack_namespace(), vec!["__test", "__test __sub"]);
+        assert_eq!(selected_name(&menu), "..");
+
+        // Press the command: its script is queued, not run in place.
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "B");
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.queued_gcode(), vec!["M117 b"]);
+
+        // Back out: the parent reselects the container we were in.
+        menu.key_event("back", 0.0);
+        assert_eq!(menu.stack_namespace(), vec!["__test"]);
+        assert_eq!(selected_name(&menu), "Sub");
+
+        // The `..` row steps out too.
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.stack_size(), 2);
+        assert_eq!(selected_name(&menu), "..");
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.stack_namespace(), vec!["__test"]);
+
+        // Back at the root, back closes the menu.
+        menu.key_event("back", 0.0);
+        assert!(!menu.is_running());
+    }
+
+    /// `menu_reverse_navigation` swaps the two arrows (`menu.py:848-873`).
+    #[test]
+    fn test_reverse_navigation_swaps_the_arrows() {
+        let printer = load("menu_root: __test\nmenu_reverse_navigation: True\n", TEST_TREE);
+        let menu = menu_of(&printer);
+        menu.key_event("click", 0.0);
+        assert_eq!(selected_name(&menu), "..");
+        menu.key_event("up", 0.0);
+        assert_eq!(selected_name(&menu), "A");
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "..");
+    }
+
+    /// A disabled item is skipped, and an `enable` template is evaluated with
+    /// the printer view.
+    #[test]
+    fn test_a_disabled_item_is_not_listed() {
+        let printer = load(
+            "menu_root: __test\n",
+            "[menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __off]\n\
+             type: command\n\
+             name: Off\n\
+             enable: False\n\
+             gcode: M117 off\n\
+             [menu __test __on]\n\
+             type: command\n\
+             name: On\n\
+             enable: {1 == 1}\n\
+             gcode: M117 on\n",
+        );
+        let menu = menu_of(&printer);
+        menu.key_event("click", 0.0);
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "On");
+        assert_eq!(menu.lookup_children("__test").len(), 2);
+    }
+
+    // -- inputs -------------------------------------------------------------
+
+    /// `%3d` over a float renders what Python renders: `menu.cfg`'s input
+    /// names are `{'%3d' % (menu.input*100)}%`, and `menu.input` is a float.
+    #[test]
+    fn test_a_printf_integer_conversion_truncates_a_float() {
+        fn rendered(source: &str) -> String {
+            let mut context = Context::new();
+            context.insert("menu", Rt::Json(json!({"input": 9.99})));
+            Template::parse("x", source)
+                .expect("the format parses")
+                .render(&mut context)
+                .unwrap_or_else(|error| panic!("{error}"))
+        }
+        assert_eq!(rendered("Speed: {'%3d' % (menu.input*100)}%"), "Speed: 999%");
+        // A negative float truncates toward zero, as Python's `%d` does.
+        assert_eq!(rendered("{'%d' % (0 - 3.7)}"), "-3");
+        // An integer argument is untouched.
+        assert_eq!(rendered("{'%03d' % 7}"), "007");
+    }
+    /// An input evaluates its `input`/`input_min`/`input_max` templates and
+    /// steps by `input_step`, ten times as far when `fast_rate` applies.
+    #[test]
+    fn test_an_input_evaluates_and_steps() {
+        let printer = load(
+            "menu_root: __test\n",
+            "[menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __speed]\n\
+             type: input\n\
+             name: Speed: {'%3d' % (menu.input*100)}%\n\
+             input: 9.99\n\
+             input_min: 0\n\
+             input_max: 10\n\
+             input_step: 0.01\n\
+             realtime: True\n\
+             gcode: M220 S{'%d' % (menu.input*100)}\n\
+             [menu __test __low]\n\
+             type: input\n\
+             name: Low: {menu.input}\n\
+             input: 0.005\n\
+             input_min: 0\n\
+             input_max: 10\n\
+             input_step: 1\n\
+             gcode: M117 low\n",
+        );
+        let menu = menu_of(&printer);
+        let speed = menu.lookup_menuitem("__test __speed").expect("the input");
+
+        // Not editing: the name renders the `input` template's value.
+        assert_eq!(speed.name_text(), "Speed: 999%");
+        assert_eq!(speed.input_value(), None);
+
+        speed.start_editing();
+        assert_eq!(speed.input_value(), Some(9.99));
+
+        // The last step clamps at `input_max`.
+        speed.inc_value(false);
+        assert_eq!(speed.input_value(), Some(10.0));
+
+        // `(max - min) / step > 100`, so a fast rate steps ten times as far.
+        speed.dec_value(true);
+        let value = speed.input_value().expect("still editing");
+        assert!((value - 9.9).abs() < 1e-9, "{value}");
+        speed.dec_value(false);
+        let value = speed.input_value().expect("still editing");
+        assert!((value - 9.89).abs() < 1e-9, "{value}");
+
+        // Stop editing: the name goes back to the option's own value.
+        speed.stop_editing();
+        assert_eq!(speed.input_value(), None);
+        assert_eq!(speed.name_text(), "Speed: 999%");
+
+        // A step below the minimum clamps at it.
+        let low = menu.lookup_menuitem("__test __low").expect("the input");
+        low.start_editing();
+        assert_eq!(low.input_value(), Some(0.005));
+        low.dec_value(false);
+        assert_eq!(low.input_value(), Some(0.0));
+    }
+
+    /// While an input is being edited the arrows change its value instead of
+    /// moving the selection, and the `..` row is not reached.
+    #[test]
+    fn test_the_arrows_edit_an_input_in_place() {
+        let printer = load(
+            "menu_root: __test\n",
+            "[menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __speed]\n\
+             type: input\n\
+             name: Speed: {menu.input}\n\
+             input: 1\n\
+             input_min: 0\n\
+             input_max: 10\n\
+             input_step: 1\n\
+             gcode: M117 speed\n",
+        );
+        let menu = menu_of(&printer);
+        menu.key_event("click", 0.0);
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "Speed: 1.0");
+
+        // A click starts editing; the arrows then change the value.
+        menu.key_event("click", 0.0);
+        let speed = menu.lookup_menuitem("__test __speed").expect("the input");
+        assert_eq!(speed.input_value(), Some(1.0));
+        menu.key_event("down", 0.0);
+        assert_eq!(speed.input_value(), Some(2.0));
+        menu.key_event("up", 0.0);
+        assert_eq!(speed.input_value(), Some(1.0));
+        // Still the same row.
+        assert_eq!(menu.selected_namespace().as_deref(), Some("__test __speed"));
+
+        // A second click stops editing; the only other row is reached with the
+        // up arrow (the list has just the `..` row and this input).
+        menu.key_event("click", 0.0);
+        assert_eq!(speed.input_value(), None);
+        menu.key_event("up", 0.0);
+        assert_eq!(selected_name(&menu), "..");
+    }
+
+    // -- the SD card --------------------------------------------------------
+
+    /// A `vsdlist` lists the SD card's files as `M23 /<name>` commands
+    /// (`MenuVSDList._populate`).
+    #[test]
+    fn test_a_vsdlist_lists_the_sd_cards_files() {
+        let dir = TempDir::new("vsd");
+        for name in ["a.gcode", "B.gcode", "notes.txt"] {
+            std::fs::write(dir.path().join(name), "G28\n").expect("the file is written");
+        }
+        let sections = format!(
+            "[virtual_sdcard]\npath: {}\n\
+             [menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __files]\n\
+             type: vsdlist\n\
+             name: Files\n",
+            dir.path().display()
+        );
+        let printer = load("menu_root: __test\n", &sections);
+        let menu = menu_of(&printer);
+
+        menu.key_event("click", 0.0);
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "Files");
+        menu.key_event("click", 0.0);
+
+        // Three files -- `a.gcode`, `B.gcode`, `notes.txt`, sorted
+        // case-insensitively -- and the `..` row the list inserts first.
+        let files = menu.stack_peek(0).expect("the list is open");
+        assert_eq!(files.len(), 4);
+        assert_eq!(selected_name(&menu), "..");
+        menu.key_event("down", 0.0);
+        assert_eq!(selected_name(&menu), "a.gcode");
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.queued_gcode(), vec!["M23 /a.gcode"]);
+    }
+
+    // -- the script queue ---------------------------------------------------
+
+    /// A pressed item's script is queued and then run as a g-code command with
+    /// its parameters (`queue_gcode` / `dispatch_gcode`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_pressed_script_runs_as_a_gcode_command() {
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __test\n\
+             [menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __cmd]\n\
+             type: command\n\
+             name: Cmd\n\
+             gcode: MENU_TEST VALUE=7\n"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        printer.load_config(&config).expect("the config loads");
+        let menu = menu_of(&printer);
+
+        let seen = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let handler: CommandHandler = {
+            let seen = Arc::clone(&seen);
+            sync(move |gcmd: &crate::core::klippy::gcode::GcodeCommand| {
+                let value = gcmd
+                    .get_str("VALUE")
+                    .map_err(|error| CommandError::new(error.to_string()))?;
+                seen.lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push((gcmd.command().to_string(), value));
+                Ok(())
+            })
+        };
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher");
+        gcode
+            .register_command("MENU_TEST", handler, None, true)
+            .expect("the command registers");
+
+        menu.key_event("click", 0.0);
+        menu.key_event("down", 0.0);
+        menu.key_event("click", 0.0);
+        assert_eq!(menu.queued_gcode(), vec!["MENU_TEST VALUE=7"]);
+
+        // The queue's callback runs on the reactor; the script it dispatches
+        // runs detached, so the test waits for the handler.
+        reactor.run_due();
+        let seen_by_handler = Arc::clone(&seen);
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async move {
+            wait_until(
+                Duration::from_secs(10),
+                Duration::from_millis(10),
+                || {
+                    !seen_by_handler
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .is_empty()
+                },
+                "the menu script reaches the dispatcher",
+            )
+            .await;
+            seen_by_handler
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone()
+        })
+        .await
+        .expect("the script runs");
+
+        assert_eq!(
+            outcome,
+            vec![("MENU_TEST".to_string(), "7".to_string())]
+        );
+        assert!(menu.queued_gcode().is_empty());
+    }
+
+    // -- the rows -----------------------------------------------------------
+
+    /// A row carries the cursor, the name padded to the panel's width, and the
+    /// folder marker; a name too long for the row rolls after a heartbeat.
+    #[test]
+    fn test_a_long_name_rolls_and_a_container_is_marked() {
+        let printer = load(
+            "menu_root: __test\n",
+            "[menu __test]\n\
+             type: list\n\
+             name: Test\n\
+             [menu __test __long]\n\
+             type: command\n\
+             name: ABCDEFGHIJKLMNOPQRSTUVWXYZ\n\
+             gcode: M117 long\n\
+             [menu __test __sub]\n\
+             type: list\n\
+             name: Sub\n",
+        );
+        let menu = menu_of(&printer);
+        assert_eq!(menu.cols(), 16);
+        assert_eq!(menu.rows(), 4);
+
+        menu.begin(0.0);
+        // The `..` row first, then the long command.
+        menu.down(false);
+        let rows = menu.screen_rows_at(1.0);
+        assert_eq!(rows.len(), 4, "a 16x4 panel shows four rows");
+        assert_eq!(rows[1].prefix, ">");
+        assert_eq!(rows[1].text, "ABCDEFGHIJKLMNO");
+        assert_eq!(rows[1].suffix, "");
+        // The container row is marked, and not selected.
+        assert_eq!(rows[2].prefix, " ");
+        assert_eq!(rows[2].text, pad_to("Sub", 14));
+        assert_eq!(rows[2].suffix, ">");
+
+        // The scroller was armed by the row above; the row-wide heartbeats then
+        // cut one more character off the front every step.
+        let rows = menu.screen_rows_at(1.6);
+        assert_eq!(rows[1].text, "ABCDEFGHIJKLMNO");
+        let rows = menu.screen_rows_at(2.2);
+        assert_eq!(rows[1].text, "BCDEFGHIJKLMNOP");
+    }
+
+    /// The manager reports itself the way upstream's `get_status` does.
+    #[test]
+    fn test_the_menu_object_reports_its_status() {
+        let printer = load("menu_root: __test\nmenu_timeout: 40\n", TEST_TREE);
+        let menu = menu_of(&printer);
+        let status = menu.get_status(0.0);
+        assert_eq!(status["timeout"], json!(40));
+        assert_eq!(status["running"], json!(false));
+        assert_eq!(status["rows"], json!(4));
+        assert_eq!(status["cols"], json!(16));
+
+        // The display hands the screen to the menu while it is open.
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        assert!(!menu.screen_update_event(0.0));
+        menu.key_event("click", 0.0);
+        assert!(menu.screen_update_event(0.0));
+        assert_eq!(display.get_dimensions(), (16, 4));
+    }
+}
+

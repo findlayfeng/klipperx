@@ -1,11 +1,19 @@
-//! `st7920` — the ST7920 (128x64 graphics) panel driver
-//! (upstream `klippy/extras/display/st7920.py`).
+//! `st7920` and `emulated_st7920` — the ST7920 (128x64 graphics) panel driver
+//! and its software-SPI sibling (upstream `klippy/extras/display/st7920.py`,
+//! two classes over one `DisplayBase`).
 //!
-//! A `[display]` section with `lcd_type: st7920` builds one of these. Three
-//! GPIO pins (`cs`, `sclk`, `sid`, all on one MCU) are the whole bus: the host
-//! drives the panel's own bit-level protocol through the firmware's
+//! A `[display]` section with `lcd_type: st7920` builds the parallel panel.
+//! Three GPIO pins (`cs`, `sclk`, `sid`, all on one MCU) are the whole bus: the
+//! host drives the panel's own bit-level protocol through the firmware's
 //! `config_st7920` / `st7920_send_cmds` / `st7920_send_data` commands, which is
 //! why no SPI resource is involved (upstream's `st7920.py` does the same).
+//!
+//! `lcd_type: emulated_st7920` builds the same panel over a **software SPI**
+//! bus (`st7920.py:209-256`): each protocol byte leaves as two nibbles behind a
+//! sync byte (`0xf8` for commands, `0xfa` for data) in one `spi_send`, and an
+//! `en_pin` is pulsed once before the first frame. The framebuffers, the flush,
+//! the drawing and the extended-mode switch are shared — only where the bytes
+//! go differs ([`Transport`]).
 //!
 //! | framework call | here | upstream |
 //! |---|---|---|
@@ -21,33 +29,44 @@
 //! is the flush algorithm: find the changed bytes, join runs closer than five
 //! bytes, then send each run as a command pair plus its data. Commands take the
 //! panel in and out of extended mode by prepending `0x26`/`0x22`
-//! (`st7920.py:174-184`).
+//! (`st7920.py:174-184`) — for both transports, before the SPI framing.
 //!
 //! # What is not here
 //!
-//! * **`emulated_st7920`** (`st7920.py:209-256`): the software-SPI variant that
-//!   shifts each byte as two nibbles and toggles an enable pin. Not implemented;
-//!   `lcd_type` reports it as a gap.
-//! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:10,184`): upstream
-//!   sends with `reqclock=0x7fffffff00000000` and orders startup writes by clock;
-//!   this host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no
-//!   clock, so commands go out in call order.
+//! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:10,184,207`):
+//!   upstream sends with `reqclock=0x7fffffff00000000` and orders startup writes
+//!   by clock; this host's [`McuCommand`](crate::core::klippy::cmd::McuCommand)
+//!   carries no clock, so commands go out in call order.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tracing::warn;
 
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::spi_device::mcu_object_name;
-use crate::core::klippy::mcu::{pin_number, ConfigBuilder, Mcu, McuError, McuObject};
+use crate::core::klippy::mcu::{
+    pin_number, ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SpiMode,
+};
 use crate::core::klippy::msg::proto::ArgValue;
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 use super::display::{Glyph, LcdChip, SentMessage};
 use super::font8x14::VGA_FONT;
+use super::uc1701::ResetHelper;
+
+/// The sync byte that starts a command frame (`st7920.py:232`).
+const SPI_COMMAND_SYNC: u8 = 0xf8;
+/// The sync byte that starts a data frame (`st7920.py:231`).
+const SPI_DATA_SYNC: u8 = 0xfa;
+
+/// Upstream's default `spi_speed` for the emulated panel (`st7920.py:227`).
+const DEFAULT_SPI_SPEED: u32 = 1_000_000;
+/// The lowest clock upstream accepts there (`st7920.py:227`, its `minval`).
+const MIN_SPI_SPEED: i64 = 100_000;
 
 /// Upstream's `ST7920_SYNC_DELAY` (`st7920.py:14`), in seconds.
 const ST7920_SYNC_DELAY: f64 = 0.000045;
@@ -142,12 +161,6 @@ impl Framebuffers {
 /// The state a config callback and the runtime methods share.
 #[derive(Debug)]
 struct St7920State {
-    /// The oid the firmware allocated for this panel.
-    oid: u8,
-    /// The three pin descriptions as written, in `cs`, `sclk`, `sid` order.
-    pins: Vec<String>,
-    /// The chip all three pins are on.
-    chip_name: String,
     /// Whether the panel is currently in extended mode (`st7920.py:180`).
     is_extended: Mutex<bool>,
     /// The framebuffers.
@@ -163,17 +176,79 @@ struct St7920State {
     sent: Mutex<Vec<SentMessage>>,
 }
 
-/// One `lcd_type: st7920` panel.
+impl St7920State {
+    /// Upstream's `DisplayBase.__init__` (`st7920.py:19-34`): fresh
+    /// framebuffers, no glyphs cached yet, and the panel out of extended mode.
+    fn new() -> Self {
+        Self {
+            is_extended: Mutex::new(false),
+            framebuffers: Mutex::new(Framebuffers::new()),
+            icons: Mutex::new(HashMap::new()),
+            cached_glyphs: Mutex::new(HashMap::new()),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// The bytes to send, with upstream's extended-mode switch in front of a
+    /// command message that changes it (`st7920.py:174-184`, `:230-238`). Data
+    /// messages never switch the mode.
+    fn with_extended_mode(&self, cmds: &[u8], is_data: bool, is_extended: bool) -> Vec<u8> {
+        let mut bytes = cmds.to_vec();
+        if !is_data {
+            let mut extended = self
+                .is_extended
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if *extended != is_extended {
+                bytes.insert(0, if is_extended { 0x26 } else { 0x22 });
+                *extended = is_extended;
+            }
+        }
+        bytes
+    }
+
+    /// Remember one message, in order.
+    fn record(&self, is_data: bool, bytes: Vec<u8>) {
+        self.sent
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(SentMessage { is_data, bytes });
+    }
+}
+
+/// Where a message goes — the one thing upstream's two classes differ in
+/// (`st7920.py:145-184` parallel, `:209-256` emulated).
+enum Transport {
+    /// The panel's own three-wire protocol, through `st7920_send_cmds` /
+    /// `st7920_send_data` on the MCU the three pins are on.
+    Parallel {
+        /// The MCU the pins are on.
+        mcu: Arc<McuObject>,
+        /// The oid the firmware allocated for `config_st7920`.
+        oid: u8,
+    },
+    /// A software SPI bus, with the enable line the first frame pulses.
+    Emulated {
+        /// The SPI resource: no chip select, mode 0
+        /// (`st7920.py:228`).
+        spi: Arc<McuSpi>,
+        /// The `en_pin` helper (`st7920.py:222-224`).
+        enable: EnableHelper,
+    },
+}
+
+/// One ST7920 panel, parallel or emulated.
 pub struct ST7920 {
     state: Arc<St7920State>,
-    /// The MCU the pins are on, for the runtime sends.
-    mcu: Arc<McuObject>,
+    /// Where the bytes go.
+    transport: Transport,
 }
 
 impl ST7920 {
     /// Read the three pins, allocate the oid, and register the config callback.
     ///
-    /// Upstream's `ST7920.__init__` (`st7920.py:140-160`).
+    /// Upstream's `ST7920.__init__` (`st7920.py:140-160`), for the parallel
+    /// panel.
     ///
     /// # Errors
     /// A missing pin, an unresolvable or already-used pin, pins on different
@@ -214,65 +289,97 @@ impl ST7920 {
             .create_oid()
             .map_err(|err| ConfigError::new(err.to_string()))?;
 
-        let state = Arc::new(St7920State {
+        let parallel = Arc::new(ParallelConfig {
             oid,
             pins: descriptions,
             chip_name,
-            is_extended: Mutex::new(false),
-            framebuffers: Mutex::new(Framebuffers::new()),
-            icons: Mutex::new(HashMap::new()),
-            cached_glyphs: Mutex::new(HashMap::new()),
-            sent: Mutex::new(Vec::new()),
         });
-
-        let build_state = Arc::downgrade(&state);
+        let build_parallel = Arc::downgrade(&parallel);
         let build_pins = Arc::downgrade(&pins);
         mcu.config()
-            .register_config_callback(Box::new(move |builder, mcu| match build_state.upgrade() {
-                Some(state) => state.build(builder, mcu, &build_pins),
-                None => Ok(()),
+            .register_config_callback(Box::new(move |builder, mcu| {
+                match build_parallel.upgrade() {
+                    Some(parallel) => parallel.build(builder, mcu, &build_pins),
+                    None => Ok(()),
+                }
             }))
             .map_err(|err| ConfigError::new(err.to_string()))?;
 
-        Ok(Self { state, mcu })
+        Ok(Self {
+            state: Arc::new(St7920State::new()),
+            transport: Transport::Parallel { mcu, oid },
+        })
+    }
+
+    /// Read the software SPI pins and the enable line, and build the panel over
+    /// that bus.
+    ///
+    /// Upstream's `EmulatedST7920.__init__` (`st7920.py:210-229`): the MCU and
+    /// the three `spi_software_*` pins, a `spi_speed` bounded below by 100 kHz,
+    /// and the `en_pin` its `EnableHelper` pulses.
+    ///
+    /// # Errors
+    /// A missing `spi_software_{miso,mosi,sclk}_pin` or `en_pin`, pins on
+    /// different MCUs (`st7920 all pins must be on same mcu`), an `en_pin` on
+    /// another MCU, an `spi_speed` under 100 kHz, or an unknown MCU.
+    pub fn new_emulated(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+    ) -> Result<Self, ConfigError> {
+        let (mcu, spi) = software_spi(config, printer)?;
+        // `EnableHelper(config.get("en_pin"), self.spi)` (`st7920.py:222`):
+        // the option is read with no default, so it must be written.
+        config.get("en_pin", None)?;
+        let enable = EnableHelper {
+            line: ResetHelper::new(config, printer, "en_pin", &mcu)?,
+            set: AtomicBool::new(false),
+        };
+        Ok(Self {
+            state: Arc::new(St7920State::new()),
+            transport: Transport::Emulated { spi, enable },
+        })
     }
 
     /// Send one protocol message, switching extended mode when upstream does
-    /// (`st7920.py:174-184`).
+    /// (`st7920.py:174-184`) and framing it for the panel's transport.
     fn send(&self, cmds: &[u8], is_data: bool, is_extended: bool) -> Result<(), McuError> {
-        let mut bytes = cmds.to_vec();
-        if !is_data {
-            let mut extended = self
-                .state
-                .is_extended
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner());
-            if *extended != is_extended {
-                bytes.insert(0, if is_extended { 0x26 } else { 0x22 });
-                *extended = is_extended;
+        let mut bytes = self.state.with_extended_mode(cmds, is_data, is_extended);
+        match &self.transport {
+            Transport::Parallel { mcu, oid } => {
+                let mcu = mcu
+                    .mcu()
+                    .ok_or_else(|| McuError::Config("the MCU is not connected".to_string()))?;
+                if is_data {
+                    mcu.send_msg(&St7920SendData {
+                        oid: *oid,
+                        data: bytes.clone(),
+                    })?;
+                } else {
+                    mcu.send_msg(&St7920SendCmds {
+                        oid: *oid,
+                        cmds: bytes.clone(),
+                    })?;
+                }
+            }
+            // Upstream's `EmulatedST7920.send` (`st7920.py:230-256`): the
+            // enable line is pulsed once, then the message leaves as one frame.
+            Transport::Emulated { spi, enable } => {
+                enable.init_once();
+                bytes = spi_frame(&bytes, is_data);
+                spi.send(&bytes)?;
             }
         }
-        let mcu = self
-            .mcu
-            .mcu()
-            .ok_or_else(|| McuError::Config("the MCU is not connected".to_string()))?;
-        if is_data {
-            mcu.send_msg(&St7920SendData {
-                oid: self.state.oid,
-                data: bytes.clone(),
-            })?;
-        } else {
-            mcu.send_msg(&St7920SendCmds {
-                oid: self.state.oid,
-                cmds: bytes.clone(),
-            })?;
-        }
-        self.state
-            .sent
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .push(SentMessage { is_data, bytes });
+        self.state.record(is_data, bytes);
         Ok(())
+    }
+
+    /// The panel's `lcd_type`, for its log lines: upstream has one class per
+    /// transport, so the name is the transport's.
+    fn name(&self) -> &'static str {
+        match &self.transport {
+            Transport::Parallel { .. } => "st7920",
+            Transport::Emulated { .. } => "emulated_st7920",
+        }
     }
 
     /// The glyph framebuffer, for [`ST7920::cache_glyph`].
@@ -290,7 +397,7 @@ impl LcdChip for ST7920 {
     fn init(&self) {
         let cmds = [0x24, 0x40, 0x02, 0x26, 0x22, 0x02, 0x06, 0x0c];
         if let Err(err) = self.send(&cmds, false, false) {
-            warn!("st7920: could not initialise the panel: {err}");
+            warn!("{}: could not initialise the panel: {err}", self.name());
             return;
         }
         self.flush();
@@ -345,11 +452,11 @@ impl LcdChip for ST7920 {
                     vec![fb_id + chip_pos as u8]
                 };
                 if let Err(err) = self.send(&command, false, fb_id < GLYPH_FB_ID) {
-                    warn!("st7920: could not flush the panel: {err}");
+                    warn!("{}: could not flush the panel: {err}", self.name());
                     return;
                 }
                 if let Err(err) = self.send(&data[pos..pos + count], true, false) {
-                    warn!("st7920: could not flush the panel: {err}");
+                    warn!("{}: could not flush the panel: {err}", self.name());
                     return;
                 }
             }
@@ -492,9 +599,127 @@ impl PrinterObject for ST7920 {
 impl std::fmt::Debug for ST7920 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ST7920")
-            .field("oid", &self.state.oid)
+            .field("lcd_type", &self.name())
             .finish_non_exhaustive()
     }
+}
+
+/// One SPI frame of a message (`st7920.py:230-245`): the sync byte, then every
+/// byte as its high nibble and its low nibble shifted up.
+fn spi_frame(cmds: &[u8], is_data: bool) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(2 * cmds.len() + 1);
+    frame.push(if is_data {
+        SPI_DATA_SYNC
+    } else {
+        SPI_COMMAND_SYNC
+    });
+    for byte in cmds {
+        frame.push(byte & 0xf0);
+        frame.push((byte & 0x0f) << 4);
+    }
+    frame
+}
+
+/// Upstream's `EnableHelper` (`st7920.py:187-207`): the line the emulated
+/// panel needs pulsed before its first frame. The toggle is [`ResetHelper`]'s —
+/// low at +100ms, high at +200ms, high again at +300ms, which is the shape
+/// upstream's three `update_digital_out` calls have — fired once
+/// (`st7920.py:253-255`).
+struct EnableHelper {
+    /// The `en_pin` line.
+    line: ResetHelper,
+    /// Whether the toggle has already happened.
+    set: AtomicBool,
+}
+
+impl EnableHelper {
+    /// Pulse the line the first time a frame goes out.
+    fn init_once(&self) {
+        if !self.set.swap(true, Ordering::SeqCst) {
+            self.line.init();
+        }
+    }
+}
+
+/// Build the emulated panel's software SPI bus, on the MCU its pins are on.
+///
+/// Upstream's `EmulatedST7920.__init__` (`st7920.py:211-228`): the three
+/// `spi_software_*` pins are looked up as one share (the option name is the
+/// share type, as in `bus.py:140-146`), must sit on one MCU, and become a mode-0
+/// bus with no chip select at `spi_speed`.
+///
+/// # Errors
+/// A missing or already-used `spi_software_{miso,mosi,sclk}_pin`, the three not
+/// on one MCU (`st7920 all pins must be on same mcu`), an `spi_speed` under
+/// 100 kHz, or no MCU object for the pins' chip.
+fn software_spi(
+    config: &ConfigWrapper,
+    printer: &Arc<Printer>,
+) -> Result<(Arc<McuObject>, Arc<McuSpi>), ConfigError> {
+    let identifier = config.identifier();
+    let pins = printer
+        .lookup_object_as::<PrinterPins>(PINS_OBJECT)
+        .expect("the loader registers `pins` before any section");
+
+    let mut descriptions = Vec::with_capacity(3);
+    let mut chip_name: Option<String> = None;
+    for option in [
+        "spi_software_miso_pin",
+        "spi_software_mosi_pin",
+        "spi_software_sclk_pin",
+    ] {
+        let description = config.get(option, None)?;
+        let params = pins
+            .lookup_pin(&description, false, false, Some(option))
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        match &chip_name {
+            Some(chip) if *chip != params.chip_name => {
+                return Err(ConfigError::new(
+                    "st7920 all pins must be on same mcu".to_string(),
+                ));
+            }
+            Some(_) => {}
+            None => chip_name = Some(params.chip_name.clone()),
+        }
+        descriptions.push(params.pin);
+    }
+    let chip_name = chip_name.expect("three pins were read");
+
+    let speed = config.get_int_bounded(
+        "spi_speed",
+        Some(i64::from(DEFAULT_SPI_SPEED)),
+        Some(MIN_SPI_SPEED),
+        None,
+    )? as u32;
+
+    let mcu = printer
+        .lookup_object_as::<McuObject>(&mcu_object_name(&chip_name))
+        .ok_or_else(|| {
+            ConfigError::new(format!("Section '{identifier}': unknown MCU '{chip_name}'"))
+        })?;
+    let spi = mcu.setup_spi(
+        SpiMode::Software {
+            miso_pin: descriptions[0].clone(),
+            mosi_pin: descriptions[1].clone(),
+            sclk_pin: descriptions[2].clone(),
+            speed,
+            mode: 0,
+        },
+        None,
+        false,
+    );
+    Ok((mcu, spi))
+}
+
+/// The parallel panel's config-time state: what its config callback needs to
+/// turn the pin names into numbers.
+struct ParallelConfig {
+    /// The oid the firmware allocated for `config_st7920`.
+    oid: u8,
+    /// The three pin descriptions as written, in `cs`, `sclk`, `sid` order.
+    pins: Vec<String>,
+    /// The chip all three pins are on.
+    chip_name: String,
 }
 
 impl ST7920 {
@@ -541,7 +766,7 @@ impl ST7920 {
     }
 }
 
-impl St7920State {
+impl ParallelConfig {
     /// Add this panel's configuration command, with the pin numbers resolved.
     ///
     /// Upstream's `ST7920.build_config` (`st7920.py:161-173`): the pin *names*
@@ -550,7 +775,7 @@ impl St7920State {
         &self,
         builder: &ConfigBuilder,
         mcu: &Mcu,
-        pins: &Weak<PrinterPins>,
+        pins: &std::sync::Weak<PrinterPins>,
     ) -> Result<(), McuError> {
         let pins = pins
             .upgrade()

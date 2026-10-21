@@ -116,10 +116,17 @@ pub(crate) struct Page {
 /// The font and the icons live here too, in the byte order the panels take: a
 /// character is eight bytes per page, and a 16x16 icon is sixteen (its two
 /// column halves, one per page).
+///
+/// `x_offset` is where column 0 of the character grid lands in the page
+/// (`uc1701.py:16,20`): the SH1106's visible area starts two columns into its
+/// 132-column RAM, so drawing starts at byte 2 while the flush still addresses
+/// the bytes it sends by their own position (`uc1701.py:34-52`).
 #[derive(Debug)]
 pub(crate) struct DisplayBase {
     /// Bytes per page — one page is eight pixel rows of `columns` columns.
     columns: usize,
+    /// The page byte the character grid's column 0 is drawn at.
+    x_offset: usize,
     /// The eight pages, in row order.
     pub(crate) pages: Vec<Page>,
     /// Every VGA glyph, already swizzled (`uc1701.py:25-26`).
@@ -132,9 +139,10 @@ pub(crate) struct DisplayBase {
 impl DisplayBase {
     /// Eight blank pages, each with an unsent copy (`uc1701.py:21-23`), and the
     /// font every character is drawn from (`uc1701.py:25-26`).
-    pub(crate) fn new(columns: usize) -> Self {
+    pub(crate) fn new(columns: usize, x_offset: usize) -> Self {
         Self {
             columns,
+            x_offset,
             pages: (0..8)
                 .map(|_| Page {
                     data: vec![0; columns],
@@ -190,7 +198,7 @@ impl DisplayBase {
         let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) else {
             return;
         };
-        let mut pix_x = x * 8;
+        let mut pix_x = x * 8 + self.x_offset;
         for &character in data {
             let (bits_top, bits_bot) = &font[character as usize];
             page_top[pix_x..pix_x + 8].copy_from_slice(bits_top);
@@ -210,7 +218,7 @@ impl DisplayBase {
         let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) else {
             return;
         };
-        let pix_x = x * 8;
+        let pix_x = x * 8 + self.x_offset;
         for i in 0..8 {
             page_top[pix_x + i] ^= bits_top[i];
             page_bot[pix_x + i] ^= bits_bot[i];
@@ -225,7 +233,7 @@ impl DisplayBase {
         let icon = self.icons.get(name).cloned();
         if let Some((top, bottom)) = icon {
             if x < 15 {
-                let pix_x = x * 8;
+                let pix_x = x * 8 + self.x_offset;
                 if let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) {
                     page_top[pix_x..pix_x + 16].copy_from_slice(&top);
                     page_bot[pix_x..pix_x + 16].copy_from_slice(&bottom);
@@ -680,7 +688,7 @@ impl Uc1701 {
             config.get_int_bounded("contrast", Some(DEFAULT_UC1701_CONTRAST), Some(0), Some(63))?;
         let reset = ResetHelper::new(config, printer, "rst_pin", &mcu)?;
         Ok(Self {
-            base: Mutex::new(DisplayBase::new(128)),
+            base: Mutex::new(DisplayBase::new(128, 0)),
             io,
             reset,
             contrast,
@@ -974,8 +982,9 @@ mod tests {
     fn test_the_framebuffers_start_unsent() {
         // Eight blank pages, each with `~` as its "already sent" copy, so the
         // first flush sends the whole screen (`uc1701.py:21-23`).
-        let base = DisplayBase::new(128);
+        let base = DisplayBase::new(128, 0);
         assert_eq!(base.columns, 128);
+        assert_eq!(base.x_offset, 0);
         assert_eq!(base.pages.len(), 8);
         for page in &base.pages {
             assert_eq!(page.data, vec![0; 128]);
@@ -985,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_clear_blanks_every_page() {
-        let mut base = DisplayBase::new(128);
+        let mut base = DisplayBase::new(128, 0);
         for page in &mut base.pages {
             page.data = vec![0xff; 128];
         }

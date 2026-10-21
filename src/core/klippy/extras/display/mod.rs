@@ -8,7 +8,9 @@
 //! the same split is kept: [`display`] is the framework, [`st7920`],
 //! [`hd44780`], [`hd44780_spi`], [`uc1701`], [`ssd1306`] and [`aip31068_spi`]
 //! are the panels that
-//! have a driver here, `font8x14` is the graphics panels' font table, and the
+//! have a driver here (two of them build more than one `lcd_type`: [`st7920`]
+//! also builds `emulated_st7920`, [`ssd1306`] also builds `sh1106`), `font8x14`
+//! is the graphics panels' font table, and the
 //! shipped layout is [`display::DISPLAY_CFG`], vendored beside them.
 //!
 //! | section | upstream | notes |
@@ -29,14 +31,13 @@
 //!   (`MenuManager::screen_update_event`); the key buttons register through
 //!   `buttons` (firmware query since 2026-10-21), whose registry has no rotary
 //!   encoder here.
-//! * **The other panels' drawing.** `st7920`, `hd44780`, `hd44780_spi`,
-//!   `uc1701`, `ssd1306` and `aip31068_spi` have drivers and **all six draw**
-//!   (2026-10-21); `sh1106` and `emulated_st7920` are accepted by `lcd_type`
-//!   (so its error wording stays upstream's) and refused with a message naming
-//!   the gap. The graphics panels' font is upstream's `font8x14.VGA_FONT`,
-//!   vendored as the private [`font8x14`] module (byte-for-byte, with a drift
-//!   test); the text panels draw through the character generator, as
-//!   [`hd44780`] does.
+//! * **The other panels' drawing.** `st7920`, `emulated_st7920`, `hd44780`,
+//!   `hd44780_spi`, `uc1701`, `ssd1306`, `sh1106` and `aip31068_spi` have
+//!   drivers and **all eight draw** — every `lcd_type` upstream's table offers
+//!   is implemented, so `lcd_type` has no "gap" error left. The graphics
+//!   panels' font is upstream's `font8x14.VGA_FONT`, vendored as the private
+//!   [`font8x14`] module (byte-for-byte, with a drift test); the text panels
+//!   draw through the character generator, as [`hd44780`] does.
 
 pub mod aip31068_spi;
 pub mod display;

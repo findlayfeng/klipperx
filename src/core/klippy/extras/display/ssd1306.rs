@@ -1,7 +1,8 @@
-//! `ssd1306` — the SSD1306 (128x64 OLED) panel driver (upstream defines it in
-//! `klippy/extras/display/uc1701.py:199-235`, because it is the same
+//! `ssd1306` and `sh1106` — the SSD1306 (128x64 OLED) panel driver and its
+//! 132-column sibling (upstream defines both in
+//! `klippy/extras/display/uc1701.py:199-241`, because they are the same
 //! framebuffer and flush as the UC1701; `display.py:19` maps `lcd_type:
-//! ssd1306` to `uc1701.SSD1306`).
+//! ssd1306` to `uc1701.SSD1306` and `lcd_type: sh1106` to `uc1701.SH1106`).
 //!
 //! The panel picks its bus from the config, exactly as upstream does
 //! (`uc1701.py:201-207`): a `cs_pin` makes it a "4 wire" SPI panel that also
@@ -21,13 +22,15 @@
 //! The framebuffers, the flush, the drawing, the IO wrappers and the reset
 //! helper are [`super::uc1701`]'s — upstream imports them from the same module.
 //!
+//! `sh1106` differs from `ssd1306` in the two constructor arguments upstream's
+//! subclass passes (`uc1701.py:237-241`): 132 columns of RAM instead of 128 and
+//! an `x_offset` (0..=3, default 0) that puts the character grid two columns
+//! into that RAM. The drawing and the flush are the same code, so both
+//! `lcd_type`s are this driver, built through [`Ssd1306::new`] and
+//! [`Ssd1306::new_sh1106`].
+//!
 //! # What is not here
 //!
-//! * **`SH1106`** (`uc1701.py:238-241`): the 132-column variant adds an
-//!   `x_offset` option and is a separate `lcd_type`, still refused by
-//!   [`super::display`]; the `columns`/`x_offset` parameters of upstream's
-//!   `SSD1306.__init__` exist only for that subclass, so this driver takes the
-//!   defaults (128 columns, no offset) and reads no option for them.
 //! * **The reset queue stall** and `BACKGROUND_PRIORITY_CLOCK`: see
 //!   [`super::uc1701`]'s module docs.
 
@@ -48,6 +51,20 @@ const DEFAULT_CONTRAST: i64 = 239;
 
 /// Upstream's default `vcomh` (`uc1701.py:211`).
 const DEFAULT_VCOMH: i64 = 0;
+
+/// The SSD1306's page width (`uc1701.py:200`), the default of upstream's
+/// `columns` argument.
+const SSD1306_COLUMNS: usize = 128;
+
+/// The SH1106's page width (`uc1701.py:240`): the same controller with 132
+/// columns of RAM, of which the middle 128 are the visible area.
+const SH1106_COLUMNS: usize = 132;
+
+/// Upstream's default `x_offset` (`uc1701.py:239`).
+const DEFAULT_X_OFFSET: i64 = 0;
+
+/// The largest `x_offset` upstream accepts (`uc1701.py:239`).
+const MAX_X_OFFSET: i64 = 3;
 
 /// The power-up commands (`uc1701.py:215-233`), with `contrast`, `vcomh` and
 /// the `invert` choice in their slots.
@@ -82,7 +99,8 @@ fn init_commands(contrast: i64, vcomh: i64, invert: bool) -> Vec<u8> {
     ]
 }
 
-/// One `lcd_type: ssd1306` panel (upstream's `SSD1306`, `uc1701.py:199-235`).
+/// One `lcd_type: ssd1306` or `lcd_type: sh1106` panel (upstream's `SSD1306`,
+/// `uc1701.py:199-235`, and `SH1106`, `:237-241`).
 pub struct Ssd1306 {
     /// The eight page framebuffers.
     base: Mutex<DisplayBase>,
@@ -96,20 +114,53 @@ pub struct Ssd1306 {
     vcomh: i64,
     /// `invert` (`uc1701.py:212`).
     invert: bool,
+    /// The `lcd_type` this panel was built as, for its log lines.
+    name: &'static str,
 }
 
 impl Ssd1306 {
-    /// Read the options and build the panel.
+    /// Read the options and build the SSD1306 panel.
     ///
-    /// Upstream's `SSD1306.__init__` (`uc1701.py:200-212`): the bus from
-    /// `cs_pin`, the optional `reset_pin`, then `contrast`, `vcomh` and
-    /// `invert`.
+    /// Upstream's `SSD1306.__init__` (`uc1701.py:200-212`) with its default
+    /// geometry: the bus from `cs_pin`, the optional `reset_pin`, then
+    /// `contrast`, `vcomh` and `invert`.
     ///
     /// # Errors
     /// As [`PanelIo::spi4wire`] (including a missing `dc_pin`) or
     /// [`PanelIo::i2c`], a `reset_pin` that is not on the bus's MCU, a
     /// `contrast` outside `0..=255`, or a `vcomh` outside `0..=63`.
     pub fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
+        Self::build(config, printer, "ssd1306", SSD1306_COLUMNS, 0)
+    }
+
+    /// Read the options and build the SH1106 panel: the SSD1306 with 132
+    /// columns and an `x_offset`.
+    ///
+    /// Upstream's `SH1106.__init__` (`uc1701.py:238-241`) reads `x_offset`
+    /// bounded `0..=3` and hands 132 columns and that offset to
+    /// `SSD1306.__init__`; everything else is the SSD1306's own.
+    ///
+    /// # Errors
+    /// As [`Ssd1306::new`], plus an `x_offset` outside `0..=3`.
+    pub fn new_sh1106(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Self, ConfigError> {
+        let x_offset = config.get_int_bounded(
+            "x_offset",
+            Some(DEFAULT_X_OFFSET),
+            Some(0),
+            Some(MAX_X_OFFSET),
+        )?;
+        Self::build(config, printer, "sh1106", SH1106_COLUMNS, x_offset as usize)
+    }
+
+    /// Upstream's `SSD1306.__init__` (`uc1701.py:200-212`) for a panel of
+    /// `columns` page bytes drawn at `x_offset`.
+    fn build(
+        config: &ConfigWrapper,
+        printer: &Arc<Printer>,
+        name: &'static str,
+        columns: usize,
+        x_offset: usize,
+    ) -> Result<Self, ConfigError> {
         let (io, mcu) = if config.get_str("cs_pin").is_some() {
             // `SPI4wire(config, "dc_pin")` (`uc1701.py:205-207`).
             PanelIo::spi4wire(config, printer, "dc_pin")?
@@ -123,12 +174,13 @@ impl Ssd1306 {
         let vcomh = config.get_int_bounded("vcomh", Some(DEFAULT_VCOMH), Some(0), Some(63))?;
         let invert = config.get_bool("invert", Some(false))?;
         Ok(Self {
-            base: Mutex::new(DisplayBase::new(128)),
+            base: Mutex::new(DisplayBase::new(columns, x_offset)),
             io,
             reset,
             contrast,
             vcomh,
             invert,
+            name,
         })
     }
 
@@ -147,7 +199,7 @@ impl LcdChip for Ssd1306 {
         self.reset.init();
         let commands = init_commands(self.contrast, self.vcomh, self.invert);
         if let Err(err) = self.io.send(&commands, false) {
-            warn!("ssd1306: could not initialise the panel: {err}");
+            warn!("{}: could not initialise the panel: {err}", self.name);
             return;
         }
         self.flush();
@@ -161,7 +213,7 @@ impl LcdChip for Ssd1306 {
     /// Upstream's `DisplayBase.flush` (`uc1701.py:28-52`).
     fn flush(&self) {
         if let Err(err) = self.base().flush(&self.io) {
-            warn!("ssd1306: could not flush the panel: {err}");
+            warn!("{}: could not flush the panel: {err}", self.name);
         }
     }
 
@@ -211,6 +263,7 @@ impl PrinterObject for Ssd1306 {
 impl std::fmt::Debug for Ssd1306 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Ssd1306")
+            .field("name", &self.name)
             .field("contrast", &self.contrast)
             .field("vcomh", &self.vcomh)
             .field("invert", &self.invert)

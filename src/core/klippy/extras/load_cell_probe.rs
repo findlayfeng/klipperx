@@ -16,6 +16,8 @@
 //! | the sensor's `*_attach_trigger_analog` init command | `MCU_trigger_analog._build_config` |
 //! | [`LoadCellProbeChip`] (`probe:z_virtual_endstop`) | `probe.HomingViaProbeHelper` |
 //! | the `probe` object | `LoadCellPrinterProbe` |
+//! | [`TapAnalysis`] + `load_cell_probe/dump_taps` | `TapAnalysis` / `ApiClientHelper` |
+//! | `LOAD_CELL_TEST_TAP` | `LoadCellProbeCommands` |
 //!
 //! The cell itself (chips, calibration, `LOAD_CELL_*`, `load_cell/dump_force`)
 //! is [`load_cell`](crate::core::klippy::extras::load_cell): `LoadCell::new`
@@ -33,14 +35,17 @@
 //! reach it, so the corpus case `load_cell.test`'s g-code runs through
 //! (verified against the fake firmware).
 //!
+//! Every tap broadcasts its collected window on the `load_cell_probe/dump_taps`
+//! mux endpoint as upstream's `TappingMove.run_tap` does
+//! (`self._clients.send({'tap': TapAnalysis(samples).to_dict()})`), and
+//! `LOAD_CELL_TEST_TAP` waits for `TAPS` taps on a bare trigger analog
+//! (`LoadCellProbingMove.probing_test`).
+//!
 //! What upstream adds around that and is **not** wired yet:
 //!
-//! * the `load_cell_probe/dump_taps` mux endpoint (`tap` events are not
-//!   broadcast).
 //! * `ContinuousTareFilterHelper.update_from_command`: a `PROBE`/`G28` that
 //!   overrides the drift/buzz/notch options at the command line is not read
 //!   (the corpus passes none).
-//! * `LOAD_CELL_TEST_TAP`.
 //!
 //! The wiring that makes a real board's `PROBE` work is in place: the sensor
 //! is attached to the trigger analog at load (its `*_attach_trigger_analog`
@@ -54,12 +59,17 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use crate::core::klippy::api::protocol::{ApiError, PushTarget, Request, ResponseTemplate};
+use crate::core::klippy::api::registry::{EndpointContext, EndpointFuture, MuxEndpoint};
+use crate::core::klippy::api::webhooks;
 use crate::core::klippy::cmd::trigger_analog::TriggerAnalogType;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
+use crate::core::klippy::extras::bulk_sensor::ClientCb;
 use crate::core::klippy::extras::load_cell::{LoadCell, LoadCellSampleCollector};
 use crate::core::klippy::extras::probe::{
     calc_probe_z_average, check_virtual_endstop, ProbeOffsets, ProbeParams, ProbeSession,
@@ -69,7 +79,7 @@ use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::{HomingEndstop, ToolHeadObject};
 use crate::core::klippy::extras::trigger_analog::{calc_frac_bits, to_fixed_32, DigitalFilter};
 use crate::core::klippy::gcode::{
-    CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
+    parse_float, CommandError, CommandFuture, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::mathutil::{gaussian_solve, mat_mat_mul, mat_transp, Coord};
@@ -118,6 +128,33 @@ const BUZZ_DELAY: (i64, i64) = (1, 2);
 
 /// The most notches `notch_filter_frequencies` may carry (`max_len=2`).
 const MAX_NOTCHES: usize = 2;
+
+/// The mux path the tap events stream on (`load_cell_probe/dump_taps`).
+pub const DUMP_TAPS_ENDPOINT: &str = "load_cell_probe/dump_taps";
+
+/// The mux key that selects the probe
+/// (`add_mux_endpoint(..., "load_cell_probe", name, header)`).
+pub const DUMP_TAPS_KEY: &str = "load_cell_probe";
+
+/// The column the tap endpoint's start response advertises
+/// (`header = {"header": ["probe_tap_event"]}`): one event per tap.
+const TAP_HEADER: [&str; 1] = ["probe_tap_event"];
+
+/// `LOAD_CELL_TEST_TAP`'s help string
+/// (`cmd_LOAD_CELL_TEST_TAP_help`).
+const LOAD_CELL_TEST_TAP_HELP: &str = "Tap the load cell probe to verify operation";
+
+/// `LOAD_CELL_TEST_TAP TAPS`'s default and bound (`get_int(..., 3, minval=1,
+/// maxval=10)`).
+const TEST_TAP_TAPS: (i64, i64, i64) = (3, 1, 10);
+
+/// `LOAD_CELL_TEST_TAP TIMEOUT`'s default and bound (`get_float(..., 30.,
+/// minval=1., maxval=120.)`), in seconds.
+const TEST_TAP_TIMEOUT: (f64, f64, f64) = (30., 1., 120.);
+
+/// The pause between taps (`reactor.pause(reactor.monotonic() + 0.2)`): the
+/// finger needs a moment to leave the probe.
+const TEST_TAP_PAUSE_SECONDS: f64 = 0.2;
 
 // ===========================================================================
 // The configuration helpers (unit-tested directly)
@@ -638,6 +675,8 @@ pub struct LoadCellProbe {
     is_last_tap_valid: AtomicBool,
     /// The live tare in counts (`LoadCellProbingMove.get_status`).
     tare_counts: Mutex<f64>,
+    /// The `tap` event's fan-out (`TappingMove._clients`).
+    tap_events: Arc<TapFanOut>,
 }
 
 impl LoadCellProbe {
@@ -733,6 +772,20 @@ impl LoadCellProbe {
             Box::new(move |_| register_z_steppers(&identify_printer, &identify_analog)),
         );
 
+        // `TappingMove.__init__`: the tap event's mux endpoint, keyed by the
+        // section's full name (`config.get_name()`), greeting each connection
+        // with the `probe_tap_event` header.
+        let tap_events = Arc::new(TapFanOut::new(&identifier));
+        let webhooks = webhooks::install(printer)?;
+        webhooks.register_mux_endpoint(
+            DUMP_TAPS_ENDPOINT,
+            DUMP_TAPS_KEY,
+            Some(&identifier),
+            Arc::new(DumpTapsEndpoint {
+                fan_out: Arc::downgrade(&tap_events),
+            }),
+        )?;
+
         // `probe.lookup_minimum_z`: `[stepper_z] position_min`, else
         // `[printer] minimum_z_position`, else 0.
         let z_min_position = match config.sibling("stepper_z") {
@@ -759,6 +812,7 @@ impl LoadCellProbe {
             last_result: Mutex::new(0.0),
             is_last_tap_valid: AtomicBool::new(false),
             tare_counts: Mutex::new(0.0),
+            tap_events,
         })
     }
 
@@ -961,9 +1015,92 @@ impl LoadCellProbe {
         let corrected_z =
             self.analyze_ascent(gcmd, &samples, ascent_start_time, &toolhead, epos.z())?;
         epos.set_axis(Z_AXIS, corrected_z);
+        // `self._clients.send({'tap': ppa.to_dict()})`: the tap's collected
+        // window goes out before the result is recorded, as upstream does.
+        self.send_tap(&samples);
         *self.last_result.lock().unwrap_or_else(|p| p.into_inner()) = corrected_z;
         self.is_last_tap_valid.store(true, Ordering::SeqCst);
         Ok(epos)
+    }
+
+    /// Broadcast one tap's samples on `load_cell_probe/dump_taps`
+    /// (`TappingMove.run_tap` → `self._clients.send`).
+    ///
+    /// The event carries the tap's own collected window — nothing is kept
+    /// between taps (`_last_result` is the only history) — so a client that
+    /// never subscribed loses nothing, and the payload is bounded by the
+    /// tap's descend-plus-ascent window.
+    fn send_tap(&self, samples: &[[f64; 3]]) {
+        let analysis = TapAnalysis::new(samples);
+        self.tap_events.send(&json!({ "tap": analysis.to_dict() }));
+    }
+
+    /// `LoadCellProbingMove.probing_test`: tare, then wait for the trigger
+    /// analog to fire with no movement.
+    ///
+    /// Returns the print time the trigger fired at, or `0.0` when `timeout`
+    /// seconds passed without one.
+    ///
+    /// # Errors
+    /// A cell that is not calibrated, a missing toolhead, or a trigger-analog
+    /// error (a saturated sensor, a filter overflow, a firmware timeout).
+    async fn probing_test(&self, gcmd: &GcodeCommand, timeout: f64) -> Result<f64, CommandError> {
+        let toolhead = self.toolhead()?;
+        self.pause_and_tare(gcmd, &toolhead).await?;
+        let print_time = toolhead.get_last_move_time();
+        self.trigger_analog
+            .home_start(print_time, 0., 0, 0., false)
+            .map_err(|err| CommandError::new(err.to_string()))?;
+        self.trigger_analog
+            .home_wait(print_time + timeout)
+            .await
+            .map_err(|err| CommandError::new(err.to_string()))
+    }
+
+    /// `LoadCellProbeCommands.cmd_LOAD_CELL_TEST_TAP`: wait for `TAPS` taps,
+    /// each landing within `TIMEOUT` seconds.
+    ///
+    /// # Errors
+    /// `Test timeout out` when a tap times out (upstream's wording), or
+    /// whatever [`probing_test`](Self::probing_test) raises.
+    async fn test_taps(&self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
+        let (default_taps, min_taps, max_taps) = TEST_TAP_TAPS;
+        // `gcmd.get_int('TAPS', 3, minval=1, maxval=10)`: the shorthand
+        // getters have no default-plus-bound form, so the generic `get` takes
+        // it with the same integer parse.
+        let taps = gcmd.get::<i64>(
+            "TAPS",
+            Some(default_taps),
+            |raw| raw.parse().ok(),
+            Some(min_taps),
+            Some(max_taps),
+            None,
+            None,
+        )?;
+        let (default_timeout, min_timeout, max_timeout) = TEST_TAP_TIMEOUT;
+        let timeout = gcmd.get::<f64>(
+            "TIMEOUT",
+            Some(default_timeout),
+            parse_float,
+            Some(min_timeout),
+            Some(max_timeout),
+            None,
+            None,
+        )?;
+        gcmd.respond_info(&format!("Tap the load cell {taps} times:"));
+        for _ in 0..taps {
+            let result = self.probing_test(gcmd, timeout).await?;
+            if result == 0. {
+                // `raise gcmd.error("Test timeout out")`, typo and all.
+                return Err(CommandError::new("Test timeout out"));
+            }
+            gcmd.respond_info("Tap Detected!");
+            // `reactor.pause(reactor.monotonic() + 0.2)`: give the finger
+            // some time to move away from the probe.
+            tokio::time::sleep(Duration::from_secs_f64(TEST_TAP_PAUSE_SECONDS)).await;
+        }
+        gcmd.respond_info(&format!("Test complete, {taps} taps detected"));
+        Ok(())
     }
 
     /// `TappingMove._analyze_ascent`: the piecewise fit over the ascent
@@ -1068,6 +1205,20 @@ impl LoadCellProbe {
                 false,
             )
             .map_err(ConfigError::new)?;
+        // `LOAD_CELL_TEST_TAP` (`LoadCellProbeCommands._register_commands`).
+        let probe = Arc::clone(self);
+        gcode
+            .register_command_with_params(
+                "LOAD_CELL_TEST_TAP",
+                Arc::new(move |gcmd| {
+                    let probe = Arc::clone(&probe);
+                    Box::pin(async move { probe.test_taps(gcmd).await })
+                }),
+                Some(LOAD_CELL_TEST_TAP_HELP),
+                &["TAPS", "TIMEOUT"],
+                false,
+            )
+            .map_err(ConfigError::new)?;
         Ok(())
     }
 }
@@ -1159,6 +1310,166 @@ impl LCBestFit {
             samples.len() - n_below,
             depress_slope,
         ))
+    }
+}
+
+/// One tap's samples as the `tap` event carries them (`TapAnalysis`): the
+/// `time` and `force` columns of the window the tap collected.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TapAnalysis {
+    /// The sample times, in seconds.
+    pub time: Vec<f64>,
+    /// The sample forces, in grams.
+    pub force: Vec<f64>,
+}
+
+impl TapAnalysis {
+    /// Split the tap's `[time, force, counts]` rows into the event's columns.
+    pub fn new(samples: &[[f64; 3]]) -> Self {
+        Self {
+            time: samples.iter().map(|sample| sample[0]).collect(),
+            force: samples.iter().map(|sample| sample[1]).collect(),
+        }
+    }
+
+    /// The pushed payload (`TapAnalysis.to_dict`).
+    pub fn to_dict(&self) -> Value {
+        json!({
+            "time": self.time,
+            "force": self.force,
+            "is_valid": true,
+        })
+    }
+}
+
+/// The `tap` event's fan-out (`load_cell.ApiClientHelper` as `TappingMove`
+/// uses it): the `load_cell_probe/dump_taps` connections, sent once per tap.
+struct TapFanOut {
+    /// The instance name, for the unknown-instance answer after a reload.
+    name: String,
+    /// The connections, plus whether the mux registration was detached.
+    clients: Mutex<TapClients>,
+}
+
+/// The fan-out's connections (`ApiClientHelper.client_cbs`).
+///
+/// `detached` shares the callbacks' lock, so a request that resolved the
+/// instance just before a reload cannot add a client after the reload cleared
+/// them.
+#[derive(Default)]
+struct TapClients {
+    callbacks: Vec<ClientCb>,
+    detached: bool,
+}
+
+impl TapFanOut {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            clients: Mutex::new(TapClients::default()),
+        }
+    }
+
+    /// `ApiClientHelper.add_client`; `false` once the registration is
+    /// detached.
+    fn add_client(&self, client: ClientCb) -> bool {
+        let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        if clients.detached {
+            return false;
+        }
+        clients.callbacks.push(client);
+        true
+    }
+
+    /// `ApiClientHelper.send`: one message per live connection, dropping the
+    /// ones whose client went away.
+    fn send(&self, message: &Value) {
+        let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        clients.callbacks.retain(|client| client(message));
+    }
+
+    /// Stop the fan-out: a dropped registration must not reach the previous
+    /// configuration's connections.
+    fn detach(&self) {
+        let mut clients = self.clients.lock().unwrap_or_else(|p| p.into_inner());
+        clients.detached = true;
+        clients.callbacks.clear();
+    }
+
+    /// How many connections are registered (tests and bookkeeping).
+    #[cfg(test)]
+    fn client_count(&self) -> usize {
+        self.clients
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .callbacks
+            .len()
+    }
+}
+
+/// `load_cell_probe/dump_taps`: one API connection receiving the tap events
+/// (`ApiClientHelper._add_webhooks_client`).
+struct DumpTapsEndpoint {
+    /// The probe's fan-out, weakly: the API table outlives the configuration
+    /// that registered the instance.
+    fan_out: Weak<TapFanOut>,
+}
+
+impl MuxEndpoint for DumpTapsEndpoint {
+    fn handle<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a EndpointContext<'a>,
+    ) -> EndpointFuture<'a> {
+        Box::pin(async move {
+            let fan_out = self
+                .fan_out
+                .upgrade()
+                .ok_or_else(|| ApiError::Internal("the load cell probe is gone".to_string()))?;
+            let template = ResponseTemplate::from_params(&request.params())?;
+            let pusher = TapPush {
+                target: Arc::clone(&context.client),
+                template,
+            };
+            if !fan_out.add_client(Arc::new(move |message: &Value| pusher.send(message))) {
+                // The registration is gone: a reload detached this instance
+                // after the request was routed to it. Answer like the table
+                // would have, so the client retries instead of waiting on a
+                // stream that will never run.
+                return Err(ApiError::UnknownMuxValue {
+                    key: DUMP_TAPS_KEY.to_string(),
+                    value: fan_out.name.clone(),
+                });
+            }
+            Ok(json!({ "header": TAP_HEADER }))
+        })
+    }
+
+    /// Dropping this registration unregisters every tap client of the probe
+    /// (`ApiClientHelper`'s client list goes with the configuration).
+    fn detach(&self) {
+        if let Some(fan_out) = self.fan_out.upgrade() {
+            fan_out.detach();
+        }
+    }
+}
+
+/// A pusher for one `dump_taps` connection (`BatchWebhooksClient`).
+struct TapPush {
+    /// The connection, kept so the subscription outlives its request.
+    target: Arc<dyn PushTarget>,
+    /// The reply envelope the events are wrapped in.
+    template: ResponseTemplate,
+}
+
+impl TapPush {
+    /// Push one tap event; `false` when the connection is gone.
+    fn send(&self, message: &Value) -> bool {
+        if self.target.is_closed() {
+            return false;
+        }
+        self.target.push(self.template.message(message.clone()));
+        true
     }
 }
 
@@ -1298,6 +1609,7 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::test_support::RecordingTarget;
     use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
@@ -1603,6 +1915,186 @@ mod tests {
         assert!((z_contact - 0.25).abs() <= 0.01, "z_contact={z_contact}");
         assert!(below >= FIT_MIN_POINTS, "below={below}");
         assert!(above >= FIT_MIN_POINTS, "above={above}");
+    }
+
+    // ------------------------------------------------------------------
+    // The tap event (`load_cell_probe/dump_taps`)
+    // ------------------------------------------------------------------
+
+    /// The probe's `load_cell_probe/dump_taps` registration, out of the
+    /// initial load's pending list (`WebhooksStatus`).
+    fn tap_registration(machine: &Arc<Printer>) -> webhooks::MuxRegistration {
+        let webhooks = machine
+            .lookup_object_as::<webhooks::WebhooksStatus>(webhooks::WEBHOOKS_OBJECT)
+            .expect("the probe installs `webhooks`");
+        webhooks
+            .take_mux_endpoints()
+            .into_iter()
+            .find(|registration| registration.path == DUMP_TAPS_ENDPOINT)
+            .expect("the probe registers the tap endpoint")
+    }
+
+    /// One `load_cell_probe/dump_taps` request, as a client sends it.
+    async fn subscribe_taps(
+        handler: &Arc<dyn MuxEndpoint>,
+        target: Arc<RecordingTarget>,
+    ) -> Result<Value, ApiError> {
+        let api = crate::core::klippy::api::registry::Api::new();
+        let request = Request::parse(
+            br#"{"method":"load_cell_probe/dump_taps","params":{"load_cell_probe":"load_cell_probe"}}"#,
+        )
+        .expect("test body is a valid request");
+        let context = EndpointContext {
+            api: &api,
+            client: target as Arc<dyn PushTarget>,
+        };
+        handler.handle(&request, &context).await
+    }
+
+    /// `TappingMove.__init__`'s `add_mux_endpoint`: the instance is the
+    /// section's full name under the `load_cell_probe` key, and the greeting
+    /// carries the `probe_tap_event` header.
+    #[tokio::test]
+    async fn the_tap_endpoint_is_registered_for_the_probe_with_the_tap_header() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        assert_eq!(registration.key, DUMP_TAPS_KEY);
+        assert_eq!(registration.value.as_deref(), Some("load_cell_probe"));
+        // Nothing is pushed before the first tap: the stream only carries
+        // what a measurement produced (upstream sends in `run_tap`).
+        let target = RecordingTarget::new();
+        let reply = subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "header": ["probe_tap_event"] }));
+        assert_eq!(probe.tap_events.client_count(), 1);
+        assert!(target.pushes().is_empty(), "no tap has run yet");
+    }
+
+    /// Each tap pushes its own collected window as `{'tap': {'time',
+    /// 'force', 'is_valid'}}` (`TappingMove.run_tap` → `TapAnalysis`).
+    #[tokio::test]
+    async fn a_tap_pushes_its_window_as_time_and_force_columns() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        let target = RecordingTarget::new();
+        subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+
+        // Two taps, each with the `[time, force, counts]` rows a collector
+        // hands the analysis; the counts column is not part of the event.
+        let first = [
+            [10.0, 0.0, 1000.0],
+            [10.001, 74.5, 8450.0],
+            [10.002, 75.0, 8500.0],
+        ];
+        let second = [[10.2, 0.5, 1050.0], [10.201, 30.25, 4025.0]];
+        probe.send_tap(&first);
+        probe.send_tap(&second);
+
+        let pushes = target.pushes();
+        assert_eq!(pushes.len(), 2, "one event per tap, nothing coalesced");
+        assert_eq!(
+            pushes[0]["params"]["tap"],
+            json!({
+                "time": [10.0, 10.001, 10.002],
+                "force": [0.0, 74.5, 75.0],
+                "is_valid": true,
+            })
+        );
+        assert_eq!(
+            pushes[1]["params"]["tap"],
+            json!({
+                "time": [10.2, 10.201],
+                "force": [0.5, 30.25],
+                "is_valid": true,
+            })
+        );
+    }
+
+    /// `LOAD_CELL_TEST_TAP` is registered with upstream's help string and its
+    /// two parameters (`LoadCellProbeCommands`).
+    #[test]
+    fn the_load_cell_test_tap_command_is_registered() {
+        let (machine, _probe) = corpus_probe();
+        let gcode = machine
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        assert_eq!(
+            gcode
+                .command_help()
+                .get("LOAD_CELL_TEST_TAP")
+                .map(String::as_str),
+            Some("Tap the load cell probe to verify operation")
+        );
+    }
+
+    /// No hardware: a tap that collected nothing is an empty event, not a
+    /// panic, and an endpoint whose probe is gone answers an error instead of
+    /// panicking.
+    #[tokio::test]
+    async fn an_empty_tap_and_a_dropped_probe_do_not_panic() {
+        let machine = printer();
+        let registration;
+        {
+            let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+            registration = tap_registration(&machine);
+            let target = RecordingTarget::new();
+            subscribe_taps(&registration.handler, Arc::clone(&target))
+                .await
+                .unwrap();
+            // A probe that was never sampled (no MCU, no sensor data).
+            probe.send_tap(&[]);
+            let pushes = target.pushes();
+            assert_eq!(pushes.len(), 1);
+            assert_eq!(
+                pushes[0]["params"]["tap"],
+                json!({ "time": [], "force": [], "is_valid": true })
+            );
+        }
+        // The configuration is gone (or was never wired): the registration
+        // outlives it, but the fan-out does not.
+        let target = RecordingTarget::new();
+        let err = subscribe_taps(&registration.handler, target)
+            .await
+            .expect_err("a probe that is gone takes no client");
+        assert_eq!(
+            err,
+            ApiError::Internal("the load cell probe is gone".to_string())
+        );
+    }
+
+    /// A dropped registration stops the fan-out and answers the unknown
+    /// instance afterwards, like the `load_cell/dump_force` instance does.
+    #[tokio::test]
+    async fn a_detached_tap_endpoint_stops_the_fan_out() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        let target = RecordingTarget::new();
+        subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+        assert_eq!(probe.tap_events.client_count(), 1);
+
+        registration.handler.detach();
+        assert_eq!(probe.tap_events.client_count(), 0);
+        probe.send_tap(&[[0.0, 1.0, 1000.0]]);
+        assert!(target.pushes().is_empty(), "a detached fan-out is silent");
+
+        let err = subscribe_taps(&registration.handler, RecordingTarget::new())
+            .await
+            .expect_err("a detached instance takes no client");
+        assert_eq!(
+            err,
+            ApiError::UnknownMuxValue {
+                key: DUMP_TAPS_KEY.to_string(),
+                value: "load_cell_probe".to_string(),
+            }
+        );
     }
 
     // ------------------------------------------------------------------

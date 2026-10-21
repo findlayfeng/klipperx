@@ -134,6 +134,7 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
     ("LOAD_CELL_DIAGNOSTIC", &["LOAD_CELL"]),
     ("LOAD_CELL_READ", &["LOAD_CELL"]),
     ("LOAD_CELL_TARE", &["LOAD_CELL"]),
+    ("LOAD_CELL_TEST_TAP", &["TAPS", "TIMEOUT"]),
     ("M104", &["S", "T"]),
     ("M106", &["S"]),
     ("M109", &["S", "T"]),

@@ -29,27 +29,23 @@ pub const BUFFER_TIME_START: f64 = 0.250;
 /// has time to be generated and reach the wire before its own clock.
 ///
 /// **In this host the term is dominated** — `BUFFER_TIME_START` (0.250) is
-/// already larger than `MIN_KIN_TIME + KIN_FLUSH_DELAY` (0.101) — so folding it
+/// already larger than `MIN_KIN_TIME + SDS_CHECK_TIME` (0.101) — so folding it
 /// into the floor is an alignment with upstream's formula, not a behavioural
 /// change on its own (it only ever wins when `last_step_gen_time` is further
-/// ahead than `est + 0.101`).
+/// ahead than `est + 0.101`); a raised `kin_flush_delay` narrows that.
 const MIN_KIN_TIME: f64 = 0.100;
 
 /// The step+dir+step filter window, in seconds (`SDS_CHECK_TIME`,
 /// `klippy/extras/motion_queuing.py:17`, `chelper/stepcompress.c:504`).
 ///
-/// Upstream starts `kin_flush_delay` here and only raises it for a stepper with
-/// a wider step generation window (`motion_queuing.py:120-140`): an extruder's
-/// half smooth time (`kin_extruder.c:145`) or an input shaper's pulse span
-/// (`kin_shaper.c:202-218`). The extruder's window is now generated
-/// ([`StepKinematics::generate_steps`](super::itersolve::StepKinematics::generate_steps)),
-/// but this host has no equivalent of that scan-windows pass, so the filter alone
-/// is used: the floor and the history expiry are still computed as if every
-/// window were zero. Safe for history (`MOVE_HISTORY_EXPIRE` keeps far more than
-/// any `hst`); the cost is that a change landing inside a half smooth time of the
-/// horizon may rewrite steps already generated — see the `smooth_time` item in
-/// `TODO.md`.
-const KIN_FLUSH_DELAY: f64 = 0.001;
+/// It is the floor of [`ToolHead::kin_flush_delay`], which upstream starts here
+/// and only raises for a stepper with a wider step generation window
+/// (`motion_queuing.py:123-138`): an extruder's half smooth time
+/// (`kin_extruder.c:144-145`) or an input shaper's pulse span
+/// (`kin_shaper.c:202-218`). `recompute_scan_windows` runs the same scan over
+/// this toolhead's steppers; with no stepper, or none with a window, the filter
+/// alone is in force.
+const SDS_CHECK_TIME: f64 = 0.001;
 
 /// Where the toolhead reads the MCU's estimated print time from
 /// (`MCU.estimated_print_time`).
@@ -186,6 +182,17 @@ pub struct ToolHead {
     /// (`motion_queuing.py:145-146`), the `kin_time` half of
     /// `_calc_print_time`'s floor (`toolhead.py:263` → `motion_queuing.py:191`).
     last_step_gen_time: f64,
+    /// The widest step generation window among the steppers, in seconds —
+    /// upstream's `motion_queuing.kin_flush_delay` (`motion_queuing.py:126-138`),
+    /// kept in step by [`Self::recompute_scan_windows`].
+    ///
+    /// It is added to the print-time floor (`calc_step_gen_restart`,
+    /// `motion_queuing.py:190-192`) and subtracted from the trapq free time
+    /// before history is expired (`_advance_flush_time`,
+    /// `motion_queuing.py:152,155`): steps inside it may still be rewritten by
+    /// a change to the smoothing, so nothing inside it can be treated as
+    /// finished.
+    kin_flush_delay: f64,
     special_queuing_state: bool,
     /// How many moves sit in `lookahead`: one is added with every `move_to`
     /// and leaves with the batch `process_lookahead` flushes. It is the queue
@@ -225,6 +232,7 @@ impl ToolHead {
             estimated_print_time: EstimatedPrintTime::default(),
             sync_print_time: SyncPrintTimeNotify::default(),
             last_step_gen_time: 0.0,
+            kin_flush_delay: SDS_CHECK_TIME,
             // Upstream starts in "NeedPrime" and resyncs the print time on the
             // first planned move (`klippy/toolhead.py:227`).
             special_queuing_state: true,
@@ -524,10 +532,15 @@ impl ToolHead {
     ///
     /// Folding both terms in is an **alignment with the upstream formula, not a
     /// behavioural change on its own**: `BUFFER_TIME_START` (0.250) already
-    /// exceeds `MIN_KIN_TIME + KIN_FLUSH_DELAY` (0.101), so the buffer term wins
+    /// exceeds `MIN_KIN_TIME + SDS_CHECK_TIME` (0.101), so the buffer term wins
     /// everywhere the generated horizon does not, and the rest differs only by
-    /// the 1 ms filter. The step-lead fix a live wait needs is elsewhere (the
+    /// the step filter. The step-lead fix a live wait needs is elsewhere (the
     /// fake firmware's step-chain model, `interface/devices/simulator.rs`).
+    ///
+    /// `kin_flush_delay` is the widest stepper window the scan pass found
+    /// ([`Self::recompute_scan_windows`]): a smoothing change inside it may
+    /// still rewrite already-generated steps, so a new move is held back by it
+    /// rather than by the 1 ms filter alone.
     ///
     /// Raise-only: a horizon the machine has not caught up with is left alone,
     /// so re-priming after an idle moves the next move **forward** — onto
@@ -538,8 +551,9 @@ impl ToolHead {
     /// [`EstimatedPrintTime`]).
     fn calc_print_time(&mut self) {
         let est = self.estimated_print_time.get();
-        // `calc_step_gen_restart` (`motion_queuing.py:190-192`).
-        let kin_time = (est + MIN_KIN_TIME).max(self.last_step_gen_time) + KIN_FLUSH_DELAY;
+        // `calc_step_gen_restart` (`motion_queuing.py:190-192`), with the
+        // `kin_flush_delay` the scan-window pass last computed.
+        let kin_time = (est + MIN_KIN_TIME).max(self.last_step_gen_time) + self.kin_flush_delay;
         let min_print_time = (est + BUFFER_TIME_START).max(kin_time);
         if min_print_time > self.print_time {
             self.print_time = min_print_time;
@@ -652,6 +666,44 @@ impl ToolHead {
     /// max of the two.
     pub fn last_step_gen_time(&self) -> f64 {
         self.last_step_gen_time
+    }
+
+    /// The widest step generation window among this toolhead's steppers
+    /// (`motion_queuing.get_kin_flush_delay`, `motion_queuing.py:123-124`).
+    ///
+    /// Never below the step filter ([`SDS_CHECK_TIME`]), because with no
+    /// stepper, or none whose position function reaches past its own move, the
+    /// filter alone is what the floor and the history expiry account for.
+    pub fn kin_flush_delay(&self) -> f64 {
+        self.kin_flush_delay
+    }
+
+    /// Rescan every stepper's step generation window and keep the widest
+    /// (`motion_queuing.check_step_generation_scan_windows`,
+    /// `motion_queuing.py:126-138`).
+    ///
+    /// A stepper's window is how far, in seconds, its steps reach past the
+    /// first and last move it is active in: an extruder's half smooth time, an
+    /// input shaper's pulse span. Steps inside that window are not final — a
+    /// change to the smoothing may rewrite them — so both the print-time floor
+    /// ([`Self::calc_print_time`]) and the history expiry are held back by the
+    /// widest one.
+    ///
+    /// Call it **whenever a window changes**, as upstream does
+    /// (`kinematics/extruder.py:57,66,82`): this is a scan, not a per-flush
+    /// cost. A detached stepper (`set_trapq(None)`) is skipped, matching
+    /// upstream's NULL-trapq check: it generates no steps, so its window cannot
+    /// be rewritten.
+    pub fn recompute_scan_windows(&mut self) {
+        let mut kin_flush_delay = SDS_CHECK_TIME;
+        for stepper in self.motion_queuing.steppers() {
+            if stepper.trapq_id().is_none() {
+                continue;
+            }
+            let (pre_active, post_active) = stepper.kinematics().effective_generation_window();
+            kin_flush_delay = kin_flush_delay.max(pre_active).max(post_active);
+        }
+        self.kin_flush_delay = kin_flush_delay;
     }
 
     /// Plan everything queued so far — upstream's `_flush_lookahead`, the
@@ -878,6 +930,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::mathutil::AXES;
     use crate::core::klippy::motion::itersolve::Axis;
+    use crate::core::klippy::motion::pressure_advance::ExtruderPressureAdvance;
     use crate::core::klippy::motion::stepcompress::StepCommand;
     use crate::core::klippy::motion::stepper::Stepper;
     use std::sync::Mutex;
@@ -1202,7 +1255,7 @@ mod tests {
     /// the filter window still covers.
     ///
     /// This host's `BUFFER_TIME_START` (0.250) already exceeds `MIN_KIN_TIME`
-    /// (0.100) + `KIN_FLUSH_DELAY` (0.001), so the boundary is the only place
+    /// (0.100) + `SDS_CHECK_TIME` (0.001), so the boundary is the only place
     /// the kin terms can ever bind — folding them in is an alignment with the
     /// upstream formula, and this pins exactly what it changes.
     #[test]
@@ -1216,23 +1269,134 @@ mod tests {
         // (a) The generated horizon binds: the floor is that horizon plus the
         // step filter — not the bare horizon, and not the buffer.
         *est.lock().unwrap() = 1.0;
-        assert!(1.0 + MIN_KIN_TIME + KIN_FLUSH_DELAY < 5.0);
+        assert!(1.0 + MIN_KIN_TIME + SDS_CHECK_TIME < 5.0);
         toolhead.set_position(Coord::default(), &[0]);
         let floor = toolhead.get_last_move_time();
         assert!(
-            (floor - (5.0 + KIN_FLUSH_DELAY)).abs() < 1e-9,
+            (floor - (5.0 + SDS_CHECK_TIME)).abs() < 1e-9,
             "the floor is the generated horizon plus the filter: {floor}"
         );
 
         // (b) The buffer binds instead: the estimate has caught up past the
         // horizon, so `est + BUFFER_TIME_START` wins.
-        assert!(10.0 + MIN_KIN_TIME + KIN_FLUSH_DELAY < 10.0 + BUFFER_TIME_START);
+        assert!(10.0 + MIN_KIN_TIME + SDS_CHECK_TIME < 10.0 + BUFFER_TIME_START);
         *est.lock().unwrap() = 10.0;
         toolhead.set_position(Coord::default(), &[0]);
         let floor = toolhead.get_last_move_time();
         assert!(
             (floor - (10.0 + BUFFER_TIME_START)).abs() < 1e-9,
             "the buffer floor binds once the estimate passes the horizon: {floor}"
+        );
+    }
+
+    /// A pressure-advance stepper with `smooth_time`, on the main trapq: the
+    /// window steps are generated over is half of it (`kin_extruder.c:144-145`).
+    fn pressure_advance_stepper(
+        name: &str,
+        oid: u32,
+        pressure_advance: f64,
+        smooth_time: f64,
+    ) -> Stepper {
+        let mut stepper = Stepper::cartesian(name, oid, 1.0, Axis::X, 1_000_000.0);
+        stepper.set_pressure_advance(ExtruderPressureAdvance::new(pressure_advance, smooth_time));
+        stepper
+    }
+
+    /// The flush delay starts at the step filter and only the scan pass raises
+    /// it (`check_step_generation_scan_windows`, `motion_queuing.py:126-138`):
+    /// with no stepper — and with steppers whose position function reads only
+    /// the move it is asked about — it stays at `SDS_CHECK_TIME`.
+    #[test]
+    fn test_the_flush_delay_starts_at_the_step_filter() {
+        let mut bare = ToolHead::new(limits());
+        bare.recompute_scan_windows();
+        assert_eq!(bare.kin_flush_delay(), SDS_CHECK_TIME);
+
+        let mut toolhead = toolhead();
+        toolhead.recompute_scan_windows();
+        assert_eq!(toolhead.kin_flush_delay(), SDS_CHECK_TIME);
+    }
+
+    /// An extruder with pressure advance reaches half a smooth time past the
+    /// moves it is active in, and that window is the flush delay
+    /// (`kin_extruder.c:144-145` → `motion_queuing.py:126-138`).
+    #[test]
+    fn test_a_pressure_advance_stepper_raises_the_flush_delay_to_half_its_smooth_time() {
+        let mut toolhead = toolhead();
+        toolhead.add_stepper(pressure_advance_stepper("stepper_e", 1, 0.05, 0.04));
+
+        toolhead.recompute_scan_windows();
+
+        assert!(
+            (toolhead.kin_flush_delay() - 0.02).abs() < 1e-12,
+            "half the smooth time: {}",
+            toolhead.kin_flush_delay()
+        );
+    }
+
+    /// The pass keeps the **widest** window: the delay has to cover the stepper
+    /// that reaches furthest past its own moves, whichever one that is.
+    #[test]
+    fn test_the_flush_delay_is_the_widest_stepper_window() {
+        let mut toolhead = toolhead();
+        toolhead.add_stepper(pressure_advance_stepper("stepper_e", 1, 0.05, 0.04));
+        let mut shaper = Stepper::cartesian("stepper_y", 2, 1.0, Axis::Y, 1_000_000.0);
+        // An input shaper's pulse span, as `input_shaper` reports it.
+        shaper.kinematics_mut().set_generation_window(0.03, 0.035);
+        toolhead.add_stepper(shaper);
+
+        toolhead.recompute_scan_windows();
+
+        assert!(
+            (toolhead.kin_flush_delay() - 0.035).abs() < 1e-12,
+            "the widest window wins over the extruder's half smooth time: {}",
+            toolhead.kin_flush_delay()
+        );
+    }
+
+    /// A `SET_PRESSURE_ADVANCE` that changes the smooth time changes the window
+    /// (`kinematics/extruder.py:66,82`): the rescan reads the live values, so
+    /// the delay follows without the stepper being reinstalled.
+    #[test]
+    fn test_a_changed_smooth_time_moves_the_flush_delay() {
+        let mut toolhead = toolhead();
+        let stepper = pressure_advance_stepper("stepper_e", 1, 0.05, 0.04);
+        let pressure_advance = Arc::clone(stepper.kinematics().pressure_advance().unwrap());
+        toolhead.add_stepper(stepper);
+        toolhead.recompute_scan_windows();
+        assert!((toolhead.kin_flush_delay() - 0.02).abs() < 1e-12);
+
+        pressure_advance.set(1.5, 0.05, 0.08);
+        toolhead.recompute_scan_windows();
+
+        assert!(
+            (toolhead.kin_flush_delay() - 0.04).abs() < 1e-12,
+            "the wider smooth time raises the delay: {}",
+            toolhead.kin_flush_delay()
+        );
+    }
+
+    /// The floor is read from the **runtime** delay, not the filter constant:
+    /// with a wide window the generated horizon binds by that window
+    /// (`calc_step_gen_restart`, `motion_queuing.py:190-192`).
+    #[test]
+    fn test_the_prime_floor_adds_the_runtime_flush_delay_on_the_generated_horizon() {
+        let est = Arc::new(Mutex::new(0.0));
+        let mut toolhead = toolhead_with_estimate(&est);
+        toolhead.add_stepper(pressure_advance_stepper("stepper_e", 1, 0.05, 0.2));
+        toolhead.recompute_scan_windows();
+        // Generation reaches a horizon the estimate lags far behind, so the
+        // kin term — not the buffer — is what the floor is built from.
+        toolhead.flush_step_generation(5.0).unwrap();
+        *est.lock().unwrap() = 1.0;
+        assert!(1.0 + MIN_KIN_TIME + toolhead.kin_flush_delay() < 5.0);
+
+        toolhead.set_position(Coord::default(), &[0]);
+        let floor = toolhead.get_last_move_time();
+
+        assert!(
+            (floor - (5.0 + 0.1)).abs() < 1e-9,
+            "the floor is the horizon plus the extruder's half smooth time: {floor}"
         );
     }
 

@@ -27,8 +27,10 @@
 //! toolhead/stepper plumbing it needs is ported here, so
 //! [`InputShaper::update_input_shaping`] is the seam where they would be
 //! reached, and the motion queue's scan-window accounting it ends with is
-//! [`recompute_scan_windows`] — a documented no-op this host has no mechanism
-//! for. `SET_INPUT_SHAPER` therefore changes the reported parameters only.
+//! [`recompute_scan_windows`] — a no-op there while no stepper carries a shaper
+//! window (the scan itself lives on the toolhead,
+//! [`ToolHeadObject::recompute_scan_windows`](crate::core::klippy::extras::toolhead::ToolHeadObject::recompute_scan_windows)).
+//! `SET_INPUT_SHAPER` therefore changes the reported parameters only.
 //!
 //! The same layer is what upstream re-points when a dual carriage changes the
 //! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
@@ -412,13 +414,16 @@ const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
 ];
 
 /// Upstream's `motion_queuing.check_step_generation_scan_windows()`, which
-/// `_update_input_shaping` ends with (`input_shaper.py:185-186`): the step
-/// generation windows a shaper widens have to be recomputed when it changes.
+/// `_update_kinematics` and `_update_input_shaping` end with
+/// (`input_shaper.py:168,186`): the step generation windows a shaper widens
+/// have to be recomputed when it changes.
 ///
-/// This host has no such mechanism — `motion_queuing` is not ported and nothing
-/// under `src/core/klippy/motion/` mentions a scan window — so there is nothing
-/// to recompute. The call is kept, named and made rather than dropped, so the
-/// seam stays visible and cannot be lost silently when the mechanism lands.
+/// The scan itself exists
+/// ([`ToolHeadObject::recompute_scan_windows`](crate::core::klippy::extras::toolhead::ToolHeadObject::recompute_scan_windows)),
+/// but it is a no-op here: the shaper coefficients never reach the steppers
+/// (module docs), so no stepper carries a shaper window for it to find. The call
+/// is kept, named and made rather than dropped, so the seam stays visible until
+/// that layer lands.
 fn recompute_scan_windows() {}
 
 /// The factory `section!` names (`input_shaper.py:209 def load_config`).

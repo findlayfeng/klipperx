@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::mathutil::Xyz;
 
-use super::pressure_advance::{half_smooth_time, ExtruderPressureAdvance, PressureAdvanceEntry};
+use super::pressure_advance::{ExtruderPressureAdvance, PressureAdvanceEntry};
 use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
@@ -214,12 +214,40 @@ impl StepKinematics {
         (self.gen_steps_pre_active, self.gen_steps_post_active)
     }
 
+    /// The window this stepper's steps are generated over right now, as
+    /// [`StepKinematics::generate_steps`] uses it: the live half smooth time
+    /// for a pressure-advance stepper — upstream rewrites both
+    /// `gen_steps_pre_active`/`gen_steps_post_active` from it on every
+    /// `SET_PRESSURE_ADVANCE` (`kin_extruder.c:144-145`) — else the stored
+    /// [`StepKinematics::generation_window`].
+    ///
+    /// The motion queue's scan pass reads it
+    /// ([`ToolHead::recompute_scan_windows`](super::toolhead::ToolHead::recompute_scan_windows)),
+    /// so the flush delay is computed from the window generation actually
+    /// rewrites.
+    pub fn effective_generation_window(&self) -> (f64, f64) {
+        match &self.pressure_advance {
+            Some(pressure_advance) => {
+                let hst = 0.5 * pressure_advance.values().1;
+                (hst, hst)
+            }
+            None => (self.gen_steps_pre_active, self.gen_steps_post_active),
+        }
+    }
+
     /// Drive this stepper's position function with pressure advance
     /// (`extruder_set_pressure_advance`, `kin_extruder.c:138-139`): the solver
     /// reads the shared parameters on every evaluation, so a
     /// `SET_PRESSURE_ADVANCE` is seen without reinstalling anything.
     pub fn set_pressure_advance(&mut self, pressure_advance: Arc<ExtruderPressureAdvance>) {
         self.pressure_advance = Some(pressure_advance);
+    }
+
+    /// The pressure-advance parameters driving this stepper, when it is an
+    /// extruder stepper (`struct extruder_stepper`'s `pa_list` and the shared
+    /// parameter block `SET_PRESSURE_ADVANCE` writes).
+    pub fn pressure_advance(&self) -> Option<&Arc<ExtruderPressureAdvance>> {
+        self.pressure_advance.as_ref()
     }
 
     /// Install the solver's position hooks (upstream: the `calc_position_cb`
@@ -354,16 +382,12 @@ impl StepKinematics {
         };
         let first_queued = cuts.len().saturating_sub(trapq.moves().len());
         // Upstream rewrites both fields from the live `hst` on every
-        // `SET_PRESSURE_ADVANCE` (`kin_extruder.c:143-145`), so the extruder's
-        // window is derived from the snapshot here rather than cached in the
-        // stepper: a change is then in force for the very next flush.
-        let (pre_active, post_active) = match self.pressure_advance {
-            Some(_) => {
-                let hst = half_smooth_time(&schedule);
-                (hst, hst)
-            }
-            None => self.generation_window(),
-        };
+        // `SET_PRESSURE_ADVANCE` (`kin_extruder.c:144-145`), so the extruder's
+        // window is derived from the live values here rather than cached in the
+        // stepper: a change is then in force for the very next flush, and the
+        // queue's scan pass reads the same window
+        // ([`StepKinematics::effective_generation_window`]).
+        let (pre_active, post_active) = self.effective_generation_window();
         let moves = trapq.moves();
         let mut force_steps_time = self.last_move_time + post_active;
         let mut skip_count = 0;

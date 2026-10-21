@@ -451,12 +451,27 @@ fn set_pressure_advance(
             "SMOOTH_TIME must be between 0.0 and 0.2, got {smooth}"
         )));
     }
-    let print_time = printer
+    let toolhead = printer
         .upgrade()
-        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
+    let print_time = toolhead
+        .as_ref()
         .map(|toolhead| toolhead.get_last_move_time())
         .unwrap_or(0.0);
     pressure_advance.set(print_time, value, smooth);
+    // The extruder stepper's step generation window is half its smooth time, so
+    // a changed smooth time changes how far generated steps are still open to
+    // rewriting: rescan and update the flush delay
+    // (`motion_queuing.check_step_generation_scan_windows`,
+    // `kinematics/extruder.py:82`; the detach/bind scan at `:57,66` has no
+    // counterpart here yet). Upstream also flushes step generation first when
+    // the smooth time changed (`kinematics/extruder.py:79`); this host has no
+    // equivalent (a flush here would need the flush task), so only the
+    // bookkeeping moves — the wider window holds the print-time floor and the
+    // history expiry back instead.
+    if let Some(toolhead) = &toolhead {
+        toolhead.recompute_scan_windows();
+    }
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
     ));

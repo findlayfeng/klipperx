@@ -588,20 +588,18 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       参数是按打印时间的表、逐段查表（改值不改写已生成位置），`SET_PRESSURE_ADVANCE` 写入共享的
       `Arc<ExtruderPressureAdvance>`；`pa = 0` 有逐点回归保护。同批修了两个既有静默错：挤出机 stepper
       被 `add_stepper` 重指回主 trapq（从未读自己的）、`ToolHead::set_position` 把 toolhead 坐标写进 extra axis。
-- [ ] **压力提前的余项（2026-10-21 收口时登记）**：
-      1. 改值用 `get_last_move_time()` 落表，**不**走上游的 `register_lookahead_callback`；且 `smooth_time`
-         变更不 `flush_step_generation`（扫描窗记账已落地，能挡住大部分，但 flush 本身仍缺）；
-      2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）；
-      3. `find_past_position` 仍是 stub，pa 领先量不经 MCU 计数进 `motion_report`。
+- [ ] **压力提前的余项**：
+      1. 改**值**（`ADVANCE=`）仍用 `get_last_move_time()` 落表、不走上游的 `register_lookahead_callback`
+         （`smooth_time` 变更**已按上游 flush**，2026-10-21）；
+      2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）。
 - [x] **`input_shaper` 已作用到运动（2026-10-21）**：`motion/shaper.rs` 移植 `kin_shaper.c` 的整形位置函数
       （脉冲归一化 + 重心归零、按 `SegmentWindow` 定位、`DUMMY_T` 合成段喂内层 solver），
       `extras/toolhead.rs` 把脉冲装到主 trapq 的每个 stepper，窗口取活跃轴脉冲极值、扫描窗随之变宽。
       无脉冲轴短路走内层（零开销）。
 - [ ] **`input_shaper` 的余项**：
-      1. 装/换整形前不 `flush_step_generation`（同 PA 那条）；
-      2. `resonance_tester` 从不调 `disable_shaping`/`enable_shaping`——它的运动路径未落地，落地时需补；
-      3. 双滑车重指向（`dual_carriage:update_kinematics`）无人发送，整形层不会跟着换；
-      4. 边界行为：窗口越到首/尾 trapq 段之外时被**裁剪**（上游会走进哨兵段），表现为首次移动的小起点偏移。
+      1. `resonance_tester` 从不调 `disable_shaping`/`enable_shaping`——它的运动路径未落地，落地时需补；
+      2. 双滑车重指向（`dual_carriage:update_kinematics`）无人发送，整形层不会跟着换。
+      （装/换整形前 **已 flush**；窗口越界的**裁剪口径已写进模块文档并给出与上游等价的证据**——2026-10-21。）
 - [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
 - 依赖 F5/F6/F7、C1。
 
@@ -1083,18 +1081,17 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] 桥端口数上限与固件不符：主机允许 256、固件 `BRIDGE_MAX_PORTS 4`（`bridge_ports.rs` / `third_party/klipper/src/bridge.c`），
       超限只靠固件 shutdown 兜住且报错不点名额；固件把「槽号越界」与「tty 打不开」折叠成同一句 `config_uart: … could not be opened`，
       主机侧当成瞬时丢 tty 去走 10 s 恢复。
+- [x] **设备层小件批 —— 已落地（2026-10-21）**：`seconds_to_clock` 拒绝负值/NaN/∞（钳位下移到 `step_pulse_duration` 一处）、
+      `move_clocks` 发送失败退回槽位、`TriggerDispatch::stop()` 保留原始失败理由（探针失败不再读成主机请求）、
+      `trigger_analog` 的 arm 带 `reqclock` 且先停再清了、端停链路故障不再吞掉 `Communication timeout during homing`、
+      `stress --task step` 加行程上界（`position_max × 0.5`）+ 三种出口（断线 exit 1）+ `shutdown_timeout` + 有界 `wait_for_idle`。
 - [ ] `pending::cancel` 删的是「第一个同名同 oid 匹配」而非 token：同名并发调用时先超时者会删掉别人的登记；
       `resolve` 对「有同名登记但 oid 不匹配」也返回 `true`（`mcu/pending.rs`）。修法：`register` 返回自增 token，按 token 精确删。
-- [ ] `seconds_to_clock` 的 `.max(0.0)` 与上游不符：负数/NaN 静默变成 0（= 立刻执行）而非报错（`mcu/mod.rs`）。
-- [ ] `move_clocks` 先记池子再 `enqueue`，`enqueue` 失败会留一条永不解扣的幽灵槽（`mcu/mod.rs`）。
-- [ ] `TriggerDispatch::stop()` 把 raw≥5 的失败理由折成 `HostRequest`（`resource/trsync.rs`）；改用 `stop()` 返回值的调用方会把探针错误读成正常结束。
-- [ ] `trigger_analog_home` 缺 `req_clock`（上游 `reqclock=clock`）；`home_wait` 在 `clear_home()` 失败时跳过 `dispatch.stop()` 且顺序与上游相反；
-      重发缓存「先提交后发送」，发送失败无回滚（`resource/trigger_analog.rs`）。
-- [ ] `endstop.rs` 的链路故障用 send 错误覆盖了上游的 "Communication timeout during homing" 文案。
-- [ ] `stress --task step` 无行程上界与提示（真打印机上会顶机械端）；`Err(err)` 与固件自报 shutdown 折成同一出口（断线=量到限值、退出码 0）；
-      收尾用隐式 `Drop` 而非 `shutdown_timeout`；`wait_for_idle` 以「相隔 5 ms 两次读数相等」判定空闲（`src/stress.rs`）。
-- [ ] `hardware_test` 没有用例级总超时（L2 用例体与板锁等待都无界）；teardown 不关加热/输出（用例在设了目标后失败会带着 PWM 值继续跑）；
-      `apply_id_addressed_transport` 只复刻 Serial 那一枚戳，`host_mux`/`host_port_paths` 不设（`src/hardware_test.rs`）。
+- [x] **`hardware_test` 的用例级总超时与 teardown 护栏 —— 已落地（2026-10-21）**：
+      `hardware_test::case`/`async_case` 把用例体放自管线程、主线程 `recv_timeout(300 s)` 并打
+      `HW-TIMEOUT: <用例>: still at <阶段> after <时长>`；板锁 `LOCK_EX|LOCK_NB` 轮询、`LOCK_TIMEOUT=600 s`
+      （大于用例预算，慢前驱不误报）；teardown 先关加热/输出再拆机器；`apply_id_addressed_transport`
+      补齐 `host_mux`/`host_port_paths`。
 - [ ] 注释/文档与实现不符的存量：`mcu/ids.rs` 称串口 id「无人消费」；`resource/stepper.rs` 称 `step_pulse_duration=0`
       让固件自己挑（实际是零脉宽）；`MoveSlots` 把 `set_next_step_dir` 说成占槽（真正占槽的是 `queue_step`/`queue_digital_out`/
       `queue_pwm_out`/`queue_pca9685_out`）。

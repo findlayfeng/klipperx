@@ -13,6 +13,9 @@
 //! | `clear()` | blank the text and graphics framebuffers | `st7920.py:131-135` |
 //! | `flush()` | batch the framebuffer differences and send them | `st7920.py:35-62` |
 //! | `set_glyphs()` | keep the 16x16 icons and cache the two animated pairs | `st7920.py:86-93` |
+//! | `write_text()` | copy the bytes into the row's text framebuffer | `st7920.py:94-97` |
+//! | `write_glyph()` | draw the icon's two page columns, or one character | `st7920.py:103-124` |
+//! | `write_graphics()` | write one 16-byte pixel column | `st7920.py:98-102` |
 //!
 //! The framebuffers are upstream's three (text, glyph, 32 graphics rows), and so
 //! is the flush algorithm: find the changed bytes, join runs closer than five
@@ -25,15 +28,6 @@
 //! * **`emulated_st7920`** (`st7920.py:209-256`): the software-SPI variant that
 //!   shifts each byte as two nibbles and toggles an enable pin. Not implemented;
 //!   `lcd_type` reports it as a gap.
-//! * **Text and glyph drawing.** The framework draws now — it calls
-//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
-//!   friends through [`display::draw_text`](super::display::draw_text) — but the
-//!   `write_text`/`write_glyph`/`write_graphics` half of upstream's
-//!   `DisplayBase` is a later unit: it needs the font (`font8x14.VGA_FONT`) and
-//!   the `CharGlyphs` table, so this driver keeps the draw-nothing defaults and
-//!   the panel stays blank while the layout renders. The glyph framebuffer is
-//!   still filled by [`ST7920::set_glyphs`], because upstream caches the
-//!   animated icons at load time.
 //! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`st7920.py:10,184`): upstream
 //!   sends with `reqclock=0x7fffffff00000000` and orders startup writes by clock;
 //!   this host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no
@@ -53,11 +47,34 @@ use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 use super::display::{Glyph, LcdChip, SentMessage};
+use super::font8x14::VGA_FONT;
 
 /// Upstream's `ST7920_SYNC_DELAY` (`st7920.py:14`), in seconds.
 const ST7920_SYNC_DELAY: f64 = 0.000045;
 /// Upstream's `ST7920_CMD_DELAY` (`st7920.py:13`), in seconds.
 const ST7920_CMD_DELAY: f64 = 0.000020;
+
+/// The glyph that is one of the panel's own characters (`st7920.py:16`): the
+/// right arrow is character `0x1a`.
+fn text_glyph(name: &str) -> Option<u8> {
+    match name {
+        "right_arrow" => Some(0x1a),
+        _ => None,
+    }
+}
+
+/// The glyph that is one column of the VGA font (`st7920.py:17`): `degrees` is
+/// entry `0xf8`, drawn as a single pixel column.
+fn char_glyph(name: &str) -> Option<&'static [u8; 16]> {
+    match name {
+        "degrees" => Some(&VGA_FONT[0xf8]),
+        _ => None,
+    }
+}
+
+/// The text framebuffer's start per row (`st7920.py:96`): the panel's four rows
+/// are the two halves of its 64-byte text RAM, in the order 0, 2, 1, 3.
+const ROW_STARTS: [usize; 4] = [0, 32, 16, 48];
 
 /// The glyph framebuffer's id in the flush order (`st7920.py:29`).
 const GLYPH_FB_ID: u8 = 0x40;
@@ -138,6 +155,10 @@ struct St7920State {
     /// The 16x16 icons by glyph name, split into the two column halves
     /// (`st7920.py:34`).
     icons: Mutex<HashMap<String, (Vec<u8>, Vec<u8>)>>,
+    /// The animated glyphs cached into the character generator by
+    /// [`ST7920::cache_glyph`]: the base glyph to draw again and the two text
+    /// bytes that select the frame (`st7920.py:74-85`).
+    cached_glyphs: Mutex<HashMap<String, (String, [u8; 2])>>,
     /// Every message handed to the firmware, in order (tests and diagnostics).
     sent: Mutex<Vec<SentMessage>>,
 }
@@ -200,6 +221,7 @@ impl ST7920 {
             is_extended: Mutex::new(false),
             framebuffers: Mutex::new(Framebuffers::new()),
             icons: Mutex::new(HashMap::new()),
+            cached_glyphs: Mutex::new(HashMap::new()),
             sent: Mutex::new(Vec::new()),
         });
 
@@ -367,6 +389,93 @@ impl LcdChip for ST7920 {
             .unwrap_or_else(|poison| poison.into_inner())
             .clone()
     }
+
+    /// Upstream's `DisplayBase.write_text` (`st7920.py:94-97`): a run that does
+    /// not fit is cut at the panel's right edge, and row `y` starts at
+    /// `ROW_STARTS[y]` — the text RAM holds the four rows as two halves.
+    ///
+    /// A row past the fourth draws nothing here; upstream's list index would
+    /// raise.
+    fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+        let width = DIMENSIONS.0;
+        let text = if x + text.len() > width {
+            &text[..width - x.min(width)]
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
+        let Some(row_start) = ROW_STARTS.get(row).copied() else {
+            return;
+        };
+        let pos = row_start + x;
+        let mut framebuffers = self.framebuffers();
+        framebuffers.text.data[pos..pos + text.len()].copy_from_slice(text);
+    }
+
+    /// Upstream's `DisplayBase.write_graphics` (`st7920.py:98-102`): one 16-byte
+    /// pixel column, each byte a row of eight pixels of one graphics page. Rows
+    /// 2 and 3 use the same 16 pages as 0 and 1 but start at column 16.
+    fn write_graphics(&self, x: usize, row: usize, data: &[u8]) {
+        if x >= DIMENSIONS.0 || row >= DIMENSIONS.1 || data.len() != 16 {
+            return;
+        }
+        let mut gfx_fb = row * 16;
+        let mut x = x;
+        if gfx_fb >= 32 {
+            gfx_fb -= 32;
+            x += 16;
+        }
+        let mut framebuffers = self.framebuffers();
+        for (i, bits) in data.iter().enumerate() {
+            framebuffers.graphics[gfx_fb + i].data[x] = *bits;
+        }
+    }
+
+    /// Upstream's `DisplayBase.write_glyph` (`st7920.py:103-124`), in its order:
+    /// a cached animated glyph writes its two text bytes (at an even column)
+    /// and then draws the base icon; a 16x16 icon is two graphics columns and
+    /// costs two cells; `right_arrow` is a character; `degrees` is one font
+    /// column; anything else costs nothing.
+    fn write_glyph(&self, x: usize, row: usize, name: &str) -> usize {
+        let cached = self
+            .state
+            .cached_glyphs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(name)
+            .cloned();
+        let mut base = None;
+        if let Some((base_name, bytes)) = cached {
+            if x & 1 == 0 {
+                self.write_text(x, row, &bytes);
+                base = Some(base_name);
+            }
+        }
+        let lookup = base.as_deref().unwrap_or(name);
+        let icon = self
+            .state
+            .icons
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(lookup)
+            .cloned();
+        if let Some((first, second)) = icon {
+            self.write_graphics(x, row, &first);
+            self.write_graphics(x + 1, row, &second);
+            return 2;
+        }
+        if let Some(character) = text_glyph(lookup) {
+            self.write_text(x, row, &[character]);
+            return 1;
+        }
+        if let Some(column) = char_glyph(lookup) {
+            self.write_graphics(x, row, column);
+            return 1;
+        }
+        0
+    }
 }
 
 impl PrinterObject for ST7920 {
@@ -419,6 +528,16 @@ impl ST7920 {
             // (`st7920.py:84`), so the next flush transmits these two bytes.
             framebuffers.glyph.synced[pos..pos + 2].copy_from_slice(&[x1 ^ 1, x2 ^ 1]);
         }
+        // The frame is selected by writing a text byte: CGRAM's second block
+        // is character `0x02` (`st7920.py:85`).
+        self.state
+            .cached_glyphs
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(
+                glyph_name.to_string(),
+                (base_glyph_name.to_string(), [0, (glyph_id * 2) as u8]),
+            );
     }
 }
 
@@ -778,6 +897,124 @@ mod tests {
         assert_eq!(framebuffers.glyph.synced[0], 0xfe);
         // `bed_heat2` (slot 1) starts at byte 32.
         assert_eq!(framebuffers.glyph.data[32], 0xff);
+    }
+
+    /// A framebuffer's bytes as lowercase hex, for byte-pinned assertions.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// A panel with three pins on the main MCU.
+    fn chip() -> ST7920 {
+        let printer = printer();
+        let section =
+            display_section(&[("cs_pin", "PA3"), ("sclk_pin", "PA1"), ("sid_pin", "PC1")]);
+        ST7920::new(&ConfigWrapper::untracked(&section), &printer).expect("the section loads")
+    }
+
+    #[test]
+    fn test_write_text_picks_the_rows_half_and_cuts_at_the_edge() {
+        // `st7920.py:94-97`: the run is cut at 16 characters and row `y` starts
+        // at `[0, 32, 16, 48][y]` — the panel's rows are the two halves of its
+        // text RAM, in the order 0, 2, 1, 3.
+        let chip = chip();
+
+        chip.write_text(14, 0, b"abc");
+        chip.write_text(0, 1, b"two");
+        chip.write_text(15, 2, b"z");
+        // At or past the edge the cut leaves nothing to write.
+        chip.write_text(16, 3, b"x");
+
+        let framebuffers = chip.framebuffers();
+        assert_eq!(
+            hex(&framebuffers.text.data),
+            format!(
+                "{}{}{}{}{}{}",
+                "20".repeat(14),
+                "6162",
+                "20".repeat(15),
+                "7a",
+                "74776f",
+                "20".repeat(29)
+            )
+        );
+    }
+
+    #[test]
+    fn test_write_glyph_draws_an_icon_two_columns_a_character_and_a_font_column() {
+        // `st7920.py:103-124` in its order: a 16x16 icon is two graphics
+        // columns and costs two cells; `right_arrow` is character `0x1a`;
+        // `degrees` is the VGA font's `0xf8` entry drawn as one graphics column
+        // (`st7920.py:16-17`).
+        let chip = chip();
+        let mut glyphs: BTreeMap<String, Glyph> = BTreeMap::new();
+        glyphs.insert(
+            "thermometer".to_string(),
+            Glyph {
+                icon16x16: Some((vec![0x11; 16], vec![0x22; 16])),
+                icon5x8: None,
+            },
+        );
+        chip.set_glyphs(&glyphs);
+
+        assert_eq!(chip.write_glyph(2, 0, "thermometer"), 2);
+        assert_eq!(chip.write_glyph(4, 1, "right_arrow"), 1);
+        assert_eq!(chip.write_glyph(5, 2, "degrees"), 1);
+        assert_eq!(chip.write_glyph(0, 0, "fan1"), 0);
+
+        let framebuffers = chip.framebuffers();
+        // The icon's two column halves land at columns 2 and 3 of the sixteen
+        // graphics pages that make up rows 0 and 2.
+        for page in &framebuffers.graphics[0..16] {
+            assert_eq!((page.data[2], page.data[3]), (0x11, 0x22));
+        }
+        // `degrees` at row 2 is the same pages at column 5 + 16.
+        for (page, bits) in framebuffers.graphics[0..16]
+            .iter()
+            .zip(VGA_FONT[0xf8].iter())
+        {
+            assert_eq!(page.data[21], *bits);
+        }
+        // The arrow is a text cell on row 1, which starts at byte 32.
+        assert_eq!(
+            hex(&framebuffers.text.data),
+            format!("{}{}{}", "20".repeat(36), "1a", "20".repeat(27))
+        );
+    }
+
+    #[test]
+    fn test_a_cached_animated_glyph_writes_two_text_bytes_then_the_base_icon() {
+        // `st7920.py:74-85,103-110`: the frame is selected by writing CGRAM's
+        // second block's character (`0x02`) after a blank, and the base glyph's
+        // icon is drawn over the same two columns afterwards.
+        let chip = chip();
+        let mut glyphs: BTreeMap<String, Glyph> = BTreeMap::new();
+        for name in ["fan1", "fan2"] {
+            glyphs.insert(
+                name.to_string(),
+                Glyph {
+                    icon16x16: Some((vec![0; 16], vec![0; 16])),
+                    icon5x8: None,
+                },
+            );
+        }
+        chip.set_glyphs(&glyphs);
+        // Pretend the page already holds the other frame of the animation.
+        {
+            let mut framebuffers = chip.framebuffers();
+            framebuffers.graphics[16].data[2] = 0xff;
+        }
+
+        assert_eq!(chip.write_glyph(2, 1, "fan2"), 2);
+
+        let framebuffers = chip.framebuffers();
+        // Row 1 starts at byte 32: the two bytes at 34 and 35 are CGRAM block 0
+        // and the cached slot's character.
+        assert_eq!(framebuffers.text.data[34..36], [0x00, 0x00]);
+        // The base icon is assigned (not xored) over columns 2 and 3 of the
+        // sixteen pages that make up rows 1 and 3.
+        assert_eq!(framebuffers.graphics[16].data[2], 0x00);
+        assert_eq!(framebuffers.graphics[16].data[3], 0x00);
     }
 
     #[test]

@@ -583,7 +583,9 @@ mod tests {
             Ok(())
         }
         .await;
+        eprintln!("TT: before teardown");
         printer.teardown();
+        eprintln!("TT: after teardown");
         run.expect("the UART section loads");
     }
 

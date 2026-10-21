@@ -132,15 +132,27 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
-/// an entry. `tuning_tower` is unconditional upstream (`TUNING_TOWER` exists
-/// without the section) but **not** here: its factory calls `gcode_move::ensure`
-/// at load time, which builds the toolhead — a config with no `[printer]` would
-/// hang or fail on a module the config never asked for. Making it unconditional
-/// needs the factory to defer that lookup to `klippy:connect`; until then the
-/// command exists only when `[tuning_tower]` is written. `statistics` and
-/// `garbage_collection` exist only in part (the `system_stats` object and the
-/// reactor's latency warning stand in for their log summaries).
+/// an entry. `statistics` and `garbage_collection` exist only in part (the
+/// `system_stats` object and the reactor's latency warning stand in for their
+/// log summaries).
 const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
+
+/// The rest of upstream's unconditional list: modules that reach into the
+/// toolhead at load time, so they are built only when the config has a
+/// `[printer]` — which is exactly when upstream's list runs.
+///
+/// Upstream has no choice about that: `_read_config` calls
+/// `toolhead.add_printer_objects` unconditionally (`klippy.py:124-125`), and its
+/// first line builds `ToolHead(config)` from `[printer]`'s options, so a config
+/// without `[printer]` never boots at all. Here a `[mcu]`-only config is
+/// legitimate (`klippyx stress`, `admin`, the scan path), so the precondition
+/// has to be stated instead of assumed: with no `[printer]` there is no
+/// toolhead, no `gcode_move` move-transform slot, and a module that expects one
+/// has nothing to attach to.
+///
+/// `tuning_tower` is the first entry: it takes `gcode_move`'s transform slot at
+/// load time so `TUNING_TOWER` works without a `[tuning_tower]` section.
+const TOOLHEAD_MODULES: &[&str] = &["tuning_tower"];
 
 /// Every section id this host knows, in load order.
 ///
@@ -331,22 +343,46 @@ impl Printer {
         // section, which is what upstream's `getsection` hands it — every option
         // these modules read has a default.
         for id in DEFAULT_MODULES {
-            let Some((_, entry)) = factories.iter().find(|(known, _)| *known == *id) else {
-                // The table is the schema: a module this host does not know
-                // cannot be loaded from a name alone.
-                continue;
-            };
-            let Some(load) = entry.load_config else {
-                continue;
-            };
-            if config.get_section(id).is_some() {
-                continue;
+            self.load_default(factories, config, access, &mut claimed, id)?;
+        }
+
+        // ...and the ones that need a toolhead to attach to (`TOOLHEAD_MODULES`).
+        // Upstream runs its whole list at the end of `toolhead.add_printer_objects`
+        // (`toolhead.py:604-614`), which only happens through `[printer]`; here a
+        // `[mcu]`-only config is legitimate, so those modules are built only when
+        // the config actually has a printer to hook into.
+        if config.get_section("printer").is_some() {
+            for id in TOOLHEAD_MODULES {
+                self.load_default(factories, config, access, &mut claimed, id)?;
             }
-            let absent = ConfigSection::new(id, None);
-            self.register(load, entry, &absent, config, access, &mut claimed)?;
         }
 
         Ok(claimed)
+    }
+
+    /// Build one module from [`DEFAULT_MODULES`] / [`TOOLHEAD_MODULES`], from its
+    /// own section when the config has one and from an empty section otherwise.
+    fn load_default(
+        self: &Arc<Self>,
+        factories: &[(&str, Factories)],
+        config: &Config,
+        access: &Arc<AccessTracking>,
+        claimed: &mut Vec<String>,
+        id: &str,
+    ) -> Result<(), ConfigError> {
+        let Some((_, entry)) = factories.iter().find(|(known, _)| *known == id) else {
+            // The table is the schema: a module this host does not know cannot be
+            // loaded from a name alone.
+            return Ok(());
+        };
+        let Some(load) = entry.load_config else {
+            return Ok(());
+        };
+        if config.get_section(id).is_some() {
+            return Ok(());
+        }
+        let absent = ConfigSection::new(id, None);
+        self.register(load, entry, &absent, config, access, claimed)
     }
 
     /// Build and register one section, recording it as claimed.

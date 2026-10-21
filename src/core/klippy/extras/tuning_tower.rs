@@ -507,7 +507,10 @@ pub fn load_config(
         .ok_or_else(|| ConfigError::new("the gcode dispatcher is not registered".to_string()))?;
     let gcode_move = gcode_move::ensure(printer)?;
     let object = Arc::new(TuningTower::new(config, printer, gcode, gcode_move));
+    eprintln!("TT: built object");
     object.register_commands(printer)?;
+    eprintln!("TT: commands registered");
+    eprintln!("TT: about to register event handler");
     printer.register_event_handler(
         KlippyEvent::KlippyConnect,
         Box::new({
@@ -515,6 +518,7 @@ pub fn load_config(
             move |_| object.handle_connect()
         }),
     );
+    eprintln!("TT: load_config done");
     Ok(object)
 }
 

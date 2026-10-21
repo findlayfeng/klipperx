@@ -839,6 +839,7 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 | `BED_MESH_OUTPUT` | `PGP` | `PGP=1` 打探针点表（含 offset 调整列），否则打插值网格；无网格报 `Bed has not been probed` |
 | `BED_MESH_MAP` | — | `mesh_map_output <紧凑 JSON>`，payload `{mesh_min, mesh_max, z_positions}` |
 | `BED_MESH_OFFSET` | `X` / `Y` / **`ZFADE`** | 写进网格查找偏移（`ZFADE` 是 z 淡出偏移）；之后重锚 G-Code 坐标；无网格报 `No mesh loaded to offset` |
+| `ZERO_REFERENCE` | **`X` / `Y`**（均必填） | 把该点的插值 Z 整成 0：**probed 与 mesh 两个矩阵同时减去这个 offset**，日志打 `bed_mesh: setting zero reference at (x, y, offset)`；无网格报 `Bed has not been probed` |
 
 > 注意 `BED_MESH_OFFSET` 的第三轴参数名是 **`ZFADE`**（上游同名），不是 `Z`。
 

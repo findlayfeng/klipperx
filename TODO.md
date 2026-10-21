@@ -90,7 +90,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前的 pre/post 活跃窗口等四条余项（PA 本身已驱动运动，2026-10-21），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi，含各自的 `config_*`/send 命令）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`bed_mesh` 的 faulty 区域与 `set_zero_reference`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`skew_correction`/`z_thermal_adjust`/`tuning_tower` 三个未移植项（`bed_mesh` 的 faulty 与 `ZERO_REFERENCE` 已 2026-10-21 落地），见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -667,14 +667,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       **profile 命令族已落地（2026-10-19）**：`BED_MESH_PROFILE`（LOAD/SAVE/REMOVE，存 `[bed_mesh <name>]`、
       `SAVE_CONFIG` 写回）、`BED_MESH_OUTPUT`（`PGP`）、`BED_MESH_MAP`、`BED_MESH_OFFSET`（`X`/`Y`/**`ZFADE`**），
       `BED_MESH_CALIBRATE PROFILE=` 自动存盘；`bed_mesh/dump_mesh` 的 `profiles` 改读真实表。
-- [ ] **`bed_mesh` 余项（唯一登记处）**：
-      1. **faulty 区域替换**（上游 `_process_faulty_regions`，`bed_mesh.py:949-1000`）：本仓
-         `FaultyRegion` 只解析成字段，插值/探测/`get_status`/dump **全部不看它**；
-      2. **`ZERO_REFERENCE`**：`set_zero_reference`（上游 `bed_mesh.py:1409`）没有命令注册；
-      3. **dump 端点的 `mesh_params` 界限**：`bed_mesh/dump_mesh` 用配置现算的点算界限，而上游用
-         已装载网格的探测点包围盒（`z_mesh.get_mesh_params()`）——`LOAD=` 一个不同规模的 profile 后两者不同。
-         （注意 `calibration.config.mesh_min/mesh_max` 取配置**是对的**，上游 `dump_calibration` 同样如此；
-         `get_status` 也已用装载网格。）
+- [x] **`bed_mesh` 余项 —— 已全部落地（2026-10-21）**：faulty 区域替换（候选点/反向行首尾对调/越界与圆床过滤/读数取平均写回原点）、
+      `ZERO_REFERENCE X= Y=`（probed 与 mesh 两个矩阵同时减 offset）、dump 的 `current_mesh.mesh_params` 改读已装载网格。
+      **仍欠一处小口径**：`BED_MESH_OUTPUT PGP=` 不打印上游的 `(Substitute)` 列。
 - [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段 + 命令族均已落地**（2026-10-06，`55f534a`：`BED_SCREWS_ADJUST`
       常驻注册，`ACCEPT`/`ADJUSTED`/`ABORT` 随会话注册与注销；粗调→精调两遍；`bed_screws.test` 走真命令转绿）。
       有意偏离一处（已登记）：注册中途失败时本仓收回半组命令并复位，上游会留下半个命令组（`upstream-deviations.md`）。

@@ -1459,6 +1459,16 @@ impl PrinterObject for ToolHeadObject {
                 }
             }
 
+            // Every stepper is in the queue now, so scan their step generation
+            // windows once (`motion_queuing.check_step_generation_scan_windows`,
+            // `motion_queuing.py:126-140`). This is where upstream's extruder
+            // `_handle_connect` leaves the state (`kinematics/extruder.py:57`
+            // via `_set_pressure_advance`): an extruder configured with
+            // pressure advance has its half smooth time as its window, and the
+            // scan is what puts it into the flush delay. It cannot run at the
+            // stepper's own connect — the planner holds no stepper then.
+            toolhead.recompute_scan_windows();
+
             // The auto-enable chain (`MCU_stepper.add_active_callback`):
             // `stepper_enable` armed a callback per stepper at config load, and
             // its own registry is what the queue must check before every step
@@ -1946,6 +1956,24 @@ impl ToolHeadObject {
         self.lock()
             .as_mut()
             .map(|connected| connected.toolhead.get_last_move_time())
+    }
+
+    /// Rescan the steppers' step generation windows and update the flush delay
+    /// (`motion_queuing.check_step_generation_scan_windows`,
+    /// `motion_queuing.py:126-140`).
+    ///
+    /// Upstream calls it from the places a window changes: the extruder's
+    /// `_handle_connect`, its `_set_pressure_advance` and its
+    /// `sync_to_extruder` (`kinematics/extruder.py:57,66,82`), plus
+    /// `input_shaper`'s two. The window decides how far a printing change can
+    /// still rewrite generated steps
+    /// ([`crate::core::klippy::motion::toolhead::ToolHead::recompute_scan_windows`]).
+    ///
+    /// Before connect there is no planner and nothing to scan.
+    pub fn recompute_scan_windows(&self) {
+        if let Some(connected) = self.lock().as_mut() {
+            connected.toolhead.recompute_scan_windows();
+        }
     }
 
     /// Advance the planner's timeline by `delay` seconds (`toolhead.dwell`).
@@ -2931,9 +2959,14 @@ impl Connected {
             .max(self.toolhead.last_step_gen_time());
         let step_gen_time = self.horizon(self.toolhead.print_time(), start_time);
         let batches = self.toolhead.flush_step_generation(step_gen_time)?;
+        // History is only final outside the widest stepper window
+        // (`_advance_flush_time`, `motion_queuing.py:157-158`: `trapq_free_time
+        // = step_gen_time - kin_flush_delay`): a step inside that window can
+        // still be rewritten by a smoothing change.
+        let trapq_free_time = step_gen_time - self.toolhead.kin_flush_delay();
         self.toolhead.finalize_moves(
-            step_gen_time,
-            (step_gen_time - MOVE_HISTORY_EXPIRE).max(0.0),
+            trapq_free_time,
+            (trapq_free_time - MOVE_HISTORY_EXPIRE).max(0.0),
         );
         self.last_step_gen_time = step_gen_time;
         Ok(batches
@@ -2950,8 +2983,8 @@ impl Connected {
     /// The generation horizon for one pass — upstream's `_flush_handler`
     /// (`extras/motion_queuing.py:193-234`), with `need_step_gen_time` /
     /// `need_flush_time` read as the planner's own reach (`content_end`,
-    /// `wait_moves` having just drained it) and `kin_flush_delay` — not
-    /// modelled in this host — left at zero. `last` is the horizon the pass
+    /// `wait_moves` having just drained it) and the `2.*kin_flush_delay` guard
+    /// on the aggressive branch left out. `last` is the horizon the pass
     /// starts from, which it never lowers.
     ///
     /// Bounded by the estimate: `est + 0.4 s` at rest, `est + 0.7 s` while

@@ -8,9 +8,12 @@
 //!
 //! This port reads the section the same way — the motor options through
 //! [`PrinterStepper`], plus `extruder` and the two pressure-advance options —
-//! registers the stepper's own `SET_PRESSURE_ADVANCE` mux value, and binds to
-//! the extruder at connect, complaining with upstream's wording when the name
-//! is not an extruder.
+//! installs the section's **own** pressure-advance parameters on that stepper's
+//! solver (`ExtruderStepper.__init__` reads them from the section's config, not
+//! from the `[extruder]` it follows: `kinematics/extruder.py:12-16`), registers
+//! the stepper's own `SET_PRESSURE_ADVANCE` mux value, and binds to the extruder
+//! at connect, complaining with upstream's wording when the name is not an
+//! extruder.
 //!
 //! What is still open (tracked as the H10 motion-sync gap): the bound
 //! extruder's trapq is allocated by the toolhead, which connects **after** this
@@ -26,7 +29,7 @@ use serde_json::{json, Value};
 
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::error::KlippyError;
-use crate::core::klippy::extras::extruder::PrinterExtruder;
+use crate::core::klippy::extras::extruder::{apply_pressure_advance, PrinterExtruder};
 use crate::core::klippy::extras::stepper::PrinterStepper;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
@@ -34,6 +37,7 @@ use crate::core::klippy::gcode::{
 };
 use crate::core::klippy::load::section;
 use crate::core::klippy::motion::itersolve::{extruder_active_flags, extruder_position_fn, Axis};
+use crate::core::klippy::motion::pressure_advance::ExtruderPressureAdvance;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 // Only the prefix form exists upstream (`extruder_stepper.py:23`).
@@ -49,16 +53,13 @@ pub struct PrinterExtruderStepper {
     /// The wrapped stepper: the motor options are read through it, and it runs
     /// the extruder position function.
     stepper: Arc<PrinterStepper>,
-    /// `pressure_advance` from the config, applied at connect (upstream's
-    /// `config_pa`).
-    config_pa: f64,
-    /// `pressure_advance_smooth_time` from the config (upstream's
-    /// `config_smooth_time`).
-    config_smooth_time: f64,
-    /// The live values `SET_PRESSURE_ADVANCE` writes and status reports
-    /// (`Arc` so the mux handler shares the same slots).
-    pressure_advance: Arc<Mutex<f64>>,
-    pressure_advance_smooth_time: Arc<Mutex<f64>>,
+    /// The live parameters `SET_PRESSURE_ADVANCE` writes: status reports them
+    /// and this stepper's own solver smooths with them — the same shared block
+    /// the primary `[extruder]` hands its stepper (`extruder_stepper_alloc` +
+    /// `extruder_set_pressure_advance`). They start at the section's
+    /// `pressure_advance`/`pressure_advance_smooth_time` (upstream's
+    /// `config_pa`/`config_smooth_time`, applied from time zero at connect).
+    pressure_advance: Arc<ExtruderPressureAdvance>,
     /// `motion_queue`: the extruder this stepper is bound to once connected.
     /// `Arc` so the `SYNC_EXTRUDER_MOTION` handler shares the same slot.
     motion_queue: Arc<Mutex<Option<String>>>,
@@ -96,15 +97,20 @@ impl PrinterExtruderStepper {
 
         let stepper = Arc::new(PrinterStepper::new(config, printer, Axis::X, false)?);
         stepper.setup_itersolve(extruder_position_fn(), extruder_active_flags());
+        // The section's own pressure advance drives its own solver, from print
+        // time zero (`extruder_stepper_alloc`; upstream's `_handle_connect`
+        // calls `espa(sk, 0., config_pa, config_smooth_time)`,
+        // `kinematics/extruder.py:40-41`). An unconfigured section (`pa = 0`)
+        // keeps the plain position function: the parameters zero their own
+        // smooth time, which is the solver's off switch (`kin_extruder.c:129-132`).
+        let pressure_advance = ExtruderPressureAdvance::new(config_pa, config_smooth_time);
+        stepper.setup_pressure_advance(Arc::clone(&pressure_advance));
 
         let extruder_stepper = Self {
             name,
             extruder_name,
             stepper,
-            config_pa,
-            config_smooth_time,
-            pressure_advance: Arc::new(Mutex::new(0.0)),
-            pressure_advance_smooth_time: Arc::new(Mutex::new(0.0)),
+            pressure_advance,
             motion_queue: Arc::new(Mutex::new(None)),
             printer: Arc::downgrade(printer),
         };
@@ -132,20 +138,22 @@ impl PrinterExtruderStepper {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
-        let advance = Arc::clone(&self.pressure_advance);
-        let smooth = Arc::clone(&self.pressure_advance_smooth_time);
-        let handler: CommandHandler =
-            sync(move |gcmd: &GcodeCommand| cmd_set_pressure_advance(gcmd, &advance, &smooth));
-        gcode
-            .register_mux_command_with_params(
-                "SET_PRESSURE_ADVANCE",
-                "EXTRUDER",
-                Some(&self.name),
-                handler,
-                Some("Set pressure advance parameters"),
-                &["ADVANCE", "SMOOTH_TIME"],
-            )
-            .map_err(ConfigError::new)?;
+        {
+            let advance = Arc::clone(&self.pressure_advance);
+            let printer = Arc::downgrade(printer);
+            let handler: CommandHandler =
+                sync(move |gcmd: &GcodeCommand| cmd_set_pressure_advance(gcmd, &advance, &printer));
+            gcode
+                .register_mux_command_with_params(
+                    "SET_PRESSURE_ADVANCE",
+                    "EXTRUDER",
+                    Some(&self.name),
+                    handler,
+                    Some("Set pressure advance parameters"),
+                    &["ADVANCE", "SMOOTH_TIME"],
+                )
+                .map_err(ConfigError::new)?;
+        }
 
         // The motion-sync commands every extruder stepper registers
         // (`kinematics/extruder.py:37-42`): the rotation distance is set on the
@@ -219,9 +227,10 @@ impl PrinterObject for PrinterExtruderStepper {
     /// Upstream's `ExtruderStepper.get_status`: pressure advance, smooth time
     /// and the motion queue (`kinematics/extruder.py:43-46`).
     fn get_status(&self, _eventtime: f64) -> Value {
+        let (pressure_advance, smooth_time) = self.pressure_advance.values();
         json!({
-            "pressure_advance": *lock(&self.pressure_advance),
-            "smooth_time": *lock(&self.pressure_advance_smooth_time),
+            "pressure_advance": pressure_advance,
+            "smooth_time": smooth_time,
             "motion_queue": lock(&self.motion_queue).clone(),
         })
     }
@@ -229,15 +238,15 @@ impl PrinterObject for PrinterExtruderStepper {
     fn connect<'a>(&'a self) -> ConnectFuture<'a> {
         Box::pin(async move {
             // The host stepper builds its solver here, as every `[stepper_*]`
-            // does at its own connect.
+            // does at its own connect; the section's pressure advance was
+            // installed on it at load, so the solver smooths with it from the
+            // first generated step.
             self.stepper.connect().await?;
             let printer = self.printer.upgrade().ok_or_else(|| {
                 KlippyError::Internal("the printer dropped before connect".to_string())
             })?;
-            // Upstream's `_handle_connect` applies the configured values before
-            // `PrinterExtruderStepper.handle_connect` binds the extruder.
-            *lock(&self.pressure_advance) = self.config_pa;
-            *lock(&self.pressure_advance_smooth_time) = self.config_smooth_time;
+            // `PrinterExtruderStepper.handle_connect` binds the extruder
+            // (`extruder_stepper.py:19-21`).
             self.sync_to_extruder(&printer)
         })
     }
@@ -252,35 +261,29 @@ impl std::fmt::Debug for PrinterExtruderStepper {
     }
 }
 
-/// `SET_PRESSURE_ADVANCE`'s body for one extra stepper: record both values and
-/// report them (upstream `ExtruderStepper.cmd_SET_PRESSURE_ADVANCE`,
-/// `kinematics/extruder.py:98-107`).
+/// `SET_PRESSURE_ADVANCE`'s body for one extra stepper: validate the two values
+/// against upstream's bounds (the section's own values are the defaults), then
+/// apply them to this stepper's solver the way the primary extruder does
+/// (upstream `ExtruderStepper.cmd_SET_PRESSURE_ADVANCE`,
+/// `kinematics/extruder.py:98-107` → `_set_pressure_advance`, `:67-88`).
 fn cmd_set_pressure_advance(
     gcmd: &GcodeCommand,
-    advance: &Arc<Mutex<f64>>,
-    smooth_time: &Arc<Mutex<f64>>,
+    pressure_advance: &Arc<ExtruderPressureAdvance>,
+    printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
+    let (advance, smooth_time) = pressure_advance.values();
     let parse = |raw: &str| raw.parse::<f64>().ok();
-    let value = gcmd.get(
-        "ADVANCE",
-        Some(*lock(advance)),
-        parse,
-        Some(0.0),
-        None,
-        None,
-        None,
-    )?;
+    let value = gcmd.get("ADVANCE", Some(advance), parse, Some(0.0), None, None, None)?;
     let smooth = gcmd.get(
         "SMOOTH_TIME",
-        Some(*lock(smooth_time)),
+        Some(smooth_time),
         parse,
         Some(0.0),
         Some(0.200),
         None,
         None,
     )?;
-    *lock(advance) = value;
-    *lock(smooth_time) = smooth;
+    apply_pressure_advance(pressure_advance, printer, value, smooth)?;
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
     ));
@@ -412,7 +415,14 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::mathutil::{Coord, Xyz};
+    use crate::core::klippy::motion::trapq::Trapq;
+    use crate::core::klippy::motion::Stepper;
     use crate::core::klippy::reactor::ManualReactor;
+    use std::time::Duration;
+
+    /// The fake firmware's clock rate, for a solver built without one.
+    const MCU_FREQ: f64 = 1_000_000.0;
 
     /// The corpus's section body (`test/klippy/pressure_advance.cfg:52-58`).
     const EXTRA_STEPPER: &str = "extruder: extruder\n\
@@ -471,20 +481,19 @@ mod tests {
     }
 
     /// The pressure-advance options default as upstream's `ExtruderStepper`
-    /// defines them, and explicit values are taken as written.
+    /// defines them (`kinematics/extruder.py:14-16`), and explicit values are
+    /// taken as written — both reach the stepper's parameters.
     #[test]
     fn test_the_pressure_advance_option_defaults_follow_upstream() {
         let printer = load_ok(&config(EXTRA_STEPPER));
         let stepper = the_stepper(&printer);
-        assert_eq!(stepper.config_pa, 0.0);
-        assert_eq!(stepper.config_smooth_time, 0.040);
+        assert_eq!(stepper.pressure_advance.values(), (0.0, 0.040));
 
         let printer = load_ok(&config(&format!(
             "{EXTRA_STEPPER}pressure_advance: 0.05\npressure_advance_smooth_time: 0.02\n"
         )));
         let stepper = the_stepper(&printer);
-        assert_eq!(stepper.config_pa, 0.05);
-        assert_eq!(stepper.config_smooth_time, 0.02);
+        assert_eq!(stepper.pressure_advance.values(), (0.05, 0.02));
     }
 
     /// The bounds upstream puts on the two options (`minval=0.` /
@@ -687,5 +696,164 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must have maximum of"), "{err}");
+    }
+
+    /// The extruder trapq the solver tests use: 0.3 s of extrusion at 10 mm/s in
+    /// three 0.1 s segments, the first of which may not advance
+    /// (`axes_r.y` is `can_pressure_advance`, `kinematics/extruder.py:221-232`).
+    fn extruder_trapq() -> Trapq {
+        let mut trapq = Trapq::new();
+        let mut position = 0.0;
+        for (print_time, can_advance) in [(0.0, false), (0.1, true), (0.2, true)] {
+            trapq.append(
+                print_time,
+                0.0,
+                0.1,
+                0.0,
+                Xyz::new(position, 0.0, 0.0),
+                Xyz::new(1.0, f64::from(u8::from(can_advance)), 0.0),
+                10.0,
+                10.0,
+                0.0,
+            );
+            position += 1.0;
+        }
+        trapq
+    }
+
+    /// The section's own `pressure_advance` reaches this stepper's solver: at a
+    /// constant 10 mm/s the position leads the nominal extrusion by
+    /// `pressure_advance * velocity` and the step generation window is the half
+    /// smooth time — the same assertion the primary extruder's solver test makes
+    /// (`itersolve`'s `test_pressure_advance_drives_the_extruder_steps`).
+    #[test]
+    fn test_a_configured_pressure_advance_leads_the_steppers_position() {
+        let printer = load_ok(&config(&format!("{EXTRA_STEPPER}pressure_advance: 0.05\n")));
+        let stepper = the_stepper(&printer);
+        let mut host = stepper.stepper.build_host_stepper(0, MCU_FREQ);
+
+        assert!(
+            host.kinematics().pressure_advance().is_some(),
+            "the section's parameters must be installed on its own solver"
+        );
+        assert_eq!(
+            host.kinematics().effective_generation_window(),
+            (0.02, 0.02)
+        );
+
+        host.generate(&extruder_trapq(), 0.2)
+            .expect("the flush runs");
+        assert!(
+            (host.commanded_position() - 2.5).abs() < 0.02,
+            "expected 2 mm nominal + the 0.5 mm lead, got {}",
+            host.commanded_position()
+        );
+    }
+
+    /// Without `pressure_advance` the section adds nothing: the solver keeps the
+    /// plain position function — the parameters zero the smooth time when the
+    /// advance is zero (`kin_extruder.c`'s `sa->half_smooth_time`, the solver's
+    /// off switch, `:129-132`) — so the same trapq generates the same position at
+    /// every flush point as a solver built with no parameters at all.
+    #[test]
+    fn test_an_unconfigured_pressure_advance_leaves_the_positions_alone() {
+        let printer = load_ok(&config(EXTRA_STEPPER));
+        let stepper = the_stepper(&printer);
+        let scheduled = *stepper
+            .pressure_advance
+            .schedule()
+            .last()
+            .expect("the config entry");
+        assert_eq!(scheduled.pressure_advance, 0.0);
+        assert_eq!(
+            scheduled.smooth_time, 0.0,
+            "pa = 0 must zero the smooth time, or the solver would smooth"
+        );
+        let mut host = stepper.stepper.build_host_stepper(0, MCU_FREQ);
+
+        let mut plain = Stepper::new(
+            "plain_extruder",
+            0,
+            stepper.stepper.step_dist(),
+            extruder_position_fn(),
+            extruder_active_flags(),
+            MCU_FREQ,
+        );
+        let trapq = extruder_trapq();
+        for flush in [0.05, 0.1, 0.15, 0.2] {
+            host.generate(&trapq, flush).expect("the flush runs");
+            plain.generate(&trapq, flush).expect("the flush runs");
+            assert_eq!(
+                host.commanded_position(),
+                plain.commanded_position(),
+                "pressure advance off must not change the position at {flush} s"
+            );
+        }
+        assert!(
+            (host.commanded_position() - 2.0).abs() < 0.02,
+            "expected the nominal 2 mm, got {}",
+            host.commanded_position()
+        );
+    }
+
+    /// `SET_PRESSURE_ADVANCE EXTRUDER=<section>` changes what status reports at
+    /// once and puts the value in force when the look-ahead flushes — never on
+    /// the moves already parked — the way the primary extruder does
+    /// (`kinematics/extruder.py:67-88`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_set_pressure_advance_lands_at_the_lookahead_flush() {
+        let printer = load_ok(
+            &config(&format!(
+                "{EXTRA_STEPPER}pressure_advance: 0.05\npressure_advance_smooth_time: 0.04\n"
+            ))
+            .replace("kinematics: cartesian", "kinematics: none"),
+        );
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        tokio::time::timeout(Duration::from_secs(30), toolhead.connect())
+            .await
+            .expect("the toolhead connects within the bound")
+            .expect("the toolhead connects");
+        let gcode = gcode(&printer);
+        let stepper = the_stepper(&printer);
+        let config_entry = |stepper: &PrinterExtruderStepper| {
+            *stepper
+                .pressure_advance
+                .schedule()
+                .last()
+                .expect("the config entry")
+        };
+        assert_eq!(config_entry(&stepper).pressure_advance, 0.05);
+        // A move still in the look-ahead: the change has a flush point to wait
+        // for, so nothing the generator could already have stepped over moves.
+        toolhead
+            .move_to(Coord::new(0.0, 0.0, 0.0, 5.0), 10.0)
+            .expect("an E-only move is accepted");
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            gcode.run_script("SET_PRESSURE_ADVANCE EXTRUDER=my_extra_stepper ADVANCE=0.1"),
+        )
+        .await
+        .expect("the line applies within the bound")
+        .expect("the line applies");
+
+        // Reported at once …
+        let status = PrinterObject::get_status(&*stepper, 0.0);
+        assert_eq!(status["pressure_advance"], 0.1);
+        // … while the solver keeps the value it was stepped with until the
+        // look-ahead flushes.
+        assert_eq!(config_entry(&stepper).pressure_advance, 0.05);
+
+        // Flushing the look-ahead is the flush point: the new value takes over
+        // from the end of the parked move, not from time zero.
+        let move_end = toolhead.get_last_move_time();
+        let scheduled = config_entry(&stepper);
+        assert_eq!(scheduled.pressure_advance, 0.1);
+        assert_eq!(scheduled.smooth_time, 0.04);
+        assert!(move_end > 0.0, "the parked move must take time: {move_end}");
+        assert_eq!(scheduled.print_time, move_end);
     }
 }

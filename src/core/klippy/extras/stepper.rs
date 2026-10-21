@@ -778,6 +778,56 @@ impl PrinterStepper {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
+
+    /// The host `Stepper` this section describes: its owner's solver
+    /// (`setup_itersolve`), the solver hooks (`setup_hooks`) and the extruder's
+    /// pressure-advance parameters (`setup_pressure_advance`) installed.
+    ///
+    /// [`PrinterStepper::connect`] builds this and then does the MCU handshake
+    /// around it; a test that needs the solver without a firmware can build the
+    /// same object here.
+    pub(crate) fn build_host_stepper(&self, oid: u32, mcu_freq: f64) -> Stepper {
+        let solver = *self
+            .solver
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .unwrap_or(&SolverSpec {
+                position: cartesian_position_fn(self.axis),
+                active_flags: cartesian_active_flags(self.axis),
+            });
+        let mut stepper = Stepper::new(
+            self.name.clone(),
+            oid,
+            self.step_dist,
+            solver.position,
+            solver.active_flags,
+            mcu_freq,
+        );
+        // Apply the owner's hooks (polar's bed angle solver) to the host
+        // solver, mirroring upstream where `setup_itersolve` and the
+        // callback/`post_cb` are installed together.
+        if let Some(hooks) = *self
+            .hooks
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+        {
+            stepper
+                .kinematics_mut()
+                .set_hooks(Some(hooks.unwrap), Some(hooks.post));
+        }
+        // The extruder owner's pressure-advance parameters turn the plain axis
+        // reader into the smoothed `pa_position` solver.
+        let pressure_advance = self
+            .pressure_advance
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        if let Some(pressure_advance) = pressure_advance {
+            stepper.set_pressure_advance(pressure_advance);
+        }
+        stepper
+    }
 }
 
 impl PrinterObject for PrinterStepper {
@@ -808,45 +858,7 @@ impl PrinterObject for PrinterStepper {
                 .oid()
                 .map_err(|err| config_error(err.to_string()))?;
 
-            let solver = *self
-                .solver
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .as_ref()
-                .unwrap_or(&SolverSpec {
-                    position: cartesian_position_fn(self.axis),
-                    active_flags: cartesian_active_flags(self.axis),
-                });
-            let mut stepper = Stepper::new(
-                self.name.clone(),
-                u32::from(oid),
-                self.step_dist,
-                solver.position,
-                solver.active_flags,
-                freq,
-            );
-            // Apply the owner's hooks (polar's bed angle solver) to the host
-            // solver, mirroring upstream where `setup_itersolve` and the
-            // callback/`post_cb` are installed together.
-            if let Some(hooks) = *self
-                .hooks
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-            {
-                stepper
-                    .kinematics_mut()
-                    .set_hooks(Some(hooks.unwrap), Some(hooks.post));
-            }
-            // The extruder owner's pressure-advance parameters turn the plain
-            // axis reader into the smoothed `pa_position` solver.
-            let pressure_advance = self
-                .pressure_advance
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .clone();
-            if let Some(pressure_advance) = pressure_advance {
-                stepper.set_pressure_advance(pressure_advance);
-            }
+            let mut stepper = self.build_host_stepper(u32::from(oid), freq);
             // Read the board's step counter and align the solver with it, as
             // upstream's `_query_mcu_position` does at connect
             // (`klippy/stepper.py:212-228`). This is what makes the host's

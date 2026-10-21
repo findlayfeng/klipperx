@@ -425,21 +425,11 @@ impl PrinterExtruder {
 /// same body against a different extruder.
 const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 
-/// `SET_PRESSURE_ADVANCE`'s body: record both values for the solver and report
-/// them (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`,
-/// `kinematics/extruder.py:93-107`; the bounds are its `minval=0.` on `ADVANCE`
-/// and `minval=0., maxval=.200` on `SMOOTH_TIME`).
-///
-/// The new value is active from the print time the extruder has already
-/// planned up to: the command registers a lookahead callback, which fires with
-/// exactly that time (`extruder.py:83-86` → `toolhead.py:526-531`) — so segments
-/// the step generator has stepped over keep the value they were stepped with.
-///
-/// A changed **smooth time** is the exception: the smoothing filter's width is
-/// part of how a segment is stepped, so upstream flushes step generation first
-/// and applies the new parameters from time zero (`extruder.py:75-83`). The
-/// values upstream compares are the *effective* smooth times — either side is
-/// zero when its pressure advance is zero (`:67-74`).
+/// `SET_PRESSURE_ADVANCE`'s body: validate both values, apply them (see
+/// [`apply_pressure_advance`]) and report them (upstream
+/// `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`, `kinematics/extruder.py:93-107`;
+/// the bounds are its `minval=0.` on `ADVANCE` and `minval=0., maxval=.200` on
+/// `SMOOTH_TIME`).
 fn set_pressure_advance(
     gcmd: &GcodeCommand,
     pressure_advance: &Arc<ExtruderPressureAdvance>,
@@ -458,6 +448,37 @@ fn set_pressure_advance(
             "SMOOTH_TIME must be between 0.0 and 0.2, got {smooth}"
         )));
     }
+    apply_pressure_advance(pressure_advance, printer, value, smooth)?;
+    gcmd.respond_info(&format!(
+        "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
+    ));
+    Ok(())
+}
+
+/// Put already-validated `SET_PRESSURE_ADVANCE` values in force. Every extruder
+/// stepper runs this same body — the primary `[extruder]` and each
+/// `[extruder_stepper <name>]` (upstream's `_set_pressure_advance`,
+/// `kinematics/extruder.py:67-88`) — against its own parameters.
+///
+/// The new value is active from the print time the extruder has already
+/// planned up to: the command registers a lookahead callback, which fires with
+/// exactly that time (`extruder.py:83-86` → `toolhead.py:526-531`) — so segments
+/// the step generator has stepped over keep the value they were stepped with.
+///
+/// A changed **smooth time** is the exception: the smoothing filter's width is
+/// part of how a segment is stepped, so upstream flushes step generation first
+/// and applies the new parameters from time zero (`extruder.py:75-83`). The
+/// values upstream compares are the *effective* smooth times — either side is
+/// zero when its pressure advance is zero (`:67-74`).
+pub(crate) fn apply_pressure_advance(
+    pressure_advance: &Arc<ExtruderPressureAdvance>,
+    printer: &std::sync::Weak<Printer>,
+    value: f64,
+    smooth: f64,
+) -> Result<(), CommandError> {
+    // The values in force now, read before [`ExtruderPressureAdvance::set_reported`]
+    // overwrites them: they date the old side of the comparison.
+    let (advance, smooth_time) = pressure_advance.values();
     let toolhead = printer
         .upgrade()
         .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"));
@@ -510,9 +531,6 @@ fn set_pressure_advance(
             toolhead.recompute_scan_windows();
         }
     }
-    gcmd.respond_info(&format!(
-        "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
-    ));
     Ok(())
 }
 

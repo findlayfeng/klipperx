@@ -621,15 +621,6 @@ impl Lis2dwState {
         Ok(())
     }
 
-    /// The chip's name as upstream spells it in its messages (`lis2dw` /
-    /// `lis3dh`).
-    fn chip_name(&self) -> &'static str {
-        match self.chip {
-            LisChipType::Lis2dw => "lis2dw",
-            LisChipType::Lis3dh => "lis3dh",
-        }
-    }
-
     /// The connected MCU, or why the sensor cannot reach it.
     fn connected_mcu(&self) -> Result<Arc<Mcu>, String> {
         self.mcu_object
@@ -639,7 +630,7 @@ impl Lis2dwState {
 
     /// Bring the chip up and arm the bulk stream (`_start_measurements`).
     async fn start_measurements(&self) -> Result<(), String> {
-        let chip_name = self.chip_name();
+        let chip_name = self.chip.name();
         // In case of miswiring, the device id tells a real chip from noise.
         let expected = dev_id(self.chip);
         let dev_id = self.bus.read_reg(REG_WHO_AM_I).await?;
@@ -684,7 +675,7 @@ impl Lis2dwState {
 
     /// Halt the bulk stream (`_finish_measurements`).
     async fn finish_measurements(&self) -> Result<(), String> {
-        let chip_name = self.chip_name();
+        let chip_name = self.chip.name();
         let (reg, value) = fifo_off_write();
         self.bus.set_reg(reg, value, chip_name).await?;
         // Upstream's `send_wait_ack` blocks for the ack; the queued messages
@@ -830,4 +821,317 @@ pub fn load_config_prefix_lis3dh(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     load_config_lis3dh(config, printer)
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::any::Any;
+
+    use crate::core::klippy::api::protocol::{PushTarget, Request};
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
+    use crate::core::klippy::api::webhooks;
+    use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
+    use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::extras::bulk_sensor::{SampleFormat, SamplePayload};
+    use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    fn section(name: &str, sub: Option<&str>, options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new(name, sub);
+        for (key, value) in options {
+            section.parameters.insert(
+                (*key).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    /// A section and a tracked wrapper for it, leaked so the borrow outlives the
+    /// call (tests only).
+    fn wrap(name: &str, sub: Option<&str>, options: &[(&str, &str)]) -> ConfigWrapper<'static> {
+        ConfigWrapper::new(
+            Box::leak(Box::new(section(name, sub, options))),
+            AccessTracking::shared(),
+        )
+    }
+
+    /// A ready printer with `pins` and one registered `[mcu]`.
+    fn printer() -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        let mcu = McuObject::new(ConfigSection::new("mcu", None), &printer).unwrap();
+        printer.add_object("mcu", Arc::new(mcu)).unwrap();
+        printer.send_event(&KlippyEvent::KlippyReady);
+        printer
+    }
+
+    /// The driver a factory built, downcast from its registered object.
+    fn driver(object: Arc<dyn PrinterObject>) -> Arc<Lis2dw> {
+        let any: Arc<dyn Any + Send + Sync> = object;
+        any.downcast::<Lis2dw>()
+            .expect("the factories build the lis2dw driver")
+    }
+
+    // -----------------------------------------------------------------
+    // Section options and the chip-type branch
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_a_lis2dw_section_builds_the_lis2dw_chip_on_spi() {
+        let printer = printer();
+        // `cs_pin` present → SPI (`if config.get('cs_pin', None) is not None`).
+        let lis =
+            driver(load_config(&wrap("lis2dw", None, &[("cs_pin", "PK7")]), &printer).unwrap());
+
+        assert_eq!(lis.name(), "lis2dw");
+        assert_eq!(lis.chip(), LisChipType::Lis2dw);
+        assert_eq!(lis.data_rate(), 1600);
+        assert_eq!(lis.bus_type(), LisBusType::Spi);
+        // The default `axes_map` is the identity, scaled by the chip's
+        // sensitivity (`read_axes_map(config, LIS2DW_SCALE, …)`).
+        assert_eq!(
+            lis.axes_map(),
+            [(0, LIS2DW_SCALE), (1, LIS2DW_SCALE), (2, LIS2DW_SCALE)]
+        );
+    }
+
+    #[test]
+    fn test_a_lis3dh_section_builds_the_lis3dh_chip_on_i2c() {
+        let printer = printer();
+        // No `cs_pin` → I2C (`MCU_I2C_from_config` with `LIS_I2C_ADDR`).
+        let lis = driver(
+            load_config_prefix_lis3dh(&wrap("lis3dh", Some("my_lis"), &[]), &printer).unwrap(),
+        );
+
+        assert_eq!(lis.name(), "my_lis");
+        assert_eq!(lis.chip(), LisChipType::Lis3dh);
+        assert_eq!(lis.data_rate(), 1344);
+        assert_eq!(lis.bus_type(), LisBusType::I2c);
+        assert_eq!(lis.axes_map()[0].1, LIS3DH_SCALE);
+        assert_ne!(
+            LIS2DW_SCALE, LIS3DH_SCALE,
+            "the two chips scale differently"
+        );
+    }
+
+    #[test]
+    fn test_each_factory_hardcodes_its_chip_type() {
+        // `lis3dh.py` is `lis2dw.LIS2DW(config, lis2dw.LIS3DH_TYPE)` and
+        // nothing else: the section id picks the type, not an option.
+        let printer = printer();
+        let plain = driver(load_config(&wrap("lis2dw", None, &[]), &printer).unwrap());
+        let three = driver(load_config_lis3dh(&wrap("lis3dh", None, &[]), &printer).unwrap());
+
+        assert_eq!(plain.chip(), LisChipType::Lis2dw);
+        assert_eq!(three.chip(), LisChipType::Lis3dh);
+        assert_eq!((plain.data_rate(), three.data_rate()), (1600, 1344));
+        assert_eq!(dev_id(plain.chip()), LIS2DW_DEV_ID);
+        assert_eq!(dev_id(three.chip()), LIS3DH_DEV_ID);
+    }
+
+    #[test]
+    fn test_an_unknown_axis_is_refused() {
+        let printer = printer();
+        let err = Lis2dw::new(
+            &wrap("lis2dw", None, &[("cs_pin", "PK7"), ("axes_map", "x,y,w")]),
+            &printer,
+            LisChipType::Lis2dw,
+        )
+        .unwrap_err();
+        assert_eq!(err.to_string(), "Invalid axes_map parameter");
+    }
+
+    // -----------------------------------------------------------------
+    // Sample decoding and scaling
+    // -----------------------------------------------------------------
+
+    /// The identity `axes_map` at one chip's sensitivity.
+    fn unit_axes(scale: f64) -> [(usize, f64); 3] {
+        [(0, scale), (1, scale), (2, scale)]
+    }
+
+    #[test]
+    fn test_the_sample_format_is_the_firmwares_six_byte_words() {
+        let format = SampleFormat::parse(SAMPLE_FORMAT).expect("a valid struct format");
+        assert_eq!(format.bytes_per_sample(), 6);
+        // `BYTES_PER_BLOCK` (48) fits 8 samples in one report, and 51 // 6 is
+        // upstream's `MAX_BULK_MSG_SIZE // bytes_per_sample`.
+        assert_eq!(format.samples_per_block(), 8);
+    }
+
+    #[test]
+    fn test_raw_sample_bytes_decode_and_convert_to_lis2dw_physical_values() {
+        // One sample as `src/sensor_lis2dw.c` reports it: three little-endian
+        // 16-bit words. The chip left-justifies its 14-bit reading, so the
+        // signed word is the reading (`0x1000`, `-1`, `-0x1000` here).
+        let format = SampleFormat::parse(SAMPLE_FORMAT).expect("a valid struct format");
+        let bytes = [0x00, 0x10, 0xff, 0xff, 0x00, 0xf0];
+        let payload = <[i32; SAMPLE_FIELDS]>::decode(&format, &bytes).expect("six good bytes");
+        assert_eq!(payload, [0x1000, -1, -0x1000], "sign-extended words");
+
+        let rows = convert_samples(&unit_axes(LIS2DW_SCALE), &[(1.5, payload)]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], 1.5);
+        // 4096 LSB * (9.80665 * 1.952 / 4) m/s² per LSB, rounded to 6 digits.
+        assert!((rows[0][1] - 19602.002739).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][2] - -4.785645).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - -19602.002739).abs() < 1e-6, "{rows:?}");
+    }
+
+    #[test]
+    fn test_convert_samples_scales_lis3dh_counts() {
+        // The LIS3DH's 12-bit readings sit in the high bits of the same words;
+        // 0x1234 is one (0x123 left-justified), 0xf000 is -4096.
+        let rows = convert_samples(
+            &unit_axes(LIS3DH_SCALE),
+            &[(0.25, [0x1234, 0x0000, -0x1000])],
+        );
+        // 4660 LSB * (9.80665 * 11.718 / 16) m/s² per LSB.
+        assert!((rows[0][1] - 33468.797069).abs() < 1e-6, "{rows:?}");
+        assert_eq!(rows[0][2], 0.0);
+        assert!((rows[0][3] - -29418.067123).abs() < 1e-6, "{rows:?}");
+    }
+
+    #[test]
+    fn test_convert_samples_applies_the_axes_map() {
+        // The corpus accelerometer setting, `-x,-y,z`: negation flips the sign,
+        // a permuted map reads the components from other axes.
+        let negated = [(0, -LIS2DW_SCALE), (1, -LIS2DW_SCALE), (2, LIS2DW_SCALE)];
+        let raw = [(1.0, [0x1000, -1, -0x1000])];
+        let rows = convert_samples(&negated, &raw);
+        assert!((rows[0][1] - -19602.002739).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][2] - 4.785645).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - -19602.002739).abs() < 1e-6, "{rows:?}");
+
+        let swapped = [(2, LIS2DW_SCALE), (0, LIS2DW_SCALE), (1, LIS2DW_SCALE)];
+        let rows = convert_samples(&swapped, &raw);
+        assert!((rows[0][1] - -19602.002739).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][2] - 19602.002739).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - -4.785645).abs() < 1e-6, "{rows:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // Register traffic
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_the_lis2dw_register_setup_sequence_is_upstreams() {
+        assert_eq!(
+            setup_writes(LisChipType::Lis2dw),
+            [
+                (0x25, 0x34), // CTRL_REG6: ODR/2, +-16g, low-pass, low noise
+                (0x2e, 0xc0), // FIFO_CTRL: continuous mode
+                (0x20, 0x94), // CTRL_REG1: high-performance 1600 Hz, 14-bit
+            ]
+        );
+        // SPI only: disable the chip's I2C interface first.
+        assert_eq!(disable_i2c_write(), (0x21, 0x06));
+        // Re-armed after the bulk query starts, and cleared on both sides of
+        // `_finish_measurements`.
+        assert_eq!(fifo_arm_write(LisChipType::Lis2dw), (0x2e, 0xc0));
+        assert_eq!(fifo_off_write(), (0x2e, 0x00));
+    }
+
+    #[test]
+    fn test_the_lis3dh_register_setup_sequence_is_upstreams() {
+        assert_eq!(
+            setup_writes(LisChipType::Lis3dh),
+            [
+                (0x20, 0x97), // CTRL_REG1: 1344 Hz, high resolution, XYZ on
+                (0x21, 0x00), // CTRL_REG2: no filtering
+                (0x23, 0x38), // CTRL_REG4: +-16g, high resolution
+                (0x24, 0x40), // CTRL_REG5: FIFO enabled
+                (0x2e, 0x80), // FIFO_CTRL: stream mode
+            ]
+        );
+        assert_eq!(fifo_arm_write(LisChipType::Lis3dh), (0x2e, 0x80));
+    }
+
+    #[test]
+    fn test_register_frames_set_and_clear_the_read_bit() {
+        // `read_reg` clocks the address with `REG_MOD_READ` set plus a dummy
+        // byte out; the reply's second byte is the register's value.
+        assert_eq!(spi_read_frame(REG_WHO_AM_I), [0x8f, 0x00]);
+        assert_eq!(spi_read_frame(REG_FIFO_CTRL), [0xae, 0x00]);
+        assert_eq!(read_reg_value(&[0x8f, 0x44]), Some(0x44));
+        assert_eq!(read_reg_value(&[0x8f]), None);
+        // Writes shift the plain address and the value, on both buses.
+        assert_eq!(write_frame(REG_CTRL_REG1, 0x94), [0x20, 0x94]);
+    }
+
+    // -----------------------------------------------------------------
+    // The dump endpoint
+    // -----------------------------------------------------------------
+
+    /// A recording push target for the endpoint test.
+    #[derive(Default)]
+    struct Recorder {
+        messages: Mutex<Vec<Value>>,
+    }
+
+    impl PushTarget for Recorder {
+        fn is_closed(&self) -> bool {
+            false
+        }
+        fn push(&self, message: Value) {
+            self.messages
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(message);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_dump_endpoint_registers_the_sensor_key_and_header() {
+        let printer = printer();
+        let lis = driver(
+            load_config_prefix(
+                &wrap("lis2dw", Some("my_lis"), &[("cs_pin", "PK7")]),
+                &printer,
+            )
+            .unwrap(),
+        );
+
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].path, DUMP_ENDPOINT);
+        assert_eq!(registrations[0].key, DUMP_KEY);
+        assert_eq!(registrations[0].value.as_deref(), Some("my_lis"));
+
+        // The start response is the column header a connecting client gets
+        // (`{'header': hdr}` upstream); this answers before any sample moves,
+        // so the chip's stream is irrelevant here.
+        let request = Request::parse(
+            br#"{"method":"lis2dw/dump_lis2dw","params":{"sensor":"my_lis","response_template":{"method":"dump"}}}"#,
+        )
+        .unwrap();
+        let api = Api::new();
+        let recorder = Arc::new(Recorder::default());
+        let context = EndpointContext {
+            api: &api,
+            client: Arc::clone(&recorder) as Arc<dyn PushTarget>,
+        };
+        let reply = Arc::clone(&registrations[0].handler)
+            .handle(&request, &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            reply,
+            json!({"header": [
+                "time",
+                "x_acceleration",
+                "y_acceleration",
+                "z_acceleration"
+            ]})
+        );
+        assert_eq!(lis.name(), "my_lis");
+    }
 }

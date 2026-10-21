@@ -37,7 +37,7 @@ ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同�
 | 间隔 | `interval = round(clock_freq / rate)` 个 tick（最少 1） |
 | 每条命令 | `count = round(actual_rate * SLICE_SECONDS)` 步（约 10 ms 一条，上限 `u16`） |
 | 命令条数 | `round(stage_seconds * clock_freq / (count*interval))`，封顶 `MOVE_SLOTS`（64） |
-| 收尾 | 等本段跑完（时长 + 余量），再 `get_config` 问固件还活着吗 |
+| 收尾 | 等本段跑完（时长 + 余量），再 `get_config` 问固件还活着吗（三种出口见下） |
 
 步频从 `START_RATE`（10 kHz）乘 `--rate-step` 一路升到 `MAX_RATE`（20 MHz）；高段是任何 MCU 都
 做不到的，所以正常会停在某一段。**结果是一对包围盒**：最后一个活下来的步频、和第一个挂掉的
@@ -50,9 +50,33 @@ ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同�
    早先写死的 1 ms 差），RTT 测量不可用时回退 1 ms。提前量必须盖住「取样到 `reset_step_clock`
    送达固件」的整段链路延迟——慢链路（如 UART 桥）上固定 1 ms 会让锚点到达时已过期，第一档
    就 `Timer too close`；
-2. **重锚前先等步进器真的停下**（轮询 `stepper_get_position` 到两次读数相同）。固件在还有 move
+2. **重锚前先等步进器真的停下**（`wait_for_idle`：位置连续 `IDLE_SETTLE` **20 ms** 不变才算空闲，`IDLE_POLL` 5 ms 一轮，超过 `IDLE_TIMEOUT` 5 s 直接报错并带上最后位置——「两次读数相等就空闲」会误判排队段尚未起步的瞬间）。固件在还有 move
    未执行时**拒绝** `reset_step_clock`：`shutdown("Can't reset time when stepper active")`
    （`src/stepper.c:311`）——如果不先等，这个错误会被误当成速率上限。
+
+**行程上界（2026-10-21）**：真打印机上不能无限加步频——它会一路顶到机械端。每块板取自己的
+`position_max`，预算 = `position_max × TRAVEL_FRACTION(0.5) / step_dist` 步，多节时取**最紧**的一个
+（同一 schedule 下各 stepper 步数相同，所以能用「步」统一比较）；下一段会越预算就停，并打：
+
+```
+stopping at N steps/s: the next stage would take [stepper_x] from A to B of its C units of travel
+  (0.5x position_max); this is the run's travel bound, not the firmware's limit
+```
+
+没写 `position_max`（或算不出步距）时不阻断，只打一行 `no travel bound (only a warning, not a stop)`。
+**停在行程上界仍算成功**（exit 0）——它和「固件跟不上」是两件事。
+
+### 三种出口（不是两种）
+
+| 出口 | 含义 | 退出码 |
+|---|---|---|
+| 固件 `shutdown`（`Stepper too far in past` 等） | 真的量到了步进上限 | **0**（测量结果） |
+| 行程上界 | 预算用完，不是固件的限 | **0** |
+| **链路断了**（`get_config` 不再应答） | **不是**限制，板子/线出事 | **1** |
+
+断线曾经与 shutdown 折在同一出口，于是「断线」被读成「量到了限值」并 exit 0——现由
+`StageVerdict{Lived, ShutDown, LinkLost}` 区分，断线打
+`link gave out at …: no answer from the board, so this is not a step-rate limit` 并让整个 run 失败。
 
 发送时一段的命令分批发（每批 `SEND_BATCH` 条，之间 `flush`）：主机出站通道容量是
 `SEND_QUEUE_CAPACITY`（`mcu/mod.rs`，512 格；同步 `send` 队列满时**有界退避等待**（总 ≤ `SYNC_SEND_WAIT` 1s），
@@ -62,7 +86,8 @@ ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同�
 ### 步进任务的出错形态
 
 三种都由固件 `shutdown`，工具把原因（`shutdown` / `is_shutdown` 事件的 `static_string_id`，经字典
-解出）一并报出：
+解出）一并报出；整个 run 的结果由 `run()` 用有界的 `runtime.shutdown_timeout(5 s)` 收尾，
+不靠隐式 `Drop`：
 
 - **步进的时间落在过去** → `Stepper too far in past`（`src/stepper.c:108`）——最典型的一种，
   说明 MCU 已经跟不上下一个步进时刻；

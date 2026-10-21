@@ -28,14 +28,16 @@
 //! no impulses, so a section that shapes nothing installs nothing and the motion
 //! is untouched.
 //!
-//! # Differences from upstream
+//! A dual-carriage switch re-hands the impulses to the motion: `idex_modes`
+//! fires `dual_carriage:update_kinematics` on every switch and restore
+//! (`DualCarriageRail.apply_transform`, `idex_modes.py:383`), and the handler
+//! here is upstream's `_update_kinematics` (`input_shaper.py:153-168`) — flush,
+//! then recompute each stepper's step generation window from the axes it now
+//! moves, then rescan the queue. Upstream re-points a wrapper solver at the
+//! stepper's replaced solver; here the impulses are re-installed on the
+//! steppers' own solvers, which is the same re-window without a wrapper.
 //!
-//! Upstream re-points the shaper when a dual carriage changes the
-//! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
-//! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
-//! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
-//! it), so no handler is registered and a shaper installed on a stepper whose
-//! solver is later replaced would be lost.
+//! # Differences from upstream
 //!
 //! Upstream's `set_shaper_kinematics` disables a shaper whose impulse list the
 //! solver refuses and raises "Failed to configure shaper(s) …" from
@@ -331,6 +333,25 @@ impl InputShaper {
     /// a section that configures an axis is a config error. Upstream's check
     /// reads the parameters only, and only here — a `SET_INPUT_SHAPER` that
     /// enables shaping at run time is allowed (`:200-207`).
+    /// Upstream's `_update_kinematics` (`input_shaper.py:153-168`), fired on
+    /// `dual_carriage:update_kinematics`: a dual carriage changed the
+    /// kinematics under the shaper, so the impulses go to the steppers again
+    /// and their step generation windows follow the axes each one now moves.
+    ///
+    /// The flush comes first, as upstream's does (`:157`): the segments planned
+    /// before the switch have to be generated under the kinematics they were
+    /// planned with. A machine with no connected planner and a section that
+    /// shapes nothing are both quiet: there is nothing to re-window.
+    fn update_kinematics(&self) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let shapers = self.lock();
+        if let Err(err) = self.apply_shapers(&shapers) {
+            printer.set_error_state(&err.to_string());
+        }
+    }
+
     fn connect(&self) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -426,6 +447,13 @@ impl InputShaper {
             Box::new({
                 let object = Arc::clone(self);
                 move |_| object.connect()
+            }),
+        );
+        printer.register_event_handler(
+            KlippyEvent::DualCarriageUpdateKinematics,
+            Box::new({
+                let object = Arc::clone(self);
+                move |_| object.update_kinematics()
             }),
         );
         let gcode = printer

@@ -627,6 +627,15 @@ fn current_position(printer: &Arc<Printer>) -> Option<Coord> {
 /// re-anchors `gcode_move` behind it. A machine with no connected toolhead
 /// keeps the frames only; there is no coordinate to move.
 ///
+/// The switch also fires `dual_carriage:update_kinematics`, upstream's
+/// `DualCarriagesRail.apply_transform` event (`idex_modes.py:383`): the shaping
+/// layer holds impulse-derived step generation windows that have to follow the
+/// kinematics the carriages left behind. Upstream sends it from inside
+/// `activate`/`inactivate`, i.e. before the position is re-anchored and after
+/// `toggle_active_dc_rail`'s own flush; here it fires once per switch, right
+/// after the bookkeeping and **outside** the `Shared` lock — the handlers flush
+/// step generation, which must not run under it.
+///
 /// # Errors
 /// A failure from the toolhead's flush (`set_position`).
 async fn apply(
@@ -644,6 +653,7 @@ async fn apply(
         // that is not the departing one's.
         (state.axes[state.active], arriving)
     };
+    printer.send_event(&KlippyEvent::DualCarriageUpdateKinematics);
     let (Some(toolhead), Some(current)) = (toolhead, current) else {
         return Ok(());
     };

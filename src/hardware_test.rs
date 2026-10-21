@@ -2,32 +2,38 @@
 //!
 //! One input — the user's own printer config, named by [`HW_CONFIG_ENV`] — and
 //! per-test declarations of what they need. A module's test says what it wants
-//! and then asks for a [`Machine`]:
+//! and hands [`case`] (or [`async_case`]) the body to run with a [`Machine`]:
 //!
 //! ```ignore
 //! #[tokio::test]
 //! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
 //! async fn test_endstop_trigger_on_a_real_board() {
-//!     let Some(machine) = crate::hardware_test::acquire(
+//!     crate::hardware_test::async_case(
 //!         "test_endstop_trigger_on_a_real_board",
 //!         &crate::hardware_test::Requires::new()
 //!             .mcu()
 //!             .option("stepper_x", "endstop_pin"),
-//!     ) else {
-//!         return; // reported as HW-IGNORED; the test passes without a board
-//!     };
-//!     let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
-//!         .await
-//!         .expect("identify completes");
-//!     // … the assertions, against the real board …
+//!         |machine| async move {
+//!             let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+//!                 .await
+//!                 .expect("identify completes");
+//!             // … the assertions, against the real board …
+//!         },
+//!     );
 //! }
 //! ```
 //!
 //! That case is the **first layer**, and it is `async`: it opens the board
 //! itself with `Mcu::connect(…).await` and owns no runtime, so `#[tokio::test]`
 //! is the right frame. A case over the **second** layer is the opposite and
-//! must be a **plain `#[test]`** — see [the second
+//! must be a **plain `#[test]`** with [`case`] — see [the second
 //! layer](#the-second-layer-a-machine-that-is-up).
+//!
+//! Both runners give the case a **total budget** ([`case`], [`CASE_TIMEOUT`]):
+//! the body runs on a thread of its own, and a case that hangs is reported as
+//! `HW-TIMEOUT: <case>: still at "<phase>" …` rather than parking the run. A
+//! config that does not provide what the case declared is still a skip, printed
+//! as `HW-IGNORED: …`, and the body never runs.
 //!
 //! The `#[ignore]` marker must be written out as a literal with exactly that
 //! wording — an attribute cannot name a constant. Run one like this:
@@ -77,20 +83,21 @@
 //! **name**, not by its section header:
 //!
 //! ```ignore
-//! let Some(machine) = crate::hardware_test::acquire(
+//! crate::hardware_test::async_case(
 //!     "test_z_probe_uses_both_boards",
 //!     &crate::hardware_test::Requires::new()
 //!         .mcu()                 // [mcu] must be reachable
 //!         .mcu_named("zboard"),  // and so must [mcu zboard]
-//! ) else {
-//!     return; // reported as HW-IGNORED; the test passes without the boards
-//! };
-//! let main = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
-//!     .await
-//!     .expect("identify completes");
-//! let z = Mcu::connect("zboard", machine.open_mcu_named("zboard").expect("its port opens"))
-//!     .await
-//!     .expect("identify completes");
+//!     |machine| async move {
+//!         let main = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+//!             .await
+//!             .expect("identify completes");
+//!         let z = Mcu::connect("zboard", machine.open_mcu_named("zboard").expect("its port opens"))
+//!             .await
+//!             .expect("identify completes");
+//!         // …
+//!     },
+//! );
 //! ```
 //!
 //! Two things the framework deliberately leaves out. It hands a test the
@@ -116,24 +123,25 @@
 //! #[test]
 //! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
 //! fn test_homing_reaches_the_endstop_on_a_real_board() {
-//!     let Some(machine) = crate::hardware_test::acquire(
+//!     crate::hardware_test::case(
 //!         "test_homing_reaches_the_endstop_on_a_real_board",
 //!         &crate::hardware_test::Requires::new()
 //!             .mcu()
 //!             .option("stepper_x", "endstop_pin"),
-//!     ) else {
-//!         return; // reported as HW-IGNORED; the test passes without a board
-//!     };
-//!     let started = machine.bring_up().expect("the machine comes up");
-//!     let gcode = started
-//!         .printer()
-//!         .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
-//!         .expect("the g-code dispatcher is registered");
-//!     gcode.run_script_sync("G28 X").expect("the homing move runs");
-//!     // … the assertions, against the running machine …
-//!     // `started` is dropped here, and that is what takes the machine down
-//!     // (`Drop`, the panic path included) — keep it alive to the end of the
-//!     // test, or put it in a scope that ends where the session should.
+//!         |machine| {
+//!             let started = machine.bring_up().expect("the machine comes up");
+//!             let gcode = started
+//!                 .printer()
+//!                 .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
+//!                 .expect("the g-code dispatcher is registered");
+//!             gcode.run_script_sync("G28 X").expect("the homing move runs");
+//!             // … the assertions, against the running machine …
+//!             // `started` is dropped here, and that is what takes the machine
+//!             // down (`Drop`, the panic path included) — keep it alive to the
+//!             // end of the body, or put it in a scope that ends where the
+//!             // session should.
+//!         },
+//!     );
 //! }
 //! ```
 //!
@@ -268,10 +276,12 @@
 //! not it is in this process, so one lock covers both "another test thread of
 //! this binary" (which `cargo test` runs in parallel by default) and "a second
 //! `cargo test` run elsewhere". A test that has to wait prints
-//! `HW-WAIT: <test>: …` once and then blocks; the wait has no timeout, because
-//! what it waits for is the other test's session on that board, and a session
-//! that never ends is a hung test rather than a lock problem. `--test-threads=1`
-//! is therefore **not** needed (and passing it anyway is harmless).
+//! `HW-WAIT: <test>: …` once and then polls for the lock; the wait is **bounded**
+//! by [`LOCK_TIMEOUT`], because a session that never ends is exactly the hung
+//! case a run must hear about rather than sit in — so a wait that runs out says
+//! another hardware test still holds the board instead of blocking forever.
+//! `--test-threads=1` is therefore **not** needed (and passing it anyway is
+//! harmless).
 
 use std::fmt;
 use std::fs::File;
@@ -692,6 +702,16 @@ impl Machine {
     /// The whole parsed printer config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Record this case's progress in the runner's `progress` from here on.
+    ///
+    /// [`acquire`] builds a machine with a phase record of its own; the runner
+    /// swaps in the one its timeout report watches, so the phases
+    /// [`Machine::bring_up`] and [`Machine::open_mcu_named`] stamp land where
+    /// that report reads them.
+    fn traced_by(&mut self, progress: &Arc<CaseProgress>) {
+        self.progress = Arc::clone(progress);
     }
 
     /// Start the machine the config describes, as the host does.
@@ -1117,26 +1137,8 @@ fn run_line(test_name: &str) -> String {
 /// machine had a config, so "there was nothing to test" is a failure, not a
 /// skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
-    acquire_traced(test_name, requires, &CaseProgress::new(PHASE_ACQUIRING))
-}
-
-/// [`acquire`], recording where the case has got to in `progress`.
-///
-/// The runner's entry point: the case body it runs is on another thread, so the
-/// machine it hands out carries the same record the budget's timeout report
-/// reads.
-fn acquire_traced(
-    test_name: &str,
-    requires: &Requires,
-    progress: &Arc<CaseProgress>,
-) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
-    acquire_at_traced(
-        path.as_deref().map(Path::new),
-        test_name,
-        requires,
-        progress,
-    )
+    acquire_at(path.as_deref().map(Path::new), test_name, requires)
 }
 
 /// [`acquire`], on a path instead of the environment.
@@ -1145,21 +1147,6 @@ fn acquire_traced(
 /// path as an argument so the branches can be exercised without setting a
 /// variable (which no test can do without racing the others).
 fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Option<Machine> {
-    acquire_at_traced(
-        path,
-        test_name,
-        requires,
-        &CaseProgress::new(PHASE_ACQUIRING),
-    )
-}
-
-/// [`acquire_at`], recording the case's phase in `progress`.
-fn acquire_at_traced(
-    path: Option<&Path>,
-    test_name: &str,
-    requires: &Requires,
-    progress: &Arc<CaseProgress>,
-) -> Option<Machine> {
     match decide(path, requires) {
         Decision::NotSet => {
             println!("HW-IGNORED: {test_name}: {HW_CONFIG_ENV} is not set");
@@ -1188,11 +1175,11 @@ fn acquire_at_traced(
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
             println!("{}", run_line(test_name));
-            progress.enter(PHASE_BODY);
+            let progress = CaseProgress::new(PHASE_BODY);
             Some(Machine {
                 config,
                 path,
-                progress: Arc::clone(progress),
+                progress,
                 _board,
             })
         }
@@ -1311,10 +1298,15 @@ fn run_case<F>(
             // runs here, before the outcome travels, on the panic path too.
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let machine = match path {
-                    Some(path) => acquire_at_traced(Some(&path), &name, &requires, &case_progress),
-                    None => acquire_traced(&name, &requires, &case_progress),
+                    Some(path) => acquire_at(Some(&path), &name, &requires),
+                    None => acquire(&name, &requires),
                 };
-                if let Some(machine) = machine {
+                if let Some(mut machine) = machine {
+                    // The machine's phase record becomes the runner's from here
+                    // on: the acquiring phase was already the runner's own, and
+                    // the body's phases are what it has to report.
+                    case_progress.enter(PHASE_BODY);
+                    machine.traced_by(&case_progress);
                     body(machine);
                 }
             }));

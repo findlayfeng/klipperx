@@ -95,6 +95,7 @@ use crate::core::klippy::error::KlippyError;
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::carriage::{self, KinematicStepper};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
+use crate::core::klippy::extras::extruder_stepper::PrinterExtruderStepper;
 use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
 use crate::core::klippy::extras::idex_modes::DUAL_CARRIAGE_OBJECT;
@@ -1480,6 +1481,43 @@ impl PrinterObject for ToolHeadObject {
                 }
             }
 
+            // `[extruder_stepper <name>]` motors: each has its own solver, but
+            // reads the trapq of the extruder it is bound to — so it takes the
+            // steps that extruder takes and no others (`kinematics/extruder.py
+            // :50-66`). The binding was resolved at the section's own connect
+            // (which runs before this one); an unbound stepper is added
+            // detached, so the queue generates nothing for it, exactly as
+            // upstream leaves `set_trapq(None)`.
+            if let Some(printer) = self.printer.upgrade() {
+                for (_, section) in
+                    printer.lookup_objects_as::<PrinterExtruderStepper>(Some("extruder_stepper"))
+                {
+                    let Some(mut host) = section.take_stepper() else {
+                        continue;
+                    };
+                    let bound = section
+                        .bound_extruder()
+                        .and_then(|name| printer.lookup_object_as::<PrinterExtruder>(&name))
+                        .and_then(|extruder| {
+                            extruder
+                                .trapq()
+                                .map(|trapq| (trapq, extruder.last_position()))
+                        });
+                    match bound {
+                        Some((trapq, last_position)) => {
+                            // Upstream seeds the position from the extruder it
+                            // joins before pointing it at the queue
+                            // (`kinematics/extruder.py:63-64`).
+                            host.set_position(Xyz::new(last_position, 0.0, 0.0));
+                            host.set_trapq(trapq);
+                        }
+                        None => host.set_trapq(None),
+                    }
+                    mcu_steppers.insert(host.name().to_string(), section.mcu_stepper());
+                    toolhead.add_extra_axis_stepper(host);
+                }
+            }
+
             // Every stepper is in the queue now, so scan their step generation
             // windows once (`motion_queuing.check_step_generation_scan_windows`,
             // `motion_queuing.py:126-138`). This is where upstream's extruder
@@ -2410,6 +2448,39 @@ impl ToolHeadObject {
             .find(|stepper| stepper.name() == name)
             .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
         stepper.set_trapq(trapq);
+        Ok(())
+    }
+
+    /// Change one motion stepper's step distance — the `_step_dist` half of
+    /// upstream's `MCU_stepper.set_rotation_distance`
+    /// (`klippy/stepper.py:138-143`, which rewrites it before re-pointing the
+    /// queue).
+    ///
+    /// The solver's copy is what turns a position into steps, so the next
+    /// generation counts the new distance. `commanded_pos` is left where it is:
+    /// the trapq's positions are absolute, so the motor keeps its place and only
+    /// the conversion changes (upstream re-derives its offset so its *reported*
+    /// position stays continuous, `_set_mcu_position`, `:186-189`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"
+    /// when no motion stepper answers to `name`.
+    pub fn set_stepper_step_dist(&self, name: &str, step_dist: f64) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers_mut()
+            .iter_mut()
+            .find(|stepper| stepper.name() == name)
+            .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
+        // `MCU_stepper.set_rotation_distance`'s `self._step_dist = …
+        // self.set_trapq(self._trapq)`: the queue is kept as it is; only the
+        // conversion is replaced.
+        stepper.kinematics_mut().step_dist = step_dist;
         Ok(())
     }
 

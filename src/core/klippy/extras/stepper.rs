@@ -215,14 +215,14 @@ pub struct PrinterStepper {
     /// `MCU_stepper.units_in_radians`): a bare stepper whose `rotation_distance`
     /// is inferred from `gear_ratio` — the polar bed (`stepper.py:302-304`).
     units_in_radians: bool,
-    /// Millimetres per step, after rotation distance, microsteps and gearing.
-    step_dist: f64,
     /// The rotation distance the section wrote, and the full steps that make
     /// one rotation (`get_rotation_distance`, `klippy/stepper.py:136-137`).
     ///
-    /// `SET_EXTRUDER_ROTATION_DISTANCE` rewrites the distance; the host solver
-    /// is not rebuilt here, so the new value is recorded for reporting (the H10
-    /// motion-sync gap the extruder sections document).
+    /// These two are the whole of the step distance: millimetres per step is
+    /// their quotient ([`PrinterStepper::step_dist`]), so
+    /// `SET_EXTRUDER_ROTATION_DISTANCE` rewriting the distance rewrites the
+    /// conversion with it (upstream's `_step_dist = rotation_dist /
+    /// _steps_per_rotation`, `klippy/stepper.py:140-142`).
     rotation_distance: Mutex<f64>,
     steps_per_rotation: f64,
     /// Whether the direction pin was written with `!` (`orig_dir_inverted`,
@@ -380,7 +380,6 @@ impl PrinterStepper {
             config.get_float_bounded("rotation_distance", None, None, None, Some(0.0), None)?
         };
         let steps_per_rotation = full_steps as f64 * microsteps as f64 * gear_ratio;
-        let step_dist = rotation_distance / steps_per_rotation;
 
         let pins = printer
             .lookup_object_as::<PrinterPins>(PINS_OBJECT)
@@ -536,7 +535,6 @@ impl PrinterStepper {
             axis,
             microsteps,
             units_in_radians,
-            step_dist,
             rotation_distance: Mutex::new(rotation_distance),
             steps_per_rotation,
             orig_dir_inverted: mcu_stepper.invert_dir(),
@@ -606,9 +604,18 @@ impl PrinterStepper {
             .unwrap_or_else(|poison| poison.into_inner()) = Some(pressure_advance);
     }
 
-    /// Millimetres per step.
+    /// Millimetres per step: the rotation distance over the steps that make
+    /// one rotation (upstream's `get_step_dist`, `klippy/stepper.py:134-135`).
+    ///
+    /// Derived rather than stored, so a rotation-distance change is in force
+    /// for the next read (`MCU_stepper.set_rotation_distance` rewrites
+    /// `_step_dist`, `:140-142`).
     pub fn step_dist(&self) -> f64 {
-        self.step_dist
+        *self
+            .rotation_distance
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            / self.steps_per_rotation
     }
 
     /// The rotation distance and the steps that make one rotation
@@ -625,8 +632,11 @@ impl PrinterStepper {
 
     /// Upstream's `set_rotation_distance` (`klippy/stepper.py:138-143`).
     ///
-    /// The distance is recorded; the host solver and `step_dist` are not
-    /// rebuilt, so motion does not yet follow the change (the H10 gap).
+    /// The distance is recorded here, so [`PrinterStepper::step_dist`] follows
+    /// at once. The **live** host stepper the toolhead drives carries its own
+    /// copy of the step distance; a caller that reaches it
+    /// (`crate::core::klippy::extras::toolhead::ToolHeadObject::set_stepper_step_dist`)
+    /// is what makes the next step generation use the new one.
     pub fn set_rotation_distance(&self, rotation_distance: f64) {
         *self
             .rotation_distance
@@ -743,7 +753,7 @@ impl PrinterStepper {
     /// (`commanded_pos = steps * step_dist` in [`PrinterStepper::connect`]), so
     /// the offset is always 0 and the distance alone converts.
     pub fn mcu_to_commanded_position(&self, mcu_pos: i64) -> f64 {
-        mcu_pos as f64 * self.step_dist
+        mcu_pos as f64 * self.step_dist()
     }
 
     /// Take the host-side stepper the toolhead will drive.
@@ -799,7 +809,7 @@ impl PrinterStepper {
         let mut stepper = Stepper::new(
             self.name.clone(),
             oid,
-            self.step_dist,
+            self.step_dist(),
             solver.position,
             solver.active_flags,
             mcu_freq,
@@ -868,7 +878,7 @@ impl PrinterObject for PrinterStepper {
                 .query_position(POSITION_TIMEOUT)
                 .await
                 .map_err(|err| config_error(err.to_string()))?;
-            stepper.kinematics_mut().commanded_pos = f64::from(steps) * self.step_dist;
+            stepper.kinematics_mut().commanded_pos = f64::from(steps) * self.step_dist();
             // Point the compressor at this MCU's clock domain. The `[mcu]`
             // object already built the estimate and the `SecondarySync` offset at
             // its own connect (which runs before any stepper); find it by chip
@@ -895,7 +905,7 @@ impl std::fmt::Debug for PrinterStepper {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrinterStepper")
             .field("name", &self.name)
-            .field("step_dist", &self.step_dist)
+            .field("step_dist", &self.step_dist())
             .finish_non_exhaustive()
     }
 }

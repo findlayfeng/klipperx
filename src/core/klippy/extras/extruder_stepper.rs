@@ -15,13 +15,18 @@
 //! at connect, complaining with upstream's wording when the name is not an
 //! extruder.
 //!
-//! What is still open (tracked as the H10 motion-sync gap): the bound
-//! extruder's trapq is allocated by the toolhead, which connects **after** this
-//! generic section, and only the toolhead adds a host stepper to the step
-//! generation — so the binding is recorded (status `motion_queue`) but the
-//! stepper does not yet follow the extruder's motion. `SET_EXTRUDER_ROTATION_DISTANCE`
-//! records its new distance and direction but does not rebuild the solver; the
-//! corpus's fake firmware only needs the commands to run without error.
+//! What binds it to the extruder's **motion** is upstream's `sync_to_extruder`
+//! (`kinematics/extruder.py:50-66`): the stepper's solver reads the extruder's
+//! own trapq, whose x is the extrusion amount, so the motor takes exactly the
+//! steps that extruder takes. The host stepper joins the toolhead's motion queue
+//! at the toolhead's own connect — the first moment the extruder's trapq exists
+//! (it is allocated there) — and `SYNC_EXTRUDER_MOTION` re-points it while the
+//! machine runs. An unbound stepper stays detached (`set_trapq(None)`) and
+//! generates no steps, as upstream leaves it.
+//!
+//! `SET_EXTRUDER_ROTATION_DISTANCE` rewrites the step distance, which both the
+//! recorded geometry ([`PrinterStepper::step_dist`]) and the live solver's
+//! conversion follow (`ToolHeadObject::set_stepper_step_dist`).
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -36,12 +41,17 @@ use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::mcu::McuStepper;
 use crate::core::klippy::motion::itersolve::{extruder_active_flags, extruder_position_fn, Axis};
 use crate::core::klippy::motion::pressure_advance::ExtruderPressureAdvance;
+use crate::core::klippy::motion::stepper::Stepper;
 use crate::core::klippy::printer::{ConnectFuture, Printer, PrinterObject};
 
 // Only the prefix form exists upstream (`extruder_stepper.py:23`).
 section!("extruder_stepper", order = 20, prefix = load_config_prefix);
+
+/// The toolhead object, as the loader registers `[printer]`.
+const TOOLHEAD_OBJECT: &str = "toolhead";
 
 /// One configured `[extruder_stepper <name>]`.
 pub struct PrinterExtruderStepper {
@@ -60,7 +70,8 @@ pub struct PrinterExtruderStepper {
     /// `pressure_advance`/`pressure_advance_smooth_time` (upstream's
     /// `config_pa`/`config_smooth_time`, applied from time zero at connect).
     pressure_advance: Arc<ExtruderPressureAdvance>,
-    /// `motion_queue`: the extruder this stepper is bound to once connected.
+    /// `motion_queue`: the extruder whose trapq this stepper's motion follows,
+    /// or `None` when it is detached (`kinematics/extruder.py:59-65`).
     /// `Arc` so the `SYNC_EXTRUDER_MOTION` handler shares the same slot.
     motion_queue: Arc<Mutex<Option<String>>>,
     /// The machine, to find the extruder at connect.
@@ -128,12 +139,31 @@ impl PrinterExtruderStepper {
         &self.extruder_name
     }
 
+    /// The extruder this stepper's motion follows right now — upstream's
+    /// `sync_to_extruder`'s `self.motion_queue` (`kinematics/extruder.py:59`).
+    pub fn bound_extruder(&self) -> Option<String> {
+        lock(&self.motion_queue).clone()
+    }
+
+    /// Take the host stepper the toolhead will drive: the same handover
+    /// `[extruder]` makes through its own `take_stepper`.
+    pub fn take_stepper(&self) -> Option<Stepper> {
+        self.stepper.take_stepper()
+    }
+
+    /// The firmware stepper this section's steps are sent through.
+    pub fn mcu_stepper(&self) -> Arc<McuStepper> {
+        Arc::clone(self.stepper.mcu_stepper())
+    }
+
     /// Register `SET_PRESSURE_ADVANCE EXTRUDER=<name>` — the stepper's own mux
-    /// value (`kinematics/extruder.py:32-34`).
-    ///
-    /// `SYNC_EXTRUDER_MOTION` and `SET_EXTRUDER_ROTATION_DISTANCE` are not
-    /// registered; the dispatcher reports them as unknown commands (see the
-    /// module docs).
+    /// value (`kinematics/extruder.py:32-34`) — plus the two motion-sync
+    /// commands every extruder stepper registers (`:37-42`):
+    /// `SET_EXTRUDER_ROTATION_DISTANCE` on this stepper and
+    /// `SYNC_EXTRUDER_MOTION` on its binding. Both flush step generation first
+    /// (`toolhead.flush_step_generation`, `:120,135`), so the handlers are
+    /// futures like upstream's own bodies are allowed to be elsewhere; nothing
+    /// queued is stepped over by the change.
     fn register_commands(&self, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -161,8 +191,14 @@ impl PrinterExtruderStepper {
         {
             let stepper = Arc::clone(&self.stepper);
             let name = self.name.clone();
-            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
-                cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
+            let printer = Arc::downgrade(printer);
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let stepper = Arc::clone(&stepper);
+                let name = name.clone();
+                let printer = printer.clone();
+                Box::pin(async move {
+                    cmd_set_extruder_rotation_distance(gcmd, &name, &stepper, &printer).await
+                })
             });
             gcode
                 .register_mux_command_with_params(
@@ -177,10 +213,17 @@ impl PrinterExtruderStepper {
         }
         {
             let queue = Arc::clone(&self.motion_queue);
+            let stepper = Arc::clone(&self.stepper);
             let name = self.name.clone();
             let printer = Arc::downgrade(printer);
-            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
-                cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let queue = Arc::clone(&queue);
+                let stepper = Arc::clone(&stepper);
+                let name = name.clone();
+                let printer = printer.clone();
+                Box::pin(async move {
+                    cmd_sync_extruder_motion(gcmd, &name, &printer, &queue, Some(&stepper)).await
+                })
             });
             gcode
                 .register_mux_command_with_params(
@@ -200,26 +243,21 @@ impl PrinterExtruderStepper {
     /// `ExtruderStepper.sync_to_extruder`, `kinematics/extruder.py:50-66`): an
     /// empty name detaches, any other must name an `[extruder]`.
     ///
-    /// The trapq repointing lives in the toolhead (see the module docs); here
-    /// the binding is validated and recorded as the status's `motion_queue`.
+    /// The trapq repointing happens here too, through
+    /// [`ToolHeadObject::set_stepper_trapq`] once the machine is up; at the
+    /// section's own connect the toolhead is not connected yet and its connect
+    /// does the pointing, from [`PrinterExtruderStepper::bound_extruder`].
     ///
     /// # Errors
     /// Upstream's wording when the name does not resolve to an extruder.
     pub(crate) fn sync_to_extruder(&self, printer: &Arc<Printer>) -> Result<(), KlippyError> {
-        if self.extruder_name.is_empty() {
-            *lock(&self.motion_queue) = None;
-            return Ok(());
-        }
-        printer
-            .lookup_object_as::<PrinterExtruder>(&self.extruder_name)
-            .ok_or_else(|| {
-                KlippyError::Config(ConfigError::new(format!(
-                    "'{}' is not a valid extruder.",
-                    self.extruder_name
-                )))
-            })?;
-        *lock(&self.motion_queue) = Some(self.extruder_name.clone());
-        Ok(())
+        bind_motion_queue(
+            printer,
+            &self.motion_queue,
+            Some(&self.stepper),
+            &self.extruder_name,
+        )
+        .map_err(KlippyError::Config)
     }
 }
 
@@ -297,13 +335,17 @@ fn cmd_set_pressure_advance(
 /// A missing `DISTANCE` reports the current value; a zero is refused; a
 /// negative value flips the direction and stores the absolute distance. Each
 /// `[extruder]` and `[extruder_stepper <name>]` registers this for its own name.
+/// Upstream flushes step generation before rebuilding the solver (`:120-122`)
+/// and the live stepper's conversion follows the new distance
+/// (`MCU_stepper.set_rotation_distance`, `klippy/stepper.py:138-143`).
 ///
 /// # Errors
 /// Upstream's wording when `DISTANCE` is zero, plus the parameter errors.
-pub(crate) fn cmd_set_extruder_rotation_distance(
+pub(crate) async fn cmd_set_extruder_rotation_distance(
     gcmd: &GcodeCommand,
     name: &str,
     stepper: &PrinterStepper,
+    printer: &Weak<Printer>,
 ) -> Result<(), CommandError> {
     let rotation_dist = if gcmd.get_command_parameters().contains_key("DISTANCE") {
         let distance = gcmd.get_float("DISTANCE")?;
@@ -318,9 +360,20 @@ pub(crate) fn cmd_set_extruder_rotation_distance(
             distance = -distance;
         }
         // Upstream flushes step generation before rebuilding the solver
-        // (`kinematics/extruder.py:120-122`); the solver half is the H10 gap.
+        // (`kinematics/extruder.py:120-122`): the segments already planned were
+        // stepped with the old distance, so they are generated before the new
+        // one is in force.
+        let toolhead = connected_toolhead(printer);
+        if let Some(toolhead) = &toolhead {
+            toolhead.flush_step_generation().await?;
+        }
         stepper.set_rotation_distance(distance);
         stepper.set_dir_inverted(next_invert_dir);
+        // The live solver keeps its own copy of the step distance; upstream's
+        // `MCU_stepper.set_rotation_distance` rewrites it in place.
+        if let Some(toolhead) = &toolhead {
+            toolhead.set_stepper_step_dist(name, stepper.step_dist())?;
+        }
         distance
     } else {
         stepper.get_rotation_distance().0
@@ -337,40 +390,111 @@ pub(crate) fn cmd_set_extruder_rotation_distance(
     Ok(())
 }
 
-/// `SYNC_EXTRUDER_MOTION`'s body for one extruder stepper (upstream
+/// `SYNC_EXTRUDER_MOTION`'s body for one extruder's stepper (upstream
 /// `cmd_SYNC_EXTRUDER_MOTION`, `kinematics/extruder.py:133-137`).
 ///
-/// An empty `MOTION_QUEUE` detaches — upstream's `sync_to_extruder("")` branch,
+/// An empty `MOTION_QUEUE` detaches — upstream's `sync_to_extruder(""` branch,
 /// which must **not** be treated as an invalid name; any other value must name
-/// an `[extruder]`.
+/// an `[extruder]`. Step generation is flushed first (`:52`), so everything
+/// planned into the old queue is stepped before the stepper leaves it.
+///
+/// `stepper` is the motion stepper to point at the named extruder's trapq. The
+/// primary `[extruder]` passes `None`: its stepper's trapq *is* its own queue,
+/// so a `SYNC_EXTRUDER_MOTION` for it only records the binding (see the module
+/// docs).
 ///
 /// # Errors
 /// Upstream's wording when the name does not resolve to an extruder.
-pub(crate) fn cmd_sync_extruder_motion(
+pub(crate) async fn cmd_sync_extruder_motion(
     gcmd: &GcodeCommand,
     name: &str,
     printer: &Weak<Printer>,
     motion_queue: &Mutex<Option<String>>,
+    stepper: Option<&Arc<PrinterStepper>>,
 ) -> Result<(), CommandError> {
     let ename = gcmd.get_str_default("MOTION_QUEUE", "");
     let printer = printer
         .upgrade()
         .ok_or_else(|| CommandError::new("printer is gone"))?;
-    if ename.is_empty() {
-        *lock(motion_queue) = None;
-    } else {
-        if printer
-            .lookup_object_as::<PrinterExtruder>(&ename)
-            .is_none()
-        {
-            return Err(CommandError::new(format!(
-                "'{ename}' is not a valid extruder."
-            )));
-        }
-        *lock(motion_queue) = Some(ename.clone());
+    if let Some(toolhead) = connected_toolhead(&Arc::downgrade(&printer)) {
+        toolhead.flush_step_generation().await?;
     }
+    bind_motion_queue(&printer, motion_queue, stepper.map(Arc::as_ref), &ename)
+        .map_err(|err| CommandError::new(err.to_string()))?;
     gcmd.respond_info(&format!("Extruder '{name}' now syncing with '{ename}'"));
     Ok(())
+}
+
+/// Upstream's `ExtruderStepper.sync_to_extruder` (`kinematics/extruder.py:50-66`):
+/// record `extruder_name` as the motion queue and point `stepper` at that
+/// extruder's trapq, or detach it for an empty name.
+///
+/// # Errors
+/// Upstream's wording when the name is not an `[extruder]`.
+fn bind_motion_queue(
+    printer: &Arc<Printer>,
+    motion_queue: &Mutex<Option<String>>,
+    stepper: Option<&PrinterStepper>,
+    extruder_name: &str,
+) -> Result<(), ConfigError> {
+    if extruder_name.is_empty() {
+        *lock(motion_queue) = None;
+        return attach_trapq(printer, stepper, None);
+    }
+    let extruder = printer
+        .lookup_object_as::<PrinterExtruder>(extruder_name)
+        .ok_or_else(|| ConfigError::new(format!("'{extruder_name}' is not a valid extruder.")))?;
+    *lock(motion_queue) = Some(extruder_name.to_string());
+    attach_trapq(printer, stepper, Some(&extruder))
+}
+
+/// Point `stepper` at `extruder`'s trapq with its position where that extruder
+/// last planned extrusion (upstream's
+/// `set_position([extruder.last_position, 0., 0.])` then
+/// `set_trapq(extruder.get_trapq())`, `kinematics/extruder.py:63-65`), or take
+/// it off every queue with `None` (`:56-58`).
+///
+/// Before the machine is up there is no planner to point anything at: nothing
+/// has been generated, so there is no position to seed, and the toolhead's own
+/// connect does the pointing from
+/// [`PrinterExtruderStepper::bound_extruder`].
+fn attach_trapq(
+    printer: &Arc<Printer>,
+    stepper: Option<&PrinterStepper>,
+    extruder: Option<&Arc<PrinterExtruder>>,
+) -> Result<(), ConfigError> {
+    let (Some(stepper), Some(toolhead)) = (
+        stepper,
+        printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT),
+    ) else {
+        return Ok(());
+    };
+    if !toolhead.is_connected() {
+        return Ok(());
+    }
+    let name = stepper.name();
+    if let Some(extruder) = extruder {
+        toolhead
+            .set_stepper_position(name, extruder.last_position())
+            .map_err(|err| ConfigError::new(err.to_string()))?;
+        toolhead
+            .set_stepper_trapq(name, extruder.trapq())
+            .map_err(|err| ConfigError::new(err.to_string()))?;
+    } else {
+        toolhead
+            .set_stepper_trapq(name, None)
+            .map_err(|err| ConfigError::new(err.to_string()))?;
+    }
+    Ok(())
+}
+
+/// The toolhead, when the machine is up far enough to have one: a command run
+/// before connect has nothing queued and nothing to flush.
+fn connected_toolhead(printer: &Weak<Printer>) -> Option<Arc<ToolHeadObject>> {
+    printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT))
+        .filter(|toolhead| toolhead.is_connected())
 }
 
 /// The factory the section declaration names (`extruder_stepper.py:23`).

@@ -271,6 +271,17 @@ impl PrinterExtruder {
         *Self::lock(&self.trapq)
     }
 
+    /// The extrusion position this extruder last planned
+    /// (`PrinterExtruder.last_position`, `kinematics/extruder.py:158`).
+    ///
+    /// An `[extruder_stepper <name>]` reads it when it binds: its own solver is
+    /// put at that position before it starts reading this extruder's trapq
+    /// (`sync_to_extruder`, `:63`), or the first generation would step the gap
+    /// between the two positions.
+    pub fn last_position(&self) -> f64 {
+        *Self::lock(&self.last_position)
+    }
+
     /// Register the extruder's g-code commands
     /// (`kinematics/extruder.py:34-50`, `:180-190`).
     fn register_commands(&self, printer: &Arc<Printer>) -> Result<(), ConfigError> {
@@ -378,8 +389,15 @@ impl PrinterExtruder {
         if let Some(stepper) = &self.stepper {
             let stepper = Arc::clone(stepper);
             let name = self.name.clone();
-            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
-                cmd_set_extruder_rotation_distance(gcmd, &name, &stepper)
+            let printer = Arc::downgrade(printer);
+            let sync_printer = printer.clone();
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let stepper = Arc::clone(&stepper);
+                let name = name.clone();
+                let printer = printer.clone();
+                Box::pin(async move {
+                    cmd_set_extruder_rotation_distance(gcmd, &name, &stepper, &printer).await
+                })
             });
             gcode
                 .register_mux_command_with_params(
@@ -395,9 +413,13 @@ impl PrinterExtruder {
 
             let queue = Arc::clone(&self.motion_queue);
             let name = self.name.clone();
-            let printer = Arc::downgrade(printer);
-            let handler: CommandHandler = sync(move |gcmd: &GcodeCommand| {
-                cmd_sync_extruder_motion(gcmd, &name, &printer, &queue)
+            let handler: CommandHandler = Arc::new(move |gcmd: &GcodeCommand| {
+                let queue = Arc::clone(&queue);
+                let name = name.clone();
+                let printer = sync_printer.clone();
+                Box::pin(async move {
+                    cmd_sync_extruder_motion(gcmd, &name, &printer, &queue, None).await
+                })
             });
             gcode
                 .register_mux_command_with_params(

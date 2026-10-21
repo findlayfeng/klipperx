@@ -242,6 +242,16 @@ impl ToolHead {
         self.motion_queuing.add_stepper(stepper);
     }
 
+    /// Add a stepper that drives its own trapq (an extra axis' motor) without
+    /// re-pointing it at the main one.
+    ///
+    /// [`ToolHead::add_stepper`] is for the kinematic motors, which all read the
+    /// main trapq; an extra axis' stepper was already pointed at the trapq its
+    /// axis queues into (`ToolHead.add_extra_axis`'s caller owns it).
+    pub fn add_extra_axis_stepper(&mut self, stepper: Stepper) {
+        self.motion_queuing.add_stepper(stepper);
+    }
+
     /// Add a non-kinematic axis (the extruder).
     ///
     /// The caller owns the axis' trapq and has already pointed its stepper at

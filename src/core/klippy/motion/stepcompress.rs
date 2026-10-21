@@ -433,7 +433,6 @@ impl StepCompressor {
         self.next_step_dir = sdir;
         Ok(())
     }
-
     /// Emit the pending step even though it can no longer be rolled back
     /// (`stepcompress_commit`).
     ///

@@ -253,3 +253,203 @@ fn range_integrate(
     }
     res
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::mathutil::Xyz;
+
+    /// One extruder trapq segment: `start_x` is the extrusion amount, the
+    /// segment travels `start_v` millimetres of filament per second and
+    /// accelerates at `2 * half_accel`. `axes_r.y` marks it as a move that may
+    /// use pressure advance (`can_pressure_advance`, `extruder.py:221-232`).
+    fn segment(
+        print_time: f64,
+        move_t: f64,
+        start_x: f64,
+        start_v: f64,
+        half_accel: f64,
+    ) -> MoveSegment {
+        MoveSegment {
+            print_time,
+            move_t,
+            start_v,
+            half_accel,
+            start_pos: Xyz::new(start_x, 0.0, 0.0),
+            axes_r: Xyz::new(1.0, 1.0, 0.0),
+        }
+    }
+
+    /// The smoothed position at absolute print time `print_time`, evaluated on
+    /// the segment that contains it (as the solver does).
+    fn position_at(state: &ExtruderPressureAdvance, cuts: &[MoveSegment], print_time: f64) -> f64 {
+        let index = cuts
+            .iter()
+            .position(|segment| print_time < segment.end_time())
+            .unwrap_or(cuts.len() - 1);
+        state.position(cuts, index, print_time - cuts[index].print_time)
+    }
+
+    /// The old position function read the trapq's x
+    /// (`extruder_position_fn`, `chelper/kin_extruder.c:134`'s nominal path).
+    /// With pressure advance off, point for point the same.
+    #[test]
+    fn test_pressure_advance_off_keeps_the_nominal_position() {
+        let cuts = [
+            segment(0.0, 0.1, 0.0, 5.0, 20.0),
+            segment(0.1, 0.2, 0.6, 9.0, 0.0),
+            segment(0.3, 0.1, 2.4, 9.0, -20.0),
+        ];
+        // `smooth_time` alone does nothing: upstream disables the filter when
+        // `pressure_advance` is zero (`extruder.py:68-73`).
+        let state = ExtruderPressureAdvance::new(0.0, 0.040);
+
+        for (index, segment) in cuts.iter().enumerate() {
+            for sample in 0..=20 {
+                let move_time = segment.move_t * f64::from(sample) / 20.0;
+                assert_eq!(
+                    state.position(&cuts, index, move_time),
+                    segment.coord(move_time).x(),
+                    "segment {index} at {move_time}"
+                );
+            }
+        }
+    }
+
+    /// During a constant-velocity stretch the smoothed position is the nominal
+    /// one plus `pressure_advance * velocity`: the triangular window is
+    /// symmetric, so a straight line passes through it unchanged.
+    #[test]
+    fn test_pressure_advance_leads_by_pa_times_velocity() {
+        // Accelerate from rest to 100 mm/s over 0.1 s (half_accel 500), then
+        // cruise.
+        let cuts = [
+            segment(0.0, 0.1, 0.0, 0.0, 500.0),
+            segment(0.1, 0.2, 5.0, 100.0, 0.0),
+        ];
+        let state = ExtruderPressureAdvance::new(0.05, 0.020);
+
+        // 0.05 s into the cruise: the whole smoothing window (0.11..0.19 s) is
+        // inside the constant-velocity segment.
+        let nominal = cuts[1].coord(0.05).x();
+        let smoothed = state.position(&cuts, 1, 0.05);
+        assert_eq!(nominal, 10.0);
+        assert!(
+            (smoothed - (nominal + 0.05 * 100.0)).abs() < 1e-9,
+            "expected {nominal} + pa*velocity, got {smoothed}"
+        );
+
+        // The offset disappears again when pressure advance is zeroed, and the
+        // new value is what the next evaluation reads.
+        state.set(0.0, 0.020);
+        assert!((state.position(&cuts, 1, 0.05) - nominal).abs() < 1e-12);
+    }
+
+    /// A feed-rate step is spread over `smooth_time`: the longer the time, the
+    /// gentler the smoothed position moves (checking the shape, not one
+    /// number).
+    #[test]
+    fn test_a_longer_smooth_time_makes_the_transition_gentler() {
+        // Standing still, then extruding flat out at 20 mm/s: without
+        // smoothing the pressure-advance term steps by `0.05 * 20 = 1 mm`.
+        let cuts = [
+            segment(0.0, 0.5, 0.0, 0.0, 0.0),
+            segment(0.5, 0.5, 0.0, 20.0, 0.0),
+        ];
+
+        // The largest position change over 0.5 ms, around the feed-rate step.
+        let steepest = |smooth_time: f64| {
+            let state = ExtruderPressureAdvance::new(0.05, smooth_time);
+            let step = 0.000_5;
+            let mut previous = position_at(&state, &cuts, 0.46);
+            let mut steepest = 0.0_f64;
+            let mut print_time = 0.46 + step;
+            while print_time <= 0.54 {
+                let position = position_at(&state, &cuts, print_time);
+                steepest = steepest.max(((position - previous) / step).abs());
+                previous = position;
+                print_time += step;
+            }
+            steepest
+        };
+
+        let sharp = steepest(0.005);
+        let gentle = steepest(0.100);
+        assert!(
+            gentle < sharp * 0.5,
+            "a 0.1 s smooth time should be much gentler than 0.005 s: {gentle} vs {sharp}"
+        );
+    }
+
+    /// `SET_PRESSURE_ADVANCE` writes the shared parameters: the next evaluation
+    /// uses them, with no solver reinstall (`kinematics/extruder.py:67-88`).
+    #[test]
+    fn test_set_pressure_advance_takes_effect_on_the_next_evaluation() {
+        let cuts = [segment(0.0, 0.2, 0.0, 10.0, 0.0)];
+        let state = ExtruderPressureAdvance::new(0.0, 0.040);
+        let nominal = cuts[0].coord(0.1).x();
+        assert_eq!(state.position(&cuts, 0, 0.1), nominal);
+
+        state.set(0.06, 0.040);
+        assert_eq!(state.values(), (0.06, 0.040));
+        let smoothed = state.position(&cuts, 0, 0.1);
+        assert!(
+            (smoothed - (nominal + 0.06 * 10.0)).abs() < 1e-9,
+            "expected the new pa in the next evaluation, got {smoothed}"
+        );
+    }
+
+    /// The smoothed position is the documented weighted average of the
+    /// pressure-advanced position (`kin_extruder.c:18-25`), checked against a
+    /// numerical integration of that formula.
+    #[test]
+    fn test_the_smoothing_is_the_documented_weighted_average() {
+        let cuts = [
+            segment(0.0, 0.1, 0.0, 5.0, 0.0),
+            segment(0.1, 0.1, 0.5, 5.0, 10.0),
+            segment(0.2, 0.2, 1.05, 7.0, 0.0),
+        ];
+        let pressure_advance = 0.04;
+        let state = ExtruderPressureAdvance::new(pressure_advance, 0.030);
+        let hst = 0.015;
+        // `pa_position(x)`, from the segment that holds `x`.
+        let pa_position = |x: f64| {
+            let segment = cuts
+                .iter()
+                .rev()
+                .find(|segment| x >= segment.print_time)
+                .expect("a segment starts at or before the sample");
+            let move_time = x - segment.print_time;
+            let pa = if segment.axes_r.y() != 0.0 {
+                pressure_advance
+            } else {
+                0.0
+            };
+            segment.start_pos.x()
+                + segment.distance(move_time)
+                + pa * (segment.start_v + 2.0 * segment.half_accel * move_time)
+        };
+
+        // Every window below (0.015 s either side) sits inside 0..0.4 s.
+        for print_time in [0.15, 0.18, 0.25, 0.30] {
+            let samples = 20_000;
+            let width = 2.0 * hst;
+            let mut area = 0.0;
+            for sample in 0..samples {
+                let offset = width * (f64::from(sample) + 0.5) / f64::from(samples);
+                let x = print_time - hst + offset;
+                area += (hst - (print_time - x).abs()) * pa_position(x);
+            }
+            let expected = area * width / f64::from(samples) / (hst * hst);
+            let got = position_at(&state, &cuts, print_time);
+            assert!(
+                (got - expected).abs() < 1e-6,
+                "at {print_time}: expected {expected}, got {got}"
+            );
+        }
+    }
+}

@@ -1450,7 +1450,9 @@ impl PrinterObject for ToolHeadObject {
                         let trapq = toolhead.allocate_trapq();
                         stepper.set_trapq(trapq);
                         mcu_steppers.insert(stepper.name().to_string(), mcu_stepper);
-                        toolhead.add_stepper(stepper);
+                        // `add_stepper` would re-point it at the main trapq;
+                        // an extra axis keeps the queue it just got.
+                        toolhead.add_extra_axis_stepper(stepper);
                         extruder.set_trapq(trapq);
                     }
                     toolhead.add_extra_axis(Arc::clone(&extruder) as Arc<dyn ExtraAxis>);

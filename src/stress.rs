@@ -4009,6 +4009,78 @@ mod tests {
         outcome.expect("the step ramp ran to the end of the command");
     }
 
+    /// A whole `--task motion` smoke against a `test: dict=` fake: identify →
+    /// configure (through the real stepper resource) → one 5 mm move through the
+    /// host's motion path (`Trapq` → `itersolve` → `stepcompress` →
+    /// `queue_step`) → the firmware's own `stepper_get_position`.
+    ///
+    /// The read-back is the point: [`move_one_axis`] fails the board unless the
+    /// firmware reports exactly `round(5 mm / step_dist)` steps, so an empty
+    /// failure list *is* the match — 400 steps on a 40 mm/rotation ×
+    /// 16-microstep axis (0.0125 mm/step), the same assertion R5 makes against a
+    /// real board. It runs on the fake only because the fake now counts the
+    /// steps it is handed; before its step position existed it answered zero and
+    /// this path had nothing to check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_motion_smoke_runs_end_to_end_against_a_fake_board() {
+        use clap::Parser;
+
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        let text = format!(
+            "[mcu]\ntest: dict={}\n\n\
+             [stepper_x]\nstep_pin: PA0\ndir_pin: PB0\n\
+             microsteps: 16\nrotation_distance: 40\n",
+            dict.display()
+        );
+        let (config, _) = Config::from_text(&text).expect("a fake board parses");
+        let mcu_config = resolve_mcu(&config, "mcu").expect("the [mcu] section resolves");
+        let pins = build_pin_registry(&config).expect("the pin registry builds");
+        let mcu = connect(&mcu_config)
+            .await
+            .expect("the fake board identifies");
+
+        // What the firmware has to report: the smoke's own move (5 mm, the
+        // constant in `motion_smoke`) over this section's step distance.
+        let (steppers, rejected) = find_steppers(&config, "mcu", &mcu, &pins);
+        assert_eq!(
+            rejected,
+            Vec::<String>::new(),
+            "the section is a driveable one"
+        );
+        let step_dist = steppers[0]
+            .options
+            .step_dist
+            .expect("the section's rotation_distance/microsteps set step_dist");
+        assert_eq!(
+            (5.0 / step_dist).round() as i32,
+            400,
+            "5 mm over 40 mm/rotation × 16 microsteps"
+        );
+
+        let args = Cli::try_parse_from(["stress", "printer.cfg", "--task", "motion"])
+            .expect("a motion smoke parses")
+            .stress;
+        let (failures, ran) = drive_boards(
+            vec![OpenedBoard {
+                mcu_config,
+                mcu,
+                link: BoardLink::Own,
+            }],
+            &config,
+            &args,
+            &pins,
+        )
+        .await;
+        assert!(
+            failures.is_empty(),
+            "the fake firmware's position must match the move: {failures:?}"
+        );
+        assert_eq!(
+            ran, 1,
+            "the board identified, configured and drove its move"
+        );
+    }
+
     /// A whole `--task comm` ramp against a `test: dict=` fake: identify, then
     /// `get_clock` round-trips at a rising request rate. The comm task never
     /// configures the firmware, so this only needs the transport.

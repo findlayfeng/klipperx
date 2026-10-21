@@ -177,6 +177,28 @@ struct StepChain {
     end: u32,
     /// Whether a batch is armed (the firmware's `s->count > 0`).
     armed: bool,
+    /// The dir pin level the next batch steps in (the firmware's
+    /// `SF_NEXT_DIR`): high adds a batch's steps, low subtracts them
+    /// (`stepper.c:80-81`). It starts low, as `config_stepper` writes the pin
+    /// (`stepper.c:229` with `:230`'s reverse-flagged starting position), so a
+    /// stepper that is never sent `set_next_step_dir` counts backwards.
+    dir: bool,
+    /// How many steps this firmware has been handed, signed by the direction
+    /// they were queued in — the firmware's `s->position` as
+    /// `stepper_get_position` reports it (`stepper.c:319-334`). A batch adds
+    /// its `count` while [`StepChain::dir`] is high and subtracts it while
+    /// low; the firmware instead negates the accumulated position when the
+    /// direction changes (`stepper.c:81`, the top bit as a reverse flag), which
+    /// reports the same signed sum (`:329-331` flips the sign back). Nothing
+    /// here clears it: `reset_step_clock` re-anchors the clock only
+    /// (`stepper.c:304-316`), so the count runs across move boundaries and
+    /// across a session's restart list.
+    ///
+    /// Steps are counted when the batch is queued, not when they fire: the
+    /// timer-driven unstep that makes real firmware report only the steps
+    /// already taken (`stepper.c:323-328` subtracting `s->count`) has no
+    /// equivalent here, so a readback already sees a queued move's whole span.
+    position: i32,
 }
 
 /// The `static_string_id` of the shutdowns [`State::firmware_shutdown`] can
@@ -427,6 +449,19 @@ impl SimulatorDevice {
         span.max(0) as u32
     }
 
+    /// What a batch of `count` steps adds to a chain's position when queued
+    /// with [`StepChain::dir`] high (forward) or low (reverse) — the firmware's
+    /// `s->position` movement at `stepper.c:80-81`, signed the way
+    /// `stepper_get_position` reports it (`:319-334`).
+    fn signed_steps(dir: bool, count: u16) -> i32 {
+        let count = i32::from(count);
+        if dir {
+            count
+        } else {
+            -count
+        }
+    }
+
     /// Raise a firmware-style shutdown once: record why, and emit the
     /// `shutdown clock=%u static_string_id=%hu` frame the host renders as
     /// `MCU shutdown: <reason>` (the dictionary gives the id — an unnamed
@@ -541,8 +576,12 @@ impl SimulatorDevice {
                     );
                 }
                 "stepper_get_position" => {
-                    // `stepper_get_position oid=%c` — the connect-time position
-                    // read. No step model, so report zero.
+                    // `stepper_get_position oid=%c` — the firmware's own step
+                    // count for that oid (`stepper.c:319-346`), which the host
+                    // reconciles a move against (the connect-time sync and R5's
+                    // distance check). An oid no `config_stepper` named has no
+                    // chain: report zero, as this fake did before it had a step
+                    // position at all.
                     let oid = match params.first() {
                         Some(ArgValue::UInt8(v)) => *v,
                         _ => {
@@ -550,11 +589,12 @@ impl SimulatorDevice {
                             return;
                         }
                     };
+                    let position = state.steppers.get(&oid).map_or(0, |chain| chain.position);
                     Self::respond(
                         state,
                         seq,
                         "stepper_position",
-                        &[ArgValue::UInt8(oid), ArgValue::Int32(0)],
+                        &[ArgValue::UInt8(oid), ArgValue::Int32(position)],
                     );
                 }
                 "endstop_home" => {
@@ -829,6 +869,24 @@ impl SimulatorDevice {
                     Self::trigger_analog_if_armed(state, seq, new_base);
                     Self::note_move(state);
                 }
+                // The direction the *next* batch steps in
+                // (`set_next_step_dir oid=%c dir=%c`, `stepper.c:294-302`). A
+                // direction alone is no step: no trigger, and the position is
+                // moved by the batch that follows.
+                "set_next_step_dir" => {
+                    let (Some(ArgValue::UInt8(oid)), Some(ArgValue::UInt8(dir))) =
+                        (params.first(), params.get(1))
+                    else {
+                        debug!("simulator: set_next_step_dir with unexpected arguments");
+                        continue;
+                    };
+                    match state.steppers.get_mut(oid) {
+                        Some(chain) => chain.dir = *dir != 0,
+                        None => {
+                            debug!("simulator: set_next_step_dir for an oid without config_stepper")
+                        }
+                    }
+                }
                 // `queue_step` is the move itself: also a trigger point.
                 "queue_step" => {
                     let clock = state.endstop_clock;
@@ -883,6 +941,9 @@ impl SimulatorDevice {
                                 .end
                                 .wrapping_add(interval)
                                 .wrapping_add(Self::chain_span(interval, count, add));
+                            chain.position = chain
+                                .position
+                                .wrapping_add(Self::signed_steps(chain.dir, count));
                             false
                         } else {
                             // Idle: the first step fires at `base + interval`
@@ -906,6 +967,9 @@ impl SimulatorDevice {
                                 chain.end =
                                     first.wrapping_add(Self::chain_span(interval, count, add));
                                 chain.armed = true;
+                                chain.position = chain
+                                    .position
+                                    .wrapping_add(Self::signed_steps(chain.dir, count));
                                 false
                             }
                         }
@@ -931,6 +995,8 @@ impl SimulatorDevice {
                                 base: 0,
                                 end: 0,
                                 armed: false,
+                                dir: false,
+                                position: 0,
                             },
                         );
                     }
@@ -1984,6 +2050,138 @@ mod tests {
         let state = device.state.lock().unwrap_or_else(|p| p.into_inner());
         let chain = state.steppers.get(&0).expect("oid 0 is configured");
         (chain.base, chain.end, chain.armed)
+    }
+
+    /// One `queue_step` on oid 0.
+    fn queue(device: &SimulatorDevice, interval: u32, count: u16, add: i16) {
+        issue(
+            device,
+            "queue_step",
+            &[
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(interval),
+                ArgValue::UInt16(count),
+                ArgValue::Int16(add),
+            ],
+        );
+    }
+
+    /// The step position the fake reports for oid 0 (`stepper_position`), read
+    /// over the wire rather than out of the model.
+    fn position(device: &SimulatorDevice) -> i32 {
+        issue(device, "stepper_get_position", &[ArgValue::UInt8(0)]);
+        let (name, args) = queued(device).expect("a position answer");
+        assert_eq!(name, "stepper_position");
+        assert_eq!(args[0], ArgValue::UInt8(0), "the answer carries the oid");
+        match &args[1] {
+            ArgValue::Int32(pos) => *pos,
+            other => panic!("pos is an i32, not {other:?}"),
+        }
+    }
+
+    /// The fake's `stepper_get_position` counts the steps it has been handed:
+    /// each `queue_step` adds its `count`, across the batches one move is sent
+    /// as (R5 reconciles the move against this number). `dir` starts low, so the
+    /// batches here are queued forwards explicitly — a stepper never told
+    /// otherwise counts backwards (`stepper.c:229-230`).
+    #[test]
+    fn stepper_position_accumulates_queued_steps() {
+        let device = armed_device();
+        config_a_stepper(&device);
+        issue(
+            &device,
+            "set_next_step_dir",
+            &[ArgValue::UInt8(0), ArgValue::UInt8(1)],
+        );
+
+        // A fresh chain reports zero: `s->position = -POSITION_BIAS` reads as
+        // `0` through `stepper_get_position` (`stepper.c:230`, `:319-334`).
+        assert_eq!(position(&device), 0);
+
+        // The first batch: a far `interval`, so the first shot clears the
+        // fake's clock (which starts at zero, unlike a board's).
+        queue(&device, 1_000_000, 100, 0);
+        assert_eq!(position(&device), 100, "the batch's steps are counted");
+
+        // The batches a move is really sent as: hundreds of small `queue_step`s
+        // chained back to back while the previous one runs.
+        for _ in 0..3 {
+            queue(&device, 1_000, 50, 7);
+        }
+        assert_eq!(position(&device), 250, "every queued batch adds its count");
+    }
+
+    /// The count is **signed**: `set_next_step_dir` picks the direction the
+    /// next batch steps in (`stepper.c:294-302`), so a reverse batch subtracts
+    /// from what the forward ones added — the sign the host reconciles against
+    /// (`stepper.py:212-228`) and the one the firmware's reverse-flag position
+    /// reports (`stepper.c:329-331`).
+    #[test]
+    fn a_direction_change_subtracts_the_next_batch() {
+        let device = armed_device();
+        config_a_stepper(&device);
+
+        // Never told a direction: the pin is low, so the batch subtracts.
+        queue(&device, 1_000_000, 100, 0);
+        assert_eq!(position(&device), -100, "a low dir counts backwards");
+
+        // Flip the dir: the next batch adds, so the count grows through zero.
+        issue(
+            &device,
+            "set_next_step_dir",
+            &[ArgValue::UInt8(0), ArgValue::UInt8(1)],
+        );
+        queue(&device, 1_000, 300, 0);
+        assert_eq!(position(&device), 200, "forward from -100 by 300");
+
+        // And back: reverse subtracts again, from the accumulated total.
+        issue(
+            &device,
+            "set_next_step_dir",
+            &[ArgValue::UInt8(0), ArgValue::UInt8(0)],
+        );
+        queue(&device, 1_000, 50, 0);
+        assert_eq!(position(&device), 150, "reverse from 200 by 50");
+    }
+
+    /// `reset_step_clock` re-anchors the clock, not the count
+    /// (`stepper.c:304-316` touches `next_step_time`/`waketime` only): a host's
+    /// restart list sends one per session and between moves, so clearing the
+    /// position there would lose every step already taken. A fresh
+    /// `config_stepper` — `oid_alloc` over the oid — is what zeroes it
+    /// (`stepper.c:230`).
+    #[test]
+    fn reset_step_clock_does_not_clear_the_position() {
+        let device = armed_device();
+        config_a_stepper(&device);
+        issue(
+            &device,
+            "set_next_step_dir",
+            &[ArgValue::UInt8(0), ArgValue::UInt8(1)],
+        );
+        queue(&device, 1_000_000, 1, 0);
+        queue(&device, 1_000, 99, 0);
+        assert_eq!(position(&device), 100);
+
+        // The re-anchor has to arrive on an idle chain: a running one is the
+        // firmware's `Can't reset time when stepper active` (`stepper.c:
+        // 310-311`), so let the batches run out first.
+        advance_ticks(&device, 1_200_000);
+        issue(
+            &device,
+            "reset_step_clock",
+            &[ArgValue::UInt8(0), ArgValue::UInt32(0)],
+        );
+        assert_eq!(
+            shutdown_reason(&device),
+            None,
+            "the chain is idle, so the re-anchor is accepted"
+        );
+        assert_eq!(position(&device), 100, "the steps survive the re-anchor");
+
+        // What does zero the count: a fresh configuration over the oid.
+        config_a_stepper(&device);
+        assert_eq!(position(&device), 0, "a reconfigured stepper starts at 0");
     }
 
     /// `chain_span` is the span from a batch's first step to its last: the

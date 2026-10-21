@@ -31,7 +31,7 @@
 //!
 //! It is a crate of its own, depending on [`klippy_api`] and nothing else of
 //! this project, so that this binary does not compile or link the host: no
-//! `reqwest`, no `flate2`, no `libloading`. What a client shares with the host is
+//! HTTP client, no `flate2`, no `libloading`. What a client shares with the host is
 //! the API, which is exactly what that crate is.
 
 pub mod connection;

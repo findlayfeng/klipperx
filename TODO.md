@@ -334,7 +334,11 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       与上游三次 `draw_text` 写同一批单元格等价），行号/选中标记（`>`、编辑态 `*`）/容器后缀 `>`/滚动指示
       都照 `menu.py:601-660`；空行照样写满。`display.rs` 的刷新拆出 `draw_screen(chip, eventtime)`，
       面板作为参数一路传到菜单钩子与 `show_group`。两处钉子按帧字节断言（含 `down` 后光标移动）。
-- [ ] `[display_data]`/`[display_glyph]` 无主配置 factory：出货 `display.cfg` 是唯一 layout 来源。
+- [x] **`[display_data]`/`[display_glyph]` 的主配置 factory —— 已落地（2026-10-21）**：两个 `section!(…)`
+      只「认领 + 解析」，组与图标的装配仍在 `[display]` 侧（`load_display_groups`/`load_display_glyphs`），
+      同名 section 仍按 `display.py:126-128` 覆盖出货项（组大小不变、`identifier` 指向主配置那条）。
+      **口径更正**：主配置写这两个节此前其实**已经能用**（`check_unused` 接受「选项被读过」的 section），
+      真缺口是 **schema 成员资格**（未知 section 检查与 `load` 的 factory 表）；本条按后者的语义结项。
 - [ ] 个别驱动的 `set_glyphs`：`uc1701`、`hd44780_spi`、`aip31068_spi` 自述未移植字形写入。
 - 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
 

@@ -551,6 +551,32 @@ fn compact_rate(rate: f64) -> String {
     }
 }
 
+/// What the firmware's answer after a stage means for the ramp.
+///
+/// The three are deliberately not one exit: a firmware that shut down **is** the
+/// measurement (the step rate the MCU could not hold), while a firmware that did
+/// not answer at all says nothing about its step engine — the link gave out and
+/// the run has no step-rate answer to report. Folding the two together reads a
+/// dropped cable as "the limit", and leaves the command exiting 0 on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StageVerdict {
+    /// It answered and is still running: the stage survived.
+    Survived,
+    /// It answered from its shutdown state: this rate is the limit.
+    ShutDown,
+    /// It did not answer: the link, not the step engine, gave out.
+    LinkLost(String),
+}
+
+/// Read one stage's `get_config` answer as one of [`StageVerdict`].
+fn stage_verdict(answer: Result<ConfigState, McuError>) -> StageVerdict {
+    match answer {
+        Ok(state) if state.is_shutdown => StageVerdict::ShutDown,
+        Ok(_) => StageVerdict::Survived,
+        Err(err) => StageVerdict::LinkLost(err.to_string()),
+    }
+}
+
 /// Ramp the step rate until the MCU's step timer gives out.
 ///
 /// The board drives **every** stepper section it owns: each gets its own oid
@@ -712,11 +738,11 @@ async fn step_stress(
         // Let the stage run out, waking early if the firmware stops.
         sleep_until(wait, &shutdown_reason).await;
 
-        match mcu
-            .call_msg::<_, ConfigState>(&GetConfig, CALL_TIMEOUT)
-            .await
-        {
-            Ok(state) if state.is_shutdown => {
+        match stage_verdict(
+            mcu.call_msg::<_, ConfigState>(&GetConfig, CALL_TIMEOUT)
+                .await,
+        ) {
+            StageVerdict::ShutDown => {
                 println!(
                     "{}",
                     tagged(
@@ -733,25 +759,31 @@ async fn step_stress(
                 );
                 return Ok(BoardOutcome::Ran);
             }
-            Ok(_) => {
+            StageVerdict::Survived => {
                 last_good = Some(actual_rate);
             }
-            Err(err) => {
+            StageVerdict::LinkLost(err) => {
+                // Not the limit: the board is unreachable, so no step rate was
+                // measured. Reported as the board's failure, which fails the
+                // command (exit code 1) — the last rate that survived is still
+                // printed for the log.
                 println!(
                     "{}",
                     tagged(
                         &mcu_config.name,
                         format!(
-                            "  no answer at {actual_rate:.0} steps/s ({err}); treating it as the limit"
+                            "  link gave out at {actual_rate:.0} steps/s ({err}): no answer from the board, so this is not a step-rate limit"
                         )
                     )
                 );
-                // Every way the ramp ends leaves one summary line behind.
                 println!(
                     "{}",
                     step_summary_line(&mcu_config.name, oids.len(), last_good)
                 );
-                return Ok(BoardOutcome::Ran);
+                return Err(format!(
+                    "the link gave out at {actual_rate:.0} steps/s ({err}); no step-rate limit was measured"
+                )
+                .into());
             }
         }
 
@@ -3132,6 +3164,51 @@ mod tests {
         assert_eq!(limit.stop_line(0, &small, 1_000.0), None);
         assert_eq!(limit.stop_line(11_500, &small, 1_000.0), None);
         assert!(limit.stop_line(11_501, &small, 1_000.0).is_some());
+    }
+
+    /// A shutdown and a silent link are two different answers: the first **is**
+    /// the measurement (the rate the MCU could not hold), the second says nothing
+    /// about the step engine at all. Only the silence is a failure — so only it
+    /// turns into a non-zero exit code through [`final_error`].
+    #[test]
+    fn a_shutdown_and_a_silent_link_leave_by_different_exits() {
+        use crate::core::klippy::mcu::McuCallError;
+
+        let shutdown = ConfigState {
+            is_config: true,
+            crc: 7,
+            is_shutdown: true,
+            move_count: 64,
+        };
+        let running = ConfigState {
+            is_shutdown: false,
+            ..shutdown
+        };
+
+        assert_eq!(stage_verdict(Ok(running)), StageVerdict::Survived);
+        assert_eq!(
+            stage_verdict(Ok(shutdown)),
+            StageVerdict::ShutDown,
+            "a shutdown is the limit the ramp was looking for"
+        );
+        let silent = Err(McuError::Call(McuCallError::Timeout(
+            "get_config".to_string(),
+        )));
+        assert!(
+            matches!(stage_verdict(silent), StageVerdict::LinkLost(_)),
+            "a board that stopped answering is a lost link, not a measured limit"
+        );
+
+        // The exit code follows the distinction: reaching the limit is a
+        // success, losing the link is not.
+        assert_eq!(final_error(&[], 1, 1, Task::Step), None);
+        let lost = "mcu: the link gave out at 125000 steps/s (timeout: get_config); \
+                    no step-rate limit was measured"
+            .to_string();
+        assert!(
+            final_error(&[lost], 1, 1, Task::Step).is_some(),
+            "a lost link must fail the command"
+        );
     }
 
     /// A pin registry with a chip for every named board, the way a run builds

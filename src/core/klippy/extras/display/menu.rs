@@ -1363,7 +1363,7 @@ impl MenuManager {
                         manager.key_event(&event, eventtime);
                     }
                 }),
-            );
+            )?;
         }
         if let Some(pin) = &keys.kill_pin {
             let printer = Arc::downgrade(&self.printer);
@@ -1376,7 +1376,7 @@ impl MenuManager {
                         }
                     }
                 }),
-            );
+            )?;
         }
         Ok(())
     }

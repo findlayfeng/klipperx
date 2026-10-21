@@ -78,7 +78,7 @@ use crate::core::klippy::mcu::{pin_number, query_slot, ConfigBuilder, Mcu, McuCh
 use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::Reactor;
-use tracing::{error, warn};
+use tracing::warn;
 
 /// The name the sensors look the registry up by (`load_object(config,
 /// 'buttons')`).
@@ -946,10 +946,13 @@ mod tests {
     #[test]
     fn test_register_buttons_records_the_group() {
         let world = world();
-        world.buttons.register_buttons(
-            vec!["PA0".to_string(), "PA1".to_string()],
-            Box::new(|_, _| {}),
-        );
+        world
+            .buttons
+            .register_buttons(
+                vec!["PA0".to_string(), "PA1".to_string()],
+                Box::new(|_, _| {}),
+            )
+            .expect("the pins register");
         assert_eq!(world.buttons.registration_count(), 1);
         assert_eq!(
             world.buttons.registered_pins(),
@@ -975,9 +978,19 @@ mod tests {
         pins.register_chip("toolboard", Arc::new(other))
             .expect("a second chip name");
 
-        world.buttons.register_buttons(
+        // Upstream raises this from `register_buttons` itself
+        // (`buttons.py:309-336`), so the config fails to load instead of
+        // coming up with a button that will never report.
+        let refused = world.buttons.register_buttons(
             vec!["PA0".to_string(), "toolboard:PA1".to_string()],
             Box::new(|_, _| {}),
+        );
+        let refused = refused.expect_err("a cross-mcu group is refused");
+        assert!(
+            refused
+                .message()
+                .contains("button pins must be on same mcu"),
+            "{refused:?}"
         );
         assert_eq!(world.buttons.registration_count(), 0);
     }
@@ -990,7 +1003,8 @@ mod tests {
         for index in 0..9 {
             world
                 .buttons
-                .register_buttons(vec![format!("PA{index}")], Box::new(|_, _| {}));
+                .register_buttons(vec![format!("PA{index}")], Box::new(|_, _| {}))
+                .expect("the pins register");
         }
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));
@@ -1016,10 +1030,13 @@ mod tests {
     #[tokio::test]
     async fn test_the_config_and_init_lists_carry_the_button_bytes() {
         let world = world();
-        world.buttons.register_buttons(
-            vec!["PA1".to_string(), "~PA2".to_string()],
-            Box::new(|_, _| {}),
-        );
+        world
+            .buttons
+            .register_buttons(
+                vec!["PA1".to_string(), "~PA2".to_string()],
+                Box::new(|_, _| {}),
+            )
+            .expect("the pins register");
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));
         let built = world.chip.config().build(&mcu).unwrap();
@@ -1073,12 +1090,15 @@ mod tests {
         let calls: Arc<Mutex<Vec<(f64, bool)>>> = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&calls);
         // `!PA1`: active low, so the report byte 0 means "pressed".
-        world.buttons.register_buttons(
-            vec!["!PA1".to_string()],
-            Box::new(move |eventtime, state| {
-                record.lock().unwrap().push((eventtime, state));
-            }),
-        );
+        world
+            .buttons
+            .register_buttons(
+                vec!["!PA1".to_string()],
+                Box::new(move |eventtime, state| {
+                    record.lock().unwrap().push((eventtime, state));
+                }),
+            )
+            .expect("the pins register");
 
         let wire = RecordingWire::new();
         let sent = wire.sent();
@@ -1205,7 +1225,8 @@ mod tests {
         let world = world();
         world
             .buttons
-            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}));
+            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}))
+            .expect("the pins register");
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));
         let group = the_group(&world.buttons);
@@ -1249,7 +1270,8 @@ mod tests {
         let world = world();
         world
             .buttons
-            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}));
+            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}))
+            .expect("the pins register");
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));
         let group = the_group(&world.buttons);
@@ -1277,7 +1299,8 @@ mod tests {
         let world = world();
         world
             .buttons
-            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}));
+            .register_buttons(vec!["PA1".to_string()], Box::new(|_, _| {}))
+            .expect("the pins register");
         let mcu = mcu(RecordingWire::new());
         let _session = SessionGuard(Arc::clone(&mcu));
         let group = the_group(&world.buttons);
@@ -1340,10 +1363,13 @@ mod tests {
     #[tokio::test]
     async fn test_the_query_arms_the_firmware_debounce() {
         let world = world();
-        world.buttons.register_buttons(
-            vec!["!PA1".to_string(), "PA2".to_string()],
-            Box::new(|_, _| {}),
-        );
+        world
+            .buttons
+            .register_buttons(
+                vec!["!PA1".to_string(), "PA2".to_string()],
+                Box::new(|_, _| {}),
+            )
+            .expect("the pins register");
         let wire = RecordingWire::new();
         let sent = wire.sent();
         let mcu = mcu(wire);

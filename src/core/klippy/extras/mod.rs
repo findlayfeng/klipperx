@@ -46,6 +46,7 @@ pub mod gcode_button;
 pub mod gcode_macro;
 pub mod gcode_move;
 pub mod gcode_request_queue;
+pub mod hall_filament_width_sensor;
 pub mod heater_bed;
 pub mod heater_fan;
 pub mod heater_generic;

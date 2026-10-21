@@ -3159,91 +3159,93 @@ mod tests {
     #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     fn test_m105_reports_each_registered_sensor_on_a_real_board() {
-        let Some(hardware) = crate::hardware_test::acquire(
+        crate::hardware_test::case(
             "test_m105_reports_each_registered_sensor_on_a_real_board",
             &temperature_case(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        // `hardware` holds the board lock and must outlive `started`, whose
-        // `Drop` tears the machine down — so declare it first and keep both to
-        // the end of the test. Every part handle taken from `started`
-        // (`heaters`, `gcode`) is declared *after* it, so the ordinary
-        // reverse-declaration drop order releases them before the machine goes:
-        // the dispatcher's command table and the heaters table keep their parts
-        // (and those parts their `Mcu`) alive, and a machine that still holds
-        // its `Mcu` cannot meet `StartedMachine::drop`'s shutdown bound.
-        let config = hardware.config();
-        let started = hardware.bring_up().expect("the board comes up");
-        let printer = started.printer();
+            |machine| {
+                // `machine` holds the board lock and must outlive `started`, whose
+                // `Drop` tears the machine down — so take `started` after it and keep
+                // both to the end of the case. Every part handle taken from `started`
+                // (`heaters`, `gcode`) is declared *after* it, so the ordinary
+                // reverse-declaration drop order releases them before the machine goes:
+                // the dispatcher's command table and the heaters table keep their parts
+                // (and those parts their `Mcu`) alive, and a machine that still holds
+                // its `Mcu` cannot meet `StartedMachine::drop`'s shutdown bound.
+                let config = machine.config();
+                let started = machine.bring_up().expect("the board comes up");
+                let printer = started.printer();
 
-        let heaters = printer
-            .lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT)
-            .expect("the loader registers `heaters` before any sensor section");
-        let available = registered_sensor_sections(&heaters, printer.eventtime());
-        assert!(
+                let heaters = printer
+                    .lookup_object_as::<PrinterHeaters>(HEATERS_OBJECT)
+                    .expect("the loader registers `heaters` before any sensor section");
+                let available = registered_sensor_sections(&heaters, printer.eventtime());
+                assert!(
             !available.is_empty(),
             "the config registers no temperature sensor at all: `temperature_case()` requires \
              [extruder] sensor_pin, so `acquire` should have skipped this case before bring-up"
         );
 
-        let readings = wait_for_readings(printer, config, &available);
-        for reading in &readings {
-            println!(
-                "HW-TEMP: {} = {} {}",
-                reading.name,
-                reading.temperature,
-                reading.bounds()
-            );
-        }
+                let readings = wait_for_readings(printer, config, &available);
+                for reading in &readings {
+                    println!(
+                        "HW-TEMP: {} = {} {}",
+                        reading.name,
+                        reading.temperature,
+                        reading.bounds()
+                    );
+                }
 
-        let extruder = readings
-            .iter()
-            .find(|reading| reading.name == "extruder")
-            .expect("[extruder] is registered by the section `temperature_case()` requires");
-        let (min, max) = (
-            extruder.min.expect("[extruder] declares min_temp"),
-            extruder.max.expect("[extruder] declares max_temp"),
-        );
+                let extruder = readings
+                    .iter()
+                    .find(|reading| reading.name == "extruder")
+                    .expect(
+                        "[extruder] is registered by the section `temperature_case()` requires",
+                    );
+                let (min, max) = (
+                    extruder.min.expect("[extruder] declares min_temp"),
+                    extruder.max.expect("[extruder] declares max_temp"),
+                );
 
-        let gcode = printer
-            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .expect("the loader registers `gcode`");
-        let lines = captured_lines(&gcode);
-        for round in 1..=M105_ROUNDS {
-            gcode
-                .run_script_sync("M105")
-                .expect("M105 runs on a live machine");
-            // Whatever else the machine may print, the newest line that is
-            // either M105's fallback or a run of `id:current /target` entries is
-            // this round's answer.
-            let line = emitted(&lines)
-                .into_iter()
-                .rev()
-                .find(|line| line.trim() == "T:0" || !m105_entries(line).is_empty())
-                .expect("M105 answered one line");
-            assert_ne!(
+                let gcode = printer
+                    .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                    .expect("the loader registers `gcode`");
+                let lines = captured_lines(&gcode);
+                for round in 1..=M105_ROUNDS {
+                    gcode
+                        .run_script_sync("M105")
+                        .expect("M105 runs on a live machine");
+                    // Whatever else the machine may print, the newest line that is
+                    // either M105's fallback or a run of `id:current /target` entries is
+                    // this round's answer.
+                    let line = emitted(&lines)
+                        .into_iter()
+                        .rev()
+                        .find(|line| line.trim() == "T:0" || !m105_entries(line).is_empty())
+                        .expect("M105 answered one line");
+                    assert_ne!(
                 line.trim(),
                 "T:0",
                 "M105 round {round}: the line fell back to `T:0` with {available:?} registered — \
                  `has_started` is false (the machine never fired klippy:ready; state: {})",
                 printer.get_state_message().message
             );
-            let (_, current, target) = m105_entries(&line)
-                .into_iter()
-                .find(|(id, _, _)| id == "T0")
-                .unwrap_or_else(|| {
-                    panic!(
+                    let (_, current, target) = m105_entries(&line)
+                        .into_iter()
+                        .find(|(id, _, _)| id == "T0")
+                        .unwrap_or_else(|| {
+                            panic!(
                         "M105 round {round}: no `T0` entry for the required [extruder]: `{line}`"
                     )
-                });
-            assert!(
+                        });
+                    assert!(
                 current.is_finite() && current != 0.0 && current >= min && current <= max,
                 "M105 round {round}: T0 = {current} is not a live reading inside [extruder]'s \
                  declared range {min}..{max} (target {target})"
             );
-            println!("HW-TEMP: M105 round {round}: {line}");
-        }
+                    println!("HW-TEMP: M105 round {round}: {line}");
+                }
+            },
+        );
     }
 
     /// The declaration the real-board case runs under is the one the config is

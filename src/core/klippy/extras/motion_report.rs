@@ -1078,4 +1078,227 @@ mod tests {
             .unwrap();
         assert_eq!(reply, json!({"header": ["interval", "count", "add"]}));
     }
+
+    #[test]
+    fn test_get_status_reports_the_five_keys_with_the_extruder_in_the_fourth_slot() {
+        // One extra axis: the position is `x, y, z, e`, the extruder last.
+        let steppers = vec!["stepper_x".to_string()];
+        let trapqs = vec!["extruder".to_string(), "toolhead".to_string()];
+
+        let status = live_status(&[10.0, 20.0, 30.0, 4.5], 25.0, 1.5, &steppers, &trapqs);
+
+        assert_eq!(
+            status["live_position"],
+            json!([10.0, 20.0, 30.0, 4.5]),
+            "three kinematics axes and one slot per extra axis"
+        );
+        assert_eq!(status["live_position"].as_array().unwrap().len(), 4);
+        assert_eq!(status["live_velocity"], json!(25.0));
+        assert_eq!(status["live_extruder_velocity"], json!(1.5));
+        assert_eq!(status["steppers"], json!(["stepper_x"]));
+        assert_eq!(status["trapq"], json!(["extruder", "toolhead"]));
+        for key in ["live_velocity", "live_extruder_velocity"] {
+            assert!(status[key].is_f64(), "{key} is a float");
+        }
+    }
+
+    #[test]
+    fn test_the_live_position_is_read_from_the_queue_at_the_given_time() {
+        // 2 mm/s accelerating at 1000 mm/s^2 along +X from (10, 20, 30).
+        let moves = [segment(
+            1.0,
+            0.5,
+            2.0,
+            1000.0,
+            [10., 20., 30.],
+            [1., 0., 0.],
+        )];
+
+        // 0.2 s in: distance = (2 + 500 * 0.2) * 0.2 = 20.4 mm.
+        let position = trapq_position(&moves, 1.2).expect("a position");
+        assert!((position.pos[0] - 30.4).abs() < 1e-9, "{position:?}");
+        assert!((position.pos[1] - 20.0).abs() < 1e-9);
+        assert!((position.pos[2] - 30.0).abs() < 1e-9);
+        assert!(
+            (position.velocity - 202.0).abs() < 1e-9,
+            "start_v + accel * t = 2 + 1000 * 0.2"
+        );
+
+        // Before the segment starts the queue holds its start; past its end it
+        // holds the end (upstream clamps the same way).
+        let before = trapq_position(&moves, 0.5).expect("the segment start");
+        assert_eq!(before.pos, [10.0, 20.0, 30.0]);
+        assert_eq!(before.velocity, 2.0);
+        let after = trapq_position(&moves, 5.0).expect("the segment end");
+        // The whole 0.5 s: (2 + 500 * 0.5) * 0.5 = 126 mm.
+        assert!((after.pos[0] - 136.0).abs() < 1e-9, "{after:?}");
+
+        assert_eq!(
+            trapq_position(&[], 1.0),
+            None,
+            "an empty queue has no position"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_stepper_window_oldest_first() {
+        let steps = vec![
+            HistoryStep {
+                first_clock: 100,
+                last_clock: 160,
+                start_position: 0,
+                step_count: 3,
+                interval: 20,
+                add: 1,
+            },
+            HistoryStep {
+                first_clock: 160,
+                last_clock: 210,
+                start_position: 3,
+                step_count: 2,
+                interval: 25,
+                add: 0,
+            },
+        ];
+
+        let block = stepper_dump_block("stepper_x", "mcu", &steps).expect("one block");
+
+        assert_eq!(
+            block,
+            "Dumping stepper 'stepper_x' (mcu) 2 queue_step:\n\
+             queue_step 0: t=100 p=0 i=20 c=3 a=1\n\
+             queue_step 1: t=160 p=3 i=25 c=2 a=0",
+            "upstream's `DumpStepper.log_steps` lines"
+        );
+        assert_eq!(
+            stepper_dump_block("stepper_x", "mcu", &[]),
+            None,
+            "an empty window logs nothing"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_trapq_window_oldest_first() {
+        let moves = [
+            segment(1.0, 0.5, 2.0, 1000.0, [10., 20., 30.], [0., 0., 1.]),
+            segment(1.5, 0.25, 4.0, 0.0, [10., 20., 30.5], [0., 0., 1.]),
+        ];
+
+        let block = trapq_dump_block("toolhead", &moves).expect("one block");
+
+        assert_eq!(
+            block,
+            "Dumping trapq 'toolhead' 2 moves:\n\
+             move 0: pt=1.000000 mt=0.500000 sv=2.000000 a=1000.000000 \
+             sp=(10.000000,20.000000,30.000000) ar=(0.000000,0.000000,1.000000)\n\
+             move 1: pt=1.500000 mt=0.250000 sv=4.000000 a=0.000000 \
+             sp=(10.000000,20.000000,30.500000) ar=(0.000000,0.000000,1.000000)",
+            "upstream's `DumpTrapQ.log_trapq` lines, acceleration published whole"
+        );
+        assert_eq!(trapq_dump_block("toolhead", &[]), None);
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_requested_position() {
+        assert_eq!(
+            shutdown_position_block(12.5, [1.5, -2.0, 3.25]),
+            "Requested toolhead position at shutdown time 12.500000: (1.5, -2.0, 3.25)",
+            "upstream's `%.6f` time and the tuple of the requested position"
+        );
+    }
+
+    #[test]
+    fn test_a_shutdown_without_an_mcu_clock_dumps_nothing() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+
+        // upstream's early returns: another message, no MCU named, no clock,
+        // or an MCU this host does not have.
+        assert_eq!(
+            motion_report.shutdown_report("Internal error in stepcompress", &HashMap::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            motion_report.shutdown_report("MCU shutdown", &HashMap::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            motion_report.shutdown_report(
+                "MCU shutdown",
+                &HashMap::from([("mcu".to_string(), json!("mcu"))])
+            ),
+            Vec::<String>::new(),
+            "no shutdown_clock: the window cannot be dated"
+        );
+        assert_eq!(
+            motion_report.shutdown_report(
+                "MCU shutdown",
+                &HashMap::from([
+                    ("mcu".to_string(), json!("mcu")),
+                    ("shutdown_clock".to_string(), json!(1234)),
+                ])
+            ),
+            Vec::<String>::new(),
+            "no such MCU on this machine"
+        );
+    }
+
+    #[test]
+    fn test_motion_report_is_queryable() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+        motion_report.register_extruder_trapq("extruder").unwrap();
+        motion_report.register_stepper("stepper_y").unwrap();
+        motion_report.register_stepper("stepper_x").unwrap();
+
+        assert!(
+            printer
+                .queryable_objects()
+                .contains(&"motion_report".to_string()),
+            "`objects/list` reports it"
+        );
+        let status = printer
+            .statuses(0.0)
+            .remove("motion_report")
+            .expect("`objects/query` answers for it");
+
+        // Nothing is connected: no planner, no dated clock, so every number is
+        // zero and the position has only the three kinematics axes.
+        assert_eq!(status["live_position"], json!([0.0, 0.0, 0.0]));
+        assert_eq!(status["live_velocity"], json!(0.0));
+        assert_eq!(status["live_extruder_velocity"], json!(0.0));
+        assert_eq!(
+            status["steppers"],
+            json!(["stepper_x", "stepper_y"]),
+            "the registered steppers, sorted as upstream sorts them"
+        );
+        assert_eq!(status["trapq"], json!(["extruder", "toolhead"]));
+    }
+
+    #[test]
+    fn test_the_status_answer_stands_until_the_refresh_time() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+
+        let first = motion_report.get_status(0.0);
+        assert_eq!(first["steppers"], json!([]));
+
+        // Registered inside the 0.250 s window: the cached answer stands.
+        motion_report.register_stepper("stepper_x").unwrap();
+        let cached = motion_report.get_status(0.1);
+        assert_eq!(cached["steppers"], json!([]), "the answer is reused");
+
+        let refreshed = motion_report.get_status(0.3);
+        assert_eq!(
+            refreshed["steppers"],
+            json!(["stepper_x"]),
+            "past the refresh time the status is read again"
+        );
+    }
 }

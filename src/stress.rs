@@ -2862,35 +2862,83 @@ fn bind_shutdown(mcu: &Mcu, slot: &Arc<Mutex<Option<String>>>) -> Result<(), std
     Ok(())
 }
 
+/// How often [`wait_for_idle`] reads the stepper's position.
+const IDLE_POLL: Duration = Duration::from_millis(5);
+
+/// How long the reported position has to stay unchanged before the stepper
+/// counts as idle.
+///
+/// Two readings that happen to be equal are not enough: the position also stands
+/// still **before** a queued stage starts stepping, so a stage still loaded can
+/// read as idle. The position has to hold for a window longer than the poll
+/// interval (four polls) before the move is taken as finished.
+const IDLE_SETTLE: Duration = Duration::from_millis(20);
+
+/// How long [`wait_for_idle`] waits for that before it gives up.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll `position` until two answers `settle` apart are equal, giving up after
+/// `timeout`.
+///
+/// The same shape as `test_util::wait_until` (poll to a deadline, then fail
+/// loudly) for a value instead of a predicate: a stepper that never stays put is
+/// a stepper that cannot keep up, and a silent "it is idle" there would send the
+/// next `reset_step_clock` into a still-loaded move — the firmware's
+/// `Can't reset time when stepper active` shutdown, which would then be read as
+/// a step-rate limit.
+async fn wait_until_still<F, Fut>(
+    settle: Duration,
+    poll: Duration,
+    timeout: Duration,
+    mut position: F,
+) -> Result<i32, std::io::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<i32, std::io::Error>>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut last: Option<i32> = None;
+    let mut still_since = Instant::now();
+    loop {
+        let current = position().await?;
+        let now = Instant::now();
+        match last {
+            Some(previous) if previous == current => {
+                if now.duration_since(still_since) >= settle {
+                    return Ok(current);
+                }
+            }
+            _ => {
+                last = Some(current);
+                still_since = now;
+            }
+        }
+        if now >= deadline {
+            return Err(std::io::Error::other(format!(
+                "the stepper's position {} did not hold still for {settle:?} within {timeout:?}; it cannot keep up",
+                last.unwrap_or(current)
+            )));
+        }
+        tokio::time::sleep(poll).await;
+    }
+}
+
 /// Wait until the stepper stops moving.
 ///
 /// `reset_step_clock` shuts the firmware down if a move is still loaded
 /// (`Can't reset time when stepper active`, `src/stepper.c:311`), so the stage
 /// before it must be completely done. The reported position moves while a move is
-/// loaded and stops when none is, so two equal readings in a row mean idle.
+/// loaded and stops when none is, so idle is "the position has not changed for
+/// [`IDLE_SETTLE`]" — polled every [`IDLE_POLL`], given up on after
+/// [`IDLE_TIMEOUT`] with an error rather than silently taken as idle.
 async fn wait_for_idle(mcu: &Arc<Mcu>, oid: u8) -> Result<i32, std::io::Error> {
-    const POLL: Duration = Duration::from_millis(5);
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
-    let deadline = Instant::now() + TIMEOUT;
-    let mut last: Option<i32> = None;
-    loop {
-        let position = mcu
-            .call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
+    wait_until_still(IDLE_SETTLE, IDLE_POLL, IDLE_TIMEOUT, || async {
+        mcu.call_msg::<_, StepperPosition>(&StepperGetPosition { oid }, CALL_TIMEOUT)
             .await
-            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))?
-            .pos;
-        if last == Some(position) {
-            return Ok(position);
-        }
-        last = Some(position);
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::other(
-                "the stepper never went idle after a stage; it cannot keep up",
-            ));
-        }
-        tokio::time::sleep(POLL).await;
-    }
+            .map(|answer| answer.pos)
+            .map_err(|err| std::io::Error::other(format!("stepper_get_position: {err}")))
+    })
+    .await
 }
 
 /// Sleep for `wait`, waking early if the firmware reports a shutdown.
@@ -3097,6 +3145,54 @@ mod tests {
                 position_max,
             },
         }
+    }
+
+    /// A stepper is idle once its position has held still for the settle
+    /// window — not as soon as two readings match: the position also stands
+    /// still before a queued stage starts stepping, and treating that as idle is
+    /// what made `reset_step_clock` shut the firmware down.
+    #[tokio::test]
+    async fn the_stepper_is_idle_only_once_its_position_holds_still() {
+        // Three equal readings inside the window, then a move: the early match
+        // must not count as idle, and the answer is the settled position.
+        let mut reads = 0u32;
+        let position = wait_until_still(
+            Duration::from_millis(20),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+            || {
+                reads += 1;
+                let value = if reads <= 3 { 0 } else { 500 };
+                async move { Ok(value) }
+            },
+        )
+        .await
+        .expect("the position settles after the move");
+        assert_eq!(
+            position, 500,
+            "the stage that started is never read as idle"
+        );
+        assert!(reads > 3, "the equal readings at the start were not enough");
+
+        // A position that never holds still is an error, not a silent "idle".
+        let mut moving = 0i32;
+        let err = wait_until_still(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            Duration::from_millis(60),
+            || {
+                moving += 1;
+                let value = moving;
+                async move { Ok(value) }
+            },
+        )
+        .await
+        .expect_err("a stepper that never stops cannot be reported as idle");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not hold still for") && message.contains("cannot keep up"),
+            "{message}"
+        );
     }
 
     /// The bound is the tightest section's share of its **own** stroke, in the

@@ -263,8 +263,10 @@
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
@@ -290,6 +292,45 @@ pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
 /// spirit as the corpus' case bound: without it a machine that never answers
 /// parks the test instead of failing it.
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one hardware case may take in total, from the board lock to its
+/// last assertion.
+///
+/// Deliberately wide, and the numbers are why. A board's identify handshake is
+/// about a second; a `G28` on a big printer is tens of seconds of real motion;
+/// and a temperature wait is minutes — a 40 W hotend climbing from room
+/// temperature to 200 °C takes several minutes, and a heated bed can take ten.
+/// The budget has to clear the slowest legitimate case by a lot, because a
+/// false timeout fails a case that would have passed on a slow board, while a
+/// budget that is too wide only costs time on a case that is already hung. Five
+/// minutes is far above what the cases here do (the longest is a homing case at
+/// tens of seconds) and still short enough that a hung case ends a run rather
+/// than parking it.
+const CASE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often a case waiting for the board looks again.
+const LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// How long a case waits for the board lock before it reports the board busy.
+///
+/// Longer than [`CASE_TIMEOUT`] on purpose: the lock is held for one whole
+/// case, so a wait shorter than a case would report "busy" for a predecessor
+/// that is merely slow — the false failure this bound is not allowed to make.
+/// Twice a case is the point where the predecessor is not slow but stuck, and
+/// the wait then says so instead of blocking forever.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The phase a case is in before [`acquire`] hands out the machine.
+const PHASE_ACQUIRING: &str = "acquiring the machine (the config and the board lock)";
+
+/// The phase a case is in while its own body runs.
+const PHASE_BODY: &str = "the case body";
+
+/// The phase [`Machine::bring_up`] is in.
+const PHASE_BRING_UP: &str = "bring_up (connecting every part of the config)";
+
+/// The phase [`Machine::open_mcu_named`] is in.
+const PHASE_OPEN: &str = "opening the transport of one [mcu] section";
 
 /// How long a [`StartedMachine`] gives its runtime to shut down, once the
 /// machine's parts are dropped.
@@ -568,12 +609,51 @@ fn bring_up_failure(reason: String, runtime: Runtime, timeout: Duration) -> Stri
     }
 }
 
+/// Where a case has got to, as the case timeout names it.
+///
+/// The phase is shared with the runner, which is what makes a timeout report
+/// "stuck at bring_up" instead of only "stuck": the case body runs on its own
+/// thread, so the thread watching the budget cannot ask it anything — the
+/// framework's own seams stamp the phase as the case passes through them.
+struct CaseProgress {
+    /// The phase's name and the instant it was entered.
+    current: Mutex<(&'static str, Instant)>,
+}
+
+impl CaseProgress {
+    /// Start the record in `phase`.
+    fn new(phase: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new((phase, Instant::now())),
+        })
+    }
+
+    /// Record that the case has reached `phase`.
+    fn enter(&self, phase: &'static str) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = (phase, Instant::now());
+    }
+
+    /// The phase the case is in, and how long it has been in it.
+    fn current(&self) -> (&'static str, Duration) {
+        let guarded = self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (guarded.0, guarded.1.elapsed())
+    }
+}
+
 /// A config that satisfies a test's [`Requires`], with the board locked.
 pub struct Machine {
     /// The parsed printer config.
     config: Config,
     /// The config file the parser read, as the host's start arguments name it.
     path: PathBuf,
+    /// Where this case has got to, for the case timeout's report.
+    progress: Arc<CaseProgress>,
     /// The exclusive lock on the board, held until this machine is dropped.
     _board: BoardLock,
 }
@@ -623,6 +703,7 @@ impl Machine {
     /// [`StartedMachine`]'s `Drop` uses; a runtime that does not close inside it
     /// is a leaked part, and the `Err` says so after the original reason.
     pub fn bring_up(&self) -> Result<StartedMachine, String> {
+        self.progress.enter(PHASE_BRING_UP);
         // First, before any device or config work: a bring-up from inside a
         // runtime cannot work, and a plain `Err` beats tokio's panic (see the
         // module doc's rule for second-layer cases).
@@ -711,6 +792,7 @@ impl Machine {
     /// environment. The message is the parser's or the transport's own, except
     /// that a name with no section says which section is missing.
     pub fn open_mcu_named(&self, name: &str) -> Result<Interface, String> {
+        self.progress.enter(PHASE_OPEN);
         let section_id = mcu_section_id(name);
         let section = self
             .config
@@ -835,9 +917,21 @@ impl Drop for BoardLock {
 
 /// Take the board lock for the config at `config`, announcing a wait once.
 ///
-/// `test_name` is only used in the message. Blocking, and no other lock is held
-/// while blocking here.
+/// `test_name` is only used in the message. Blocking, but not unboundedly: a
+/// board held for longer than [`LOCK_TIMEOUT`] is a session that never ended,
+/// and the `Err` says so instead of parking this case forever. No other lock is
+/// held while waiting here.
 fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
+    lock_board_within(config, test_name, LOCK_TIMEOUT)
+}
+
+/// [`lock_board`] with the bound as a parameter, so the wait can be exercised
+/// without waiting [`LOCK_TIMEOUT`] out.
+fn lock_board_within(
+    config: &Path,
+    test_name: &str,
+    timeout: Duration,
+) -> Result<BoardLock, String> {
     let file = File::open(config).map_err(|error| format!("{}: {error}", config.display()))?;
     let fd = file.as_raw_fd();
 
@@ -853,15 +947,28 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
     }
     println!("HW-WAIT: {test_name}: waiting for the board (another hardware test is running)");
 
+    let deadline = Instant::now() + timeout;
     loop {
+        // A polled non-blocking take rather than a blocking `flock`, because a
+        // blocking one cannot be given a deadline: the thread would sit inside
+        // the syscall with no way to look at the clock.
+        //
         // SAFETY: as above; `fd` is owned by `file`, which is still alive.
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(BoardLock { file });
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(format!("{}: flock: {error}", config.display()));
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "another hardware test still holds the board: waited {timeout:?} for {} and its \
+                 session never ended. Free it (a hung `cargo test` left behind?) and run again",
+                config.display()
+            ));
+        }
+        std::thread::sleep(LOCK_POLL);
     }
 }
 
@@ -896,8 +1003,26 @@ fn run_line(test_name: &str) -> String {
 /// machine had a config, so "there was nothing to test" is a failure, not a
 /// skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
+    acquire_traced(test_name, requires, &CaseProgress::new(PHASE_ACQUIRING))
+}
+
+/// [`acquire`], recording where the case has got to in `progress`.
+///
+/// The runner's entry point: the case body it runs is on another thread, so the
+/// machine it hands out carries the same record the budget's timeout report
+/// reads.
+fn acquire_traced(
+    test_name: &str,
+    requires: &Requires,
+    progress: &Arc<CaseProgress>,
+) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
-    acquire_at(path.as_deref().map(Path::new), test_name, requires)
+    acquire_at_traced(
+        path.as_deref().map(Path::new),
+        test_name,
+        requires,
+        progress,
+    )
 }
 
 /// [`acquire`], on a path instead of the environment.
@@ -906,6 +1031,21 @@ pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
 /// path as an argument so the branches can be exercised without setting a
 /// variable (which no test can do without racing the others).
 fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Option<Machine> {
+    acquire_at_traced(
+        path,
+        test_name,
+        requires,
+        &CaseProgress::new(PHASE_ACQUIRING),
+    )
+}
+
+/// [`acquire_at`], recording the case's phase in `progress`.
+fn acquire_at_traced(
+    path: Option<&Path>,
+    test_name: &str,
+    requires: &Requires,
+    progress: &Arc<CaseProgress>,
+) -> Option<Machine> {
     match decide(path, requires) {
         Decision::NotSet => {
             println!("HW-IGNORED: {test_name}: {HW_CONFIG_ENV} is not set");
@@ -934,13 +1074,185 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
             println!("{}", run_line(test_name));
+            progress.enter(PHASE_BODY);
             Some(Machine {
                 config,
                 path,
+                progress: Arc::clone(progress),
                 _board,
             })
         }
     }
+}
+
+/// Run `body` as one hardware case: the board locked, and a total budget.
+///
+/// This is the frame a hardware case is written in, and it replaces the
+/// `let Some(machine) = acquire(…) else { return }; …` shape:
+///
+/// ```ignore
+/// #[test]
+/// #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+/// fn test_homing_reaches_the_endstop_on_a_real_board() {
+///     crate::hardware_test::case(
+///         "test_homing_reaches_the_endstop_on_a_real_board",
+///         &crate::hardware_test::Requires::new().mcu(),
+///         move |machine| {
+///             let started = machine.bring_up().expect("the machine comes up");
+///             // … the case …
+///         },
+///     );
+/// }
+/// ```
+///
+/// `body` runs on a thread of its own, and this one waits for it for at most
+/// [`CASE_TIMEOUT`]: a case that parks in a device read or in a temperature
+/// wait is then **reported** — `HW-TIMEOUT: <case>: still at "<phase>" …` — and
+/// the run goes on. The thread that is still blocked cannot be stopped (a
+/// blocking read is not cancellable), so it is abandoned: it keeps the board
+/// lock until it ends, which is why the next case's wait for the board is
+/// bounded too ([`LOCK_TIMEOUT`]) and says the board is still held.
+///
+/// A case whose [`Requires`] the config does not provide is a skip, exactly as
+/// [`acquire`] alone reports it: `HW-IGNORED`, and this returns.
+///
+/// A panic in `body` — `expect` failing, an assertion — is re-raised here with
+/// the same message, so the case fails the ordinary way. The machine is dropped
+/// (and its session torn down) inside the case thread on the panic path as
+/// well, before that message travels.
+///
+/// `body` takes `&Machine`; the `Machine` lives on the case thread for exactly
+/// as long as `body` runs, so anything the case opens has to be closed inside
+/// it — that is what makes the teardown the machine's `Drop` covers complete.
+///
+/// # Panics
+/// When the case times out, when `body` panics, and when the machine cannot be
+/// built (a set [`HW_CONFIG_ENV`] naming a config that cannot be used, or a
+/// board that cannot be locked).
+pub fn case<F>(test_name: &str, requires: &Requires, body: F)
+where
+    F: FnOnce(&Machine) + Send + 'static,
+{
+    run_case(None, test_name, requires, CASE_TIMEOUT, body);
+}
+
+/// [`case`] for a case whose body is `async` — an L1 case, which opens a
+/// transport with `Mcu::connect(…).await`.
+///
+/// The body is polled on a current-thread runtime built **inside** the case
+/// thread, which is the same runtime a `#[tokio::test]` would have given it:
+/// same IO and timers enabled, same single thread. Nothing about the body
+/// changes; only its frame does. A case that calls [`Machine::bring_up`] is not
+/// one of these — that method owns a runtime and refuses to run inside one, so
+/// such a case is a plain [`case`].
+pub fn async_case<F, Fut>(test_name: &str, requires: &Requires, body: F)
+where
+    F: FnOnce(&Machine) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    run_case(None, test_name, requires, CASE_TIMEOUT, move |machine| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the case's runtime builds");
+        runtime.block_on(body(machine));
+    });
+}
+
+/// The end of a case body, as the case thread reports it.
+#[derive(Debug)]
+enum CaseOutcome {
+    /// The body ran to its end (or the case was skipped).
+    Finished,
+    /// The body panicked; the message is what the case failed with.
+    Panicked(String),
+}
+
+/// [`case`]'s body: run `body` on its own thread under `budget`.
+///
+/// `path` is the config to run against; `None` reads [`HW_CONFIG_ENV`] inside
+/// the case thread, the way [`acquire`] does. The parameter is what lets a test
+/// exercise this without setting a variable.
+fn run_case<F>(
+    path: Option<PathBuf>,
+    test_name: &str,
+    requires: &Requires,
+    budget: Duration,
+    body: F,
+) where
+    F: FnOnce(&Machine) + Send + 'static,
+{
+    let name = test_name.to_string();
+    let requires = requires.clone();
+    let progress = CaseProgress::new(PHASE_ACQUIRING);
+    let case_progress = Arc::clone(&progress);
+    let (sender, receiver) = mpsc::channel::<CaseOutcome>();
+
+    let spawned = std::thread::Builder::new()
+        .name(format!("hw-case {test_name}"))
+        .spawn(move || {
+            // The machine lives inside this closure: its `Drop` — the board
+            // lock and, for a machine that came up, the session's teardown —
+            // runs here, before the outcome travels, on the panic path too.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let machine = match path {
+                    Some(path) => acquire_at_traced(Some(&path), &name, &requires, &case_progress),
+                    None => acquire_traced(&name, &requires, &case_progress),
+                };
+                if let Some(machine) = machine {
+                    body(&machine);
+                }
+            }));
+            let outcome = match outcome {
+                Ok(()) => CaseOutcome::Finished,
+                Err(payload) => CaseOutcome::Panicked(panic_text(payload.as_ref())),
+            };
+            // A closed receiver means the budget already ran out and nobody is
+            // listening; the case thread ends here either way.
+            let _ = sender.send(outcome);
+        });
+    let case_thread = match spawned {
+        Ok(case_thread) => case_thread,
+        Err(error) => panic!("{test_name}: cannot start the case's thread: {error}"),
+    };
+
+    match receiver.recv_timeout(budget) {
+        Ok(CaseOutcome::Finished) => {
+            // The body is done; the thread has nothing left but its return.
+            let _ = case_thread.join();
+        }
+        Ok(CaseOutcome::Panicked(message)) => {
+            let _ = case_thread.join();
+            // The case's own failure, re-raised here so it is this test's
+            // failure rather than a silent thread's.
+            panic!("{message}");
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let (phase, in_phase) = progress.current();
+            let message = format!(
+                "HW-TIMEOUT: {test_name}: still at \"{phase}\" after {in_phase:?} in that phase \
+                 ({budget:?} of case budget). The case thread is abandoned and still holds the \
+                 board, so the next case will report the board as held rather than run: the \
+                 case itself hung, which is what this budget is for — look at the phase above \
+                 for where"
+            );
+            println!("{message}");
+            panic!("{message}");
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("{test_name}: the case thread died without reporting an outcome")
+        }
+    }
+}
+
+/// The message a caught panic carried, for the case [`run_case`] re-raises it
+/// with.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+        .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
 /// Print what the configured printer provides, without touching a board.
@@ -1189,6 +1501,7 @@ mod tests {
         Machine {
             config,
             path: fixture.path().to_path_buf(),
+            progress: CaseProgress::new(PHASE_BODY),
             _board: board,
         }
     }
@@ -1949,15 +2262,6 @@ mod tests {
         let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
     }
 
-    /// The message a caught panic carried.
-    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-        payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
-            .unwrap_or_else(|| "a panic with no message".to_string())
-    }
-
     /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,
     /// not a skip: the variable said the machine had a config to test against.
     /// Only an unset variable and an unmet [`Requires`] are skips.
@@ -1972,7 +2276,7 @@ mod tests {
             Err(payload) => payload,
         };
 
-        let message = panic_message(payload.as_ref());
+        let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         // The parser's own reason travels with it.
         assert!(
@@ -1993,8 +2297,157 @@ mod tests {
             Err(payload) => payload,
         };
 
-        let message = panic_message(payload.as_ref());
+        let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         assert!(message.contains("printer.cfg"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The case runner — a bound on the whole case, and its attribution
+    // -----------------------------------------------------------------------
+
+    /// A case that hangs is **reported** and the runner returns: the body is
+    /// abandoned at the budget, the message names the case and the phase it was
+    /// stuck in, and the caller fails with that message rather than waiting.
+    ///
+    /// The budget is milliseconds here so the test stays bounded; production
+    /// passes [`CASE_TIMEOUT`].
+    #[test]
+    fn test_a_case_that_hangs_reports_its_phase_and_the_runner_returns() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let started = Instant::now();
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_case(
+                Some(fixture.path().to_path_buf()),
+                "test_a_case_that_hangs",
+                &Requires::new().mcu(),
+                Duration::from_millis(100),
+                |_machine| std::thread::sleep(Duration::from_secs(30)),
+            )
+        })) {
+            Ok(()) => panic!("the runner must fail the case, not return as if it passed"),
+            Err(payload) => payload,
+        };
+
+        // Bounded: the abandoned body sleeps for 30 s, the runner returned long
+        // before it.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the runner returned inside its budget: {:?}",
+            started.elapsed()
+        );
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("HW-TIMEOUT: test_a_case_that_hangs"),
+            "{message}"
+        );
+        assert!(
+            message.contains(PHASE_BODY),
+            "the message names the phase the case was stuck in: {message}"
+        );
+    }
+
+    /// The other half: a case that finishes inside its budget passes, and the
+    /// body really ran with a machine (which is what the board lock is for).
+    #[test]
+    fn test_a_case_that_finishes_inside_its_budget_passes() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+
+        run_case(
+            Some(fixture.path().to_path_buf()),
+            "test_a_case_that_finishes",
+            &Requires::new().mcu(),
+            Duration::from_secs(30),
+            move |machine| {
+                assert_eq!(
+                    machine
+                        .config()
+                        .get_section("mcu")
+                        .and_then(|section| section.get_str("serial")),
+                    Some("/dev/ttyACM0")
+                );
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the body ran with the machine the config provides"
+        );
+    }
+
+    /// A body that panics fails the case with its own message: the failure is
+    /// this test's, not a silent thread's.
+    #[test]
+    fn test_a_panic_in_the_body_fails_the_case_with_its_message() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_case(
+                Some(fixture.path().to_path_buf()),
+                "test_a_case_that_panics",
+                &Requires::new().mcu(),
+                Duration::from_secs(30),
+                |_machine| panic!("the board answered 0 where 1 was expected"),
+            )
+        })) {
+            Ok(()) => panic!("a panicking body fails the case"),
+            Err(payload) => payload,
+        };
+
+        assert_eq!(
+            panic_text(payload.as_ref()),
+            "the board answered 0 where 1 was expected"
+        );
+    }
+
+    /// The skip path travels through the runner unchanged: a config that does
+    /// not provide what the case asked for is `HW-IGNORED`, and the body never
+    /// runs.
+    #[test]
+    fn test_a_case_the_config_does_not_provide_is_skipped_by_the_runner() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+
+        run_case(
+            Some(fixture.path().to_path_buf()),
+            "test_a_case_that_is_skipped",
+            &Requires::new().section("stepper_x"),
+            Duration::from_secs(30),
+            move |_machine| seen.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a skipped case runs no body: there is no machine to hand it"
+        );
+    }
+
+    /// The board lock's wait is bounded: a board another session holds is
+    /// reported as held, not waited on forever. The short bound is a parameter
+    /// so the check does not wait [`LOCK_TIMEOUT`] out.
+    #[test]
+    fn test_waiting_for_a_held_board_ends_with_the_board_reported_as_held() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        // Held for the whole check, as a hung case would hold it.
+        let _held = lock_board(fixture.path(), "self-test").expect("the fixture locks");
+
+        let started = Instant::now();
+        let reason = lock_board_within(fixture.path(), "self-test", Duration::from_millis(150))
+            .err()
+            .expect("a held board is not handed out");
+
+        assert!(
+            reason.contains("another hardware test still holds the board"),
+            "the reason says the board is held: {reason}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ended at its bound: {:?}",
+            started.elapsed()
+        );
     }
 }

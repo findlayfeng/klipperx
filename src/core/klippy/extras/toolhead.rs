@@ -2335,7 +2335,7 @@ impl ToolHeadObject {
         connected
             .mcu_steppers
             .insert(stepper.name().to_string(), mcu_stepper);
-        connected.toolhead.motion_queuing_mut().add_stepper(stepper);
+        connected.toolhead.add_extra_axis_stepper(stepper);
         Ok(trapq)
     }
 

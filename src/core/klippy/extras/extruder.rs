@@ -299,11 +299,13 @@ impl PrinterExtruder {
         }
 
         // SET_PRESSURE_ADVANCE is a per-extruder mux command; the solver reads
-        // the same parameters on its next evaluation.
+        // the new parameters from the print time the extruder has planned up
+        // to (`extruder.py:67-88`).
         {
             let pa = Arc::clone(&self.pressure_advance);
+            let printer = Arc::downgrade(printer);
             let handler: CommandHandler =
-                sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa));
+                sync(move |gcmd: &GcodeCommand| set_pressure_advance(gcmd, &pa, &printer));
             gcode
                 .register_mux_command_with_params(
                     "SET_PRESSURE_ADVANCE",
@@ -426,9 +428,15 @@ const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 /// them (upstream `extruder_stepper.cmd_SET_PRESSURE_ADVANCE`,
 /// `kinematics/extruder.py:93-107`; the bounds are its `minval=0.` on `ADVANCE`
 /// and `minval=0., maxval=.200` on `SMOOTH_TIME`).
+///
+/// The new value is active from the print time the extruder has already
+/// planned up to — upstream hands it to `register_lookahead_callback`, which
+/// fires with exactly that time (`extruder.py:82-86`) — so segments the step
+/// generator has stepped over keep the value they were stepped with.
 fn set_pressure_advance(
     gcmd: &GcodeCommand,
     pressure_advance: &Arc<ExtruderPressureAdvance>,
+    printer: &std::sync::Weak<Printer>,
 ) -> Result<(), CommandError> {
     let (advance, smooth_time) = pressure_advance.values();
     let value = gcmd.get_float_default("ADVANCE", advance)?;
@@ -443,7 +451,12 @@ fn set_pressure_advance(
             "SMOOTH_TIME must be between 0.0 and 0.2, got {smooth}"
         )));
     }
-    pressure_advance.set(value, smooth);
+    let print_time = printer
+        .upgrade()
+        .and_then(|printer| printer.lookup_object_as::<ToolHeadObject>("toolhead"))
+        .map(|toolhead| toolhead.get_last_move_time())
+        .unwrap_or(0.0);
+    pressure_advance.set(print_time, value, smooth);
     gcmd.respond_info(&format!(
         "pressure_advance: {value:.6}\npressure_advance_smooth_time: {smooth:.6}",
     ));
@@ -470,7 +483,7 @@ fn forward_pressure_advance(
     if extruder.stepper.is_none() {
         return Err(active("Active extruder does not have a stepper"));
     }
-    set_pressure_advance(gcmd, &extruder.pressure_advance)
+    set_pressure_advance(gcmd, &extruder.pressure_advance, &Arc::downgrade(&printer))
 }
 
 impl PrinterObject for PrinterExtruder {

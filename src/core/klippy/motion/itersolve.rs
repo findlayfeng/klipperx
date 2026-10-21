@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::mathutil::Xyz;
 
-use super::pressure_advance::ExtruderPressureAdvance;
+use super::pressure_advance::{ExtruderPressureAdvance, PressureAdvanceEntry};
 use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
@@ -107,8 +107,9 @@ pub type PositionPost = fn(commanded: &mut f64);
 
 /// The segments a position function may read while generating steps: the
 /// trapq's finished history (oldest first) followed by its queued segments
-/// (`chelper/trapq.c` keeps both in one linked list), and the index of the
-/// segment being generated.
+/// (`chelper/trapq.c` keeps both in one linked list), the index of the segment
+/// being generated, and the pressure-advance schedule snapshot the extruder
+/// solver reads.
 ///
 /// A solver that reads only the segment it is asked about gets a one-segment
 /// window ([`SegmentWindow::single`]); the pressure-advance extruder needs its
@@ -118,14 +119,16 @@ pub type PositionPost = fn(commanded: &mut f64);
 pub struct SegmentWindow<'a> {
     cuts: &'a [MoveSegment],
     index: usize,
+    schedule: &'a [PressureAdvanceEntry],
 }
 
 impl<'a> SegmentWindow<'a> {
-    /// A window holding only `segment`.
+    /// A window holding only `segment`, for a solver with no pressure advance.
     pub fn single(segment: &'a MoveSegment) -> Self {
         Self {
             cuts: std::slice::from_ref(segment),
             index: 0,
+            schedule: &[],
         }
     }
 
@@ -142,6 +145,11 @@ impl<'a> SegmentWindow<'a> {
     /// The segment being generated.
     pub fn segment(&self) -> &'a MoveSegment {
         &self.cuts[self.index]
+    }
+
+    /// The pressure-advance parameters in force over the window.
+    pub fn schedule(&self) -> &'a [PressureAdvanceEntry] {
+        self.schedule
     }
 }
 
@@ -213,7 +221,7 @@ impl StepKinematics {
     fn eval(&self, window: SegmentWindow<'_>, move_time: f64) -> f64 {
         let raw = match &self.pressure_advance {
             Some(pressure_advance) => {
-                pressure_advance.position(window.cuts, window.index, move_time)
+                pressure_advance.position(window.cuts, window.index, move_time, window.schedule)
             }
             None => self.position.call(window.segment(), move_time),
         };
@@ -311,7 +319,13 @@ impl StepKinematics {
         // The pressure-advance position function reads the segments around the
         // one it is asked about, including the ones already finalized into the
         // history (`kin_extruder.c` walks the trapq list both ways). Copy them
-        // into one slice, oldest first, only when this stepper needs them.
+        // into one slice, oldest first, only when this stepper needs them — and
+        // take one snapshot of the parameters, so the position function itself
+        // needs no lock.
+        let schedule: Vec<PressureAdvanceEntry> = match &self.pressure_advance {
+            Some(pressure_advance) => pressure_advance.schedule(),
+            None => Vec::new(),
+        };
         let cuts: Vec<MoveSegment> = if self.pressure_advance.is_some() {
             let mut cuts: Vec<MoveSegment> = trapq.history().iter().rev().copied().collect();
             cuts.extend(trapq.moves().iter().copied());
@@ -339,6 +353,7 @@ impl StepKinematics {
                     SegmentWindow {
                         cuts: &cuts,
                         index: first_queued + queued,
+                        schedule: &schedule,
                     }
                 } else {
                     SegmentWindow::single(segment)
@@ -763,5 +778,85 @@ mod tests {
         sk.set_position(Xyz::new(1.0, 2.0, 3.0));
 
         assert_eq!(sk.commanded_pos(), 2.0);
+    }
+
+    /// An extruder trapq: `from..to` seconds of constant `speed` mm/s
+    /// extrusion, in segments so a `SET_PRESSURE_ADVANCE` can land between
+    /// them. The `y` direction cosine marks a segment as able to advance
+    /// (`can_pressure_advance`, `extruder.py:221-232`); a trapq has to start
+    /// with one that cannot, or the pressure advance would be on at the very
+    /// first step — a jump no solver could step smoothly.
+    fn extruder_trapq(segments: &[(f64, f64, bool)]) -> Trapq {
+        let mut trapq = Trapq::new();
+        let mut position = 0.0;
+        for (print_time, duration, can_advance) in segments {
+            trapq.append(
+                *print_time,
+                0.0,
+                *duration,
+                0.0,
+                Xyz::new(position, 0.0, 0.0),
+                Xyz::new(1.0, f64::from(u8::from(*can_advance)), 0.0),
+                10.0,
+                10.0,
+                0.0,
+            );
+            position += 10.0 * duration;
+        }
+        trapq
+    }
+
+    /// The extruder solver with pressure advance drives the steps: at a
+    /// constant extrusion rate it leads the nominal position by
+    /// `pressure_advance * velocity`, both from the configured value and from
+    /// one `SET_PRESSURE_ADVANCE` writes after the solver was built.
+    #[test]
+    fn test_pressure_advance_drives_the_extruder_steps() {
+        // Constant 10 mm/s for 0.3 s: a 0.1 s stretch that cannot advance,
+        // then two that can.
+        let trapq = extruder_trapq(&[(0.0, 0.1, false), (0.1, 0.1, true), (0.2, 0.1, true)]);
+        let solver = || StepKinematics::new(0.01, extruder_position_fn(), extruder_active_flags());
+
+        // No pressure advance gets the nominal millimetres.
+        let mut sk = solver();
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        sk.set_pressure_advance(ExtruderPressureAdvance::new(0.0, 0.040));
+        sk.generate_steps(&trapq, &mut sc, 0.1).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        assert!(
+            (sk.commanded_pos() - 1.0).abs() < 0.02,
+            "expected the nominal millimetre, got {}",
+            sk.commanded_pos()
+        );
+
+        // pa 0.05 at 10 mm/s leads by 0.5 mm.
+        let mut sk = solver();
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        sk.set_pressure_advance(ExtruderPressureAdvance::new(0.05, 0.040));
+        sk.generate_steps(&trapq, &mut sc, 0.2).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        assert!(
+            (sk.commanded_pos() - 2.5).abs() < 0.02,
+            "expected 2 mm nominal + the 0.5 mm lead, got {}",
+            sk.commanded_pos()
+        );
+
+        // The same solver with the value changed after the first flush: the
+        // segment that starts after the written print time uses it
+        // (`STATE` = 0.15 s lands between two segments).
+        let mut sk = solver();
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        let state = ExtruderPressureAdvance::new(0.0, 0.040);
+        sk.set_pressure_advance(Arc::clone(&state));
+        sk.generate_steps(&trapq, &mut sc, 0.1).unwrap();
+        assert!((sk.commanded_pos() - 1.0).abs() < 0.02);
+        state.set(0.15, 0.05, 0.040);
+        sk.generate_steps(&trapq, &mut sc, 0.25).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        assert!(
+            (sk.commanded_pos() - 3.0).abs() < 0.02,
+            "expected 2.5 mm nominal + the 0.5 mm lead, got {}",
+            sk.commanded_pos()
+        );
     }
 }

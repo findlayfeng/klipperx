@@ -27,66 +27,128 @@
 //! quadratic `base + t*(start_v + t*half_accel)`, so the weighted integral is
 //! closed-form per segment and the window is clipped at segment boundaries,
 //! walking into the neighbouring segments (`pa_range_integrate`,
-//! `kin_extruder.c:90-116`). That keeps the result independent of the solver's
-//! evaluation times, which is what lets the secant search ask for positions at
+//! `kin_extruder.c:81-116`). That keeps the result a pure function of time,
+//! which is what lets the solver's secant search ask for positions at
 //! arbitrary, non-monotonic times.
 //!
-//! The two numbers `SET_PRESSURE_ADVANCE` writes live in atomics so the step
-//! generator reads them without a lock and a change is seen at the next
-//! evaluation (`kin_extruder.c:147-155` keeps a timestamped list instead; the
-//! command path here applies the new value immediately, see
-//! `extras::extruder::set_pressure_advance`).
+//! # Changing the parameters
+//!
+//! `SET_PRESSURE_ADVANCE` does not rewrite the past: a new value takes effect
+//! from a print time (the end of the motion already planned), and each trapq
+//! segment uses the value that was in force at that segment's own print time —
+//! upstream's `pa_list` lookup in `pa_move_integrate`
+//! (`kin_extruder.c:59-69`) and `extruder_set_pressure_advance`
+//! (`:147-186`). Without that, changing `pressure_advance` would shift the
+//! position of segments the step generator has already stepped over, and the
+//! solver would try to make up the difference in one clock tick.
+//!
+//! The parameters live behind a rarely-taken mutex: [`ExtruderPressureAdvance::set`]
+//! writes it from the g-code command, and the step generator takes one snapshot
+//! per [`StepKinematics::generate_steps`](super::itersolve::StepKinematics)
+//! call, so the position function itself runs without a lock.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use super::trapq::MoveSegment;
 
+/// The parameters one stretch of the trapq uses
+/// (upstream's `struct pa_params`, `kin_extruder.c:11-14`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PressureAdvanceEntry {
+    /// The print time this value becomes active at.
+    pub print_time: f64,
+    /// `pressure_advance`.
+    pub pressure_advance: f64,
+    /// `pressure_advance_smooth_time`; zero when pressure advance is off, which
+    /// is how upstream disables the filter (`kinematics/extruder.py:67-74`).
+    pub smooth_time: f64,
+}
+
+impl PressureAdvanceEntry {
+    fn new(print_time: f64, pressure_advance: f64, smooth_time: f64) -> Self {
+        Self {
+            print_time,
+            pressure_advance,
+            // Upstream's `_set_pressure_advance` zeroes the smooth time when
+            // the pressure advance is zero (`extruder.py:68-73`).
+            smooth_time: if pressure_advance == 0.0 {
+                0.0
+            } else {
+                smooth_time
+            },
+        }
+    }
+}
+
 /// The extruder's pressure-advance parameters, shared between the `[extruder]`
 /// object (which `SET_PRESSURE_ADVANCE` writes) and its stepper's solver
-/// (which reads them on every evaluation).
+/// (which reads them while generating steps).
 #[derive(Debug)]
 pub struct ExtruderPressureAdvance {
-    /// `pressure_advance`, as `f64` bits.
-    pressure_advance: AtomicU64,
-    /// `pressure_advance_smooth_time` in seconds, as `f64` bits.
-    smooth_time: AtomicU64,
+    /// The values the command last set, for status and for the next command's
+    /// defaults. Written immediately, as upstream's `self.pressure_advance =`
+    /// does (`kinematics/extruder.py:87-88`).
+    reported_pressure_advance: AtomicU64,
+    reported_smooth_time: AtomicU64,
+    /// The per-print-time schedule the solver reads, oldest first. One entry
+    /// from the config, then one per `SET_PRESSURE_ADVANCE`.
+    schedule: Mutex<Vec<PressureAdvanceEntry>>,
 }
 
 impl ExtruderPressureAdvance {
     /// Parameters for an extruder configured with `pressure_advance` and
-    /// `pressure_advance_smooth_time`.
+    /// `pressure_advance_smooth_time`, active from print time zero
+    /// (`_handle_connect` calls `espa(sk, 0., …)`, `extruder.py:41-42`).
     pub fn new(pressure_advance: f64, smooth_time: f64) -> Arc<Self> {
         Arc::new(Self {
-            pressure_advance: AtomicU64::new(pressure_advance.to_bits()),
-            smooth_time: AtomicU64::new(smooth_time.to_bits()),
+            reported_pressure_advance: AtomicU64::new(pressure_advance.to_bits()),
+            reported_smooth_time: AtomicU64::new(smooth_time.to_bits()),
+            schedule: Mutex::new(vec![PressureAdvanceEntry::new(
+                0.0,
+                pressure_advance,
+                smooth_time,
+            )]),
         })
     }
 
-    /// The configured `(pressure_advance, smooth_time)`.
-    ///
-    /// Two relaxed loads: a reader may see one of them from before a
-    /// simultaneous `set` (see [`ExtruderPressureAdvance::set`]).
+    /// The `(pressure_advance, smooth_time)` the command last set.
     pub fn values(&self) -> (f64, f64) {
         (
-            f64::from_bits(self.pressure_advance.load(Ordering::Relaxed)),
-            f64::from_bits(self.smooth_time.load(Ordering::Relaxed)),
+            f64::from_bits(self.reported_pressure_advance.load(Ordering::Relaxed)),
+            f64::from_bits(self.reported_smooth_time.load(Ordering::Relaxed)),
         )
     }
 
-    /// Record new values for the next evaluation of the position function.
+    /// Record new values, in force from print time `print_time` on
+    /// (`extruder_set_pressure_advance`, `kin_extruder.c:147-155`).
     ///
-    /// Upstream applies a `pressure_advance` change at the print time of the
-    /// next queued move (`register_lookahead_callback`) and flushes step
-    /// generation when `smooth_time` changes (`kinematics/extruder.py:67-88`).
-    /// Here both land in the solver directly: the next segment stepped uses
-    /// them. A `smooth_time` change mid-queue therefore reaches the step
-    /// generator without a flush (documented in `upstream-deviations`).
-    pub fn set(&self, pressure_advance: f64, smooth_time: f64) {
-        self.pressure_advance
+    /// Segments that start before `print_time` keep the value they had — they
+    /// may already have been stepped. Entries later than `print_time` are
+    /// dropped: a command cannot schedule a change behind one already queued.
+    pub fn set(&self, print_time: f64, pressure_advance: f64, smooth_time: f64) {
+        self.reported_pressure_advance
             .store(pressure_advance.to_bits(), Ordering::Relaxed);
-        self.smooth_time
+        self.reported_smooth_time
             .store(smooth_time.to_bits(), Ordering::Relaxed);
+        let mut schedule = self.lock();
+        schedule.retain(|entry| entry.print_time < print_time);
+        schedule.push(PressureAdvanceEntry::new(
+            print_time,
+            pressure_advance,
+            smooth_time,
+        ));
+    }
+
+    /// The schedule the step generator reads, oldest first.
+    pub fn schedule(&self) -> Vec<PressureAdvanceEntry> {
+        self.lock().clone()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<PressureAdvanceEntry>> {
+        self.schedule
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Where the extruder stepper is `move_time` seconds into `cuts[index]`
@@ -96,24 +158,53 @@ impl ExtruderPressureAdvance {
     /// first (`itersolve::SegmentWindow`); the smoothing window reads its
     /// neighbours. Outside `cuts` the window is clipped, so a lone segment (a
     /// coordinate round-trip) behaves like the midpoint of a standing move.
-    pub fn position(&self, cuts: &[MoveSegment], index: usize, move_time: f64) -> f64 {
+    /// `schedule` is the snapshot from [`ExtruderPressureAdvance::schedule`].
+    pub fn position(
+        &self,
+        cuts: &[MoveSegment],
+        index: usize,
+        move_time: f64,
+        schedule: &[PressureAdvanceEntry],
+    ) -> f64 {
         let segment = &cuts[index];
-        let (pressure_advance, smooth_time) = self.values();
-        let hst = 0.5 * smooth_time;
-        if pressure_advance == 0.0 || hst == 0.0 {
+        let hst = half_smooth_time(schedule);
+        if hst == 0.0 {
             // Pressure advance not enabled (`kin_extruder.c:122-125`).
             return nominal_position(segment, move_time);
         }
-        let area = range_integrate(cuts, index, move_time, hst, pressure_advance);
+        let area = range_integrate(cuts, index, move_time, hst, schedule);
         segment.start_pos.x() + area / (hst * hst)
     }
+}
+
+/// Half the smoothing window, from the newest schedule entry — upstream keeps
+/// one `half_smooth_time` per solver (`kin_extruder.c:149-151`) — or zero when
+/// pressure advance is off.
+fn half_smooth_time(schedule: &[PressureAdvanceEntry]) -> f64 {
+    match schedule.last() {
+        Some(entry) => 0.5 * entry.smooth_time,
+        None => 0.0,
+    }
+}
+
+/// The pressure advance in force at `print_time`: the entry with the largest
+/// active time at or before it (`pa_move_integrate`'s walk back through
+/// `pa_list`, `kin_extruder.c:59-68`).
+fn pressure_advance_at(schedule: &[PressureAdvanceEntry], print_time: f64) -> f64 {
+    let mut pressure_advance = 0.0;
+    for entry in schedule {
+        if entry.print_time > print_time {
+            break;
+        }
+        pressure_advance = entry.pressure_advance;
+    }
+    pressure_advance
 }
 
 /// The nominal extruder position `move_time` seconds into `segment`: the
 /// extrusion amount, `m->start_pos.x + move_get_distance(m, move_time)`
 /// (`kin_extruder.c:134`). The extruder trapq's x direction cosine is 1
-/// (`extruder::PrinterExtruder::process_move` appends `(1, can_pa, 0)`), so
-/// this is also what the axis-reading position function returns.
+/// (`extruder::PrinterExtruder::process_move` appends `(1, can_pa, 0)`).
 fn nominal_position(segment: &MoveSegment, move_time: f64) -> f64 {
     segment.start_pos.x() + segment.distance(move_time)
 }
@@ -163,7 +254,7 @@ fn integrate_time(base: f64, start_v: f64, half_accel: f64, start: f64, end: f64
 /// `kinematics/extruder.py:221-232`).
 fn move_integrate(
     segment: &MoveSegment,
-    pressure_advance: f64,
+    schedule: &[PressureAdvanceEntry],
     base: f64,
     start: f64,
     end: f64,
@@ -172,7 +263,7 @@ fn move_integrate(
     let start = start.max(0.0);
     let end = end.min(segment.move_t);
     let pressure_advance = if segment.axes_r.y() != 0.0 {
-        pressure_advance
+        pressure_advance_at(schedule, segment.print_time)
     } else {
         0.0
     };
@@ -197,14 +288,14 @@ fn range_integrate(
     index: usize,
     move_time: f64,
     hst: f64,
-    pressure_advance: f64,
+    schedule: &[PressureAdvanceEntry],
 ) -> f64 {
     let segment = &cuts[index];
     let start_base = segment.start_pos.x();
     let mut res = 0.0;
     res += move_integrate(
         segment,
-        pressure_advance,
+        schedule,
         0.0,
         move_time - hst,
         move_time,
@@ -212,7 +303,7 @@ fn range_integrate(
     );
     res -= move_integrate(
         segment,
-        pressure_advance,
+        schedule,
         0.0,
         move_time,
         move_time + hst,
@@ -229,14 +320,7 @@ fn range_integrate(
         let previous = &cuts[prev];
         start += previous.move_t;
         let base = previous.start_pos.x() - start_base;
-        res += move_integrate(
-            previous,
-            pressure_advance,
-            base,
-            start,
-            previous.move_t,
-            start,
-        );
+        res += move_integrate(previous, schedule, base, start, previous.move_t, start);
     }
     // Integrate over the following segments.
     let mut end = move_time + hst;
@@ -249,7 +333,7 @@ fn range_integrate(
         next += 1;
         let following = &cuts[next];
         let base = following.start_pos.x() - start_base;
-        res -= move_integrate(following, pressure_advance, base, 0.0, end, end);
+        res -= move_integrate(following, schedule, base, 0.0, end, end);
     }
     res
 }
@@ -291,7 +375,12 @@ mod tests {
             .iter()
             .position(|segment| print_time < segment.end_time())
             .unwrap_or(cuts.len() - 1);
-        state.position(cuts, index, print_time - cuts[index].print_time)
+        state.position(
+            cuts,
+            index,
+            print_time - cuts[index].print_time,
+            &state.schedule(),
+        )
     }
 
     /// The old position function read the trapq's x
@@ -307,12 +396,13 @@ mod tests {
         // `smooth_time` alone does nothing: upstream disables the filter when
         // `pressure_advance` is zero (`extruder.py:68-73`).
         let state = ExtruderPressureAdvance::new(0.0, 0.040);
+        let schedule = state.schedule();
 
         for (index, segment) in cuts.iter().enumerate() {
             for sample in 0..=20 {
                 let move_time = segment.move_t * f64::from(sample) / 20.0;
                 assert_eq!(
-                    state.position(&cuts, index, move_time),
+                    state.position(&cuts, index, move_time, &schedule),
                     segment.coord(move_time).x(),
                     "segment {index} at {move_time}"
                 );
@@ -336,17 +426,22 @@ mod tests {
         // 0.05 s into the cruise: the whole smoothing window (0.11..0.19 s) is
         // inside the constant-velocity segment.
         let nominal = cuts[1].coord(0.05).x();
-        let smoothed = state.position(&cuts, 1, 0.05);
+        let schedule = state.schedule();
+        let smoothed = state.position(&cuts, 1, 0.05, &schedule);
         assert_eq!(nominal, 10.0);
         assert!(
             (smoothed - (nominal + 0.05 * 100.0)).abs() < 1e-9,
             "expected {nominal} + pa*velocity, got {smoothed}"
         );
 
-        // The offset disappears again when pressure advance is zeroed, and the
-        // new value is what the next evaluation reads.
-        state.set(0.0, 0.020);
-        assert!((state.position(&cuts, 1, 0.05) - nominal).abs() < 1e-12);
+        // The offset disappears again when pressure advance is zeroed from a
+        // later print time on.
+        state.set(cuts[1].print_time, 0.0, 0.020);
+        let schedule = state.schedule();
+        assert!(
+            (state.position(&cuts, 1, 0.05, &schedule) - nominal).abs() < 1e-12,
+            "the zeroed value should apply to this segment"
+        );
     }
 
     /// A feed-rate step is spread over `smooth_time`: the longer the time, the
@@ -385,21 +480,33 @@ mod tests {
         );
     }
 
-    /// `SET_PRESSURE_ADVANCE` writes the shared parameters: the next evaluation
-    /// uses them, with no solver reinstall (`kinematics/extruder.py:67-88`).
+    /// `SET_PRESSURE_ADVANCE` writes the shared parameters: the next segment
+    /// stepper uses them, with no solver reinstall, and segments that start
+    /// earlier keep the value they had (`extruder.py:67-88`,
+    /// `kin_extruder.c:147-186`).
     #[test]
-    fn test_set_pressure_advance_takes_effect_on_the_next_evaluation() {
-        let cuts = [segment(0.0, 0.2, 0.0, 10.0, 0.0)];
+    fn test_set_pressure_advance_takes_effect_on_the_next_segment() {
+        let cuts = [
+            segment(0.0, 0.1, 0.0, 10.0, 0.0),
+            segment(0.1, 0.1, 1.0, 10.0, 0.0),
+        ];
         let state = ExtruderPressureAdvance::new(0.0, 0.040);
-        let nominal = cuts[0].coord(0.1).x();
-        assert_eq!(state.position(&cuts, 0, 0.1), nominal);
+        let nominal = cuts[1].coord(0.05).x();
+        assert_eq!(state.position(&cuts, 1, 0.05, &state.schedule()), nominal);
 
-        state.set(0.06, 0.040);
+        // The change lands at the print time the extruder has planned up to;
+        // the segment that starts there uses it, the one before does not.
+        state.set(cuts[1].print_time, 0.06, 0.040);
+        let schedule = state.schedule();
         assert_eq!(state.values(), (0.06, 0.040));
-        let smoothed = state.position(&cuts, 0, 0.1);
+        let smoothed = state.position(&cuts, 1, 0.05, &schedule);
         assert!(
             (smoothed - (nominal + 0.06 * 10.0)).abs() < 1e-9,
-            "expected the new pa in the next evaluation, got {smoothed}"
+            "expected the new pa in the next segment, got {smoothed}"
+        );
+        assert!(
+            (state.position(&cuts, 0, 0.05, &schedule) - cuts[0].coord(0.05).x()).abs() < 1e-9,
+            "the segment stepped before the change keeps its value"
         );
     }
 

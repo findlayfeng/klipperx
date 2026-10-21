@@ -283,10 +283,15 @@ impl StepKinematics {
     /// Generate the steps for `trapq` up to `flush_time`
     /// (`itersolve_generate_steps`, `chelper/itersolve.c:147-204`).
     ///
-    /// Upstream's `gen_steps_pre_active`/`gen_steps_post_active` window (which
-    /// keeps a shaper fed before and after a stepper is active) is not
-    /// implemented: cartesian needs neither, and they arrive with the input
-    /// shaper (H6).
+    /// Upstream's `gen_steps_pre_active`/`gen_steps_post_active` window is not
+    /// implemented. A plain cartesian axis needs neither, but **pressure advance
+    /// does**: upstream sets both to `hst = smooth_time/2` on the extruder
+    /// (`extruder_set_pressure_advance` in `kin_extruder.c`), so that stepper
+    /// also generates steps in the `hst` before its first move and after its
+    /// last. Without it the first and last `hst` of an extrusion are compressed
+    /// into the move instead of spread across the boundary — a small extruder
+    /// jump at starts and stops. Registered in `TODO.md`; the input shaper (H6)
+    /// needs the same window for its own reason.
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from the compressor.

@@ -594,8 +594,8 @@ SPI_TRANSFER DEVICE=flash DATA=9f000000    ; W25 flash JEDEC ID → ef 30 13
 | `max_extrude_only_velocity` | 浮点 (mm/s) | 否 | ready 时由 `max_velocity` 推导 | 纯挤出速度上限 |
 | `max_extrude_only_accel` | 浮点 (mm/s²) | 否 | ready 时由 `max_accel` 推导 | 纯挤出加速度上限 |
 | `instantaneous_corner_velocity` | 浮点 (mm/s) | 否 | `1.0` | 挤出拐角的瞬时速度 |
-| `pressure_advance` | 浮点 | 否 | `0.0` | 压力推进，`≥ 0`（运行期用 `SET_PRESSURE_ADVANCE` 调） |
-| `pressure_advance_smooth_time` | 浮点 (s) | 否 | `0.040` | PA 平滑时间，`≤ 0.200` |
+| `pressure_advance` | 浮点 | 否 | `0.0` | 压力推进，`≥ 0`（运行期用 `SET_PRESSURE_ADVANCE` 调）——**现已真驱动挤出机运动**：求解器按 `pa × 速度` 提前/回抽，再按 `smooth_time` 做三角窗平滑 |
+| `pressure_advance_smooth_time` | 浮点 (s) | 否 | `0.040` | PA 平滑窗口，`(0, 0.200]`；`pressure_advance: 0` 时自动归零（上游同） |
 | `step_pin` / `dir_pin` / `rotation_distance` / `microsteps` … | 同 `[stepper_*]` | 否 | — | **写了任一个**才建 E 轴 stepper（上游同规则）；不写则纯加热 |
 
 命令：`M104` / `M109`（等待到目标温度）/ `SET_PRESSURE_ADVANCE`（mux `EXTRUDER`）/
@@ -991,7 +991,7 @@ pins: PA1, my_alias
 |------|------|------|
 | 电机组 | — | 经 `PrinterStepper` 读取（步距等同上游） |
 | `extruder` | `extruder` | 绑定的挤出机名（connect 期校验，上游文案 `'<名>' is not a valid extruder.`） |
-| `pressure_advance` / `smooth_time` | `0.` / `0.040` | 本步进独立压力推进 |
+| `pressure_advance` / `smooth_time` | `0.` / `0.040` | 本步进独立压力推进——**目前只记录/上报**（默认 0 与上游一致；非零值不驱动求解器，见 `TODO.md` H6 余项 3） |
 
 段已落地（批 #2）；`SET_PRESSURE_ADVANCE [EXTRUDER=<段名>]` 按名挂值 ✓；宿主 step 同步待 toolhead 缝（H10），`SYNC_EXTRUDER_MOTION`/`SET_EXTRUDER_ROTATION_DISTANCE` 未注册。
 

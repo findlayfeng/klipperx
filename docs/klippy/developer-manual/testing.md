@@ -610,7 +610,8 @@ git config core.hooksPath .githooks
 | `plan.rs` | move 剖成加速-巡航-减速、extrude-only 无运动学距离；拐角被 junction 速度限制、直线保持巡航；前瞻攒够时间才 flush、偷懒 flush 不弄坏短队列 |
 | `stepcompress.rs` | 等间隔→一条 move、加速/减速/二次曲线段与上游对拍；方向切换插 dir 命令、大空隙变单步重锚、SDS 过滤在反向前丢步；flush 等 move clock、`set_last_position` 记 history 标记、`find_past_position` 与发出的时刻表一致、history 过期清理；抖动序列与上游对拍；一整段压缩重建出请求的每一步 |
 | `trapq.rs` | 梯形变三段、相位连续、时间空隙填静止段、坐标沿加速度走；`finalize_moves` 过期段、`extract_old` 按窗口取段 |
-| `itersolve.rs` | cartesian 只读自己的轴、corexy 读 x±y、corexz 读 x±z；不动的 stepper 是惰性的；步距处生成步进、`generate` 走完整 trapq、位置坐标往返 |
+| `itersolve.rs` | cartesian 只读自己的轴、corexy 读 x±y、corexz 读 x±z；不动的 stepper 是惰性的；步距处生成步进、`generate` 走完整 trapq、位置坐标往返；**压力提前真驱动步进（2026-10-21）**：`test_pressure_advance_drives_the_extruder_steps`——同一段移动 nominal 1 mm，带 pa 出 1.5 mm；中途 `SET_PRESSURE_ADVANCE` 改值后从下一段起生效（2.5 → 3.0 mm） |
+| `pressure_advance.rs` | **ESPA 平滑（5 测，2026-10-21）**：`pa = 0` 时与旧行为**逐点相等**（3 段 × 21 个时间点，`assert_eq!` 对 `segment.coord(t).x()`，**回归保护**）；`pa > 0` 时进给率变化处出现超前/滞后且量值等于 `pa × 速度`（容差）；`smooth_time` 变大时过渡更平缓（单调性断言）；改值后下一段立即生效；解析积分与数值积分对账 |
 | `stepper.rs` | cartesian stepper 只动自己的轴、每个 stepper 在自己的 MCU 时钟里生成、`mcu_position` / `past_position`、`generate` 交出该 stepper 的命令 |
 | `toolhead.rs` | 额外轴（挤出机）在自己的 trapq 检查与排队、限制拐角；move 到 trapq 生成 `queue_step`；两条共线 move 保住拐角速度；`dwell` 推进 print time；`drip_move` 直灌 trapq（零长度不做事）；未 homed 轴拒绝、零长 move 忽略；**C5 五测（两组转红）**：实时 est 打底（`print_time ≥ live_est + BUFFER_TIME_START`，回退成 connect 快照即 5 条全红）、`need_prime_rearm::{wait_moves,dwell,flush_step_generation}` 三条复位路径（去复位恰好 3 条红）、入队批 `req`/`completion` 域界（`req ≤ est+0.100`、`completion ≥ est`）；`wait_moves_state()` 快照（`special_queuing_state`/`print_time`/est 同一次锁内取出，供 `M400` 的等待环逐轮重读） |
 | `queuing.rs` | `append` 与 `generate` 共用同一 trapq；没事做的 stepper 静默；两个 stepper 在同一 MCU 上都生成；`register_flush_callback` 的回调在 `generate(flush_time)` 开头**按注册序**触发、**无 stepper 也照跑**（`test_flush_callbacks_run_in_registration_order_even_without_steppers`） |

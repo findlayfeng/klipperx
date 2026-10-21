@@ -87,7 +87,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——三者主体**均已落地**（含单测）；`rename_existing` 连接期换名已落地（2026-10-06，`5ba2356`），余项＝`printer.objects` 的可枚举反射（Q5），见 H3 节 | G1b、Q5 |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
-| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
+| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前的 pre/post 活跃窗口等四条余项（PA 本身已驱动运动，2026-10-21），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`bed_mesh` 的 faulty 区域与 `set_zero_reference`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
@@ -578,9 +578,18 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `src/sensor_*.c` 已有，宿主未建）。
 - [ ] **`ads1x1x`**（`ads1x1x.py`）。
 - [ ] **`adxl345` 的寄存器 setup / `_convert_samples` 缩放**（`adxl345.rs:38-40` 自述）。
-- [ ] **`SET_PRESSURE_ADVANCE` 作用于运动**：现在只写槽与 status，运动/求解器不读
-      （`extras/extruder.rs:91-92` `:282`；上游 `kinematics/extruder.py:67-88` → C helper `espa`）——
-      属挤出求解器，与 `input_shaper` 同属「运动保真」块，**不做也能打印**（影响拐角质量）。
+- [x] **`SET_PRESSURE_ADVANCE` 作用于运动 —— 已落地（2026-10-21）**：ESPA 平滑按 `kin_extruder.c` 的解析积分实现（`motion/pressure_advance.rs`），
+      参数是按打印时间的表、逐段查表（改值不改写已生成位置），`SET_PRESSURE_ADVANCE` 写入共享的
+      `Arc<ExtruderPressureAdvance>`；`pa = 0` 有逐点回归保护。同批修了两个既有静默错：挤出机 stepper
+      被 `add_stepper` 重指回主 trapq（从未读自己的）、`ToolHead::set_position` 把 toolhead 坐标写进 extra axis。
+- [ ] **压力提前的余项（2026-10-21 收口时登记）**：
+      1. `gen_steps_pre_active`/`post_active = hst` 未实现（上游 `kin_extruder.c` 的 `extruder_set_pressure_advance`）：
+         首/尾 `hst` 的挤出量被压进移动内而不是跨边界展开——起停处会出现一次小步跳；
+         **`input_shaper` 也需要同一个窗口**，建议两者一起做；
+      2. 改值用 `get_last_move_time()` 落表，**不**走上游的 `register_lookahead_callback`；且 `smooth_time`
+         变更不 `flush_step_generation`——若无 ≥`hst` 的前瞻余量，可能改写 `hst` 内已生成位置、触发一次原地补步；
+      3. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）；
+      4. `find_past_position` 仍是 stub，pa 领先量不经 MCU 计数进 `motion_report`。
 - [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
 - 依赖 F5/F6/F7、C1。
 

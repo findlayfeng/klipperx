@@ -13,18 +13,18 @@
 //! | MCU → host | `buttons_state oid=%c ack_count=%c state=%*s` |
 //!
 //! The firmware's side is `src/buttons.c`. `config_buttons` allocates the oid
-//! and its pin slots (at most eight, `src/buttons.c:63-64`); `buttons_add` fills
+//! and its pin slots (at most eight, `src/buttons.c:76-78`); `buttons_add` fills
 //! one slot with a pin number and its pull-up (`int8_t`: `1` up, `-1` down,
 //! `0` none — sent here as the same byte); `buttons_query` starts the polling
 //! timer at `clock`, every `rest_ticks`, and seeds the debounce with `invert` so
 //! the first report is compared against the right idle level
-//! (`src/buttons.c:101-115`).
+//! (`src/buttons.c:99-116`).
 //!
 //! A report carries one byte per **debounced** change, each byte a level per
 //! pin, and the firmware's own 8-bit message counter in `ack_count`. The host
 //! answers each report with `buttons_ack` and that many bytes; the counter is
 //! what tells a retransmission (the firmware repeats an unreported change every
-//! `retransmit_count` polls, `src/buttons.c:45-53`) from new data.
+//! `retransmit_count` polls, `src/buttons.c:57-64`) from new data.
 
 use crate::core::klippy::cmd::{McuCommand, McuResponse, Params};
 use crate::core::klippy::mcu::McuError;
@@ -36,7 +36,7 @@ use crate::core::klippy::msg::proto::ArgValue;
 pub struct ConfigButtons {
     /// The object id the firmware allocated for this query.
     pub oid: u8,
-    /// How many pins the object polls; at most eight (`src/buttons.c:63`).
+    /// How many pins the object polls; at most eight (`src/buttons.c:77`).
     pub button_count: u8,
 }
 

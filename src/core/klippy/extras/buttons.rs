@@ -11,7 +11,7 @@
 //! # The firmware side
 //!
 //! A registration does not poll anything itself. Upstream groups the
-//! registrations of one MCU into an `MCU_buttons` (`buttons.py:40-92`), which
+//! registrations of one MCU into an `MCU_buttons` (`buttons.py:16-83`), which
 //! configures one firmware button object per eight pins and arms its polling
 //! timer; the firmware then reports the *debounced* level of every pin whenever
 //! one changes. That is what [`McuButtons`] here is: the same object, built on
@@ -39,9 +39,9 @@
 //!
 //! The firmware's `ack_count` is 8-bit and wraps; upstream expands it against
 //! its own counter to tell a **retransmission** (the firmware repeats an
-//! unacknowledged change every `retransmit_count` polls, `src/buttons.c:45-53`)
+//! unacknowledged change every `retransmit_count` polls, `src/buttons.c:57-64`)
 //! from new data, and acks the number of bytes it consumed
-//! (`buttons.py:66-88`). Only the new bytes are turned into callbacks.
+//! (`buttons.py:58-83`). Only the new bytes are turned into callbacks.
 //!
 //! Each pin's `!` (`invert`) is applied to the whole report byte before the
 //! levels are read, as upstream does (`button ^= self.invert`), and the same
@@ -49,7 +49,7 @@
 //! wired active-low idles at zero on both sides.
 //!
 //! Two debounces exist and both are here: the firmware's, which needs a level
-//! to hold for one poll (`QUERY_TIME` = 2 ms, `src/buttons.c:29-46`), and the
+//! to hold for one poll (`QUERY_TIME` = 2 ms, `src/buttons.c:28-70`), and the
 //! host's [`DebounceButton`] (`debounce_delay`, default `0.`), which holds a
 //! change for the configured time before it reaches the consumer.
 //!
@@ -89,15 +89,15 @@ pub const BUTTONS_OBJECT: &str = "buttons";
 pub type ButtonCallback = Box<dyn Fn(f64, bool) + Send + Sync>;
 
 /// How often the firmware polls the pins: upstream's `QUERY_TIME`
-/// (`buttons.py:10`, `0.002` s).
+/// (`buttons.py:13`, `0.002` s).
 const QUERY_TIME: f64 = 0.002;
 
-/// Upstream's `RETRANSMIT_COUNT` (`buttons.py:11`): how many polls an
+/// Upstream's `RETRANSMIT_COUNT` (`buttons.py:14`): how many polls an
 /// unacknowledged change is repeated for. The firmware refuses the value once it
-/// reaches its "no retransmit" bit (`src/buttons.c:113-114`).
+/// reaches its "no retransmit" bit (`src/buttons.c:109-110`).
 const RETRANSMIT_COUNT: u8 = 50;
 
-/// The firmware's per-object pin limit (`src/buttons.c:63-64`): one report byte
+/// The firmware's per-object pin limit (`src/buttons.c:76-78`): one report byte
 /// is one bit per pin.
 const MAX_BUTTONS: usize = 8;
 
@@ -113,10 +113,10 @@ struct GroupCallback {
     callback: Arc<dyn Fn(f64, bool) + Send + Sync>,
 }
 
-/// One firmware button object — upstream's `MCU_buttons` (`buttons.py:40-92`).
+/// One firmware button object — upstream's `MCU_buttons` (`buttons.py:16-83`).
 ///
 /// Upstream makes a new one when a chip's eight pin slots are full
-/// (`buttons.py:333-336`), so a chip may own several; each has its own oid and
+/// (`buttons.py:328-332`), so a chip may own several; each has its own oid and
 /// its own report state.
 struct McuButtons {
     chip: McuChip,
@@ -189,7 +189,7 @@ impl McuButtons {
     }
 
     /// Add one registration's pins to this object — upstream's `setup_buttons`
-    /// (`buttons.py:52-60`).
+    /// (`buttons.py:26-34`).
     fn setup_buttons(&self, pins: &[PinParams], callback: ButtonCallback) {
         let mut state = self.lock();
         let shift = state.pins.len() as u8;
@@ -221,7 +221,7 @@ impl McuButtons {
 
     /// The build-time half: assign the oid, add the config and init commands,
     /// and arrange for the query to be armed on the connection that will
-    /// report. Upstream's `MCU_buttons.build_config` (`buttons.py:61-82`).
+    /// report. Upstream's `MCU_buttons.build_config` (`buttons.py:35-57`).
     fn build(
         self: &Arc<Self>,
         builder: &ConfigBuilder,
@@ -233,7 +233,7 @@ impl McuButtons {
             (state.pins.clone(), state.invert)
         };
         // Querying nothing is not an object: upstream returns before creating
-        // the oid (`buttons.py:62-63`).
+        // the oid (`buttons.py:36-37`).
         if pin_list.is_empty() {
             return Ok(());
         }
@@ -292,7 +292,7 @@ impl McuButtons {
     /// Fold one report in: acknowledge what it delivered, then hand the new
     /// levels to the callbacks.
     ///
-    /// Upstream's `MCU_buttons.handle_buttons_state` (`buttons.py:83-92`). The
+    /// Upstream's `MCU_buttons.handle_buttons_state` (`buttons.py:58-83`). The
     /// ack goes out first, before any consumer code runs, so a slow consumer
     /// cannot make the firmware retransmit what the host already has.
     fn handle_report(&self, report: &ButtonsState) {
@@ -327,7 +327,7 @@ impl McuButtons {
     /// be acknowledged, and what the registrations' levels became.
     ///
     /// `None` when the report carried nothing new — a retransmission, as
-    /// upstream's `if new_count <= 0: return` (`buttons.py:78-79`).
+    /// upstream's `if new_count <= 0: return` (`buttons.py:67-68`).
     #[allow(clippy::type_complexity)]
     fn take_report(
         &self,
@@ -335,7 +335,7 @@ impl McuButtons {
     ) -> Option<(u8, Vec<(Arc<dyn Fn(f64, bool) + Send + Sync>, bool)>)> {
         let mut state = self.lock();
         // The firmware's counter is 8-bit; upstream reads the difference as a
-        // signed byte (`buttons.py:85-87`), so a wrap between two reports is
+        // signed byte (`buttons.py:60-63`), so a wrap between two reports is
         // the small step it looks like rather than a 256-byte jump.
         let ack_diff = (i64::from(report.ack_count) - state.ack_count) & 0xff;
         let ack_diff = if ack_diff & 0x80 != 0 {
@@ -352,7 +352,7 @@ impl McuButtons {
         // The report may repeat bytes the host has already seen at its front.
         // Python's `buttons[-new_count:]` clamps a slice longer than the array
         // to the whole array, which a report after a counter wrap can ask for
-        // (`buttons.py:80`).
+        // (`buttons.py:69`).
         let start = report.state.len().saturating_sub(new_count);
         let new_bytes = report.state.get(start..)?;
         state.ack_count += new_count as i64;
@@ -433,7 +433,7 @@ impl ButtonsRouter {
 }
 
 /// The host-side debounce between the firmware's levels and a consumer —
-/// upstream's `DebounceButton` (`buttons.py:239-269`).
+/// upstream's `DebounceButton` (`buttons.py:252-276`).
 ///
 /// The firmware already requires a level to hold for one poll; this holds the
 /// *transition* for `debounce_delay` on top of that. Two properties are
@@ -549,7 +549,7 @@ impl PrinterButtons {
     /// [`DebounceButton`].
     ///
     /// The debounce delay is read from `config` (the caller's section), as
-    /// upstream's `DebounceButton` reads it (`buttons.py:255`).
+    /// upstream's `DebounceButton` reads it (`buttons.py:257`).
     ///
     /// # Errors
     /// A negative or unparsable `debounce_delay`.
@@ -959,7 +959,7 @@ mod tests {
     }
 
     /// Nine pins do not fit one firmware object (its report is one byte), so
-    /// the ninth starts a second oid — upstream's `buttons.py:333-336`.
+    /// the ninth starts a second oid — upstream's `buttons.py:328-332`.
     #[tokio::test]
     async fn test_a_ninth_pin_starts_a_second_firmware_object() {
         let world = world();
@@ -1268,7 +1268,7 @@ mod tests {
 
     /// ④ The host-side debounce: a level has to hold for `debounce_delay`, and
     /// two edges inside that window are one (cancelled) transition, not two
-    /// callbacks — upstream's `DebounceButton` (`buttons.py:239-269`).
+    /// callbacks — upstream's `DebounceButton` (`buttons.py:252-276`).
     #[test]
     fn test_the_host_debounce_holds_a_change_and_drops_a_bounce() {
         let reactor = Arc::new(ManualReactor::new());

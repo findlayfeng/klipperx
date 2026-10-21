@@ -1071,7 +1071,7 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 | `axes_map` | `x,y,z` | 轴映射（可负，如 `-x,-y,z`） |
 | `rate` | `3200` | 采样率；非法值报 `Invalid rate parameter: %d` |
 
-段/命令层/加速度计接口（`start_internal_client`）与 mux 端点 `adxl345/dump_adxl345`（key `sensor`）已落地。**gap：bulk 数据通路未接**——共享 `FixedFreqReader` 现绑死 LDC1612 的 4 字节样本与 `query_status_ldc1612`，ADXL345 需 `"BBBBB"` 与 `query_adxl345_status`（泛化归 main 的共享基础设施任务）。
+段/命令层/加速度计接口（`start_internal_client`）与 mux 端点 `adxl345/dump_adxl345`（key `sensor`）已落地。**样本通路已通（2026-10-21）**：共享 `FixedFreqReader` 已泛化成按字段表解码（每字段带宽度与符号，`SamplePayload` 在构造期拒绝格式/载荷不匹配），ADXL345 的 5 字节 `"BBBBB"` + `query_adxl345_status`、MPU9250 的 6 字节 `">hhh"` + `query_mpu9250_status` 各自接上寄存器序列与 `_convert_samples` 缩放（含 `axes_map`）；ldc1612/hx71x/ads1220/ads131m0x 行为逐字节不变（默认类型参数 `P = u32`）。
 
 ### `[mpu9250]` / `[mpu9250 <name>]` — 加速度计（wave-2）
 

@@ -86,7 +86,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`replicape` 与 `pwm_tool` 的 `maximum_mcu_duration` 中间更新（见 H2 节） | F3、F4、F6、F7 |
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——**✅ 收官**（三者主体均已落地且含单测；`rename_existing` 连接期换名（2026-10-06，`5ba2356`）；`printer.objects` 的可枚举反射 2026-10-21 落地，见 H3 节） | — |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——**均已落地**（`sdcard_loop` 的三条命令与 `SdCardFile` 接缝 2026-10-21），见 H4 节 | F9、C1 |
-| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
+| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查）；both-edge 已按上游判定链启用（2026-10-21），余项＝两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi，含各自的 `config_*`/send 命令）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
@@ -490,7 +490,7 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `ensure` 无条件建立，`homing` 是运动学层而非可装载模块——这三者不需条目。
       **为什么不能整体无条件**：上游 `[printer]` 是硬前提（`klippy.py:124-125` 无条件建 `ToolHead(config)`），
       本仓的 `[mcu]`-only 配置是合法的，没有 toolhead 就没有可挂的 move-transform 槽。
-      剩下的差：`statistics` 只缺 1 Hz 汇总日志（对象已落地，见 H11）；`garbage_collection` 只缺日志汇总
+      剩下的差：`statistics` 已完整（1 Hz 汇总行 2026-10-21 落地，见 H11）；`garbage_collection` 只缺日志汇总
       （Rust 无 GC 冻结机制，只有延迟告警）。
 
 - [x] **归零丢报告不再锁死（2026-10-18 真机）**：`trsync_state` 路由器提前到会话 `attach` 安装、无主 oid 静默、
@@ -538,14 +538,15 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       自动使能链修掉）；**B** `[manual_stepper]` 未装队列（已由自有 trapq 修掉）；**C** 队列外电机
       **静默空跑**（推进时间轴、返回 Ok、0 步、无日志）——C 已改成 `warn!`（不报错，见下一条）。
       **仍需真机复验**：`MANUAL_STEPPER MOVE=` / `FORCE_MOVE` / `STEPPER_BUZZ` 三条各自的 `queue_step`。
-- [ ] **IDEX 第二滑车根本没有步进生成**（2026-10-18 发现，真缺口）：`idex_modes` 给 `[dual_carriage]`
-      建的 `PrinterStepper` 从不 `take_stepper()`、也从不进 `MotionQueuing`，它的 solver 没挂任何 trapq
-      ⇒ 不只是 `STEPPER_BUZZ` 不响，这一路**整条驱动链**都不出步。上游每个 `MCU_stepper` 建时即
-      `allocate_syncemitter`（`klippy/stepper.py:50-56`），所以 IDEX 机器在那里是正常的；本仓语料此前
-      是**假绿**（只要求 `STEPPER_BUZZ STEPPER=dual_carriage` 不报错）。修法参考
-      `manual_stepper::ensure_motion`（`take_stepper` → `add_extra_axis_stepper` → 装进队列入生成集），
-      但要照顾 kinematics 那一侧（carriage 在 IDEX 里是主 kinematics 的一部分，不是「自有 trapq」那种
-      独立轴），属跨 kinematics/queuing seam 的独立单元。到那时 `force_move` 的 `warn!` 可收掉。
+- [x] **IDEX 第二滑车没有步进生成 —— 已修（2026-10-21）**：先定接线——上游 `cartesian.py:28-38` 把滑车 rail
+      **追加进 `self.rails`** 再 `set_trapq(toolhead.get_trapq())`，所以它跟 `stepper_x` **同一个 queue、各自 solver**，
+      不是 `add_extra_axis_stepper` 那种独立轴。真因有两层：① `idex_modes` 建的 `PrinterStepper` 从未注册成对象 ⇒
+      它自己的 `connect` 不跑、宿主 `Stepper` 根本不存在（`take_stepper()` 才一直取空）；② 没人把它交给 `toolhead`。
+      现按 `dual_carriage_stepper <id>` 隐藏对象注册、`toolhead` 在本仓 `claim` 成立时取出并 `add_stepper` 进主 trapq
+      （判定写进 `idex_modes.rs` 模块文档）。钉子：`test_the_second_carriage_generates_steps_on_its_carriage_axis`。
+      **仍未做**：模式层（激活/去激活的 scale/offset 变换）、hybrid-corexy 族、`G28` 时第二滑车不被自身端停停住
+      ——这些是真缺口，仍在 `idex_modes.rs` 模块文档的 gap 清单里；`force_move` 的 `warn!` 因此保留（hybrid 滑车与
+      `[manual_stepper]` 首个 `MOVE=` 前仍会命中）。
 - [x] **`admin` 工具的 attach 没有会话 takeover —— 已修（2026-10-18）**：接管本来就是 klippy
       identify 的能力（`mcu/mod.rs` 的重号重发），缺的是「握手无应答就再也走不到 identify」。现在
       重试耗尽后改为「不握手开链路 → identify 接管陈旧会话 → 同一 handle 上补做分配握手」；沉默板子
@@ -558,12 +559,13 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       重走 drip 段，重走出来的步落在 compressor 的 `last_step_clock` 之前 ⇒ `check_line` 报
       `Invalid sequence`。修法：地平线起点取 `max(两处)`，并在未触发分支补上游的收尾（`&[]` 不标
       homed）。仍待真机复验一次。
-- [ ] **both-edge（`dedge`）**：宿主侧不选用——`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，
-      `mcu/resource/stepper.rs` 只发 `invert_step` + `step_pulse_ticks`，所以 TMC 从不写 `dedge`。
-      **固件是支持的**：`src/stepper.c` 声明 `STEPPER_STEP_BOTH_EDGE=1`、`invert_step < 0` 走单定时器路径，
-      `Kconfig` 的 `WANT_STEPPER_OPTIMIZED_BOTH_EDGE` 默认 y。缺的是主机侧按
-      `STEPPER_STEP_BOTH_EDGE`/`STEPPER_OPTIMIZED_UNSTEP` + 脉宽算出 `want_both_edges`
-      （上游 `stepper.py:86-113`）并未 `invert_step=-1`。属优化项，不影响正确性。
+- [x] **both-edge（`dedge`）—— 已按上游判定链启用（2026-10-21）**：`mcu/resource/stepper.rs` 新增
+      `StepPulse`/`StepEdgeConstants`/`resolve_step_config`，逐行移植 `stepper.py:82-113`：脉宽 `>500 ns`
+      否决 → `STEPPER_BOTH_EDGE` 且 `>150 ns` 否决 → `SSBE`/`SBE` 都缺则否决 → `STEPPER_OPTIMIZED_UNSTEP`
+      抢占；成立时 `invert_step=-1`，老 MCU（`STEPPER_BOTH_EDGE`）额外把脉宽归零。`PrinterStepper::get_pulse_duration()`
+      第二项现在是真值。**默认行为不变**：本仓 `Kconfig` 的 `WANT_STEPPER_OPTIMIZED_BOTH_EDGE` 默认 y ⇒
+      `sou=1` 走第 4 级否决，仍单沿；要真启用得换固件配置。缺 `configfile.deprecate_mcu_code` 的 seam ⇒
+      用同文案 `tracing::warn!`。
 - 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。
 
 ### H6 传感器与块状数据
@@ -590,7 +592,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `sensor_lis2dw.c` / `sensor_bmi160.c` 已有，宿主未建）。注意 **`lis3dh` 不需要单独的固件支持**：
       上游 `lis3dh.py` 复用 `lis2dw` 的类型分支，`Kconfig` 也把两者合在一个选项。
 - [ ] **`ads1x1x`**（`ads1x1x.py`）。
-- [ ] **`adxl345` 的寄存器 setup / `_convert_samples` 缩放**（`adxl345.rs:38-40` 自述）。
+- [x] **`adxl345` 的寄存器 setup / `_convert_samples` 缩放 —— 已落地（2026-10-21）**：`FixedFreqReader` 泛化成
+      按字段表解码（`SampleField{width,signed}` + `SamplePayload` trait + `decode_fields::<N>()`，默认类型参数
+      保证 ldc1612/hx71x/ads1220/ads131m0x 逐字节不变），ADXL345 的 5 字节 `"BBBBB"` 与 MPU9250 的 6 字节
+      `">hhh"` 各自接上寄存器序列与缩放/`axes_map`。
 - [x] **`SET_PRESSURE_ADVANCE` 作用于运动 —— 已落地（2026-10-21）**：ESPA 平滑按 `kin_extruder.c` 的解析积分实现（`motion/pressure_advance.rs`），
       参数是按打印时间的表、逐段查表（改值不改写已生成位置），`SET_PRESSURE_ADVANCE` 写入共享的
       `Arc<ExtruderPressureAdvance>`；`pa = 0` 有逐点回归保护。同批修了两个既有静默错：挤出机 stepper
@@ -734,10 +739,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       flush/active 回调全部 `catch_unwind`；panic 记 `error!`（带回调名与 panic 文本）后丢弃那个定时器，
       其余照常调度（详见 `docs/klippy/developer-manual/architecture.md`）。
 
-- [ ] `statistics.py` 的 **`PrinterStats` 半**：上游每秒打一行主机统计汇总（`statistics.py:47-72`）。
-      对象那半已落地（`extras/system_stats.rs` 无条件注册 `system_stats`，报
-      `sysload`/`cputime`/`memavail`/`dropped_logs`/`dispatch`），本仓以反应堆延迟告警替代该日志行；
-      要补时需要 `PrinterObject` 上的 `stats` 回调位（现在 trait 没有）。
+- [x] **`statistics.py` 的 `PrinterStats` 半 —— 已落地（2026-10-21）**：`PrinterObject` 新增
+      `stats() -> Option<(bool, String)>`（默认 `None`），新模块 `extras/printer_stats.rs` 在 `klippy:ready`
+      收集各部件、按 `Weak` 捕获装 1 Hz 定时器、`max(first)` 为真才打 `Stats <eventtime>: <key=value…>`
+      （`debugoutput` 下不装定时器，对齐上游）；`DEFAULT_MODULES` 现在是 `["idle_timeout", "printer_stats"]`。
+      `system_stats` 与 `temperature_probe` 已改为 trait 实现。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
   `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
 - [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs`（现迁移至
@@ -1097,8 +1103,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `move_clocks` 发送失败退回槽位、`TriggerDispatch::stop()` 保留原始失败理由（探针失败不再读成主机请求）、
       `trigger_analog` 的 arm 带 `reqclock` 且先停再清了、端停链路故障不再吞掉 `Communication timeout during homing`、
       `stress --task step` 加行程上界（`position_max × 0.5`）+ 三种出口（断线 exit 1）+ `shutdown_timeout` + 有界 `wait_for_idle`。
-- [ ] `pending::cancel` 删的是「第一个同名同 oid 匹配」而非 token：同名并发调用时先超时者会删掉别人的登记；
-      `resolve` 对「有同名登记但 oid 不匹配」也返回 `true`（`mcu/pending.rs`）。修法：`register` 返回自增 token，按 token 精确删。
+- [ ] `pending::cancel` 已改为按 token 精确删（2026-10-21：`register` 返回 `PendingCallToken`，计数在登记表内 `Arc<AtomicU64>`、
+      随 clone 共享；三条清理路径都按自己那笔的 token 取消）；**剩下的一半**：`resolve` 对「有同名登记但 oid 不匹配」
+      仍返回 `true`（`mcu/pending.rs`）。
 - [x] **`hardware_test` 的用例级总超时与 teardown 护栏 —— 已落地（2026-10-21）**：
       `hardware_test::case`/`async_case` 把用例体放自管线程、主线程 `recv_timeout(300 s)` 并打
       `HW-TIMEOUT: <用例>: still at <阶段> after <时长>`；板锁 `LOCK_EX|LOCK_NB` 轮询、`LOCK_TIMEOUT=600 s`

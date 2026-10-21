@@ -201,7 +201,7 @@ identify 是唯一的例外：它不在这一层，格式由主机自有、且�
 | 项 | 说明 |
 |----|------|
 | `output` 表的异步投递 | `sendf` 类事件（`responses` 表）已可经 `Mcu::bind_event` 回调投递；但 `output()` 申报的消息留在 `output` 表里，`Dictionary` 已解析却**不注册**，也没有对应通道 |
-| 并发同名响应 | `PendingCalls` 只按响应名匹配，先到先得；两个并发 `get_clock` 会互相抢答，需要 `oid` 之类的区分参数 |
+| 并发同名响应 | `PendingCalls`：派发按 name+oid 先到先得；`register` 返回 `PendingCallToken`，三条清理路径按 token 精确取消（2026-10-21）。**残余**：`resolve` 对「有同名登记但 oid 不匹配」仍返回 `true` |
 | 枚举参与编解码 | `ArgType` 没有枚举变体，枚举只在 `Params::get_enum` 与 `Dictionary` 里手工解析 |
 | 命名参数 | `Param` 类型已定义但未接入 `Parser::encode` |
 

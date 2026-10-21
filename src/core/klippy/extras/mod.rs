@@ -55,6 +55,7 @@ pub mod homing_heaters;
 pub mod homing_override;
 pub mod hx71x;
 pub mod i2c_device;
+pub mod icm20948;
 pub mod idex_modes;
 pub mod idle_timeout;
 pub mod input_shaper;

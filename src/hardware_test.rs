@@ -230,6 +230,19 @@
 //! subscription can trip the bound; the cycle itself is fixed where it lives,
 //! never papered over with `Mcu::close` here.
 //!
+//! # The machine is turned off before it is torn down
+//!
+//! A case over the second layer can command hardware: `M104`/`M140` set a
+//! target, `SET_PIN` drives a fan or a PWM output. A case that commands one and
+//! then fails would leave the board doing it — on a real printer, heating — for
+//! as long as it stays powered. So [`StartedMachine`]'s `Drop` turns the machine
+//! off **before** it takes the parts down: `TURN_OFF_HEATERS` (every heater's
+//! target to 0) and `SET_PIN PIN=<name> VALUE=0` for every `[output_pin]` that is
+//! not already at zero. It runs on both paths, the pass and the panic, because
+//! it is in `Drop` rather than in the case body, and it reports what it put back
+//! as `HW-TEARDOWN:` lines (best effort: a machine that is already shut down
+//! refuses commands, which is another off state).
+//!
 //! # Ignored is reported, not failed
 //!
 //! `cargo test` and `cargo test --workspace` never touch the config: every test
@@ -274,6 +287,9 @@ use tokio::runtime::Runtime;
 use crate::core::klippy::api::StartArgs;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
+use crate::core::klippy::extras::heaters::HEATERS_OBJECT;
+use crate::core::klippy::extras::output_pin::OutputPin;
+use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::ids::NODEID_FIRST;
 use crate::core::klippy::printer::{Printer, PrinterState};
@@ -847,15 +863,27 @@ impl StartedMachine {
 }
 
 impl Drop for StartedMachine {
-    /// Take the machine down, then bound the runtime's shutdown.
+    /// Turn the machine off, take it down, then bound the runtime's shutdown.
     ///
-    /// In this order, and for this reason: the parts the config loaded are what
-    /// shut a device down when they drop (`Mcu::Drop` → `Interface::shutdown`,
-    /// which releases the blocking read the session parked), so they have to go
-    /// while the runtime is still alive to carry that — and only then does the
-    /// runtime get its bound. Dropping the machine as well is what makes the
-    /// bound mean something: whatever is still holding a device afterwards was
-    /// leaked by a part, not kept alive by this framework.
+    /// **The machine is turned off first** ([`turn_everything_off`]): every
+    /// heater's target goes to zero and every `[output_pin]` that is not
+    /// already at zero is driven back to zero, through the same g-code the
+    /// host's own client would send (`TURN_OFF_HEATERS`, `SET_PIN … VALUE=0`).
+    /// This runs on **both** paths — a case that passes and a case that panics —
+    /// because it is here, in `Drop`, and not in the case body: a case that set
+    /// a target and then failed on the next assertion would otherwise leave the
+    /// board heating, which is the one thing a test lane must never do. The
+    /// commands are best effort and report as `HW-TEARDOWN:` lines; a machine
+    /// that is already shut down refuses them, which is another off state.
+    ///
+    /// Then, in this order, and for this reason: the parts the config loaded
+    /// are what shut a device down when they drop (`Mcu::Drop` →
+    /// `Interface::shutdown`, which releases the blocking read the session
+    /// parked), so they have to go while the runtime is still alive to carry
+    /// that — and only then does the runtime get its bound. Dropping the machine
+    /// as well is what makes the bound mean something: whatever is still holding
+    /// a device afterwards was leaked by a part, not kept alive by this
+    /// framework.
     ///
     /// A runtime that does not finish inside [`SHUTDOWN_TIMEOUT`] is a **panic**
     /// naming the leak: the live shape's blocked read cannot be cancelled, so
@@ -865,6 +893,7 @@ impl Drop for StartedMachine {
     /// abort the process instead of reporting either.
     fn drop(&mut self) {
         if let Some(printer) = self.printer.take() {
+            turn_everything_off(&printer);
             printer.teardown();
             drop(printer);
         }
@@ -891,6 +920,91 @@ impl Drop for StartedMachine {
              `Mcu::close`; the cycle itself is what has to go. See \
              `docs/klippy/developer-manual/testing.md`."
         );
+    }
+}
+
+/// Turn the machine off before it is torn down: every heater's target to zero,
+/// every output that is on back to zero.
+///
+/// What it fixes: a case that set `M104 S200`, or drove a fan, and then failed
+/// on the next assertion used to leave the board doing exactly that for as long
+/// as the printer stayed powered. `Drop` is where this belongs, because it is
+/// the one piece of a case that runs on both paths — the ordinary return and the
+/// panic — and it runs before the parts go.
+///
+/// The two commands are the host's own, not a private back door:
+/// `TURN_OFF_HEATERS` is what upstream's `cmd_TURN_OFF_HEATERS` runs
+/// (`heaters.py:283-285`, giving every registered heater a target of 0), and
+/// `SET_PIN PIN=<name> VALUE=0` is upstream's `output_pin` command
+/// (`output_pin.py:196-269`). Both are read off the machine's own status: the
+/// heater registry's presence, and the value each `[output_pin]` last drove —
+/// only pins that are not already at zero are sent.
+///
+/// Best effort, never a panic: this runs while unwinding as often as not, and a
+/// machine that is already shut down refuses commands. Each line it sends, and
+/// each refusal, is printed as an `HW-TEARDOWN:` line so a run says what it put
+/// back.
+fn turn_everything_off(printer: &Arc<Printer>) {
+    let heater_registry = printer.lookup_object(HEATERS_OBJECT).is_some();
+    let outputs: Vec<(String, f64)> = printer
+        .lookup_objects_as::<OutputPin>(Some("output_pin"))
+        .into_iter()
+        .map(|(registered, pin)| {
+            let value = printer
+                .status_of(&registered, printer.eventtime())
+                .and_then(|status| status.get("value").and_then(serde_json::Value::as_f64))
+                .unwrap_or(0.0);
+            (pin.name().to_string(), value)
+        })
+        .collect();
+    let lines = turn_off_script(heater_registry, &outputs);
+    if lines.is_empty() {
+        return;
+    }
+    let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) else {
+        println!("HW-TEARDOWN: no g-code dispatcher, so nothing can be turned off");
+        return;
+    };
+    drive_teardown(lines, |line| {
+        gcode
+            .run_script_sync(line)
+            .map_err(|error| error.to_string())
+    });
+}
+
+/// The g-code [`turn_everything_off`] sends, from what the machine reports.
+///
+/// `heater_registry` is whether the config built a `heaters` registry at all
+/// (`[extruder]`'s `heaters::ensure` does, so a config with no heater section
+/// has nothing to turn off); `outputs` is every `[output_pin]`'s name and the
+/// value it last drove. A pin already at zero is left alone — the command would
+/// be a no-op, and a run's `HW-TEARDOWN:` lines should say what changed.
+fn turn_off_script(heater_registry: bool, outputs: &[(String, f64)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if heater_registry {
+        lines.push("TURN_OFF_HEATERS".to_string());
+    }
+    for (name, value) in outputs {
+        if *value != 0.0 {
+            lines.push(format!("SET_PIN PIN={name} VALUE=0"));
+        }
+    }
+    lines
+}
+
+/// Run `lines` through `run`, reporting each one rather than panicking.
+///
+/// `run` is a parameter so the driving can be exercised without a machine: a
+/// test records what was sent, and sees a refusal reported rather than raised.
+fn drive_teardown<F>(lines: Vec<String>, mut run: F)
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    for line in lines {
+        match run(&line) {
+            Ok(()) => println!("HW-TEARDOWN: {line}"),
+            Err(error) => println!("HW-TEARDOWN: {line} failed: {error}"),
+        }
     }
 }
 
@@ -2301,6 +2415,77 @@ mod tests {
         let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         assert!(message.contains("printer.cfg"), "{message}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The teardown — the machine turned off on both paths
+    // -----------------------------------------------------------------------
+
+    /// What the teardown sends: every heater off, and only the outputs that are
+    /// actually on.
+    ///
+    /// `outputs` is the recording fake of the machine's own status — the pair
+    /// `turn_everything_off` reads for each `[output_pin]` — so the decision is
+    /// checked without a board.
+    #[test]
+    fn test_the_teardown_turns_heaters_off_and_only_the_outputs_that_are_on() {
+        let outputs = vec![
+            ("fan".to_string(), 0.6),
+            ("led".to_string(), 0.0),
+            ("pwm".to_string(), 1.0),
+        ];
+
+        assert_eq!(
+            turn_off_script(true, &outputs),
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+                "SET_PIN PIN=pwm VALUE=0".to_string(),
+            ],
+            "the heaters go off, and a pin already at zero is left alone"
+        );
+
+        // A config with no heater section has no registry to command, and a
+        // machine with nothing on has nothing to send at all.
+        assert_eq!(
+            turn_off_script(
+                false,
+                &["led".to_string()]
+                    .iter()
+                    .map(|name| (name.clone(), 0.0))
+                    .collect::<Vec<_>>()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The driving: every line is sent, in order, and a refusal is reported
+    /// rather than raised — this runs while unwinding as often as not.
+    #[test]
+    fn test_the_teardown_sends_every_line_and_reports_a_refusal() {
+        let mut sent = Vec::new();
+        drive_teardown(
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+            ],
+            |line| {
+                sent.push(line.to_string());
+                if line.contains("SET_PIN") {
+                    return Err("the machine is shut down".to_string());
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            sent,
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+            ],
+            "both lines are sent, and the refusal of one does not stop the other"
+        );
     }
 
     // -----------------------------------------------------------------------

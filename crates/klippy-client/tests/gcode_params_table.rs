@@ -58,9 +58,10 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     // Pinning the total is what keeps that sum honest: were the scanner to stop
     // recognising a call site entirely, this drops and the check goes red.
     // `[sdcard_loop]`'s three commands share one registration loop (94 → 95);
-    // `[z_thermal_adjust]`'s `SET_Z_THERMAL_ADJUST` is the next one (95 → 96).
+    // `[z_thermal_adjust]`'s `SET_Z_THERMAL_ADJUST` is the next one (95 → 96),
+    // and `[tuning_tower]`'s one command is its own site (96 → 97).
     assert_eq!(
-        scan.call_sites, 96,
+        scan.call_sites, 97,
         "the number of registration call sites the scanner sees changed"
     );
 

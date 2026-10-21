@@ -33,6 +33,8 @@ scripts/host-stability.sh                 # 默认：满配，不接真板
 | B API 时延 | ~15 s | 8 路 `gcode/script` + 8 路 `info` 压着跑，然后 100 次串行计时 | 0 次失败/超时；p50 ≤ 20 ms（含客户端进程启动）；p99 ≤ 100 ms 为建议值 |
 | C 重启风暴 | `--storm` 次（默认 60） | 连打 `RESTART`，每次看线程数/RSS | 全部被接受；线程数不变；RSS 增长 ≤ 10 MiB；结束 15 s 内回到 `ready`；SIGTERM 5 s 内干净退出 |
 | D 调度 | 与 B 重叠 15 s | `scripts/kx-sched.py` 采每线程运行队列等待 | `klippy-mcu` 最差均值 ≤ 100 µs（建议值） |
+| F 盘停顿 | `--f-stall` 秒（默认 20） | `scripts/disk-stall.py`：顺序读写 MB/s、4 KiB 随机读 p50/p99/max，**再在持续写+fsync 压力下重测**（这才是廉价 TF 的失效形状：平均值好看，偶发几百 ms～秒级停顿）；然后用回放 4 万行 gcode 看 `file_position` 推进有没有空档 | 4 KiB 随机 ≥ 500 IOPS；受压时无读数 > 200 ms；回放不停顿且 `over_threshold = 0`（建议值） |
+| F2 日志余量 | 与 A 同时采样 | 队列容量 1024 条 ÷ A 段实测行速率 = **这块盘能容忍多长的停顿而不丢日志** | 计算的数，不判 PASS/FAIL |
 | E 真板 | ~15 s | 只有带 `--config` 才跑：`ready` + 两份 `last_stats` 差分 | 有字节流动（`bytes_read` 在涨）；`srtt` 出现为建议值 |
 
 **为什么是这些判据**：
@@ -48,6 +50,17 @@ scripts/host-stability.sh                 # 默认：满配，不接真板
   离群意味着某个 endpoint 或锁在特定时刻把 api runtime 卡住了。
 
 ## 三条卡片机特有的坑（都是实测出来的）
+
+> **F 段为什么看 p99/max 而不用平均吞吐**：廉价 TF 的典型失效不是「慢」，是「偶发停顿」
+> （控制器内部 GC / 映射表刷新）。平均 1200 IOPS 的卡完全可能在持续写几十秒后卡 1 s。
+> 平均吞吐看不见它，`disk-stall.py` 的「持续写 + fsync 期间测随机读」就是专门把它逗出来。
+> 判读：受压时读的 **max** 在 100 ms 级 ⇒ 只是慢，主进程仍然不受影响（日志丢弃计数会说话）；
+> 上到秒级 ⇒ 打印回放会看到空档，但机器时间线仍不受影响（读在 blocking 池上）。
+>
+> **F2 的日志余量是算的，不是压的**：本宿主**不按 gcode 命令打日志**，所以不接真板、没有真打印时，
+> 日志速率小到无法把 1024 条队列填满。报告里给的数是「队列容量 ÷ 实测行速率」，换成你自己的日志
+> 速率就对（例：某张卡实测 41 B/行、340 B/s ⇒ ≈8 行/s ⇒ 能容忍 128 s 停顿）。要真测丢弃，得在
+> 真板打印时把 `RUST_LOG` 开到 `debug`，那条路径的典型量级是 2000 行/s（≈180 KB/s）。
 
 1. **cgroup 配额会把 worker 数压到 1。** `std::thread::available_parallelism()` 在 Linux 上跟着
    `cpu.max` 走：`CPUQuota=25%` 时报 **1**。API runtime 因此有 `max(2, …)` 的下限

@@ -73,9 +73,6 @@ const TOOLHEAD_OBJECT: &str = "toolhead";
 /// The stepper whose step distance is the minimum adjustment upstream applies.
 const Z_STEPPER: &str = "stepper_z";
 
-/// The Z axis index (`mathutil::Z_AXIS`, named here for the reads below).
-const Z: usize = Z_AXIS;
-
 /// Upstream's `SET_Z_THERMAL_ADJUST` help text.
 const SET_Z_THERMAL_ADJUST_HELP: &str = "Set/query Z Thermal Adjust parameters.";
 
@@ -155,7 +152,7 @@ pub struct ZThermalAdjust {
     /// g-code slot was empty (upstream's `self.toolhead`).
     target: Mutex<Option<Arc<dyn MoveTarget>>>,
     /// The transform this one displaced from `gcode_move`'s slot (upstream
-    /// `next_transform`, `z_thermal_adjust.py:44`); `None` while the slot was
+    /// `next_transform`, `z_thermal_adjust.py:68`); `None` while the slot was
     /// empty when this one took it.
     next_transform: Mutex<Option<Arc<dyn MoveTarget>>>,
 }
@@ -218,7 +215,7 @@ impl ZThermalAdjust {
     }
 
     /// The events upstream's `__init__` subscribes to
-    /// (`z_thermal_adjust.py:27-31`).
+    /// (`z_thermal_adjust.py:27-30`).
     fn register_handlers(self: &Arc<Self>, printer: &Arc<Printer>) {
         printer.register_event_handler(
             KlippyEvent::KlippyConnect,
@@ -253,6 +250,9 @@ impl ZThermalAdjust {
             *object.target.lock().unwrap_or_else(|p| p.into_inner()) =
                 Some(Arc::new(ToolheadMove(toolhead)));
         }
+        // Upstream pulls this out of the kinematics' `stepper_z` and fails the
+        // load without one; a machine with no `[stepper_z]` (a delta) keeps
+        // 0.0 here, which means every change applies.
         if let Some(stepper) = printer.lookup_object_as::<PrinterStepper>(Z_STEPPER) {
             object.lock_state().z_step_dist = stepper.step_dist();
         }
@@ -261,7 +261,7 @@ impl ZThermalAdjust {
             return;
         };
         match gcode_move.set_move_transform(Arc::clone(object) as Arc<dyn MoveTarget>, true) {
-            // `next_transform` (`z_thermal_adjust.py:44`): whatever held the
+            // `next_transform` (`z_thermal_adjust.py:68`): whatever held the
             // slot — `bed_mesh`/`bed_tilt` when one of them registered first —
             // is what the forwarded moves go through.
             Ok(previous) => {
@@ -276,9 +276,10 @@ impl ZThermalAdjust {
         }
     }
 
-    /// Upstream's `handle_homing_move_end`: Z homing re-references the offset.
+    /// Upstream's `handle_homing_move_end`
+    /// (`z_thermal_adjust.py:86-91`): Z homing re-references the offset.
     fn handle_home_rails_end(&self, axes: &[usize]) {
-        if !axes.contains(&Z) {
+        if !axes.contains(&Z_AXIS) {
             return;
         }
         let mut state = self.lock_state();
@@ -311,8 +312,9 @@ impl ZThermalAdjust {
         })
     }
 
-    /// Upstream's `calc_adjust`: the toolhead position for a g-code move —
-    /// refresh the offset from the current reading, then add it.
+    /// Upstream's `calc_adjust` (`z_thermal_adjust.py:93-117`): the toolhead
+    /// position for a g-code move — refresh the offset from the current
+    /// reading, then add it.
     fn calc_adjust(&self, state: &mut State, position: Coord) -> Coord {
         if position.z() < self.off_above_z {
             let delta_t = state.smoothed_temp - state.ref_temperature;
@@ -333,7 +335,7 @@ impl ZThermalAdjust {
             }
         }
         let mut adjusted = position;
-        adjusted.set_axis(Z, position.z() + state.z_adjust_mm);
+        adjusted.set_axis(Z_AXIS, position.z() + state.z_adjust_mm);
         state.last_z_adjust_mm = state.z_adjust_mm;
         adjusted
     }
@@ -341,11 +343,11 @@ impl ZThermalAdjust {
     /// Upstream's `calc_unadjust`: the g-code position behind a toolhead one.
     fn calc_unadjust(state: &State, position: Coord) -> Coord {
         let mut unadjusted = position;
-        unadjusted.set_axis(Z, position.z() - state.z_adjust_mm);
+        unadjusted.set_axis(Z_AXIS, position.z() - state.z_adjust_mm);
         unadjusted
     }
 
-    /// Register the section's command (`z_thermal_adjust.py:44-46`).
+    /// Register the section's command (`z_thermal_adjust.py:58-60`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -449,8 +451,8 @@ impl ZThermalAdjust {
     }
 }
 
-/// Upstream's `temperature_callback`: the low-pass filter over the raw
-/// readings.
+/// Upstream's `temperature_callback` (`z_thermal_adjust.py:135-146`): the
+/// low-pass filter over the raw readings.
 ///
 /// `adj_time` is the share of the gap the reading is allowed to move the
 /// smoothed value, capped at 1 so a reading after a long gap lands on it.
@@ -467,7 +469,7 @@ fn temperature_callback(state: &Mutex<State>, read_time: f64, temp: f64) {
 }
 
 impl MoveTarget for ZThermalAdjust {
-    /// Upstream's `move` (`z_thermal_adjust.py:106-114`): an extrusion-only
+    /// Upstream's `move` (`z_thermal_adjust.py:124-133`): an extrusion-only
     /// move (X and Y unchanged) keeps the offset the last real move applied; a
     /// travel recomputes it. Disabled means the last offset is still applied —
     /// `adjust_enable` only stops the *updates*.
@@ -483,7 +485,7 @@ impl MoveTarget for ZThermalAdjust {
                 position.x() == state.last_position.x() && position.y() == state.last_position.y();
             let forward = if xy_unchanged || !state.adjust_enable {
                 let mut forward = position;
-                forward.set_axis(Z, position.z() + state.last_z_adjust_mm);
+                forward.set_axis(Z_AXIS, position.z() + state.last_z_adjust_mm);
                 forward
             } else {
                 self.calc_adjust(&mut state, position)
@@ -494,7 +496,7 @@ impl MoveTarget for ZThermalAdjust {
         target.move_to(forward, speed)
     }
 
-    /// Upstream's `get_position` (`z_thermal_adjust.py:99-103`): the chain's
+    /// Upstream's `get_position` (`z_thermal_adjust.py:119-122`): the chain's
     /// position with the offset **removed**, and the cached last position
     /// re-derived through the current offset.
     fn position(&self) -> Coord {
@@ -510,14 +512,15 @@ impl MoveTarget for ZThermalAdjust {
 }
 
 impl GcodeTempSensor for ZThermalAdjust {
-    /// Upstream's `get_temp`: the filtered reading, with no target.
+    /// Upstream's `get_temp` (`z_thermal_adjust.py:147-148`): the filtered
+    /// reading, with no target.
     fn get_temp(&self, _eventtime: f64) -> (f64, f64) {
         (self.lock_state().smoothed_temp, 0.0)
     }
 }
 
 impl PrinterObject for ZThermalAdjust {
-    /// Upstream's `get_status` (`z_thermal_adjust.py:63-72`).
+    /// Upstream's `get_status` (`z_thermal_adjust.py:76-84`).
     fn get_status(&self, _eventtime: f64) -> Value {
         let state = self.lock_state();
         json!({
@@ -572,7 +575,7 @@ impl MoveTarget for ToolheadMove {
     }
 }
 
-/// Upstream's `load_config` (`z_thermal_adjust.py:177-178`).
+/// Upstream's `load_config` (`z_thermal_adjust.py:187-188`).
 pub fn load_config(
     config: &ConfigWrapper,
     printer: &Arc<Printer>,

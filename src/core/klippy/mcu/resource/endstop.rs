@@ -223,7 +223,10 @@ impl McuEndstop {
     /// ended without a hit.
     ///
     /// # Errors
-    /// Returns [`McuError`] on a communication timeout or a missing answer.
+    /// Returns [`McuError`] on a communication timeout or a missing answer. A
+    /// move that failed is reported as upstream's "Communication timeout during
+    /// homing" even when the link itself breaks while the check is disarmed —
+    /// the send error then follows as the detail.
     pub async fn home_wait(&self, home_end_time: f64) -> Result<f64, McuError> {
         let mcu = self
             .chip
@@ -240,12 +243,19 @@ impl McuEndstop {
         let disabled = mcu.send_msg(&EndstopHome::disable(self.oid));
         // Reset the firmware's group; the completion already recorded why.
         self.dispatch.stop();
-        disabled?;
+        // The move's failure is what gets named first: upstream raises
+        // "Communication timeout during homing" for a `res >= REASON_COMMS_TIMEOUT`
+        // (`MCU_endstop.home_wait`, `klippy/mcu.py:390-393`), and a link that
+        // breaks on the disarm above must not replace that diagnosis with a bare
+        // send error. The send error stays as the detail.
         if reason.is_failure() {
-            return Err(McuError::Config(
-                "Communication timeout during homing".to_string(),
-            ));
+            return Err(match disabled {
+                Ok(()) => McuError::Config("Communication timeout during homing".to_string()),
+                Err(err) => McuError::Config(format!("Communication timeout during homing: {err}")),
+            });
         }
+        // With the reason ruled out, a failed disarm speaks for itself.
+        disabled?;
         if reason != TriggerReason::EndstopHit {
             return Ok(0.0);
         }
@@ -396,6 +406,73 @@ mod tests {
         // anything but an endstop hit. This is the pure half of the decision.
         assert!(!TriggerReason::EndstopHit.is_failure());
         assert_eq!(TriggerReason::from_u8(1), Some(TriggerReason::EndstopHit));
+    }
+
+    /// A failed move is reported as upstream's "Communication timeout during
+    /// homing" (`MCU_endstop.home_wait`, `klippy/mcu.py:390-393`).
+    #[tokio::test]
+    async fn test_home_wait_reports_the_upstream_timeout_message() {
+        let wire = RecordingWire::new();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let endstop = McuEndstop::new(chip_with(Arc::clone(&mcu)), &params("PA1", false)).unwrap();
+
+        // What the dispatch's wait records when the firmware never reports.
+        endstop
+            .dispatch()
+            .completion()
+            .complete(TriggerReason::CommsTimeout);
+
+        let err = tokio::time::timeout(Duration::from_secs(5), endstop.home_wait(1.0))
+            .await
+            .expect("the wait is bounded")
+            .expect_err("a failed dispatch fails the wait");
+        assert!(
+            err.to_string()
+                .contains("Communication timeout during homing"),
+            "{err}"
+        );
+        assert!(
+            !err.to_string().contains("the connection is closed"),
+            "no link failure here, so no detail: {err}"
+        );
+    }
+
+    /// A link that breaks while the check is disarmed must not swallow the
+    /// move's own failure: the upstream message stays, and the send error
+    /// becomes its detail.
+    #[tokio::test]
+    async fn test_home_wait_keeps_the_timeout_message_when_the_disarm_send_fails() {
+        let wire = RecordingWire::new();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let endstop = McuEndstop::new(chip_with(Arc::clone(&mcu)), &params("PA1", false)).unwrap();
+
+        endstop
+            .dispatch()
+            .completion()
+            .complete(TriggerReason::CommsTimeout);
+        // The link is gone by the time `home_wait` disarms the check, so the
+        // `endstop_home` disable send fails.
+        mcu.close();
+
+        let err = tokio::time::timeout(Duration::from_secs(5), endstop.home_wait(1.0))
+            .await
+            .expect("the wait is bounded")
+            .expect_err("a failed dispatch fails the wait");
+        assert!(
+            err.to_string()
+                .contains("Communication timeout during homing"),
+            "upstream's attribution must survive a broken link: {err}"
+        );
+        assert!(
+            err.to_string().contains("the connection is closed"),
+            "the send error stays as the detail: {err}"
+        );
     }
 
     /// Encode one message with the test dictionary's formats.

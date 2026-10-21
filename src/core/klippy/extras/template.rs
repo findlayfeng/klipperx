@@ -51,9 +51,15 @@
 //!   and `'<name>' in printer` asks whether that object is registered
 //!   (`GetStatusWrapper.__contains__`, `:33-37`) — the engine's containment
 //!   check on a map object *is* its lookup, so an unregistered name is absent,
-//!   not an error. The view is not enumerable, the way upstream's wrapper is
-//!   not iterable; a `{% for %}` over `printer` is refused rather than
-//!   silently walking every object the machine registered.
+//!   not an error. The view is not enumerable, so a `{% for %}` over `printer`
+//!   is refused rather than silently walking every object the machine
+//!   registered.
+//! - `printer.objects` is the reflection onto that same view: an enumerable
+//!   map from object name to status, holding the objects `objects/list`
+//!   reports ([`Printer::queryable_objects`]) in registration order. Each
+//!   lookup is the cached status `printer['<name>']` returns, and a name that
+//!   is unregistered or reports no status is absent — Strict then fails the
+//!   render if the body uses it.
 //! - **Only a `printer` status array** becomes a [`Coord`]: klippy reports
 //!   `Coord` namedtuples (`klippy/gcode.py`) whose fields are `x y z e`
 //!   (`mathutil.rs`), this host's statuses are JSON arrays, and a body reads
@@ -283,6 +289,16 @@ impl PrinterView {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
+
+    /// The reflection view `printer.objects` reads: this view again (one
+    /// cache for both spellings) over the queryable names in registration
+    /// order.
+    fn objects(&self) -> ObjectsView {
+        ObjectsView {
+            printer: self.clone(),
+            names: Arc::new(self.printer.queryable_objects()),
+        }
+    }
 }
 
 impl Object for PrinterView {
@@ -291,14 +307,90 @@ impl Object for PrinterView {
     }
 
     fn get_value(self: &Arc<Self>, key: &MjValue) -> Option<MjValue> {
-        self.status(key.as_str()?)
+        let name = key.as_str()?;
+        // The reflection view, which the todo tracks as `printer.objects`.
+        // Reserved on purpose: no machine registers a part under this name,
+        // and a body that reads it wants the reflection, not a lookup.
+        if name == OBJECTS_KEY {
+            return Some(MjValue::from_object(self.objects()));
+        }
+        self.status(name)
     }
 
     /// Not enumerable: upstream's wrapper is a `__getitem__`-only mapping, so
     /// `{% for %}` over `printer` is refused, while containment (a map lookup)
-    /// and truthiness still work.
+    /// and truthiness still work. [`ObjectsView`] is the enumerable side.
     fn enumerate(self: &Arc<Self>) -> Enumerator {
         Enumerator::NonEnumerable
+    }
+}
+
+/// The key a body reads the reflection view under: `printer.objects`.
+const OBJECTS_KEY: &str = "objects";
+
+/// `printer.objects` — the reflection over the machine's registered objects.
+///
+/// Upstream's wrappers reach the same set through the registry
+/// (`printer.lookup_objects()`, `klippy.py:81-88`; `GetStatusWrapper.__iter__`
+/// walks it, `gcode_macro.py:34-40`), and `objects/list` reports only the
+/// parts that answer a status ([`Printer::queryable_objects`], upstream's
+/// `hasattr(o, 'get_status')` filter). This port binds that set as a map from
+/// name to status, in **registration order** — the order `objects/list` and
+/// upstream's `OrderedDict` use.
+///
+/// The spelling is this port's: upstream's `GetStatusWrapper` has no `objects`
+/// key (its iterable reflection is `{% for name in printer %}`), while here
+/// `printer` stays a plain `__getitem__` map and the reflection hangs off
+/// `printer.objects`, the name the TODO tracks it under. What a body gets is
+/// the iterable side upstream's `__iter__` provides: the object names, and a
+/// status for each.
+///
+/// The names are snapshotted when a body reads `printer.objects`, and the
+/// statuses go through the render's [`PrinterView`] cache: `printer.objects
+/// ['mcu']` and `printer['mcu']` answer the same value, and `get_status` runs
+/// at most once per object per render. Both are what keeps a render off the
+/// reactor: nothing here blocks, and nothing is recomputed per read.
+#[derive(Clone)]
+pub struct ObjectsView {
+    /// The view the lookups go through, shared with the body's `printer` so
+    /// both spellings hit one cache.
+    printer: PrinterView,
+    /// The names this view exposes, in registration order.
+    names: Arc<Vec<String>>,
+}
+
+impl fmt::Debug for ObjectsView {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Printer` has no `Debug`; the names are the interesting part.
+        f.debug_struct("ObjectsView")
+            .field("names", &self.names)
+            .finish()
+    }
+}
+
+impl Object for ObjectsView {
+    fn repr(self: &Arc<Self>) -> ObjectRepr {
+        ObjectRepr::Map
+    }
+
+    /// One object's status. `None` for a name that is unregistered or reports
+    /// no status: Strict turns that into an `undefined value` error when the
+    /// body prints, iterates or tests it, and `'<name>' in printer.objects`
+    /// is `false` — the same quiet probe `printer` itself answers.
+    fn get_value(self: &Arc<Self>, key: &MjValue) -> Option<MjValue> {
+        let name = key.as_str()?;
+        self.names
+            .iter()
+            .any(|known| known == name)
+            .then(|| self.printer.status(name))
+            .flatten()
+    }
+
+    /// `{% for name in printer.objects %}` walks the names, as a Jinja2 dict
+    /// iterates its keys; `|items` / `|dictsort` read the pairs through
+    /// [`ObjectsView::get_value`]. The length is known, so `|length` works.
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Values(self.names.iter().cloned().map(MjValue::from).collect())
     }
 }
 
@@ -1629,6 +1721,7 @@ fn char_offset(text: &str, index: usize) -> usize {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
 
     use crate::core::klippy::printer::PrinterObject;
     use crate::core::klippy::reactor::ManualReactor;
@@ -1672,6 +1765,74 @@ mod tests {
             .add_object(name, Arc::new(Fixed(status)))
             .expect("the name is free");
         printer
+    }
+
+    /// A part that reports `status` and counts its `get_status` calls, for
+    /// pinning that a render asks an object once.
+    struct Counted(Value, Arc<AtomicUsize>);
+
+    impl PrinterObject for Counted {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.clone()
+        }
+    }
+
+    /// A part `objects/list` leaves out (upstream's `hasattr(o, 'get_status')`
+    /// filter; `pins` on the real machine).
+    struct NotQueryable;
+
+    impl PrinterObject for NotQueryable {
+        fn get_status(&self, _eventtime: f64) -> Value {
+            json!({})
+        }
+
+        fn is_queryable(&self) -> bool {
+            false
+        }
+    }
+
+    /// The machine the `printer.objects` tests read: registered in an order
+    /// that is **not** alphabetical (`toolhead` before `motion_report`), with
+    /// one part that reports no status, so an assertion can tell
+    /// "registration order, queryable only" from "sorted" and from "every
+    /// registered object".
+    fn printer_with_objects() -> (Arc<Printer>, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                "toolhead",
+                Arc::new(Counted(
+                    json!({ "position": [1.5, 2.5, 3.5, 4.5] }),
+                    Arc::clone(&calls),
+                )),
+            )
+            .expect("the name is free");
+        printer
+            .add_object("pins", Arc::new(NotQueryable))
+            .expect("the name is free");
+        printer
+            .add_object(
+                "motion_report",
+                Arc::new(Counted(
+                    json!({
+                        "live_position": [1.0, 2.0, 3.0, 4.0],
+                        "live_velocity": 6.0,
+                    }),
+                    Arc::clone(&calls),
+                )),
+            )
+            .expect("the name is free");
+        (printer, calls)
+    }
+
+    /// A context over `printer`, the way `MacroState::context`
+    /// (`gcode_macro.rs`) binds it.
+    fn printer_context(printer: Arc<Printer>) -> Context {
+        let mut context = Context::new();
+        context.insert("printer", Rt::Printer(PrinterView::new(printer)));
+        context
     }
 
     /// The scalar spellings are Python's `str`, because the body is rendered
@@ -2121,6 +2282,135 @@ mod tests {
         // is on the namedtuple.
         let error = render("{printer.toolhead.position.w}", &mut context).expect_err("no field");
         assert!(error.to_string().contains("undefined"), "{error}");
+    }
+
+    /// `printer.objects` is the reflection `objects/list` reports: every part
+    /// that answers a status, in registration order — `{% for name in
+    /// printer.objects %}` walks the names (a Jinja2 dict iterates its keys),
+    /// `|length` counts them, and a part that reports no status (`pins`) or a
+    /// name nobody registered is absent.
+    #[test]
+    fn printer_objects_iterates_the_queryable_objects() {
+        let (printer, _calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        assert_eq!(
+            render(
+                "{% for name in printer.objects %}{name} {% endfor %}",
+                &mut context
+            )
+            .expect("renders"),
+            // Two queryable parts, `pins` left out: the N the machine has, not
+            // the three it registered.
+            "toolhead motion_report "
+        );
+        assert_eq!(
+            render("{printer.objects|length}", &mut context).expect("renders"),
+            "2"
+        );
+        assert_eq!(
+            render(
+                "{% if 'motion_report' in printer.objects %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "yes"
+        );
+        assert_eq!(
+            render(
+                "{% if 'pins' in printer.objects %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "no"
+        );
+    }
+
+    /// The order is the registry's and stays put: `toolhead` precedes
+    /// `motion_report` although it sorts after it, and three renders of one
+    /// machine walk the same order. `|sort` is still there for a body that
+    /// wants alphabetical.
+    #[test]
+    fn printer_objects_walk_the_registration_order() {
+        let (printer, _calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+        let body = "{% for name in printer.objects %}{name} {% endfor %}";
+
+        for _ in 0..3 {
+            assert_eq!(
+                render(body, &mut context).expect("renders"),
+                "toolhead motion_report "
+            );
+        }
+        assert_eq!(
+            render(
+                "{% for name in printer.objects|sort %}{name} {% endfor %}",
+                &mut context
+            )
+            .expect("renders"),
+            "motion_report toolhead "
+        );
+    }
+
+    /// One object's status through the reflection — the `motion_report`
+    /// `live_position` a macro reads — and the render's cache: both spellings
+    /// (`printer.objects['name']` and `printer['name']`) ask `get_status`
+    /// **once** for that object, so a body loops over objects without paying a
+    /// status read per use.
+    #[test]
+    fn printer_objects_lookup_reads_the_cached_status() {
+        let (printer, calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        assert_eq!(
+            render(
+                "{printer.objects['motion_report'].live_position.z} \
+                 {printer.objects.motion_report.live_velocity} \
+                 {printer['motion_report'].live_position.x}",
+                &mut context
+            )
+            .expect("renders"),
+            "3.0 6.0 1.0"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A second object is the second read, and its status is the cached
+        // one too.
+        assert_eq!(
+            render(
+                "{printer.objects['toolhead'].position.y} \
+                 {printer.objects['toolhead'].position.e}",
+                &mut context
+            )
+            .expect("renders"),
+            "2.5 4.5"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// A name the reflection does not hold — unregistered, or registered
+    /// without a status — is `Undefined`, which Strict fails the render on
+    /// when the body uses it (the `printer.nope` rule, not a silent blank);
+    /// the `in` probe stays quiet, as it does on `printer`.
+    #[test]
+    fn printer_objects_unknown_name_is_undefined() {
+        let (printer, _calls) = printer_with_objects();
+        let mut context = printer_context(printer);
+
+        let error = render("{printer.objects['nope']}", &mut context).expect_err("unregistered");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+
+        let error = render("{printer.objects.pins}", &mut context).expect_err("not queryable");
+        assert!(error.to_string().contains("undefined value"), "{error}");
+
+        assert_eq!(
+            render(
+                "{% if 'nope' in printer.objects %}yes{% else %}no{% endif %}",
+                &mut context
+            )
+            .expect("renders"),
+            "no"
+        );
     }
 
     /// An array outside `printer` keeps its JSON meaning: `params`,

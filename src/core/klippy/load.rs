@@ -133,11 +133,13 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
 /// an entry. `tuning_tower` is unconditional upstream (`TUNING_TOWER` exists
-/// without the section) but **not** here: its factory calls `gcode_move::ensure`
-/// at load time, which builds the toolhead — a config with no `[printer]` would
-/// hang or fail on a module the config never asked for. Making it unconditional
-/// needs the factory to defer that lookup to `klippy:connect`; until then the
-/// command exists only when `[tuning_tower]` is written. `statistics` and
+/// without the section) but **not** here: loading it unconditionally makes a
+/// machine that has a `[printer]` hang after `teardown` — `load_config` itself
+/// completes and `TUNING_TOWER` registers, so the stall is at object teardown
+/// or runtime shutdown, in the same family as the `Weak`-capture rings fixed in
+/// `virtual_sdcard`/`pause_button`/`gcode_button` (that module's command handler
+/// captures a strong `Arc<Self>`). Until that is settled the command exists only
+/// when `[tuning_tower]` is written; `TODO.md` carries it. `statistics` and
 /// `garbage_collection` exist only in part (the `system_stats` object and the
 /// reactor's latency warning stand in for their log summaries).
 const DEFAULT_MODULES: &[&str] = &["idle_timeout"];

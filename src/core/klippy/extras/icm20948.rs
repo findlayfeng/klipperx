@@ -716,3 +716,289 @@ pub fn load_config_prefix(
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     Ok(Arc::new(Icm20948::new(config, printer)?))
 }
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::klippy::api::protocol::Request;
+    use crate::core::klippy::api::registry::{Api, EndpointContext};
+    use crate::core::klippy::api::{test_support, webhooks};
+    use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigValue};
+    use crate::core::klippy::reactor::ManualReactor;
+
+    fn section(name: &str, options: &[(&str, &str)]) -> ConfigSection {
+        let mut section = ConfigSection::new("icm20948", Some(name));
+        for (key, value) in options {
+            section.parameters.insert(
+                (*key).to_string(),
+                ConfigValue::Single((*value).to_string()),
+            );
+        }
+        section
+    }
+
+    /// A section and a tracked wrapper for it, leaked so the borrow outlives
+    /// the call (tests only).
+    fn wrap(name: &str, options: &[(&str, &str)]) -> ConfigWrapper<'static> {
+        ConfigWrapper::new(
+            Box::leak(Box::new(section(name, options))),
+            AccessTracking::shared(),
+        )
+    }
+
+    /// A ready printer with `pins` and one registered `[mcu]`.
+    fn printer() -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+        let mcu = McuObject::new(ConfigSection::new("mcu", None), &printer).unwrap();
+        printer.add_object("mcu", Arc::new(mcu)).unwrap();
+        printer
+    }
+
+    // --- section options and defaults ------------------------------------
+
+    #[test]
+    fn test_the_defaults_are_the_upstream_ones() {
+        let printer = printer();
+
+        let icm = Icm20948::new(&wrap("my_icm", &[]), &printer).unwrap();
+
+        assert_eq!(icm.name(), "my_icm");
+        assert_eq!(icm.data_rate(), 4500);
+        assert_eq!(icm.i2c_address(), 0x68);
+        assert_eq!(icm.i2c_speed(), 400_000);
+        assert_eq!(icm.axes_map(), &vec![(0, SCALE), (1, SCALE), (2, SCALE)]);
+    }
+
+    #[test]
+    fn test_the_default_options_are_recorded_as_read() {
+        let printer = printer();
+        let access = AccessTracking::shared();
+        let config = ConfigWrapper::new(
+            Box::leak(Box::new(section("my_icm", &[]))),
+            Arc::clone(&access),
+        );
+
+        Icm20948::new(&config, &printer).unwrap();
+
+        for option in ["rate", "i2c_address", "i2c_speed"] {
+            assert!(
+                access.contains("icm20948 my_icm", option),
+                "option {option} recorded"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_section_options_are_taken_from_the_config() {
+        let printer = printer();
+
+        let icm = Icm20948::new(
+            &wrap(
+                "my_icm",
+                &[
+                    ("i2c_address", "105"),
+                    ("i2c_speed", "100000"),
+                    ("axes_map", "z,-x,y"),
+                ],
+            ),
+            &printer,
+        )
+        .unwrap();
+
+        assert_eq!(icm.i2c_address(), 0x69);
+        assert_eq!(icm.i2c_speed(), 100_000);
+        assert_eq!(icm.axes_map(), &vec![(2, SCALE), (0, -SCALE), (1, SCALE)]);
+    }
+
+    #[test]
+    fn test_an_unsupported_rate_is_refused() {
+        let printer = printer();
+
+        let err = Icm20948::new(&wrap("my_icm", &[("rate", "3200")]), &printer).unwrap_err();
+
+        assert_eq!(err.to_string(), "Invalid rate parameter: 3200");
+    }
+
+    #[test]
+    fn test_an_address_out_of_range_is_refused() {
+        let printer = printer();
+
+        let err = Icm20948::new(&wrap("my_icm", &[("i2c_address", "128")]), &printer).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'i2c_address' in section 'icm20948 my_icm' must have maximum of 127"
+        );
+    }
+
+    #[test]
+    fn test_a_bare_section_is_named_after_its_section_id() {
+        let printer = printer();
+        let mut bare = ConfigSection::new("icm20948", None);
+        bare.parameters.clear();
+        let config = ConfigWrapper::new(Box::leak(Box::new(bare)), AccessTracking::shared());
+
+        let icm = Icm20948::new(&config, &printer).unwrap();
+
+        assert_eq!(icm.name(), "icm20948");
+    }
+
+    #[test]
+    fn test_the_loader_registers_the_section_under_its_identifier() {
+        use crate::core::klippy::config::Config;
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let config = Config::from_text("[mcu]\nserial: /dev/a\n[icm20948 my_icm]\n")
+            .expect("the test config parses")
+            .0;
+
+        printer.load_config(&config).unwrap();
+
+        assert!(printer
+            .lookup_object_as::<Icm20948>("icm20948 my_icm")
+            .is_some());
+    }
+
+    // --- sample decoding and scaling -------------------------------------
+
+    #[test]
+    fn test_convert_samples_maps_axes_and_scales() {
+        // X reads raw Z, Y reads raw X negated, Z reads raw Y — all at SCALE.
+        let map = vec![(2, SCALE), (0, -SCALE), (1, SCALE)];
+
+        let samples = convert_samples(&map, &[(1.000_000_49, [100, 200, 300])]);
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0][0], 1.000_000, "time rounded to 6 digits");
+        assert_eq!(samples[0][1], round(300.0 * SCALE, 6));
+        assert_eq!(samples[0][2], round(-100.0 * SCALE, 6));
+        assert_eq!(samples[0][3], round(200.0 * SCALE, 6));
+    }
+
+    #[test]
+    fn test_the_16g_scale_is_upstreams_one_gravity_lsb() {
+        // 1/2048 g/LSB at 16g, in mm/s²: one raw count is half a milli-g.
+        assert_eq!(SCALE, 0.00048828125 * 9.80665 * 1000.);
+        // One g of raw counts (2048 LSB) converts back to one g.
+        let map = vec![(0, SCALE), (1, SCALE), (2, SCALE)];
+        let samples = convert_samples(&map, &[(0.5, [2048, -2048, 0])]);
+        assert_eq!(samples[0][1], round(9.80665 * 1000., 6));
+        assert_eq!(samples[0][2], round(-9.80665 * 1000., 6));
+        assert_eq!(samples[0][3], 0.0);
+    }
+
+    #[test]
+    fn test_convert_samples_of_nothing_is_empty() {
+        let map = vec![(0, SCALE), (1, SCALE), (2, SCALE)];
+
+        assert!(convert_samples(&map, &[]).is_empty());
+    }
+
+    // --- dump endpoint ----------------------------------------------------
+
+    #[tokio::test]
+    async fn test_the_dump_endpoint_is_registered_under_the_sections_name() {
+        let printer = printer();
+
+        Icm20948::new(&wrap("my_icm", &[]), &printer).unwrap();
+
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+        assert_eq!(registrations.len(), 1);
+        assert_eq!(registrations[0].path, DUMP_ENDPOINT);
+        assert_eq!(registrations[0].key, DUMP_KEY);
+        assert_eq!(registrations[0].value.as_deref(), Some("my_icm"));
+    }
+
+    #[tokio::test]
+    async fn test_the_dump_endpoint_greets_a_client_with_the_accel_header() {
+        let printer = printer();
+        Icm20948::new(&wrap("my_icm", &[]), &printer).unwrap();
+        let registrations = webhooks::install(&printer).unwrap().take_mux_endpoints();
+
+        let api = Api::new();
+        let request =
+            Request::parse(br#"{"method":"icm20948/dump_icm20948","params":{"sensor":"my_icm"}}"#)
+                .expect("a valid request");
+        let context = EndpointContext {
+            api: &api,
+            client: test_support::silent_target(),
+        };
+        let response = registrations[0]
+            .handler
+            .handle(&request, &context)
+            .await
+            .expect("the instance takes the client");
+
+        assert_eq!(
+            response,
+            json!({ "header": ["time", "x_acceleration", "y_acceleration", "z_acceleration"] })
+        );
+    }
+
+    // --- register setup sequences -----------------------------------------
+
+    #[test]
+    fn test_the_register_sequence_is_upstreams() {
+        // Wake, accelerometer axes on (the gyro axes stay off).
+        assert_eq!(setup_writes(), [(0x06, 0x01), (0x07, 0x07)]);
+        assert_eq!(
+            config_writes(4500).expect("the supported rate"),
+            [
+                (0x10, 0x00), // ACCEL_SMPLRT_DIV1: 4.5 kHz
+                (0x11, 0x00), // ACCEL_SMPLRT_DIV2: 4.5 kHz
+                (0x7f, 0x20), // BANK_SEL: bank 2, where ACCEL_CONFIG lives
+                (0x14, 0x06), // ACCEL_CONFIG: 16g, 1209 Hz bandwidth
+                (0x7f, 0x00), // BANK_SEL: back to bank 0
+                (0x67, 0x00), // FIFO_EN: disabled while the FIFO is reset
+                (0x03, 0x0e), // USER_CTRL: reset the FIFO
+                (0x03, 0x40), // USER_CTRL: FIFO enabled
+            ]
+        );
+        // The rate is fixed: nothing else has a divider.
+        assert_eq!(config_writes(3200), None);
+        assert_eq!(sample_rate_div(4500), Some(0x00));
+        assert_eq!(sample_rate_div(4000), None);
+        // Back to sleep, everything off.
+        assert_eq!(shutdown_writes(), [(0x06, 0x41), (0x07, 0x3f)]);
+        // The one id upstream accepts.
+        assert_eq!(device_name(0xea), Some("icm-20948"));
+        assert_eq!(device_name(0x00), None);
+    }
+
+    // --- the accelerometer interface --------------------------------------
+
+    #[tokio::test]
+    async fn test_starting_a_measurement_registers_a_batch_client() {
+        // Asking for a client subscribes it to the batch stream (whose first
+        // client runs the chip's start callback); nothing has arrived yet.
+        let printer = printer();
+        let icm = Icm20948::new(&wrap("my_icm", &[]), &printer).unwrap();
+
+        let client = icm.start_internal_client();
+
+        assert_eq!(icm.client_count(), 1);
+        assert!(client.get_samples().is_empty());
+    }
+
+    #[test]
+    fn test_a_software_bus_with_one_pin_is_refused() {
+        let printer = printer();
+
+        let err = Icm20948::new(
+            &wrap("my_icm", &[("i2c_software_scl_pin", "PA0")]),
+            &printer,
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("both 'i2c_software_scl_pin'"),
+            "{err}"
+        );
+    }
+}

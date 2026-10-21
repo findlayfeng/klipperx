@@ -13,18 +13,13 @@
 //! | `init()` | reset, the 17-command power-up list, `0xA5`/`0xA4`, flush | `uc1701.py:174-196` |
 //! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-113` |
 //! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-52` |
-//! | `set_glyphs()` | — (see below) | `uc1701.py:64-70` |
+//! | `set_glyphs()` | swizzle the 16x16 icons into page order | `uc1701.py:64-70` |
+//! | `write_text()` | one VGA glyph per character, over two pages | `uc1701.py:71-81` |
+//! | `write_glyph()` | sixteen bytes of an icon, or one character | `uc1701.py:94-108` |
+//! | `write_graphics()` | xor one 16-byte pixel column into two pages | `uc1701.py:83-92` |
 //!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** The framework draws now — it calls
-//!   [`display::LcdChip::write_text`](super::display::LcdChip::write_text) and
-//!   friends through [`display::draw_text`](super::display::draw_text) — but this
-//!   driver's half is a later unit: `write_text`/`write_glyph`/`write_graphics`
-//!   — and with them `_swizzle_bits` and the font — are not ported, so the trait
-//!   methods keep their draw-nothing defaults; `set_glyphs` therefore has
-//!   nothing to store, because upstream only caches the swizzled icons there
-//!   for `write_glyph` to draw later.
 //! * **`BACKGROUND_PRIORITY_CLOCK`** (`uc1701.py:11`): upstream sends every
 //!   byte with `reqclock=0x7fffffff00000000`, which lets the panel writes
 //!   overtake queued g-code. This host's [`McuCommand`](crate::core::klippy::cmd::McuCommand) carries no clock, so
@@ -43,7 +38,7 @@
 //!   `i2c_response` status (`bus.py:256-259`); this host queues the same bytes
 //!   without waiting (see [`PanelIo::send`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
@@ -58,10 +53,48 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::Reactor;
 
 use super::display::{Glyph, LcdChip, SentMessage};
+use super::font8x14::VGA_FONT;
 
 /// Upstream's `MCU_SPI_from_config(config, 0, default_speed=10000000)`
 /// (`uc1701.py:120`): SPI mode 0 at 10 MHz.
 pub(crate) const DEFAULT_SPI_SPEED: u32 = 10_000_000;
+
+/// The glyphs that are one of the panel's own characters (`uc1701.py:13`): the
+/// right arrow is character `0x1a` and `degrees` is character `0xf8`.
+fn text_glyph(name: &str) -> Option<u8> {
+    match name {
+        "right_arrow" => Some(0x1a),
+        "degrees" => Some(0xf8),
+        _ => None,
+    }
+}
+
+/// Upstream's `DisplayBase._swizzle_bits` (`uc1701.py:53-62`): turn sixteen
+/// rows of eight pixels into the eight-byte page pair the panels take, most
+/// significant bit first. The first eight rows are the upper page, the last
+/// eight the lower one.
+pub(crate) fn swizzle_bits(data: &[u8]) -> ([u8; 8], [u8; 8]) {
+    let row = |index: usize| u128::from(data.get(index).copied().unwrap_or(0));
+    let mut top = 0u64;
+    let mut bottom = 0u64;
+    for offset in 0..8 {
+        // The multiplication spreads the row's eight bits into one bit per
+        // byte, which the mask then keeps.
+        let spaced = (row(offset) * 0x8040_2010_0804_0201u128) & 0x8080_8080_8080_8080u128;
+        top |= (spaced >> (7 - offset)) as u64;
+        let spaced = (row(offset + 8) * 0x8040_2010_0804_0201u128) & 0x8080_8080_8080_8080u128;
+        bottom |= (spaced >> (7 - offset)) as u64;
+    }
+    let mut bits_top = [0u8; 8];
+    let mut bits_bottom = [0u8; 8];
+    for (index, byte) in bits_top.iter_mut().enumerate() {
+        *byte = (top >> (index * 8)) as u8;
+    }
+    for (index, byte) in bits_bottom.iter_mut().enumerate() {
+        *byte = (bottom >> (index * 8)) as u8;
+    }
+    (bits_top, bits_bottom)
+}
 
 /// Upstream's default contrast (`uc1701.py:172`).
 pub(crate) const DEFAULT_UC1701_CONTRAST: i64 = 40;
@@ -71,24 +104,34 @@ pub(crate) const DEFAULT_UC1701_CONTRAST: i64 = 40;
 #[derive(Debug)]
 pub(crate) struct Page {
     /// What the screen should show.
-    data: Vec<u8>,
+    pub(crate) data: Vec<u8>,
     /// What the firmware's copy holds; the difference is what a flush sends.
-    synced: Vec<u8>,
+    pub(crate) synced: Vec<u8>,
 }
 
 /// Upstream's `DisplayBase` framebuffers (`uc1701.py:15-27`): eight pages of
 /// `columns` bytes. The page buffer starts blank and its "already sent" copy is
 /// `~`, so the first flush sends the whole screen.
+///
+/// The font and the icons live here too, in the byte order the panels take: a
+/// character is eight bytes per page, and a 16x16 icon is sixteen (its two
+/// column halves, one per page).
 #[derive(Debug)]
 pub(crate) struct DisplayBase {
     /// Bytes per page — one page is eight pixel rows of `columns` columns.
     columns: usize,
     /// The eight pages, in row order.
     pages: Vec<Page>,
+    /// Every VGA glyph, already swizzled (`uc1701.py:25-26`).
+    font: Vec<([u8; 8], [u8; 8])>,
+    /// The 16x16 icons by glyph name, as the two sixteen-byte page halves
+    /// (`uc1701.py:64-70`).
+    icons: HashMap<String, (Vec<u8>, Vec<u8>)>,
 }
 
 impl DisplayBase {
-    /// Eight blank pages, each with an unsent copy (`uc1701.py:21-23`).
+    /// Eight blank pages, each with an unsent copy (`uc1701.py:21-23`), and the
+    /// font every character is drawn from (`uc1701.py:25-26`).
     pub(crate) fn new(columns: usize) -> Self {
         Self {
             columns,
@@ -98,6 +141,8 @@ impl DisplayBase {
                     synced: vec![b'~'; columns],
                 })
                 .collect(),
+            font: VGA_FONT.iter().map(|glyph| swizzle_bits(glyph)).collect(),
+            icons: HashMap::new(),
         }
     }
 
@@ -106,6 +151,94 @@ impl DisplayBase {
     pub(crate) fn clear(&mut self) {
         for page in &mut self.pages {
             page.data = vec![0; self.columns];
+        }
+    }
+
+    /// Upstream's `DisplayBase.set_glyphs` (`uc1701.py:64-70`): swizzle each
+    /// 16x16 icon into its two sixteen-byte page halves.
+    pub(crate) fn set_glyphs(&mut self, glyphs: &BTreeMap<String, Glyph>) {
+        for (name, glyph) in glyphs {
+            let Some((first, second)) = &glyph.icon16x16 else {
+                continue;
+            };
+            let (top_first, bottom_first) = swizzle_bits(first);
+            let (top_second, bottom_second) = swizzle_bits(second);
+            let mut top = top_first.to_vec();
+            top.extend_from_slice(&top_second);
+            let mut bottom = bottom_first.to_vec();
+            bottom.extend_from_slice(&bottom_second);
+            self.icons.insert(name.clone(), (top, bottom));
+        }
+    }
+
+    /// Upstream's `DisplayBase.write_text` (`uc1701.py:71-81`): a run that does
+    /// not fit is cut at the panel's sixteen character columns, and each
+    /// character is one VGA glyph over the row's page pair.
+    ///
+    /// A row past the fourth draws nothing here; upstream's list index would
+    /// raise.
+    pub(crate) fn write_text(&mut self, x: usize, row: usize, data: &[u8]) {
+        let data = if x + data.len() > 16 {
+            &data[..16 - x.min(16)]
+        } else {
+            data
+        };
+        if data.is_empty() {
+            return;
+        }
+        let font = &self.font;
+        let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) else {
+            return;
+        };
+        let mut pix_x = x * 8;
+        for &character in data {
+            let (bits_top, bits_bot) = &font[character as usize];
+            page_top[pix_x..pix_x + 8].copy_from_slice(bits_top);
+            page_bot[pix_x..pix_x + 8].copy_from_slice(bits_bot);
+            pix_x += 8;
+        }
+    }
+
+    /// Upstream's `DisplayBase.write_graphics` (`uc1701.py:83-92`): one 16-byte
+    /// pixel column, xored over the row's page pair — a progress bar paints
+    /// over whatever the text already drew.
+    pub(crate) fn write_graphics(&mut self, x: usize, row: usize, data: &[u8]) {
+        if x >= 16 || row >= 4 || data.len() != 16 {
+            return;
+        }
+        let (bits_top, bits_bot) = swizzle_bits(data);
+        let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) else {
+            return;
+        };
+        let pix_x = x * 8;
+        for i in 0..8 {
+            page_top[pix_x + i] ^= bits_top[i];
+            page_bot[pix_x + i] ^= bits_bot[i];
+        }
+    }
+
+    /// Upstream's `DisplayBase.write_glyph` (`uc1701.py:94-108`): a 16x16 icon
+    /// replaces sixteen bytes of the row's page pair and costs two cells (as
+    /// long as it fits, `x < 15`); a `TextGlyphs` name is one character; any
+    /// other name costs nothing.
+    pub(crate) fn write_glyph(&mut self, x: usize, row: usize, name: &str) -> usize {
+        let icon = self.icons.get(name).cloned();
+        if let Some((top, bottom)) = icon {
+            if x < 15 {
+                let pix_x = x * 8;
+                if let Some((page_top, page_bot)) = page_pair(&mut self.pages, row) {
+                    page_top[pix_x..pix_x + 16].copy_from_slice(&top);
+                    page_bot[pix_x..pix_x + 16].copy_from_slice(&bottom);
+                }
+                return 2;
+            }
+        }
+        match text_glyph(name) {
+            Some(character) => {
+                self.write_text(x, row, &[character]);
+                1
+            }
+            None => 0,
         }
     }
 
@@ -133,6 +266,18 @@ impl DisplayBase {
         }
         Ok(())
     }
+}
+
+/// The two pages row `row` is drawn in: the panel has eight pages of eight
+/// pixel rows, so each character row of the 4x16 grid is a page pair
+/// (`uc1701.py:72-74`). A row past the fourth has no pair.
+fn page_pair(pages: &mut [Page], row: usize) -> Option<(&mut [u8], &mut [u8])> {
+    let bottom = row.checked_mul(2)? + 1;
+    if bottom >= pages.len() {
+        return None;
+    }
+    let (top, rest) = pages.split_at_mut(bottom);
+    Some((&mut top[bottom - 1].data, &mut rest[0].data))
 }
 
 /// Upstream's flush batching (`uc1701.py:34-42`): the positions of every
@@ -590,9 +735,25 @@ impl LcdChip for Uc1701 {
     }
 
     /// Upstream's `DisplayBase.set_glyphs` stores the icons so `write_glyph`
-    /// can draw them (`uc1701.py:64-70`); nothing draws here (module docs), so
-    /// there is nothing to keep.
-    fn set_glyphs(&self, _glyphs: &BTreeMap<String, Glyph>) {}
+    /// can draw them (`uc1701.py:64-70`).
+    fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
+        self.base().set_glyphs(glyphs);
+    }
+
+    /// Upstream's `DisplayBase.write_text` (`uc1701.py:71-81`).
+    fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+        self.base().write_text(x, row, text);
+    }
+
+    /// Upstream's `DisplayBase.write_glyph` (`uc1701.py:94-108`).
+    fn write_glyph(&self, x: usize, row: usize, name: &str) -> usize {
+        self.base().write_glyph(x, row, name)
+    }
+
+    /// Upstream's `DisplayBase.write_graphics` (`uc1701.py:83-92`).
+    fn write_graphics(&self, x: usize, row: usize, data: &[u8]) {
+        self.base().write_graphics(x, row, data);
+    }
 
     /// Every message this panel has handed to the firmware, in order.
     fn sent_messages(&self) -> Vec<SentMessage> {
@@ -832,6 +993,107 @@ mod tests {
         for page in &base.pages {
             assert_eq!(page.data, vec![0; 128]);
         }
+    }
+
+    // -- drawing -----------------------------------------------------------
+
+    /// A framebuffer's bytes as lowercase hex, for byte-pinned assertions.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// A panel from the corpus's section.
+    fn chip() -> Uc1701 {
+        let printer = printer();
+        let section = display_section(UC1701_SECTION);
+        Uc1701::new(&wrap(&section), &printer).expect("the panel loads")
+    }
+
+    #[test]
+    fn test_write_text_draws_the_vga_glyph_over_the_rows_page_pair() {
+        // `uc1701.py:71-81`: column `x` is pixel column `x * 8`, the row's two
+        // pages hold the glyph's upper and lower eight rows, and the run is cut
+        // at the sixteenth column. The expected bytes are entry 0x41 `A`
+        // swizzled into display order.
+        let chip = chip();
+
+        chip.write_text(0, 0, b"A");
+        // Fifteen columns in leaves room for one character, not three.
+        chip.write_text(15, 2, b"abc");
+
+        let base = chip.base();
+        assert_eq!(hex(&base.pages[0].data[0..8]), "c0e0301830e0c000");
+        assert_eq!(hex(&base.pages[1].data[0..8]), "0f0f0101010f0f00");
+        // Nothing else on row 0 changed.
+        assert!(base.pages[0].data[8..].iter().all(|byte| *byte == 0));
+        assert!(base.pages[1].data[8..].iter().all(|byte| *byte == 0));
+        // Row 2 is pages 4 and 5; only `a` (entry 0x61) is drawn, at 120..128.
+        assert!(base.pages[4].data[112..120].iter().all(|byte| *byte == 0));
+        assert_eq!(hex(&base.pages[4].data[120..128]), "00404040c0800000");
+        assert_eq!(hex(&base.pages[5].data[120..128]), "060f0909070f0800");
+    }
+
+    #[test]
+    fn test_write_glyph_draws_an_icon_two_cells_and_the_text_glyphs() {
+        // `uc1701.py:94-108`: a 16x16 icon replaces sixteen bytes of the row's
+        // page pair and costs two cells; `right_arrow` and `degrees` are the
+        // panel's own characters 0x1a and 0xf8 (`uc1701.py:13`).
+        let chip = chip();
+        let mut glyphs: BTreeMap<String, Glyph> = BTreeMap::new();
+        glyphs.insert(
+            "thermometer".to_string(),
+            Glyph {
+                icon16x16: Some((vec![0x81; 16], vec![0x18; 16])),
+                icon5x8: None,
+            },
+        );
+        chip.set_glyphs(&glyphs);
+
+        assert_eq!(chip.write_glyph(2, 1, "thermometer"), 2);
+        assert_eq!(chip.write_glyph(4, 1, "right_arrow"), 1);
+        assert_eq!(chip.write_glyph(7, 3, "fan1"), 0);
+
+        let base = chip.base();
+        // Row 1 is pages 2 and 3, at pixel columns 16..32.
+        assert_eq!(
+            hex(&base.pages[2].data[16..32]),
+            "ff000000000000ff000000ffff000000"
+        );
+        assert_eq!(
+            hex(&base.pages[3].data[16..32]),
+            "ff000000000000ff000000ffff000000"
+        );
+        // The arrow is one character at pixel columns 32..40.
+        assert_eq!(hex(&base.pages[2].data[32..40]), "808080a0e0c08000");
+        assert_eq!(hex(&base.pages[3].data[32..40]), "0000000203010000");
+        // Row 3 was only asked for a glyph the panel does not know.
+        assert!(base.pages[6].data.iter().all(|byte| *byte == 0));
+        assert!(base.pages[7].data.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_write_graphics_xors_the_bar_into_the_pages() {
+        // `uc1701.py:83-92`: a 16-byte column, xored over the row's page pair —
+        // so drawing the same bar twice leaves the pages as they were.
+        let chip = chip();
+        let bar = {
+            let mut data = vec![0xff];
+            data.extend(std::iter::repeat(0xf0).take(14));
+            data.push(0xff);
+            data
+        };
+
+        chip.write_graphics(3, 0, &bar);
+        {
+            let base = chip.base();
+            assert_eq!(hex(&base.pages[0].data[24..32]), "ffffffff01010101");
+            assert_eq!(hex(&base.pages[1].data[24..32]), "ffffffff80808080");
+        }
+
+        chip.write_graphics(3, 0, &bar);
+        let base = chip.base();
+        assert!(base.pages[0].data[24..32].iter().all(|byte| *byte == 0));
+        assert!(base.pages[1].data[24..32].iter().all(|byte| *byte == 0));
     }
 
     #[test]

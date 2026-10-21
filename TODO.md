@@ -240,12 +240,13 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 
 样本时间已于 2026-10-19 统一到 print time（资源层换算，与上游 `mcu.py:636-646` 同形）：
 
-- [ ] **二级 MCU 没有 `get_uptime` 样本时 `recalibrate` 会发布垃圾 offset（2026-10-19 由时钟映射单元发现）**：
-      `McuObject::recalibrate` 对二级 MCU 无条件跑 `SecondarySync::calibrate`，而它读
-      `secondary.get_clock()`——`ClockEstimator::new` 把三个字段都清零，未 seed 时它返回 0，
-      于是 `adjusted_freq = (0 - sync1_clock)/4 s` 为负、`set_mapping` 发出**错的 offset**
-      （频率部分现在由 `time_mapping` 回落到字典频）。修法方向：`SecondarySync::calibrate` /
-      `recalibrate` 加"已有样本"闸门。落点在 `mcu/object.rs`。
+- [x] **二级 MCU 没有 `get_uptime` 样本时 `recalibrate` 会发布垃圾 offset —— 已修（2026-10-21）**：
+      首因是 `ClockEstimator::new` 把三个字段清零，未 seed 时 `get_clock()` 返回 0，于是
+      `adjusted_freq = (0 - sync1_clock)/4 s` 为负、`set_mapping` 发出错的 offset。现闸门放在
+      **`McuObject::recalibrate`**（`SecondarySync::calibrate` 的唯一周期调用点、也是唯一发布方）：
+      `ClockEstimator::is_seeded()` 为假时只 `debug!` 跳过，`SecondarySync` 与 chip 映射**两者都不改写**；
+      `calibrate` 仍是纯数学，文档里补了「`secondary` 必须已 seed」的前置条件。有样本时逐字节不变。
+      （`cmd/clock.rs` 的 `seeded` 显式标志，`mcu/object.rs` 的两个用例分别钉住跳过与发布。）
 
 #### F6 SPI 总线
 

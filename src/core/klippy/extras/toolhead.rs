@@ -97,6 +97,7 @@ use crate::core::klippy::extras::carriage::{self, KinematicStepper};
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::force_move::calc_move_time;
 use crate::core::klippy::extras::idex_modes;
+use crate::core::klippy::extras::idex_modes::DUAL_CARRIAGE_OBJECT;
 use crate::core::klippy::extras::query_endstops::{QueryEndstops, QUERY_ENDSTOPS_OBJECT};
 use crate::core::klippy::extras::stepper::{PrinterStepper, Rail};
 use crate::core::klippy::extras::stepper_enable::PrinterStepperEnable;
@@ -1288,6 +1289,25 @@ impl PrinterObject for ToolHeadObject {
                     stepper.name().to_string(),
                     Arc::clone(stepper.mcu_stepper()),
                 );
+            }
+
+            // IDEX: the `[dual_carriage]` section's motor is a rail of the
+            // cartesian kinematics upstream — appended to `CartKinematics.rails`
+            // (`kinematics/cartesian.py:28-30`) and pointed at the main trapq
+            // with every other rail (`:37-38`) — so it joins the same set as the
+            // `[stepper_*]` rails. Gated on the claim: the bare section loads for
+            // every kinematics here, while upstream builds the carriage rail
+            // only inside `CartKinematics` (module docs of `idex_modes`).
+            if let Some(module) = self.printer.upgrade().and_then(|printer| {
+                printer.lookup_object_as::<idex_modes::DualCarriageModule>(DUAL_CARRIAGE_OBJECT)
+            }) {
+                if module.claimed_primary_rail().is_some() {
+                    let host = module.take_stepper().ok_or_else(|| {
+                        config_error("dual_carriage is not connected".to_string())
+                    })?;
+                    mcu_steppers.insert(host.name().to_string(), module.mcu_stepper());
+                    host_steppers.push(host);
+                }
             }
 
             // The primary MCU (the bare `[mcu]`) defines the print-time origin;

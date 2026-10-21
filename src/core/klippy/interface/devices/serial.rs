@@ -2305,6 +2305,14 @@ fn port_for(path: &Path, baud: u32) -> Result<Arc<SharedSerialPort>, InterfaceEr
 /// straight to the request. On failure the slot this opened is unregistered, so
 /// the port is left as it was found.
 ///
+/// A handshake that fails on a **stale** port — the path now names another node
+/// than the one the descriptor holds, which is what a board that reset looks
+/// like — is retried up to [`ATTACH_REOPEN_ATTEMPTS`] times, each round opening
+/// the node the path names now. A round whose open fails (the node is briefly
+/// gone before udev's `by-id` link is back) spends a round like an unanswered
+/// handshake does, and when the rounds are spent the caller gets the handshake
+/// error the reopens started from.
+///
 /// # Errors
 /// [`InterfaceError::Other`] for an id the wire format cannot carry, for an id
 /// that is **already attached** on this port, or for a port that cannot be
@@ -2324,8 +2332,34 @@ pub fn attach(
     }
 
     let mut reopened = 0u32;
+    // The handshake error the reopen rounds started from: what the caller is told
+    // when a round cannot even open the node, because it names the conversation
+    // that failed rather than a node that is briefly gone.
+    let mut handshake_error: Option<InterfaceError> = None;
     loop {
-        let port = port_for(path, baud)?;
+        let port = match port_for(path, baud) {
+            Ok(port) => port,
+            Err(open_error) => {
+                // A node that cannot be opened consumes a round the same way an
+                // unanswered handshake does: a board that reset re-enumerates, so
+                // the path is briefly missing and comes back on its own, and a
+                // round spent here must not cut the wait short. The **first**
+                // open is not retried — nothing has failed on this path yet, and
+                // a path that never opens is reported at once. Once the rounds
+                // are spent the caller gets the handshake error the reopens
+                // started from: the port that would not answer is the failure
+                // that matters, not the node that was missing between attempts.
+                let Some(original) = handshake_error.clone() else {
+                    return Err(open_error);
+                };
+                if reopened >= ATTACH_REOPEN_ATTEMPTS {
+                    return Err(original);
+                }
+                reopened += 1;
+                std::thread::sleep(ATTACH_REOPEN_DELAY);
+                continue;
+            }
+        };
         let slot = register_slot(&port, mcu_id)?;
         let handle = Arc::new(SharedSerialHandle {
             port: Arc::clone(&port),
@@ -2347,6 +2381,7 @@ pub fn attach(
             // the slot this handle registered — which, with the duplicate
             // refused in `register_slot`, is always the one still in the map.
             handle.unregister();
+            handshake_error.get_or_insert_with(|| e.clone());
             // A **stale** port is worth one more open: the descriptor belongs to
             // a device node the path no longer names (the board reset and
             // re-enumerated), so every write to it fails and waiting on the same
@@ -4068,6 +4103,75 @@ mod mux_tests {
         drop(stale);
         drop(fresh);
         let _ = std::fs::remove_file(&link);
+    }
+
+    /// A reopen round whose **open** fails spends a round, and the caller is told
+    /// the handshake error the reopens started from — not the error of a node
+    /// that was missing between two attempts.
+    ///
+    /// The path is re-pointed at a **regular file** once the handshake has run
+    /// out: `same_file` sees a move (so `attach` reopens), while opening it fails
+    /// in `set_raw_mode` — a tty ioctl on something that is not a tty. That is the
+    /// node that is briefly absent when a board re-enumerates, and before the
+    /// rounds covered it the error came straight back: the reopen budget only
+    /// ever applied to unanswered handshakes, so a node that was not back yet cut
+    /// the wait short with a message about a device node instead of the board
+    /// that would not answer.
+    #[test]
+    fn a_reopen_round_that_cannot_open_reports_the_handshake_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "klipperx-attach-open-{}-{:?}",
+            std::process::id(),
+            thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("the fixture directory");
+        let link = dir.join("port");
+        let not_a_tty = dir.join("not-a-tty");
+        std::fs::write(&not_a_tty, b"").expect("the fixture file");
+        let _ = std::fs::remove_file(&link);
+
+        let pty = Pty::new();
+        std::os::unix::fs::symlink(&pty.path, &link).expect("the link to the tty");
+
+        let request = assignment_request(4).expect("a valid mcu id");
+        let path = link.clone();
+        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
+        thread::spawn(move || {
+            let _ = tx.send(attach(&path, DEFAULT_BAUD, 4, ASSIGN_ATTACH_TIMEOUT, None));
+        });
+
+        // The request proves the attach is on the tty. The path then moves under
+        // it, to a node that cannot be put into raw mode — what a reopen round
+        // finds while the board is still re-enumerating.
+        assert!(
+            readable_within(&pty.master, ATTACH_REQUEST_WINDOW),
+            "attach must send the assignment request"
+        );
+        let seen = read_n(&pty.master, request.len());
+        assert_eq!(seen, request, "the request goes out verbatim");
+        std::fs::remove_file(&link).expect("the old link goes");
+        std::os::unix::fs::symlink(&not_a_tty, &link).expect("the link to the plain file");
+
+        let err = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("attach returns within its retry budget")
+            .expect_err("an unanswered handshake must fail the attach");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            err,
+            InterfaceError::Timeout,
+            "the caller must get the handshake error, not the node's"
+        );
+        assert!(
+            elapsed
+                >= ASSIGN_ATTACH_TIMEOUT * ASSIGN_ATTACH_ATTEMPTS
+                    + ATTACH_REOPEN_DELAY * ATTACH_REOPEN_ATTEMPTS,
+            "every reopen round must spend its delay: {elapsed:?}"
+        );
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Whether the port for `path` has been **stopped** within `window` — how a

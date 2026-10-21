@@ -186,6 +186,31 @@ G1 [X<x>] [Y<y>] [Z<z>] [E<e>] [F<f>]
 | `G21` | 毫米（唯一单位），无操作 |
 | `G20` | 英寸：**拒绝**，报 `Machine does not support G20 (inches) command (<line>)` |
 
+### G2 / G3 — 圆弧
+
+```
+G2 [X<x>] [Y<y>] [Z<z>] [I<i>] [J<j>] [K<k>] [E<e>] [F<f>]
+G3 [X<x>] [Y<y>] [Z<z>] [I<i>] [J<j>] [K<k>] [E<e>] [F<f>]
+```
+
+`G2` 顺时针、`G3` 逆时针；由 `[gcode_arcs]` 提供（无该节则两条命令都不存在）。圆心由 `I`/`J`/`K`
+以**当前点为基准的偏移**给出（上游语义，不是绝对坐标），按 `resolution` 分段后每段走与手写 `G1`
+同一条处理链。
+
+三条按上游的限定：**`R`（半径形式）被拒**（`G2/G3 does not support R moves`）；**`P` 不解析**；
+**相对模式拒绝弧**（`G91` 下报 `does not support relative move mode`）。三种平面由 `G17`/`G18`/`G19`
+选，见下节。
+
+### G17 / G18 / G19 — 弧的平面
+
+| 命令 | 平面 | 圆心词 | 螺旋轴 |
+|------|------|--------|--------|
+| `G17`（缺省） | XY | `I`（X 偏移）、`J`（Y 偏移） | `Z` |
+| `G18` | XZ | `I`、`K` | `Y` |
+| `G19` | YZ | `J`、`K` | `X` |
+
+无任何圆心词时报 `G2/G3 requires IJ, IK or JK parameters`。
+
 ### G90 / G91 — XYZ 模式
 
 `G90`：XYZ 词绝对；`G91`：XYZ 词相对。

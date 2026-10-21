@@ -1170,3 +1170,210 @@ mod tests {
         assert!(printer.get("delta_radius").is_none());
     }
 }
+
+/// Tests for the HTTP(S) config source: `from_url` and `[include http://…]`
+/// both land in [`fetch_url`], so the boundary rules (status, size) are
+/// exercised against a real loopback socket rather than a mock.
+#[cfg(test)]
+mod url_fetch_tests {
+    use super::*;
+    use std::io::{ErrorKind, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    /// Test-harness bound for one fetch. `fetch_url` gives up on its own after
+    /// 10 s; this is the outer guard so a wedged fixture can never hang the
+    /// suite.
+    const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// A single-threaded HTTP server that answers `requests` connections with
+    /// one fixed raw response, then stops.
+    struct FixtureServer {
+        url: String,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl FixtureServer {
+        fn new(response: Vec<u8>, requests: usize) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+            let address = listener.local_addr().expect("fixture address");
+            listener.set_nonblocking(true).expect("non-blocking accept");
+            let thread = thread::spawn(move || {
+                let deadline = Instant::now() + TEST_TIMEOUT;
+                for _ in 0..requests {
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                                if Instant::now() >= deadline {
+                                    return;
+                                }
+                                // Poll interval, not a synchronisation delay:
+                                // nothing is asserted after it, it only bounds
+                                // how long an unanswered fixture waits.
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    stream.set_nonblocking(false).ok();
+                    stream.set_read_timeout(Some(TEST_TIMEOUT)).ok();
+                    read_request_head(&mut stream);
+                    // A client that already stopped reading (the over-limit
+                    // test) makes this write fail; that is the expected path.
+                    let _ = stream.write_all(&response);
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                url: format!("http://{}/printer.cfg", address),
+                thread: Some(thread),
+            }
+        }
+
+        fn url(&self) -> &str {
+            &self.url
+        }
+    }
+
+    impl Drop for FixtureServer {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                // The fixture's own accept deadline bounds this join.
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Consume the request head so the client is not blocked writing it (its
+    /// body is empty, so the head ends the request).
+    fn read_request_head(stream: &mut TcpStream) {
+        let mut head: Vec<u8> = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && head.len() < 64 * 1024 {
+            match stream.read(&mut byte) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => head.push(byte[0]),
+            }
+        }
+    }
+
+    /// A complete response with an explicit length, so the client knows when
+    /// the body ends without a chunked encoding.
+    fn http_response(status: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let mut response = head.into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    /// Run a fetch on its own thread and fail the test if it outlives
+    /// [`TEST_TIMEOUT`].
+    fn run_bounded<T: Send + 'static>(fetch: impl FnOnce() -> T + Send + 'static) -> T {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = sender.send(fetch());
+        });
+        receiver
+            .recv_timeout(TEST_TIMEOUT)
+            .expect("the fetch finished inside the test bound")
+    }
+
+    #[test]
+    fn an_http_include_is_fetched_into_the_config() {
+        let fixture = FixtureServer::new(
+            http_response("200 OK", b"[printer]\nkinematics: corexy\n"),
+            1,
+        );
+        let text = format!(
+            "[include {}]\n[gcode_macro START]\ngcode: G28\n",
+            fixture.url()
+        );
+        let (config, sources) =
+            run_bounded(move || Config::from_text(&text)).expect("the remote include resolves");
+
+        assert_eq!(
+            config.get_section("printer").unwrap().get_str("kinematics"),
+            Some("corexy")
+        );
+        assert_eq!(
+            config
+                .get_section("gcode_macro START")
+                .unwrap()
+                .get_str("gcode"),
+            Some("G28")
+        );
+        assert_eq!(sources.len(), 2, "the in-memory root plus the URL include");
+        assert_eq!(sources[1], ConfigSource::Url(fixture.url().to_string()));
+    }
+
+    #[test]
+    fn from_url_parses_the_remote_config() {
+        // Two connections: `from_url` probes the URL once for its own error
+        // message, then `parse` reads it through `read_source`.
+        let fixture = FixtureServer::new(
+            http_response("200 OK", b"[printer]\nkinematics: delta\n"),
+            2,
+        );
+        let url = fixture.url().to_string();
+        let (config, _sources) =
+            run_bounded(move || Config::from_url(&url)).expect("the remote config parses");
+
+        assert_eq!(
+            config.get_section("printer").unwrap().get_str("kinematics"),
+            Some("delta")
+        );
+    }
+
+    #[test]
+    fn a_404_from_a_config_url_is_reported_with_its_status() {
+        let fixture = FixtureServer::new(http_response("404 Not Found", b"gone\n"), 1);
+        let url = fixture.url().to_string();
+        let error = run_bounded(move || Config::from_url(&url)).expect_err("the 404 fails");
+
+        assert_eq!(
+            error,
+            format!(
+                "Failed to fetch config from URL '{}': HTTP 404",
+                fixture.url()
+            )
+        );
+    }
+
+    #[test]
+    fn an_oversized_config_body_is_rejected_at_the_limit() {
+        // 2 KiB body against a 1 KiB test cap: the fixture streams real bytes,
+        // the fetcher must stop at the cap instead of buffering the body.
+        let body = vec![b'a'; 2048];
+        let fixture = FixtureServer::new(http_response("200 OK", &body), 1);
+        let url = fixture.url().to_string();
+        let error = run_bounded(move || fetch_url_with_limit(&url, 1024))
+            .expect_err("the over-limit body is rejected");
+
+        assert_eq!(error, "Response body exceeds the 1024 byte limit");
+    }
+
+    #[test]
+    fn an_unreachable_config_url_fails_with_the_url_in_the_message() {
+        // Bind then drop: the port is free and nothing listens on it.
+        let port = TcpListener::bind("127.0.0.1:0")
+            .expect("bind a port to release")
+            .local_addr()
+            .expect("released port")
+            .port();
+        let url = format!("http://127.0.0.1:{}/printer.cfg", port);
+        let probed = url.clone();
+        let error =
+            run_bounded(move || Config::from_url(&probed)).expect_err("a refused connection fails");
+
+        assert!(
+            error.starts_with(&format!("Failed to fetch config from URL '{}'", url)),
+            "unexpected error: {error}"
+        );
+    }
+}

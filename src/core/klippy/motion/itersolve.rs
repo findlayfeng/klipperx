@@ -132,24 +132,9 @@ impl<'a> SegmentWindow<'a> {
         }
     }
 
-    /// The segments around the one being generated, oldest first.
-    pub fn cuts(&self) -> &'a [MoveSegment] {
-        self.cuts
-    }
-
-    /// Where the segment being generated sits in [`SegmentWindow::cuts`].
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
     /// The segment being generated.
-    pub fn segment(&self) -> &'a MoveSegment {
+    fn segment(&self) -> &'a MoveSegment {
         &self.cuts[self.index]
-    }
-
-    /// The pressure-advance parameters in force over the window.
-    pub fn schedule(&self) -> &'a [PressureAdvanceEntry] {
-        self.schedule
     }
 }
 

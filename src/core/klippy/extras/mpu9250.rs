@@ -11,6 +11,7 @@
 //! |---|---|
 //! | [`Mpu9250`] | `MPU9250.__init__` |
 //! | [`read_axes_map`] / [`convert_samples`] | `adxl345.read_axes_map` / `MPU9250._convert_samples` |
+//! | [`setup_writes`] / `config_writes` | `_start_measurements`' register sequence |
 //! | [`AccelQueryHelper`] | `adxl345.AccelQueryHelper` |
 //! | `mpu9250/dump_mpu9250` mux endpoint | `batch_bulk.add_mux_endpoint(…)` |
 //! | [`ConfigMpu9250`] / [`QueryMpu9250`] | `config_mpu9250` / `query_mpu9250` (in [`crate::core::klippy::cmd::mpu9250`]) |
@@ -24,37 +25,38 @@
 //! collects the batches the dump endpoint also streams. `[adxl345]` exposes the
 //! same pair of names, so a caller can treat both chips alike.
 //!
-//! # Known gap: the bulk data path is not wired
+//! # The sample path
 //!
-//! Upstream's `MPU9250` pulls samples through
-//! `bulk_sensor.FixedFreqReader(mcu, chip_smooth, ">hhh")` — six bytes per
-//! sample — and names its status request `query_mpu9250_status`. This host's
+//! Samples flow through the shared
 //! [`FixedFreqReader`](crate::core::klippy::extras::bulk_sensor::FixedFreqReader)
-//! still binds the LDC1612's four-byte sample format (`BYTES_PER_SAMPLE = 4`,
-//! `Sample = (f64, u32)`) and the fixed `query_status_ldc1612` command, so the
-//! MPU9250 cannot drive it yet. The `[adxl345]` section needs the same
-//! generalization (`"BBBBB"` and `query_adxl345_status`), so it is shared
-//! infrastructure work and is left to be done once, outside this section. Until
-//! then [`Mpu9250`] configures the chip and offers the interface, but starting a
-//! measurement fails with the reason ([`BULK_GAP`]); see that constant.
+//! parameterized with the chip's 6-byte `">hhh"` layout — three signed 16-bit
+//! components, 51 // 6 = 8 samples per message — and the
+//! `query_mpu9250_status` clock query. `_start_measurements`' register sequence
+//! ([`setup_writes`], [`config_writes`]) and `_convert_samples` ([`convert_samples`])
+//! follow upstream.
+//!
+//! One batch message carries `data` rows of `[time, x, y, z]` in mm/s², an
+//! `errors` count (the MPU9250 flags none, so it stays zero) and `overflows`.
 //!
 //! The G-Code commands upstream registers through `adxl345.AccelCommandHelper`
 //! (`ACCELEROMETER_MEASURE` / `ACCELEROMETER_QUERY` / `ACCELEROMETER_DEBUG_READ`
-//! / `ACCELEROMETER_DEBUG_WRITE`) are not registered here either: they drive the
-//! same data path, so they are wired together with it.
+//! / `ACCELEROMETER_DEBUG_WRITE`) are not registered by either section yet.
 
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::cmd::mpu9250::{ConfigMpu9250, QueryMpu9250};
+use crate::core::klippy::cmd::mpu9250::{
+    ConfigMpu9250, QueryMpu9250, QUERY_MPU9250_STATUS_MSGFORMAT,
+};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
-    BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
+    BatchBulkHelper, BatchCb, FixedFreqReader, LifecycleCb,
 };
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{ConfigBuilder, I2cMode, McuError, McuI2c, McuObject};
+use crate::core::klippy::mcu::{ConfigBuilder, I2cMode, Mcu, McuError, McuI2c, McuObject};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -92,17 +94,64 @@ const FREEFALL_ACCEL: f64 = 9.80665 * 1000.;
 /// 1/4096 g/LSB at the 8g full scale, in mm/s² (`SCALE`).
 pub const SCALE: f64 = 0.000244140625 * FREEFALL_ACCEL;
 
-/// Why [`Mpu9250`] cannot start a measurement yet — see the module docs.
-///
-/// Upstream pulls the samples through a `FixedFreqReader` whose sample format
-/// and status-query command this host still fixes to the LDC1612's.
-pub const BULK_GAP: &str = "mpu9250 bulk sampling is not wired: the shared FixedFreqReader binds the \
-     LDC1612's 4-byte sample format and the `query_status_ldc1612` command, while the MPU9250 sends \
-     \">hhh\" (6 bytes/sample) and answers `query_mpu9250_status`";
-
 /// The report header a connecting dump client receives
 /// (`('time', 'x_acceleration', 'y_acceleration', 'z_acceleration')`).
 pub const DUMP_HEADER: [&str; 4] = ["time", "x_acceleration", "y_acceleration", "z_acceleration"];
+
+/// Seconds between batch callbacks and the smoothing span's unit (upstream
+/// `mpu9250.BATCH_UPDATES`).
+const MPU_BATCH_UPDATES: f64 = 0.100;
+
+/// The three signed 16-bit fields one sample unpacks (upstream's `">hhh"`).
+const SAMPLE_FIELDS: usize = 3;
+
+// The chip's register map (`mpu9250.py`'s `REG_*`).
+const REG_DEVID: u8 = 0x75;
+const REG_FIFO_EN: u8 = 0x23;
+const REG_SMPLRT_DIV: u8 = 0x19;
+const REG_CONFIG: u8 = 0x1A;
+const REG_ACCEL_CONFIG: u8 = 0x1C;
+const REG_ACCEL_CONFIG2: u8 = 0x1D;
+const REG_USER_CTRL: u8 = 0x6A;
+const REG_PWR_MGMT_1: u8 = 0x6B;
+const REG_PWR_MGMT_2: u8 = 0x6C;
+const REG_INT_STATUS: u8 = 0x3A;
+
+/// The one sample-rate divider the section accepts (`SAMPLE_RATE_DIVS`).
+const SET_SMPLRT_DIV: u8 = 0x00;
+
+/// FIFO in stream mode (`SET_CONFIG`).
+const SET_CONFIG: u8 = 0x01;
+
+/// 8g full scale (`SET_ACCEL_CONFIG`).
+const SET_ACCEL_CONFIG: u8 = 0x10;
+
+/// 1046 Hz bandwidth, 0.503 ms delay, 4 kHz sample rate (`SET_ACCEL_CONFIG2`).
+const SET_ACCEL_CONFIG2: u8 = 0x08;
+
+/// Leave sleep mode (`SET_PWR_MGMT_1_WAKE`).
+const SET_PWR_MGMT_1_WAKE: u8 = 0x00;
+
+/// Back to sleep (`SET_PWR_MGMT_1_SLEEP`).
+const SET_PWR_MGMT_1_SLEEP: u8 = 0x40;
+
+/// Accelerometer axes on (`SET_PWR_MGMT_2_ACCEL_ON`).
+const SET_PWR_MGMT_2_ACCEL_ON: u8 = 0x07;
+
+/// Everything off (`SET_PWR_MGMT_2_OFF`).
+const SET_PWR_MGMT_2_OFF: u8 = 0x3F;
+
+/// Reset the FIFO (`SET_USER_FIFO_RESET`).
+const SET_USER_FIFO_RESET: u8 = 0x04;
+
+/// Leave the FIFO enabled (`SET_USER_FIFO_EN`).
+const SET_USER_FIFO_EN: u8 = 0x40;
+
+/// Let samples into the FIFO (`SET_ENABLE_FIFO`).
+const SET_ENABLE_FIFO: u8 = 0x08;
+
+/// Stop samples entering the FIFO (`SET_DISABLE_FIFO`).
+const SET_DISABLE_FIFO: u8 = 0x00;
 
 /// One axis of the sensor's `axes_map`: which raw component it reads and the
 /// sign/scale applied.
@@ -171,16 +220,23 @@ pub fn read_axes_map(config: &ConfigWrapper, scale: f64) -> Result<AxesMap, Conf
 /// Map raw sensor counts to scaled acceleration
 /// (`MPU9250._convert_samples`).
 ///
-/// `raw` is one `(print time, x, y, z)` tuple per sample — the MPU9250's
+/// `raw` is one `(print time, [x, y, z])` sample per row — the MPU9250's
 /// `">hhh"` wire format, signed 16-bit components — and the result is the dump
 /// message's `[time, x, y, z]` rows with upstream's 6-digit rounding.
-pub fn convert_samples(axes_map: &AxesMap, raw: &[(f64, i16, i16, i16)]) -> Vec<AccelSample> {
+pub fn convert_samples(
+    axes_map: &AxesMap,
+    raw: &[(f64, [i32; SAMPLE_FIELDS])],
+) -> Vec<AccelSample> {
     let (x_pos, x_scale) = axes_map[0];
     let (y_pos, y_scale) = axes_map[1];
     let (z_pos, z_scale) = axes_map[2];
     raw.iter()
-        .map(|(ptime, rx, ry, rz)| {
-            let raw_xyz = [f64::from(*rx), f64::from(*ry), f64::from(*rz)];
+        .map(|(ptime, fields)| {
+            let raw_xyz = [
+                f64::from(fields[0]),
+                f64::from(fields[1]),
+                f64::from(fields[2]),
+            ];
             [
                 round(*ptime, 6),
                 round(raw_xyz[x_pos] * x_scale, 6),
@@ -189,6 +245,52 @@ pub fn convert_samples(axes_map: &AxesMap, raw: &[(f64, i16, i16, i16)]) -> Vec<
             ]
         })
         .collect()
+}
+
+/// The device names the chip's id byte maps to (`MPU_DEV_IDS`); the two odd ids
+/// are marked defective upstream too.
+fn device_name(dev_id: u8) -> Option<&'static str> {
+    Some(match dev_id {
+        0x74 => "mpu-9515",
+        0x73 => "mpu-9255",
+        0x71 => "mpu-9250",
+        0x70 => "mpu-6500",
+        0x68 => "mpu-6050",
+        0x75 => "mpu-unknown (DEFECTIVE! USE WITH CAUTION!)",
+        0x69 => "mpu-unknown (DEFECTIVE! USE WITH CAUTION!)",
+        _ => return None,
+    })
+}
+
+/// The writes `_start_measurements` issues first: wake the chip and turn the
+/// accelerometer axes on.
+fn setup_writes() -> [(u8, u8); 2] {
+    [
+        (REG_PWR_MGMT_1, SET_PWR_MGMT_1_WAKE),
+        (REG_PWR_MGMT_2, SET_PWR_MGMT_2_ACCEL_ON),
+    ]
+}
+
+/// The writes that configure the sample rate and the accelerometer, then empty
+/// and enable the FIFO (`_start_measurements`, after the 20 ms wake pause).
+fn config_writes() -> [(u8, u8); 7] {
+    [
+        (REG_SMPLRT_DIV, SET_SMPLRT_DIV),
+        (REG_CONFIG, SET_CONFIG),
+        (REG_ACCEL_CONFIG, SET_ACCEL_CONFIG),
+        (REG_ACCEL_CONFIG2, SET_ACCEL_CONFIG2),
+        (REG_FIFO_EN, SET_DISABLE_FIFO),
+        (REG_USER_CTRL, SET_USER_FIFO_RESET),
+        (REG_USER_CTRL, SET_USER_FIFO_EN),
+    ]
+}
+
+/// The writes `_finish_measurements` issues once the bulk query is stopped.
+fn shutdown_writes() -> [(u8, u8); 2] {
+    [
+        (REG_PWR_MGMT_1, SET_PWR_MGMT_1_SLEEP),
+        (REG_PWR_MGMT_2, SET_PWR_MGMT_2_OFF),
+    ]
 }
 
 // ===========================================================================
@@ -450,6 +552,16 @@ impl Mpu9250 {
             axes_map,
             printer: Arc::downgrade(printer),
             i2c,
+            mcu_object: Arc::clone(&mcu_object),
+            // Samples per second the clock regression expects, smoothed over
+            // two batch windows (`chip_smooth = self.data_rate * BATCH_UPDATES * 2`).
+            ffreader: FixedFreqReader::with_payload_format(
+                rate as f64 * MPU_BATCH_UPDATES * 2.,
+                ">hhh",
+                QUERY_MPU9250_STATUS_MSGFORMAT,
+            )
+            .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
+            last_error_count: Mutex::new(0),
             batch_bulk: Mutex::new(None),
         });
 
@@ -458,22 +570,47 @@ impl Mpu9250 {
         // allocates it in its config callback).
         let callback_state = Arc::downgrade(&state);
         builder
-            .register_config_callback(Box::new(move |builder, _mcu| {
+            .register_config_callback(Box::new(move |builder, mcu| {
                 if let Some(state) = callback_state.upgrade() {
-                    state.build(builder)?;
+                    state.build(builder, mcu)?;
                 }
                 Ok(())
             }))
             .map_err(|err| ConfigError::new(err.to_string()))?;
 
         // --- batch helper (BatchBulkHelper + mux endpoint) ----------------
-        let batch_bulk = BatchBulkHelper::new(
-            printer,
-            batch_callback(),
-            start_callback(),
-            stop_callback(),
-            BATCH_INTERVAL,
-        );
+        let start_state = Arc::downgrade(&state);
+        let start_cb: LifecycleCb = Arc::new(move || {
+            let start_state = start_state.clone();
+            Box::pin(async move {
+                let state = start_state
+                    .upgrade()
+                    .ok_or_else(|| "mpu9250 is gone".to_string())?;
+                state.start_measurements().await
+            })
+        });
+        let stop_state = Arc::downgrade(&state);
+        let stop_cb: LifecycleCb = Arc::new(move || {
+            let stop_state = stop_state.clone();
+            Box::pin(async move {
+                let state = stop_state
+                    .upgrade()
+                    .ok_or_else(|| "mpu9250 is gone".to_string())?;
+                state.finish_measurements().await
+            })
+        });
+        let batch_state = Arc::downgrade(&state);
+        let batch_cb: BatchCb = Arc::new(move |eventtime| {
+            let batch_state = batch_state.clone();
+            Box::pin(async move {
+                let state = batch_state
+                    .upgrade()
+                    .ok_or_else(|| "mpu9250 is gone".to_string())?;
+                state.process_batch(eventtime).await
+            })
+        });
+        let batch_bulk =
+            BatchBulkHelper::new(printer, batch_cb, start_cb, stop_cb, MPU_BATCH_UPDATES);
         batch_bulk.add_mux_endpoint(
             DUMP_ENDPOINT,
             DUMP_KEY,
@@ -513,9 +650,10 @@ impl Mpu9250 {
     /// Register a measurement client and hand it back
     /// (`MPU9250.start_internal_client`).
     ///
-    /// The caller names the chip, asks for a client, ends the window with
-    /// [`AccelQueryHelper::finish_measurements`], and reads the readings with
-    /// [`AccelQueryHelper::get_samples`].
+    /// Registering it starts the chip's stream (the helper's first client runs
+    /// `_start_measurements`); the caller ends the window with
+    /// [`AccelQueryHelper::finish_measurements`], which detaches the client and
+    /// runs the chip's own `_finish_measurements`.
     pub fn start_internal_client(&self) -> Arc<AccelQueryHelper> {
         let helper = AccelQueryHelper::new(self.state.printer.clone());
         if let Some(bulk) = self
@@ -531,6 +669,18 @@ impl Mpu9250 {
             }));
         }
         helper
+    }
+
+    /// How many clients the batch helper holds (tests and bookkeeping).
+    #[cfg(test)]
+    pub(crate) fn client_count(&self) -> usize {
+        self.state
+            .batch_bulk
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|bulk| bulk.client_count())
+            .unwrap_or(0)
     }
 }
 
@@ -565,17 +715,23 @@ struct Mpu9250State {
     address: u8,
     speed: u32,
     /// Read by [`convert_samples`], the chip's decode helper.
-    #[allow(dead_code)]
     axes_map: AxesMap,
     printer: Weak<Printer>,
     i2c: Arc<McuI2c>,
+    /// The MCU the I2C bus is on (the reader's data binding needs it).
+    mcu_object: Arc<McuObject>,
+    /// The reader: 6-byte `">hhh"` samples, `query_mpu9250_status` queries.
+    ffreader: FixedFreqReader<[i32; SAMPLE_FIELDS]>,
+    /// The MPU-family chips flag no per-sample errors, so this stays zero
+    /// (`last_error_count`, kept for the batch message's shape).
+    last_error_count: Mutex<u64>,
     batch_bulk: Mutex<Option<Arc<BatchBulkHelper>>>,
 }
 
 impl Mpu9250State {
-    /// The build-time half: the chip's config command and its armed-at-restart
-    /// disarmed query (`_build_config`).
-    fn build(&self, builder: &ConfigBuilder) -> Result<(), McuError> {
+    /// The build-time half: the chip's config command, its armed-at-restart
+    /// disarmed query, and the reader's data binding (`_build_config`).
+    fn build(&self, builder: &ConfigBuilder, mcu: &Mcu) -> Result<(), McuError> {
         let i2c_oid = self.i2c.oid()?;
         builder.add_config_cmd(&ConfigMpu9250 {
             oid: self.oid,
@@ -586,23 +742,133 @@ impl Mpu9250State {
             oid: self.oid,
             rest_ticks: 0,
         })?;
+        self.ffreader.bind(mcu, &self.mcu_object, self.oid)?;
         Ok(())
     }
-}
 
-/// The start callback: refuses with the reason the data path is not wired.
-fn start_callback() -> LifecycleCb {
-    Arc::new(move || Box::pin(async move { Err(BULK_GAP.to_string()) }))
-}
+    /// Read one register (`read_reg`), or fail when the read is short.
+    async fn read_reg(&self, reg: u8) -> Result<u8, String> {
+        let response = self
+            .i2c
+            .transfer(&[reg], 1)
+            .await
+            .map_err(|err| err.to_string())?;
+        response.first().copied().ok_or_else(|| {
+            format!(
+                "mpu9250 register 0x{reg:02x}: short read ({} byte(s))",
+                response.len()
+            )
+        })
+    }
 
-/// The stop callback: nothing to undo while the data path is unwired.
-fn stop_callback() -> LifecycleCb {
-    Arc::new(|| Box::pin(async { Ok(()) }))
-}
+    /// Write one register (`set_reg`; upstream does not read it back).
+    async fn set_reg(&self, reg: u8, value: u8) -> Result<(), String> {
+        self.i2c
+            .write(&[reg, value])
+            .await
+            .map_err(|err| err.to_string())
+    }
 
-/// The batch callback: no samples are read while the data path is unwired.
-fn batch_callback() -> BatchCb {
-    Arc::new(|_eventtime| Box::pin(async { Ok(None) }))
+    /// The connected MCU, or why the sensor cannot reach it.
+    fn connected_mcu(&self) -> Result<Arc<Mcu>, String> {
+        self.mcu_object
+            .mcu()
+            .ok_or_else(|| "mpu9250's MCU is not connected".to_string())
+    }
+
+    /// Wake the chip, configure it, and arm the bulk stream
+    /// (`_start_measurements`).
+    async fn start_measurements(&self) -> Result<(), String> {
+        // In case of miswiring, the device id tells a real chip from noise.
+        let dev_id = self.read_reg(REG_DEVID).await?;
+        let chip = device_name(dev_id).ok_or_else(|| {
+            format!(
+                "Invalid mpu id (got {dev_id:x}).\n\
+                 This is generally indicative of connection problems\n\
+                 (e.g. faulty wiring) or a faulty chip."
+            )
+        })?;
+        tracing::info!("Found {chip} with id {dev_id:x}");
+
+        for (reg, value) in setup_writes() {
+            self.set_reg(reg, value).await?;
+        }
+        // Dummy read to ensure the queues are flushed, then pause for the
+        // accelerometer to wake. Upstream gates the rate write on an MCU clock
+        // 20 ms in the future instead; the pause is the same wait.
+        self.read_reg(REG_DEVID).await?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        for (reg, value) in config_writes() {
+            self.set_reg(reg, value).await?;
+        }
+        // Clear the FIFO overflow flag.
+        self.read_reg(REG_INT_STATUS).await?;
+
+        // Start bulk reading: one report every four samples.
+        let mcu = self.connected_mcu()?;
+        let rest_ticks = mcu
+            .seconds_to_clock(4. / self.rate as f64)
+            .map_err(|err| err.to_string())? as u32;
+        mcu.send_msg(&QueryMpu9250 {
+            oid: self.oid,
+            rest_ticks,
+        })
+        .map_err(|err| err.to_string())?;
+        self.set_reg(REG_FIFO_EN, SET_ENABLE_FIFO).await?;
+
+        tracing::info!("MPU9250 starting '{}' measurements", self.name);
+        // Initialize clock tracking.
+        self.ffreader
+            .note_start()
+            .await
+            .map_err(|err| err.to_string())?;
+        *self
+            .last_error_count
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = 0;
+        Ok(())
+    }
+
+    /// Halt the bulk stream and put the chip back to sleep
+    /// (`_finish_measurements`).
+    async fn finish_measurements(&self) -> Result<(), String> {
+        self.set_reg(REG_FIFO_EN, SET_DISABLE_FIFO).await?;
+        let mcu = self.connected_mcu()?;
+        mcu.send_msg(&QueryMpu9250 {
+            oid: self.oid,
+            rest_ticks: 0,
+        })
+        .map_err(|err| err.to_string())?;
+        self.ffreader.note_end();
+        tracing::info!("MPU9250 finished '{}' measurements", self.name);
+        for (reg, value) in shutdown_writes() {
+            self.set_reg(reg, value).await?;
+        }
+        Ok(())
+    }
+
+    /// One batch: pull, convert, report (`_process_batch`).
+    async fn process_batch(&self, _eventtime: f64) -> Result<Option<Value>, String> {
+        let raw = self
+            .ffreader
+            .pull_samples()
+            .await
+            .map_err(|err| err.to_string())?;
+        let data = convert_samples(&self.axes_map, &raw);
+        if data.is_empty() {
+            return Ok(None);
+        }
+        let errors = *self
+            .last_error_count
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let overflows = self.ffreader.get_last_overflows();
+        Ok(Some(json!({
+            "data": data,
+            "errors": errors,
+            "overflows": overflows,
+        })))
+    }
 }
 
 /// Upstream's `load_config` for `[mpu9250]`.
@@ -769,13 +1035,40 @@ mod tests {
         // X reads raw Z, Y reads raw X negated, Z reads raw Y — all at SCALE.
         let map = [(2, SCALE), (0, -SCALE), (1, SCALE)];
 
-        let samples = convert_samples(&map, &[(1.000_000_49, 100, 200, 300)]);
+        let samples = convert_samples(&map, &[(1.000_000_49, [100, 200, 300])]);
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0][0], 1.000_000, "time rounded to 6 digits");
         assert_eq!(samples[0][1], round(300.0 * SCALE, 6));
         assert_eq!(samples[0][2], round(-100.0 * SCALE, 6));
         assert_eq!(samples[0][3], round(200.0 * SCALE, 6));
+    }
+
+    #[test]
+    fn test_the_register_sequence_is_upstreams() {
+        // Wake, accelerometer axes on; then rate, FIFO stream mode and the
+        // accelerometer's bandwidth/full scale; then empty and enable the FIFO.
+        assert_eq!(setup_writes(), [(0x6b, 0x00), (0x6c, 0x07)]);
+        assert_eq!(
+            config_writes(),
+            [
+                (0x19, 0x00), // SMPLRT_DIV: 4 kHz
+                (0x1a, 0x01), // CONFIG: FIFO stream mode
+                (0x1c, 0x10), // ACCEL_CONFIG: 8g full scale
+                (0x1d, 0x08), // ACCEL_CONFIG2: 1046 Hz bandwidth
+                (0x23, 0x00), // FIFO_EN: disabled while the FIFO is reset
+                (0x6a, 0x04), // USER_CTRL: reset the FIFO
+                (0x6a, 0x40), // USER_CTRL: FIFO enabled
+            ]
+        );
+        assert_eq!(shutdown_writes(), [(0x6b, 0x40), (0x6c, 0x3f)]);
+
+        // The ids upstream accepts, both defective ones included.
+        assert_eq!(device_name(0x71), Some("mpu-9250"));
+        assert_eq!(device_name(0x70), Some("mpu-6500"));
+        assert_eq!(device_name(0x68), Some("mpu-6050"));
+        assert!(device_name(0x75).expect("a known id").contains("DEFECTIVE"));
+        assert_eq!(device_name(0x00), None);
     }
 
     #[test]
@@ -894,18 +1187,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_starting_a_measurement_reports_the_bulk_gap() {
-        // The interface exists and is callable, but the data path is a
-        // documented gap: a client gets no samples.
+    async fn test_starting_a_measurement_registers_a_batch_client() {
+        // The interface now drives the real path: asking for a client subscribes
+        // it to the batch stream (whose first client runs the chip's start
+        // callback), and nothing has arrived yet.
         let printer = printer();
         let mpu = Mpu9250::new(&wrap("my_mpu", &[]), &printer).unwrap();
 
         let client = mpu.start_internal_client();
 
+        assert_eq!(mpu.client_count(), 1);
         assert!(client.get_samples().is_empty());
-        assert!(
-            BULK_GAP.contains("query_mpu9250_status") && BULK_GAP.contains("LDC1612"),
-            "{BULK_GAP}"
-        );
     }
 }

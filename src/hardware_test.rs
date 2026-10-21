@@ -1487,7 +1487,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, Weak};
 
+    use crate::core::klippy::interface::devices::host::HostMux;
     use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+    use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::{Mcu, McuObject};
 
     /// Parse fixture text with the real parser.
@@ -2415,6 +2417,117 @@ mod tests {
         let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         assert!(message.contains("printer.cfg"), "{message}");
+    }
+
+    /// The host-library transport facts `Machine::open_mcu_named` stamps on the
+    /// board called `name`: the mux attach and the bridge port table.
+    fn host_facts(parsed: &Config, name: &str) -> (Option<HostMux>, Vec<(u8, String)>) {
+        let identifier = mcu_section_id(name);
+        let section = parsed
+            .get_section(&identifier)
+            .unwrap_or_else(|| panic!("the fixture has [{identifier}]"));
+        let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
+            section,
+            crate::core::klippy::config::AccessTracking::shared(),
+            None,
+            parsed,
+        ))
+        .expect("the section parses");
+        apply_id_addressed_transport(parsed, section, &mut mcu);
+        (mcu.host_mux, mcu.host_port_paths)
+    }
+
+    /// A `host_library:` path the config does not call muxed opens with bare
+    /// frames, exactly as the load path leaves it.
+    #[test]
+    fn test_a_plain_host_library_path_stays_unmuxed() {
+        let parsed = config("[mcu]\nhost_library: /opt/libklipper_host.so\n");
+
+        assert_eq!(host_facts(&parsed, "mcu"), (None, Vec::new()));
+    }
+
+    /// A path the config **does** call muxed (here: the section writes a
+    /// `uuid`, which names the board the mux routes to) is opened through
+    /// [`Interface::host_mux`] with the identity pair the load path gives it —
+    /// without this the library would be opened with bare frames and address
+    /// nobody.
+    #[test]
+    fn test_a_muxed_host_library_path_attaches_with_its_identity_pair() {
+        let parsed = config("[mcu]\nhost_library: /opt/libklipper_host.so\nuuid: 11aa22bb33cc\n");
+
+        let (mux, paths) = host_facts(&parsed, "mcu");
+        let mux = mux.expect("a section writing a uuid makes the path muxed");
+        assert_eq!(
+            mux.named,
+            [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            "the attach names the uuid the section wrote"
+        );
+        // The identity is the path's own (seeded from its text, so the same
+        // config always gets the same one), and it is what the load path's own
+        // grouping assigns: replaying that call is the point of the stamp.
+        let section = parsed.get_section("mcu").expect("the fixture has [mcu]");
+        let libraries = HostLibraries::classify(&ConfigWrapper::with_config(
+            section,
+            crate::core::klippy::config::AccessTracking::shared(),
+            None,
+            &parsed,
+        ))
+        .expect("the fixture classifies");
+        assert_eq!(
+            Some(mux.identity),
+            libraries.identity("/opt/libklipper_host.so"),
+            "the identity is the load path's, not a number invented here"
+        );
+        assert!(paths.is_empty(), "this path names no uart port: {paths:?}");
+    }
+
+    /// A bridge is muxed even when it writes no `uuid`: the downstream device on
+    /// its port is what makes the path addressed by id (`path_is_mux`'s
+    /// `has_bridge`/`downstream` rule), and the attach then names the bridge's own
+    /// identity.
+    #[test]
+    fn test_a_host_library_bridge_is_muxed_and_names_its_own_identity() {
+        let parsed = config(
+            "[mcu bridge]\nhost_library: /opt/libklipper_host.so\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_path: /dev/bridge-a\n",
+        );
+
+        let (mux, paths) = host_facts(&parsed, "bridge");
+        let mux = mux.expect("a bridge with a downstream device is muxed");
+        assert_eq!(
+            mux.named, mux.identity,
+            "without a uuid the attach names the bridge's own identity"
+        );
+        assert_eq!(
+            paths,
+            vec![(0u8, "/dev/bridge-a".to_string())],
+            "the port's own tty is recorded under its uart slot"
+        );
+    }
+
+    /// The bridge port table is the load path's, slot for slot: only a
+    /// `[uart_device]` takes a UART slot, a `[can_device]` does not, and a port
+    /// without `uart_path:` records no tty but still takes its slot.
+    #[test]
+    fn test_the_bridge_port_table_counts_uart_slots_the_way_the_load_does() {
+        let parsed = config(
+            "[mcu bridge]\nhost_library: /opt/libklipper_host.so\n\
+             [uart_device first]\nuart_mcu: bridge\nuart_oid: uart0\nuart_path: /dev/a\n\
+             [can_device between]\ncan_mcu: bridge\ncan_oid: can0\n\
+             [uart_device second]\nuart_mcu: bridge\nuart_oid: uart1\n\
+             [uart_device third]\nuart_mcu: bridge\nuart_oid: uart2\nuart_path: /dev/c\n",
+        );
+
+        assert_eq!(
+            host_facts(&parsed, "bridge").1,
+            vec![(0u8, "/dev/a".to_string()), (2u8, "/dev/c".to_string()),],
+            "the CAN port takes no slot, and the uart port without a tty still takes one"
+        );
+
+        // A serial board has no port table at all.
+        assert!(host_facts(&config("[mcu]\nserial: /dev/ttyACM0\n"), "mcu")
+            .1
+            .is_empty());
     }
 
     // -----------------------------------------------------------------------

@@ -11,9 +11,11 @@
 //! * The periodic runout check (`_extruder_pos_update_event`, upstream's
 //!   `CHECK_RUNOUT_TIMEOUT = .250` timer): the `idle_timeout:printing` event
 //!   would point that timer at "now", but the timer itself and the position
-//!   comparison against `filament_runout_pos` are not wired. On the corpus's
-//!   fake firmware no encoder event is generated either, so the runout check is
-//!   never reached.
+//!   comparison against `filament_runout_pos` are not wired. The encoder events
+//!   themselves *are* delivered: `[buttons]` has a firmware query since
+//!   2026-10-21, so a real board's encoder reports reach [`RunoutHelper`]; only
+//!   the corpus's fake firmware generates none, which is why the corpus never
+//!   reaches the runout check.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};

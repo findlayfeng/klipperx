@@ -22,13 +22,13 @@
 //!
 //! # Gaps this port does not close yet
 //!
-//! * **The button event.** Upstream registers a debounced button with the
+//! * **The button event** is live (2026-10-21): the registration goes to the
 //!   `buttons` module (`:17-18`), whose firmware query (`buttons.py`'s
-//!   `MCU_buttons`) fires the callback on a pin change. This host has no button
-//!   query (see [`buttons`](crate::core::klippy::extras::buttons)), so the
-//!   callback is recorded but never reached by the firmware. The corpus only
-//!   *loads* `[gcode_button lcd_button]` (`printer-biqu-bx-2021.cfg:185`) and
-//!   never presses it, so that is faithful on the corpus.
+//!   `MCU_buttons` — `config_buttons`/`buttons_add`/`buttons_query`/
+//!   `buttons_ack`/`buttons_state`) fires this callback on a pin change, with
+//!   upstream's host debounce in between. The corpus only *loads*
+//!   `[gcode_button lcd_button]` (`printer-biqu-bx-2021.cfg:185`) and never
+//!   presses it, so the corpus exercises the registration alone.
 //! * **`analog_range`.** Upstream's analog branch (`gcode_button.py:19-23`)
 //!   registers through `buttons.register_debounce_adc_button`, which rests on
 //!   the `query_adc` object — absent from this host, the same reason

@@ -364,6 +364,7 @@ impl McuButtons {
             return None;
         }
         let new_count = new_count as usize;
+        let count = u8::try_from(new_count).ok()?;
         // The report may repeat bytes the host has already seen at its front.
         // Python's `buttons[-new_count:]` clamps a slice longer than the array
         // to the whole array, which a report after a counter wrap can ask for
@@ -371,7 +372,6 @@ impl McuButtons {
         let start = report.state.len().saturating_sub(new_count);
         let new_bytes = report.state.get(start..)?;
         state.ack_count += new_count as i64;
-        let count = u8::try_from(new_count).ok()?;
 
         let callbacks = state.callbacks.clone();
         let mut calls = Vec::new();

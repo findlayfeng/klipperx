@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 pub use access::AccessTracking;
 pub use object::PrinterConfig;
@@ -57,6 +58,76 @@ pub struct Config {
     /// `SAVE_CONFIG` writes back. `None` when the file has no block. Boxed so
     /// the option stays a sized member of `Config`.
     autosave: Option<Box<Config>>,
+}
+
+/// Wall-clock budget for one whole `[include https://…]` / `from_url` fetch.
+///
+/// A config URL is read while a print may be waiting on the config load, so a
+/// stalled remote must not hang the process: ten seconds is long enough for a
+/// few-hundred-KB config over a slow link and short enough that a dead host
+/// fails visibly instead of blocking startup.
+const CONFIG_URL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connect-phase slice of [`CONFIG_URL_TIMEOUT`]: a TCP+TLS handshake that has
+/// not completed in five seconds means the host is unreachable rather than
+/// slow, and failing there leaves budget for the transfer on the retry.
+const CONFIG_URL_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Hard cap on a remotely fetched config body. The largest real Klipper config
+/// in the corpus is tens of KB, so 4 MiB is generous; the cap exists because a
+/// wrong or hostile URL must not be able to exhaust memory on a card computer.
+const CONFIG_URL_BODY_LIMIT: usize = 4 * 1024 * 1024;
+
+/// Fetch a config body over HTTP(S), bounded in both time and size.
+///
+/// The body is streamed in chunks and the running length is checked after each
+/// one, so an over-limit response is rejected *while* reading it — never after
+/// buffering it whole.
+fn fetch_url(url: &str) -> Result<String, String> {
+    fetch_url_with_limit(url, CONFIG_URL_BODY_LIMIT)
+}
+
+/// [`fetch_url`] with an explicit size cap; the cap is a parameter so tests can
+/// exercise the over-limit path without feeding it a real 4 MiB response.
+fn fetch_url_with_limit(url: &str, body_limit: usize) -> Result<String, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(CONFIG_URL_CONNECT_TIMEOUT)
+        .timeout(CONFIG_URL_TIMEOUT)
+        .build();
+
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        // A non-2xx answer is not a transport failure; report the status the
+        // way the callers always have (`…: HTTP 404`).
+        Err(ureq::Error::Status(status, _)) => return Err(format!("HTTP {}", status)),
+        Err(ureq::Error::Transport(transport)) => return Err(transport.to_string()),
+    };
+
+    let mut reader = response.into_reader();
+    let mut body: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("Failed to read response body: {}", e))?;
+        if read == 0 {
+            break;
+        }
+        if body.len() + read > body_limit {
+            return Err(format!(
+                "Response body exceeds the {} byte limit",
+                body_limit
+            ));
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+
+    // Remote config fetches leave a trail: an operator debugging a print that
+    // picked up an unexpected config needs to know a URL was pulled and how
+    // much came back.
+    tracing::info!("Fetched config from URL '{}' ({} bytes)", url, body.len());
+
+    String::from_utf8(body).map_err(|e| format!("Response body is not valid UTF-8: {}", e))
 }
 
 impl Config {
@@ -200,20 +271,7 @@ impl Config {
 
     /// Parse a config from a URL.
     pub fn from_url(url: &str) -> Result<(Self, Vec<ConfigSource>), String> {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("Failed to fetch config from URL '{}': {}", url, e))?;
-
-        if !response.status().is_success() {
-            return Err(format!(
-                "Failed to fetch config from URL '{}': HTTP {}",
-                url,
-                response.status()
-            ));
-        }
-
+        fetch_url(url).map_err(|e| format!("Failed to fetch config from URL '{}': {}", url, e))?;
         let source = ConfigSource::Url(url.to_string());
         Self::parse(source)
     }
@@ -396,21 +454,7 @@ impl Config {
             ConfigSource::File(path) => fs::read_to_string(path)
                 .map_err(|e| format!("Failed to read file '{}': {}", path.display(), e)),
             ConfigSource::Url(url) => {
-                let client = reqwest::blocking::Client::new();
-                let response = client
-                    .get(url)
-                    .send()
-                    .map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))?;
-                if !response.status().is_success() {
-                    return Err(format!(
-                        "Failed to fetch URL '{}': HTTP {}",
-                        url,
-                        response.status()
-                    ));
-                }
-                response
-                    .text()
-                    .map_err(|e| format!("Failed to read URL '{}': {}", url, e))
+                fetch_url(url).map_err(|e| format!("Failed to fetch URL '{}': {}", url, e))
             }
             ConfigSource::None(s) => Ok(s.clone()),
         }

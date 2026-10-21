@@ -731,6 +731,14 @@ impl MenuItem {
         if let Some(list) = data.list_mut() {
             list.allitems = allitems;
         }
+        drop(data);
+        // The populate callback (`menu.py:344-346`): upstream raises it after
+        // `_populate` and its `_populate_cb`, and hands itself as the payload.
+        // The event is raised with the item's own lock released — a handler that
+        // reads the menu would otherwise deadlock on this same mutex.
+        if let Some(manager) = self.manager.upgrade() {
+            manager.announce(KlippyEvent::MenuPopulate);
+        }
     }
 
     /// Record that a container child hangs under this one (`_insert_item`'s
@@ -1084,6 +1092,10 @@ impl MenuManager {
         }
         manager.register_keys(config, options)?;
 
+        // End of construction (`menu.py:721-722`): upstream raises `init` here,
+        // before the reactor timer exists, with the manager as the payload.
+        manager.announce(KlippyEvent::MenuInit);
+
         printer.add_object(MENU_OBJECT, Arc::clone(&manager) as Arc<dyn PrinterObject>)?;
 
         let ready = Arc::downgrade(&manager);
@@ -1101,6 +1113,16 @@ impl MenuManager {
     /// The machine this menu belongs to.
     pub fn printer(&self) -> &Arc<Printer> {
         &self.printer
+    }
+
+    /// Raise a `menu:` event (`MenuManager.send_event`, `menu.py:743-744`).
+    ///
+    /// Upstream spells it `printer.send_event("menu:" + event, self)` and hands
+    /// the sender as the payload. The registry here declares the four names
+    /// without a payload (see `event/decl/menu.rs`), so only the name travels;
+    /// a handler that needs the menu looks it up by object name (`menu`).
+    fn announce(&self, event: KlippyEvent) {
+        self.printer.send_event(&event);
     }
 
     /// The panel's width in characters.
@@ -1513,6 +1535,9 @@ impl MenuManager {
             tracing::error!("menu: invalid root '{}', menu stopped", self.root_ns);
             return;
         }
+        // Upstream raises `begin` before it seeds the selection and pushes the
+        // root (`menu.py:750-757`), so a handler sees the menu as not running.
+        self.announce(KlippyEvent::MenuBegin);
         root.init_selection();
         self.stack_push(root);
         self.state().running = true;
@@ -1725,6 +1750,7 @@ impl MenuManager {
         if container.is_list() {
             container.run_gcode(Some("leave"));
         }
+        self.announce(KlippyEvent::MenuExit);
         self.state().running = false;
     }
 
@@ -2613,6 +2639,48 @@ mod tests {
     }
 
     /// The manager reports itself the way upstream's `get_status` does.
+    /// Each lifecycle point raises its own `menu:` event, in upstream's order:
+    /// `init` at the end of construction (`menu.py:721-722`), `begin` before the
+    /// root is pushed (`:750-757`), `populate` when a container is rebuilt
+    /// (`:344-346`) and `exit` just before the menu stops running (`:913`).
+    #[test]
+    fn test_the_lifecycle_raises_the_four_menu_events() {
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}menu_root: __test\n{TEST_TREE}"
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let printer = machine();
+        let seen: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        for (event, name) in [
+            (KlippyEvent::MenuInit, "init"),
+            (KlippyEvent::MenuPopulate, "populate"),
+            (KlippyEvent::MenuBegin, "begin"),
+            (KlippyEvent::MenuExit, "exit"),
+        ] {
+            let seen = Arc::clone(&seen);
+            printer.register_event_handler(
+                event,
+                Box::new(move |_| seen.lock().unwrap_or_else(|p| p.into_inner()).push(name)),
+            );
+        }
+        printer
+            .load_config(&config)
+            .unwrap_or_else(|error| panic!("the config loads: {error}"));
+        let menu = menu_of(&printer);
+        // Construction raised `init` and nothing else: the root is populated
+        // when the menu opens, not when it is built.
+        assert_eq!(*seen.lock().unwrap(), vec!["init"]);
+
+        menu.begin(0.0);
+        {
+            let seen = seen.lock().unwrap();
+            assert_eq!(&seen[1..], ["begin", "populate"], "{seen:?}");
+        }
+
+        menu.exit(true);
+        assert_eq!(seen.lock().unwrap().last(), Some(&"exit"));
+    }
+
     #[test]
     fn test_the_menu_object_reports_its_status() {
         let printer = load("menu_root: __test\nmenu_timeout: 40\n", TEST_TREE);

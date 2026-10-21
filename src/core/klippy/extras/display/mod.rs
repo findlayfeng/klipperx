@@ -7,11 +7,10 @@
 //! on-screen menu), and two shipped layouts (`display.cfg`, `menu.cfg`). Here
 //! the same split is kept: [`display`] is the framework, [`st7920`],
 //! [`hd44780`], [`hd44780_spi`], [`uc1701`], [`ssd1306`] and [`aip31068_spi`]
-//! are the panels that
-//! have a driver here (two of them build more than one `lcd_type`: [`st7920`]
-//! also builds `emulated_st7920`, [`ssd1306`] also builds `sh1106`), `font8x14`
-//! is the graphics panels' font table, and the
-//! shipped layout is [`display::DISPLAY_CFG`], vendored beside them.
+//! are the panels that have a driver here (two of them build more than one
+//! `lcd_type`: [`st7920`] also builds `emulated_st7920`, [`ssd1306`] also builds
+//! `sh1106`), `font8x14` is the graphics panels' font table, and the shipped
+//! layout is [`display::DISPLAY_CFG`], vendored beside them.
 //!
 //! | section | upstream | notes |
 //! |---|---|---|

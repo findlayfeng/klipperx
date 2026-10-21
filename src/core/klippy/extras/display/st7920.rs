@@ -58,14 +58,14 @@ use super::display::{Glyph, LcdChip, SentMessage};
 use super::font8x14::VGA_FONT;
 use super::uc1701::ResetHelper;
 
-/// The sync byte that starts a command frame (`st7920.py:232`).
+/// The sync byte that starts a command frame (`st7920.py:236`).
 const SPI_COMMAND_SYNC: u8 = 0xf8;
-/// The sync byte that starts a data frame (`st7920.py:231`).
+/// The sync byte that starts a data frame (`st7920.py:234`).
 const SPI_DATA_SYNC: u8 = 0xfa;
 
-/// Upstream's default `spi_speed` for the emulated panel (`st7920.py:227`).
+/// Upstream's default `spi_speed` for the emulated panel (`st7920.py:224`).
 const DEFAULT_SPI_SPEED: u32 = 1_000_000;
-/// The lowest clock upstream accepts there (`st7920.py:227`, its `minval`).
+/// The lowest clock upstream accepts there (`st7920.py:224`, its `minval`).
 const MIN_SPI_SPEED: i64 = 100_000;
 
 /// Upstream's `ST7920_SYNC_DELAY` (`st7920.py:14`), in seconds.
@@ -224,15 +224,17 @@ enum Transport {
     Parallel {
         /// The MCU the pins are on.
         mcu: Arc<McuObject>,
-        /// The oid the firmware allocated for `config_st7920`.
-        oid: u8,
+        /// The config-time state: its oid is what the two send commands
+        /// address, and holding it is what keeps the config callback's weak
+        /// handle upgradable until the configuration is built.
+        config: Arc<ParallelConfig>,
     },
     /// A software SPI bus, with the enable line the first frame pulses.
     Emulated {
         /// The SPI resource: no chip select, mode 0
-        /// (`st7920.py:228`).
+        /// (`st7920.py:225`).
         spi: Arc<McuSpi>,
-        /// The `en_pin` helper (`st7920.py:222-224`).
+        /// The `en_pin` helper (`st7920.py:227`).
         enable: EnableHelper,
     },
 }
@@ -307,14 +309,17 @@ impl ST7920 {
 
         Ok(Self {
             state: Arc::new(St7920State::new()),
-            transport: Transport::Parallel { mcu, oid },
+            transport: Transport::Parallel {
+                mcu,
+                config: parallel,
+            },
         })
     }
 
     /// Read the software SPI pins and the enable line, and build the panel over
     /// that bus.
     ///
-    /// Upstream's `EmulatedST7920.__init__` (`st7920.py:210-229`): the MCU and
+    /// Upstream's `EmulatedST7920.__init__` (`st7920.py:210-231`): the MCU and
     /// the three `spi_software_*` pins, a `spi_speed` bounded below by 100 kHz,
     /// and the `en_pin` its `EnableHelper` pulses.
     ///
@@ -327,7 +332,7 @@ impl ST7920 {
         printer: &Arc<Printer>,
     ) -> Result<Self, ConfigError> {
         let (mcu, spi) = software_spi(config, printer)?;
-        // `EnableHelper(config.get("en_pin"), self.spi)` (`st7920.py:222`):
+        // `EnableHelper(config.get("en_pin"), self.spi)` (`st7920.py:227`):
         // the option is read with no default, so it must be written.
         config.get("en_pin", None)?;
         let enable = EnableHelper {
@@ -345,23 +350,23 @@ impl ST7920 {
     fn send(&self, cmds: &[u8], is_data: bool, is_extended: bool) -> Result<(), McuError> {
         let mut bytes = self.state.with_extended_mode(cmds, is_data, is_extended);
         match &self.transport {
-            Transport::Parallel { mcu, oid } => {
+            Transport::Parallel { mcu, config } => {
                 let mcu = mcu
                     .mcu()
                     .ok_or_else(|| McuError::Config("the MCU is not connected".to_string()))?;
                 if is_data {
                     mcu.send_msg(&St7920SendData {
-                        oid: *oid,
+                        oid: config.oid,
                         data: bytes.clone(),
                     })?;
                 } else {
                     mcu.send_msg(&St7920SendCmds {
-                        oid: *oid,
+                        oid: config.oid,
                         cmds: bytes.clone(),
                     })?;
                 }
             }
-            // Upstream's `EmulatedST7920.send` (`st7920.py:230-256`): the
+            // Upstream's `EmulatedST7920.send` (`st7920.py:232-256`): the
             // enable line is pulsed once, then the message leaves as one frame.
             Transport::Emulated { spi, enable } => {
                 enable.init_once();
@@ -604,7 +609,7 @@ impl std::fmt::Debug for ST7920 {
     }
 }
 
-/// One SPI frame of a message (`st7920.py:230-245`): the sync byte, then every
+/// One SPI frame of a message (`st7920.py:232-250`): the sync byte, then every
 /// byte as its high nibble and its low nibble shifted up.
 fn spi_frame(cmds: &[u8], is_data: bool) -> Vec<u8> {
     let mut frame = Vec::with_capacity(2 * cmds.len() + 1);
@@ -620,11 +625,11 @@ fn spi_frame(cmds: &[u8], is_data: bool) -> Vec<u8> {
     frame
 }
 
-/// Upstream's `EnableHelper` (`st7920.py:187-207`): the line the emulated
+/// Upstream's `EnableHelper` (`st7920.py:188-206`): the line the emulated
 /// panel needs pulsed before its first frame. The toggle is [`ResetHelper`]'s —
 /// low at +100ms, high at +200ms, high again at +300ms, which is the shape
 /// upstream's three `update_digital_out` calls have — fired once
-/// (`st7920.py:253-255`).
+/// (`st7920.py:252-254`).
 struct EnableHelper {
     /// The `en_pin` line.
     line: ResetHelper,
@@ -643,9 +648,9 @@ impl EnableHelper {
 
 /// Build the emulated panel's software SPI bus, on the MCU its pins are on.
 ///
-/// Upstream's `EmulatedST7920.__init__` (`st7920.py:211-228`): the three
+/// Upstream's `EmulatedST7920.__init__` (`st7920.py:212-225`): the three
 /// `spi_software_*` pins are looked up as one share (the option name is the
-/// share type, as in `bus.py:140-146`), must sit on one MCU, and become a mode-0
+/// share type, as in `bus.py:141-142`), must sit on one MCU, and become a mode-0
 /// bus with no chip select at `spi_speed`.
 ///
 /// # Errors
@@ -1254,7 +1259,7 @@ mod tests {
 
     /// An `lcd_type: emulated_st7920` section: the three `spi_software_*` pins
     /// and the enable line upstream's `EmulatedST7920` reads
-    /// (`st7920.py:211-227`), overridden by `options`.
+    /// (`st7920.py:212-227`), overridden by `options`.
     fn emulated_section(options: &[(&str, &str)]) -> ConfigSection {
         let mut all = vec![
             ("lcd_type", "emulated_st7920"),
@@ -1278,7 +1283,7 @@ mod tests {
 
     /// One SPI frame, as the byte list the firmware is handed: the sync byte,
     /// then every byte as its high nibble and its low nibble shifted up
-    /// (`st7920.py:230-245`).
+    /// (`st7920.py:232-250`).
     fn frame(cmds: &[u8], is_data: bool) -> SentMessage {
         SentMessage {
             is_data,
@@ -1289,8 +1294,8 @@ mod tests {
     #[test]
     fn test_the_emulated_panel_reads_its_software_spi_bus_and_enable_line() {
         // The three pins and `en_pin` are required and must sit on one MCU
-        // (`st7920.py:211-224`), and `spi_speed` is bounded below by 100 kHz
-        // (`st7920.py:227`).
+        // (`st7920.py:212-227`), and `spi_speed` is bounded below by 100 kHz
+        // (`st7920.py:224`).
         let chip = emulated_chip(&[]).expect("the panel loads");
         assert_eq!(chip.get_dimensions(), (16, 4));
         assert_eq!(chip.sent_message_count(), 0);
@@ -1321,7 +1326,7 @@ mod tests {
     fn test_the_spi_frame_carries_the_sync_byte_and_two_nibbles_per_byte() {
         // `0xf8` starts a command frame and `0xfa` a data one; each protocol
         // byte becomes its high nibble then its low nibble shifted up
-        // (`st7920.py:231-244`).
+        // (`st7920.py:234-250`).
         assert_eq!(
             spi_frame(&[0x24, 0x40], false),
             vec![0xf8, 0x20, 0x40, 0x40, 0x00]
@@ -1367,7 +1372,7 @@ mod tests {
     /// The emulated panel against the dictionary-driven fake firmware: the
     /// power-up commands and the first flush leave as SPI frames, one
     /// `spi_send` each, with the extended-mode switch riding in the first
-    /// graphics frame (`st7920.py:230-256`).
+    /// graphics frame (`st7920.py:232-256`).
     #[tokio::test(flavor = "multi_thread")]
     async fn test_the_emulated_panel_writes_spi_frames_to_the_fake_firmware() {
         use crate::core::klippy::api::StartArgs;
@@ -1443,7 +1448,7 @@ mod tests {
         assert_eq!(messages[1], frame(&[0x80], false));
         assert_eq!(messages[2], frame(&[b' '; 16], true));
         // A graphics row is selected in extended mode, so that switch rides in
-        // the frame (`st7920.py:236-240`).
+        // the frame (`st7920.py:236-243`).
         assert!(
             messages
                 .iter()

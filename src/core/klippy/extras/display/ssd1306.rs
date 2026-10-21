@@ -23,7 +23,7 @@
 //! helper are [`super::uc1701`]'s — upstream imports them from the same module.
 //!
 //! `sh1106` differs from `ssd1306` in the two constructor arguments upstream's
-//! subclass passes (`uc1701.py:237-241`): 132 columns of RAM instead of 128 and
+//! subclass passes (`uc1701.py:238-241`): 132 columns of RAM instead of 128 and
 //! an `x_offset` (0..=3, default 0) that puts the character grid two columns
 //! into that RAM. The drawing and the flush are the same code, so both
 //! `lcd_type`s are this driver, built through [`Ssd1306::new`] and
@@ -60,10 +60,10 @@ const SSD1306_COLUMNS: usize = 128;
 /// columns of RAM, of which the middle 128 are the visible area.
 const SH1106_COLUMNS: usize = 132;
 
-/// Upstream's default `x_offset` (`uc1701.py:239`).
+/// Upstream's default `x_offset` (`uc1701.py:240`).
 const DEFAULT_X_OFFSET: i64 = 0;
 
-/// The largest `x_offset` upstream accepts (`uc1701.py:239`).
+/// The largest `x_offset` upstream accepts (`uc1701.py:240`).
 const MAX_X_OFFSET: i64 = 3;
 
 /// The power-up commands (`uc1701.py:215-233`), with `contrast`, `vcomh` and
@@ -393,7 +393,7 @@ mod tests {
     // -- the sh1106 geometry -------------------------------------------------
 
     /// The `lcd_type: sh1106` shape: the same panel with 132 columns and the
-    /// character grid drawn two columns in (`uc1701.py:237-241`).
+    /// character grid drawn two columns in (`uc1701.py:238-241`).
     fn sh1106(options: &[(&str, &str)]) -> Result<Ssd1306, ConfigError> {
         let printer = printer();
         let mut section = vec![
@@ -410,7 +410,7 @@ mod tests {
     fn test_the_sh1106_is_the_132_column_variant_drawn_at_the_x_offset() {
         // `SH1106.__init__` (`uc1701.py:238-241`) hands 132 columns and
         // `x_offset` to the SSD1306 constructor; `write_text` starts at
-        // `x * 8 + x_offset` (`uc1701.py:75-76`), and the flush still
+        // `x * 8 + x_offset` (`uc1701.py:74-75`), and the flush still
         // addresses each byte by its own position (`uc1701.py:34-52`).
         let chip = sh1106(&[("x_offset", "2")]).expect("the panel loads");
 
@@ -440,7 +440,7 @@ mod tests {
     #[test]
     fn test_the_sh1106_x_offset_keeps_upstreams_bounds() {
         // `config.getint('x_offset', 0, minval=0, maxval=3)`
-        // (`uc1701.py:239`).
+        // (`uc1701.py:240`).
         let err = sh1106(&[("x_offset", "4")]).map(|_| ()).unwrap_err();
         assert_eq!(
             err.to_string(),

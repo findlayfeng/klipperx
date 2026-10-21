@@ -434,7 +434,7 @@ API 本身在 `crates/klippy-api/src/`：
 |------|------|
 | `plan.rs` | `Move` 与 `LookAheadQueue`：主机侧规划器，决定每个 move 的速度（前瞻、拐角、Z 限速） |
 | `trapq.rs` | 梯形速度队列：步进生成器读它的段（含相续填补、过期提取） |
-| `itersolve.rs` | 每个 stepper 的位置求解器：把轨迹变成步进时刻（含 cartesian/corexy/corexz 族的位置函数） |
+| `itersolve.rs` | 每个 stepper 的位置求解器：把轨迹变成步进时刻（含 cartesian/corexy/corexz 族的位置函数）；**pre/post 活跃窗口（2026-10-21）**：`gen_steps_pre_active`/`post_active`（`set_generation_window`）——生成时比活跃区间向前/向后多算一段，压力提前用它把首/尾 `hst` 的挤出量跨边界展开（input shaper 落地后同口径写脉冲跳度）；`SET_PRESSURE_ADVANCE` 改值后下一次 flush 即生效（不缓存 `hst`） |
 | `stepcompress.rs` | 把步进时刻压成 `queue_step(interval, count, add)` 批（SDS 过滤、方向切换、history 回溯，与上游 C 实现对拍） |
 | `stepper.rs` | 运动层眼中的 stepper：一个 stepper 的位置/历史/生成接口，与 MCU 侧资源对接；`trapq` 为 `Option<usize>`（脱挂态，`z_tilt` 的逐电机调整依赖它） |
 | `toolhead.rs` | `ToolHead`：print time 跟踪、move 入队、dwell、`drip_move`（回零直灌）与 flush 调度；`Stepper` 可脱挂（`set_trapq(None)`），`MotionQueuing::generate` 跳过脱挂者；`register_lookahead_callback`（空队列立即以 `get_last_move_time()` 回调，否则记队列深度、`process_lookahead` 时挂回该 move）与 `register_flush_callback` 两个转发口 |

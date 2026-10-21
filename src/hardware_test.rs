@@ -1121,9 +1121,10 @@ fn acquire_at_traced(
 /// (and its session torn down) inside the case thread on the panic path as
 /// well, before that message travels.
 ///
-/// `body` takes `&Machine`; the `Machine` lives on the case thread for exactly
-/// as long as `body` runs, so anything the case opens has to be closed inside
-/// it — that is what makes the teardown the machine's `Drop` covers complete.
+/// `body` takes the `Machine` by value; it lives on the case thread for exactly
+/// as long as `body` runs (and is dropped there, teardown and all), so anything
+/// the case opens has to be closed inside it — that is what makes the teardown
+/// the machine's `Drop` covers complete.
 ///
 /// # Panics
 /// When the case times out, when `body` panics, and when the machine cannot be
@@ -1131,7 +1132,7 @@ fn acquire_at_traced(
 /// board that cannot be locked).
 pub fn case<F>(test_name: &str, requires: &Requires, body: F)
 where
-    F: FnOnce(&Machine) + Send + 'static,
+    F: FnOnce(Machine) + Send + 'static,
 {
     run_case(None, test_name, requires, CASE_TIMEOUT, body);
 }
@@ -1147,7 +1148,7 @@ where
 /// such a case is a plain [`case`].
 pub fn async_case<F, Fut>(test_name: &str, requires: &Requires, body: F)
 where
-    F: FnOnce(&Machine) -> Fut + Send + 'static,
+    F: FnOnce(Machine) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
 {
     run_case(None, test_name, requires, CASE_TIMEOUT, move |machine| {
@@ -1180,7 +1181,7 @@ fn run_case<F>(
     budget: Duration,
     body: F,
 ) where
-    F: FnOnce(&Machine) + Send + 'static,
+    F: FnOnce(Machine) + Send + 'static,
 {
     let name = test_name.to_string();
     let requires = requires.clone();
@@ -1200,7 +1201,7 @@ fn run_case<F>(
                     None => acquire_traced(&name, &requires, &case_progress),
                 };
                 if let Some(machine) = machine {
-                    body(&machine);
+                    body(machine);
                 }
             }));
             let outcome = match outcome {

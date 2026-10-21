@@ -65,6 +65,7 @@ pub mod ads1220;
 pub mod ads131m0x;
 pub mod adxl345;
 pub mod allocate_oids;
+pub mod bmi160;
 pub mod buttons;
 pub mod clock;
 pub mod config;
@@ -89,6 +90,7 @@ pub mod uart;
 pub mod uptime;
 
 pub use adc::{AnalogInState, AnalogInStateOld, ConfigAnalogIn, QueryAnalogIn, QueryAnalogInOld};
+pub use bmi160::{ConfigBmi160, QueryBmi160, QUERY_BMI160_STATUS};
 pub use buttons::{ButtonsAck, ButtonsAdd, ButtonsQuery, ButtonsState, ConfigButtons};
 pub use clock::{ClockState, ClockSync, GetClock, McuClock, SecondarySync};
 pub use debug::{DebugRead, DebugResult, DebugWrite};

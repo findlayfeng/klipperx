@@ -17,6 +17,7 @@ pub mod bed_mesh;
 pub mod bed_screws;
 pub mod bed_tilt;
 pub mod bltouch;
+pub mod bmi160;
 pub mod board_pins;
 pub mod bulk_sensor;
 pub(crate) mod bus_debug;

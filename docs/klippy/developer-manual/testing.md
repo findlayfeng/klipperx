@@ -248,6 +248,7 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
 | ⑥ PWM 更新棘轮（对齐上游） | `min_pwm_change = max_power × 5%` + `next_pwm_time`（≈每 2.1 s 一个发送窗口）：事件从 3.3 条/秒降到 0.5 条/秒，批次迟到不再把旧样本年龄写上线（+3 测） | **57.6 s** | 3524 |
 | ⑪ 宿主抖动/IO 批（6 lane + 2 直提交，2026-10-20） | reactor 迟到统计进 `system_stats`（新增对象）、`last_stats` 键名对齐上游并补 `srtt/rttvar/rto`、日志改专用写线程+有界队列（满则丢并计数）、打印回放的 open/seek/8 KiB 读移到 blocking 池、API/mainsail runtime 的 worker 下限 2、两个测量脚本入 `scripts/`、`stats` 日志行带 MCU 名、`system_stats.dropped_logs`、jitter 脚本按名分族（+24 个 `fn test_`；`pause_resume` 的固定 yield 改成有界等待） | **46.8 s** | 3635 |
 | ⑫ 配置 include 与依赖减肥（2026-10-21） | `[include]` 对齐上游 `glob.glob`（相对包含者目录、`*`/`?`/`[]` 非递归、不匹配前导点、排序、通配零匹配静默；保留环检测）+ URL 取源从 `reqwest`换 `ureq`（openssl/native-tls/aws-lc 全部离开依赖树，`cargo tree` 442→328 行；新增 10 s/5 s/4 MiB 边界）（+13 个 `fn test_`） | **46.5 s** | 3648 |
+| ⑬ 运动数学与设备层健壮性（5 lane + 直提交，2026-10-21） | `G2`/`G3` 弧与 `G17`–`G19` 平面、压力提前（ESPA 解析积分）真驱动挤出机、`objects/subscribe` 定时器环改 `Weak`、`serial.rs` 设备层九条修补、CAN 读回定布局与写失败即停（+34 个 `fn test_`） | **46.8 s** | 3682 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。

@@ -28,15 +28,16 @@
 //! to read from; `test_the_vendored_layout_has_not_drifted` keeps the copy
 //! byte-for-byte equal to the submodule's.
 //!
-//! Merging keeps upstream's rule, including the part that only matters once the
-//! main config can name these sections: a section whose identifier the main
-//! config already defines is not loaded from the shipped file.
+//! Merging keeps upstream's rule (`display.py:126-128`): a section whose
+//! identifier the main config already defines is not loaded from the shipped
+//! file, so the config's own item replaces the shipped one instead of joining
+//! it. A config's own `[display_data]`/`[display_glyph]` sections have
+//! factories of their own ([`load_display_data`], [`load_display_glyph`]): the
+//! factory claims the section and parses it, and `[display]` assembles the
+//! groups and glyphs from every section plus this file.
 //!
 //! # What is not here
 //!
-//! * **`[display_data]` / `[display_glyph]` in the main config.** Only the
-//!   shipped `display.cfg` is read; a config's own layouts and glyphs have no
-//!   factory, so the loader still rejects them (see the parent module's docs).
 //! * **The other panels' drawing.** [`LcdChip::write_text`],
 //!   [`LcdChip::write_glyph`] and [`LcdChip::write_graphics`] have a
 //!   draw-nothing default, and only `hd44780` implements them: `st7920`,
@@ -81,6 +82,15 @@ use super::uc1701::Uc1701;
 // come at 50 and a panel driver only needs plain pins, so 45 puts `[display]`
 // after everything it reads and before the bus consumers.
 section!("display", order = 45, load = load_config);
+
+// The layout sections a config may write for itself. Upstream reads them out of
+// the config without a factory of their own (`display.py:132-166`); here the
+// factory table is the loader's schema, so each needs one to be a section this
+// host knows. They sit with `[display]` (45): a main section is loaded before
+// every prefix section in its phase, so `[display]` has already read these
+// sections by the time their factories run.
+section!("display_data", order = 45, prefix = load_display_data);
+section!("display_glyph", order = 45, prefix = load_display_glyph);
 
 /// Normal time between each screen redraw (`display.py:12`).
 const REDRAW_TIME: f64 = 0.500;
@@ -932,6 +942,65 @@ fn parse_glyph(
         return Err(ConfigError::new(format!("Glyph {name} incorrect lines")));
     }
     Ok(rows)
+}
+
+// ===========================================================================
+// The layout sections' factories
+// ===========================================================================
+
+/// Claim one `[display_data <group> <item>]` section of the config.
+///
+/// Upstream reads these sections straight out of the config
+/// (`display.py:132-145`); here a section is valid exactly when a factory
+/// claims it, so this is the claim. The section is then handed to the same
+/// parse path the shipped layout uses ([`parse_data_item`]), which is what
+/// reports a malformed section under its own name and records its options for
+/// the undefined-option check.
+///
+/// The parsed item is not kept: a group is assembled from every `display_data`
+/// section at once and merged with the shipped `display.cfg`, which only
+/// `[display]` can do ([`load_display_groups`]).
+///
+/// # Errors
+/// Upstream's wording for a malformed section name or `position`.
+pub fn load_display_data(
+    config: &ConfigWrapper,
+    _printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    parse_data_item(config)?;
+    Ok(Arc::new(LayoutSection))
+}
+
+/// Claim one `[display_glyph <name>]` section of the config.
+///
+/// The counterpart of [`load_display_data`]: [`parse_glyph_section`] reads the
+/// two icon encodings and the CGRAM slot, and the merged set is the one the
+/// panel is given ([`load_display_glyphs`]).
+///
+/// # Errors
+/// Upstream's glyph wording, and `hd44780_slot`'s bounds.
+pub fn load_display_glyph(
+    config: &ConfigWrapper,
+    _printer: &Arc<Printer>,
+) -> Result<Arc<dyn PrinterObject>, ConfigError> {
+    parse_glyph_section(config)?;
+    Ok(Arc::new(LayoutSection))
+}
+
+/// What a claimed `[display_data]`/`[display_glyph]` section registers.
+///
+/// It carries nothing — see [`load_display_data`] — and is not a printer part,
+/// so it does not reach `objects/list`.
+struct LayoutSection;
+
+impl PrinterObject for LayoutSection {
+    fn get_status(&self, _eventtime: f64) -> Value {
+        json!({})
+    }
+
+    fn is_queryable(&self) -> bool {
+        false
+    }
 }
 
 /// Whether a shipped section is skipped because the main config defines a
@@ -1867,6 +1936,12 @@ mod tests {
     /// `toolhead.extruder` (the guarded ones — `extruder`, `fan`,
     /// `virtual_sdcard` — stay absent, so their items render empty).
     fn layout_machine() -> Arc<Printer> {
+        layout_machine_with("")
+    }
+
+    /// [`layout_machine`] with `extra` appended to its config text, for a
+    /// config that writes its own layout sections.
+    fn layout_machine_with(extra: &str) -> Arc<Printer> {
         struct Stub(Value);
         impl PrinterObject for Stub {
             fn get_status(&self, _eventtime: f64) -> Value {
@@ -1874,8 +1949,9 @@ mod tests {
             }
         }
         let printer = machine();
+        let text = format!("[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}{extra}");
         printer
-            .load_config(&display_config(ST7920_SECTION))
+            .load_config(&Config::from_text(&text).expect("the config parses").0)
             .expect("the section loads");
         printer
             .add_object("gcode_move", Arc::new(Stub(json!({ "speed_factor": 1.0 }))))
@@ -2036,6 +2112,179 @@ mod tests {
         data.extend(std::iter::repeat(byte).take(14));
         data.push(0xff);
         data
+    }
+
+    // -- a config's own layout sections -------------------------------------
+
+    #[test]
+    fn test_a_main_config_data_item_joins_its_group_and_renders() {
+        // A config's own `[display_data <group> <item>]` section is a layout
+        // source: the item joins the group the section names, it is ordered by
+        // its position with the shipped items, and the frame shows it.
+        let printer = layout_machine_with(
+            "\n\
+             [display_data _default_16x4 site]\n\
+             position: 0, 0\n\
+             text: hello\n",
+        );
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        let group = &display.display_data_groups()["_default_16x4"];
+        assert_eq!(group.items().len(), 9);
+        // The shipped `[display_data _default_16x4 extruder]` is also at (0, 0),
+        // and the tie is broken by the section identifier.
+        assert_eq!(
+            group.items()[1].identifier,
+            "display_data _default_16x4 site"
+        );
+
+        let (templates, panel) = layout_panel(&printer);
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        show_group(&chip, group, &templates, &printer).expect("the group renders");
+        assert_eq!(panel.row(0), "hello               ");
+    }
+
+    #[test]
+    fn test_a_main_config_data_section_creates_its_group() {
+        // A group the shipped file does not have is created from the config's
+        // sections (`groups.setdefault(...)`, `display.py:139-145`), and
+        // `display_group` may select it.
+        let printer = layout_machine_with(
+            "display_group: _site\n\
+             [display_data _site bottom]\n\
+             position: 3, 2\n\
+             text: B\n\
+             [display_data _site top]\n\
+             position: 1, 0\n\
+             text: A\n",
+        );
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        assert_eq!(display.show_data_group(), "_site");
+        let group = &display.display_data_groups()["_site"];
+        assert_eq!(
+            group
+                .items()
+                .iter()
+                .map(|item| (item.row, item.col, item.text.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, 0, "A"), (3, 2, "B")]
+        );
+
+        let (templates, panel) = layout_panel(&printer);
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        show_group(&chip, group, &templates, &printer).expect("the group renders");
+        assert_eq!(
+            [panel.row(0), panel.row(1), panel.row(2), panel.row(3)],
+            [
+                "                    ",
+                "A                   ",
+                "                    ",
+                "  B                 ",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_a_main_config_data_item_replaces_the_shipped_one() {
+        // The same section identifier as a shipped item: upstream merges by
+        // name (`display.py:126-128`), so the config's item replaces it — it
+        // neither joins the group beside it nor adds a second one.
+        let printer = layout_machine_with(
+            "\n\
+             [display_data _default_16x4 fan]\n\
+             position: 0, 10\n\
+             text: cfgfan\n",
+        );
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        let group = &display.display_data_groups()["_default_16x4"];
+        assert_eq!(group.items().len(), 8);
+        assert_eq!(
+            group.items()[1].identifier,
+            "display_data _default_16x4 fan"
+        );
+        assert_eq!(group.items()[1].text, "cfgfan");
+
+        let (templates, panel) = layout_panel(&printer);
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        show_group(&chip, group, &templates, &printer).expect("the group renders");
+        assert_eq!(panel.row(0), "          cfgfan    ");
+    }
+
+    /// `value`'s lines, indented as a config value's continuation lines.
+    fn indented(value: &str) -> String {
+        value
+            .lines()
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn test_a_main_config_glyph_section_is_parsed() {
+        // `data` is the 16x16 icon, split into its high and low bytes, and
+        // `hd44780_data` + `hd44780_slot` the 5x8 one (`display.py:147-166`);
+        // a config's own `[display_glyph <name>]` section may write both.
+        let wide = vec![".............*.."; 16].join("\n");
+        let narrow = vec!["**..."; 8].join("\n");
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}\
+\
+             [display_glyph site]\ndata:\n{}\nhd44780_data:\n{}\nhd44780_slot: 6\n",
+            indented(&wide),
+            indented(&narrow),
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let section = config.get_section("display").expect("the section");
+        let access = AccessTracking::shared();
+        let wrapper = ConfigWrapper::with_config(section, access, None, &config);
+
+        let glyphs = load_display_glyphs(&wrapper).expect("the glyphs load");
+        // Bit 2 is set in every row of the wide glyph, bits 4 and 3 of the
+        // narrow one.
+        assert_eq!(
+            glyphs["site"].icon16x16,
+            Some((vec![0x00; 16], vec![0x04; 16]))
+        );
+        assert_eq!(glyphs["site"].icon5x8, Some((6, vec![0x18; 8])));
+        // The shipped glyphs are still there, beside the config's own one.
+        assert!(glyphs.contains_key("extruder"));
+        assert!(glyphs.contains_key("bed"));
+    }
+
+    #[test]
+    fn test_the_layout_sections_are_claimed_by_factories() {
+        // The factory table is the loader's schema: a `[display_data]` or
+        // `[display_glyph]` section is a section this host knows exactly when
+        // its own factory claims it, and the factory reads the section (the
+        // load ends in the undefined-option check, so `Ok` is the proof).
+        assert!(crate::core::klippy::load::known_section_ids().contains(&"display_data"));
+        assert!(crate::core::klippy::load::known_section_ids().contains(&"display_glyph"));
+
+        let printer = machine();
+        let text = format!(
+            "[mcu]\nserial: /dev/a\n[display]\n{ST7920_SECTION}\
+\
+             [display_data _default_16x4 site]\nposition: 0, 0\ntext: hello\n\
+             [display_glyph site]\ndata:\n{}\n",
+            indented(&vec![".............*.."; 16].join("\n")),
+        );
+        printer
+            .load_config(&Config::from_text(&text).expect("the config parses").0)
+            .expect("the layout sections load");
+
+        // Each section is claimed under its own identifier, but a layout piece
+        // is not a printer part: it stays out of `objects/list`.
+        for identifier in ["display_data _default_16x4 site", "display_glyph site"] {
+            let claimed = printer
+                .lookup_object(identifier)
+                .expect("the section is claimed");
+            assert!(!claimed.is_queryable());
+        }
     }
 
     #[test]

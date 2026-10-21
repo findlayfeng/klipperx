@@ -596,8 +596,12 @@ mod tests {
                 "tmc2660",
                 "tmc5160",
                 // The display framework, after the `display_template` registry
-                // it reads (40) and before the bus consumers (50).
+                // it reads (40) and before the bus consumers (50), with the two
+                // layout sections it assembles (`display_data`/`display_glyph`)
+                // beside it.
                 "display",
+                "display_data",
+                "display_glyph",
                 "spi_device",
                 "stepper_a",
                 "stepper_arm",

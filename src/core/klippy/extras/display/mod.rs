@@ -13,10 +13,10 @@
 //!
 //! | section | upstream | notes |
 //! |---|---|---|
-//! | `[display]` | `display/display.py:176` `load_config` | the only section; the panel is chosen by `lcd_type` |
+//! | `[display]` | `display/display.py:176` `load_config` | builds the one panel and draws the layout; the panel is chosen by `lcd_type` |
 //! | `[display_template <name>]` | `display/display.py:168` (no file of its own) | lives in [`led`](super::led) |
-//! | `[display_data <group> <item>]` | `display/display.py:56` | shipped `display.cfg` only |
-//! | `[display_glyph <name>]` | `display/display.py:103` | shipped `display.cfg` only |
+//! | `[display_data <group> <item>]` | `display/display.py:56` | claimed by a factory of its own; the groups are assembled by `[display]` from the config's items and the shipped `display.cfg`, the config's winning by name |
+//! | `[display_glyph <name>]` | `display/display.py:103` | claimed by a factory of its own; merged with the shipped glyphs the same way |
 //! | `[menu <name>]` | `display/menu.py:1035` | read by [`menu::MenuManager`]; shipped `menu.cfg` first, then the main config |
 //!
 //! # What is not here
@@ -37,11 +37,6 @@
 //!   (`font8x14.VGA_FONT`, `st7920.CharGlyphs`, `uc1701.CharGlyphs`) are a
 //!   later unit, so their [`display::LcdChip::write_text`] and friends are the
 //!   draw-nothing defaults and their panels stay blank while the layout renders.
-//! * **`[display_data]`/`[display_glyph]` in the main config.** Only the shipped
-//!   `display.cfg` is read; a main config's own layouts and glyphs are still
-//!   rejected as unknown sections, because the loader claims a section through
-//!   its factory table and neither has a factory here. The shipped three groups
-//!   are the layouts a machine can show today.
 
 pub mod aip31068_spi;
 pub mod display;

@@ -221,6 +221,9 @@ impl KinematicShaper {
     /// `is->m.start_pos = move_get_coord(m, move_time)` followed by the
     /// per-axis overrides. The shaped coordinate then goes into `inner` as a
     /// synthetic move that does not travel, at `DUMMY_T`.
+    ///
+    /// A stepper the shaper has no impulses for reads its plain position
+    /// function, as upstream's `!num_pulses` checks do (`kin_shaper.c:139-141`).
     pub fn position(
         &self,
         window: SegmentWindow<'_>,
@@ -230,6 +233,7 @@ impl KinematicShaper {
     ) -> f64 {
         let segment = window.segment();
         let mut start_pos = segment.coord(move_time);
+        let mut shaped = false;
         for (pulses, (axis, flag)) in self.axes.iter().zip(AXES) {
             if !active_flags.intersects(flag) {
                 continue;
@@ -237,12 +241,16 @@ impl KinematicShaper {
             let Some(pulses) = pulses else {
                 continue;
             };
-            let shaped = pulses.position(window.cuts(), window.index(), move_time, axis);
+            let position = pulses.position(window.cuts(), window.index(), move_time, axis);
             start_pos = match axis {
-                Axis::X => Xyz::new(shaped, start_pos.y(), start_pos.z()),
-                Axis::Y => Xyz::new(start_pos.x(), shaped, start_pos.z()),
-                Axis::Z => Xyz::new(start_pos.x(), start_pos.y(), shaped),
+                Axis::X => Xyz::new(position, start_pos.y(), start_pos.z()),
+                Axis::Y => Xyz::new(start_pos.x(), position, start_pos.z()),
+                Axis::Z => Xyz::new(start_pos.x(), start_pos.y(), position),
             };
+            shaped = true;
+        }
+        if !shaped {
+            return inner.call(segment, move_time);
         }
         let synthetic = MoveSegment {
             print_time: segment.print_time,
@@ -534,5 +542,37 @@ mod tests {
             (position - (1000.0 * shaped_x + DUMMY_T)).abs() < 1e-6,
             "{position} did not see {shaped_x} at {DUMMY_T}"
         );
+    }
+
+    /// A shaper with impulses for one axis leaves the others alone: a stepper
+    /// that moves only y — an axis the shaper has no impulses for — reads its
+    /// plain position function (`!num_pulses`, `kin_shaper.c:139-141`).
+    #[test]
+    fn a_shaper_without_impulses_for_an_axis_leaves_that_axis_alone() {
+        // A diagonal move, so both coordinates are non-zero throughout.
+        let mut diagonal = segment(0.0, 0.1, 0.0, 100.0, 0.0);
+        diagonal.axes_r = Xyz::new(0.5, 0.5, 0.0);
+        let cuts = [diagonal];
+        let shaper = KinematicShaper::new([
+            Some(ShaperPulses::new(&[0.8, 0.2], &[0.02, 0.05]).unwrap()),
+            None,
+            None,
+        ]);
+        let inner = cartesian_position_fn(Axis::Y);
+
+        for sample in 0..=10 {
+            let move_time = 0.01 + 0.08 * f64::from(sample) / 10.0;
+            let unshaped = cuts[0].coord(move_time).y();
+            assert!(
+                (shaper.position(
+                    SegmentWindow::new(&cuts, 0, &[]),
+                    move_time,
+                    AxisFlags::Y,
+                    &inner
+                ) - unshaped)
+                    .abs()
+                    < 1e-12
+            );
+        }
     }
 }

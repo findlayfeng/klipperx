@@ -24,6 +24,8 @@
 
 # Local scratch: logs and run artifacts (never committed).
 /.staging/
+# `scripts/host-stability.sh` defaults to `$PWD/host-stability-<timestamp>/`.
+/host-stability-*/
 
 src/core/klippy/upstream_generated/cases/
 src/core/klippy/upstream_generated/fixtures/

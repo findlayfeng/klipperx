@@ -201,7 +201,21 @@ OctoPrint 只走 pty，与本条取舍无关。
    `send_seq`/`receive_seq`/`retransmit_seq` 仍**不上报**：它们属于上游 C 侧 `serialqueue`，本仓的
    传输层没有等价计数器，报 0 比不报更容易误导。
 
-### 4.6 一条负向结论
+### 4.6 配置 `[include]`：URL 取源与自包含保护
+
+上游 `_resolve_include`（`third_party/klipper/klippy/configfile.py:181-195`）只有「路径 + `glob.glob`」，
+本仓在其上加了两件事（代码在 `src/core/klippy/config/mod.rs` 的 `resolve_include_sources`）：
+
+1. **`[include http(s)://…]` 直接取远端正文**。这是新能力，上游没有。边界：总超时 10 s、
+   连接 5 s、正文上限 4 MiB（边读边判），成功时 `info!` 留一行（URL + 字节数）。
+   配置侧行为见[配置手册](../user-manual/config.md#include引入其它文件)。
+2. **自包含保护**。通配符展开会把「包含者自己」也匹配进来（`[include *.cfg]` 写在同目录），
+   上游没有环检测 ⇒ 无限递归；本仓报 `Circular include detected: <source>`。
+
+除这两点外，展开语义与上游一致：相对包含者目录、`*`/`?`/`[]` 非递归、**不匹配前导点文件**、
+排序后逐个读、有通配但零匹配时静默不报错。
+
+### 4.7 一条负向结论
 
 **API 端点没有本仓特有项**：`src/core/klippy/api/endpoints/` 注册的 13 条 path 全部能对上上游
 `klippy/webhooks.py`（以及 `query_endstops` / `pause_resume` / `bed_mesh` 各自的 extras）的注册处，

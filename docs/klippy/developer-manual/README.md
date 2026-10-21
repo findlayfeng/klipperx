@@ -125,7 +125,7 @@ klipperx（bin，src/main.rs）
 - **终端还原放在 `TerminalGuard` 的 Drop 里**：窗口任务是被 abort 的（主机先退出
   时），futures 被丢弃不会执行后面的清理。
 
-它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 `reqwest` / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 72.4 MB / release 4.1 MB，而 `klipperx` 是 debug 290.5 MB / release 27.5 MB（2026-10-19 实测；两个主机二进制含 build.rs 嵌入的 config/docs 资产 6.6 MB，`klippy-client` 不含）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
+它是唯一**依赖不重合**的包：`cargo tree -p klippy-client` 里没有 HTTP 客户端 / `flate2` / `libloading`（TUI 用的 `ratatui` 是它自己的），实测 debug 69.3 MB / release 3.9 MB，而 `klipperx` 是 debug 273.4 MB / release 26.1 MB（2026-10-21 实测；两个主机二进制含 build.rs 嵌入的 config/docs 资产 6.6 MB，`klippy-client` 不含）。代价是 `main.rs` 里那二十行日志初始化与主机重复——为它单开一个 crate 比重复更糟。
 
 ## 模块结构
 
@@ -509,7 +509,7 @@ NaN 也归一），与上游写出的文件逐字一致，见用户手册 [配�
 
 参数定义全在库里（`klippy::AppArgs`、`klippy_client::{ApiArgs, ConsoleArgs}`），二进制只做三件事：解析命令行、装日志、把错误打成一行并以退出码 1 结束。后两个二进制只装载各自那部分，因此命令行与帮助文本是干净的。
 
-`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 `reqwest` / `flate2` / `libloading`，产物也小得多（实测 debug 72.4 MB vs 290.5 MB、release 4.1 MB vs 27.5 MB，2026-10-19）。
+`klippy` 与 `klipperx` 在同一个包里，共用一套依赖（模板引擎是 `minijinja 2.24`，启用 `custom_syntax` 与 `json` 特性）；`klippy-client` 在另一个包里，只依赖 `klippy-api` 与 clap / serde_json / tokio / tracing，所以它既不会编 HTTP 客户端 / `flate2` / `libloading`，产物也小得多（实测 debug 69.3 MB vs 273.4 MB、release 3.9 MB vs 26.1 MB，2026-10-21）。
 
 ## 目录
 

@@ -168,10 +168,12 @@ impl McuIds {
 
     /// The next id for an MCU with no transport-specific allocation of its own.
     ///
-    /// Serial and host-lib MCUs take this at load. No concrete allocation flow
-    /// is implemented for them yet, and nothing consumes the number — it is
-    /// assigned so the MCU owns an id before it can communicate, ready for the
-    /// transport that later makes it meaningful.
+    /// Serial and host-lib MCUs take this at load. The number is **consumed**:
+    /// it lands in the MCU's `McuConfig.id` and is what the transport layer
+    /// requires before it opens a link (`mcu/object.rs`: "an MCU must hold the
+    /// id it was assigned at load before its transport can be opened"), and it
+    /// keeps the per-MCU id unique across the two allocators (`[mcu_ids]` and a
+    /// CAN node id share one sequence).
     ///
     /// # Errors
     /// A config error naming the MCU when the whole `NODEID_FIRST`..=`MAX_MCU_ID`

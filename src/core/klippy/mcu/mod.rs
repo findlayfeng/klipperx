@@ -2705,9 +2705,14 @@ impl Mcu {
     }
 
     /// Send a **move-class** command: one whose firmware handler takes a slot
-    /// from the board's move free list (`queue_step`, `set_next_step_dir`,
-    /// `queue_digital_out`, `queue_pwm_out` — each `move_alloc()`s,
+    /// from the board's move free list (`queue_step` / `queue_digital_out` /
+    /// `queue_pwm_out` / `queue_pca9685_out` — each calls `move_alloc()`,
     /// `stepper.c:262` / `gpiocmds.c:148` / `pwmcmds.c:86`).
+    ///
+    /// `set_next_step_dir` is **not** one of them: the firmware handler only
+    /// sets a flag (`stepper.c:294-301`), so it must not consume a slot — this
+    /// host sends it through the plain path, and the direction a step will use
+    /// is carried by the following `queue_step`.
     ///
     /// The command enters this MCU's pool with `completion_clock` — when its
     /// last step (or its own scheduled instant) runs — which is what later

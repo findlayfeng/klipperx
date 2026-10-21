@@ -60,6 +60,7 @@ pub mod idle_timeout;
 pub mod input_shaper;
 pub mod ldc1612;
 pub mod led;
+pub mod lis2dw;
 pub mod load_cell;
 pub mod load_cell_probe;
 pub mod manual_probe;

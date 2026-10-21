@@ -2469,12 +2469,21 @@ fn register_slot(port: &SharedSerialPort, mcu_id: u32) -> Result<Arc<McuSlot>, I
 }
 
 /// Wait up to `timeout` for the reader to record an assignment answer.
-fn wait_for_ack(slot: &McuSlot, timeout: Duration) -> Option<u32> {
+///
+/// A port that **stops** while the wait is on ends it here: nothing can answer a
+/// dead port, and `stop` notifies `ack_cv`, so the waiter wakes and reports “no
+/// answer” at once instead of sitting out the rest of its `timeout`. The caller
+/// (`run_handshake`) turns that into [`InterfaceError::ConnectionLost`] on the
+/// `stopped` check it makes next.
+fn wait_for_ack(port: &SharedSerialPort, slot: &McuSlot, timeout: Duration) -> Option<u32> {
     let deadline = Instant::now() + timeout;
     let mut ack = slot.ack.lock().unwrap();
     loop {
         if let Some(id) = *ack {
             return Some(id);
+        }
+        if port.stopped.load(Ordering::SeqCst) {
+            return None;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -3124,7 +3133,7 @@ impl SharedSerialHandle {
         loop {
             *self.slot.ack.lock().unwrap() = None;
             self.port.write_unit(&request)?;
-            if wait_for_ack(&self.slot, timeout) == Some(self.mcu_id) {
+            if wait_for_ack(&self.port, &self.slot, timeout) == Some(self.mcu_id) {
                 return Ok(());
             }
             if self.port.stopped.load(Ordering::SeqCst) {
@@ -3551,6 +3560,43 @@ mod mux_tests {
         // attach on the same path completes a handshake.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(1, vec![0xab])).is_ok());
+    }
+
+    /// A port that stops while a handshake is waiting for its answer ends that
+    /// wait **at once** with [`InterfaceError::ConnectionLost`].
+    ///
+    /// Without the `stopped` check inside the wait, a dead port cost the whole
+    /// timeout — three attempts of it, since the handshake retries — for an
+    /// answer, and then reported a plain `Timeout`.
+    #[test]
+    fn a_stopped_port_ends_the_wait_for_an_ack_at_once() {
+        let pty = Pty::new();
+        let handle = attach_with_reply(&pty, 4);
+        let request = assignment_request(4).expect("a valid mcu id");
+
+        let waiting = Arc::clone(&handle);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            // Long enough that waiting it out cannot be mistaken for the bound.
+            let _ = tx.send(waiting.run_handshake(None, Duration::from_secs(10)));
+        });
+        assert!(
+            readable_within(&pty.master, ATTACH_REQUEST_WINDOW),
+            "the handshake must send its request"
+        );
+        let seen = read_n(&pty.master, request.len());
+        assert_eq!(seen, request, "the request goes out verbatim");
+
+        // The tty goes away under the session: the reader stops the port.
+        handle.port.stop();
+        let outcome = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("a stopped port must end the wait at once");
+        assert_eq!(
+            outcome,
+            Err(InterfaceError::ConnectionLost),
+            "a dead port is a lost connection, not a timeout"
+        );
     }
 
     /// A downstream device attaches with **no handshake at all**: the peer never

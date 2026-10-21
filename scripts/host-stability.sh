@@ -382,7 +382,11 @@ s = d.get("stall") or {}
 print("| measure | value |")
 print("|---|---|")
 print(f"| sequential write / read | {d['seq_write_mbps']:.1f} / {d['seq_read_mbps']:.1f} MB/s |")
-print(f"| 4 KiB random read | {d['rand4k_iops']:.0f} IOPS, p50 {d['rand4k_p50_us']:.0f} us, p99 {d['rand4k_p99_us']:.0f} us, max {d['rand4k_max_us']:.0f} us |")
+print(f"| 4 KiB random read (O_DIRECT) | {d['rand4k_iops']:.0f} IOPS, p50 {d['rand4k_p50_us']:.0f} us, p99 {d['rand4k_p99_us']:.0f} us, max {d['rand4k_max_us']:.0f} us |")
+if 'rand4k_cached_p50_us' in d:
+    print(f"| 4 KiB random read (page cache, for contrast) | {1e6/d['rand4k_cached_p50_us']:.0f} IOPS, p50 {d['rand4k_cached_p50_us']:.0f} us |")
+if d.get('rand4k_direct_note'):
+    print(f"| note | {d['rand4k_direct_note']} |")
 if s:
     print(f"| under sustained write: reads p99/max | {s['read_p99_ms']:.2f} / {s['read_max_ms']:.2f} ms |")
     print(f"| under sustained write: writes(fsync) p99/max | {s['write_p99_ms']:.2f} / {s['write_max_ms']:.2f} ms |")

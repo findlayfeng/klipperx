@@ -34,6 +34,7 @@ files are removed at the end.
 
 import argparse
 import json
+import mmap
 import os
 import random
 import statistics
@@ -98,21 +99,48 @@ def seq_read(path):
     return total / elapsed / MIB, elapsed
 
 
-def rand4k(path, count, size):
-    fd = os.open(path, os.O_RDONLY)
+def rand4k(path, count, size, direct=False):
+    """Random 4 KiB reads; with `direct` the page cache is bypassed entirely.
+
+    `posix_fadvise(DONTNEED)` is only a hint: on a file that was just written, or
+    while pages are being written back, it is a no-op, and the reads are then
+    answered from RAM (tens of thousands of IOPS on anything). `O_DIRECT` takes
+    the cache out of the question, which is the only way this number can be
+    compared with a datasheet or with `fio --direct=1`.
+    """
+    flags = os.O_RDONLY | (getattr(os, "O_DIRECT", 0) if direct else 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        if not direct:
+            raise
+        return None
     rng = random.Random(20261021)
     samples = []
+    buffer = mmap.mmap(-1, 4096) if direct else None
     try:
         for _ in range(count):
             offset = rng.randrange(0, max(1, size - 4096)) & ~0xFFF
-            drop_cache(fd, offset, 4096)
-            started = time.perf_counter()
-            data = os.pread(fd, 4096, offset)
-            samples.append((time.perf_counter() - started) * 1e6)
-            if not data:
+            if direct:
+                started = time.perf_counter()
+                read = os.preadv(fd, [buffer], offset)
+                samples.append((time.perf_counter() - started) * 1e6)
+                ok = read == 4096
+            else:
+                drop_cache(fd, offset, 4096)
+                started = time.perf_counter()
+                ok = bool(os.pread(fd, 4096, offset))
+                samples.append((time.perf_counter() - started) * 1e6)
+            if not ok:
                 break
+    except OSError:
+        if direct:
+            return None
+        raise
     finally:
         os.close(fd)
+        if buffer is not None:
+            buffer.close()
     return samples
 
 
@@ -139,16 +167,29 @@ def stall_phase(path, seconds, interval_s, size):
 
     thread = threading.Thread(target=writer, name="disk-writer", daemon=True)
     thread.start()
-    fd = os.open(path, os.O_RDONLY)
+    # Read through the cache if `O_DIRECT` is unavailable: a stall that only the
+    # device can show is worth more than no measurement, but the report says
+    # which one it was.
+    direct = bool(getattr(os, "O_DIRECT", 0))
+    try:
+        fd = os.open(path, os.O_RDONLY | (os.O_DIRECT if direct else 0))
+    except OSError:
+        direct = False
+        fd = os.open(path, os.O_RDONLY)
+    buffer = mmap.mmap(-1, 4096) if direct else None
     rng = random.Random(7)
     deadline = time.perf_counter() + seconds
     over = {50: 0, 200: 0, 1000: 0}
     try:
         while time.perf_counter() < deadline:
             offset = rng.randrange(0, max(1, size - 4096)) & ~0xFFF
-            drop_cache(fd, offset, 4096)
-            started = time.perf_counter()
-            os.pread(fd, 4096, offset)
+            if direct:
+                started = time.perf_counter()
+                os.preadv(fd, [buffer], offset)
+            else:
+                drop_cache(fd, offset, 4096)
+                started = time.perf_counter()
+                os.pread(fd, 4096, offset)
             elapsed_ms = (time.perf_counter() - started) * 1e3
             read_samples.append(elapsed_ms)
             for threshold in over:
@@ -156,6 +197,8 @@ def stall_phase(path, seconds, interval_s, size):
                     over[threshold] += 1
     finally:
         os.close(fd)
+        if buffer is not None:
+            buffer.close()
         stop.set()
         thread.join(timeout=10)
 
@@ -164,6 +207,7 @@ def stall_phase(path, seconds, interval_s, size):
     w1000 = sum(1 for value in write_samples if value > 1000)
     return {
         "seconds": seconds,
+        "reads_direct": direct,
         "writes": len(write_samples),
         "reads": len(read_samples),
         "write_p50_ms": take_latencies(write_samples)[0],
@@ -201,7 +245,7 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--dir", default=".", help="where to create the temp files")
-    parser.add_argument("--size-mb", type=int, default=64, help="file size for the sequential phases")
+    parser.add_argument("--size-mb", type=int, default=32, help="file size for the sequential phases")
     parser.add_argument("--random-reads", type=int, default=200, help="4 KiB reads in the rand4k phase")
     parser.add_argument("--stall-seconds", type=float, default=20.0, help="length of the stall phase")
     parser.add_argument("--interval-ms", type=float, default=5.0, help="pause between stall-phase writes")
@@ -226,6 +270,33 @@ def main(argv=None):
                 "seq_write_seconds": write_s,
                 "seq_read_mbps": read_mbps,
                 "seq_read_seconds": read_s,
+                "rand4k_cached_count": len(samples),
+                "rand4k_cached_p50_us": p50,
+                "rand4k_cached_p99_us": p99,
+                "rand4k_cached_max_us": worst,
+            }
+        )
+        direct = rand4k(path, args.random_reads, size, direct=True)
+        if direct:
+            d50, d99, dworst = take_latencies(direct)
+            result.update(
+                {
+                    "rand4k_direct_count": len(direct),
+                    "rand4k_direct_p50_us": d50,
+                    "rand4k_direct_p99_us": d99,
+                    "rand4k_direct_max_us": dworst,
+                    "rand4k_direct_iops": (1e6 / d50) if d50 else 0.0,
+                }
+            )
+            # `rand4k_*` is the device number when the platform allows O_DIRECT.
+            p50, p99, worst = d50, d99, dworst
+        else:
+            result["rand4k_direct_note"] = (
+                "O_DIRECT unavailable here (tmpfs or an unsupported fs); the "
+                "rand4k_* numbers below are cache-influenced"
+            )
+        result.update(
+            {
                 "rand4k_count": len(samples),
                 "rand4k_p50_us": p50,
                 "rand4k_p99_us": p99,

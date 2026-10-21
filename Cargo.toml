@@ -47,3 +47,10 @@ default = []
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 klipperx-test-support = { path = "crates/test-support" }
+
+# Release builds are shipped, not debugged: the symbol table costs ~20 MB of
+# link-and-write time (which a card-sized machine pays for on a slow eMMC/SD)
+# and buys nothing on the target. `cargo build --release` on an RK3566 spends
+# its last minute writing those bytes; the profile below removes them.
+[profile.release]
+strip = "symbols"

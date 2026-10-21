@@ -883,12 +883,29 @@ impl TriggerDispatch {
         }
     }
 
-    /// Fire every trsync with `HOST_REQUEST` and return the recorded reason.
+    /// Fire every trsync with `HOST_REQUEST` and return the **raw** reason the
+    /// dispatch ended with.
+    ///
+    /// The value is the raw wire reason, not the typed [`TriggerReason`], for
+    /// the same reason [`Completion::wait_raw`] exists: a `trigger_analog`
+    /// failure rides codes 5 and up (`REASON_TRIGGER_ANALOG`), and a typed view
+    /// of them would have to collapse onto [`TriggerReason::CommsTimeout`] or,
+    /// as this used to do, onto [`TriggerReason::HostRequest`] — making a probe
+    /// error read as a normal end of the move. Upstream returns the firmware's
+    /// own number here too (`TriggerDispatch.stop`, `klippy/mcu.py:331-338`:
+    /// `res`, preferring the first `>= REASON_COMMS_TIMEOUT`) and its callers
+    /// classify it by number (`home_wait`, `klippy/mcu.py:391`,
+    /// `trigger_analog.py:393`); [`raw_is_failure`](crate::core::klippy::cmd::trsync::raw_is_failure)
+    /// is that classification here.
+    ///
+    /// Nothing recorded means this host's own trigger is what ended the move,
+    /// so [`TriggerReason::HostRequest`] is returned — the same value the
+    /// firmware reports for it.
     ///
     /// The group is closed here too, so the reports these triggers provoke are
     /// dropped once they arrive (`handle_state`) instead of completing or
     /// extending a dispatch that already ended.
-    pub fn stop(&self) -> TriggerReason {
+    pub fn stop(&self) -> u8 {
         self.group.can_trigger.store(false, Ordering::SeqCst);
         for trsync in self
             .group
@@ -901,8 +918,8 @@ impl TriggerDispatch {
         }
         self.group
             .completion
-            .reason()
-            .unwrap_or(TriggerReason::HostRequest)
+            .raw()
+            .unwrap_or(TriggerReason::HostRequest as u8)
     }
 }
 
@@ -910,6 +927,7 @@ impl TriggerDispatch {
 mod tests {
     use super::*;
 
+    use crate::core::klippy::cmd::trsync::raw_is_failure;
     use crate::core::klippy::interface::devices::frame_mock::{FrameMock, RecordingWire};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::{Dictionary, Mcu};
@@ -1081,6 +1099,53 @@ mod tests {
         assert_eq!(completion.wait().await, TriggerReason::CommsTimeout);
     }
 
+    /// `stop()` hands back the reason the dispatch ended with, not a reason
+    /// folded onto "the host asked": a caller that classifies the return value
+    /// can tell a probe failure from a normal end of the move.
+    ///
+    /// Upstream returns the firmware's own number
+    /// (`TriggerDispatch.stop`, `klippy/mcu.py:331-338`) and its `home_wait`s
+    /// compare it against `REASON_COMMS_TIMEOUT`
+    /// (`klippy/mcu.py:391`, `trigger_analog.py:393`).
+    #[tokio::test]
+    async fn test_stop_keeps_a_remote_failure_reason() {
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        dispatch.start(0.0).unwrap();
+        let trsync = first(&dispatch);
+
+        // A `trigger_analog` monitor failure: raw 7, past what the typed enum
+        // covers, and past `REASON_COMMS_TIMEOUT`.
+        trsync.handle_state(TrsyncState {
+            oid: trsync.oid(),
+            can_trigger: false,
+            trigger_reason: 7,
+            clock: 0,
+        });
+
+        let reason = dispatch.stop();
+        assert_eq!(reason, 7, "the failure reason must survive `stop()`");
+        assert!(raw_is_failure(reason), "raw {reason} reads as a failure");
+        assert_ne!(
+            reason,
+            TriggerReason::HostRequest as u8,
+            "a probe error must not read as the host's own stop"
+        );
+    }
+
+    /// A dispatch the host closes before any report resolved it ends with
+    /// `HOST_REQUEST` — the reason the firmware records for the host's own
+    /// `trsync_trigger`, so the two cases stay distinguishable.
+    #[tokio::test]
+    async fn test_stop_reports_a_host_request_when_nothing_was_recorded() {
+        let dispatch = TriggerDispatch::new(vec![chip("mcu", identified_mcu("mcu"))]).unwrap();
+        let completion = dispatch.start(0.0).unwrap();
+
+        let reason = dispatch.stop();
+        assert_eq!(reason, TriggerReason::HostRequest as u8);
+        assert!(!raw_is_failure(reason));
+        assert_eq!(completion.raw(), None, "a host stop records no reason");
+    }
+
     #[tokio::test]
     async fn test_a_zero_reason_does_not_complete() {
         // The firmware never reports reason 0; a stray zero must not wake a
@@ -1180,7 +1245,7 @@ mod tests {
 
         // The dispatcher is closed down the way `McuEndstop::home_wait` does it
         // on the failure path, and the firmware is told to fire the group.
-        assert_eq!(dispatch.stop(), TriggerReason::CommsTimeout);
+        assert_eq!(dispatch.stop(), TriggerReason::CommsTimeout as u8);
         mcu.flush(Duration::from_millis(500)).await.unwrap();
         let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let names = sent_message_names(&blocks);

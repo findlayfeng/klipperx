@@ -85,6 +85,14 @@ use crate::core::klippy::pins::{PinParams, PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 use crate::core::klippy::reactor::ManualReactor;
 
+/// How long to give the `stress` run's runtime to shut down before giving up on
+/// it.
+///
+/// The run is done by then and only cleanup is left: each board's send/receive
+/// tasks, and the blocking port read behind them that no cancellation reaches.
+/// The same bound as `hardware_test`'s machine teardown.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// The first step rate to try, in steps per second.
 ///
 /// Low enough that any Klipper MCU should survive it, so the ramp starts from a
@@ -252,7 +260,14 @@ pub fn run(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(stress(args))
+    let outcome = runtime.block_on(stress(args));
+    // A run leaves the boards' send/receive tasks (and a port whose blocking read
+    // cannot be cancelled) behind, so the runtime is taken down with a bound: the
+    // implicit `Drop` waits for blocking work for ever, which would hang the
+    // command on a port that stopped answering. The run's own result is returned
+    // as it is — the shutdown is cleanup, not a second verdict.
+    runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
+    outcome
 }
 
 async fn stress(args: StressArgs) -> Result<(), Box<dyn std::error::Error>> {

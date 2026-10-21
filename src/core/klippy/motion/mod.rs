@@ -9,6 +9,8 @@
 //!   the host-side planner that decides the velocity of every move.
 //! * [`trapq`] — the trapezoidal velocity queue the step generators read.
 //! * [`itersolve`] — the per-stepper position solver that finds step times.
+//! * [`shaper`] — the input shaper's position function: a stepper's coordinate
+//!   convolved with the shaper's impulses (upstream `chelper/kin_shaper.c`).
 //! * [`stepcompress`] — turning those step times into `queue_step` commands
 //!   (the **simplified** one for now; the compressor is FW5f).
 //! * [`stepper`] — one stepper: its solver and compressor.

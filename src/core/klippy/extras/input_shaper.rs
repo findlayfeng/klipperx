@@ -31,14 +31,14 @@
 //! # Differences from upstream
 //!
 //! Upstream flushes step generation before putting new impulses into the
-//! steppers (`toolhead.flush_step_generation()`, `input_shaper.py:170,181`).
+//! steppers (`toolhead.flush_step_generation()`, `input_shaper.py:157,170`).
 //! There is no flush from a g-code command here (it needs the flush task — the
 //! same gap `SET_PRESSURE_ADVANCE` has), so only the bookkeeping moves: the
 //! widened window holds the print-time floor and the history expiry back, but
 //! steps generated *before* the change are not rewritten by it.
 //!
 //! Upstream also re-points the shaper when a dual carriage changes the
-//! kinematics (`_update_kinematics`, `input_shaper.py:140-168`, on
+//! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
 //! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
 //! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
 //! it), so no handler is registered and a shaper installed on a stepper whose

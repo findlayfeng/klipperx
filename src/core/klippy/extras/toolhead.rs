@@ -1981,7 +1981,7 @@ impl ToolHeadObject {
     /// Install `shaper` on every stepper of the main trapq, or take the shaper
     /// off again with `None` — upstream's
     /// `_update_input_shaping`/`_update_kinematics`
-    /// (`input_shaper.py:137-190`).
+    /// (`input_shaper.py:138-190`).
     ///
     /// The steppers it walks are `kin.get_steppers()` upstream: the motors that
     /// read the main trapq, identified here by their trapq id — an extra axis
@@ -1991,7 +1991,7 @@ impl ToolHeadObject {
     ///
     /// Each stepper's step generation window is rewritten from the impulses of
     /// the axes it moves (`input_shaper_set_shaper_params` →
-    /// `shaper_note_generation_time`, `kin_shaper.c:197-241`), and the scan runs
+    /// `shaper_note_generation_time`, `kin_shaper.c:270-282`), and the scan runs
     /// afterwards so the flush delay follows
     /// (`check_step_generation_scan_windows`, `input_shaper.py:186`).
     ///

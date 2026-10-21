@@ -136,27 +136,32 @@ impl<'a> SegmentWindow<'a> {
     }
 
     /// A window over `cuts`, oldest first, with `index` being the segment being
-    /// generated.
-    pub fn new(cuts: &'a [MoveSegment], index: usize) -> Self {
+    /// generated and `schedule` the pressure-advance snapshot the extruder
+    /// solver reads (empty for a solver that reads no pressure advance).
+    pub(crate) fn new(
+        cuts: &'a [MoveSegment],
+        index: usize,
+        schedule: &'a [PressureAdvanceEntry],
+    ) -> Self {
         Self {
             cuts,
             index,
-            schedule: &[],
+            schedule,
         }
     }
 
     /// The segments around the one being generated, oldest first.
-    pub fn cuts(&self) -> &'a [MoveSegment] {
+    pub(crate) fn cuts(&self) -> &'a [MoveSegment] {
         self.cuts
     }
 
     /// Where the segment being generated sits in [`Self::cuts`].
-    pub fn index(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.index
     }
 
     /// The segment being generated.
-    pub fn segment(&self) -> &'a MoveSegment {
+    pub(crate) fn segment(&self) -> &'a MoveSegment {
         &self.cuts[self.index]
     }
 }
@@ -192,7 +197,7 @@ pub struct StepKinematics {
     pressure_advance: Option<Arc<ExtruderPressureAdvance>>,
     /// The input shaper, when this stepper is shaped: the position function
     /// becomes the shaper's convolution of the coordinate it reads
-    /// (`struct input_shaper`, `kin_shaper.c:17-23`).
+    /// (`struct input_shaper`, `kin_shaper.c:125-130`).
     shaper: Option<Arc<KinematicShaper>>,
     /// The time before the first move this stepper is active in that it also
     /// generates steps in (`gen_steps_pre_active`).
@@ -279,7 +284,7 @@ impl StepKinematics {
     }
 
     /// Shape this stepper's position function (`input_shaper_set_sk` plus
-    /// `input_shaper_update_sk`, `kin_shaper.c:226-279`), or take the shaper off
+    /// `input_shaper_update_sk`, `kin_shaper.c:226-268`), or take the shaper off
     /// again with `None`.
     ///
     /// The step generation window follows the impulses, as upstream's
@@ -399,7 +404,7 @@ impl StepKinematics {
     /// averages over `2 * hst = smooth_time` of the trapq (`pa_range_integrate`,
     /// `kin_extruder.c:89-116`), and an input shaper's impulses reach into the
     /// segments either side of the one being generated (`calc_position`,
-    /// `kin_shaper.c:120-152`). So the `hst` before its first active move and
+    /// `kin_shaper.c:87-116`). So the `hst` before its first active move and
     /// after its last one really does move the extruder, and the shaped motion
     /// starts before and ends after the moves an axis is active in. Generating
     /// only inside the active moves would squeeze that motion into the move's
@@ -662,11 +667,7 @@ fn segment_window<'a>(
     if cuts.is_empty() {
         SegmentWindow::single(segment)
     } else {
-        SegmentWindow {
-            cuts,
-            index: first_queued + index,
-            schedule,
-        }
+        SegmentWindow::new(cuts, first_queued + index, schedule)
     }
 }
 
@@ -1013,7 +1014,7 @@ mod tests {
         for (index, segment) in cuts.iter().enumerate() {
             for sample in 0..=20 {
                 let move_time = segment.move_t * f64::from(sample) / 20.0;
-                let window = SegmentWindow::new(&cuts, index);
+                let window = SegmentWindow::new(&cuts, index, &[]);
                 assert_eq!(
                     plain.eval(window, move_time),
                     segment.coord(move_time).x(),
@@ -1047,7 +1048,7 @@ mod tests {
         for (index, segment) in cuts.iter().enumerate() {
             for sample in 0..=20 {
                 let move_time = segment.move_t * f64::from(sample) / 20.0;
-                let window = SegmentWindow::new(&cuts, index);
+                let window = SegmentWindow::new(&cuts, index, &[]);
                 assert!(
                     (shaped.eval(window, move_time) - segment.coord(move_time).x()).abs() < 1e-9,
                     "segment {index} at {move_time}"
@@ -1085,9 +1086,9 @@ mod tests {
         // less than the plain 20 mm.
         // `cuts[0]` is the stationary filler the trapq puts before the first
         // move; the motion starts on `cuts[1]`.
-        let start = shaped.eval(SegmentWindow::new(&cuts, 1), 0.0);
+        let start = shaped.eval(SegmentWindow::new(&cuts, 1, &[]), 0.0);
         let last = &cuts[cuts.len() - 1];
-        let end = shaped.eval(SegmentWindow::new(&cuts, cuts.len() - 1), last.move_t);
+        let end = shaped.eval(SegmentWindow::new(&cuts, cuts.len() - 1, &[]), last.move_t);
         assert!((start - 0.48).abs() < 1e-9, "the shaped start is {start}");
         assert!((end - 19.76).abs() < 1e-9, "the shaped end is {end}");
         let travel = f64::from(total_steps(&shaped_steps));

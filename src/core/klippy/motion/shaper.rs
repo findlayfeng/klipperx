@@ -11,7 +11,7 @@
 //! stepper_position(t)   = inner_solver(shaped_x(t), shaped_y(t), shaped_z(t))
 //! ```
 //!
-//! (`calc_position`, `kin_shaper.c:120-152`). The impulse times are relative to
+//! (`calc_position`, `kin_shaper.c:87-116`). The impulse times are relative to
 //! the shaped moment and may be either sign: a shaper reaches both before and
 //! after `t` (`mzv`'s impulses do), so a sample can land in the segment before
 //! or after the one being generated. The samples are taken from the trapq
@@ -20,13 +20,13 @@
 //!
 //! The shaped coordinate then goes into the solver that was decorated, as a
 //! synthetic move that does not travel (`is->m` with `DUMMY_T`,
-//! `kin_shaper.c:124-190`): a delta's tower length or a polar's angle is
+//! `kin_shaper.c:132-187`): a delta's tower length or a polar's angle is
 //! computed from the shaped position exactly as it would be from a commanded
 //! one.
 //!
 //! The impulses are normalized and shifted so that constant-velocity motion
 //! passes through the convolution unchanged ([`ShaperPulses::new`],
-//! `shift_pulses`, `kin_shaper.c:28-52`) — without that a shaper would also
+//! `shift_pulses`, `kin_shaper.c:30-45`) — without that a shaper would also
 //! move the toolhead.
 
 use super::itersolve::{Axis, AxisFlags, PositionFn, SegmentWindow};
@@ -34,16 +34,16 @@ use super::trapq::MoveSegment;
 use crate::core::klippy::mathutil::Xyz;
 
 /// The most impulses a shaper may carry (`shaper_pulses.pulses[10]`,
-/// `kin_shaper.c:22-27`).
+/// `kin_shaper.c:23-28`).
 ///
 /// The limit is enforced where a shaper's coefficients are built
 /// ([`crate::core::klippy::extras::input_shaper`]), as upstream's
 /// `input_shaper_set_shaper_params` enforces it
-/// (`kin_shaper.c:54-59`).
+/// (`kin_shaper.c:50-53`).
 pub const MAX_PULSES: usize = 10;
 
 /// The time the shaped coordinate is handed to the decorated solver at
-/// (`DUMMY_T`, `kin_shaper.c:114`). The synthetic move is twice as long and
+/// (`DUMMY_T`, `kin_shaper.c:123`). The synthetic move is twice as long and
 /// does not travel, so any time inside it reads the same position.
 const DUMMY_T: f64 = 500.0;
 
@@ -55,7 +55,7 @@ const AXES: [(Axis, AxisFlags); 3] = [
 ];
 
 /// One impulse: when it acts and how much it weighs (`struct { double t, a; }`,
-/// `kin_shaper.c:22-27`).
+/// `kin_shaper.c:23-28`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ShaperPulse {
     /// Seconds relative to the shaped moment; a negative impulse acts ahead of
@@ -66,11 +66,11 @@ pub struct ShaperPulse {
 }
 
 /// One axis' impulses as the solver applies them (upstream's `struct
-/// shaper_pulses`, `kin_shaper.c:22-27`).
+/// shaper_pulses`, `kin_shaper.c:23-28`).
 ///
 /// The impulses are normalized (weights summing to 1) and shifted so that
 /// their time-weighted sum is 0 (`init_shaper` + `shift_pulses`,
-/// `kin_shaper.c:54-89`), which is what makes the shaper transparent to
+/// `kin_shaper.c:47-71`), which is what makes the shaper transparent to
 /// constant-velocity motion.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShaperPulses {
@@ -82,14 +82,14 @@ pub struct ShaperPulses {
 
 impl ShaperPulses {
     /// The solver's impulses for a shaper's coefficients (`init_shaper`,
-    /// `kin_shaper.c:54-80`): the weights are normalized, the impulse order is
+    /// `kin_shaper.c:47-71`): the weights are normalized, the impulse order is
     /// reversed (upstream's `pulses[n-i-1]`, so the list runs in increasing
     /// time), and every time is moved by the weighted mean time.
     ///
     /// `None` when there is nothing to apply — no impulses at all, which is how
     /// `get_none_shaper()` describes an axis without shaping
     /// (`input_shaper.py:49-54`) and what upstream checks as `!num_pulses`
-    /// (`kin_shaper.c:130,144,158`).
+    /// (`kin_shaper.c:139,152,165`).
     ///
     /// # Panics
     /// If `a` and `t` are not one weight per impulse. The two lists come from
@@ -112,7 +112,7 @@ impl ShaperPulses {
             .collect();
         // Shift the impulses around their weighted mean time, so that the shaper
         // is an identity for constant-speed motion (`shift_pulses`,
-        // `kin_shaper.c:28-38`).
+        // `kin_shaper.c:30-40`).
         let shift: f64 = pulses.iter().map(|pulse| pulse.a * pulse.t).sum();
         for pulse in &mut pulses {
             pulse.t -= shift;
@@ -126,27 +126,27 @@ impl ShaperPulses {
     }
 
     /// The latest time an impulse acts at: how far the shaped motion reaches
-    /// after the move it is active in (`pre_active`, `kin_shaper.c:199-201`).
+    /// after the move it is active in (`pre_active`, `kin_shaper.c:205-206`).
     pub fn pre_active(&self) -> f64 {
         self.pulses.last().map_or(0.0, |pulse| pulse.t)
     }
 
     /// The earliest time an impulse acts at, negated: how far the shaped motion
     /// reaches before the move it is active in (`post_active`,
-    /// `kin_shaper.c:200-202`).
+    /// `kin_shaper.c:205-206`).
     pub fn post_active(&self) -> f64 {
         self.pulses.first().map_or(0.0, |pulse| -pulse.t)
     }
 
     /// Where `axis` is `move_time` seconds into `cuts[index]`, after the shaper
-    /// (`calc_position`, `kin_shaper.c:120-152`):
+    /// (`calc_position`, `kin_shaper.c:87-116`):
     ///
     /// ```text
     /// Σ_i a[i] * axis_position(seg_at(t + t[i]), t + t[i])
     /// ```
     ///
     /// `axis_position` is the trapq's own coordinate of that axis
-    /// (`get_axis_position`, `kin_shaper.c:97-103`). Upstream walks the trapq's
+    /// (`get_axis_position`, `kin_shaper.c:78-85`). Upstream walks the trapq's
     /// move list from the segment being generated, in both directions, because
     /// a pulse time is either sign; `cuts` is that neighbourhood and `index` the
     /// segment being generated. A time running off either end of `cuts` is
@@ -163,7 +163,7 @@ impl ShaperPulses {
 }
 
 /// The shaper one stepper applies: the impulses of each axis, as one snapshot
-/// (the `sp[3]` of upstream's `struct input_shaper`, `kin_shaper.c:17-23`).
+/// (the `sp[3]` of upstream's `struct input_shaper`, `kin_shaper.c:125-130`).
 ///
 /// A `[input_shaper]` builds one and hands the same snapshot to every stepper
 /// ([`crate::core::klippy::extras::input_shaper`]'s
@@ -191,7 +191,7 @@ impl KinematicShaper {
 
     /// How far, in seconds, the shaped motion of a stepper that moves
     /// `active_flags` reaches before the first and after the last move it is
-    /// active in (`shaper_note_generation_time`, `kin_shaper.c:197-224`): the
+    /// active in (`shaper_note_generation_time`, `kin_shaper.c:199-224`): the
     /// largest impulse time of the axes it moves, and the largest negated one.
     ///
     /// Only the axes the stepper moves count (upstream's `active_flags & AF_X`
@@ -213,14 +213,14 @@ impl KinematicShaper {
     }
 
     /// Where a stepper is `move_time` seconds into the segment being generated
-    /// (`shaper_x_calc_position` and friends, `kin_shaper.c:124-190`).
+    /// (`shaper_x_calc_position` and friends, `kin_shaper.c:132-187`).
     ///
     /// `inner` is the position function being decorated and `active_flags` the
     /// axes the stepper moves: each of those with impulses is convolved, the
     /// others are read at `move_time` unshaped — upstream's
     /// `is->m.start_pos = move_get_coord(m, move_time)` followed by the
     /// per-axis overrides. The shaped coordinate then goes into `inner` as a
-    /// synthetic move that does not travel, at [`DUMMY_T`].
+    /// synthetic move that does not travel, at `DUMMY_T`.
     pub fn position(
         &self,
         window: SegmentWindow<'_>,
@@ -257,7 +257,7 @@ impl KinematicShaper {
 }
 
 /// The coordinate `axis` has `move_time` seconds into `segment`
-/// (`get_axis_position`, `kin_shaper.c:97-103`).
+/// (`get_axis_position`, `kin_shaper.c:78-85`).
 fn axis_position(segment: &MoveSegment, move_time: f64, axis: Axis) -> f64 {
     let distance = segment.distance(move_time);
     let (start, direction) = match axis {
@@ -269,7 +269,7 @@ fn axis_position(segment: &MoveSegment, move_time: f64, axis: Axis) -> f64 {
 }
 
 /// The segment of `cuts` that `abs_time` falls in, with the time relative to
-/// it (`calc_position`'s two walks, `kin_shaper.c:120-152`).
+/// it (`calc_position`'s two walks, `kin_shaper.c:87-116`).
 ///
 /// The walk starts at `index`, the segment being generated, because a shifted
 /// time is only a few milliseconds away. A time before the first segment or
@@ -324,7 +324,7 @@ mod tests {
 
     /// The coordinate the trapq holds at absolute print time `time`, from the
     /// segment that contains it — the sampled function, evaluated independently
-    /// of [`locate`].
+    /// of `locate`.
     fn coordinate_at(cuts: &[MoveSegment], time: f64) -> f64 {
         for segment in cuts {
             if time < segment.end_time() {
@@ -337,7 +337,7 @@ mod tests {
 
     /// The impulses are normalized and shifted around their weighted mean time,
     /// which is what makes the shaper transparent to constant-velocity motion
-    /// (`init_shaper` + `shift_pulses`, `kin_shaper.c:28-89`).
+    /// (`init_shaper` + `shift_pulses`, `kin_shaper.c:47-71`).
     #[test]
     fn the_impulses_normalize_and_shift_to_a_weighted_mean_of_zero() {
         // Weights 0.8 and 0.2 at 0.02 s and 0.05 s, from a shaper that sums to
@@ -370,7 +370,7 @@ mod tests {
 
     /// The generation window comes from the outermost impulse times, and only
     /// from the axes the stepper moves (`shaper_note_generation_time`,
-    /// `kin_shaper.c:197-224`).
+    /// `kin_shaper.c:199-224`).
     #[test]
     fn the_generation_window_spans_the_pulse_times() {
         let assert_window = |got: (f64, f64), want: (f64, f64)| {
@@ -429,7 +429,7 @@ mod tests {
             let move_time = 0.05 + 0.04 * f64::from(sample);
             let unshaped = cuts[0].coord(move_time).x();
             let shaped = shaper.position(
-                SegmentWindow::new(&cuts, 0),
+                SegmentWindow::new(&cuts, 0, &[]),
                 move_time,
                 AxisFlags::X,
                 &inner,
@@ -442,7 +442,7 @@ mod tests {
     }
 
     /// The shaped position is the weighted sum of the axis positions at the
-    /// delayed times (`calc_position`, `kin_shaper.c:120-152`), checked against
+    /// delayed times (`calc_position`, `kin_shaper.c:87-116`), checked against
     /// that formula evaluated independently, across a velocity step so the
     /// impulses really sample different segments.
     #[test]
@@ -473,7 +473,7 @@ mod tests {
                     .map(|pulse| pulse.a * coordinate_at(&cuts, shaped_time + pulse.t))
                     .sum();
                 let shaped = shaper.position(
-                    SegmentWindow::new(&cuts, index),
+                    SegmentWindow::new(&cuts, index, &[]),
                     move_time,
                     AxisFlags::X,
                     &inner,
@@ -489,13 +489,18 @@ mod tests {
         // 6 ms ahead, so just after the velocity step the shaped position is
         // already out at the moving one.
         let unshaped = cuts[1].coord(0.004).x();
-        let shaped = shaper.position(SegmentWindow::new(&cuts, 1), 0.004, AxisFlags::X, &inner);
+        let shaped = shaper.position(
+            SegmentWindow::new(&cuts, 1, &[]),
+            0.004,
+            AxisFlags::X,
+            &inner,
+        );
         assert!(shaped > unshaped + 0.1, "{shaped} should lead {unshaped}");
     }
 
     /// The shaped coordinate goes into the decorated solver as a position, not
     /// as a motion: a delta's arm length is computed from it
-    /// (`shaper_xyz_calc_position`, `kin_shaper.c:162-190`).
+    /// (`shaper_xyz_calc_position`, `kin_shaper.c:172-187`).
     #[test]
     fn the_decorated_solver_sees_the_shaped_coordinate() {
         let cuts = [segment(0.0, 0.2, 0.0, 50.0, 0.0)];
@@ -520,7 +525,7 @@ mod tests {
             .map(|pulse| pulse.a * coordinate_at(&cuts, 0.05 + pulse.t))
             .sum();
         let position = shaper.position(
-            SegmentWindow::new(&cuts, 0),
+            SegmentWindow::new(&cuts, 0, &[]),
             move_time,
             AxisFlags::X,
             &probe,

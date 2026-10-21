@@ -60,9 +60,10 @@ fn test_every_registration_call_site_is_resolved_or_recorded() {
     // `[sdcard_loop]`'s three commands share one registration loop (94 → 95);
     // `[z_thermal_adjust]`'s `SET_Z_THERMAL_ADJUST` is the next one (95 → 96);
     // `[tuning_tower]`'s one command is its own site (96 → 97);
-    // `[skew_correction]`'s four share one registration loop (97 → 98).
+    // `[skew_correction]`'s four share one registration loop (97 → 98);
+    // `[load_cell_probe]`'s `LOAD_CELL_TEST_TAP` is its own site (98 → 99).
     assert_eq!(
-        scan.call_sites, 98,
+        scan.call_sites, 99,
         "the number of registration call sites the scanner sees changed"
     );
 

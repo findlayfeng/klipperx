@@ -38,7 +38,7 @@ use crate::core::klippy::cmd::trigger_analog::{
 use crate::core::klippy::cmd::trsync::{raw_is_failure, TriggerReason};
 use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::extras::toolhead::{EndstopFuture, HomingEndstop, QueryEndstopFuture};
-use crate::core::klippy::mcu::{Mcu, McuError};
+use crate::core::klippy::mcu::{Mcu, McuError, SendClocks};
 
 /// How long a `trigger_analog_query_state` exchange may take.
 const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
@@ -138,6 +138,12 @@ impl SosFilter {
 
     /// The messages one [`reset`](Self::reset) sends, updating the resend
     /// caches as a send would.
+    ///
+    /// The caches are recorded here, before the caller sends: a caller whose
+    /// send fails must drop them with
+    /// [`forget_sent_state`](Self::forget_sent_state), or the change-only rule
+    /// below skips a message the firmware never got. [`reset`](Self::reset) and
+    /// [`McuTriggerAnalog::home_start`] both do.
     ///
     /// Section coefficients and offset/scale are omitted when unchanged since
     /// the last send; states and activation are always included, because the
@@ -250,14 +256,46 @@ impl SosFilter {
 
     /// Send the pending messages to `mcu` (`MCU_SosFilter.reset_filter`).
     ///
+    /// A send that fails leaves the resend caches empty
+    /// ([`forget_sent_state`](Self::forget_sent_state)), so the next reset sends
+    /// the filter description again instead of skipping it as delivered.
+    ///
     /// # Errors
     /// As [`take_pending_messages`](Self::take_pending_messages), or when a
     /// send fails.
     pub fn reset(&self, mcu: &Mcu) -> Result<(), McuError> {
         for (name, args) in self.take_pending_messages()? {
-            mcu.send(name, &args)?;
+            if let Err(err) = mcu.send(name, &args) {
+                self.forget_sent_state();
+                return Err(err.into());
+            }
         }
         Ok(())
+    }
+
+    /// Forget what [`take_pending_messages`](Self::take_pending_messages)
+    /// recorded as sent, so the next one sends every message again.
+    ///
+    /// The caches claim what the firmware holds, and
+    /// [`take_pending_messages`](Self::take_pending_messages) records them
+    /// **before** the caller sends: a send that fails leaves them claiming
+    /// messages the firmware never got, and the change-only rule would then
+    /// skip those on every later arm. Dropping them costs one extra resend of
+    /// the coefficients and offset/scale — exactly what keeps a half-sent
+    /// filter from staying half-set.
+    pub fn forget_sent_state(&self) {
+        for slot in self
+            .last_sent_coeffs
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter_mut()
+        {
+            *slot = None;
+        }
+        *self
+            .last_sent_offset_scale
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
@@ -388,6 +426,10 @@ impl McuTriggerAnalog {
     /// the last arm, then the SOS filter's pending messages
     /// (upstream `_reset_filter`, `trigger_analog.py:351-363`).
     ///
+    /// Like [`SosFilter::take_pending_messages`], the resend caches are
+    /// recorded here and [`home_start`](Self::home_start) drops them again if
+    /// the sends fail.
+    ///
     /// # Errors
     /// As [`SosFilter::take_pending_messages`].
     pub fn take_pending_filter_messages(
@@ -443,6 +485,12 @@ impl McuTriggerAnalog {
     /// `MCU_trigger_analog` ignores them too (`trigger_analog.py:374-385`);
     /// the sensor's rate, fixed at construction, sets the monitor window.
     ///
+    /// The arm carries upstream's `reqclock=clock` (`trigger_analog.py:382-384`):
+    /// as with `endstop_home` ([`McuEndstop::home_start`](super::endstop::McuEndstop::home_start)),
+    /// the `req_clock` keeps it behind any lower `req_clock` on the wire — the
+    /// `queue_step` messages queued for this move — so the check never starts
+    /// watching before the steps it has to stop exist.
+    ///
     /// # Errors
     /// Returns [`McuError`] if the MCU is not connected, the clock estimate is
     /// missing, or a send fails.
@@ -459,7 +507,10 @@ impl McuTriggerAnalog {
             .mcu()
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         for (name, args) in self.take_pending_filter_messages()? {
-            mcu.send(name, &args)?;
+            if let Err(err) = mcu.send(name, &args) {
+                self.forget_filter_sent_state();
+                return Err(err.into());
+            }
         }
         let completion = self.dispatch.start(print_time)?;
         let clock = self
@@ -468,16 +519,38 @@ impl McuTriggerAnalog {
             .ok_or_else(|| McuError::Config("trigger_analog has no clock estimate".to_string()))?;
         *self.arm_clock.lock().unwrap_or_else(|p| p.into_inner()) = Some(clock);
         let monitor_ticks = mcu.seconds_to_clock(1.0 / self.samples_per_second)? as u32;
-        mcu.send_msg(&TriggerAnalogHome {
-            oid: self.oid,
-            trsync_oid: self.dispatch.get_oid(),
-            trigger_reason: TriggerReason::EndstopHit as u8,
-            error_reason: REASON_TRIGGER_ANALOG,
-            clock: clock as u32,
-            monitor_ticks,
-            monitor_max: MONITOR_MAX,
-        })?;
+        mcu.send_msg_clocked(
+            &TriggerAnalogHome {
+                oid: self.oid,
+                trsync_oid: self.dispatch.get_oid(),
+                trigger_reason: TriggerReason::EndstopHit as u8,
+                error_reason: REASON_TRIGGER_ANALOG,
+                clock: clock as u32,
+                monitor_ticks,
+                monitor_max: MONITOR_MAX,
+            },
+            SendClocks {
+                min_clock: None,
+                req_clock: Some(clock),
+            },
+        )?;
         Ok(completion)
+    }
+
+    /// Drop the resend caches after a failed arm send
+    /// (see [`SosFilter::forget_sent_state`]): the next arm sends the raw
+    /// range, the trigger and the filter description again instead of skipping
+    /// what the firmware never received.
+    fn forget_filter_sent_state(&self) {
+        *self
+            .last_range_args
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        *self
+            .last_trigger_args
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+        self.sos_filter.forget_sent_state();
     }
 
     /// Map the firmware's 32-bit `homing_clock` onto the 64-bit clock of the
@@ -562,11 +635,15 @@ impl McuTriggerAnalog {
             .ok_or_else(|| McuError::Config("MCU is not connected".to_string()))?;
         self.dispatch.wait_end(home_end_time);
         let raw = self.dispatch.completion().wait_raw().await;
-        // Clear the homing state before judging the reason: the trigger clock
-        // is read back here, and upstream runs `_clear_home` first too
-        // (`trigger_analog.py:365-369`).
-        let trigger_time = self.clear_home().await?;
+        // Close the dispatch **before** clearing the homing state, as upstream
+        // does (`trigger_analog.py:388-392`): `stop()` is what tells every MCU
+        // in the group to fire, which deletes the firmware's report timer
+        // (`src/trsync.c:171-186`). Running it first is also what keeps a
+        // failed `clear_home` from skipping it — a dispatch left armed keeps
+        // reporting for good (`src/trsync.c:57-65`).
         self.dispatch.stop();
+        // The trigger clock is read back here (upstream `_clear_home`).
+        let trigger_time = self.clear_home().await?;
         if raw_is_failure(raw) {
             if raw == TriggerReason::CommsTimeout as u8 {
                 return Err(McuError::Config(
@@ -638,7 +715,7 @@ mod tests {
     use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
-    use crate::core::klippy::mcu::{BuiltConfig, ConfigBuilder, Dictionary, Mcu};
+    use crate::core::klippy::mcu::{BuiltConfig, ConfigBuilder, Dictionary, Mcu, McuCallError};
     use crate::core::klippy::msg::proto::ArgValue;
     use crate::core::klippy::pins::PrinterPins;
     use crate::core::klippy::reactor::ManualReactor;
@@ -954,6 +1031,37 @@ mod tests {
         assert_eq!(third, vec!["trigger_analog_set_trigger"]);
     }
 
+    /// A send that fails must not leave the resend caches claiming it went out:
+    /// the next arm would skip exactly the messages the firmware never got.
+    #[tokio::test]
+    async fn test_a_failed_arm_send_leaves_the_resend_caches_empty() {
+        let (chip, mcu) = chip();
+        let ta = McuTriggerAnalog::new(chip, 400.0, None).unwrap();
+        ta.set_raw_range(-1_000_000, 1_000_000);
+        ta.set_trigger(TriggerAnalogType::Gt, 1500);
+        // A closed session refuses every send (`Mcu::enqueue`): the arm's first
+        // filter message never reaches the firmware.
+        mcu.close();
+        ta.home_start(0.0, 0.0, 0, 0.0, true)
+            .expect_err("a closed session cannot be armed");
+
+        let names: Vec<&str> = ta
+            .take_pending_filter_messages()
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "trigger_analog_set_raw_range",
+                "trigger_analog_set_trigger",
+                "sos_filter_set_offset_scale"
+            ],
+            "the arm's messages must be resent, not skipped as delivered"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_non_positive_sample_rate_is_refused() {
         let (chip, _mcu) = chip();
@@ -1097,6 +1205,146 @@ mod tests {
             .expect("a hit is not an error");
         assert!(time > 0.9 && time < 1.1, "trigger print time: {time}");
         assert_eq!(completion.reason(), Some(TriggerReason::EndstopHit));
+    }
+
+    /// An identified fake MCU whose sends a test can read back as raw blocks.
+    ///
+    /// A `RecordingWire`, not a `FrameMock`: the frame mock accepts only what a
+    /// mapping entry scripts, so an unsolicited `trsync_trigger` would never be
+    /// recorded.
+    fn chip_over(mcu: Arc<Mcu>) -> McuChip {
+        let chip = McuChip::new(
+            "mcu".to_string(),
+            Arc::new(ConfigBuilder::new()),
+            Arc::new(PrinterPins::new()),
+        );
+        let clock = Arc::new(McuClock::new(Arc::clone(&mcu), ManualReactor::shared()));
+        clock.seed(0.0, 0);
+        chip.set_clock(clock, 0.0);
+        chip.attach(mcu);
+        chip
+    }
+
+    /// The `(name, arguments)` of every message the wire carries, decoded with
+    /// this test dictionary's command table.
+    fn sent_messages(mcu: &Mcu, blocks: &[Vec<u8>]) -> Vec<(String, Vec<ArgValue>)> {
+        let mut parser = crate::core::klippy::msg::parser::Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        blocks
+            .iter()
+            .flat_map(|block| {
+                parser
+                    .decode(crate::core::klippy::msg::proto::Payload::from_raw(
+                        block.clone(),
+                    ))
+                    .unwrap_or_default()
+            })
+            .map(|(message, args)| (message.name.clone(), args))
+            .collect()
+    }
+
+    /// The arm carries upstream's `reqclock=clock`
+    /// (`trigger_analog.py:382-384`): with the move a lead window ahead of the
+    /// clock estimate, `trigger_analog_home` must wait for that window — the
+    /// ordering that keeps the arm behind the `queue_step` messages of the move
+    /// it watches — and it must name the arm clock.
+    #[tokio::test]
+    async fn test_home_start_waits_for_its_reqclock_window() {
+        use crate::core::klippy::interface::devices::frame_mock::RecordingWire;
+        use crate::core::klippy::test_util::wait_until;
+        use tokio::time::sleep;
+
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let ta = McuTriggerAnalog::new(chip_over(Arc::clone(&mcu)), 400.0, None).unwrap();
+
+        // Arm 10 s out on the 1 MHz clock; the window opens at 10 s − 0.1 s.
+        ta.home_start(10.0, 0.0, 0, 0.0, true).unwrap();
+        sleep(Duration::from_millis(60)).await;
+        let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let names: Vec<String> = sent_messages(&mcu, &blocks)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            !names.iter().any(|name| name == "trigger_analog_home"),
+            "the arm went out without its reqclock holding it to the window: {names:?}"
+        );
+
+        mcu.set_clock_base(10_000_000 - 100_000 + 1);
+        // Poll on a bound: the gate's re-poll and the send task both have to run
+        // before the arm is on the wire, and a loaded machine can miss a fixed
+        // window that small.
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || {
+                let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                sent_messages(&mcu, &blocks)
+                    .iter()
+                    .any(|(name, _)| name == "trigger_analog_home")
+            },
+            "the arm never left after its window opened",
+        )
+        .await;
+        let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let arm = sent_messages(&mcu, &blocks)
+            .into_iter()
+            .find(|(name, _)| name == "trigger_analog_home")
+            .expect("the arm is on the wire once its window opens");
+        assert_eq!(
+            arm.1[4],
+            ArgValue::UInt32(10_000_000),
+            "the arm names the move's own clock (upstream `reqclock`)"
+        );
+    }
+
+    /// `home_wait` closes the dispatch **before** clearing the homing state, as
+    /// upstream does (`trigger_analog.py:388-392`), so a failing `clear_home`
+    /// cannot skip `stop()` and leave the group armed — an armed group keeps
+    /// reporting every `report_ticks` until a `trsync_trigger` deletes its
+    /// timers (`src/trsync.c:57-65, 171-186`).
+    #[tokio::test]
+    async fn test_home_wait_stops_the_dispatch_when_clear_home_fails() {
+        use crate::core::klippy::interface::devices::frame_mock::RecordingWire;
+
+        let wire = RecordingWire::new();
+        let sent = wire.sent();
+        let mcu = Arc::new(Mcu::for_test("mcu", Interface::recording(wire)));
+        mcu.install_dictionary(dictionary()).unwrap();
+        mcu.set_clock_base(0);
+        let _session = SessionGuard(Arc::clone(&mcu));
+        let ta = McuTriggerAnalog::new(chip_over(Arc::clone(&mcu)), 400.0, None).unwrap();
+        ta.home_start(0.0, 0.0, 0, 0.0, true).unwrap();
+
+        // The firmware reports a monitor failure. The `trigger_analog_state`
+        // answer `clear_home` needs is never scripted, so its query times out
+        // (`QUERY_TIMEOUT`) and the wait fails on the clear, not on the reason.
+        ta.dispatch()
+            .completion()
+            .complete_raw(REASON_TRIGGER_ANALOG);
+        let err = tokio::time::timeout(Duration::from_secs(5), ta.home_wait(1.0))
+            .await
+            .expect("bounded by the query timeout")
+            .expect_err("an unanswered clear_home fails the wait");
+        assert!(
+            matches!(err, McuError::Call(McuCallError::Timeout(_))),
+            "the failure is the unanswered state query: {err}"
+        );
+
+        let blocks = sent.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let names: Vec<String> = sent_messages(&mcu, &blocks)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "trsync_trigger"),
+            "a failed clear_home must still close the dispatch: {names:?}"
+        );
     }
 
     /// The guard is what makes the harness's session droppable: `configure()`

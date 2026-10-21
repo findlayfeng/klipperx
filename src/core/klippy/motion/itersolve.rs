@@ -797,6 +797,7 @@ pub fn extruder_active_flags() -> AxisFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::motion::shaper::ShaperPulses;
     use crate::core::klippy::motion::stepcompress::StepCommand;
 
     /// A constant-velocity move along X covering `distance` at `speed`.
@@ -941,6 +942,160 @@ mod tests {
 
         // 20 mm of travel at 1 mm per step.
         assert_eq!(total_steps(&sc.take_commands()), 20);
+    }
+
+    /// A shaper on the x axis, built as the `[input_shaper]` layer builds it.
+    fn x_shaper(a: &[f64], t: &[f64]) -> Arc<KinematicShaper> {
+        Arc::new(KinematicShaper::new([
+            Some(ShaperPulses::new(a, t).expect("impulses")),
+            None,
+            None,
+        ]))
+    }
+
+    /// Two x moves: 10 mm at 100 mm/s, then 10 mm at 50 mm/s. The velocity step
+    /// in the middle is what a shaper acts on.
+    fn x_trapq() -> Trapq {
+        let mut trapq = Trapq::new();
+        trapq.append(
+            0.0,
+            0.0,
+            0.1,
+            0.0,
+            Xyz::new(0.0, 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            100.0,
+            100.0,
+            0.0,
+        );
+        trapq.append(
+            0.1,
+            0.0,
+            0.2,
+            0.0,
+            Xyz::new(10.0, 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            50.0,
+            50.0,
+            0.0,
+        );
+        trapq
+    }
+
+    /// The step commands `sk` generates for all of `trapq`.
+    fn steps_of(sk: &mut StepKinematics, trapq: &Trapq) -> Vec<StepCommand> {
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        sk.generate_steps(trapq, &mut sc, 0.3).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        sc.take_commands()
+    }
+
+    /// The plain x solver.
+    fn plain_x_solver() -> StepKinematics {
+        StepKinematics::new(0.01, cartesian_position_fn(Axis::X), AxisFlags::X)
+    }
+
+    /// No shaping is no change: a stepper without a shaper reads its plain
+    /// position function point for point, and a stepper a shaper was taken off
+    /// generates the same steps as one that never carried one. This is the
+    /// regression guard for `shaper_type: none` and for an axis whose
+    /// `shaper_freq` is 0 — the extras layer installs nothing there.
+    #[test]
+    fn test_without_a_shaper_nothing_changes() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let plain = plain_x_solver();
+        let mut cleared = plain_x_solver();
+        cleared.set_input_shaper(Some(x_shaper(&[0.5, 0.5], &[0.0, 0.02])));
+        cleared.set_input_shaper(None);
+        assert_eq!(cleared.generation_window(), (0.0, 0.0));
+
+        for (index, segment) in cuts.iter().enumerate() {
+            for sample in 0..=20 {
+                let move_time = segment.move_t * f64::from(sample) / 20.0;
+                let window = SegmentWindow::new(&cuts, index);
+                assert_eq!(
+                    plain.eval(window, move_time),
+                    segment.coord(move_time).x(),
+                    "the plain solver reads its axis: segment {index} at {move_time}"
+                );
+                assert_eq!(
+                    cleared.eval(window, move_time),
+                    plain.eval(window, move_time),
+                    "a cleared shaper leaves no trace: segment {index} at {move_time}"
+                );
+            }
+        }
+
+        assert_eq!(
+            steps_of(&mut plain_x_solver(), &trapq),
+            steps_of(&mut cleared, &trapq)
+        );
+    }
+
+    /// A single impulse weighting 1 at time 0 is the identity transformation
+    /// (`shift_pulses` leaves it where it is): the shaped position is the plain
+    /// one point for point, and so are the steps.
+    #[test]
+    fn test_a_single_impulse_at_time_zero_is_the_identity() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let mut shaped = plain_x_solver();
+        shaped.set_input_shaper(Some(x_shaper(&[1.0], &[0.0])));
+        assert_eq!(shaped.generation_window(), (0.0, 0.0));
+
+        for (index, segment) in cuts.iter().enumerate() {
+            for sample in 0..=20 {
+                let move_time = segment.move_t * f64::from(sample) / 20.0;
+                let window = SegmentWindow::new(&cuts, index);
+                assert!(
+                    (shaped.eval(window, move_time) - segment.coord(move_time).x()).abs() < 1e-9,
+                    "segment {index} at {move_time}"
+                );
+            }
+        }
+
+        assert_eq!(
+            steps_of(&mut shaped, &trapq),
+            steps_of(&mut plain_x_solver(), &trapq)
+        );
+    }
+
+    /// A two-impulse shaper does reach the steps: at the velocity step the
+    /// position is the weighted sum of two delayed positions, so the generated
+    /// steps cannot be the plain ones.
+    #[test]
+    fn test_a_two_impulse_shaper_moves_the_steps() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let mut shaped = plain_x_solver();
+        shaped.set_input_shaper(Some(x_shaper(&[0.8, 0.2], &[0.02, 0.05])));
+        // The impulses reach 6 ms ahead and 24 ms back of the shaped moment.
+        let (pre_active, post_active) = shaped.generation_window();
+        assert!((pre_active - 0.006).abs() < 1e-12, "{pre_active}");
+        assert!((post_active - 0.024).abs() < 1e-12, "{post_active}");
+
+        let shaped_steps = steps_of(&mut shaped, &trapq);
+        let plain_steps = steps_of(&mut plain_x_solver(), &trapq);
+
+        assert_ne!(shaped_steps, plain_steps);
+        // The solver really stepped the shaped positions: it starts where the
+        // shaper reaches (the impulses that would sample before the trapq are
+        // clipped to its first position) and stops where it ends, so it travels
+        // less than the plain 20 mm.
+        // `cuts[0]` is the stationary filler the trapq puts before the first
+        // move; the motion starts on `cuts[1]`.
+        let start = shaped.eval(SegmentWindow::new(&cuts, 1), 0.0);
+        let last = &cuts[cuts.len() - 1];
+        let end = shaped.eval(SegmentWindow::new(&cuts, cuts.len() - 1), last.move_t);
+        assert!((start - 0.48).abs() < 1e-9, "the shaped start is {start}");
+        assert!((end - 19.76).abs() < 1e-9, "the shaped end is {end}");
+        let travel = f64::from(total_steps(&shaped_steps));
+        assert!(
+            (travel - (end - start) / 0.01).abs() <= 1.0,
+            "{travel} steps is not the shaped travel"
+        );
+        assert!(f64::from(total_steps(&plain_steps)) - travel > 20.0);
     }
 
     #[test]

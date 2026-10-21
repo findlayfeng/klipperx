@@ -45,6 +45,7 @@
 
 pub mod aip31068_spi;
 pub mod display;
+mod font8x14;
 pub mod hd44780;
 pub mod hd44780_spi;
 pub mod menu;

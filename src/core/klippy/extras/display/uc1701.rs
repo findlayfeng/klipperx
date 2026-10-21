@@ -121,7 +121,7 @@ pub(crate) struct DisplayBase {
     /// Bytes per page — one page is eight pixel rows of `columns` columns.
     columns: usize,
     /// The eight pages, in row order.
-    pages: Vec<Page>,
+    pub(crate) pages: Vec<Page>,
     /// Every VGA glyph, already swizzled (`uc1701.py:25-26`).
     font: Vec<([u8; 8], [u8; 8])>,
     /// The 16x16 icons by glyph name, as the two sixteen-byte page halves

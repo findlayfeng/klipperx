@@ -13,9 +13,13 @@
 //! | `init()` | reset, the 25-command power-up list, flush | `uc1701.py:213-235` |
 //! | `clear()` | blank the eight page framebuffers | `uc1701.py:110-113` |
 //! | `flush()` | batch the framebuffer differences and send them | `uc1701.py:28-52` |
+//! | `set_glyphs()` | swizzle the 16x16 icons into page order | `uc1701.py:64-70` |
+//! | `write_text()` | one VGA glyph per character, over two pages | `uc1701.py:71-81` |
+//! | `write_glyph()` | sixteen bytes of an icon, or one character | `uc1701.py:94-108` |
+//! | `write_graphics()` | xor one 16-byte pixel column into two pages | `uc1701.py:83-92` |
 //!
-//! The framebuffers, the flush, the IO wrappers and the reset helper are
-//! [`super::uc1701`]'s — upstream imports them from the same module.
+//! The framebuffers, the flush, the drawing, the IO wrappers and the reset
+//! helper are [`super::uc1701`]'s — upstream imports them from the same module.
 //!
 //! # What is not here
 //!
@@ -24,8 +28,8 @@
 //!   [`super::display`]; the `columns`/`x_offset` parameters of upstream's
 //!   `SSD1306.__init__` exist only for that subclass, so this driver takes the
 //!   defaults (128 columns, no offset) and reads no option for them.
-//! * **Text and glyph drawing**, the reset queue stall and
-//!   `BACKGROUND_PRIORITY_CLOCK`: see [`super::uc1701`]'s module docs.
+//! * **The reset queue stall** and `BACKGROUND_PRIORITY_CLOCK`: see
+//!   [`super::uc1701`]'s module docs.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -166,9 +170,26 @@ impl LcdChip for Ssd1306 {
         (16, 4)
     }
 
-    /// Nothing draws here, so the icons upstream caches for `write_glyph` have
-    /// nowhere to go (see [`super::uc1701`]).
-    fn set_glyphs(&self, _glyphs: &BTreeMap<String, Glyph>) {}
+    /// Upstream's `DisplayBase.set_glyphs` (`uc1701.py:64-70`), shared with
+    /// the UC1701 through [`DisplayBase`].
+    fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
+        self.base().set_glyphs(glyphs);
+    }
+
+    /// Upstream's `DisplayBase.write_text` (`uc1701.py:71-81`).
+    fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+        self.base().write_text(x, row, text);
+    }
+
+    /// Upstream's `DisplayBase.write_glyph` (`uc1701.py:94-108`).
+    fn write_glyph(&self, x: usize, row: usize, name: &str) -> usize {
+        self.base().write_glyph(x, row, name)
+    }
+
+    /// Upstream's `DisplayBase.write_graphics` (`uc1701.py:83-92`).
+    fn write_graphics(&self, x: usize, row: usize, data: &[u8]) {
+        self.base().write_graphics(x, row, data);
+    }
 
     /// Every message this panel has handed to the firmware, in order.
     fn sent_messages(&self) -> Vec<SentMessage> {
@@ -240,6 +261,80 @@ mod tests {
 
     fn wrap(section: &ConfigSection) -> ConfigWrapper<'_> {
         ConfigWrapper::untracked(section)
+    }
+
+    /// A framebuffer's bytes as lowercase hex, for byte-pinned assertions.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The corpus's I2C panel (`printer-wanhao-duplicator-6-2016.cfg`).
+    fn chip() -> Ssd1306 {
+        let printer = printer();
+        let section = display_section(&[
+            ("lcd_type", "ssd1306"),
+            ("reset_pin", "PE3"),
+            ("encoder_pins", "^PG1, ^PG0"),
+            ("click_pin", "^!PD2"),
+        ]);
+        Ssd1306::new(&wrap(&section), &printer).expect("the panel loads")
+    }
+
+    // -- drawing -----------------------------------------------------------
+
+    #[test]
+    fn test_write_text_draws_the_vga_glyph_over_the_rows_page_pair() {
+        // The SSD1306 draws through the UC1701's `DisplayBase`
+        // (`uc1701.py:71-81`): column `x` is pixel column `x * 8`, the row's
+        // two pages hold the glyph's two eight-row halves, and the run is cut
+        // at the sixteenth column. The expected bytes are entry 0x7a `z`
+        // swizzled into display order.
+        let chip = chip();
+
+        chip.write_text(3, 2, b"z");
+        chip.write_text(15, 0, b"zz");
+
+        let base = chip.base();
+        // Row 2 is pages 4 and 5, at pixel columns 24..32.
+        assert_eq!(hex(&base.pages[4].data[24..32]), "c0c04040c0c04000");
+        assert_eq!(hex(&base.pages[5].data[24..32]), "080c0e0b090c0c00");
+        // The cut at the sixteenth column leaves room for one character.
+        assert_eq!(hex(&base.pages[0].data[120..128]), "c0c04040c0c04000");
+        assert!(base.pages[0].data[..120].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_write_glyph_draws_an_icon_two_cells_and_the_text_glyphs() {
+        // The icon path is `uc1701.py:94-108`: sixteen bytes over the row's
+        // page pair, two cells; `degrees` is the panel's own character 0xf8
+        // (`uc1701.py:13`).
+        let chip = chip();
+        let mut glyphs: BTreeMap<String, Glyph> = BTreeMap::new();
+        glyphs.insert(
+            "bed_heat1".to_string(),
+            Glyph {
+                icon16x16: Some((vec![0x81; 16], vec![0x18; 16])),
+                icon5x8: None,
+            },
+        );
+        chip.set_glyphs(&glyphs);
+
+        assert_eq!(chip.write_glyph(4, 1, "bed_heat1"), 2);
+        assert_eq!(chip.write_glyph(9, 3, "degrees"), 1);
+
+        let base = chip.base();
+        // Row 1 is pages 2 and 3, at pixel columns 32..48.
+        assert_eq!(
+            hex(&base.pages[2].data[32..48]),
+            "ff000000000000ff000000ffff000000"
+        );
+        assert_eq!(
+            hex(&base.pages[3].data[32..48]),
+            "ff000000000000ff000000ffff000000"
+        );
+        // `degrees` on row 3 is pages 6 and 7 at pixel columns 72..80.
+        assert_eq!(hex(&base.pages[6].data[72..80]), "00183c243c180000");
+        assert_eq!(hex(&base.pages[7].data[72..80]), "0000000000000000");
     }
 
     // -- the two buses -----------------------------------------------------

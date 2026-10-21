@@ -8,8 +8,8 @@
 //! the same split is kept: [`display`] is the framework, [`st7920`],
 //! [`hd44780`], [`hd44780_spi`], [`uc1701`], [`ssd1306`] and [`aip31068_spi`]
 //! are the panels that
-//! have a driver here, and the shipped layout is [`display::DISPLAY_CFG`],
-//! vendored beside them.
+//! have a driver here, `font8x14` is the graphics panels' font table, and the
+//! shipped layout is [`display::DISPLAY_CFG`], vendored beside them.
 //!
 //! | section | upstream | notes |
 //! |---|---|---|
@@ -30,13 +30,12 @@
 //!   later unit paints them with; the key buttons register through `buttons`,
 //!   whose registry has no rotary encoder here.
 //! * **The other panels' drawing.** `st7920`, `hd44780`, `hd44780_spi`,
-//!   `uc1701`, `ssd1306` and `aip31068_spi` have drivers; `sh1106` and
-//!   `emulated_st7920` are accepted by `lcd_type` (so its error wording stays
-//!   upstream's) and refused with a message naming the gap. Of the six, only
-//!   [`hd44780`] draws: the font tables the others write glyphs from
-//!   (`font8x14.VGA_FONT`, `st7920.CharGlyphs`, `uc1701.CharGlyphs`) are a
-//!   later unit, so their [`display::LcdChip::write_text`] and friends are the
-//!   draw-nothing defaults and their panels stay blank while the layout renders.
+//!   `uc1701`, `ssd1306` and `aip31068_spi` have drivers and all six draw;
+//!   `sh1106` and `emulated_st7920` are accepted by `lcd_type` (so its error
+//!   wording stays upstream's) and refused with a message naming the gap. The
+//!   graphics panels' font is upstream's `font8x14.VGA_FONT`, vendored as the
+//!   private [`font8x14`] module; the two text panels draw through the
+//!   character generator instead, as `hd44780` does.
 //! * **`[display_data]`/`[display_glyph]` in the main config.** Only the shipped
 //!   `display.cfg` is read; a main config's own layouts and glyphs are still
 //!   rejected as unknown sections, because the loader claims a section through

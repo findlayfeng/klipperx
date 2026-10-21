@@ -219,6 +219,10 @@ taskset -c 0,1 klipperx klippy -a tcp:127.0.0.1:7125 printer.cfg     # 限核：
 systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总量：≈ 1/4 个 Zen4 核 ≈ RK3328
 ```
 
+真到那台机器上验收时不用手工拼这些——
+[卡片机验收](host-stability.md) 里一条 `scripts/host-stability.sh` 就把空载、API 时延、重启风暴、
+调度与真板只读串完，并给出 PASS/FAIL 与可贴回的 `report.md`。
+
 两个反直觉但实测成立的细节：① `available_parallelism()` **会读 cgroup 的 `cpu.max`**，
 `CPUQuota=25%` 时它报 **1**（所以 API runtime 有了那个 `max(2, …)` 的地板）；
 ② 限到 2 核时两个 `klippy-mcu` worker 里**只有一个**开始排队（0.08 vs 9.28 µs），

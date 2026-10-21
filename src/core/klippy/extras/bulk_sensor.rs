@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
@@ -68,12 +69,18 @@ pub const SAMPLES_PER_BLOCK: usize = MAX_BULK_MSG_SIZE / BYTES_PER_SAMPLE;
 /// round-trip may take.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// One raw sample: `(print time, raw value)`.
+/// One timestamped raw sample: the print time plus what the sample's format
+/// unpacked (upstream's `(ptime,) + unpack_from(data, offset)`).
+///
+/// `P` is the payload the wire format carries — see [`SamplePayload`].
+pub type TimedSample<P> = (f64, P);
+
+/// One raw sample of a single-field sensor: `(print time, raw value)`.
 ///
 /// The raw value is converted to the sensor's unit by the sensor itself
 /// (`ldc1612._convert_samples`), exactly as upstream pulls `(ptime, raw)`
 /// and converts afterwards.
-pub type Sample = (f64, u32);
+pub type Sample = TimedSample<u32>;
 
 /// A batch client: receives each message, returns `false` to unregister.
 pub type ClientCb = Arc<dyn Fn(&Value) -> bool + Send + Sync>;
@@ -577,10 +584,48 @@ pub struct SampleFormat {
     spec: String,
     /// Bytes one sample occupies (upstream's `unpack.size`).
     bytes_per_sample: usize,
-    /// Fields the format unpacks (upstream's tuple arity).
-    field_count: usize,
+    /// The fields the format unpacks, in order (upstream's tuple arity).
+    fields: Vec<SampleField>,
     /// Whether the sample's bytes are little-endian.
     little_endian: bool,
+}
+
+/// One field of a [`SampleFormat`]: how wide it is and whether its code is a
+/// signed one ([`SampleField::value`] sign-extends those).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SampleField {
+    /// Bytes the field occupies.
+    width: usize,
+    /// Whether the code is one of `b`, `h`, `i`, `l`, `q`.
+    signed: bool,
+}
+
+impl SampleField {
+    /// Read this field out of exactly `width` bytes.
+    fn value(&self, bytes: &[u8], little_endian: bool) -> Result<i32, McuError> {
+        let mut raw: u64 = 0;
+        if little_endian {
+            for (index, byte) in bytes.iter().enumerate() {
+                raw |= u64::from(*byte) << (8 * index);
+            }
+        } else {
+            for byte in bytes {
+                raw = (raw << 8) | u64::from(*byte);
+            }
+        }
+        let width_bits = 8 * bytes.len() as u32;
+        let value = if self.signed && width_bits > 0 && (raw >> (width_bits - 1)) & 1 == 1 {
+            raw as i64 - (1_i64 << width_bits)
+        } else {
+            raw as i64
+        };
+        i32::try_from(value).map_err(|_| {
+            McuError::Decode(format!(
+                "a {}-byte sample field does not fit an i32",
+                bytes.len()
+            ))
+        })
+    }
 }
 
 impl SampleFormat {
@@ -609,22 +654,27 @@ impl SampleFormat {
             }
         };
         let mut bytes_per_sample = 0usize;
-        let mut field_count = 0usize;
+        let mut parsed = Vec::new();
         for code in fields.chars() {
-            bytes_per_sample += match code {
-                'b' | 'B' | '?' => 1,
-                'h' | 'H' => 2,
-                'i' | 'I' | 'l' | 'L' => 4,
-                'q' | 'Q' => 8,
+            let (width, signed) = match code {
+                'b' => (1, true),
+                'B' | '?' => (1, false),
+                'h' => (2, true),
+                'H' => (2, false),
+                'i' | 'l' => (4, true),
+                'I' | 'L' => (4, false),
+                'q' => (8, true),
+                'Q' => (8, false),
                 other => {
                     return Err(ConfigError::new(format!(
                         "sample format \"{spec}\": unsupported field code '{other}'"
                     )))
                 }
             };
-            field_count += 1;
+            bytes_per_sample += width;
+            parsed.push(SampleField { width, signed });
         }
-        if field_count == 0 {
+        if parsed.is_empty() {
             return Err(ConfigError::new(format!(
                 "sample format \"{spec}\" has no fields"
             )));
@@ -632,7 +682,7 @@ impl SampleFormat {
         Ok(Self {
             spec: spec.to_string(),
             bytes_per_sample,
-            field_count,
+            fields: parsed,
             little_endian,
         })
     }
@@ -652,16 +702,12 @@ impl SampleFormat {
     ///
     /// # Errors
     /// The format cannot be carried by `Sample = (f64, u32)` — more than one
-    /// field or wider than four bytes (adxl345's `"BBBBB"`, mpu9250's
-    /// `">hhh"`; wiring those needs a wider sample type) — or `bytes` is not
-    /// exactly one sample long.
+    /// field or wider than four bytes (see [`decode_fields`](Self::decode_fields)
+    /// for the multi-field accelerometer layouts) — or `bytes` is not exactly
+    /// one sample long.
     pub fn decode(&self, bytes: &[u8]) -> Result<u32, McuError> {
-        if self.field_count != 1 || self.bytes_per_sample > 4 {
-            return Err(McuError::Decode(format!(
-                "sample format \"{}\" unpacks {} byte(s) in {} field(s); Sample = (f64, u32) \
-                 cannot carry it",
-                self.spec, self.bytes_per_sample, self.field_count
-            )));
+        if let Some(reason) = self.scalar_error() {
+            return Err(McuError::Decode(reason));
         }
         if bytes.len() != self.bytes_per_sample {
             return Err(McuError::Decode(format!(
@@ -683,6 +729,124 @@ impl SampleFormat {
         }
         Ok(value)
     }
+
+    /// Unpack one sample's bytes into its integer fields, in format order
+    /// (upstream's `unpack_from` tuple).
+    ///
+    /// # Errors
+    /// [`McuError::Decode`] when the format does not carry exactly `N` fields of
+    /// at most four bytes each, when `bytes` is not one sample long, or when a
+    /// field's value does not fit an `i32`.
+    pub fn decode_fields<const N: usize>(&self, bytes: &[u8]) -> Result<[i32; N], McuError> {
+        if let Some(reason) = self.fields_error::<N>() {
+            return Err(McuError::Decode(reason));
+        }
+        if bytes.len() != self.bytes_per_sample {
+            return Err(McuError::Decode(format!(
+                "sample format \"{}\" needs {} byte(s), got {}",
+                self.spec,
+                self.bytes_per_sample,
+                bytes.len()
+            )));
+        }
+        let mut values = [0_i32; N];
+        let mut offset = 0;
+        for (index, field) in self.fields.iter().enumerate() {
+            let end = offset + field.width;
+            values[index] = field.value(&bytes[offset..end], self.little_endian)?;
+            offset = end;
+        }
+        Ok(values)
+    }
+
+    /// Why a [`Sample`] cannot carry this format, if it cannot.
+    fn scalar_error(&self) -> Option<String> {
+        if self.fields.len() == 1 && self.bytes_per_sample <= 4 {
+            return None;
+        }
+        Some(format!(
+            "sample format \"{}\" unpacks {} byte(s) in {} field(s); Sample = (f64, u32) \
+             cannot carry it",
+            self.spec,
+            self.bytes_per_sample,
+            self.fields.len()
+        ))
+    }
+
+    /// Why an `[i32; N]` payload cannot carry this format, if it cannot.
+    fn fields_error<const N: usize>(&self) -> Option<String> {
+        if self.fields.len() != N {
+            return Some(format!(
+                "sample format \"{}\" unpacks {} field(s); this sensor's sample carries {N}",
+                self.spec,
+                self.fields.len()
+            ));
+        }
+        if self.fields.iter().any(|field| field.width > 4) {
+            return Some(format!(
+                "sample format \"{}\" has a field wider than four bytes, which [i32; {N}] \
+                 cannot carry",
+                self.spec
+            ));
+        }
+        None
+    }
+}
+
+// ===========================================================================
+// SamplePayload
+// ===========================================================================
+
+/// What one raw sample's bytes decode into — the payload half of a
+/// [`TimedSample`] (upstream's `struct.unpack_from` result, without the print
+/// time).
+///
+/// [`FixedFreqReader`] is generic over it, so [`FixedFreqReader::pull_samples`]
+/// yields exactly the shape a chip's wire format carries: `u32` for the
+/// single-word sensors (`">I"`, `"<i"`) and an integer array for the
+/// accelerometers (`"BBBBB"` → `[i32; 5]`, `">hhh"` → `[i32; 3]`). The
+/// per-chip scaling from raw fields to physical units stays in the sensor
+/// (`ldc1612::convert_samples`, `adxl345::convert_samples`, …), as upstream's
+/// `_convert_samples` does.
+pub trait SamplePayload: Sized {
+    /// Reject a sample format this payload cannot carry — when the reader is
+    /// built, instead of on the first batch.
+    ///
+    /// # Errors
+    /// [`ConfigError`] naming the format and the payload's shape.
+    fn check_format(format: &SampleFormat) -> Result<(), ConfigError>;
+
+    /// Decode one sample's bytes (exactly `format.bytes_per_sample()` long).
+    ///
+    /// # Errors
+    /// [`McuError::Decode`] when the bytes do not fit the format.
+    fn decode(format: &SampleFormat, bytes: &[u8]) -> Result<Self, McuError>;
+}
+
+impl SamplePayload for u32 {
+    fn check_format(format: &SampleFormat) -> Result<(), ConfigError> {
+        match format.scalar_error() {
+            None => Ok(()),
+            Some(reason) => Err(ConfigError::new(reason)),
+        }
+    }
+
+    fn decode(format: &SampleFormat, bytes: &[u8]) -> Result<Self, McuError> {
+        format.decode(bytes)
+    }
+}
+
+impl<const N: usize> SamplePayload for [i32; N] {
+    fn check_format(format: &SampleFormat) -> Result<(), ConfigError> {
+        match format.fields_error::<N>() {
+            None => Ok(()),
+            Some(reason) => Err(ConfigError::new(reason)),
+        }
+    }
+
+    fn decode(format: &SampleFormat, bytes: &[u8]) -> Result<Self, McuError> {
+        format.decode_fields::<N>(bytes)
+    }
 }
 
 impl Default for SampleFormat {
@@ -691,7 +855,10 @@ impl Default for SampleFormat {
         Self {
             spec: ">I".to_string(),
             bytes_per_sample: 4,
-            field_count: 1,
+            fields: vec![SampleField {
+                width: 4,
+                signed: false,
+            }],
             little_endian: false,
         }
     }
@@ -710,8 +877,9 @@ impl Default for SampleFormat {
 ///
 /// The sample layout and the status-query command are parameters — upstream's
 /// `unpack_fmt` and the `msgformat` of `setup_query_command` — with
-/// [`new`](Self::new) keeping ldc1612's defaults.
-pub struct FixedFreqReader {
+/// [`new`](Self::new) keeping ldc1612's defaults. The layout parameter `P` is
+/// the payload each sample decodes to ([`SamplePayload`]).
+pub struct FixedFreqReader<P = u32> {
     /// The machine this sensor is on, resolved when it binds.
     mcu_object: Mutex<Weak<McuObject>>,
     oid: Mutex<Option<u8>>,
@@ -732,9 +900,12 @@ pub struct FixedFreqReader {
     /// `setup_query_command(msgformat, …)`; its argument is always the
     /// sensor's `oid` (`oid=%c`).
     query_cmd: String,
+    /// The payload type this reader's samples decode to; `P` appears nowhere
+    /// else in the reader's state.
+    payload: PhantomData<P>,
 }
 
-impl FixedFreqReader {
+impl FixedFreqReader<u32> {
     /// Track samples expected `chip_clock_smooth` MCU ticks apart — upstream
     /// passes `data_rate * BATCH_UPDATES * 2` — with ldc1612's defaults: the
     /// `">I"` sample format and the `query_status_ldc1612` status query
@@ -748,12 +919,13 @@ impl FixedFreqReader {
         )
     }
 
-    /// The parameterized constructor — upstream's `__init__(mcu,
+    /// The single-word constructor — upstream's `__init__(mcu,
     /// chip_clock_smooth, unpack_fmt)` together with the `msgformat` half of
-    /// `setup_query_command(msgformat, oid, cq)`.
+    /// `setup_query_command(msgformat, oid, cq)` — for a format whose one
+    /// field fits a [`Sample`] payload (`"<i"`, `">I"`).
     ///
-    /// `unpack_fmt` is a Python `struct` format (`"<i"`, `">I"`, `"BBBBB"`)
-    /// that fixes the sample's byte order and size — hence
+    /// `unpack_fmt` is a Python `struct` format that fixes the sample's byte
+    /// order and size — hence
     /// [`samples_per_block`](SampleFormat::samples_per_block) =
     /// `51 // bytes_per_sample` — and `query_msgformat` is the chip's status
     /// query (e.g. `"query_hx71x_status oid=%c"`), whose first token names
@@ -761,13 +933,34 @@ impl FixedFreqReader {
     ///
     /// # Errors
     /// [`ConfigError`] when either string is unusable (see
-    /// [`SampleFormat::parse`]).
+    /// [`SampleFormat::parse`]) or the format does not fit one `u32` (see
+    /// [`with_payload_format`](Self::with_payload_format)).
     pub fn with_format(
         chip_clock_smooth: f64,
         unpack_fmt: &str,
         query_msgformat: &str,
     ) -> Result<Self, ConfigError> {
+        Self::with_payload_format(chip_clock_smooth, unpack_fmt, query_msgformat)
+    }
+}
+
+impl<P: SamplePayload> FixedFreqReader<P> {
+    /// The payload-typed constructor: the same two upstream calls, for a
+    /// format whose fields stay separate — the accelerometers' `"BBBBB"`
+    /// (five bytes → `[i32; 5]`) and `">hhh"` (three signed words →
+    /// `[i32; 3]`).
+    ///
+    /// # Errors
+    /// [`ConfigError`] when either string is unusable (see
+    /// [`SampleFormat::parse`]) or the format does not fit `P` (see
+    /// [`SamplePayload::check_format`]).
+    pub fn with_payload_format(
+        chip_clock_smooth: f64,
+        unpack_fmt: &str,
+        query_msgformat: &str,
+    ) -> Result<Self, ConfigError> {
         let format = SampleFormat::parse(unpack_fmt)?;
+        P::check_format(&format)?;
         let query_cmd = query_msgformat
             .split_whitespace()
             .next()
@@ -781,7 +974,7 @@ impl FixedFreqReader {
     }
 
     /// The shared constructor behind [`new`](Self::new) and
-    /// [`with_format`](Self::with_format).
+    /// [`with_payload_format`](Self::with_payload_format).
     fn build(chip_clock_smooth: f64, format: SampleFormat, query_cmd: String) -> Self {
         Self {
             mcu_object: Mutex::new(Weak::new()),
@@ -793,6 +986,7 @@ impl FixedFreqReader {
             last_overflows: Mutex::new(0),
             format,
             query_cmd,
+            payload: PhantomData,
         }
     }
 
@@ -948,7 +1142,7 @@ impl FixedFreqReader {
 
     /// Query the clock, pull every queued message, and timestamp the samples
     /// (`pull_samples` upstream).
-    pub async fn pull_samples(&self) -> Result<Vec<Sample>, McuError> {
+    pub async fn pull_samples(&self) -> Result<Vec<TimedSample<P>>, McuError> {
         self.query_and_apply(false).await?;
         let raw: Vec<(u16, Vec<u8>)> = {
             let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
@@ -967,7 +1161,7 @@ impl FixedFreqReader {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get_time_translation(|ticks| clock.clock_to_print_time(ticks));
-        let (samples, last_chip_clock) = decode_blocks(
+        let (samples, last_chip_clock) = decode_blocks::<P>(
             &raw,
             &self.format,
             last_sequence as i64,
@@ -1017,21 +1211,21 @@ impl FixedFreqReader {
     }
 }
 
-/// Decode queued `sensor_bulk_data` messages into timestamped samples
-/// (the inner loop of upstream's `pull_samples`).
+/// Decode queued `sensor_bulk_data` messages into timestamped samples of
+/// payload `P` (the inner loop of upstream's `pull_samples`).
 ///
 /// `start_last_sequence` is the sequence the status query established; each
 /// message's sequence is taken relative to it with 16-bit wrap and signed
 /// extension. Returns the samples and the chip-clock position of the last
 /// sample (for [`ClockSyncRegression::set_last_chip_clock`]).
-fn decode_blocks(
+fn decode_blocks<P: SamplePayload>(
     raw: &[(u16, Vec<u8>)],
     format: &SampleFormat,
     start_last_sequence: i64,
     time_base: f64,
     chip_base: f64,
     inv_freq: f64,
-) -> Result<(Vec<Sample>, f64), McuError> {
+) -> Result<(Vec<TimedSample<P>>, f64), McuError> {
     let samples_per_block = format.samples_per_block();
     let bytes_per_sample = format.bytes_per_sample();
     let mut samples = Vec::with_capacity(raw.len() * samples_per_block);
@@ -1047,7 +1241,7 @@ fn decode_blocks(
         for index in 0..count {
             let ptime = time_base + (msg_cdiff + index as f64) * inv_freq;
             let start = index * bytes_per_sample;
-            let raw_value = format.decode(&data[start..start + bytes_per_sample])?;
+            let raw_value = P::decode(format, &data[start..start + bytes_per_sample])?;
             samples.push((ptime, raw_value));
         }
         if count > 0 {
@@ -1130,7 +1324,8 @@ mod tests {
             block.extend_from_slice(&value.to_le_bytes());
         }
         let raw = vec![(1_u16, block)];
-        let (samples, _) = decode_blocks(&raw, &format, 1, 10.0, 13.0, 0.5).expect("decodes");
+        let (samples, _) =
+            decode_blocks::<u32>(&raw, &format, 1, 10.0, 13.0, 0.5).expect("decodes");
         assert_eq!(samples.len(), 3);
         assert_eq!(samples[0].1, 0x0010_0000);
         // -1 as i32 is all bits set; little-endian must not byte-swap it.
@@ -1157,7 +1352,7 @@ mod tests {
         assert_eq!(reader.format, SampleFormat::default());
         let raw = vec![(1_u16, block)];
         let (samples, _) =
-            decode_blocks(&raw, &reader.format, 1, 10.0, 13.0, 0.5).expect("decodes");
+            decode_blocks::<u32>(&raw, &reader.format, 1, 10.0, 13.0, 0.5).expect("decodes");
         let decoded: Vec<u32> = samples.iter().map(|(_t, value)| *value).collect();
         assert_eq!(decoded, expected);
 
@@ -1196,6 +1391,83 @@ mod tests {
             be.decode(&[0x12, 0x34, 0x56, 0x78]).expect("4 bytes"),
             0x1234_5678
         );
+    }
+
+    #[test]
+    fn test_adxl345_five_byte_samples_decode_into_their_fields() {
+        // Upstream's `FixedFreqReader(mcu, chip_smooth, "BBBBB")`: five 1-byte
+        // fields per sample, 51 // 5 = 10 samples per message, and the
+        // `query_adxl345_status` clock query.
+        let reader = FixedFreqReader::<[i32; 5]>::with_payload_format(
+            80.,
+            "BBBBB",
+            "query_adxl345_status oid=%c",
+        )
+        .expect("valid args");
+        assert_eq!(reader.format.bytes_per_sample(), 5);
+        assert_eq!(reader.format.samples_per_block(), 10);
+        assert_eq!(reader.query_cmd, "query_adxl345_status");
+
+        // Two samples, in the chip's field order xlow, ylow, zlow, xzhigh,
+        // yzhigh; the second carries the error flag (yzhigh bit 7).
+        let block = vec![0x7b, 0x00, 0x11, 0x02, 0x00, 0x01, 0x02, 0x03, 0xe4, 0x80];
+        let raw = vec![(1_u16, block)];
+        let (samples, last_chip) =
+            decode_blocks::<[i32; 5]>(&raw, &reader.format, 1, 10.0, 13.0, 0.5).expect("decodes");
+        assert_eq!(samples.len(), 2);
+        assert_eq!(samples[0].1, [0x7b, 0x00, 0x11, 0x02, 0x00]);
+        assert_eq!(samples[1].1, [0x01, 0x02, 0x03, 0xe4, 0x80]);
+        // Sequence 1 is the baseline (10 samples/block), so the block starts
+        // three samples before the estimate's chip base of 13.
+        assert_eq!(samples[0].0, 10.0 + (10.0 - 13.0) * 0.5);
+        assert_eq!(samples[1].0, 10.0 + (10.0 - 13.0 + 1.0) * 0.5);
+        assert_eq!(last_chip, 10.0 + 1.0);
+
+        // The scalar payload cannot carry this format: refused at
+        // construction rather than on the first batch.
+        assert!(FixedFreqReader::with_format(80., "BBBBB", "query_adxl345_status oid=%c").is_err());
+    }
+
+    #[test]
+    fn test_mpu9250_six_byte_samples_decode_into_signed_words() {
+        // Upstream's `FixedFreqReader(mcu, chip_smooth, ">hhh")`: three signed
+        // 16-bit words, 51 // 6 = 8 samples per message.
+        let reader = FixedFreqReader::<[i32; 3]>::with_payload_format(
+            80.,
+            ">hhh",
+            "query_mpu9250_status oid=%c",
+        )
+        .expect("valid args");
+        assert_eq!(reader.format.bytes_per_sample(), 6);
+        assert_eq!(reader.format.samples_per_block(), 8);
+        assert_eq!(reader.query_cmd, "query_mpu9250_status");
+
+        let mut block = Vec::new();
+        // 1, -2, -32768 big-endian.
+        block.extend_from_slice(&[0x00, 0x01, 0xff, 0xfe, 0x80, 0x00]);
+        // 32767, 0, 2 big-endian.
+        block.extend_from_slice(&[0x7f, 0xff, 0x00, 0x00, 0x00, 0x02]);
+        let raw = vec![(1_u16, block)];
+        let (samples, last_chip) =
+            decode_blocks::<[i32; 3]>(&raw, &reader.format, 1, 0.0, 8.0, 1.0).expect("decodes");
+        assert_eq!(samples[0], (0.0, [1, -2, -32768]));
+        assert_eq!(samples[1], (1.0, [32767, 0, 2]));
+        assert_eq!(last_chip, 9.0);
+
+        // The same words little-endian (`<hhh`) keep their sign.
+        let little = SampleFormat::parse("<hhh").expect("valid format");
+        let raw = vec![(1_u16, vec![0x01, 0x00, 0xfe, 0xff, 0x00, 0x80])];
+        let (samples, _) =
+            decode_blocks::<[i32; 3]>(&raw, &little, 1, 0.0, 8.0, 1.0).expect("decodes");
+        assert_eq!(samples[0].1, [1, -2, -32768]);
+
+        // An arity mismatch is refused at construction.
+        assert!(FixedFreqReader::<[i32; 3]>::with_payload_format(
+            80.,
+            "BBBBB",
+            "query_x_status oid=%c"
+        )
+        .is_err());
     }
 
     #[test]
@@ -1238,7 +1510,8 @@ mod tests {
         }
         let raw = vec![(1_u16, first), (2_u16, second)];
         let (samples, last_chip_clock) =
-            decode_blocks(&raw, &SampleFormat::default(), 1, 10.0, 13.0, 0.5).expect("decodes");
+            decode_blocks::<u32>(&raw, &SampleFormat::default(), 1, 10.0, 13.0, 0.5)
+                .expect("decodes");
         // 24 samples; message 1 is seq 1 (baseline), message 2 follows.
         assert_eq!(samples.len(), 24);
         assert_eq!(samples[0], (10.0 + (12.0 - 13.0) * 0.5, 0x0010_0000));
@@ -1250,7 +1523,7 @@ mod tests {
 
         // An empty pull decodes to nothing.
         let (empty, _) =
-            decode_blocks(&[], &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
+            decode_blocks::<u32>(&[], &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
         assert!(empty.is_empty());
     }
 
@@ -1260,7 +1533,8 @@ mod tests {
         // Forward across the 16-bit wrap: 65534 → 1 is +3 messages.
         let raw = vec![(65534_u16, block.clone()), (1_u16, block.clone())];
         let (samples, last_chip) =
-            decode_blocks(&raw, &SampleFormat::default(), 65534, 0., 0., 1.).expect("decodes");
+            decode_blocks::<u32>(&raw, &SampleFormat::default(), 65534, 0., 0., 1.)
+                .expect("decodes");
         assert_eq!(samples.len(), 2 * SAMPLES_PER_BLOCK);
         // chip positions: 65534*12+12 → 65537*12+11 (baseline arithmetic).
         assert_eq!(last_chip, 65537.0 * 12.0 + 11.0);
@@ -1268,7 +1542,7 @@ mod tests {
         // A backwards jump: 0x8000 is -32768 signed (upstream's extension).
         let raw = vec![(0x8000_u16, block)];
         let (samples, last_chip) =
-            decode_blocks(&raw, &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
+            decode_blocks::<u32>(&raw, &SampleFormat::default(), 0, 0., 0., 1.).expect("decodes");
         assert_eq!(last_chip, -32768.0 * 12.0 + 11.0);
         assert_eq!(samples.len(), SAMPLES_PER_BLOCK);
     }

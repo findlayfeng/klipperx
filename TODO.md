@@ -441,8 +441,11 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `TimedRotatingFileHandler(when='midnight', backupCount=5)` 轮转（本地午夜后第一条日志触发，
       `klippy.log.YYYY-MM-DD`、保留 5 份），新文件开头写 `rollover_info`（`versions` + `config` 块，
       形状照 `configfile.py:482-487`）。**修正旧断言**：上游**不是**「2 MB × 5」，全仓没有 `maxBytes`。
-- [ ] **余项**：`--logfile` 缺省仍不落盘（上游同样需要显式给）；仓内不带 systemd unit 文件；
-      按天切不按大小切，刷屏会话单日文件仍可能很大。
+- [x] **余项判定（2026-10-22 拍板：与上游保持一致，不改缺省行为）**：`--logfile` 缺省仍不落盘——
+      上游 `bglogger` 同样要求显式给，改缺省就是刻意偏离，不做；仓内不带 systemd unit 文件同理
+      （部署形态由使用者决定，本仓只提供 `klipperx` 二进制）；按天切不按大小切是上游 `TimedRotatingFileHandler`
+      的原语义，保留。刷屏会话单日文件可能很大的**缓解**写在日志手册里（`grep`/`journalctl` 用法与
+      `log_config` 的轮转说明），不在代码里加大小上限。
 - [x] **定时器回调 panic 无兜底 —— 已修（2026-10-18）**：定时器、latency notifier、运动队列的
       flush/active 回调全部 `catch_unwind`；panic 记 `error!`（带回调名与 panic 文本）后丢弃那个定时器，
       其余照常调度（详见 `docs/klippy/developer-manual/architecture.md`）。
@@ -479,14 +482,13 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 ### H12 核心工具补齐
 
-- [ ] 便捷 helper（**参照系待定**）：`get_heater` / `get_sensor` 这类封装。**注意口径**：语料钉定的上游
-      `third_party/klipper/klippy/util.py` **没有**这两个函数——它们是更新版上游才有的东西，
-      本仓在语料里无参照。现有能力已足够：前缀式 `lookup_objects`、`statuses`、
-      `get_status -> serde_json::Value`（`printer.rs`）。按 AGENTS 「一切对照读 `third_party/klipper`、
-      语料是最终仲裁」，这条先当「新上游特性、无覆盖」挂着，不排期。
-- [ ] `pins.py` 消费侧 `get_pin_type` 查询面——同样参照系待定：语料钉定的上游 `pins.py` 没有该函数；
-      本仓以 typed 入口（`setup_digital_out`/`setup_pwm`/`setup_adc`）代替上游的 `setup_pin(type, desc)`，
-      `PinType` 与 `lookup_pin` 已有（`pins.rs`）。
+- [x] **便捷 helper 判定（2026-10-22 拍板：不实现，等上游引用更新）**：`get_heater` / `get_sensor` 在
+      语料钉定的上游 `third_party/klipper/klippy/util.py` 里**不存在**（更新版上游才有），本仓无参照可依。
+      按 AGENTS「一切对照读 `third_party/klipper`、语料是最终仲裁」：**不实现**，等子模组更新到含这两个
+      函数的版本后再评估。现有能力已足够：前缀式 `lookup_objects`、`statuses`、`get_status -> serde_json::Value`。
+- [x] **`pins.get_pin_type` 判定（2026-10-22 拍板：不实现，等上游引用更新）**：语料钉定的上游 `pins.py`
+      没有该函数；本仓以 typed 入口（`setup_digital_out`/`setup_pwm`/`setup_adc`）代替上游的
+      `setup_pin(type, desc)`，`PinType` 与 `lookup_pin` 已有。同上：等子模组更新后再评估。
 
 ## 未决问题
 

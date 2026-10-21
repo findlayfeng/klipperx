@@ -57,6 +57,15 @@
 //! `GCODE_AXIS` manual stepper does not yet (its module docs register that
 //! gap).
 //!
+//! The position container is finite ([`MAX_AXES`](crate::core::klippy::mathutil::MAX_AXES):
+//! sixteen axes, the four modelled ones plus twelve extra). Upstream's lists
+//! grow without bound; here an axis past the cap gets no letter in `axis_map`,
+//! and rebuilding `axis_map` reports the letters it had to drop with
+//! `tracing::error!` — once per registration, not once per move — so a
+//! machine that outgrew the cap is diagnosable. `G0`/`G1` still declare every
+//! free letter (all twenty of them), so a client is offered them whether or
+//! not a host has a slot.
+//!
 //! The move-transform slot itself is complete: `bed_mesh`
 //! (`bed_mesh.rs:1851`), `bed_tilt` (`bed_tilt.rs:376`) and `exclude_object`
 //! all take it through [`GCodeMove::set_move_transform`], and the last one
@@ -206,6 +215,10 @@ impl MoveState {
     /// index the planner uses.
     fn update_extra_axes(&mut self, extra_axes: &[Option<String>]) {
         let mut axis_map = four_axis_map();
+        // The letters with a slot for everything but the container's capacity.
+        // One registration can overflow by several axes, so the report is one
+        // line listing them all rather than one per letter.
+        let mut dropped: Vec<&str> = Vec::new();
         for (index, gcode_id) in extra_axes.iter().enumerate() {
             // Slot 0 is the extrude slot ([`E_AXIS`]) in this port —
             // `ToolHead::add_extra_axis` puts the extruder there, and a lone
@@ -232,11 +245,25 @@ impl MoveState {
             }
             // Past the container's capacity a letter would address a slot that
             // cannot exist; upstream's list has no such bound. With
-            // [`MAX_AXES`] eight, indices 1..=4 map (positions 4..=7).
+            // [`MAX_AXES`] sixteen, indices 1..=12 map (positions 4..=15); the
+            // axis is recorded and reported below.
             if E_AXIS + index >= MAX_AXES {
+                dropped.push(gcode_id);
                 continue;
             }
             axis_map.insert(gcode_id.clone(), E_AXIS + index);
+        }
+        if !dropped.is_empty() {
+            // Once per registration, not per move: the printer keeps running
+            // (upstream has no such bound), so this line is how an operator
+            // learns which axes `G1` cannot reach. `G1_PARAMS` still offers
+            // their letters to a client; only `axis_map` is missing them.
+            tracing::error!(
+                "extra axes {dropped:?} exceed the position capacity: MAX_AXES is \
+                 {MAX_AXES} (E plus {} extra axes), so their G-code letters are not in \
+                 axis_map and G-code cannot move them",
+                MAX_AXES - AXES
+            );
         }
         self.axis_map = axis_map;
         // `self.base_position[4:] = [0.] * (len(extra_axes) - 4)`: the anchors
@@ -250,17 +277,6 @@ impl MoveState {
             .chain(std::iter::repeat(0.0))
             .take(len);
         self.base_position = Coord::from_axes(base_position);
-    }
-
-    /// Grow or trim `last_position` to `len` axes, keeping the values it has.
-    fn resize_last_position(&mut self, len: usize) {
-        let axes: Vec<f64> = self
-            .last_position
-            .axes()
-            .chain(std::iter::repeat(0.0))
-            .take(len)
-            .collect();
-        self.last_position = Coord::from_axes(axes);
     }
 }
 
@@ -378,10 +394,15 @@ impl GCodeMove {
     /// Upstream's `reset_last_position`: `last_position` follows the toolhead,
     /// but only once there is one to ask.
     ///
-    /// The toolhead reports the four modelled axes; the extra-axis tail is
-    /// carried over from the last move, because upstream reads it back from the
-    /// toolhead's own `commanded_pos`, which does not track extra axes in this
-    /// port yet (see the module docs).
+    /// Upstream assigns `position_with_transform()`, the toolhead's whole
+    /// `commanded_pos`, so `last_position` comes back as long as the machine
+    /// has axes (`gcode_move.py:115-117`). [`MoveTarget::position`] reports the
+    /// four modelled axes only — the toolhead keeps the extra-axis tail in its
+    /// own `extra_pos` — so the tail is carried over from the last move and the
+    /// result is rebuilt at the axis count `update_extra_axes` set for
+    /// `base_position`: four modelled axes plus the registered extra ones,
+    /// capped by [`MAX_AXES`]. An axis that registered after the last move has
+    /// no value to carry and starts at zero.
     pub fn reset_last_position(&self) {
         let Some(target) = self.target() else {
             return;
@@ -389,13 +410,18 @@ impl GCodeMove {
         let position = target.position();
         let mut state = self.lock();
         let len = state.base_position.len();
-        // `toolhead.position()` carries the four modelled axes, so the
-        // extra-axis tail keeps the values of the last move until the toolhead
-        // reports the tail itself (upstream reads it out of `commanded_pos`).
-        let tail = state.last_position.as_slice().get(AXES..).unwrap_or(&[]);
-        let axes = position.axes().chain(tail.iter().copied());
-        state.last_position = Coord::from_axes(axes);
-        state.resize_last_position(len);
+        // The tail the last move left: padded for an axis that registered
+        // after it, trimmed for one that was removed.
+        let tail = state
+            .last_position
+            .as_slice()
+            .get(AXES..)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0.0))
+            .take(len.saturating_sub(AXES));
+        state.last_position = Coord::from_axes(position.axes().chain(tail));
     }
 
     /// Upstream's `_update_extra_axes` (`gcode_move.py:118-133`), driven by the
@@ -455,10 +481,17 @@ impl GCodeMove {
         type Command = fn(&GCodeMove, &GcodeCommand) -> Result<(), CommandError>;
         /// The words `cmd_g1` reads, shared by both spellings of the move.
         ///
-        /// A registered `GCODE_AXIS` letter is read too, but the table is built
-        /// here, before any extra axis can register, so a client is offered the
-        /// four axes only.
-        const G1_PARAMS: &[&str] = &["X", "Y", "Z", "E", "F"];
+        /// `cmd_g1` walks `axis_map` and then reads `F`, and `axis_map` is
+        /// rebuilt whenever an extra axis registers — after this table is
+        /// built. So the table names every letter an extra axis may take:
+        /// `A`–`Z` minus the four axes, `F` (feed) and `N` (line number) —
+        /// upstream's filter (`gcode_move.py:126-128`) — with `F` last
+        /// because that is when the handler reads it. A letter no extra axis
+        /// registered is simply never looked for.
+        const G1_PARAMS: &[&str] = &[
+            "X", "Y", "Z", "E", "A", "B", "C", "D", "G", "H", "I", "J", "K", "L", "M", "O", "P",
+            "Q", "R", "S", "T", "U", "V", "W", "F",
+        ];
         /// The axes `cmd_g92` anchors on.
         const G92_PARAMS: &[&str] = &["X", "Y", "Z", "E"];
         /// `cmd_m220` and `cmd_m221` each read their factor as a percentage, in
@@ -1657,9 +1690,21 @@ mod tests {
         let (_printer, gcode, _object, _target) = machine(Coord::default());
 
         let commands = gcode.get_status(0.0)["commands"].clone();
-        assert_eq!(
-            commands["G1"]["parameters"],
-            json!(["X", "Y", "Z", "E", "F"])
+        // The full letter set is `test_g0_and_g1_declare_every_extra_axis_letter`;
+        // here the shape matters: the four axes, a slot's worth of extra-axis
+        // letters, the feed word, and not the line number.
+        let g1_params: Vec<&str> = commands["G1"]["parameters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|param| param.as_str().unwrap())
+            .collect();
+        for word in ["X", "Y", "Z", "E", "A", "W", "F"] {
+            assert!(g1_params.contains(&word), "G1 must declare `{word}`");
+        }
+        assert!(
+            !g1_params.contains(&"N"),
+            "`N` is the line number, never an axis"
         );
         assert_eq!(commands["G0"]["parameters"], commands["G1"]["parameters"]);
         assert_eq!(commands["G92"]["parameters"], json!(["X", "Y", "Z", "E"]));
@@ -1883,30 +1928,39 @@ mod tests {
         );
     }
 
-    /// The capacity cap, pinned: with `MAX_AXES` eight the four extra axes
-    /// after the extruder map (positions 4..=7) and a fifth does not. Raising
-    /// `MAX_AXES` has to revisit this assertion.
+    /// The extra axes that still fit: the extruder, then one `GCODE_AXIS` per
+    /// remaining slot — `MAX_AXES` minus the four modelled axes, taken from the
+    /// free letters in order (`F` and `N` are not free, upstream's filter,
+    /// `gcode_move.py:126-128`).
+    fn extra_axes_at_capacity() -> Vec<Option<String>> {
+        let mut axes = vec![Some("E".to_string())];
+        for letter in "ABCDGHIJKLMOPQRSTUVW".chars().take(MAX_AXES - AXES) {
+            axes.push(Some(letter.to_string()));
+        }
+        axes
+    }
+
+    /// The capacity cap, pinned: with `MAX_AXES` sixteen the twelve extra axes
+    /// after the extruder map (positions 4..=15) and a thirteenth does not.
+    /// Raising `MAX_AXES` has to revisit this assertion.
     #[test]
-    fn test_a_fifth_extra_axis_is_not_mapped() {
+    fn test_an_extra_axis_past_the_capacity_is_not_mapped() {
         let (_printer, _gcode, object, _target) = machine(Coord::default());
 
-        object.update_extra_axes_from(&[
-            Some("E".to_string()),
-            Some("A".to_string()),
-            Some("B".to_string()),
-            Some("C".to_string()),
-            Some("D".to_string()),
-            Some("G".to_string()),
-        ]);
+        let mut extra_axes = extra_axes_at_capacity();
+        extra_axes.push(Some("P".to_string()));
+        object.update_extra_axes_from(&extra_axes);
 
         let map = axis_map(&object);
         assert_eq!(map["A"], json!(4));
-        assert_eq!(map["B"], json!(5));
-        assert_eq!(map["C"], json!(6));
-        assert_eq!(map["D"], json!(7));
+        assert_eq!(
+            map["O"],
+            json!(E_AXIS + MAX_AXES - AXES),
+            "the last slot a letter can take"
+        );
         assert!(
-            map.get("G").is_none(),
-            "the fifth extra axis has no slot: {map}"
+            map.get("P").is_none(),
+            "the axis past the capacity has no slot: {map}"
         );
         assert_eq!(map.as_object().unwrap().len(), MAX_AXES);
         assert_eq!(
@@ -1914,5 +1968,154 @@ mod tests {
             MAX_AXES,
             "the position is capped at the container's capacity"
         );
+        assert_eq!(
+            object.lock().last_position.len(),
+            MAX_AXES,
+            "`last_position` is rebuilt at the capped count too"
+        );
+    }
+
+    /// Past the capacity is not silent: one error line names **every** letter
+    /// that found no slot, and it is emitted per registration — a move that
+    /// follows does not repeat it. Upstream, whose lists grow without bound,
+    /// has no such line to give.
+    #[test]
+    fn test_axes_past_the_capacity_are_reported_once() {
+        let (_printer, gcode, object, _target) = machine(Coord::default());
+        let mut extra_axes = extra_axes_at_capacity();
+        extra_axes.push(Some("P".to_string()));
+        extra_axes.push(Some("Q".to_string()));
+
+        let capture = LogCapture::default();
+        use tracing_subscriber::layer::SubscriberExt;
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::ERROR)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        tracing::subscriber::with_default(subscriber, || {
+            object.update_extra_axes_from(&extra_axes);
+            assert_eq!(
+                axis_map(&object)["O"],
+                json!(E_AXIS + MAX_AXES - AXES),
+                "the axes that fit map"
+            );
+            gcode.run_script_sync("G1 A1").unwrap();
+        });
+
+        let log = capture.text();
+        let lines: Vec<&str> = log.lines().filter(|line| !line.is_empty()).collect();
+        assert_eq!(lines.len(), 1, "one line per registration: {log}");
+        assert!(
+            lines[0].contains("P") && lines[0].contains("Q"),
+            "both dropped letters are named: {log}"
+        );
+        assert!(
+            !lines[0].contains("\"O\"") && !lines[0].contains("\"A\""),
+            "only the dropped letters are named: {log}"
+        );
+    }
+
+    /// Upstream's `reset_last_position` rebuilds `last_position` at the
+    /// toolhead's full axis count, extra axes included — not at the four
+    /// modelled axes (`gcode_move.py:115-117`). The tail comes from the last
+    /// move in this port, because [`MoveTarget::position`] reports four axes.
+    #[test]
+    fn test_reset_last_position_keeps_every_extra_axis() {
+        let (_printer, gcode, object, target) = machine(Coord::new(1.0, 2.0, 3.0, 4.0));
+        object.update_extra_axes_from(&[Some("E".to_string()), Some("A".to_string())]);
+
+        let axis_count = E_AXIS + 2;
+        assert_eq!(
+            object.lock().last_position.len(),
+            axis_count,
+            "four modelled axes plus `A` — the count `update_extra_axes` set"
+        );
+
+        gcode.run_script_sync("G1 A7").unwrap();
+
+        // A move the toolhead makes outside `G1` re-anchors the state: the
+        // modelled axes follow the toolhead, the tail keeps the last move's
+        // value, and the length stays the full axis count.
+        *target
+            .position
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Coord::new(5.0, 6.0, 7.0, 8.0);
+        object.reset_last_position();
+
+        let state = object.lock();
+        assert_eq!(state.last_position.len(), axis_count);
+        assert_eq!(
+            state.last_position.as_slice(),
+            &[5.0, 6.0, 7.0, 8.0, 7.0],
+            "the four modelled axes, then `A`'s last position"
+        );
+        assert_eq!(state.last_position.len(), state.base_position.len());
+    }
+
+    /// `G0`/`G1` declare every letter an extra axis may take: a client
+    /// completes from this table, and the axes register after it is built.
+    #[test]
+    fn test_g0_and_g1_declare_every_extra_axis_letter() {
+        use crate::core::klippy::printer::PrinterObject;
+
+        let (_printer, gcode, _object, _target) = machine(Coord::default());
+
+        let mut expected = vec![json!("X"), json!("Y"), json!("Z"), json!("E")];
+        for letter in 'A'..='Z' {
+            if !matches!(letter, 'E' | 'F' | 'N' | 'X' | 'Y' | 'Z') {
+                expected.push(json!(letter.to_string()));
+            }
+        }
+        expected.push(json!("F"));
+
+        let status = gcode.get_status(0.0);
+        for command in ["G0", "G1"] {
+            assert_eq!(
+                status["commands"][command]["parameters"],
+                Value::Array(expected.clone()),
+                "{command}"
+            );
+        }
+    }
+
+    /// A byte sink for the fmt layer above. `with_default` keeps the capture
+    /// off the process-wide subscriber, the same shape `reactor.rs` uses.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 }

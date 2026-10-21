@@ -27,14 +27,17 @@ pub const AXES: usize = 4;
 /// [`Coord::len`], and `MAX_AXES` only appears in type declarations (the
 /// backing array's length), never in a loop bound or an index. Upstream's
 /// positions grow a slot per extra axis (`toolhead.py:378-385`,
-/// `add_extra_axis` appends to `commanded_pos`), so the room is eight: the
-/// four modelled axes plus four extra ones.
+/// `add_extra_axis` appends to `commanded_pos`), so the room is sixteen: the
+/// four modelled axes plus twelve extra ones — twelve of the twenty letters an
+/// extra axis can take (`A`–`Z` minus `X`/`Y`/`Z`, `E`, `F` and `N`), which is
+/// an arbitrary bound on an otherwise unbounded machine.
 ///
-/// The capacity is `E` plus **four** extra-axis G-code letters: a fifth extra
-/// axis has no slot and its letter is not mapped into
-/// `gcode_move.axis_map` (upstream, with unbounded lists, has no such limit).
-/// Raising this constant means revisiting that cap's test as well.
-pub const MAX_AXES: usize = 8;
+/// An extra axis past that has no slot and its letter is not mapped into
+/// `gcode_move.axis_map` (upstream, with unbounded lists, has no such limit):
+/// [`Coord::from_axes`] drops the values and `gcode_move` logs the letters it
+/// had to drop, once per axis registration. Raising this constant means
+/// revisiting that cap's test as well.
+pub const MAX_AXES: usize = 16;
 
 /// A toolhead position: `x`, `y`, `z`, `e`, and any extra axes after them.
 ///
@@ -75,7 +78,9 @@ impl Coord {
     /// `Coord::from_axes([1., 2., 3., 4., 5.])` keeps all five, with
     /// [`Coord::len`] five. Values past [`MAX_AXES`] have no slot and are
     /// dropped — the one place this container is narrower than upstream's
-    /// unbounded tuple.
+    /// unbounded tuple. Dropping is silent here because this type does not
+    /// know what the slots mean: the caller that maps G-code letters onto them
+    /// (`gcode_move`) reports the axes it had to drop.
     pub fn from_axes(axes: impl IntoIterator<Item = f64>) -> Self {
         let mut coord = [0.0; MAX_AXES];
         let mut len = 0;
@@ -549,13 +554,21 @@ mod tests {
             Coord::from_axes([1.0, 2.0, 3.0, 4.0, 0.0])
         );
         // The unused tail (slots past `len`) is not part of the value.
+        let mut one_axes = [0.0; MAX_AXES];
+        one_axes[X_AXIS] = 1.0;
+        one_axes[Y_AXIS] = 2.0;
         let one = Coord {
-            axes: [1.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            len: 4,
+            axes: one_axes,
+            len: AXES,
         };
+        let mut other_axes = [9.0; MAX_AXES];
+        other_axes[X_AXIS] = 1.0;
+        other_axes[Y_AXIS] = 2.0;
+        other_axes[Z_AXIS] = 0.0;
+        other_axes[E_AXIS] = 0.0;
         let other = Coord {
-            axes: [1.0, 2.0, 0.0, 0.0, 9.0, 9.0, 9.0, 9.0],
-            len: 4,
+            axes: other_axes,
+            len: AXES,
         };
         assert_eq!(one, other);
     }

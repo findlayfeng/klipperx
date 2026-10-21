@@ -9,6 +9,8 @@
 //!   the host-side planner that decides the velocity of every move.
 //! * [`trapq`] — the trapezoidal velocity queue the step generators read.
 //! * [`itersolve`] — the per-stepper position solver that finds step times.
+//! * [`shaper`] — the input shaper's position function: a stepper's coordinate
+//!   convolved with the shaper's impulses (upstream `chelper/kin_shaper.c`).
 //! * [`stepcompress`] — turning those step times into `queue_step` commands
 //!   (the **simplified** one for now; the compressor is FW5f).
 //! * [`stepper`] — one stepper: its solver and compressor.
@@ -28,6 +30,7 @@ pub mod plan;
 pub mod pressure_advance;
 pub mod queuing;
 pub mod rotary_delta;
+pub mod shaper;
 pub mod stepcompress;
 pub mod stepper;
 pub mod toolhead;
@@ -47,6 +50,7 @@ pub use kinematics::{
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use pressure_advance::ExtruderPressureAdvance;
 pub use queuing::MotionQueuing;
+pub use shaper::{KinematicShaper, ShaperPulse, ShaperPulses};
 pub use stepcompress::{GracePolicy, HistoryStep, StepCommand, StepCompressError, StepCompressor};
 pub use stepper::Stepper;
 pub use toolhead::ToolHead;

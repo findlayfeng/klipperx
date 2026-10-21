@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::core::klippy::mathutil::Xyz;
 
 use super::pressure_advance::{ExtruderPressureAdvance, PressureAdvanceEntry};
+use super::shaper::KinematicShaper;
 use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
@@ -114,7 +115,9 @@ pub type PositionPost = fn(commanded: &mut f64);
 /// A solver that reads only the segment it is asked about gets a one-segment
 /// window ([`SegmentWindow::single`]); the pressure-advance extruder needs its
 /// neighbours for the smoothing window (`kin_extruder.c`'s
-/// `pa_range_integrate` walks the list both ways).
+/// `pa_range_integrate` walks the list both ways), and so does an input shaper,
+/// whose impulse times reach into the segments either side of the one being
+/// generated (`kin_shaper.c`'s `calc_position`).
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentWindow<'a> {
     cuts: &'a [MoveSegment],
@@ -132,8 +135,33 @@ impl<'a> SegmentWindow<'a> {
         }
     }
 
+    /// A window over `cuts`, oldest first, with `index` being the segment being
+    /// generated and `schedule` the pressure-advance snapshot the extruder
+    /// solver reads (empty for a solver that reads no pressure advance).
+    pub(crate) fn new(
+        cuts: &'a [MoveSegment],
+        index: usize,
+        schedule: &'a [PressureAdvanceEntry],
+    ) -> Self {
+        Self {
+            cuts,
+            index,
+            schedule,
+        }
+    }
+
+    /// The segments around the one being generated, oldest first.
+    pub(crate) fn cuts(&self) -> &'a [MoveSegment] {
+        self.cuts
+    }
+
+    /// Where the segment being generated sits in [`Self::cuts`].
+    pub(crate) fn index(&self) -> usize {
+        self.index
+    }
+
     /// The segment being generated.
-    fn segment(&self) -> &'a MoveSegment {
+    pub(crate) fn segment(&self) -> &'a MoveSegment {
         &self.cuts[self.index]
     }
 }
@@ -167,6 +195,10 @@ pub struct StepKinematics {
     /// (`struct extruder_stepper`'s `pa_list`): the position function becomes
     /// the smoothed `pa_position` (`kin_extruder.c:124-136`).
     pressure_advance: Option<Arc<ExtruderPressureAdvance>>,
+    /// The input shaper, when this stepper is shaped: the position function
+    /// becomes the shaper's convolution of the coordinate it reads
+    /// (`struct input_shaper`, `kin_shaper.c:125-130`).
+    shaper: Option<Arc<KinematicShaper>>,
     /// The time before the first move this stepper is active in that it also
     /// generates steps in (`gen_steps_pre_active`).
     gen_steps_pre_active: f64,
@@ -188,6 +220,7 @@ impl StepKinematics {
             unwrap: None,
             post: None,
             pressure_advance: None,
+            shaper: None,
             gen_steps_pre_active: 0.0,
             gen_steps_post_active: 0.0,
         }
@@ -250,6 +283,31 @@ impl StepKinematics {
         self.pressure_advance.as_ref()
     }
 
+    /// Shape this stepper's position function (`input_shaper_set_sk` plus
+    /// `input_shaper_update_sk`, `kin_shaper.c:226-268`), or take the shaper off
+    /// again with `None`.
+    ///
+    /// The step generation window follows the impulses, as upstream's
+    /// `shaper_note_generation_time` recomputes it on every change: the shaped
+    /// motion reaches the outermost impulse times past the first and last move
+    /// the stepper is active in, and steps there are not final
+    /// (`gen_steps_pre_active`/`gen_steps_post_active`). The caller rescans the
+    /// queue's windows afterwards
+    /// ([`ToolHead::recompute_scan_windows`](super::toolhead::ToolHead::recompute_scan_windows)).
+    pub fn set_input_shaper(&mut self, shaper: Option<Arc<KinematicShaper>>) {
+        let (pre_active, post_active) = match &shaper {
+            Some(shaper) => shaper.generation_window(self.active_flags),
+            None => (0.0, 0.0),
+        };
+        self.set_generation_window(pre_active, post_active);
+        self.shaper = shaper;
+    }
+
+    /// The shaper driving this stepper, when it is shaped.
+    pub fn input_shaper(&self) -> Option<&Arc<KinematicShaper>> {
+        self.shaper.as_ref()
+    }
+
     /// Install the solver's position hooks (upstream: the `calc_position_cb`
     /// that reads `sk->commanded_pos` and the `post_cb`; `kin_polar.c` is the
     /// only solver in the corpus that has them).
@@ -261,11 +319,12 @@ impl StepKinematics {
     /// One position-fn evaluation: the raw result, unwrapped against the
     /// commanded position (`polar_stepper_angle_calc_position`).
     fn eval(&self, window: SegmentWindow<'_>, move_time: f64) -> f64 {
-        let raw = match &self.pressure_advance {
-            Some(pressure_advance) => {
-                pressure_advance.position(window.cuts, window.index, move_time, window.schedule)
-            }
-            None => self.position.call(window.segment(), move_time),
+        let raw = if let Some(pressure_advance) = &self.pressure_advance {
+            pressure_advance.position(window.cuts, window.index, move_time, window.schedule)
+        } else if let Some(shaper) = &self.shaper {
+            shaper.position(window, move_time, self.active_flags, &self.position)
+        } else {
+            self.position.call(window.segment(), move_time)
         };
         match self.unwrap {
             Some(unwrap) => unwrap(raw, self.commanded_pos),
@@ -343,10 +402,14 @@ impl StepKinematics {
     /// A stepper only steps while it is active, but its position function may
     /// read the moves around the one it is asked about: pressure advance
     /// averages over `2 * hst = smooth_time` of the trapq (`pa_range_integrate`,
-    /// `kin_extruder.c:89-116`), so the `hst` before its first active move and
-    /// after its last one really does move the extruder. Generating only inside
-    /// the active moves would squeeze that motion into the move's own span — a
-    /// jump at the start and at the end of every extrusion. The two windows
+    /// `kin_extruder.c:89-116`), and an input shaper's impulses reach into the
+    /// segments either side of the one being generated (`calc_position`,
+    /// `kin_shaper.c:87-116`). So the `hst` before its first active move and
+    /// after its last one really does move the extruder, and the shaped motion
+    /// starts before and ends after the moves an axis is active in. Generating
+    /// only inside the active moves would squeeze that motion into the move's
+    /// own span — a jump at the start and at the end of every extrusion, and at
+    /// both ends of every shaped move. The two windows
     /// (`gen_steps_pre_active`, `gen_steps_post_active`) make the generator
     /// visit the silent moves inside that reach as well.
     ///
@@ -363,17 +426,19 @@ impl StepKinematics {
         if self.step_dist == 0.0 {
             return Ok(());
         }
-        // The pressure-advance position function reads the segments around the
-        // one it is asked about, including the ones already finalized into the
-        // history (`kin_extruder.c` walks the trapq list both ways). Copy them
-        // into one slice, oldest first, only when this stepper needs them — and
-        // take one snapshot of the parameters, so the position function itself
-        // needs no lock.
+        // The pressure-advance and shaper position functions read the segments
+        // around the one they are asked about, including the ones already
+        // finalized into the history (`kin_extruder.c` and `kin_shaper.c` walk
+        // the trapq list both ways). Copy them into one slice, oldest first,
+        // only when this stepper needs them — and take one snapshot of the
+        // pressure-advance parameters, so the position function itself needs no
+        // lock.
         let schedule: Vec<PressureAdvanceEntry> = match &self.pressure_advance {
             Some(pressure_advance) => pressure_advance.schedule(),
             None => Vec::new(),
         };
-        let cuts: Vec<MoveSegment> = if self.pressure_advance.is_some() {
+        let reads_neighbouring_moves = self.pressure_advance.is_some() || self.shaper.is_some();
+        let cuts: Vec<MoveSegment> = if reads_neighbouring_moves {
             let mut cuts: Vec<MoveSegment> = trapq.history().iter().rev().copied().collect();
             cuts.extend(trapq.moves().iter().copied());
             cuts
@@ -602,11 +667,7 @@ fn segment_window<'a>(
     if cuts.is_empty() {
         SegmentWindow::single(segment)
     } else {
-        SegmentWindow {
-            cuts,
-            index: first_queued + index,
-            schedule,
-        }
+        SegmentWindow::new(cuts, first_queued + index, schedule)
     }
 }
 
@@ -737,6 +798,7 @@ pub fn extruder_active_flags() -> AxisFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::motion::shaper::ShaperPulses;
     use crate::core::klippy::motion::stepcompress::StepCommand;
 
     /// A constant-velocity move along X covering `distance` at `speed`.
@@ -881,6 +943,160 @@ mod tests {
 
         // 20 mm of travel at 1 mm per step.
         assert_eq!(total_steps(&sc.take_commands()), 20);
+    }
+
+    /// A shaper on the x axis, built as the `[input_shaper]` layer builds it.
+    fn x_shaper(a: &[f64], t: &[f64]) -> Arc<KinematicShaper> {
+        Arc::new(KinematicShaper::new([
+            Some(ShaperPulses::new(a, t).expect("impulses")),
+            None,
+            None,
+        ]))
+    }
+
+    /// Two x moves: 10 mm at 100 mm/s, then 10 mm at 50 mm/s. The velocity step
+    /// in the middle is what a shaper acts on.
+    fn x_trapq() -> Trapq {
+        let mut trapq = Trapq::new();
+        trapq.append(
+            0.0,
+            0.0,
+            0.1,
+            0.0,
+            Xyz::new(0.0, 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            100.0,
+            100.0,
+            0.0,
+        );
+        trapq.append(
+            0.1,
+            0.0,
+            0.2,
+            0.0,
+            Xyz::new(10.0, 0.0, 0.0),
+            Xyz::new(1.0, 0.0, 0.0),
+            50.0,
+            50.0,
+            0.0,
+        );
+        trapq
+    }
+
+    /// The step commands `sk` generates for all of `trapq`.
+    fn steps_of(sk: &mut StepKinematics, trapq: &Trapq) -> Vec<StepCommand> {
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        sk.generate_steps(trapq, &mut sc, 0.3).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        sc.take_commands()
+    }
+
+    /// The plain x solver.
+    fn plain_x_solver() -> StepKinematics {
+        StepKinematics::new(0.01, cartesian_position_fn(Axis::X), AxisFlags::X)
+    }
+
+    /// No shaping is no change: a stepper without a shaper reads its plain
+    /// position function point for point, and a stepper a shaper was taken off
+    /// generates the same steps as one that never carried one. This is the
+    /// regression guard for `shaper_type: none` and for an axis whose
+    /// `shaper_freq` is 0 — the extras layer installs nothing there.
+    #[test]
+    fn test_without_a_shaper_nothing_changes() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let plain = plain_x_solver();
+        let mut cleared = plain_x_solver();
+        cleared.set_input_shaper(Some(x_shaper(&[0.5, 0.5], &[0.0, 0.02])));
+        cleared.set_input_shaper(None);
+        assert_eq!(cleared.generation_window(), (0.0, 0.0));
+
+        for (index, segment) in cuts.iter().enumerate() {
+            for sample in 0..=20 {
+                let move_time = segment.move_t * f64::from(sample) / 20.0;
+                let window = SegmentWindow::new(&cuts, index, &[]);
+                assert_eq!(
+                    plain.eval(window, move_time),
+                    segment.coord(move_time).x(),
+                    "the plain solver reads its axis: segment {index} at {move_time}"
+                );
+                assert_eq!(
+                    cleared.eval(window, move_time),
+                    plain.eval(window, move_time),
+                    "a cleared shaper leaves no trace: segment {index} at {move_time}"
+                );
+            }
+        }
+
+        assert_eq!(
+            steps_of(&mut plain_x_solver(), &trapq),
+            steps_of(&mut cleared, &trapq)
+        );
+    }
+
+    /// A single impulse weighting 1 at time 0 is the identity transformation
+    /// (`shift_pulses` leaves it where it is): the shaped position is the plain
+    /// one point for point, and so are the steps.
+    #[test]
+    fn test_a_single_impulse_at_time_zero_is_the_identity() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let mut shaped = plain_x_solver();
+        shaped.set_input_shaper(Some(x_shaper(&[1.0], &[0.0])));
+        assert_eq!(shaped.generation_window(), (0.0, 0.0));
+
+        for (index, segment) in cuts.iter().enumerate() {
+            for sample in 0..=20 {
+                let move_time = segment.move_t * f64::from(sample) / 20.0;
+                let window = SegmentWindow::new(&cuts, index, &[]);
+                assert!(
+                    (shaped.eval(window, move_time) - segment.coord(move_time).x()).abs() < 1e-9,
+                    "segment {index} at {move_time}"
+                );
+            }
+        }
+
+        assert_eq!(
+            steps_of(&mut shaped, &trapq),
+            steps_of(&mut plain_x_solver(), &trapq)
+        );
+    }
+
+    /// A two-impulse shaper does reach the steps: at the velocity step the
+    /// position is the weighted sum of two delayed positions, so the generated
+    /// steps cannot be the plain ones.
+    #[test]
+    fn test_a_two_impulse_shaper_moves_the_steps() {
+        let trapq = x_trapq();
+        let cuts: Vec<MoveSegment> = trapq.moves().iter().copied().collect();
+        let mut shaped = plain_x_solver();
+        shaped.set_input_shaper(Some(x_shaper(&[0.8, 0.2], &[0.02, 0.05])));
+        // The impulses reach 6 ms ahead and 24 ms back of the shaped moment.
+        let (pre_active, post_active) = shaped.generation_window();
+        assert!((pre_active - 0.006).abs() < 1e-12, "{pre_active}");
+        assert!((post_active - 0.024).abs() < 1e-12, "{post_active}");
+
+        let shaped_steps = steps_of(&mut shaped, &trapq);
+        let plain_steps = steps_of(&mut plain_x_solver(), &trapq);
+
+        assert_ne!(shaped_steps, plain_steps);
+        // The solver really stepped the shaped positions: it starts where the
+        // shaper reaches (the impulses that would sample before the trapq are
+        // clipped to its first position) and stops where it ends, so it travels
+        // less than the plain 20 mm.
+        // `cuts[0]` is the stationary filler the trapq puts before the first
+        // move; the motion starts on `cuts[1]`.
+        let start = shaped.eval(SegmentWindow::new(&cuts, 1, &[]), 0.0);
+        let last = &cuts[cuts.len() - 1];
+        let end = shaped.eval(SegmentWindow::new(&cuts, cuts.len() - 1, &[]), last.move_t);
+        assert!((start - 0.48).abs() < 1e-9, "the shaped start is {start}");
+        assert!((end - 19.76).abs() < 1e-9, "the shaped end is {end}");
+        let travel = f64::from(total_steps(&shaped_steps));
+        assert!(
+            (travel - (end - start) / 0.01).abs() <= 1.0,
+            "{travel} steps is not the shaped travel"
+        );
+        assert!(f64::from(total_steps(&plain_steps)) - travel > 20.0);
     }
 
     #[test]

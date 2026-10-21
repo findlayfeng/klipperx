@@ -131,6 +131,7 @@ use crate::core::klippy::motion::rotary_delta::{
     rotary_delta_active_flags, rotary_delta_position_fn, RotaryDeltaConfig, RotaryDeltaKinematics,
     ROTARY_DELTA_DEFAULT_ANGLES, ROTARY_DELTA_RAIL_NAMES,
 };
+use crate::core::klippy::motion::shaper::KinematicShaper;
 use crate::core::klippy::motion::stepcompress::{HistoryStep, StepCommand, StepCompressError};
 use crate::core::klippy::motion::stepper::Stepper;
 use crate::core::klippy::motion::toolhead::{
@@ -1975,6 +1976,41 @@ impl ToolHeadObject {
         if let Some(connected) = self.lock().as_mut() {
             connected.toolhead.recompute_scan_windows();
         }
+    }
+
+    /// Install `shaper` on every stepper of the main trapq, or take the shaper
+    /// off again with `None` — upstream's
+    /// `_update_input_shaping`/`_update_kinematics`
+    /// (`input_shaper.py:138-190`).
+    ///
+    /// The steppers it walks are `kin.get_steppers()` upstream: the motors that
+    /// read the main trapq, identified here by their trapq id — an extra axis
+    /// (an extruder, a `[manual_stepper]`) reads its own and is not shaped. A
+    /// detached stepper (`set_trapq(None)`) generates no steps, so it is skipped
+    /// as upstream skips the ones whose `get_trapq()` is `None`.
+    ///
+    /// Each stepper's step generation window is rewritten from the impulses of
+    /// the axes it moves (`input_shaper_set_shaper_params` →
+    /// `shaper_note_generation_time`, `kin_shaper.c:270-282`), and the scan runs
+    /// afterwards so the flush delay follows
+    /// (`check_step_generation_scan_windows`, `input_shaper.py:186`).
+    ///
+    /// Before connect there is no planner and nothing to shape.
+    pub fn set_input_shaper(&self, shaper: Option<Arc<KinematicShaper>>) {
+        let mut guard = self.lock();
+        let Some(connected) = guard.as_mut() else {
+            return;
+        };
+        let main_trapq = connected.toolhead.main_trapq();
+        for stepper in connected.toolhead.motion_queuing_mut().steppers_mut() {
+            if stepper.trapq_id() != Some(main_trapq) {
+                continue;
+            }
+            stepper
+                .kinematics_mut()
+                .set_input_shaper(shaper.as_ref().map(Arc::clone));
+        }
+        connected.toolhead.recompute_scan_windows();
     }
 
     /// Advance the planner's timeline by `delay` seconds (`toolhead.dwell`).
@@ -5218,6 +5254,67 @@ mod tests {
             shutdown: Arc::new(AtomicBool::new(false)),
         };
         (printer, object)
+    }
+
+    /// The shaper reaches the motion through the toolhead: every stepper of the
+    /// main trapq is given the impulses, the widest pulse span of the axes it
+    /// moves becomes the flush delay, and taking the shaper off again restores
+    /// the step filter (`_update_input_shaping`, `input_shaper.py:169-190`).
+    #[test]
+    fn test_the_input_shaper_decorates_the_steppers_and_widens_the_flush_delay() {
+        use crate::core::klippy::motion::shaper::ShaperPulses;
+
+        // The step filter, which the scan never goes below
+        // (`SDS_CHECK_TIME`, `motion_queuing.py:123-124`).
+        const SDS_CHECK_TIME: f64 = 0.001;
+        let (state, _gcode) = connected(homed_toolhead());
+        let (_printer, object) = object_over(Arc::clone(&state));
+        let flush_delay = |state: &Arc<Mutex<Option<Connected>>>| {
+            state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .as_ref()
+                .expect("connected")
+                .toolhead
+                .kin_flush_delay()
+        };
+        let shaped_steppers = |state: &Arc<Mutex<Option<Connected>>>| {
+            let mut guard = state.lock().unwrap_or_else(|poison| poison.into_inner());
+            let connected = guard.as_mut().expect("connected");
+            connected
+                .toolhead
+                .motion_queuing_mut()
+                .steppers()
+                .iter()
+                .map(|stepper| stepper.kinematics().input_shaper().is_some())
+                .collect::<Vec<bool>>()
+        };
+
+        object.recompute_scan_windows();
+        assert_eq!(flush_delay(&state), SDS_CHECK_TIME);
+
+        // x impulses at 0.02 s and 0.05 s with weights 0.8 and 0.2 shift to
+        // -0.024 s and +0.006 s: the shaped motion reaches 24 ms back of the
+        // moves the x motor is active in.
+        let shaper = KinematicShaper::new([
+            Some(ShaperPulses::new(&[0.8, 0.2], &[0.02, 0.05]).expect("impulses")),
+            None,
+            None,
+        ]);
+        object.set_input_shaper(Some(Arc::new(shaper)));
+
+        assert!(
+            (flush_delay(&state) - 0.024).abs() < 1e-12,
+            "the x motor's window is the flush delay: {}",
+            flush_delay(&state)
+        );
+        assert_eq!(shaped_steppers(&state), [true, true, true]);
+
+        // Taking it off restores the step filter and the plain position
+        // functions — a `SET_INPUT_SHAPER` that shapes nothing again.
+        object.set_input_shaper(None);
+        assert_eq!(flush_delay(&state), SDS_CHECK_TIME);
+        assert_eq!(shaped_steppers(&state), [false, false, false]);
     }
 
     /// ① Connect-safety: at config load there is no planner

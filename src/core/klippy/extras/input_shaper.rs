@@ -17,26 +17,39 @@
 //! module; `SET_INPUT_SHAPER` at run time is not refused there, which is how the
 //! corpus's `hybrid_corexy_dual_carriage.test` turns shaping on.
 //!
+//! # Applying the shaper
+//!
+//! The impulses reach the motion: each `[input_shaper]` snapshot is handed to
+//! every stepper of the main trapq, and each stepper's position function becomes
+//! the shaper's convolution of its own axis motion ([`KinematicShaper`],
+//! upstream `chelper/kin_shaper.c`). The step generation window of every shaped
+//! stepper follows its impulses, so the flush delay widens while shaping is on
+//! (see [`ToolHeadObject::set_input_shaper`]). An axis with `shaper_freq` 0 has
+//! no impulses, so a section that shapes nothing installs nothing and the motion
+//! is untouched.
+//!
 //! # Differences from upstream
 //!
-//! The parameters are validated, reported, and *not applied*: upstream swaps the
-//! stepper kinematics of every toolhead stepper for an input-shaper one
-//! (`chelper`'s `input_shaper_alloc` / `input_shaper_set_sk` /
-//! `input_shaper_set_shaper_params`, `input_shaper.py:137-165`) and re-points
-//! them when a dual carriage changes the kinematics. Neither that layer nor the
-//! toolhead/stepper plumbing it needs is ported here, so
-//! [`InputShaper::update_input_shaping`] is the seam where they would be
-//! reached, and the motion queue's scan-window accounting it ends with is
-//! [`recompute_scan_windows`] — a no-op there while no stepper carries a shaper
-//! window (the scan itself lives on the toolhead,
-//! [`ToolHeadObject::recompute_scan_windows`](crate::core::klippy::extras::toolhead::ToolHeadObject::recompute_scan_windows)).
-//! `SET_INPUT_SHAPER` therefore changes the reported parameters only.
+//! Upstream flushes step generation before putting new impulses into the
+//! steppers (`toolhead.flush_step_generation()`, `input_shaper.py:157,170`).
+//! There is no flush from a g-code command here (it needs the flush task — the
+//! same gap `SET_PRESSURE_ADVANCE` has), so only the bookkeeping moves: the
+//! widened window holds the print-time floor and the history expiry back, but
+//! steps generated *before* the change are not rewritten by it.
 //!
-//! The same layer is what upstream re-points when a dual carriage changes the
+//! Upstream also re-points the shaper when a dual carriage changes the
 //! kinematics (`_update_kinematics`, `input_shaper.py:153-168`, on
 //! `dual_carriage:update_kinematics`); `idex_modes` fires no such event here
 //! (`KlippyEvent::DualCarriageUpdateKinematics` is declared, but nothing sends
-//! it), so no handler is registered and there is nothing to re-point.
+//! it), so no handler is registered and a shaper installed on a stepper whose
+//! solver is later replaced would be lost.
+//!
+//! Upstream's `set_shaper_kinematics` disables a shaper whose impulse list the
+//! solver refuses and raises "Failed to configure shaper(s) …" from
+//! `_update_input_shaping`. The one refusal the solver has — more than
+//! [`MAX_PULSES`](crate::core::klippy::motion::shaper::MAX_PULSES) impulses — is
+//! reported where the coefficients are validated instead, so the same line is
+//! refused as a config error or a command error.
 
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
@@ -45,10 +58,12 @@ use serde_json::{json, Value};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::shaper_defs;
+use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
 };
 use crate::core::klippy::load::section;
+use crate::core::klippy::motion::shaper::{KinematicShaper, ShaperPulses, MAX_PULSES};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 section!("input_shaper", order = 30, load = load_config);
@@ -108,7 +123,7 @@ impl InputShaperParams {
         // Validate the input shaper, as upstream's `self.get_shaper()` in
         // `__init__` does (with the config writer's error).
         params
-            .shaper_n(
+            .shaper_pulses(
                 &params.shaper_type,
                 params.shaper_freq,
                 params.damping_ratio,
@@ -160,7 +175,7 @@ on axis {axis}"
             None,
         )?;
         // Validate before committing, as upstream's `get_shaper` does.
-        self.shaper_n(&shaper_name, shaper_freq, damping_ratio)
+        self.shaper_pulses(&shaper_name, shaper_freq, damping_ratio)
             .map_err(|err| CommandError::new(err.to_string()))?;
         self.damping_ratio = damping_ratio;
         self.shaper_type = shaper_name;
@@ -168,34 +183,43 @@ on axis {axis}"
         Ok(())
     }
 
-    /// Upstream's `get_shaper` (`input_shaper.py:49-58`): the number of impulses
-    /// of the shaper these parameters describe — `0` for an axis with no
-    /// `shaper_freq`, more for every shaper otherwise.
+    /// Upstream's `get_shaper` (`input_shaper.py:49-58`): the impulses these
+    /// parameters describe, as the solver applies them — `None` for an axis
+    /// with no `shaper_freq` (`get_none_shaper`), the shaper's own impulses
+    /// otherwise.
     ///
     /// The coefficients are built here, so that a shaper the parameters cannot
-    /// build is reported (upstream passes them on to the kinematics layer,
-    /// which this port has none of — see the module docs); the message is
-    /// upstream's, the "Failed to initialize shaper: …" prefix included.
-    fn shaper_n(
+    /// build is reported; the message is upstream's, the "Failed to initialize
+    /// shaper: …" prefix included. A shaper with more impulses than the solver
+    /// takes is refused with the message upstream raises when
+    /// `input_shaper_set_shaper_params` rejects it.
+    fn shaper_pulses(
         &self,
         shaper_type: &str,
         shaper_freq: f64,
         damping_ratio: f64,
-    ) -> Result<usize, shaper_defs::ShaperError> {
-        if shaper_freq == 0. {
-            let (a, _t) = shaper_defs::get_none_shaper();
-            return Ok(a.len());
-        }
-        let Some((a, _t)) = shaper_defs::init_shaper(shaper_type, shaper_freq, damping_ratio)
-            .map_err(shaper_defs::init_failed)?
-        else {
-            // Unreachable: both callers looked the name up in the same table
-            // (`get_shaper_cfg`) a moment earlier.
-            return Err(shaper_defs::ShaperError::new(format!(
-                "Unsupported shaper type: {shaper_type}"
-            )));
+    ) -> Result<Option<ShaperPulses>, shaper_defs::ShaperError> {
+        let (a, t) = if shaper_freq == 0. {
+            shaper_defs::get_none_shaper()
+        } else {
+            let Some((a, t)) = shaper_defs::init_shaper(shaper_type, shaper_freq, damping_ratio)
+                .map_err(shaper_defs::init_failed)?
+            else {
+                // Unreachable: both callers looked the name up in the same table
+                // (`get_shaper_cfg`) a moment earlier.
+                return Err(shaper_defs::ShaperError::new(format!(
+                    "Unsupported shaper type: {shaper_type}"
+                )));
+            };
+            (a, t)
         };
-        Ok(a.len())
+        if a.len() > MAX_PULSES {
+            return Err(shaper_defs::ShaperError::new(format!(
+                "Failed to configure shaper(s) shaper_{} with given parameters",
+                self.axis
+            )));
+        }
+        Ok(ShaperPulses::new(&a, &t))
     }
 
     /// Upstream's `get_status` (`input_shaper.py:59-63`): the report's fields,
@@ -214,39 +238,41 @@ struct AxisInputShaper {
     /// The lower-case axis letter.
     axis: char,
     params: InputShaperParams,
-    /// Upstream's `self.n`: how many impulses the shaper has, `0` when the axis
-    /// is not shaped. Upstream keeps the coefficients beside it for the
-    /// kinematics layer; this port has none (module docs), so the count stands
-    /// for the shaper.
-    n: usize,
+    /// Upstream's `self.n`, `self.A` and `self.T` in one: the impulses the axis'
+    /// shaper applies, `None` when the axis is not shaped.
+    pulses: Option<ShaperPulses>,
 }
 
 impl AxisInputShaper {
     /// Read one axis's shaper (`input_shaper.py:66-70`).
     fn new(axis: char, config: &ConfigWrapper) -> Result<Self, ConfigError> {
         let params = InputShaperParams::new(axis, config)?;
-        let n = params
-            .shaper_n(
+        let pulses = params
+            .shaper_pulses(
                 &params.shaper_type,
                 params.shaper_freq,
                 params.damping_ratio,
             )
             .map_err(|err| ConfigError::new(err.to_string()))?;
-        Ok(Self { axis, params, n })
+        Ok(Self {
+            axis,
+            params,
+            pulses,
+        })
     }
 
     /// Upstream's `is_enabled` (`input_shaper.py:87-88`).
     fn is_enabled(&self) -> bool {
-        self.n > 0
+        self.pulses.is_some()
     }
 
     /// Upstream's `AxisInputShaper.update` (`input_shaper.py:75-77`): the
     /// parameters, then the shaper they now describe.
     fn update(&mut self, gcmd: &GcodeCommand) -> Result<(), CommandError> {
         self.params.update(gcmd)?;
-        self.n = self
+        self.pulses = self
             .params
-            .shaper_n(
+            .shaper_pulses(
                 &self.params.shaper_type,
                 self.params.shaper_freq,
                 self.params.damping_ratio,
@@ -325,14 +351,41 @@ impl InputShaper {
     }
 
     /// Upstream's `_update_input_shaping` (`input_shaper.py:169-190`): put the
-    /// shapers' coefficients into the toolhead's steppers.
+    /// shapers' impulses into the toolhead's steppers, then rescan their step
+    /// generation windows.
     ///
-    /// This port has no shaper kinematics layer to put them into (module docs),
-    /// and everything the upstream path validates is validated before this point
-    /// ([`InputShaperParams::new`], [`InputShaperParams::update`]); the last
-    /// step left, the motion queue's accounting, is [`recompute_scan_windows`].
+    /// Upstream swaps each stepper's kinematics for a shaper one; here the same
+    /// snapshot of impulses is handed to every stepper's solver, which decorates
+    /// its own position function with it ([`KinematicShaper`]). A section that
+    /// shapes no axis has no impulses to apply: the steppers are given no shaper
+    /// at all (which also takes one off again after `SET_INPUT_SHAPER` set every
+    /// frequency to 0), so their position functions are the plain ones.
     fn update_input_shaping(&self) {
-        recompute_scan_windows();
+        let shapers = self.lock();
+        self.apply_shapers(&shapers);
+    }
+
+    /// [`InputShaper::update_input_shaping`] for a caller that already holds the
+    /// shapers' lock (`cmd_set_input_shaper` does; the lock is not reentrant).
+    fn apply_shapers(&self, shapers: &[AxisInputShaper]) {
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>("toolhead") else {
+            return;
+        };
+        toolhead.set_input_shaper(self.shaping(shapers));
+    }
+
+    /// The snapshot the steppers are handed: one impulse list per axis, `None`
+    /// while no axis is shaped.
+    fn shaping(&self, shapers: &[AxisInputShaper]) -> Option<Arc<KinematicShaper>> {
+        let mut axes: [Option<ShaperPulses>; 3] = [None, None, None];
+        for (pulses, shaper) in axes.iter_mut().zip(shapers) {
+            *pulses = shaper.pulses.clone();
+        }
+        let shaper = KinematicShaper::new(axes);
+        (!shaper.is_empty()).then(|| Arc::new(shaper))
     }
 
     /// Upstream's `cmd_SET_INPUT_SHAPER` (`input_shaper.py:200-207`): apply the
@@ -344,7 +397,7 @@ impl InputShaper {
             for shaper in shapers.iter_mut() {
                 shaper.update(gcmd)?;
             }
-            self.update_input_shaping();
+            self.apply_shapers(&shapers);
         }
         for (index, shaper) in shapers.iter().enumerate() {
             if index < 2 || shaper.is_enabled() {
@@ -413,19 +466,6 @@ const SET_INPUT_SHAPER_PARAMS: &[&str] = &[
     "SHAPER_FREQ_Z",
 ];
 
-/// Upstream's `motion_queuing.check_step_generation_scan_windows()`, which
-/// `_update_kinematics` and `_update_input_shaping` end with
-/// (`input_shaper.py:168,186`): the step generation windows a shaper widens
-/// have to be recomputed when it changes.
-///
-/// The scan itself exists
-/// ([`ToolHeadObject::recompute_scan_windows`](crate::core::klippy::extras::toolhead::ToolHeadObject::recompute_scan_windows)),
-/// but it is a no-op here: the shaper coefficients never reach the steppers
-/// (module docs), so no stepper carries a shaper window for it to find. The call
-/// is kept, named and made rather than dropped, so the seam stays visible until
-/// that layer lands.
-fn recompute_scan_windows() {}
-
 /// The factory `section!` names (`input_shaper.py:209 def load_config`).
 pub fn load_config(
     config: &ConfigWrapper,
@@ -489,6 +529,55 @@ mod tests {
         // only once the printer is ready.
         printer.send_event(&KlippyEvent::KlippyReady);
         printer
+    }
+
+    /// The `[input_shaper]` object a [`printer`] built.
+    fn input_shaper(printer: &Arc<Printer>) -> Arc<InputShaper> {
+        printer
+            .lookup_object_as::<InputShaper>("input_shaper")
+            .expect("the object is registered")
+    }
+
+    /// `SET_INPUT_SHAPER` puts the impulses it describes into the snapshot the
+    /// steppers are handed, and a frequency of 0 takes them out again: that is
+    /// how a changed parameter reaches the motion. The step generation window
+    /// comes from the impulses, so it follows too.
+    #[test]
+    fn set_input_shaper_hands_the_new_impulses_to_the_motion() {
+        use crate::core::klippy::motion::itersolve::AxisFlags;
+
+        let printer = printer(&[]);
+        let object = input_shaper(&printer);
+        // The bare section shapes nothing, so there is nothing to install.
+        assert!(object.shaping(&object.lock()).is_none());
+
+        run(
+            &printer,
+            "SET_INPUT_SHAPER SHAPER_TYPE_X=mzv SHAPER_FREQ_X=50",
+        )
+        .0
+        .expect("the line applies");
+        let shaper = object.shaping(&object.lock()).expect("x is shaped");
+        let (a, t) = shaper_defs::init_shaper("mzv", 50.0, 0.1)
+            .expect("the shaper builds")
+            .expect("mzv is a known shaper");
+        let pulses = ShaperPulses::new(&a, &t).expect("three impulses");
+        let window = shaper.generation_window(AxisFlags::X);
+        assert!(
+            (window.0 - pulses.pre_active()).abs() < 1e-12
+                && (window.1 - pulses.post_active()).abs() < 1e-12,
+            "{window:?} is not the shaper's own window"
+        );
+        // Only x was configured: y and z have no impulses, so they add no
+        // window and move nothing.
+        assert_eq!(shaper.generation_window(AxisFlags::Y), (0.0, 0.0));
+        assert_eq!(shaper.generation_window(AxisFlags::Z), (0.0, 0.0));
+
+        // Zeroing the frequency takes the impulses back out.
+        run(&printer, "SET_INPUT_SHAPER SHAPER_FREQ_X=0")
+            .0
+            .expect("the line applies");
+        assert!(object.shaping(&object.lock()).is_none());
     }
 
     /// Run `script` and return the error, if any, together with the lines the

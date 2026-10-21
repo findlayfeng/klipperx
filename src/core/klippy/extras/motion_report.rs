@@ -18,14 +18,29 @@
 //! The data is read, never produced: [`Trapq::extract_old`] and the step
 //! compressor's history are the two records this streams.
 //!
+//! # Status and shutdown diagnostics
+//!
+//! [`MotionReport`] answers `get_status` with upstream's five keys
+//! (`motion_report.py:232-264`): `live_position` (three kinematics axes plus
+//! one slot per extra axis — the extruder sits in the fourth), `live_velocity`,
+//! `live_extruder_velocity`, and the two registered-name lists `steppers` and
+//! `trapq`. The position comes from the queues themselves at the MCU's
+//! estimated print time, not from the planner's commanded position, exactly as
+//! upstream reads it (`DumpTrapQ.get_trapq_position`).
+//!
+//! On `klippy:analyze_shutdown` it dumps the queue windows around the stop into
+//! the log (`motion_report.py:188-209`): the stopping MCU's steppers, every
+//! registered trapq, and the requested toolhead position at that instant.
+//!
 //! # What is not ported yet
 //!
-//! * `get_status` (`live_position`, `live_velocity`, `live_extruder_velocity`,
-//!   `steppers`, `trapq`) — `motion_report.py:232-263`.
-//! * The shutdown diagnostics on `klippy:analyze_shutdown`
-//!   (`motion_report.py:188-231`).
 //! * The `manual_stepper` trapq instances: this port gives `manual_stepper` no
-//!   trapq (its timeline is dwell-only), so there is no queue to stream.
+//!   trapq instance here (its queue is allocated on first motion), so there is
+//!   no queue to stream and no slot for it in `live_position` — upstream fills
+//!   that slot from its instance.
+//! * The `"Internal error in stepcompress"` shutdown dump
+//!   (`motion_report.py:221-230`): this port reports that error as its own
+//!   message with no `step_gen_time` detail, so there is no window to dump.
 //! * The drip-timing guard (`motion_queuing.check_drip_timing`,
 //!   `motion_report.py:125-132`), which withholds trapq entries that may still
 //!   change while homing. This host does not expose the drip's end time, so a
@@ -33,16 +48,21 @@
 //!
 //! [`Trapq::extract_old`]: crate::core::klippy::motion::trapq::Trapq::extract_old
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
+use tracing::info;
 
 use crate::core::klippy::config::ConfigError;
+use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, LifecycleCb, BATCH_INTERVAL,
 };
 use crate::core::klippy::extras::extruder::PrinterExtruder;
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
+use crate::core::klippy::mathutil::E_AXIS;
+use crate::core::klippy::mcu::McuObject;
 use crate::core::klippy::motion::stepcompress::HistoryStep;
 use crate::core::klippy::motion::trapq::MoveSegment;
 use crate::core::klippy::printer::{Printer, PrinterObject};
@@ -91,6 +111,14 @@ const RESEND_WINDOW: f64 = 0.100;
 
 /// The clock past any scheduled step (`1 << 63`, `motion_report.py:48`).
 const NEVER_CLOCK: u64 = 1 << 63;
+
+/// How long one `get_status` answer stands before it is computed again
+/// (`STATUS_REFRESH_TIME`, `motion_report.py:143`).
+const STATUS_REFRESH_TIME: f64 = 0.250;
+
+/// How far either side of the shutdown time the diagnostics dump
+/// (`_dump_shutdown`'s `duration=0.100`, `motion_report.py:188`).
+const SHUTDOWN_DUMP_DURATION: f64 = 0.100;
 
 /// One `dump_trapq` row, in header order: `(time, duration, start_velocity,
 /// acceleration, start_position, direction)` (`motion_report.py:130-133`).
@@ -192,6 +220,120 @@ fn stepper_batch(
     }))
 }
 
+/// A trapq's toolhead position at one print time (upstream's
+/// `DumpTrapQ.get_trapq_position`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TrapqPosition {
+    /// The position along the queue's own three axes, mm.
+    pos: [f64; 3],
+    /// The path velocity, mm/s.
+    velocity: f64,
+}
+
+/// Where the queue is at `print_time` (`motion_report.py:111-123`).
+///
+/// `moves` is what the read window `0. .. print_time` returns with `max = 1`:
+/// the newest segment that had already started. `None` when the queue holds
+/// nothing that far back — upstream's `(None, None)`.
+fn trapq_position(moves: &[MoveSegment], print_time: f64) -> Option<TrapqPosition> {
+    let segment = moves.first()?;
+    // A read past the segment's end holds its end (upstream clamps the same
+    // way, `motion_report.py:118`).
+    let move_time = (print_time - segment.print_time).clamp(0.0, segment.move_t);
+    let coord = segment.coord(move_time);
+    Some(TrapqPosition {
+        pos: [coord.x(), coord.y(), coord.z()],
+        // `start_v + accel * t`, with the queue's halved acceleration doubled
+        // back (`motion_report.py:122`).
+        velocity: segment.start_v + 2.0 * segment.half_accel * move_time,
+    })
+}
+
+/// One `get_status` answer from the quantities already read
+/// (`motion_report.py:232-264`).
+///
+/// `live_position` is three kinematics axes plus one slot per extra axis; the
+/// caller builds it, so its length is the machine's axis count.
+fn live_status(
+    live_position: &[f64],
+    live_velocity: f64,
+    live_extruder_velocity: f64,
+    steppers: &[String],
+    trapqs: &[String],
+) -> Value {
+    json!({
+        "live_position": live_position,
+        "live_velocity": live_velocity,
+        "live_extruder_velocity": live_extruder_velocity,
+        "steppers": steppers,
+        "trapq": trapqs,
+    })
+}
+
+// ===========================================================================
+// Shutdown diagnostics (pure log formatting, unit-tested directly)
+// ===========================================================================
+
+/// One stepper's `queue_step` block (`DumpStepper.log_steps`,
+/// `motion_report.py:37-45`), oldest first.
+///
+/// `None` when the window is empty, which logs nothing (upstream returns
+/// before printing). Unlike the batch stream this does **not** stop at a
+/// `set_position` marker: the log is read by a human, not continued from.
+fn stepper_dump_block(stepper: &str, mcu: &str, steps: &[HistoryStep]) -> Option<String> {
+    if steps.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!(
+        "Dumping stepper '{stepper}' ({mcu}) {} queue_step:",
+        steps.len()
+    )];
+    for (index, step) in steps.iter().enumerate() {
+        out.push(format!(
+            "queue_step {index}: t={} p={} i={} c={} a={}",
+            step.first_clock, step.start_position, step.interval, step.step_count, step.add
+        ));
+    }
+    Some(out.join("\n"))
+}
+
+/// One trapq's move block (`DumpTrapQ.log_trapq`, `motion_report.py:101-110`),
+/// oldest first.
+fn trapq_dump_block(name: &str, moves: &[MoveSegment]) -> Option<String> {
+    if moves.is_empty() {
+        return None;
+    }
+    let mut out = vec![format!("Dumping trapq '{name}' {} moves:", moves.len())];
+    for (index, segment) in moves.iter().enumerate() {
+        out.push(format!(
+            "move {index}: pt={:.6} mt={:.6} sv={:.6} a={:.6} \
+             sp=({:.6},{:.6},{:.6}) ar=({:.6},{:.6},{:.6})",
+            segment.print_time,
+            segment.move_t,
+            segment.start_v,
+            // The queue keeps half the acceleration; the log publishes it
+            // whole, as the dump stream does.
+            2.0 * segment.half_accel,
+            segment.start_pos.x(),
+            segment.start_pos.y(),
+            segment.start_pos.z(),
+            segment.axes_r.x(),
+            segment.axes_r.y(),
+            segment.axes_r.z(),
+        ));
+    }
+    Some(out.join("\n"))
+}
+
+/// The requested toolhead position at the shutdown time
+/// (`motion_report.py:202-209`) — Python's `"...: %s"` of the `pos` tuple.
+fn shutdown_position_block(shutdown_time: f64, pos: [f64; 3]) -> String {
+    format!(
+        "Requested toolhead position at shutdown time {shutdown_time:.6}: ({:?}, {:?}, {:?})",
+        pos[0], pos[1], pos[2]
+    )
+}
+
 // ===========================================================================
 // Per-instance batch state
 // ===========================================================================
@@ -248,7 +390,7 @@ impl DumpTrapQ {
     fn process_batch(&self) -> Option<Value> {
         let printer = self.printer.upgrade()?;
         let toolhead = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)?;
-        let trapq = self.resolve_trapq(&printer, &toolhead)?;
+        let trapq = resolve_trapq(&printer, &toolhead, &self.source)?;
         let mut last_batch_msg = self
             .last_batch_msg
             .lock()
@@ -257,17 +399,30 @@ impl DumpTrapQ {
         let moves = toolhead.trapq_extract(trapq, usize::MAX, start_time, NEVER_TIME)?;
         trapq_batch(&mut last_batch_msg, &moves)
     }
+}
 
-    /// The trapq id to read, from the live machine: the toolhead has it only
-    /// after connect, and an extruder's is attached then too.
-    fn resolve_trapq(&self, printer: &Arc<Printer>, toolhead: &ToolHeadObject) -> Option<usize> {
-        match &self.source {
-            TrapqSource::ToolHead => toolhead.main_trapq(),
-            TrapqSource::Extruder(name) => {
-                printer.lookup_object_as::<PrinterExtruder>(name)?.trapq()
-            }
-        }
+/// The trapq id of `source`, from the live machine: the toolhead has its main
+/// queue only after connect, and an extruder's is attached then too.
+fn resolve_trapq(
+    printer: &Arc<Printer>,
+    toolhead: &ToolHeadObject,
+    source: &TrapqSource,
+) -> Option<usize> {
+    match source {
+        TrapqSource::ToolHead => toolhead.main_trapq(),
+        TrapqSource::Extruder(name) => printer.lookup_object_as::<PrinterExtruder>(name)?.trapq(),
     }
+}
+
+/// A trapq's position at `print_time`, read through the window that holds the
+/// segment covering it (`DumpTrapQ.get_trapq_position`, `motion_report.py:111-123`).
+fn read_trapq_position(
+    toolhead: &ToolHeadObject,
+    trapq: usize,
+    print_time: f64,
+) -> Option<TrapqPosition> {
+    let moves = toolhead.trapq_extract(trapq, 1, 0.0, print_time)?;
+    trapq_position(&moves, print_time)
 }
 
 /// A batch callback over one instance's `process_batch`.
@@ -294,6 +449,22 @@ fn noop_lifecycle() -> LifecycleCb {
 /// The machine's motion-report endpoints (upstream's `PrinterMotionReport`).
 pub struct MotionReport {
     printer: Weak<Printer>,
+    /// Every registered `dump_stepper` instance's stepper name
+    /// (upstream's `self.steppers` keys).
+    steppers: Mutex<Vec<String>>,
+    /// Every registered `dump_trapq` instance: its name and the queue it reads
+    /// (upstream's `self.dtrapqs`).
+    trapqs: Mutex<Vec<(String, TrapqSource)>>,
+    /// The last `get_status` answer and the eventtime it stands until
+    /// (upstream's `last_status` / `next_status_time`).
+    status_cache: Mutex<StatusCache>,
+}
+
+/// The cached `get_status` answer (`motion_report.py:151-157`).
+#[derive(Debug)]
+struct StatusCache {
+    next_status_time: f64,
+    status: Value,
 }
 
 impl MotionReport {
@@ -305,6 +476,14 @@ impl MotionReport {
         }
         let object = Arc::new(Self {
             printer: Arc::downgrade(printer),
+            steppers: Mutex::new(Vec::new()),
+            trapqs: Mutex::new(Vec::new()),
+            // Upstream's initial `last_status`: a three-axis zero position and
+            // no velocities, until something is registered and read.
+            status_cache: Mutex::new(StatusCache {
+                next_status_time: 0.0,
+                status: live_status(&[0.0; E_AXIS], 0.0, 0.0, &[], &[]),
+            }),
         });
         printer
             .add_object(
@@ -312,6 +491,26 @@ impl MotionReport {
                 Arc::clone(&object) as Arc<dyn PrinterObject>,
             )
             .expect("`motion_report` is registered once per machine");
+        // `klippy:analyze_shutdown` — the queue windows around a stop
+        // (`motion_report.py:159-161`). The handler holds the object weakly, as
+        // the object holds the printer weakly: a strong handle either way is a
+        // cycle.
+        {
+            let weak = Arc::downgrade(&object);
+            printer.register_event_handler(
+                KlippyEvent::KlippyAnalyzeShutdown {
+                    msg: String::new(),
+                    details: HashMap::new(),
+                },
+                Box::new(move |event| {
+                    if let KlippyEvent::KlippyAnalyzeShutdown { msg, details } = event {
+                        if let Some(object) = weak.upgrade() {
+                            object.handle_analyze_shutdown(msg, details);
+                        }
+                    }
+                }),
+            );
+        }
         object
     }
 
@@ -331,7 +530,9 @@ impl MotionReport {
             name,
             json!({ "header": STEPPER_HEADER }),
             instance_batch_cb(instance, DumpStepper::process_batch),
-        )
+        )?;
+        self.own_mutex(&self.steppers).push(name.to_string());
+        Ok(())
     }
 
     /// Register the toolhead's main queue's [`DUMP_TRAPQ_PATH`] instance
@@ -355,7 +556,7 @@ impl MotionReport {
     fn register_trapq(&self, name: &str, source: TrapqSource) -> Result<(), ConfigError> {
         let instance = Arc::new(DumpTrapQ {
             printer: self.printer.clone(),
-            source,
+            source: source.clone(),
             last_batch_msg: Mutex::new(None),
         });
         self.add_dump_endpoint(
@@ -363,7 +564,10 @@ impl MotionReport {
             name,
             json!({ "header": TRAPQ_HEADER }),
             instance_batch_cb(instance, DumpTrapQ::process_batch),
-        )
+        )?;
+        self.own_mutex(&self.trapqs)
+            .push((name.to_string(), source));
+        Ok(())
     }
 
     /// Give one instance its own [`BatchBulkHelper`] and mux registration
@@ -388,18 +592,220 @@ impl MotionReport {
         );
         helper.add_mux_endpoint(path, DUMP_KEY, name, start_resp)
     }
+
+    /// One of this object's own mutexes, surviving a poisoned lock: a panic in
+    /// one status read must not turn every later one into a panic.
+    fn own_mutex<'a, T>(&self, mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+        mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The `get_status` answer, read fresh (upstream's `get_status` body after
+    /// the refresh gate, `motion_report.py:232-264`).
+    ///
+    /// The position is read from the queues at the MCU's estimated print time —
+    /// not from the planner's commanded position — so a status query shows what
+    /// the machine is doing now rather than where the look-ahead will take it.
+    /// Before connect (no planner, no dated clock) every number is `0.0`.
+    fn read_status(&self) -> Value {
+        let mut steppers = self.own_mutex(&self.steppers).clone();
+        steppers.sort();
+        let registered = self.own_mutex(&self.trapqs).clone();
+        let mut trapqs: Vec<String> = registered.iter().map(|(name, _)| name.clone()).collect();
+        trapqs.sort();
+        let Some(printer) = self.printer.upgrade() else {
+            return live_status(&[0.0; E_AXIS], 0.0, 0.0, &steppers, &trapqs);
+        };
+        let Some(toolhead) = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT) else {
+            return live_status(&[0.0; E_AXIS], 0.0, 0.0, &steppers, &trapqs);
+        };
+        // One slot per axis the toolhead carries: X, Y, Z, then an extra axis
+        // each (`live_pos[:3]` plus `live_pos[ea_index]`, upstream keeps the
+        // three kinematics slots in the list too).
+        let extra_axes = toolhead.get_extra_axes();
+        let mut live_position = vec![0.0; E_AXIS + extra_axes.len()];
+        let Some(print_time) = toolhead.estimated_print_time() else {
+            return live_status(&live_position, 0.0, 0.0, &steppers, &trapqs);
+        };
+        let mut live_velocity = 0.0;
+        let mut live_extruder_velocity = 0.0;
+        if let Some(main_trapq) = toolhead.main_trapq() {
+            if let Some(position) = read_trapq_position(&toolhead, main_trapq, print_time) {
+                live_position[..E_AXIS].copy_from_slice(&position.pos);
+                live_velocity = position.velocity;
+            }
+        }
+        for (index, axis) in extra_axes.iter().enumerate() {
+            // Upstream looks the axis up in its own instance table; an axis
+            // without one keeps its zero (and contributes no velocity).
+            let Some(source) = registered
+                .iter()
+                .find(|(name, _)| name == axis.name())
+                .map(|(_, source)| source)
+            else {
+                continue;
+            };
+            let Some(trapq) = resolve_trapq(&printer, &toolhead, source) else {
+                continue;
+            };
+            let Some(position) = read_trapq_position(&toolhead, trapq, print_time) else {
+                continue;
+            };
+            live_position[E_AXIS + index] = position.pos[0];
+            // Upstream reports the first extra axis' velocity as the extruder's
+            // (`motion_report.py:257-258`).
+            if index == 0 {
+                live_extruder_velocity = position.velocity;
+            }
+        }
+        live_status(
+            &live_position,
+            live_velocity,
+            live_extruder_velocity,
+            &steppers,
+            &trapqs,
+        )
+    }
+
+    /// `_handle_analyze_shutdown` (`motion_report.py:210-230`): log the queue
+    /// windows around the stop.
+    fn handle_analyze_shutdown(&self, msg: &str, details: &HashMap<String, Value>) {
+        for block in self.shutdown_report(msg, details) {
+            info!("{block}");
+        }
+    }
+
+    /// The log blocks `_dump_shutdown` emits, in upstream's order: the stopping
+    /// MCU's steppers, then every registered trapq, then the requested toolhead
+    /// position at that instant.
+    ///
+    /// Empty when there is nothing to dump — an unrelated shutdown message, a
+    /// report carrying no `shutdown_clock` or naming an MCU this host does not
+    /// have (upstream returns on each of those too).
+    fn shutdown_report(&self, msg: &str, details: &HashMap<String, Value>) -> Vec<String> {
+        // Upstream also dumps on `"Internal error in stepcompress"`; this port
+        // reports that error as its own message without `step_gen_time`, so
+        // there is no window to date.
+        if msg != "MCU shutdown" {
+            return Vec::new();
+        }
+        let Some(printer) = self.printer.upgrade() else {
+            return Vec::new();
+        };
+        let Some(mcu_name) = details.get("mcu").and_then(Value::as_str) else {
+            return Vec::new();
+        };
+        let Some(shutdown_clock) = details.get("shutdown_clock").and_then(Value::as_i64) else {
+            return Vec::new();
+        };
+        let Some(mcu) = printer
+            .lookup_objects_as::<McuObject>(Some("mcu"))
+            .into_iter()
+            .find(|(_, object)| object.name() == mcu_name)
+            .map(|(_, object)| object)
+        else {
+            return Vec::new();
+        };
+        let Some(shutdown_time) = mcu.clock_to_print_time(shutdown_clock) else {
+            return Vec::new();
+        };
+        let toolhead = printer.lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT);
+        // Only the steppers driven by the MCU that stopped.
+        let steppers: Vec<String> = self
+            .own_mutex(&self.steppers)
+            .iter()
+            .filter(|name| {
+                toolhead
+                    .as_ref()
+                    .and_then(|toolhead| toolhead.mcu_stepper(name))
+                    .is_some_and(|stepper| stepper.chip().name() == mcu_name)
+            })
+            .cloned()
+            .collect();
+        self.dump_shutdown(
+            &printer,
+            toolhead.as_deref(),
+            &mcu,
+            &steppers,
+            shutdown_time,
+            SHUTDOWN_DUMP_DURATION,
+        )
+    }
+
+    /// `_dump_shutdown` (`motion_report.py:188-209`): the stepper queue-step
+    /// windows, every trapq's window and the toolhead's requested position, as
+    /// the log blocks to emit.
+    fn dump_shutdown(
+        &self,
+        printer: &Arc<Printer>,
+        toolhead: Option<&ToolHeadObject>,
+        mcu: &McuObject,
+        stepper_names: &[String],
+        shutdown_time: f64,
+        duration: f64,
+    ) -> Vec<String> {
+        let start_time = shutdown_time - duration;
+        let end_time = shutdown_time + duration;
+        let mut blocks = Vec::new();
+        let Some(toolhead) = toolhead else {
+            return blocks;
+        };
+        for name in stepper_names {
+            let (Some(start_clock), Some(end_clock)) = (
+                mcu.print_time_to_clock(start_time),
+                mcu.print_time_to_clock(end_time),
+            ) else {
+                continue;
+            };
+            let Some(history) =
+                toolhead.stepper_step_history(name, usize::MAX, start_clock, end_clock)
+            else {
+                continue;
+            };
+            // The history walk returns the runs newest first; the log reads
+            // oldest first.
+            let mut steps = history.steps;
+            steps.reverse();
+            blocks.extend(stepper_dump_block(name, mcu.name(), &steps));
+        }
+        for (name, source) in self.own_mutex(&self.trapqs).clone() {
+            let Some(trapq) = resolve_trapq(printer, toolhead, &source) else {
+                continue;
+            };
+            let Some(mut moves) = toolhead.trapq_extract(trapq, usize::MAX, start_time, end_time)
+            else {
+                continue;
+            };
+            moves.reverse();
+            blocks.extend(trapq_dump_block(&name, &moves));
+        }
+        // The toolhead's own position at the instant it stopped.
+        let position = resolve_trapq(printer, toolhead, &TrapqSource::ToolHead)
+            .and_then(|trapq| read_trapq_position(toolhead, trapq, shutdown_time));
+        if let Some(position) = position {
+            blocks.push(shutdown_position_block(shutdown_time, position.pos));
+        }
+        blocks
+    }
 }
 
 impl PrinterObject for MotionReport {
-    /// Upstream's `PrinterMotionReport` has `get_status`; this port has only
-    /// the two dump endpoints so far, so a status query answers empty (the same
-    /// surface as `force_move`).
-    fn get_status(&self, _eventtime: f64) -> Value {
-        json!({})
+    /// Upstream's `PrinterMotionReport.get_status` (`motion_report.py:232-264`),
+    /// behind its `STATUS_REFRESH_TIME` cache: a client that polls faster than
+    /// four times a second gets the last answer rather than another pair of
+    /// queue reads.
+    fn get_status(&self, eventtime: f64) -> Value {
+        let mut cache = self.own_mutex(&self.status_cache);
+        if eventtime < cache.next_status_time {
+            return cache.status.clone();
+        }
+        cache.next_status_time = eventtime + STATUS_REFRESH_TIME;
+        let status = self.read_status();
+        cache.status = status.clone();
+        status
     }
 
     fn is_queryable(&self) -> bool {
-        false
+        true
     }
 }
 
@@ -674,5 +1080,228 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply, json!({"header": ["interval", "count", "add"]}));
+    }
+
+    #[test]
+    fn test_get_status_reports_the_five_keys_with_the_extruder_in_the_fourth_slot() {
+        // One extra axis: the position is `x, y, z, e`, the extruder last.
+        let steppers = vec!["stepper_x".to_string()];
+        let trapqs = vec!["extruder".to_string(), "toolhead".to_string()];
+
+        let status = live_status(&[10.0, 20.0, 30.0, 4.5], 25.0, 1.5, &steppers, &trapqs);
+
+        assert_eq!(
+            status["live_position"],
+            json!([10.0, 20.0, 30.0, 4.5]),
+            "three kinematics axes and one slot per extra axis"
+        );
+        assert_eq!(status["live_position"].as_array().unwrap().len(), 4);
+        assert_eq!(status["live_velocity"], json!(25.0));
+        assert_eq!(status["live_extruder_velocity"], json!(1.5));
+        assert_eq!(status["steppers"], json!(["stepper_x"]));
+        assert_eq!(status["trapq"], json!(["extruder", "toolhead"]));
+        for key in ["live_velocity", "live_extruder_velocity"] {
+            assert!(status[key].is_f64(), "{key} is a float");
+        }
+    }
+
+    #[test]
+    fn test_the_live_position_is_read_from_the_queue_at_the_given_time() {
+        // 2 mm/s accelerating at 1000 mm/s^2 along +X from (10, 20, 30).
+        let moves = [segment(
+            1.0,
+            0.5,
+            2.0,
+            1000.0,
+            [10., 20., 30.],
+            [1., 0., 0.],
+        )];
+
+        // 0.2 s in: distance = (2 + 500 * 0.2) * 0.2 = 20.4 mm.
+        let position = trapq_position(&moves, 1.2).expect("a position");
+        assert!((position.pos[0] - 30.4).abs() < 1e-9, "{position:?}");
+        assert!((position.pos[1] - 20.0).abs() < 1e-9);
+        assert!((position.pos[2] - 30.0).abs() < 1e-9);
+        assert!(
+            (position.velocity - 202.0).abs() < 1e-9,
+            "start_v + accel * t = 2 + 1000 * 0.2"
+        );
+
+        // Before the segment starts the queue holds its start; past its end it
+        // holds the end (upstream clamps the same way).
+        let before = trapq_position(&moves, 0.5).expect("the segment start");
+        assert_eq!(before.pos, [10.0, 20.0, 30.0]);
+        assert_eq!(before.velocity, 2.0);
+        let after = trapq_position(&moves, 5.0).expect("the segment end");
+        // The whole 0.5 s: (2 + 500 * 0.5) * 0.5 = 126 mm.
+        assert!((after.pos[0] - 136.0).abs() < 1e-9, "{after:?}");
+
+        assert_eq!(
+            trapq_position(&[], 1.0),
+            None,
+            "an empty queue has no position"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_stepper_window_oldest_first() {
+        let steps = vec![
+            HistoryStep {
+                first_clock: 100,
+                last_clock: 160,
+                start_position: 0,
+                step_count: 3,
+                interval: 20,
+                add: 1,
+            },
+            HistoryStep {
+                first_clock: 160,
+                last_clock: 210,
+                start_position: 3,
+                step_count: 2,
+                interval: 25,
+                add: 0,
+            },
+        ];
+
+        let block = stepper_dump_block("stepper_x", "mcu", &steps).expect("one block");
+
+        assert_eq!(
+            block,
+            "Dumping stepper 'stepper_x' (mcu) 2 queue_step:\n\
+             queue_step 0: t=100 p=0 i=20 c=3 a=1\n\
+             queue_step 1: t=160 p=3 i=25 c=2 a=0",
+            "upstream's `DumpStepper.log_steps` lines"
+        );
+        assert_eq!(
+            stepper_dump_block("stepper_x", "mcu", &[]),
+            None,
+            "an empty window logs nothing"
+        );
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_trapq_window_oldest_first() {
+        let moves = [
+            segment(1.0, 0.5, 2.0, 1000.0, [10., 20., 30.], [0., 0., 1.]),
+            segment(1.5, 0.25, 4.0, 0.0, [10., 20., 30.5], [0., 0., 1.]),
+        ];
+
+        let block = trapq_dump_block("toolhead", &moves).expect("one block");
+
+        assert_eq!(
+            block,
+            "Dumping trapq 'toolhead' 2 moves:\n\
+             move 0: pt=1.000000 mt=0.500000 sv=2.000000 a=1000.000000 \
+             sp=(10.000000,20.000000,30.000000) ar=(0.000000,0.000000,1.000000)\n\
+             move 1: pt=1.500000 mt=0.250000 sv=4.000000 a=0.000000 \
+             sp=(10.000000,20.000000,30.500000) ar=(0.000000,0.000000,1.000000)",
+            "upstream's `DumpTrapQ.log_trapq` lines, acceleration published whole"
+        );
+        assert_eq!(trapq_dump_block("toolhead", &[]), None);
+    }
+
+    #[test]
+    fn test_shutdown_diagnostics_log_the_requested_position() {
+        assert_eq!(
+            shutdown_position_block(12.5, [1.5, -2.0, 3.25]),
+            "Requested toolhead position at shutdown time 12.500000: (1.5, -2.0, 3.25)",
+            "upstream's `%.6f` time and the tuple of the requested position"
+        );
+    }
+
+    #[test]
+    fn test_a_shutdown_without_an_mcu_clock_dumps_nothing() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+
+        // upstream's early returns: another message, no MCU named, no clock,
+        // or an MCU this host does not have.
+        assert_eq!(
+            motion_report.shutdown_report("Internal error in stepcompress", &HashMap::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            motion_report.shutdown_report("MCU shutdown", &HashMap::new()),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            motion_report.shutdown_report(
+                "MCU shutdown",
+                &HashMap::from([("mcu".to_string(), json!("mcu"))])
+            ),
+            Vec::<String>::new(),
+            "no shutdown_clock: the window cannot be dated"
+        );
+        assert_eq!(
+            motion_report.shutdown_report(
+                "MCU shutdown",
+                &HashMap::from([
+                    ("mcu".to_string(), json!("mcu")),
+                    ("shutdown_clock".to_string(), json!(1234)),
+                ])
+            ),
+            Vec::<String>::new(),
+            "no such MCU on this machine"
+        );
+    }
+
+    #[test]
+    fn test_motion_report_is_queryable() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+        motion_report.register_extruder_trapq("extruder").unwrap();
+        motion_report.register_stepper("stepper_y").unwrap();
+        motion_report.register_stepper("stepper_x").unwrap();
+
+        assert!(
+            printer
+                .queryable_objects()
+                .contains(&"motion_report".to_string()),
+            "`objects/list` reports it"
+        );
+        let status = printer
+            .statuses(0.0)
+            .remove("motion_report")
+            .expect("`objects/query` answers for it");
+
+        // Nothing is connected: no planner, no dated clock, so every number is
+        // zero and the position has only the three kinematics axes.
+        assert_eq!(status["live_position"], json!([0.0, 0.0, 0.0]));
+        assert_eq!(status["live_velocity"], json!(0.0));
+        assert_eq!(status["live_extruder_velocity"], json!(0.0));
+        assert_eq!(
+            status["steppers"],
+            json!(["stepper_x", "stepper_y"]),
+            "the registered steppers, sorted as upstream sorts them"
+        );
+        assert_eq!(status["trapq"], json!(["extruder", "toolhead"]));
+    }
+
+    #[test]
+    fn test_the_status_answer_stands_until_the_refresh_time() {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        webhooks::install(&printer).unwrap();
+        let motion_report = MotionReport::ensure(&printer);
+        motion_report.register_toolhead_trapq().unwrap();
+
+        let first = motion_report.get_status(0.0);
+        assert_eq!(first["steppers"], json!([]));
+
+        // Registered inside the 0.250 s window: the cached answer stands.
+        motion_report.register_stepper("stepper_x").unwrap();
+        let cached = motion_report.get_status(0.1);
+        assert_eq!(cached["steppers"], json!([]), "the answer is reused");
+
+        let refreshed = motion_report.get_status(0.3);
+        assert_eq!(
+            refreshed["steppers"],
+            json!(["stepper_x"]),
+            "past the refresh time the status is read again"
+        );
     }
 }

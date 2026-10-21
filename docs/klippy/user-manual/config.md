@@ -917,7 +917,15 @@ pins: PA1, my_alias
 |------|------|------|
 | `resolution` | `1.` | 每弧段毫米数（above 0） |
 
-段已落地（2026-09-24 集成批 #1）；`G2`/`G3` 与 `G17-G19` 平面命令**未注册**（H10），未知命令经静默放行。
+`G2`/`G3` 弧与 `G17`/`G18`/`G19` 平面选择已注册（2026-10-21）：`G2/G3` 接受 `X/Y/Z/I/J/K/E/F`，按 `planArc` 分段、每段走与手写 `G1` 同一条处理链（坐标变换 / `G92` / 因子均生效）。
+
+三条按上游的约定：
+
+- **`R` 被拒**：`G2/G3 does not support R moves`（不做半径形式）；
+- **`P` 不解析**（上游未读取该词，静默忽略）；
+- **平面语义**：`G17`（缺省）= `I/J` ↔ X/Y、Z 螺旋；`G18` = `I/K` ↔ X/Z、Y 螺旋；`G19` = `J/K` ↔ Y/Z、X 螺旋；`G91` 相对模式下拒绝弧（`does not support relative move mode`）；无 `I/J`、`I/K` 或 `J/K` 时报 `requires IJ, IK or JK parameters`。
+
+段数无上限（上游同）：`resolution` 极小 + 大半径会产生很多段。
 
 ### [bed_screws]
 

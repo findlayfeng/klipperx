@@ -91,7 +91,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`bed_mesh` 的 faulty 区域与 `set_zero_reference`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`motion_report` 两端点已落地）——余项＝G2/G3 弧规划、`manual_stepper` 自己的 trapq（出步）与回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -671,8 +671,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       `McuTrsync::add_stepper` 改幂等（上游 `mcu.py:183-186`）。此前 Trident 的 `G28 Z` 只有
       `stepper_z` 会立刻停，z1/z2 跑完约 50 ms 队列 ⇒ gantry 隐斜且 `set_position` 记账错误。
 
-- [ ] `gcode_arcs.py`：**段已落地**（2026-09-24 批 #1；`extras/gcode_arcs.rs` 只读 `resolution`，
-      **未注册任何命令**），G2/G3 弧规划（`planArc`）与 G17/G18/G19 平面选择仍未接。
+- [x] `gcode_arcs.py`：**已落地**（2026-10-21）——`G2`/`G3` 按上游 `planArc` 分段（圆心/角度归一化、整圆、螺旋轴、最后一段取目标点），
+      `G17`/`G18`/`G19` 选平面；`R` 按上游拒绍（`does not support R moves`）、`P` 不解析、`G91` 下拒绍。
+      每段经 `gcode_move` 的 `G1` 缝发出（不自拼 trapq），因此坐标变换/`G92`/因子均生效。18 测 + `gcode_arcs.test` 在真命令下绿。
 - [x] `manual_stepper.py` **已落地**（section + 命令；**2026-10-18 补齐自有 trapq**：首次需要时装进运动队列、`MOVE=`/`G1 A…` 真出步、`SET_POSITION` 先 flush 再摆 solver）。
       **余项**：自带回零（`STOP_ON_ENDSTOP` 仍明示拒绝——缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - [x] `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的

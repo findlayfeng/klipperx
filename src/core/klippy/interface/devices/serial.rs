@@ -203,6 +203,7 @@ impl SerialDevice {
                     path.display()
                 ))
             })?;
+        lock_serial_port(&port, &path)?;
 
         set_raw_mode(&port, baud)?;
         clear_nonblocking(&port)?;
@@ -478,6 +479,7 @@ impl ModemLines {
                     path.display()
                 ))
             })?;
+        lock_serial_port(&port, &path)?;
         set_raw_mode(&port, baud)?;
         Ok(Self { port, path })
     }
@@ -594,6 +596,39 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
     if unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
         return Err(last_error("F_SETFL"));
     }
+    Ok(())
+}
+
+/// Take the port for this process, so no other program opens it at the same
+/// time.
+///
+/// `flock(LOCK_EX | LOCK_NB)` is the only exclusion a tty supports: `O_EXCL` has
+/// no meaning for a device node, which always exists. Without it two programs —
+/// a slicer left open, a second klipperx — open the same board and each reads
+/// half of one conversation, which shows up as garbage frames and a link that
+/// keeps timing out.
+///
+/// The lock belongs to the open file description, so it goes away with the
+/// port: there is nothing to unlock, and closing is the release. A filesystem or
+/// a sandbox that cannot lock at all is **not** a reason to refuse a board — the
+/// lock guards against another program, it is not a requirement — so a failure
+/// other than “someone else has it” is logged and the port is used anyway.
+fn lock_serial_port(port: &File, path: &Path) -> Result<(), InterfaceError> {
+    // SAFETY: `flock` takes only the descriptor and a flag word.
+    if unsafe { libc::flock(port.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.kind() == ErrorKind::WouldBlock {
+        return Err(InterfaceError::Other(format!(
+            "serial port {} is already open in another process",
+            path.display()
+        )));
+    }
+    warn!(
+        "could not take the exclusive lock on serial port {} ({e}); using it nonetheless",
+        path.display()
+    );
     Ok(())
 }
 
@@ -882,6 +917,45 @@ mod tests {
         let pty = Pty::new();
         let lines = ModemLines::open(&pty.path, 2400).unwrap();
         lines.drain();
+    }
+
+    /// A port someone already holds is not opened a second time.
+    ///
+    /// Two opens on one tty — another program, or a second device in this one —
+    /// each read the same stream, so both see half a conversation. The second
+    /// open is refused with a message naming the port, and the first keeps
+    /// working; the lock goes with the port, so it opens again afterwards.
+    #[test]
+    fn test_a_port_someone_holds_is_not_opened_twice() {
+        let pty = Pty::new();
+        let held =
+            SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("the first open takes the port");
+
+        let err = SerialDevice::open(&pty.path, DEFAULT_BAUD)
+            .expect_err("the second open must be refused");
+        assert!(
+            err.to_string().contains("already open in another process"),
+            "the refusal names the port and the reason: {err}"
+        );
+        assert!(err.to_string().contains(&pty.path.display().to_string()));
+
+        // The reset handle opens the tty for itself, so it is refused too.
+        assert!(
+            ModemLines::open(&pty.path, 2400).is_err(),
+            "a port that is held cannot be taken over for the reset sequence"
+        );
+
+        // The holder is unaffected.
+        held.send(&Frame::new(1, vec![0xab]))
+            .expect("the open port still writes");
+
+        // Closing releases the lock.
+        drop(held);
+        let again = SerialDevice::open(&pty.path, DEFAULT_BAUD)
+            .expect("the lock goes away with the port that held it");
+        again
+            .send(&Frame::new(2, vec![0xcd]))
+            .expect("it is usable");
     }
 
     #[test]

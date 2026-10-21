@@ -2,11 +2,12 @@
 //!
 //! Upstream's `extras/statistics.py` has two halves: `PrinterSysStats`, which
 //! collects the numbers and registers itself as the `system_stats` object, and
-//! `PrinterStats`, which logs them once a second. Here the reactor's latency
-//! warning (`klippy.rs`) already logs what the second half is for, so the
-//! object is all this keeps — upstream's three keys (`statistics.py:51-54`)
-//! plus one of this host's own, `dispatch`, the reactor dispatcher's round
-//! totals (`DispatchStats`).
+//! `PrinterStats`, which logs them once a second. Both are here, in separate
+//! modules: this one is the numbers, and
+//! [`printer_stats`](crate::core::klippy::extras::printer_stats) is the 1 Hz
+//! `Stats` line that publishes them (`PrinterObject::stats`). This object also
+//! carries the reactor dispatcher's round totals (`DispatchStats`) as a
+//! `dispatch` sub-object, which upstream's has no counterpart for.
 //!
 //! There is no `[system_stats]` section: upstream builds the object from
 //! `load_config` as a library object (`statistics.py:58-60`), and here the host
@@ -16,13 +17,15 @@
 //!
 //! # Why the reads are inline
 //!
-//! `get_status` is where the numbers are read. Upstream reads them on its
-//! once-a-second stats timer and caches the last values in the object; this
-//! object is queried when a client asks (a subscription is 1 Hz), and reading
-//! `/proc` is a few microseconds with no lock — so reading it in `get_status`
-//! is cheaper than keeping a timer and a cache for it, and there is nothing to
-//! go stale. It is not work that blocks the dispatcher: `get_status` runs on
-//! the thread of whoever asked, never on the reactor's own thread.
+//! `get_status` is where the numbers are read. Upstream caches them in the
+//! object: `stats` recomputes the load average and the CPU total every second
+//! and `get_status` reports the cached values (`statistics.py:22-34`, `:42-45`).
+//! Here every number is read where it is reported — `get_status` when a client
+//! asks (a subscription is 1 Hz), [`PrinterObject::stats`] when the line is made
+//! — and reading `/proc` is a few microseconds with no lock, so reading it is
+//! cheaper than keeping a cache for it, and there is nothing to go stale. It is
+//! not work that blocks the dispatcher: `get_status` runs on the thread of
+//! whoever asked, never on the reactor's own thread.
 //!
 //! [`DispatchStats`]: crate::core::klippy::reactor::DispatchStats
 
@@ -125,6 +128,30 @@ impl PrinterObject for SystemStats {
             "dropped_logs": crate::logging::dropped_records(),
             "dispatch": self.dispatch_status(),
         })
+    }
+
+    /// Upstream's `PrinterSysStats.stats` (`statistics.py:22-40`): the three
+    /// numbers as one `key=value` run, always flagged `false` — they are added
+    /// to somebody else's `Stats` line but never make one
+    /// (`statistics.py:63-66`).
+    ///
+    /// `cputime` is the process's CPU time so far, which is what upstream's
+    /// running total comes to: it sums the positive diffs of
+    /// `time.process_time()`, a clock that only moves forward, so the sum is the
+    /// current value. `memavail` is always reported; upstream leaves the field
+    /// out when `/proc/meminfo` cannot be read (`statistics.py:35-40`), and here
+    /// that read's `0` default — the value `get_status` publishes too — takes
+    /// its place.
+    fn stats(&self) -> Option<(bool, String)> {
+        Some((
+            false,
+            format!(
+                "sysload={:.2} cputime={:.3} memavail={}",
+                sysload(),
+                cputime(),
+                memavail()
+            ),
+        ))
     }
 }
 
@@ -302,6 +329,37 @@ mod tests {
             status["dropped_logs"].is_u64(),
             "dropped_logs must be a counter, was {}",
             status["dropped_logs"]
+        );
+    }
+
+    #[test]
+    fn test_stats_is_the_sysload_cputime_memavail_line() {
+        let (_printer, object) = installed(Arc::new(DispatchStats::new()));
+
+        let (flag, line) = object.stats().expect("`system_stats` always reports");
+
+        // Upstream's `(False, "sysload=%.2f cputime=%.3f" + " memavail=%d")`
+        // (`statistics.py:31-40`): three `key=value` words in that order, and the
+        // flag never set — the numbers join a line, they never make one.
+        assert!(!flag, "the numbers never make a `Stats` line on their own");
+        let fields: Vec<&str> = line.split(' ').collect();
+        assert_eq!(fields.len(), 3, "line was {line}");
+        let value = |index: usize, key: &str| {
+            fields[index]
+                .strip_prefix(&format!("{key}="))
+                .unwrap_or_else(|| panic!("field {index} of '{line}' is not '{key}='"))
+        };
+        // `%.2f` and `%.3f`: the decimals upstream prints.
+        for (index, key, decimals) in [(0, "sysload", 2), (1, "cputime", 3)] {
+            let (whole, fraction) = value(index, key).split_once('.').expect("a float");
+            assert_eq!(fraction.len(), decimals, "{key} was {}", value(index, key));
+            assert!(whole.parse::<f64>().is_ok(), "{key} was {whole}");
+        }
+        // `%d`: whole kB.
+        assert!(
+            value(2, "memavail").parse::<u64>().is_ok(),
+            "memavail was {}",
+            value(2, "memavail")
         );
     }
 

@@ -17,7 +17,7 @@
 //! | [`sensor_callback`] | `_temp_callback` (`:140-153`) |
 //! | [`check_kick_next`] | `_check_kick_next` (`:155-159`) |
 //! | [`TemperatureProbe::register_commands`] and the flow behind it | the `TEMPERATURE_PROBE_*` family: registration (`:112-123`), flow (`:164-337`), command bodies (`:338-448`) |
-//! | [`TemperatureProbe::get_status`] | `get_status` (`:453-465`) |
+//! | [`TemperatureProbe::get_status`] and its `stats` line | `get_status` (`:453-465`), `stats` (`:467-468`) |
 //! | [`EddyDriftCompensation`] | the drift helper (`:479-714`) and its `probe_eddy_current` registration (`:125-137`) |
 //!
 //! The family drives a calibration state machine over the same section's
@@ -33,9 +33,6 @@
 //!   (`EddyCalibrationTool.do_calibration_moves`, `probe_eddy_current.py:134`
 //!   and `:157`) is part of the not-yet-ported calibration tool — see
 //!   [`probe_eddy_current`]'s gap list.
-//! * **`stats`** (`temperature_probe.py:467-468`): the port has no
-//!   `Printer`-level walker that collects object `stats` yet;
-//!   [`TemperatureProbe::stats`] is upstream's shape, ready for one.
 //!
 //! [`probe_eddy_current`]: crate::core::klippy::extras::probe_eddy_current
 
@@ -567,18 +564,17 @@ impl TemperatureProbe {
     pub fn is_in_calibration(&self) -> bool {
         lock_state(&self.state).in_calibration
     }
-
-    /// Upstream's `stats` (`:467-468`).
-    ///
-    /// Nothing calls it yet: the port has no `Printer`-level walker that
-    /// collects object `stats` (see the module docs).
-    pub fn stats(&self) -> (bool, String) {
-        let temperature = lock_state(&self.state).measurement.0;
-        (false, format!("{}: temp={temperature:.1}", self.name))
-    }
 }
 
 impl PrinterObject for TemperatureProbe {
+    /// Upstream's `stats` (`:467-468`): `(False, '<name>: temp=%.1f')` — the
+    /// reading joins a `Stats` line, it never makes one
+    /// ([`PrinterObject::stats`]).
+    fn stats(&self) -> Option<(bool, String)> {
+        let temperature = lock_state(&self.state).measurement.0;
+        Some((false, format!("{}: temp={temperature:.1}", self.name)))
+    }
+
     /// Upstream's `get_status` (`:453-465`). `temperature` is reported raw —
     /// upstream rounds only the two measured extremes.
     fn get_status(&self, _eventtime: f64) -> Value {
@@ -2635,7 +2631,7 @@ gcode_id: T0
 
         assert_eq!(
             probe.stats(),
-            (false, "temperature_probe name: temp=41.0".to_string())
+            Some((false, "temperature_probe name: temp=41.0".to_string()))
         );
     }
 

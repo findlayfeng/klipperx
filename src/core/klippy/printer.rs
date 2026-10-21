@@ -161,6 +161,30 @@ pub trait PrinterObject: Any + Send + Sync {
     /// connection that is waiting for the reply.
     fn get_status(&self, eventtime: f64) -> Value;
 
+    /// Add this part's numbers to the periodic statistics line, or `None` to
+    /// keep out of it.
+    ///
+    /// Upstream's half of the feature is a duck-typed attribute: `statistics`
+    /// collects every object where `hasattr(o, 'stats')` holds
+    /// (`klippy/extras/statistics.py:53-54`) and logs the answers once a second.
+    /// Here the method is the opt-in and `None` is upstream's "no `stats`".
+    ///
+    /// The flag is upstream's first element, or'ed over the parts: it says the
+    /// part has something new to report, and the line is printed only when one
+    /// of them does. A part that only contributes numbers answers `false` —
+    /// upstream's `PrinterSysStats` always does
+    /// (`statistics.py:51`, `:63-66`), so a machine with nothing to announce
+    /// logs no `Stats` line at all. The string is upstream's second element: a
+    /// `key=value` run that is joined with the others on the line, and skipped
+    /// when empty.
+    ///
+    /// Must not block: [`printer_stats`](crate::core::klippy::extras::printer_stats)
+    /// calls it from a reactor timer, so a slow answer delays every other timer
+    /// behind it. The default is "not in the line".
+    fn stats(&self) -> Option<(bool, String)> {
+        None
+    }
+
     /// Break any strong reference cycles this part holds onto the machine.
     ///
     /// Called by [`Printer::teardown`] **before** the parts are dropped. A part

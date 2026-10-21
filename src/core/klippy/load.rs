@@ -132,10 +132,16 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
-/// an entry. `statistics` and `garbage_collection` exist only in part (the
-/// `system_stats` object and the reactor's latency warning stand in for their
-/// log summaries).
-const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
+/// an entry. `garbage_collection` exists only in part (the reactor's latency
+/// warning stands in for its log summary).
+///
+/// `printer_stats` is here rather than in [`TOOLHEAD_MODULES`] because it needs
+/// no toolhead to attach to: upstream loads it from that same unconditional
+/// list (`toolhead.py:604-614`), which only ever runs with a `[printer]`, but the
+/// once-a-second `Stats` line is most useful on exactly the `[mcu]`-only runs
+/// this host allows (`klippyx stress`, `admin`), where upstream would not boot
+/// at all.
+const DEFAULT_MODULES: &[&str] = &["idle_timeout", "printer_stats"];
 
 /// The rest of upstream's unconditional list: modules that reach into the
 /// toolhead at load time, so they are built only when the config has a
@@ -547,6 +553,7 @@ mod tests {
                 "manual_probe",
                 "pause_resume",
                 "print_stats",
+                "printer_stats",
                 "probe",
                 "probe_eddy_current",
                 "quad_gantry_level",

@@ -10,7 +10,7 @@
 //! | [`FixedFreqReader`] | `FixedFreqReader` | clock-synchronized pull of `sensor_bulk_data` blocks |
 //! | [`SampleFormat`] | `struct.Struct(unpack_fmt)` | sample byte order and size (`bytes_per_sample` → `samples_per_block`) |
 //! | [`ClockSyncRegression`] | `ClockSyncRegression` | sample-rate / timestamp estimation by EMA regression |
-//! | `BulkDataQueue` | `BulkDataQueue` | per-oid queue behind the one bound `sensor_bulk_data` callback |
+//! | [`BulkDataQueue`] | `BulkDataQueue` | per-oid queue behind the one bound `sensor_bulk_data` callback |
 //!
 //! # What differs from upstream, and why
 //!
@@ -507,6 +507,49 @@ impl ClockSyncRegression {
 /// One sensor's inbound message queue.
 type BulkQueue = Arc<Mutex<Vec<(u16, Vec<u8>)>>>;
 
+/// A sensor's raw `sensor_bulk_data` blocks, taken as `(sequence, data)` pairs
+/// (`bulk_sensor.BulkDataQueue`).
+///
+/// [`FixedFreqReader`] is the timestamping consumer; this is the raw one, for a
+/// sensor that does its own decode and therefore its own clock math — upstream's
+/// `[angle]` (`angle.py:641`, `_extract_samples` at `:663-717`) — because the
+/// firmware reports a per-sample time code instead of a bulk status clock.
+///
+/// Both kinds share the one registry below, so a `sensor_bulk_data` callback is
+/// bound once per MCU and routed by oid: a sensor that bound the message a
+/// second time would replace the shared callback and silently cut every other
+/// bulk sensor on that MCU off.
+#[derive(Default)]
+pub struct BulkDataQueue {
+    queue: BulkQueue,
+}
+
+impl BulkDataQueue {
+    /// An empty queue; [`bind`](Self::bind) routes a sensor's blocks into it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route this MCU's `sensor_bulk_data` messages for `oid` into this queue
+    /// (`mcu.register_serial_response(self._handle_data, msg_fmt, oid)`).
+    ///
+    /// # Errors
+    /// [`McuError::Msg`] when the firmware has no `sensor_bulk_data` message.
+    pub fn bind(&self, mcu: &Mcu, oid: u8) -> Result<(), McuError> {
+        registry_for(mcu.name()).bind(mcu, oid, &self.queue)
+    }
+
+    /// Take every block queued since the last pull (`pull_queue`).
+    pub fn pull_queue(&self) -> Vec<(u16, Vec<u8>)> {
+        std::mem::take(&mut *self.queue.lock().unwrap_or_else(|p| p.into_inner()))
+    }
+
+    /// Drop every queued block (`clear_queue`).
+    pub fn clear_queue(&self) {
+        self.pull_queue();
+    }
+}
+
 /// Per-oid routing for `sensor_bulk_data`, one registry per MCU — the same
 /// shape as `ds18b20`'s result registry (one callback per message name, so
 /// the sensors share it and route by oid).
@@ -516,36 +559,44 @@ struct BulkDataRegistry {
 }
 
 impl BulkDataRegistry {
-    /// Route this MCU's `sensor_bulk_data` messages into `queue` for `oid`.
-    fn bind(self: &Arc<Self>, mcu: &Mcu, oid: u8, queue: &BulkQueue) -> Result<(), McuError> {
+    /// Point `oid`'s blocks at `queue`, replacing any earlier queue for it.
+    fn attach(&self, oid: u8, queue: &BulkQueue) {
         self.queues
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(oid, Arc::downgrade(queue));
+    }
+
+    /// Route this MCU's `sensor_bulk_data` messages into `queue` for `oid`.
+    fn bind(self: &Arc<Self>, mcu: &Mcu, oid: u8, queue: &BulkQueue) -> Result<(), McuError> {
+        self.attach(oid, queue);
         let registry = Arc::clone(self);
-        mcu.bind_callback(SensorBulkData::NAME, move |values| {
-            // `sensor_bulk_data oid=%c sequence=%hu data=%*s`, in that order.
-            let (oid, sequence, data) = match (values.first(), values.get(1), values.get(2)) {
-                (
-                    Some(ArgValue::UInt8(oid)),
-                    Some(ArgValue::UInt16(sequence)),
-                    Some(ArgValue::Bytes(data)),
-                ) => (*oid, *sequence, data.clone()),
-                _ => return,
-            };
-            if let Some(queue) = registry
-                .queues
+        mcu.bind_callback(SensorBulkData::NAME, move |values| registry.route(values))
+    }
+
+    /// Hand one `sensor_bulk_data oid=%c sequence=%hu data=%*s` to the queue
+    /// bound for its oid, and to no other.
+    fn route(&self, values: &[ArgValue]) {
+        let (oid, sequence, data) = match (values.first(), values.get(1), values.get(2)) {
+            (
+                Some(ArgValue::UInt8(oid)),
+                Some(ArgValue::UInt16(sequence)),
+                Some(ArgValue::Bytes(data)),
+            ) => (*oid, *sequence, data.clone()),
+            _ => return,
+        };
+        let queue = self
+            .queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&oid)
+            .and_then(Weak::upgrade);
+        if let Some(queue) = queue {
+            queue
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .get(&oid)
-                .and_then(Weak::upgrade)
-            {
-                queue
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push((sequence, data));
-            }
-        })
+                .push((sequence, data));
+        }
     }
 }
 
@@ -883,7 +934,7 @@ pub struct FixedFreqReader<P = u32> {
     /// The machine this sensor is on, resolved when it binds.
     mcu_object: Mutex<Weak<McuObject>>,
     oid: Mutex<Option<u8>>,
-    queue: BulkQueue,
+    queue: BulkDataQueue,
     clock_sync: Mutex<ClockSyncRegression>,
     /// Messages reported so far (upstream's `last_sequence`, an int that
     /// accumulates across 16-bit wraps).
@@ -979,7 +1030,7 @@ impl<P: SamplePayload> FixedFreqReader<P> {
         Self {
             mcu_object: Mutex::new(Weak::new()),
             oid: Mutex::new(None),
-            queue: Arc::new(Mutex::new(Vec::new())),
+            queue: BulkDataQueue::new(),
             clock_sync: Mutex::new(ClockSyncRegression::new(chip_clock_smooth)),
             last_sequence: Mutex::new(0),
             max_query_duration: Mutex::new(0),
@@ -995,7 +1046,7 @@ impl<P: SamplePayload> FixedFreqReader<P> {
     pub fn bind(&self, mcu: &Mcu, mcu_object: &Arc<McuObject>, oid: u8) -> Result<(), McuError> {
         *self.oid.lock().unwrap_or_else(|p| p.into_inner()) = Some(oid);
         *self.mcu_object.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(mcu_object);
-        registry_for(mcu.name()).bind(mcu, oid, &self.queue)
+        self.queue.bind(mcu, oid)
     }
 
     /// Overflow messages reported since the last start
@@ -1015,7 +1066,7 @@ impl<P: SamplePayload> FixedFreqReader<P> {
             .last_overflows
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = 0;
-        self.queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.queue.clear_queue();
         *self
             .max_query_duration
             .lock()
@@ -1031,7 +1082,7 @@ impl<P: SamplePayload> FixedFreqReader<P> {
     /// End of a measurement session: drop the queued samples (upstream
     /// `note_end`).
     pub fn note_end(&self) {
-        self.queue.lock().unwrap_or_else(|p| p.into_inner()).clear();
+        self.queue.clear_queue();
     }
 
     /// Connected pieces, or an error before the machine is up.
@@ -1144,10 +1195,7 @@ impl<P: SamplePayload> FixedFreqReader<P> {
     /// (`pull_samples` upstream).
     pub async fn pull_samples(&self) -> Result<Vec<TimedSample<P>>, McuError> {
         self.query_and_apply(false).await?;
-        let raw: Vec<(u16, Vec<u8>)> = {
-            let mut queue = self.queue.lock().unwrap_or_else(|p| p.into_inner());
-            std::mem::take(&mut *queue)
-        };
+        let raw = self.queue.pull_queue();
         if raw.is_empty() {
             return Ok(Vec::new());
         }
@@ -1258,6 +1306,10 @@ fn decode_blocks<P: SamplePayload>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::frame::Frame;
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
+    use crate::core::klippy::interface::Interface;
+    use crate::core::klippy::mcu::Dictionary;
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1796,5 +1848,121 @@ mod tests {
             }
         );
         assert_eq!(helper.client_count(), 0);
+    }
+
+    #[test]
+    fn test_two_queues_on_one_mcu_take_their_own_oids_blocks() {
+        // The nail for `BulkDataQueue`: one shared `sensor_bulk_data` callback
+        // routes by oid, so a second sensor binding its own queue keeps the
+        // first one's stream alive (`Mcu::bind_callback` replaces per message
+        // name, `events.rs:37-52`).
+        let registry = BulkDataRegistry::default();
+        let first = BulkDataQueue::new();
+        let second = BulkDataQueue::new();
+        registry.attach(1, &first.queue);
+        registry.attach(2, &second.queue);
+
+        registry.route(&[
+            ArgValue::UInt8(2),
+            ArgValue::UInt16(7),
+            ArgValue::Bytes(vec![0xaa, 0x01]),
+        ]);
+        registry.route(&[
+            ArgValue::UInt8(1),
+            ArgValue::UInt16(9),
+            ArgValue::Bytes(vec![0xbb, 0x02]),
+        ]);
+        assert_eq!(first.pull_queue(), vec![(9, vec![0xbb, 0x02])]);
+        assert_eq!(second.pull_queue(), vec![(7, vec![0xaa, 0x01])]);
+
+        // A pull empties the queue, `clear_queue` drops whatever arrived since,
+        // and an oid nobody bound is ignored rather than panicking.
+        registry.route(&[
+            ArgValue::UInt8(2),
+            ArgValue::UInt16(8),
+            ArgValue::Bytes(vec![0xcc]),
+        ]);
+        registry.route(&[
+            ArgValue::UInt8(3),
+            ArgValue::UInt16(1),
+            ArgValue::Bytes(vec![0xdd]),
+        ]);
+        second.clear_queue();
+        assert!(second.pull_queue().is_empty());
+        assert!(first.pull_queue().is_empty());
+    }
+
+    /// One encoded `sensor_bulk_data oid=%c sequence=%hu data=%*s` payload:
+    /// the message id (20), then the three parameters.
+    fn sensor_bulk_payload(oid: u8, sequence: u16, data: &[u8]) -> Vec<u8> {
+        let mut payload = vec![20];
+        crate::core::klippy::msg::proto::vlq_encode(u32::from(oid), &mut payload);
+        crate::core::klippy::msg::proto::vlq_encode(u32::from(sequence), &mut payload);
+        crate::core::klippy::msg::proto::vlq_encode(data.len() as u32, &mut payload);
+        payload.extend_from_slice(data);
+        payload
+    }
+
+    #[tokio::test]
+    async fn test_binding_a_second_queue_keeps_the_first_ones_stream() {
+        // End to end through a real connection: both queues bind the same
+        // `sensor_bulk_data` name, and each still receives its own oid's block.
+        let device = FrameMock::new(vec![MappingEntry {
+            input: Frame::new(0, vec![4]),
+            outputs: vec![
+                // One block's worth of messages: both frames carry that block's
+                // number, which is how the firmware packs them.
+                Frame::new(1, sensor_bulk_payload(2, 7, &[0xaa, 0x01])),
+                Frame::new(1, sensor_bulk_payload(1, 9, &[0xbb, 0x02])),
+            ],
+        }]);
+        let recorder = device.recorder();
+        let mcu = Mcu::for_test("test_bulk_queue_mux", Interface::new(device));
+        mcu.install_dictionary(
+            Dictionary::from_json(json!({
+                "commands": { "get_uptime": 4 },
+                "responses": { "sensor_bulk_data oid=%c sequence=%hu data=%*s": 20 },
+            }))
+            .expect("a valid dictionary"),
+        )
+        .expect("the dictionary installs");
+
+        let first = BulkDataQueue::new();
+        let second = BulkDataQueue::new();
+        first
+            .bind(&mcu, 1)
+            .expect("the message is in the dictionary");
+        second
+            .bind(&mcu, 2)
+            .expect("the message is in the dictionary");
+        mcu.send_msg(&crate::core::klippy::cmd::uptime::GetUptime)
+            .expect("get_uptime is in the dictionary");
+        crate::core::klippy::test_util::wait_until(
+            Duration::from_secs(5),
+            Duration::from_millis(2),
+            || !recorder.frames().is_empty(),
+            "get_uptime must reach the device",
+        )
+        .await;
+
+        let mut first_blocks = Vec::new();
+        let mut second_blocks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            crate::core::klippy::test_util::wait_until(
+                Duration::from_secs(5),
+                Duration::from_millis(5),
+                || {
+                    first_blocks.extend(first.pull_queue());
+                    second_blocks.extend(second.pull_queue());
+                    !first_blocks.is_empty() && !second_blocks.is_empty()
+                },
+                "both queues must receive their own block",
+            )
+            .await
+        })
+        .await
+        .expect("the two blocks arrive within the budget");
+        assert_eq!(first_blocks, vec![(9, vec![0xbb, 0x02])]);
+        assert_eq!(second_blocks, vec![(7, vec![0xaa, 0x01])]);
     }
 }

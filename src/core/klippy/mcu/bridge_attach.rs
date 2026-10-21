@@ -830,31 +830,43 @@ mod tests {
         assert_eq!(first.index(), Some(1), "the next gets index 1");
     }
 
-    /// A bridge's port count is what the declaration order can address: the
-    /// port index travels in one byte, so the 257th port is refused rather than
-    /// wrapping onto an existing port's route.
+    /// A bridge's port count is the firmware's table, not the width of the
+    /// index byte: the firmware holds
+    /// [`BRIDGE_MAX_PORTS`](crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS)
+    /// downstream ports, so the port past that is refused at configuration
+    /// time — naming the index it would have had and the limit — instead of
+    /// being sent to a firmware with no room for it.
     #[test]
-    fn a_port_past_the_index_range_is_refused() {
+    fn a_port_past_the_firmware_limit_is_refused() {
+        use crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS;
+
         let printer = printer_with("[mcu bridge]\nserial: /dev/a\n");
         let bridge = printer
             .lookup_object_as::<McuObject>("mcu bridge")
             .expect("the printer has [mcu bridge]");
 
-        for index in 0..=u8::MAX {
+        for index in 0..BRIDGE_MAX_PORTS {
             assert_eq!(
                 bridge.next_bridge_port_index("uart_device p").unwrap(),
                 index,
-                "indices 0..=255 are addressable"
+                "every port index the firmware's table holds is addressable"
             );
         }
         let err = bridge
             .next_bridge_port_index("uart_device p")
-            .expect_err("the 257th port has no address");
+            .expect_err("the port past the table has no room");
 
         let text = err.to_string();
         assert!(text.contains("uart_device p"), "{text}");
-        assert!(text.contains("256 ports"), "{text}");
-        assert!(text.contains("0..=255"), "{text}");
+        assert!(
+            text.contains("port 4"),
+            "the would-be index is named: {text}"
+        );
+        assert!(
+            text.contains("4 downstream ports"),
+            "the limit is named: {text}"
+        );
+        assert!(text.contains("0..=3"), "{text}");
     }
 
     /// A `can:` device resolves like a named uart one: the CAN port section the

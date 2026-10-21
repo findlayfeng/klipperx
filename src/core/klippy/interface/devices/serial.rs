@@ -1882,9 +1882,20 @@ impl TunnelRegistry {
     }
 
     /// Route `arb`'s tunnel units to `sink` from now on; a second registration
-    /// under the same id replaces the first.
+    /// under the same id replaces the first, and says so.
+    ///
+    /// Two listeners for one id is a mistake in whoever registered second, not
+    /// a handover: replacing silently would leave the first one believing it
+    /// still hears its blocks. The replacement still happens — a caller that
+    /// re-registers after a session it abandoned has to be able to — but the
+    /// warning is what makes the overlap visible.
     pub(crate) fn register(&self, arb: u32, sink: TunnelSink) {
-        self.sinks.lock().unwrap().insert(arb, sink);
+        if self.sinks.lock().unwrap().insert(arb, sink).is_some() {
+            warn!(
+                "a tunnel listener for arb {arb:#x} was already registered; replacing it — \
+                 the earlier listener no longer gets this id's blocks"
+            );
+        }
     }
 
     /// Stop routing `arb`'s tunnel units; an unregistered id is a no-op.
@@ -1978,9 +1989,15 @@ impl UnitRegistry {
     }
 
     /// Route `arb`'s whole units to `sink` from now on; a second registration
-    /// under the same id replaces the first.
+    /// under the same id replaces the first, and says so
+    /// ([`TunnelRegistry::register`]'s reading of the overlap).
     pub(crate) fn register(&self, arb: u32, sink: UnitSink) {
-        self.sinks.lock().unwrap().insert(arb, sink);
+        if self.sinks.lock().unwrap().insert(arb, sink).is_some() {
+            warn!(
+                "a unit listener for arb {arb:#x} was already registered; replacing it — \
+                 the earlier listener no longer gets this id's units"
+            );
+        }
     }
 
     /// Stop routing `arb`'s whole units; an unregistered id is a no-op.
@@ -1998,15 +2015,33 @@ impl UnitRegistry {
     /// listens — including a listener whose receiver has been dropped, which is
     /// removed here so a later delivery does not try it again. A listener whose
     /// queue is full keeps its registration and loses the unit.
+    ///
+    /// Every `false` says why on the way out: a unit that reaches no listener
+    /// is a scan answer lost, and the reader calls this after seeing the id
+    /// registered ([`Self::has`]), so the two ways to lose one — the listener
+    /// left between the two calls, or its receiver is gone — are both worth a
+    /// warning naming the id.
     pub(crate) fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
         match sinks.get(&arb).map(|sink| sink.deliver(arb, unit)) {
             Some(true) => true,
             Some(false) => {
+                warn!(
+                    "unit listener for arb {arb:#x} has gone away (its receiver was dropped); \
+                     unregistering it and dropping its {}-byte unit",
+                    unit.len()
+                );
                 sinks.remove(&arb);
                 false
             }
-            None => false,
+            None => {
+                warn!(
+                    "no unit listener for arb {arb:#x} any more (it left between the check and \
+                     this delivery); dropping its {}-byte unit",
+                    unit.len()
+                );
+                false
+            }
         }
     }
 }

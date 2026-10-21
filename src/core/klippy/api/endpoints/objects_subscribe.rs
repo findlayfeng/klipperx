@@ -601,6 +601,59 @@ mod tests {
         assert_eq!(reactor.advance(SUBSCRIPTION_REFRESH_TIME), 0);
     }
 
+    /// The refresh timer does not keep the printer alive.
+    ///
+    /// The timer lives in the reactor's heap until it retires itself, and the
+    /// reactor is owned by the printer: a strong capture of the endpoint's
+    /// state in the callback closes the loop `reactor → timer → Inner →
+    /// reactor`. `Printer::teardown` drops the parts but never cancels this
+    /// timer (`TimerHandle`'s `Drop` is a no-op), so the cycle would outlive it
+    /// and take the printer — and every part it loaded, each `Mcu` among them —
+    /// with it. The `Weak` capture is what lets it go.
+    #[tokio::test]
+    async fn teardown_releases_the_printer_through_the_refresh_timer() {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let reactor = Arc::new(ManualReactor::new());
+            let printer = Arc::new(Printer::new(reactor.clone()));
+            printer
+                .add_object(
+                    "toolhead",
+                    Arc::new(MutableStatus::new(
+                        json!({"position": [0.0, 0.0, 0.0, 0.0]}),
+                    )),
+                )
+                .unwrap();
+            let endpoint = ObjectsSubscribe::new(Arc::clone(&printer));
+            let api = Api::new();
+            let target = RecordingTarget::new();
+            subscribe(
+                &endpoint,
+                &api,
+                target.clone(),
+                r#"{"toolhead":["position"]}"#,
+            )
+            .await;
+            // One tick: the callback is in the reactor's heap from here on.
+            assert_eq!(reactor.advance(SUBSCRIPTION_REFRESH_TIME), 1);
+
+            // The client goes away and the machine is torn down, which is what
+            // the host does before the runtime it built is dropped. Neither
+            // touches the timer: only the endpoint's own lifetime does.
+            target.close();
+            printer.teardown();
+            let weak = Arc::downgrade(&printer);
+            drop(endpoint);
+            drop(printer);
+
+            assert!(
+                weak.upgrade().is_none(),
+                "the refresh timer kept the printer alive past teardown"
+            );
+        })
+        .await
+        .expect("the release happens at once: nothing else may hold the printer");
+    }
+
     #[tokio::test]
     async fn test_re_subscribing_replaces_the_subscription() {
         let (endpoint, reactor, toolhead) = endpoint();

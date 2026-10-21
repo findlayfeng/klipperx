@@ -16,17 +16,17 @@
 //!
 //! `G2`/`G3` are *not* moves of their own: they approximate the arc with many
 //! short linear segments and hand **each one to `gcode_move`'s `G1` handler**
-//! (`gcode_arcs.py:170-173`), so the active transform (`bed_mesh`, …), the
+//! (`gcode_arcs.py:171-180`), so the active transform (`bed_mesh`, …), the
 //! `G92` anchor and the extrude/speed factors all apply as they would to a
 //! hand-written `G1`. The command words are exactly the ones `_cmd_inner` reads
 //! — `X`, `Y`, `Z`, `R`, `I`, `J`, `K`, `E`, `F` — and the words an arc has no
 //! use for are *not* invented here: `R` is refused with upstream's own message
-//! (`gcode_arcs.py:63-64`) because upstream's planner is I/J/K-only, and `P` is
+//! (`gcode_arcs.py:72-73`) because upstream's planner is I/J/K-only, and `P` is
 //! not read at all.
 //!
 //! The plane only picks which pair the arc turns in; the third axis is helical
 //! (linear travel), which is what `axes` below spells out
-//! (`gcode_arcs.py:70-77`):
+//! (`gcode_arcs.py:75-87`):
 //!
 //! | plane | plane axes (`alpha`, `beta`) | helical |
 //! |---|---|---|
@@ -50,10 +50,10 @@ use crate::core::klippy::printer::{Printer, PrinterObject};
 
 section!("gcode_arcs", order = 30, load = load_config);
 
-/// Upstream's plane enum (`gcode_arcs.py:14-16`).
+/// Upstream's plane enum (`gcode_arcs.py:15-18`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Plane {
-    /// `ARC_PLANE_X_Y` — `G17`, the default (`gcode_arcs.py:40`).
+    /// `ARC_PLANE_X_Y` — `G17`, the default (`gcode_arcs.py:43`).
     Xy,
     /// `ARC_PLANE_X_Z` — `G18`.
     Xz,
@@ -63,7 +63,7 @@ enum Plane {
 
 impl Plane {
     /// The plane's two axes and the helical one, as upstream's `axes` tuple
-    /// (`gcode_arcs.py:71-77`).
+    /// (`gcode_arcs.py:75-87`).
     const fn axes(self) -> (usize, usize, usize) {
         match self {
             Plane::Xy => (X_AXIS, Y_AXIS, Z_AXIS),
@@ -79,13 +79,13 @@ pub struct GCodeArcs {
     /// `resolution`: millimetres per arc segment — upstream's
     /// `mm_per_arc_segment` (`gcode_arcs.py:31`).
     mm_per_arc_segment: f64,
-    /// Upstream's `self.plane` (`gcode_arcs.py:40`): the plane `G17`/`G18`/
+    /// Upstream's `self.plane` (`gcode_arcs.py:43`): the plane `G17`/`G18`/
     /// `G19` write and `G2`/`G3` read.
     plane: Mutex<Plane>,
-    /// Upstream's `self.gcode_move`, resolved at load (`gcode_arcs.py:34`); the
+    /// Upstream's `self.gcode_move`, resolved at load (`gcode_arcs.py:33`); the
     /// segments go through its `G1` handler.
     gcode_move: Arc<GCodeMove>,
-    /// Upstream's `self.gcode` (`gcode_arcs.py:35`), which builds each
+    /// Upstream's `self.gcode` (`gcode_arcs.py:34`), which builds each
     /// segment's command. Weak: the dispatcher's table holds this object.
     gcode: Weak<GCodeDispatch>,
 }
@@ -102,7 +102,7 @@ impl GCodeArcs {
         let mm_per_arc_segment =
             config.get_float_bounded("resolution", Some(1.), None, None, Some(0.0), None)?;
         // Upstream's `printer.load_object(config, 'gcode_move')`
-        // (`gcode_arcs.py:34`).
+        // (`gcode_arcs.py:33`).
         let gcode_move = gcode_move::ensure(printer)?;
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
@@ -128,12 +128,12 @@ impl GCodeArcs {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    /// The selected plane (`gcode_arcs.py:40`).
+    /// The selected plane (`gcode_arcs.py:43`).
     fn plane(&self) -> Plane {
         *self.lock()
     }
 
-    /// `G17`/`G18`/`G19` (`gcode_arcs.py:52-58`).
+    /// `G17`/`G18`/`G19` (`gcode_arcs.py:51-58`).
     fn set_plane(&self, plane: Plane) {
         *self.lock() = plane;
     }
@@ -148,7 +148,7 @@ impl GCodeArcs {
     fn cmd_inner(&self, gcmd: &GcodeCommand, clockwise: bool) -> Result<(), CommandError> {
         let status = self.gcode_move.status();
         // Upstream's `gcodestatus['absolute_coordinates']`
-        // (`gcode_arcs.py:56-58`): the planned segments are absolute g-code
+        // (`gcode_arcs.py:62-63`): the planned segments are absolute g-code
         // coordinates, so a relative mode cannot be carried through.
         if !flag(&status, "absolute_coordinates") {
             return Err(CommandError::new(
@@ -163,7 +163,7 @@ impl GCodeArcs {
             gcode_axis(&status, E_AXIS),
         ];
 
-        // Parse parameters (`gcode_arcs.py:61-66`). An unnamed axis keeps its
+        // Parse parameters (`gcode_arcs.py:67-70`). An unnamed axis keeps its
         // g-code position, so an arc that only leaves the plane moves helically.
         let target_pos = [
             gcmd.get_float_default("X", current_pos[X_AXIS])?,
@@ -176,7 +176,7 @@ impl GCodeArcs {
         }
 
         // Determine the plane coordinates and the helical axis
-        // (`gcode_arcs.py:69-77`). `I`/`J` are read in every plane and `K` only
+        // (`gcode_arcs.py:75-87`). `I`/`J` are read in every plane and `K` only
         // outside XY, exactly as upstream reads them; the plane then picks which
         // pair is the offset.
         let i = gcmd.get_float_default("I", 0.)?;
@@ -188,7 +188,7 @@ impl GCodeArcs {
             Plane::Yz => ((j, gcmd.get_float_default("K", 0.)?), plane.axes()),
         };
 
-        // `if not (asPlanar[0] or asPlanar[1])` (`gcode_arcs.py:79-80`).
+        // `if not (asPlanar[0] or asPlanar[1])` (`gcode_arcs.py:89-90`).
         if offset.0 == 0. && offset.1 == 0. {
             return Err(CommandError::new("G2/G3 requires IJ, IK or JK parameters"));
         }
@@ -204,7 +204,7 @@ impl GCodeArcs {
         )
     }
 
-    /// Upstream's `planArc` (`gcode_arcs.py:104-175`, itself Marlin's
+    /// Upstream's `planArc` (`gcode_arcs.py:104-180`, itself Marlin's
     /// `plan_arc`): turn the arc into `max(1, floor(mm_of_travel /
     /// mm_per_arc_segment))` linear `G1` moves.
     ///
@@ -254,11 +254,11 @@ impl GCodeArcs {
             && current_pos[beta_axis] == target_pos[beta_axis]
         {
             // Make a circle if the angular rotation is 0 and the target is
-            // current position (`gcode_arcs.py:114-120`).
+            // current position (`gcode_arcs.py:125-130`).
             angular_travel = 2. * std::f64::consts::PI;
         }
 
-        // Determine number of segments (`gcode_arcs.py:122-131`). An arc
+        // Determine number of segments (`gcode_arcs.py:132-140`). An arc
         // shorter than one segment is a single line.
         let linear_travel = target_pos[helical_axis] - current_pos[helical_axis];
         let radius = r_p.hypot(r_q);
@@ -270,11 +270,11 @@ impl GCodeArcs {
         };
         let segments = (mm_of_travel / self.mm_per_arc_segment).floor().max(1.);
 
-        // Generate coordinates (`gcode_arcs.py:133-134`).
+        // Generate coordinates (`gcode_arcs.py:142-144`).
         let theta_per_segment = angular_travel / segments;
         let linear_per_segment = linear_travel / segments;
 
-        // `asE` and `asF` (`gcode_arcs.py:136-137`), read after the geometry as
+        // `asE` and `asF` (`gcode_arcs.py:146-147`), read after the geometry as
         // upstream reads them.
         let as_e = optional_float(gcmd, "E")?;
         let as_f = optional_float(gcmd, "F")?;
@@ -309,12 +309,12 @@ impl GCodeArcs {
             c[helical_axis] = current_pos[helical_axis] + dist_helical;
 
             // The last segment lands exactly on the target, so float error does
-            // not accumulate into the commanded end point (`gcode_arcs.py:155-156`).
+            // not accumulate into the commanded end point (`gcode_arcs.py:169-170`).
             if i == segments as i64 {
                 c = target_pos;
             }
 
-            // Convert coordinates into a `G1` command (`gcode_arcs.py:157-173`).
+            // Convert coordinates into a `G1` command (`gcode_arcs.py:171-180`).
             let mut g1_params = HashMap::new();
             g1_params.insert("X".to_string(), number(c[X_AXIS]));
             g1_params.insert("Y".to_string(), number(c[Y_AXIS]));
@@ -335,14 +335,14 @@ impl GCodeArcs {
     }
 
     /// Register `G2`/`G3` and the plane selectors, capturing a handle to this
-    /// object (`gcode_arcs.py:36-42`).
+    /// object (`gcode_arcs.py:35-40`).
     fn register_commands(self: &Arc<Self>, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
             .expect("the loader registers `gcode` before any section");
         type Command = fn(&GCodeArcs, &GcodeCommand) -> Result<(), CommandError>;
         /// The words `_cmd_inner` reads, in upstream's order
-        /// (`gcode_arcs.py:61-89`): the target axes, then `R`, the offsets, and
+        /// (`gcode_arcs.py:68-90`): the target axes, then `R`, the offsets, and
         /// the extruder/feed words.
         const ARC_PARAMS: &[&str] = &["X", "Y", "Z", "R", "I", "J", "K", "E", "F"];
         const COMMANDS: &[(&str, Command, &[&str])] = &[
@@ -379,7 +379,7 @@ fn flag(status: &Value, key: &str) -> bool {
 }
 
 /// One axis of `gcode_move`'s `gcode_position`
-/// (`gcodestatus['gcode_position'][axis]`, `gcode_arcs.py:59-62`).
+/// (`gcodestatus['gcode_position'][axis]`, `gcode_arcs.py:61-64`).
 fn gcode_axis(status: &Value, axis: usize) -> f64 {
     status
         .get("gcode_position")
@@ -407,36 +407,36 @@ fn optional_float(gcmd: &GcodeCommand, name: &str) -> Result<Option<f64>, Comman
 /// A coordinate word's text.
 ///
 /// Upstream hands the planned float straight to `gcode_move.cmd_G1`
-/// (`gcode_arcs.py:167-172`); this port builds the command through
+/// (`gcode_arcs.py:172-179`); this port builds the command through
 /// [`GCodeDispatch::create_gcode_command`], so the text must read back as the
 /// same `f64` — which the shortest round-trip `Display` of `f64` guarantees.
 fn number(value: f64) -> String {
     format!("{value}")
 }
 
-/// `G2` (`gcode_arcs.py:44-45`): a clockwise arc.
+/// `G2` (`gcode_arcs.py:45-46`): a clockwise arc.
 fn cmd_g2(object: &GCodeArcs, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     object.cmd_inner(gcmd, true)
 }
 
-/// `G3` (`gcode_arcs.py:47-48`): a counter-clockwise arc.
+/// `G3` (`gcode_arcs.py:48-49`): a counter-clockwise arc.
 fn cmd_g3(object: &GCodeArcs, gcmd: &GcodeCommand) -> Result<(), CommandError> {
     object.cmd_inner(gcmd, false)
 }
 
-/// `G17` (`gcode_arcs.py:50-51`): the X/Y plane.
+/// `G17` (`gcode_arcs.py:51-52`): the X/Y plane.
 fn cmd_g17(object: &GCodeArcs, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
     object.set_plane(Plane::Xy);
     Ok(())
 }
 
-/// `G18` (`gcode_arcs.py:53-54`): the X/Z plane.
+/// `G18` (`gcode_arcs.py:54-55`): the X/Z plane.
 fn cmd_g18(object: &GCodeArcs, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
     object.set_plane(Plane::Xz);
     Ok(())
 }
 
-/// `G19` (`gcode_arcs.py:56-57`): the Y/Z plane.
+/// `G19` (`gcode_arcs.py:57-58`): the Y/Z plane.
 fn cmd_g19(object: &GCodeArcs, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
     object.set_plane(Plane::Yz);
     Ok(())
@@ -654,7 +654,7 @@ mod tests {
     /// The section loads through the ordinary loader: it is claimed by its
     /// factory, the default `resolution` is recorded, the object lands under
     /// the section's own name, and `gcode_move` is created for it (upstream's
-    /// `load_object`, `gcode_arcs.py:34`).
+    /// `load_object`, `gcode_arcs.py:33`).
     #[test]
     fn the_section_loads_through_the_loader() {
         let printer = Arc::new(Printer::new(ManualReactor::shared()));
@@ -681,7 +681,7 @@ mod tests {
     }
 
     /// The five commands are registered with the words `_cmd_inner` reads
-    /// (`gcode_arcs.py:36-42`, `:61-89`) — and with no word it does not read
+    /// (`gcode_arcs.py:35-40`, `:68-90`) — and with no word it does not read
     /// (`P`, say).
     #[test]
     fn the_five_commands_are_registered_with_their_words() {
@@ -702,7 +702,7 @@ mod tests {
     }
 
     /// A start that equals the target with a non-zero offset closes the circle
-    /// (`gcode_arcs.py:114-120`): `2π` of travel, `floor(2π·r / 1.) = 62`
+    /// (`gcode_arcs.py:125-130`): `2π` of travel, `floor(2π·r / 1.) = 62`
     /// segments, every point on the circle, and the last one exactly on the
     /// target.
     #[test]
@@ -729,7 +729,7 @@ mod tests {
     }
 
     /// `G3` turns the other way: the same start and offset sweep the other
-    /// half of the circle's sign (`gcode_arcs.py:106-112`).
+    /// half of the circle's sign (`gcode_arcs.py:109-123`).
     #[test]
     fn g3_sweeps_the_opposite_way() {
         let (printer, gcode, target) = machine();
@@ -757,7 +757,7 @@ mod tests {
         assert!(clockwise[0].0.y() < 20., "clockwise goes under the bottom");
     }
 
-    /// `R` is refused with upstream's own message (`gcode_arcs.py:63-64`):
+    /// `R` is refused with upstream's own message (`gcode_arcs.py:72-73`):
     /// upstream's planner is I/J/K-only, so no segment is queued.
     #[test]
     fn an_r_word_is_refused() {
@@ -771,7 +771,7 @@ mod tests {
         assert!(target.moves().is_empty(), "no move was queued");
     }
 
-    /// An arc with no plane offset at all is refused (`gcode_arcs.py:79-80`).
+    /// An arc with no plane offset at all is refused (`gcode_arcs.py:89-90`).
     #[test]
     fn an_arc_without_an_offset_is_refused() {
         let (printer, gcode, target) = machine();
@@ -784,7 +784,7 @@ mod tests {
         assert!(target.moves().is_empty());
     }
 
-    /// A relative XYZ mode cannot be planned (`gcode_arcs.py:56-58`).
+    /// A relative XYZ mode cannot be planned (`gcode_arcs.py:62-63`).
     #[test]
     fn a_relative_move_mode_is_refused() {
         let (printer, gcode, target) = machine();
@@ -798,7 +798,7 @@ mod tests {
         assert!(target.moves().is_empty());
     }
 
-    /// An unnamed `I`/`J` is `0.` (`gcode_arcs.py:71-73`), so `G2 X20 Y20 J10`
+    /// An unnamed `I`/`J` is `0.` (`gcode_arcs.py:76-78`), so `G2 X20 Y20 J10`
     /// plans the same arc as the explicit `I0`.
     #[test]
     fn an_unnamed_offset_word_is_zero() {
@@ -819,7 +819,7 @@ mod tests {
 
     /// The segment count is upstream's
     /// `max(1, floor(hypot(flat, helical) / resolution))`
-    /// (`gcode_arcs.py:122-131`): a helical full circle has longer travel than
+    /// (`gcode_arcs.py:132-140`): a helical full circle has longer travel than
     /// the flat one, and a finer `resolution` splits it further.
     #[test]
     fn the_segment_count_follows_the_travel_formula() {
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(target.moves().len(), 125);
     }
 
-    /// `G18` turns in X/Z and leaves Y helical (`gcode_arcs.py:74-76`): the
+    /// `G18` turns in X/Z and leaves Y helical (`gcode_arcs.py:80-83`): the
     /// arc bulges in Z, which an XY arc of the same words cannot do.
     #[test]
     fn g18_turns_in_the_x_z_plane() {
@@ -862,7 +862,7 @@ mod tests {
         assert!(moves.iter().any(|(position, _)| position.z() > 1.));
     }
 
-    /// `G19` turns in Y/Z and leaves X helical (`gcode_arcs.py:76-77`).
+    /// `G19` turns in Y/Z and leaves X helical (`gcode_arcs.py:84-87`).
     #[test]
     fn g19_turns_in_the_y_z_plane() {
         let (printer, gcode, target) = machine();
@@ -882,7 +882,7 @@ mod tests {
         assert!(moves.iter().any(|(position, _)| position.z() > 1.));
     }
 
-    /// `G17` selects XY again after `G18` (`gcode_arcs.py:50-58`), and a plane
+    /// `G17` selects XY again after `G18` (`gcode_arcs.py:51-58`), and a plane
     /// selector itself moves nothing.
     #[test]
     fn g17_selects_the_x_y_plane_again() {
@@ -904,7 +904,7 @@ mod tests {
 
     /// With absolute extrusion (the default `M82`) the first segment carries
     /// the arc's share of the E word and the last lands on it
-    /// (`gcode_arcs.py:139-145,158-161`).
+    /// (`gcode_arcs.py:149-153,173-176`).
     #[test]
     fn an_absolute_e_word_is_split_across_the_segments() {
         let (printer, gcode, target) = machine();
@@ -920,7 +920,7 @@ mod tests {
     }
 
     /// With relative extrusion (`M83`) every segment carries its own share
-    /// (`gcode_arcs.py:138-145`).
+    /// (`gcode_arcs.py:149-153`).
     #[test]
     fn a_relative_e_word_is_per_segment() {
         let (printer, gcode, target) = machine();
@@ -942,7 +942,7 @@ mod tests {
         assert!((previous - 1.0).abs() < 1e-12);
     }
 
-    /// `F` reaches every segment (`gcode_arcs.py:164-165`) and so sets the
+    /// `F` reaches every segment (`gcode_arcs.py:177-178`) and so sets the
     /// move speed `gcode_move` remembers.
     #[test]
     fn an_f_word_sets_every_segments_speed() {

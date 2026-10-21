@@ -619,7 +619,7 @@ impl GCodeMove {
     /// Upstream's `gcode_move.cmd_G1(gcmd)`: run a move whose command was
     /// built with [`GCodeDispatch::create_gcode_command`] through the `G1`
     /// handler, which is how `gcode_arcs` sends each arc segment
-    /// (`gcode_arcs.py:172-173`).
+    /// (`gcode_arcs.py:179-180`).
     ///
     /// # Errors
     /// As `G1`: an unparseable word, a non-positive `F`, or whatever the move

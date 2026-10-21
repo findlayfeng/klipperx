@@ -105,6 +105,10 @@ pub struct ClockEstimator {
     clock_freq: f64,
     /// Clock queries in flight (`klippy/clocksync.py:22`).
     queries_pending: u32,
+    /// Whether any sample has anchored the regression: set by [`ClockEstimator::seed`]
+    /// (the `get_uptime` reading) and by a used [`ClockEstimator::update`].
+    /// Until then every field `new` left is zero, so `get_clock` answers 0.
+    seeded: bool,
 }
 
 impl ClockEstimator {
@@ -129,6 +133,7 @@ impl ClockEstimator {
             clock_at_sample: 0.0,
             clock_freq: 0.0,
             queries_pending: 0,
+            seeded: false,
         }
     }
 
@@ -157,6 +162,16 @@ impl ClockEstimator {
         self.queries_pending
     }
 
+    /// Whether a sample has anchored the regression yet.
+    ///
+    /// A fresh estimator has no sample: `new` leaves the fields zero, so
+    /// `get_clock` answers 0 and `clock_est` reports a zero frequency. Callers
+    /// that turn those readings into a clock mapping must not: an MCU clocked
+    /// from an unseeded estimate is not "0", it is unknown.
+    pub fn is_seeded(&self) -> bool {
+        self.seeded
+    }
+
     /// Note that a `get_clock` request went out.
     pub fn note_query_sent(&mut self) {
         self.queries_pending += 1;
@@ -176,6 +191,7 @@ impl ClockEstimator {
     /// wrap-around, so this fixes `last_clock` *and* gives the regression its
     /// first point to grow from.
     pub fn seed(&mut self, sent_time: f64, clock: i64) {
+        self.seeded = true;
         self.last_clock = clock;
         self.clock_avg = clock as f64;
         self.time_avg = sent_time;
@@ -215,6 +231,7 @@ impl ClockEstimator {
         self.clock_sample_time = self.time_avg + self.min_half_rtt;
         self.clock_at_sample = self.clock_avg;
         self.clock_freq = new_freq;
+        self.seeded = true;
         true
     }
 
@@ -348,6 +365,12 @@ impl SecondarySync {
     /// (`sync2`) matches the primary's print time there; calibrating periodically
     /// keeps the two crystals from drifting apart. `print_time` is the caller's
     /// current print time (upstream passes `last_step_gen_time`).
+    ///
+    /// `secondary` must be seeded ([`ClockEstimator::is_seeded`]): an unseeded
+    /// estimate answers `get_clock` with 0, and the difference against
+    /// `sync1_clock` would come out as a *negative* frequency. The periodic
+    /// caller gates on that (`McuObject::recalibrate`), because a mapping must
+    /// not be published before the secondary has said which clock it is on.
     pub fn calibrate(
         &mut self,
         primary: &ClockEstimator,

@@ -650,7 +650,8 @@ impl McuObject {
     /// Realign a secondary MCU's clock to the primary's (`SecondarySync`).
     ///
     /// Called by this MCU's recalibration timer. Nothing happens when this is
-    /// the primary, or before both clocks are known.
+    /// the primary, or before both clocks are known, or before the secondary's
+    /// own estimate has a sample (`ClockEstimator::is_seeded`).
     pub fn recalibrate(&self) {
         let mut guard = self
             .secondary_sync
@@ -668,6 +669,19 @@ impl McuObject {
         let (Some(primary_clock), Some(local_clock)) = (primary.clock(), self.clock()) else {
             return;
         };
+        // A secondary whose `get_uptime` has not answered yet has no sample, so
+        // its estimator reads the zeroes `new` left: `get_clock` answers 0 and
+        // `SecondarySync::calibrate` would turn that into a negative frequency
+        // and a wrong offset, published to the chip as this MCU's print-time
+        // mapping. The timer firing in that window is ordinary bring-up timing,
+        // not a fault: publish nothing and let the next tick try again.
+        if !local_clock.estimator().is_seeded() {
+            tracing::debug!(
+                "MCU '{}': no clock sample yet, skipping the clock recalibration",
+                self.name()
+            );
+            return;
+        }
         let now = printer.reactor().monotonic();
         let print_time = primary_clock.estimated_print_time(now);
         sync.calibrate(
@@ -3536,6 +3550,126 @@ mod tests {
         assert_eq!(rig.manual.advance(1.0), 1, "the next round fires again");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(rig.recorder.frames().is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The periodic realignment (`SecondarySync`, behind `mcu_recalibrate`)
+    // -----------------------------------------------------------------------
+
+    /// A primary `[mcu]` and a secondary `[mcu zboard]`, wired as
+    /// [`McuObject::install_clock`] leaves them, with `seed_secondary` choosing
+    /// whether the secondary's own `get_uptime` sample is in yet.
+    ///
+    /// The printer comes back with the pair: both objects only hold a `Weak` to
+    /// it, and `recalibrate` looks the primary up through it.
+    fn sync_rig(seed_secondary: bool) -> (Arc<Printer>, Arc<McuObject>, Arc<McuObject>) {
+        let reactor = ManualReactor::shared();
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor)));
+        printer
+            .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
+            .unwrap();
+
+        // The primary defines print time, so it always has its seed.
+        let primary = Arc::new(McuObject::new(section(None), &printer).unwrap());
+        printer
+            .add_object(&primary.section.identifier(), primary.clone())
+            .unwrap();
+        let primary_clock = Arc::new(McuClock::new(
+            clocked_firmware(&primary),
+            Arc::clone(&reactor),
+        ));
+        primary_clock.seed(0.0, 1_000_000);
+        primary.chip.set_clock(primary_clock, 0.0);
+
+        let secondary = Arc::new(McuObject::new(section(Some("zboard")), &printer).unwrap());
+        printer
+            .add_object(&secondary.section.identifier(), secondary.clone())
+            .unwrap();
+        let clock = Arc::new(McuClock::new(clocked_firmware(&secondary), reactor));
+        if seed_secondary {
+            clock.seed(0.0, 2_000_000);
+        }
+        secondary.chip.set_clock(Arc::clone(&clock), 0.0);
+        let freq = clock.estimator().mcu_freq();
+        *secondary
+            .secondary_sync
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(SecondarySync::new(freq));
+        (printer, primary, secondary)
+    }
+
+    /// Attach a firmware whose dictionary reports `CLOCK_FREQ` (20 MHz, as
+    /// [`polling_dictionary`] scripts it) and hand back its `Mcu`.
+    fn clocked_firmware(object: &McuObject) -> Arc<Mcu> {
+        let mcu = Arc::new(Mcu::for_test(
+            object.name(),
+            Interface::new(FrameMock::new(Vec::new())),
+        ));
+        mcu.install_dictionary(Dictionary::from_json(polling_dictionary()).unwrap())
+            .unwrap();
+        object.chip.attach(Arc::clone(&mcu));
+        mcu
+    }
+
+    /// The value of the secondary's sync slot, for a test to read after a round.
+    fn sync_slot(secondary: &McuObject) -> SecondarySync {
+        (*secondary
+            .secondary_sync
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()))
+        .expect("a secondary MCU carries its sync")
+    }
+
+    #[tokio::test]
+    async fn test_recalibrate_skips_a_secondary_without_a_clock_sample() {
+        // The recalibration timer can fire before the secondary's `get_uptime`
+        // has answered. An unseeded estimate answers `get_clock` with 0, which
+        // `SecondarySync::calibrate` turns into a negative frequency and a
+        // wrong offset — published as this MCU's print-time mapping, where
+        // `print_time_to_clock` converts every timed command with it. The
+        // round has to publish nothing and leave the mapping as it was.
+        let (_printer, _primary, secondary) = sync_rig(false);
+        let before = secondary.chip.time_mapping();
+        assert_eq!(before, (0.0, 20_000_000.0));
+
+        secondary.recalibrate();
+
+        assert_eq!(
+            secondary.chip.time_mapping(),
+            before,
+            "no mapping published"
+        );
+        let sync = sync_slot(&secondary);
+        assert_eq!(
+            (sync.offset, sync.freq, sync.last_sync_time),
+            (0.0, 20_000_000.0, 0.0),
+            "the sync is untouched, so the next round calibrates from scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recalibrate_publishes_once_the_secondary_has_a_clock_sample() {
+        // The gate times the publish, it does not cancel it: with the seed in,
+        // the same call lands the offset and the drift-adjusted frequency.
+        let (_printer, _primary, secondary) = sync_rig(true);
+        assert_eq!(secondary.chip.time_mapping(), (0.0, 20_000_000.0));
+
+        secondary.recalibrate();
+
+        let (offset, freq) = secondary.chip.time_mapping();
+        // `sync1` is 1 000 000 ticks of the secondary against 1 000 000 of the
+        // primary at 20 MHz, and `sync2` four seconds later is 1 000 000 ahead
+        // of them both: the interval comes out 1 ms long per second, i.e.
+        // +250 kHz.
+        assert_eq!(freq, 20_250_000.0);
+        // The same intercept at the adjusted frequency: 0.05 s - 1e6/20.25e6.
+        assert!(
+            (offset - 0.000_617_283_950_617_29).abs() < 1e-12,
+            "offset {offset}"
+        );
+        let sync = sync_slot(&secondary);
+        assert_eq!((sync.offset, sync.freq), (offset, freq));
+        assert_eq!(sync.last_sync_time, 4.05);
     }
 
     // -----------------------------------------------------------------------

@@ -392,7 +392,7 @@ impl LcdChip for ST7920 {
 
     /// Upstream's `DisplayBase.write_text` (`st7920.py:94-97`): a run that does
     /// not fit is cut at the panel's right edge, and row `y` starts at
-    /// [`ROW_STARTS`]`[y]` — the text RAM holds the four rows as two halves.
+    /// `ROW_STARTS[y]` — the text RAM holds the four rows as two halves.
     ///
     /// A row past the fourth draws nothing here; upstream's list index would
     /// raise.

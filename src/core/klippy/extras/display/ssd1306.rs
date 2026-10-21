@@ -171,7 +171,7 @@ impl LcdChip for Ssd1306 {
     }
 
     /// Upstream's `DisplayBase.set_glyphs` (`uc1701.py:64-70`), shared with
-    /// the UC1701 through [`DisplayBase`].
+    /// the UC1701 through `DisplayBase`.
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>) {
         self.base().set_glyphs(glyphs);
     }

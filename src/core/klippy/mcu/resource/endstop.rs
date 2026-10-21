@@ -912,67 +912,67 @@ mod tests {
     #[tokio::test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     async fn test_endstop_level_reads_open_and_shorted_on_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_endstop_level_reads_open_and_shorted_on_a_real_board",
             &endstop_case(),
-        ) else {
-            return;
-        };
-        let config = machine.config();
-        let pin = config
-            .get_section("stepper_x")
-            .and_then(|section| section.get_str("endstop_pin"))
-            .expect("[stepper_x] endstop_pin, which acquire required")
-            .to_string();
+            |machine| async move {
+                let config = machine.config();
+                let pin = config
+                    .get_section("stepper_x")
+                    .and_then(|section| section.get_str("endstop_pin"))
+                    .expect("[stepper_x] endstop_pin, which acquire required")
+                    .to_string();
 
-        let (pins, chip, builder) = pin_world(config);
-        let endstop = pins
-            .setup_endstop(&pin, None)
-            .expect("endstop_pin names a pin and a chip this config has");
-        assert_eq!(
+                let (pins, chip, builder) = pin_world(config);
+                let endstop = pins
+                    .setup_endstop(&pin, None)
+                    .expect("endstop_pin names a pin and a chip this config has");
+                assert_eq!(
             endstop.chip_name(),
             "mcu",
             "this case declares .mcu(); an X endstop on another board needs its own declaration"
         );
 
-        let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
-            .await
-            .expect("identify completes");
-        let reopen = || async {
-            let interface = machine.open_mcu()?;
-            Mcu::connect("mcu", interface)
-                .await
-                .map_err(|err| err.to_string())
-        };
-        let mcu = configure_taking_over("mcu", mcu, reopen, &builder)
-            .await
-            .expect("the board carries this configuration");
-        chip.attach(mcu);
+                let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+                    .await
+                    .expect("identify completes");
+                let reopen = || async {
+                    let interface = machine.open_mcu()?;
+                    Mcu::connect("mcu", interface)
+                        .await
+                        .map_err(|err| err.to_string())
+                };
+                let mcu = configure_taking_over("mcu", mcu, reopen, &builder)
+                    .await
+                    .expect("the board carries this configuration");
+                chip.attach(mcu);
 
-        println!(
-            "HW-ENDSTOP: endstop_pin = {pin}; the host inverts the level: {}",
-            endstop.invert
-        );
-        let first = read_endstop_level(&endstop, "read 1").await;
-        wait_for_operator(
-            "HW-ENDSTOP: change the X endstop's physical state now \
+                println!(
+                    "HW-ENDSTOP: endstop_pin = {pin}; the host inverts the level: {}",
+                    endstop.invert
+                );
+                let first = read_endstop_level(&endstop, "read 1").await;
+                wait_for_operator(
+                    "HW-ENDSTOP: change the X endstop's physical state now \
              (open it if it is shorted, short it if it is open), then press Enter",
-        )
-        .await;
-        let second = read_endstop_level(&endstop, "read 2").await;
+                )
+                .await;
+                let second = read_endstop_level(&endstop, "read 2").await;
 
-        if first == second {
-            println!(
+                if first == second {
+                    println!(
                 "HW-ENDSTOP: 未检测到电平变化（两次都是 {}）：请确认端停是否已按需断开/短接后重跑",
                 state_name(second)
             );
-        } else {
-            println!(
-                "HW-ENDSTOP: 电平翻转确认：{} -> {}",
-                state_name(first),
-                state_name(second)
-            );
-        }
+                } else {
+                    println!(
+                        "HW-ENDSTOP: 电平翻转确认：{} -> {}",
+                        state_name(first),
+                        state_name(second)
+                    );
+                }
+            },
+        );
     }
 
     /// The take-over helper against a fake firmware: a board that already

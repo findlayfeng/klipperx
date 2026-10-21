@@ -2392,127 +2392,126 @@ mod tests {
     fn test_objects_and_status_smoke_on_a_real_board() {
         const TEST_NAME: &str = "test_objects_and_status_smoke_on_a_real_board";
 
-        let Some(machine) = crate::hardware_test::acquire(TEST_NAME, &smoke_case()) else {
-            return; // reported as HW-IGNORED; nothing was touched
-        };
-        let started = machine.bring_up().expect("the machine comes up");
-        let printer = started.printer();
-        let api = Api::new();
+        crate::hardware_test::case(TEST_NAME, &smoke_case(), |machine| {
+            let started = machine.bring_up().expect("the machine comes up");
+            let printer = started.printer();
+            let api = Api::new();
 
-        // 1. `objects/list`: every object the declared sections register.
-        let listed = endpoint_answer(
-            &ObjectsList::new(Arc::clone(printer)),
-            r#"{"method":"objects/list"}"#,
-            &api,
-        );
-        let names: Vec<&str> = listed["objects"]
-            .as_array()
-            .unwrap_or_else(|| panic!("objects/list answers a list of names: {listed}"))
-            .iter()
-            .map(|name| {
-                name.as_str()
-                    .unwrap_or_else(|| panic!("every object name is a string: {listed}"))
-            })
-            .collect();
-        // Declared section → the object it registers. `[printer]` registers its
-        // object under `toolhead` (`load.rs`'s factory table), and `heaters` is
-        // registered by `[extruder]`'s `heaters::ensure` call — so each assertion
-        // rests on one of the declarations above.
-        for (declaration, object) in [
-            ("[mcu]", "mcu"),
-            ("[printer]", "toolhead"),
-            ("[extruder]", "extruder"),
-            ("[extruder]", "heaters"),
-        ] {
-            assert!(
-                names.contains(&object),
-                "{TEST_NAME}: objects/list must name '{object}' ({declaration} declares it): \
-                 {names:?}"
+            // 1. `objects/list`: every object the declared sections register.
+            let listed = endpoint_answer(
+                &ObjectsList::new(Arc::clone(printer)),
+                r#"{"method":"objects/list"}"#,
+                &api,
             );
-        }
-        println!("{TEST_NAME}: objects/list names {} objects", names.len());
-
-        // 2. `objects/query`: the fields a client reads, in their promised shapes.
-        let queried = endpoint_answer(
-            &ObjectsQuery::new(Arc::clone(printer)),
-            r#"{"method":"objects/query","params":{"objects":{"toolhead":["position","homed_axes"],"heaters":["available_sensors","available_heaters"]}}}"#,
-            &api,
-        );
-        let eventtime = queried["eventtime"]
-            .as_f64()
-            .unwrap_or_else(|| panic!("the answer is dated: {queried}"));
-        assert!(
-            eventtime.is_finite() && eventtime >= 0.0,
-            "{TEST_NAME}: eventtime = {eventtime}"
-        );
-        let status = &queried["status"];
-        position_shape(&status["toolhead"]["position"]).expect("toolhead.position");
-        homed_axes_shape(&status["toolhead"]["homed_axes"]).expect("toolhead.homed_axes");
-        names_shape(&status["heaters"]["available_sensors"], "extruder")
-            .expect("heaters.available_sensors");
-        names_shape(&status["heaters"]["available_heaters"], "extruder")
-            .expect("heaters.available_heaters");
-        println!(
-            "{TEST_NAME}: toolhead.position = {}, homed_axes = {}",
-            status["toolhead"]["position"], status["toolhead"]["homed_axes"]
-        );
-
-        // 3. `M115`: the host's own version, in the one line upstream's
-        //    `cmd_M115` answers with. The handler is a built-in registered
-        //    `when_not_ready`, so a refusal here is a defect rather than a
-        //    command this board happens not to have.
-        let gcode = printer
-            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .expect("the loader registers `gcode` before any section");
-        let emitted = Arc::new(Mutex::new(Vec::new()));
-        {
-            let emitted = Arc::clone(&emitted);
-            gcode.register_output_handler(Arc::new(move |line: &str| {
-                emitted
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .push(line.to_string())
-            }));
-        }
-        gcode
-            .run_script_sync("M115")
-            .unwrap_or_else(|error| panic!("{TEST_NAME}: M115 must be answered: {error}"));
-        let lines = emitted
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
-        let version =
-            m115_version(&lines).unwrap_or_else(|reason| panic!("{TEST_NAME}: M115: {reason}"));
-        assert_eq!(
-            version,
-            printer.software_version(),
-            "{TEST_NAME}: M115 reports the version the host injected"
-        );
-        println!("{TEST_NAME}: M115 answers FIRMWARE_VERSION:{version}");
-
-        // 4. The board's own scheduler stats, through the same query. Not
-        //    mandatory: the firmware reports on its own schedule, so a board that
-        //    has not reported within the bound gets a note.
-        match wait_for_last_stats(printer, &api) {
-            Some(last_stats) => {
-                for field in ["mcu_task_avg", "mcu_task_stddev", "mcu_awake"] {
-                    let value = last_stats[field].as_f64().unwrap_or_else(|| {
-                        panic!("{TEST_NAME}: mcu.last_stats.{field} is a number: {last_stats}")
-                    });
-                    assert!(
-                        value.is_finite() && value >= 0.0,
-                        "{TEST_NAME}: mcu.last_stats.{field} = {value}"
-                    );
-                }
-                println!("{TEST_NAME}: mcu.last_stats = {last_stats}");
+            let names: Vec<&str> = listed["objects"]
+                .as_array()
+                .unwrap_or_else(|| panic!("objects/list answers a list of names: {listed}"))
+                .iter()
+                .map(|name| {
+                    name.as_str()
+                        .unwrap_or_else(|| panic!("every object name is a string: {listed}"))
+                })
+                .collect();
+            // Declared section → the object it registers. `[printer]` registers its
+            // object under `toolhead` (`load.rs`'s factory table), and `heaters` is
+            // registered by `[extruder]`'s `heaters::ensure` call — so each assertion
+            // rests on one of the declarations above.
+            for (declaration, object) in [
+                ("[mcu]", "mcu"),
+                ("[printer]", "toolhead"),
+                ("[extruder]", "extruder"),
+                ("[extruder]", "heaters"),
+            ] {
+                assert!(
+                    names.contains(&object),
+                    "{TEST_NAME}: objects/list must name '{object}' ({declaration} declares it): \
+                 {names:?}"
+                );
             }
-            None => println!(
+            println!("{TEST_NAME}: objects/list names {} objects", names.len());
+
+            // 2. `objects/query`: the fields a client reads, in their promised shapes.
+            let queried = endpoint_answer(
+                &ObjectsQuery::new(Arc::clone(printer)),
+                r#"{"method":"objects/query","params":{"objects":{"toolhead":["position","homed_axes"],"heaters":["available_sensors","available_heaters"]}}}"#,
+                &api,
+            );
+            let eventtime = queried["eventtime"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("the answer is dated: {queried}"));
+            assert!(
+                eventtime.is_finite() && eventtime >= 0.0,
+                "{TEST_NAME}: eventtime = {eventtime}"
+            );
+            let status = &queried["status"];
+            position_shape(&status["toolhead"]["position"]).expect("toolhead.position");
+            homed_axes_shape(&status["toolhead"]["homed_axes"]).expect("toolhead.homed_axes");
+            names_shape(&status["heaters"]["available_sensors"], "extruder")
+                .expect("heaters.available_sensors");
+            names_shape(&status["heaters"]["available_heaters"], "extruder")
+                .expect("heaters.available_heaters");
+            println!(
+                "{TEST_NAME}: toolhead.position = {}, homed_axes = {}",
+                status["toolhead"]["position"], status["toolhead"]["homed_axes"]
+            );
+
+            // 3. `M115`: the host's own version, in the one line upstream's
+            //    `cmd_M115` answers with. The handler is a built-in registered
+            //    `when_not_ready`, so a refusal here is a defect rather than a
+            //    command this board happens not to have.
+            let gcode = printer
+                .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                .expect("the loader registers `gcode` before any section");
+            let emitted = Arc::new(Mutex::new(Vec::new()));
+            {
+                let emitted = Arc::clone(&emitted);
+                gcode.register_output_handler(Arc::new(move |line: &str| {
+                    emitted
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push(line.to_string())
+                }));
+            }
+            gcode
+                .run_script_sync("M115")
+                .unwrap_or_else(|error| panic!("{TEST_NAME}: M115 must be answered: {error}"));
+            let lines = emitted
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone();
+            let version =
+                m115_version(&lines).unwrap_or_else(|reason| panic!("{TEST_NAME}: M115: {reason}"));
+            assert_eq!(
+                version,
+                printer.software_version(),
+                "{TEST_NAME}: M115 reports the version the host injected"
+            );
+            println!("{TEST_NAME}: M115 answers FIRMWARE_VERSION:{version}");
+
+            // 4. The board's own scheduler stats, through the same query. Not
+            //    mandatory: the firmware reports on its own schedule, so a board that
+            //    has not reported within the bound gets a note.
+            match wait_for_last_stats(printer, &api) {
+                Some(last_stats) => {
+                    for field in ["mcu_task_avg", "mcu_task_stddev", "mcu_awake"] {
+                        let value = last_stats[field].as_f64().unwrap_or_else(|| {
+                            panic!("{TEST_NAME}: mcu.last_stats.{field} is a number: {last_stats}")
+                        });
+                        assert!(
+                            value.is_finite() && value >= 0.0,
+                            "{TEST_NAME}: mcu.last_stats.{field} = {value}"
+                        );
+                    }
+                    println!("{TEST_NAME}: mcu.last_stats = {last_stats}");
+                }
+                None => println!(
                 "HW-NOTE: {TEST_NAME}: the board has not reported `stats` within {STATS_WAIT:?}, \
                  so `mcu.last_stats` is not checked by this case (not mandatory)"
             ),
-        }
-        // `started` goes out of scope here, and its `Drop` is what takes the
-        // machine down.
+            }
+            // `started` goes out of scope here, and its `Drop` is what takes the
+            // machine down.
+        });
     }
 
     /// The declaration the smoke case runs under, against configs that do and do

@@ -2,32 +2,38 @@
 //!
 //! One input — the user's own printer config, named by [`HW_CONFIG_ENV`] — and
 //! per-test declarations of what they need. A module's test says what it wants
-//! and then asks for a [`Machine`]:
+//! and hands [`case`] (or [`async_case`]) the body to run with a [`Machine`]:
 //!
 //! ```ignore
 //! #[tokio::test]
 //! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
 //! async fn test_endstop_trigger_on_a_real_board() {
-//!     let Some(machine) = crate::hardware_test::acquire(
+//!     crate::hardware_test::async_case(
 //!         "test_endstop_trigger_on_a_real_board",
 //!         &crate::hardware_test::Requires::new()
 //!             .mcu()
 //!             .option("stepper_x", "endstop_pin"),
-//!     ) else {
-//!         return; // reported as HW-IGNORED; the test passes without a board
-//!     };
-//!     let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
-//!         .await
-//!         .expect("identify completes");
-//!     // … the assertions, against the real board …
+//!         |machine| async move {
+//!             let mcu = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+//!                 .await
+//!                 .expect("identify completes");
+//!             // … the assertions, against the real board …
+//!         },
+//!     );
 //! }
 //! ```
 //!
 //! That case is the **first layer**, and it is `async`: it opens the board
 //! itself with `Mcu::connect(…).await` and owns no runtime, so `#[tokio::test]`
 //! is the right frame. A case over the **second** layer is the opposite and
-//! must be a **plain `#[test]`** — see [the second
+//! must be a **plain `#[test]`** with [`case`] — see [the second
 //! layer](#the-second-layer-a-machine-that-is-up).
+//!
+//! Both runners give the case a **total budget** ([`case`], [`CASE_TIMEOUT`]):
+//! the body runs on a thread of its own, and a case that hangs is reported as
+//! `HW-TIMEOUT: <case>: still at "<phase>" …` rather than parking the run. A
+//! config that does not provide what the case declared is still a skip, printed
+//! as `HW-IGNORED: …`, and the body never runs.
 //!
 //! The `#[ignore]` marker must be written out as a literal with exactly that
 //! wording — an attribute cannot name a constant. Run one like this:
@@ -77,20 +83,21 @@
 //! **name**, not by its section header:
 //!
 //! ```ignore
-//! let Some(machine) = crate::hardware_test::acquire(
+//! crate::hardware_test::async_case(
 //!     "test_z_probe_uses_both_boards",
 //!     &crate::hardware_test::Requires::new()
 //!         .mcu()                 // [mcu] must be reachable
 //!         .mcu_named("zboard"),  // and so must [mcu zboard]
-//! ) else {
-//!     return; // reported as HW-IGNORED; the test passes without the boards
-//! };
-//! let main = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
-//!     .await
-//!     .expect("identify completes");
-//! let z = Mcu::connect("zboard", machine.open_mcu_named("zboard").expect("its port opens"))
-//!     .await
-//!     .expect("identify completes");
+//!     |machine| async move {
+//!         let main = Mcu::connect("mcu", machine.open_mcu().expect("the port opens"))
+//!             .await
+//!             .expect("identify completes");
+//!         let z = Mcu::connect("zboard", machine.open_mcu_named("zboard").expect("its port opens"))
+//!             .await
+//!             .expect("identify completes");
+//!         // …
+//!     },
+//! );
 //! ```
 //!
 //! Two things the framework deliberately leaves out. It hands a test the
@@ -116,24 +123,25 @@
 //! #[test]
 //! #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
 //! fn test_homing_reaches_the_endstop_on_a_real_board() {
-//!     let Some(machine) = crate::hardware_test::acquire(
+//!     crate::hardware_test::case(
 //!         "test_homing_reaches_the_endstop_on_a_real_board",
 //!         &crate::hardware_test::Requires::new()
 //!             .mcu()
 //!             .option("stepper_x", "endstop_pin"),
-//!     ) else {
-//!         return; // reported as HW-IGNORED; the test passes without a board
-//!     };
-//!     let started = machine.bring_up().expect("the machine comes up");
-//!     let gcode = started
-//!         .printer()
-//!         .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
-//!         .expect("the g-code dispatcher is registered");
-//!     gcode.run_script_sync("G28 X").expect("the homing move runs");
-//!     // … the assertions, against the running machine …
-//!     // `started` is dropped here, and that is what takes the machine down
-//!     // (`Drop`, the panic path included) — keep it alive to the end of the
-//!     // test, or put it in a scope that ends where the session should.
+//!         |machine| {
+//!             let started = machine.bring_up().expect("the machine comes up");
+//!             let gcode = started
+//!                 .printer()
+//!                 .lookup_object_as::<GCodeDispatch>(crate::core::klippy::gcode::GCODE_OBJECT)
+//!                 .expect("the g-code dispatcher is registered");
+//!             gcode.run_script_sync("G28 X").expect("the homing move runs");
+//!             // … the assertions, against the running machine …
+//!             // `started` is dropped here, and that is what takes the machine
+//!             // down (`Drop`, the panic path included) — keep it alive to the
+//!             // end of the body, or put it in a scope that ends where the
+//!             // session should.
+//!         },
+//!     );
 //! }
 //! ```
 //!
@@ -230,6 +238,19 @@
 //! subscription can trip the bound; the cycle itself is fixed where it lives,
 //! never papered over with `Mcu::close` here.
 //!
+//! # The machine is turned off before it is torn down
+//!
+//! A case over the second layer can command hardware: `M104`/`M140` set a
+//! target, `SET_PIN` drives a fan or a PWM output. A case that commands one and
+//! then fails would leave the board doing it — on a real printer, heating — for
+//! as long as it stays powered. So [`StartedMachine`]'s `Drop` turns the machine
+//! off **before** it takes the parts down: `TURN_OFF_HEATERS` (every heater's
+//! target to 0) and `SET_PIN PIN=<name> VALUE=0` for every `[output_pin]` that is
+//! not already at zero. It runs on both paths, the pass and the panic, because
+//! it is in `Drop` rather than in the case body, and it reports what it put back
+//! as `HW-TEARDOWN:` lines (best effort: a machine that is already shut down
+//! refuses commands, which is another off state).
+//!
 //! # Ignored is reported, not failed
 //!
 //! `cargo test` and `cargo test --workspace` never touch the config: every test
@@ -255,16 +276,20 @@
 //! not it is in this process, so one lock covers both "another test thread of
 //! this binary" (which `cargo test` runs in parallel by default) and "a second
 //! `cargo test` run elsewhere". A test that has to wait prints
-//! `HW-WAIT: <test>: …` once and then blocks; the wait has no timeout, because
-//! what it waits for is the other test's session on that board, and a session
-//! that never ends is a hung test rather than a lock problem. `--test-threads=1`
-//! is therefore **not** needed (and passing it anyway is harmless).
+//! `HW-WAIT: <test>: …` once and then polls for the lock; the wait is **bounded**
+//! by [`LOCK_TIMEOUT`], because a session that never ends is exactly the hung
+//! case a run must hear about rather than sit in — so a wait that runs out says
+//! another hardware test still holds the board instead of blocking forever.
+//! `--test-threads=1` is therefore **not** needed (and passing it anyway is
+//! harmless).
 
 use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::runtime::Runtime;
@@ -272,6 +297,9 @@ use tokio::runtime::Runtime;
 use crate::core::klippy::api::StartArgs;
 use crate::core::klippy::config::mcu::McuConfig;
 use crate::core::klippy::config::{Config, ConfigSection, ConfigWrapper};
+use crate::core::klippy::extras::heaters::HEATERS_OBJECT;
+use crate::core::klippy::extras::output_pin::OutputPin;
+use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::ids::NODEID_FIRST;
 use crate::core::klippy::printer::{Printer, PrinterState};
@@ -290,6 +318,45 @@ pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
 /// spirit as the corpus' case bound: without it a machine that never answers
 /// parks the test instead of failing it.
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long one hardware case may take in total, from the board lock to its
+/// last assertion.
+///
+/// Deliberately wide, and the numbers are why. A board's identify handshake is
+/// about a second; a `G28` on a big printer is tens of seconds of real motion;
+/// and a temperature wait is minutes — a 40 W hotend climbing from room
+/// temperature to 200 °C takes several minutes, and a heated bed can take ten.
+/// The budget has to clear the slowest legitimate case by a lot, because a
+/// false timeout fails a case that would have passed on a slow board, while a
+/// budget that is too wide only costs time on a case that is already hung. Five
+/// minutes is far above what the cases here do (the longest is a homing case at
+/// tens of seconds) and still short enough that a hung case ends a run rather
+/// than parking it.
+const CASE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often a case waiting for the board looks again.
+const LOCK_POLL: Duration = Duration::from_millis(100);
+
+/// How long a case waits for the board lock before it reports the board busy.
+///
+/// Longer than [`CASE_TIMEOUT`] on purpose: the lock is held for one whole
+/// case, so a wait shorter than a case would report "busy" for a predecessor
+/// that is merely slow — the false failure this bound is not allowed to make.
+/// Twice a case is the point where the predecessor is not slow but stuck, and
+/// the wait then says so instead of blocking forever.
+const LOCK_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The phase a case is in before [`acquire`] hands out the machine.
+const PHASE_ACQUIRING: &str = "acquiring the machine (the config and the board lock)";
+
+/// The phase a case is in while its own body runs.
+const PHASE_BODY: &str = "the case body";
+
+/// The phase [`Machine::bring_up`] is in.
+const PHASE_BRING_UP: &str = "bring_up (connecting every part of the config)";
+
+/// The phase [`Machine::open_mcu_named`] is in.
+const PHASE_OPEN: &str = "opening the transport of one [mcu] section";
 
 /// How long a [`StartedMachine`] gives its runtime to shut down, once the
 /// machine's parts are dropped.
@@ -568,12 +635,51 @@ fn bring_up_failure(reason: String, runtime: Runtime, timeout: Duration) -> Stri
     }
 }
 
+/// Where a case has got to, as the case timeout names it.
+///
+/// The phase is shared with the runner, which is what makes a timeout report
+/// "stuck at bring_up" instead of only "stuck": the case body runs on its own
+/// thread, so the thread watching the budget cannot ask it anything — the
+/// framework's own seams stamp the phase as the case passes through them.
+struct CaseProgress {
+    /// The phase's name and the instant it was entered.
+    current: Mutex<(&'static str, Instant)>,
+}
+
+impl CaseProgress {
+    /// Start the record in `phase`.
+    fn new(phase: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            current: Mutex::new((phase, Instant::now())),
+        })
+    }
+
+    /// Record that the case has reached `phase`.
+    fn enter(&self, phase: &'static str) {
+        *self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = (phase, Instant::now());
+    }
+
+    /// The phase the case is in, and how long it has been in it.
+    fn current(&self) -> (&'static str, Duration) {
+        let guarded = self
+            .current
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        (guarded.0, guarded.1.elapsed())
+    }
+}
+
 /// A config that satisfies a test's [`Requires`], with the board locked.
 pub struct Machine {
     /// The parsed printer config.
     config: Config,
     /// The config file the parser read, as the host's start arguments name it.
     path: PathBuf,
+    /// Where this case has got to, for the case timeout's report.
+    progress: Arc<CaseProgress>,
     /// The exclusive lock on the board, held until this machine is dropped.
     _board: BoardLock,
 }
@@ -596,6 +702,16 @@ impl Machine {
     /// The whole parsed printer config.
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Record this case's progress in the runner's `progress` from here on.
+    ///
+    /// [`acquire`] builds a machine with a phase record of its own; the runner
+    /// swaps in the one its timeout report watches, so the phases
+    /// [`Machine::bring_up`] and [`Machine::open_mcu_named`] stamp land where
+    /// that report reads them.
+    fn traced_by(&mut self, progress: &Arc<CaseProgress>) {
+        self.progress = Arc::clone(progress);
     }
 
     /// Start the machine the config describes, as the host does.
@@ -623,6 +739,7 @@ impl Machine {
     /// [`StartedMachine`]'s `Drop` uses; a runtime that does not close inside it
     /// is a leaked part, and the `Err` says so after the original reason.
     pub fn bring_up(&self) -> Result<StartedMachine, String> {
+        self.progress.enter(PHASE_BRING_UP);
         // First, before any device or config work: a bring-up from inside a
         // runtime cannot work, and a plain `Err` beats tokio's panic (see the
         // module doc's rule for second-layer cases).
@@ -711,6 +828,7 @@ impl Machine {
     /// environment. The message is the parser's or the transport's own, except
     /// that a name with no section says which section is missing.
     pub fn open_mcu_named(&self, name: &str) -> Result<Interface, String> {
+        self.progress.enter(PHASE_OPEN);
         let section_id = mcu_section_id(name);
         let section = self
             .config
@@ -765,15 +883,27 @@ impl StartedMachine {
 }
 
 impl Drop for StartedMachine {
-    /// Take the machine down, then bound the runtime's shutdown.
+    /// Turn the machine off, take it down, then bound the runtime's shutdown.
     ///
-    /// In this order, and for this reason: the parts the config loaded are what
-    /// shut a device down when they drop (`Mcu::Drop` → `Interface::shutdown`,
-    /// which releases the blocking read the session parked), so they have to go
-    /// while the runtime is still alive to carry that — and only then does the
-    /// runtime get its bound. Dropping the machine as well is what makes the
-    /// bound mean something: whatever is still holding a device afterwards was
-    /// leaked by a part, not kept alive by this framework.
+    /// **The machine is turned off first** ([`turn_everything_off`]): every
+    /// heater's target goes to zero and every `[output_pin]` that is not
+    /// already at zero is driven back to zero, through the same g-code the
+    /// host's own client would send (`TURN_OFF_HEATERS`, `SET_PIN … VALUE=0`).
+    /// This runs on **both** paths — a case that passes and a case that panics —
+    /// because it is here, in `Drop`, and not in the case body: a case that set
+    /// a target and then failed on the next assertion would otherwise leave the
+    /// board heating, which is the one thing a test lane must never do. The
+    /// commands are best effort and report as `HW-TEARDOWN:` lines; a machine
+    /// that is already shut down refuses them, which is another off state.
+    ///
+    /// Then, in this order, and for this reason: the parts the config loaded
+    /// are what shut a device down when they drop (`Mcu::Drop` →
+    /// `Interface::shutdown`, which releases the blocking read the session
+    /// parked), so they have to go while the runtime is still alive to carry
+    /// that — and only then does the runtime get its bound. Dropping the machine
+    /// as well is what makes the bound mean something: whatever is still holding
+    /// a device afterwards was leaked by a part, not kept alive by this
+    /// framework.
     ///
     /// A runtime that does not finish inside [`SHUTDOWN_TIMEOUT`] is a **panic**
     /// naming the leak: the live shape's blocked read cannot be cancelled, so
@@ -783,6 +913,7 @@ impl Drop for StartedMachine {
     /// abort the process instead of reporting either.
     fn drop(&mut self) {
         if let Some(printer) = self.printer.take() {
+            turn_everything_off(&printer);
             printer.teardown();
             drop(printer);
         }
@@ -812,6 +943,91 @@ impl Drop for StartedMachine {
     }
 }
 
+/// Turn the machine off before it is torn down: every heater's target to zero,
+/// every output that is on back to zero.
+///
+/// What it fixes: a case that set `M104 S200`, or drove a fan, and then failed
+/// on the next assertion used to leave the board doing exactly that for as long
+/// as the printer stayed powered. `Drop` is where this belongs, because it is
+/// the one piece of a case that runs on both paths — the ordinary return and the
+/// panic — and it runs before the parts go.
+///
+/// The two commands are the host's own, not a private back door:
+/// `TURN_OFF_HEATERS` is what upstream's `cmd_TURN_OFF_HEATERS` runs
+/// (`heaters.py:283-285`, giving every registered heater a target of 0), and
+/// `SET_PIN PIN=<name> VALUE=0` is upstream's `output_pin` command
+/// (`output_pin.py:196-269`). Both are read off the machine's own status: the
+/// heater registry's presence, and the value each `[output_pin]` last drove —
+/// only pins that are not already at zero are sent.
+///
+/// Best effort, never a panic: this runs while unwinding as often as not, and a
+/// machine that is already shut down refuses commands. Each line it sends, and
+/// each refusal, is printed as an `HW-TEARDOWN:` line so a run says what it put
+/// back.
+fn turn_everything_off(printer: &Arc<Printer>) {
+    let heater_registry = printer.lookup_object(HEATERS_OBJECT).is_some();
+    let outputs: Vec<(String, f64)> = printer
+        .lookup_objects_as::<OutputPin>(Some("output_pin"))
+        .into_iter()
+        .map(|(registered, pin)| {
+            let value = printer
+                .status_of(&registered, printer.eventtime())
+                .and_then(|status| status.get("value").and_then(serde_json::Value::as_f64))
+                .unwrap_or(0.0);
+            (pin.name().to_string(), value)
+        })
+        .collect();
+    let lines = turn_off_script(heater_registry, &outputs);
+    if lines.is_empty() {
+        return;
+    }
+    let Some(gcode) = printer.lookup_object_as::<GCodeDispatch>(GCODE_OBJECT) else {
+        println!("HW-TEARDOWN: no g-code dispatcher, so nothing can be turned off");
+        return;
+    };
+    drive_teardown(lines, |line| {
+        gcode
+            .run_script_sync(line)
+            .map_err(|error| error.to_string())
+    });
+}
+
+/// The g-code [`turn_everything_off`] sends, from what the machine reports.
+///
+/// `heater_registry` is whether the config built a `heaters` registry at all
+/// (`[extruder]`'s `heaters::ensure` does, so a config with no heater section
+/// has nothing to turn off); `outputs` is every `[output_pin]`'s name and the
+/// value it last drove. A pin already at zero is left alone — the command would
+/// be a no-op, and a run's `HW-TEARDOWN:` lines should say what changed.
+fn turn_off_script(heater_registry: bool, outputs: &[(String, f64)]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if heater_registry {
+        lines.push("TURN_OFF_HEATERS".to_string());
+    }
+    for (name, value) in outputs {
+        if *value != 0.0 {
+            lines.push(format!("SET_PIN PIN={name} VALUE=0"));
+        }
+    }
+    lines
+}
+
+/// Run `lines` through `run`, reporting each one rather than panicking.
+///
+/// `run` is a parameter so the driving can be exercised without a machine: a
+/// test records what was sent, and sees a refusal reported rather than raised.
+fn drive_teardown<F>(lines: Vec<String>, mut run: F)
+where
+    F: FnMut(&str) -> Result<(), String>,
+{
+    for line in lines {
+        match run(&line) {
+            Ok(()) => println!("HW-TEARDOWN: {line}"),
+            Err(error) => println!("HW-TEARDOWN: {line} failed: {error}"),
+        }
+    }
+}
+
 /// The exclusive right to talk to one board, held for the life of a test.
 ///
 /// An open file description on the config file with `flock(LOCK_EX)`, released
@@ -835,9 +1051,21 @@ impl Drop for BoardLock {
 
 /// Take the board lock for the config at `config`, announcing a wait once.
 ///
-/// `test_name` is only used in the message. Blocking, and no other lock is held
-/// while blocking here.
+/// `test_name` is only used in the message. Blocking, but not unboundedly: a
+/// board held for longer than [`LOCK_TIMEOUT`] is a session that never ended,
+/// and the `Err` says so instead of parking this case forever. No other lock is
+/// held while waiting here.
 fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
+    lock_board_within(config, test_name, LOCK_TIMEOUT)
+}
+
+/// [`lock_board`] with the bound as a parameter, so the wait can be exercised
+/// without waiting [`LOCK_TIMEOUT`] out.
+fn lock_board_within(
+    config: &Path,
+    test_name: &str,
+    timeout: Duration,
+) -> Result<BoardLock, String> {
     let file = File::open(config).map_err(|error| format!("{}: {error}", config.display()))?;
     let fd = file.as_raw_fd();
 
@@ -853,15 +1081,28 @@ fn lock_board(config: &Path, test_name: &str) -> Result<BoardLock, String> {
     }
     println!("HW-WAIT: {test_name}: waiting for the board (another hardware test is running)");
 
+    let deadline = Instant::now() + timeout;
     loop {
+        // A polled non-blocking take rather than a blocking `flock`, because a
+        // blocking one cannot be given a deadline: the thread would sit inside
+        // the syscall with no way to look at the clock.
+        //
         // SAFETY: as above; `fd` is owned by `file`, which is still alive.
-        if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             return Ok(BoardLock { file });
         }
         let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
             return Err(format!("{}: flock: {error}", config.display()));
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "another hardware test still holds the board: waited {timeout:?} for {} and its \
+                 session never ended. Free it (a hung `cargo test` left behind?) and run again",
+                config.display()
+            ));
+        }
+        std::thread::sleep(LOCK_POLL);
     }
 }
 
@@ -934,13 +1175,191 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
                 panic!("{test_name}: cannot serialise on the board's config file: {reason}")
             });
             println!("{}", run_line(test_name));
+            let progress = CaseProgress::new(PHASE_BODY);
             Some(Machine {
                 config,
                 path,
+                progress,
                 _board,
             })
         }
     }
+}
+
+/// Run `body` as one hardware case: the board locked, and a total budget.
+///
+/// This is the frame a hardware case is written in, and it replaces the
+/// `let Some(machine) = acquire(…) else { return }; …` shape:
+///
+/// ```ignore
+/// #[test]
+/// #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
+/// fn test_homing_reaches_the_endstop_on_a_real_board() {
+///     crate::hardware_test::case(
+///         "test_homing_reaches_the_endstop_on_a_real_board",
+///         &crate::hardware_test::Requires::new().mcu(),
+///         move |machine| {
+///             let started = machine.bring_up().expect("the machine comes up");
+///             // … the case …
+///         },
+///     );
+/// }
+/// ```
+///
+/// `body` runs on a thread of its own, and this one waits for it for at most
+/// [`CASE_TIMEOUT`]: a case that parks in a device read or in a temperature
+/// wait is then **reported** — `HW-TIMEOUT: <case>: still at "<phase>" …` — and
+/// the run goes on. The thread that is still blocked cannot be stopped (a
+/// blocking read is not cancellable), so it is abandoned: it keeps the board
+/// lock until it ends, which is why the next case's wait for the board is
+/// bounded too ([`LOCK_TIMEOUT`]) and says the board is still held.
+///
+/// A case whose [`Requires`] the config does not provide is a skip, exactly as
+/// [`acquire`] alone reports it: `HW-IGNORED`, and this returns.
+///
+/// A panic in `body` — `expect` failing, an assertion — is re-raised here with
+/// the same message, so the case fails the ordinary way. The machine is dropped
+/// (and its session torn down) inside the case thread on the panic path as
+/// well, before that message travels.
+///
+/// `body` takes the `Machine` by value; it lives on the case thread for exactly
+/// as long as `body` runs (and is dropped there, teardown and all), so anything
+/// the case opens has to be closed inside it — that is what makes the teardown
+/// the machine's `Drop` covers complete.
+///
+/// # Panics
+/// When the case times out, when `body` panics, and when the machine cannot be
+/// built (a set [`HW_CONFIG_ENV`] naming a config that cannot be used, or a
+/// board that cannot be locked).
+pub fn case<F>(test_name: &str, requires: &Requires, body: F)
+where
+    F: FnOnce(Machine) + Send + 'static,
+{
+    run_case(None, test_name, requires, CASE_TIMEOUT, body);
+}
+
+/// [`case`] for a case whose body is `async` — an L1 case, which opens a
+/// transport with `Mcu::connect(…).await`.
+///
+/// The body is polled on a current-thread runtime built **inside** the case
+/// thread, which is the same runtime a `#[tokio::test]` would have given it:
+/// same IO and timers enabled, same single thread. Nothing about the body
+/// changes; only its frame does. A case that calls [`Machine::bring_up`] is not
+/// one of these — that method owns a runtime and refuses to run inside one, so
+/// such a case is a plain [`case`].
+pub fn async_case<F, Fut>(test_name: &str, requires: &Requires, body: F)
+where
+    F: FnOnce(Machine) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    run_case(None, test_name, requires, CASE_TIMEOUT, move |machine| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("the case's runtime builds");
+        runtime.block_on(body(machine));
+    });
+}
+
+/// The end of a case body, as the case thread reports it.
+#[derive(Debug)]
+enum CaseOutcome {
+    /// The body ran to its end (or the case was skipped).
+    Finished,
+    /// The body panicked; the message is what the case failed with.
+    Panicked(String),
+}
+
+/// [`case`]'s body: run `body` on its own thread under `budget`.
+///
+/// `path` is the config to run against; `None` reads [`HW_CONFIG_ENV`] inside
+/// the case thread, the way [`acquire`] does. The parameter is what lets a test
+/// exercise this without setting a variable.
+fn run_case<F>(
+    path: Option<PathBuf>,
+    test_name: &str,
+    requires: &Requires,
+    budget: Duration,
+    body: F,
+) where
+    F: FnOnce(Machine) + Send + 'static,
+{
+    let name = test_name.to_string();
+    let requires = requires.clone();
+    let progress = CaseProgress::new(PHASE_ACQUIRING);
+    let case_progress = Arc::clone(&progress);
+    let (sender, receiver) = mpsc::channel::<CaseOutcome>();
+
+    let spawned = std::thread::Builder::new()
+        .name(format!("hw-case {test_name}"))
+        .spawn(move || {
+            // The machine lives inside this closure: its `Drop` — the board
+            // lock and, for a machine that came up, the session's teardown —
+            // runs here, before the outcome travels, on the panic path too.
+            let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let machine = match path {
+                    Some(path) => acquire_at(Some(&path), &name, &requires),
+                    None => acquire(&name, &requires),
+                };
+                if let Some(mut machine) = machine {
+                    // The machine's phase record becomes the runner's from here
+                    // on: the acquiring phase was already the runner's own, and
+                    // the body's phases are what it has to report.
+                    case_progress.enter(PHASE_BODY);
+                    machine.traced_by(&case_progress);
+                    body(machine);
+                }
+            }));
+            let outcome = match outcome {
+                Ok(()) => CaseOutcome::Finished,
+                Err(payload) => CaseOutcome::Panicked(panic_text(payload.as_ref())),
+            };
+            // A closed receiver means the budget already ran out and nobody is
+            // listening; the case thread ends here either way.
+            let _ = sender.send(outcome);
+        });
+    let case_thread = match spawned {
+        Ok(case_thread) => case_thread,
+        Err(error) => panic!("{test_name}: cannot start the case's thread: {error}"),
+    };
+
+    match receiver.recv_timeout(budget) {
+        Ok(CaseOutcome::Finished) => {
+            // The body is done; the thread has nothing left but its return.
+            let _ = case_thread.join();
+        }
+        Ok(CaseOutcome::Panicked(message)) => {
+            let _ = case_thread.join();
+            // The case's own failure, re-raised here so it is this test's
+            // failure rather than a silent thread's.
+            panic!("{message}");
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            let (phase, in_phase) = progress.current();
+            let message = format!(
+                "HW-TIMEOUT: {test_name}: still at \"{phase}\" after {in_phase:?} in that phase \
+                 ({budget:?} of case budget). The case thread is abandoned and still holds the \
+                 board, so the next case will report the board as held rather than run: the \
+                 case itself hung, which is what this budget is for — look at the phase above \
+                 for where"
+            );
+            println!("{message}");
+            panic!("{message}");
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            panic!("{test_name}: the case thread died without reporting an outcome")
+        }
+    }
+}
+
+/// The message a caught panic carried, for the case [`run_case`] re-raises it
+/// with.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+        .unwrap_or_else(|| "a panic with no message".to_string())
 }
 
 /// Print what the configured printer provides, without touching a board.
@@ -1060,7 +1479,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Mutex, Weak};
 
+    use crate::core::klippy::interface::devices::host::HostMux;
     use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
+    use crate::core::klippy::mcu::host_libraries::HostLibraries;
     use crate::core::klippy::mcu::{Mcu, McuObject};
 
     /// Parse fixture text with the real parser.
@@ -1189,6 +1610,7 @@ mod tests {
         Machine {
             config,
             path: fixture.path().to_path_buf(),
+            progress: CaseProgress::new(PHASE_BODY),
             _board: board,
         }
     }
@@ -1949,15 +2371,6 @@ mod tests {
         let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
     }
 
-    /// The message a caught panic carried.
-    fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-        payload
-            .downcast_ref::<String>()
-            .cloned()
-            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
-            .unwrap_or_else(|| "a panic with no message".to_string())
-    }
-
     /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,
     /// not a skip: the variable said the machine had a config to test against.
     /// Only an unset variable and an unmet [`Requires`] are skips.
@@ -1972,7 +2385,7 @@ mod tests {
             Err(payload) => payload,
         };
 
-        let message = panic_message(payload.as_ref());
+        let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         // The parser's own reason travels with it.
         assert!(
@@ -1993,8 +2406,339 @@ mod tests {
             Err(payload) => payload,
         };
 
-        let message = panic_message(payload.as_ref());
+        let message = panic_text(payload.as_ref());
         assert!(message.contains("cannot be used"), "{message}");
         assert!(message.contains("printer.cfg"), "{message}");
+    }
+
+    /// The host-library transport facts `Machine::open_mcu_named` stamps on the
+    /// board called `name`: the mux attach and the bridge port table.
+    fn host_facts(parsed: &Config, name: &str) -> (Option<HostMux>, Vec<(u8, String)>) {
+        let identifier = mcu_section_id(name);
+        let section = parsed
+            .get_section(&identifier)
+            .unwrap_or_else(|| panic!("the fixture has [{identifier}]"));
+        let mut mcu = McuConfig::new(&ConfigWrapper::with_config(
+            section,
+            crate::core::klippy::config::AccessTracking::shared(),
+            None,
+            parsed,
+        ))
+        .expect("the section parses");
+        apply_id_addressed_transport(parsed, section, &mut mcu);
+        (mcu.host_mux, mcu.host_port_paths)
+    }
+
+    /// A `host_library:` path the config does not call muxed opens with bare
+    /// frames, exactly as the load path leaves it.
+    #[test]
+    fn test_a_plain_host_library_path_stays_unmuxed() {
+        let parsed = config("[mcu]\nhost_library: /opt/libklipper_host.so\n");
+
+        assert_eq!(host_facts(&parsed, "mcu"), (None, Vec::new()));
+    }
+
+    /// A path the config **does** call muxed (here: the section writes a
+    /// `uuid`, which names the board the mux routes to) is opened through
+    /// [`Interface::host_mux`] with the identity pair the load path gives it —
+    /// without this the library would be opened with bare frames and address
+    /// nobody.
+    #[test]
+    fn test_a_muxed_host_library_path_attaches_with_its_identity_pair() {
+        let parsed = config("[mcu]\nhost_library: /opt/libklipper_host.so\nuuid: 11aa22bb33cc\n");
+
+        let (mux, paths) = host_facts(&parsed, "mcu");
+        let mux = mux.expect("a section writing a uuid makes the path muxed");
+        assert_eq!(
+            mux.named,
+            [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc],
+            "the attach names the uuid the section wrote"
+        );
+        // The identity is the path's own (seeded from its text, so the same
+        // config always gets the same one), and it is what the load path's own
+        // grouping assigns: replaying that call is the point of the stamp.
+        let section = parsed.get_section("mcu").expect("the fixture has [mcu]");
+        let libraries = HostLibraries::classify(&ConfigWrapper::with_config(
+            section,
+            crate::core::klippy::config::AccessTracking::shared(),
+            None,
+            &parsed,
+        ))
+        .expect("the fixture classifies");
+        assert_eq!(
+            Some(mux.identity),
+            libraries.identity("/opt/libklipper_host.so"),
+            "the identity is the load path's, not a number invented here"
+        );
+        assert!(paths.is_empty(), "this path names no uart port: {paths:?}");
+    }
+
+    /// A bridge is muxed even when it writes no `uuid`: the downstream device on
+    /// its port is what makes the path addressed by id (`path_is_mux`'s
+    /// `has_bridge`/`downstream` rule), and the attach then names the bridge's own
+    /// identity.
+    #[test]
+    fn test_a_host_library_bridge_is_muxed_and_names_its_own_identity() {
+        let parsed = config(
+            "[mcu bridge]\nhost_library: /opt/libklipper_host.so\n\
+             [uart_device uart0]\nuart_mcu: bridge\nuart_oid: uart0\nuart_path: /dev/bridge-a\n",
+        );
+
+        let (mux, paths) = host_facts(&parsed, "bridge");
+        let mux = mux.expect("a bridge with a downstream device is muxed");
+        assert_eq!(
+            mux.named, mux.identity,
+            "without a uuid the attach names the bridge's own identity"
+        );
+        assert_eq!(
+            paths,
+            vec![(0u8, "/dev/bridge-a".to_string())],
+            "the port's own tty is recorded under its uart slot"
+        );
+    }
+
+    /// The bridge port table is the load path's, slot for slot: only a
+    /// `[uart_device]` takes a UART slot, a `[can_device]` does not, and a port
+    /// without `uart_path:` records no tty but still takes its slot.
+    #[test]
+    fn test_the_bridge_port_table_counts_uart_slots_the_way_the_load_does() {
+        let parsed = config(
+            "[mcu bridge]\nhost_library: /opt/libklipper_host.so\n\
+             [uart_device first]\nuart_mcu: bridge\nuart_oid: uart0\nuart_path: /dev/a\n\
+             [can_device between]\ncan_mcu: bridge\ncan_oid: can0\n\
+             [uart_device second]\nuart_mcu: bridge\nuart_oid: uart1\n\
+             [uart_device third]\nuart_mcu: bridge\nuart_oid: uart2\nuart_path: /dev/c\n",
+        );
+
+        assert_eq!(
+            host_facts(&parsed, "bridge").1,
+            vec![(0u8, "/dev/a".to_string()), (2u8, "/dev/c".to_string()),],
+            "the CAN port takes no slot, and the uart port without a tty still takes one"
+        );
+
+        // A serial board has no port table at all.
+        assert!(host_facts(&config("[mcu]\nserial: /dev/ttyACM0\n"), "mcu")
+            .1
+            .is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // The teardown — the machine turned off on both paths
+    // -----------------------------------------------------------------------
+
+    /// What the teardown sends: every heater off, and only the outputs that are
+    /// actually on.
+    ///
+    /// `outputs` is the recording fake of the machine's own status — the pair
+    /// `turn_everything_off` reads for each `[output_pin]` — so the decision is
+    /// checked without a board.
+    #[test]
+    fn test_the_teardown_turns_heaters_off_and_only_the_outputs_that_are_on() {
+        let outputs = vec![
+            ("fan".to_string(), 0.6),
+            ("led".to_string(), 0.0),
+            ("pwm".to_string(), 1.0),
+        ];
+
+        assert_eq!(
+            turn_off_script(true, &outputs),
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+                "SET_PIN PIN=pwm VALUE=0".to_string(),
+            ],
+            "the heaters go off, and a pin already at zero is left alone"
+        );
+
+        // A config with no heater section has no registry to command, and a
+        // machine with nothing on has nothing to send at all.
+        assert_eq!(
+            turn_off_script(
+                false,
+                &["led".to_string()]
+                    .iter()
+                    .map(|name| (name.clone(), 0.0))
+                    .collect::<Vec<_>>()
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    /// The driving: every line is sent, in order, and a refusal is reported
+    /// rather than raised — this runs while unwinding as often as not.
+    #[test]
+    fn test_the_teardown_sends_every_line_and_reports_a_refusal() {
+        let mut sent = Vec::new();
+        drive_teardown(
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+            ],
+            |line| {
+                sent.push(line.to_string());
+                if line.contains("SET_PIN") {
+                    return Err("the machine is shut down".to_string());
+                }
+                Ok(())
+            },
+        );
+
+        assert_eq!(
+            sent,
+            vec![
+                "TURN_OFF_HEATERS".to_string(),
+                "SET_PIN PIN=fan VALUE=0".to_string(),
+            ],
+            "both lines are sent, and the refusal of one does not stop the other"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The case runner — a bound on the whole case, and its attribution
+    // -----------------------------------------------------------------------
+
+    /// A case that hangs is **reported** and the runner returns: the body is
+    /// abandoned at the budget, the message names the case and the phase it was
+    /// stuck in, and the caller fails with that message rather than waiting.
+    ///
+    /// The budget is milliseconds here so the test stays bounded; production
+    /// passes [`CASE_TIMEOUT`].
+    #[test]
+    fn test_a_case_that_hangs_reports_its_phase_and_the_runner_returns() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let started = Instant::now();
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_case(
+                Some(fixture.path().to_path_buf()),
+                "test_a_case_that_hangs",
+                &Requires::new().mcu(),
+                Duration::from_millis(100),
+                |_machine| std::thread::sleep(Duration::from_secs(30)),
+            )
+        })) {
+            Ok(()) => panic!("the runner must fail the case, not return as if it passed"),
+            Err(payload) => payload,
+        };
+
+        // Bounded: the abandoned body sleeps for 30 s, the runner returned long
+        // before it.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the runner returned inside its budget: {:?}",
+            started.elapsed()
+        );
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("HW-TIMEOUT: test_a_case_that_hangs"),
+            "{message}"
+        );
+        assert!(
+            message.contains(PHASE_BODY),
+            "the message names the phase the case was stuck in: {message}"
+        );
+    }
+
+    /// The other half: a case that finishes inside its budget passes, and the
+    /// body really ran with a machine (which is what the board lock is for).
+    #[test]
+    fn test_a_case_that_finishes_inside_its_budget_passes() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+
+        run_case(
+            Some(fixture.path().to_path_buf()),
+            "test_a_case_that_finishes",
+            &Requires::new().mcu(),
+            Duration::from_secs(30),
+            move |machine| {
+                assert_eq!(
+                    machine
+                        .config()
+                        .get_section("mcu")
+                        .and_then(|section| section.get_str("serial")),
+                    Some("/dev/ttyACM0")
+                );
+                seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        );
+
+        assert!(
+            ran.load(std::sync::atomic::Ordering::SeqCst),
+            "the body ran with the machine the config provides"
+        );
+    }
+
+    /// A body that panics fails the case with its own message: the failure is
+    /// this test's, not a silent thread's.
+    #[test]
+    fn test_a_panic_in_the_body_fails_the_case_with_its_message() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_case(
+                Some(fixture.path().to_path_buf()),
+                "test_a_case_that_panics",
+                &Requires::new().mcu(),
+                Duration::from_secs(30),
+                |_machine| panic!("the board answered 0 where 1 was expected"),
+            )
+        })) {
+            Ok(()) => panic!("a panicking body fails the case"),
+            Err(payload) => payload,
+        };
+
+        assert_eq!(
+            panic_text(payload.as_ref()),
+            "the board answered 0 where 1 was expected"
+        );
+    }
+
+    /// The skip path travels through the runner unchanged: a config that does
+    /// not provide what the case asked for is `HW-IGNORED`, and the body never
+    /// runs.
+    #[test]
+    fn test_a_case_the_config_does_not_provide_is_skipped_by_the_runner() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = Arc::clone(&ran);
+
+        run_case(
+            Some(fixture.path().to_path_buf()),
+            "test_a_case_that_is_skipped",
+            &Requires::new().section("stepper_x"),
+            Duration::from_secs(30),
+            move |_machine| seen.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::SeqCst),
+            "a skipped case runs no body: there is no machine to hand it"
+        );
+    }
+
+    /// The board lock's wait is bounded: a board another session holds is
+    /// reported as held, not waited on forever. The short bound is a parameter
+    /// so the check does not wait [`LOCK_TIMEOUT`] out.
+    #[test]
+    fn test_waiting_for_a_held_board_ends_with_the_board_reported_as_held() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        // Held for the whole check, as a hung case would hold it.
+        let _held = lock_board(fixture.path(), "self-test").expect("the fixture locks");
+
+        let started = Instant::now();
+        let reason = lock_board_within(fixture.path(), "self-test", Duration::from_millis(150))
+            .err()
+            .expect("a held board is not handed out");
+
+        assert!(
+            reason.contains("another hardware test still holds the board"),
+            "the reason says the board is held: {reason}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait ended at its bound: {:?}",
+            started.elapsed()
+        );
     }
 }

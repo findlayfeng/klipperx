@@ -85,7 +85,9 @@ use crate::core::klippy::cmd::{GetClock, McuCommand};
 use crate::core::klippy::config::mcu::{McuConfig, Transport};
 use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigWrapper};
 use crate::core::klippy::extras::board_pins::BoardPins;
+use crate::core::klippy::interface::devices::host::HostMux;
 use crate::core::klippy::mathutil::Xyz;
+use crate::core::klippy::mcu::host_libraries::HostLibraries;
 use crate::core::klippy::mcu::port_grouping::{self, PortKind};
 use crate::core::klippy::mcu::serial_ports::SerialPorts;
 use crate::core::klippy::mcu::{
@@ -1237,6 +1239,11 @@ fn resolve_mcu(config: &Config, name: &str) -> Result<McuConfig, String> {
 /// opened with bare frames, answers nothing, and the session times out in
 /// identify.
 ///
+/// The same is true of the host-library stamps (`host_mux`,
+/// `host_port_paths`): the load path resolves them over the whole config too,
+/// and [`apply_host_library_transport`] replays exactly those calls. Serial
+/// paths are unaffected by that half.
+///
 /// It lives in this module rather than `hardware_test.rs` because that module is
 /// `#[cfg(test)]` (`lib.rs`) while `klipperx stress` is a shipped command: both
 /// lanes ask the question, and only this module is built into a release binary.
@@ -1247,6 +1254,11 @@ pub(crate) fn apply_id_addressed_transport(
     section: &ConfigSection,
     mcu: &mut McuConfig,
 ) {
+    // The host-library stamps first, and unconditionally: a `host_library:`
+    // transport has no `serial:` path, so the id-addressed arm below never runs
+    // for one. Both are the load path's own calls replayed, never a new rule.
+    apply_host_library_transport(config, section, mcu);
+
     let Some(baud) = id_addressed_baud(config, section) else {
         return;
     };
@@ -1255,6 +1267,67 @@ pub(crate) fn apply_id_addressed_transport(
     // the load path gives every `[mcu]` one in declaration order, so this
     // section's id is that sequence's, not always the first of it.
     mcu.id = Some(load_time_id(config, &mcu.name));
+}
+
+/// Set the transport facts the load path stamps on a **host-library** MCU: the
+/// mux attach of [`McuConfig::host_mux`] and the bridge port table of
+/// [`McuConfig::host_port_paths`].
+///
+/// The load path resolves both over the whole config while the config loads
+/// (`mcu/object.rs`: `host_libraries::ensure` for the mux, and the port
+/// sections' own factories for the table), so a lane that holds the parsed
+/// config and opens one section by hand has to ask the same questions of the
+/// same pass. Without them an in-process library path opens with **bare**
+/// frames: a muxed bridge answers nothing that names it, and a bridge whose
+/// ports need ttys never learns them.
+fn apply_host_library_transport(config: &Config, section: &ConfigSection, mcu: &mut McuConfig) {
+    let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, config);
+    if let Transport::Host { library, uuid } = &mcu.transport {
+        // The parse ran `host_libraries::validate` for this section, so the
+        // grouping classifies; a config it would refuse never gets here.
+        if let Ok(libraries) = HostLibraries::classify(&wrapper) {
+            mcu.host_mux = libraries.is_mux(library).then(|| HostMux {
+                identity: libraries
+                    .identity(library)
+                    .expect("a path a section names has an identity"),
+                named: libraries
+                    .named_uuid(library, *uuid)
+                    .expect("a path a section names names a device"),
+            });
+        }
+    }
+    mcu.host_port_paths = host_port_paths(config, &mcu.name);
+}
+
+/// The `(uart slot, tty)` pairs the load path records on the bridge called
+/// `mcu_name`.
+///
+/// Read raw and in declaration order, exactly as the load does it: every
+/// `[uart_device]` whose `uart_mcu:` names this bridge takes the next **UART
+/// slot** of that bridge's counter, and one that writes `uart_path:` records
+/// the pair (`mcu/bridge_ports.rs`'s `wire_bridge_port`). A `[can_device]`
+/// takes no slot — the slot is which USART of the bridge the port is, not its
+/// index among the bridge's ports — so this walk skips those sections
+/// entirely. Only a host-library bridge may write `uart_path:` (the loader
+/// refuses it anywhere else), so a non-host bridge yields an empty table.
+fn host_port_paths(config: &Config, mcu_name: &str) -> Vec<(u8, String)> {
+    let mut paths = Vec::new();
+    let mut next_slot: u8 = 0;
+    for section in config.sections_vec() {
+        if section.id != "uart_device" {
+            continue;
+        }
+        // A section the load path could not read took no slot there either.
+        if section.get_text("uart_mcu").as_deref() != Some(mcu_name) {
+            continue;
+        }
+        let slot = next_slot;
+        next_slot = next_slot.saturating_add(1);
+        if let Some(path) = section.get_text("uart_path") {
+            paths.push((slot, path));
+        }
+    }
+    paths
 }
 
 /// The baud a section's `serial:` path is opened with when the path is
@@ -5234,32 +5307,32 @@ mod tests {
         const DISTANCE_MM: f64 = 5.0;
         const SPEED_MM_S: f64 = 10.0;
 
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_r5_single_axis_move_matches_the_firmware_step_count",
             &r5_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
-        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
-        let mcu = connect(&mcu_config).await.expect("the board identifies");
-        let section = named_stepper(
-            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
-            "stepper_x",
+            |machine| async move {
+                let mcu_config =
+                    resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+                let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+                let mcu = connect(&mcu_config).await.expect("the board identifies");
+                let section = named_stepper(
+                    find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+                    "stepper_x",
+                );
+                move_one_axis(
+                    &mcu_config,
+                    mcu,
+                    &BoardLink::Own,
+                    &pins,
+                    section,
+                    DISTANCE_MM,
+                    SPEED_MM_S,
+                )
+                .await
+                .expect("R5: the firmware's step count must match the move");
+            },
         );
-        move_one_axis(
-            &mcu_config,
-            mcu,
-            &BoardLink::Own,
-            &pins,
-            section,
-            DISTANCE_MM,
-            SPEED_MM_S,
-        )
-        .await
-        .expect("R5: the firmware's step count must match the move");
     }
-
     /// R11 — a short, controlled step soak against a real board.
     ///
     /// `TESTING.md`'s R11 (lines 85-87) asks that continuous stepping leave the
@@ -5297,30 +5370,33 @@ mod tests {
         /// How long the soak drives, in seconds.
         const SECONDS: f64 = 2.0;
 
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_r11_short_soak_holds_a_safe_step_rate",
             &r11_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
-        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
-        let mcu = connect(&mcu_config).await.expect("the board identifies");
-        let section = named_stepper(
-            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
-            "stepper_x",
+            |machine| async move {
+                let mcu_config =
+                    resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+                let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+                let mcu = connect(&mcu_config).await.expect("the board identifies");
+                let section = named_stepper(
+                    find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+                    "stepper_x",
+                );
+                let rate = step_soak(
+                    &mcu_config,
+                    mcu,
+                    &BoardLink::Own,
+                    &pins,
+                    section,
+                    RATE,
+                    SECONDS,
+                )
+                .await
+                .expect(
+                    "R11: the firmware must hold the safe rate without a shutdown or a lost step",
+                );
+                println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
+            },
         );
-        let rate = step_soak(
-            &mcu_config,
-            mcu,
-            &BoardLink::Own,
-            &pins,
-            section,
-            RATE,
-            SECONDS,
-        )
-        .await
-        .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
-        println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
     }
 }

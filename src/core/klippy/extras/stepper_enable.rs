@@ -996,71 +996,71 @@ mod tests {
     #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     fn test_m18_disables_every_motor_on_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::case(
             "test_m18_disables_every_motor_on_a_real_board",
             &disable_case(),
-        ) else {
-            return; // reported as HW-IGNORED; the case passes without a board
-        };
-        let machine = machine.bring_up().expect("the board comes up");
-        let printer = machine.printer();
+            |machine| {
+                let machine = machine.bring_up().expect("the board comes up");
+                let printer = machine.printer();
 
-        let enabled = printer
-            .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
-            .expect("the machine registers `stepper_enable` for [stepper_x]");
-        let gcode = printer
-            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
-            .expect("the machine registers `gcode`");
+                let enabled = printer
+                    .lookup_object_as::<PrinterStepperEnable>("stepper_enable")
+                    .expect("the machine registers `stepper_enable` for [stepper_x]");
+                let gcode = printer
+                    .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+                    .expect("the machine registers `gcode`");
 
-        // Observe the event this object already publishes, through the
-        // existing handler registration.
-        let motor_off = Arc::new(AtomicUsize::new(0));
-        let counter = Arc::clone(&motor_off);
-        printer.register_event_handler(
-            KlippyEvent::StepperEnableMotorOff,
-            Box::new(move |_| {
-                counter.fetch_add(1, Ordering::SeqCst);
-            }),
-        );
+                // Observe the event this object already publishes, through the
+                // existing handler registration.
+                let motor_off = Arc::new(AtomicUsize::new(0));
+                let counter = Arc::clone(&motor_off);
+                printer.register_event_handler(
+                    KlippyEvent::StepperEnableMotorOff,
+                    Box::new(move |_| {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }),
+                );
 
-        // The declared `[stepper_x]` must really be tracked, or the assertions
-        // below would pass on an empty map.
-        let before = enabled.get_status(0.0);
-        assert!(
-            before
-                .get("steppers")
-                .and_then(Value::as_object)
-                .is_some_and(|steppers| steppers.contains_key("stepper_x")),
-            "the machine tracks the declared [stepper_x]: {before}"
-        );
+                // The declared `[stepper_x]` must really be tracked, or the assertions
+                // below would pass on an empty map.
+                let before = enabled.get_status(0.0);
+                assert!(
+                    before
+                        .get("steppers")
+                        .and_then(Value::as_object)
+                        .is_some_and(|steppers| steppers.contains_key("stepper_x")),
+                    "the machine tracks the declared [stepper_x]: {before}"
+                );
 
-        gcode.run_script_sync("M18").expect("M18 runs");
+                gcode.run_script_sync("M18").expect("M18 runs");
 
-        assert_eq!(
-            motor_off.load(Ordering::SeqCst),
-            1,
-            "M18 must publish `stepper_enable:motor_off` exactly once"
-        );
+                assert_eq!(
+                    motor_off.load(Ordering::SeqCst),
+                    1,
+                    "M18 must publish `stepper_enable:motor_off` exactly once"
+                );
 
-        let after = enabled.get_status(0.0);
-        let steppers = after
-            .get("steppers")
-            .and_then(Value::as_object)
-            .expect("get_status reports a `steppers` map");
-        assert!(
-            steppers.contains_key("stepper_x"),
-            "the machine still tracks the declared [stepper_x]: {after}"
-        );
-        for (name, state) in steppers {
-            assert_eq!(
-                state.as_bool(),
-                Some(false),
-                "M18 must leave [{name}] disabled: {after}"
-            );
-        }
-        println!(
-            "R9-lite: M18 disabled {} stepper(s): {steppers:?}",
-            steppers.len()
+                let after = enabled.get_status(0.0);
+                let steppers = after
+                    .get("steppers")
+                    .and_then(Value::as_object)
+                    .expect("get_status reports a `steppers` map");
+                assert!(
+                    steppers.contains_key("stepper_x"),
+                    "the machine still tracks the declared [stepper_x]: {after}"
+                );
+                for (name, state) in steppers {
+                    assert_eq!(
+                        state.as_bool(),
+                        Some(false),
+                        "M18 must leave [{name}] disabled: {after}"
+                    );
+                }
+                println!(
+                    "R9-lite: M18 disabled {} stepper(s): {steppers:?}",
+                    steppers.len()
+                );
+            },
         );
     }
 }

@@ -5872,97 +5872,96 @@ mod tests {
     #[tokio::test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     async fn test_frame_sequence_sync_against_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_frame_sequence_sync_against_a_real_board",
             &crate::hardware_test::Requires::new().mcu(),
-        ) else {
-            return;
-        };
-        let open = || machine.open_mcu().expect("the board's transport must open");
-        let seq = |mcu: &Mcu| mcu.wire.next.load(Ordering::Relaxed) & 0xf;
+            |machine| async move {
+                let open = || machine.open_mcu().expect("the board's transport must open");
+                let seq = |mcu: &Mcu| mcu.wire.next.load(Ordering::Relaxed) & 0xf;
 
-        // 1. Whichever session the board is in — just booted, or still running
-        //    from a previous host — identify has to complete. A connection that
-        //    could only ever start at sequence 0 would time out here.
-        let mcu = Mcu::connect("mcu", open())
-            .await
-            .expect("identify must complete (fresh firmware, or a session to take over)");
-        println!(
-            "connect #1: took_over={} at sequence {}",
-            mcu.took_over_session(),
-            seq(&mcu),
-        );
+                // 1. Whichever session the board is in — just booted, or still running
+                //    from a previous host — identify has to complete. A connection that
+                //    could only ever start at sequence 0 would time out here.
+                let mcu = Mcu::connect("mcu", open())
+                    .await
+                    .expect("identify must complete (fresh firmware, or a session to take over)");
+                println!(
+                    "connect #1: took_over={} at sequence {}",
+                    mcu.took_over_session(),
+                    seq(&mcu),
+                );
 
-        // 2. Round trips across the 4-bit wraparound. Identify alone already
-        //    sent roughly ninety blocks (the dictionary is that long), so a
-        //    counter that never wrapped would have stalled long before this.
-        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
-        for round in 0..40 {
-            clock
-                .get_clock()
-                .await
-                .unwrap_or_else(|e| panic!("get_clock round {round} failed: {e}"));
-        }
+                // 2. Round trips across the 4-bit wraparound. Identify alone already
+                //    sent roughly ninety blocks (the dictionary is that long), so a
+                //    counter that never wrapped would have stalled long before this.
+                let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
+                for round in 0..40 {
+                    clock
+                        .get_clock()
+                        .await
+                        .unwrap_or_else(|e| panic!("get_clock round {round} failed: {e}"));
+                }
 
-        // 3. Leave the firmware unambiguously past the "just booted" range. The
-        //    takeover check deliberately accepts 0 or 1 (a freshly booted board
-        //    answers the first block with one of them), so a connection can only
-        //    be *guaranteed* to report a takeover once the counter is past that.
-        while seq(&mcu) < 2 {
-            clock
-                .get_clock()
-                .await
-                .expect("get_clock while nudging the counter past the fresh range");
-        }
-        let running_at = seq(&mcu);
-        // The old session has to be gone before the port is reopened: `Drop`
-        // aborts both transport tasks, and their finishing is the port closing.
-        // Poll that instead of guessing how long the runtime needs.
-        let transport = [&mcu.recv_handle, &mcu.send_handle].map(|handles| {
-            handles
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .as_ref()
-                .expect("both transport tasks are running here")
-                .abort_handle()
-        });
-        drop(clock);
-        drop(mcu);
-        wait_until(
-            Duration::from_secs(5),
-            Duration::from_millis(10),
-            || transport.iter().all(|handle| handle.is_finished()),
-            "the old session's transport tasks finish before the port reopens",
-        )
-        .await;
+                // 3. Leave the firmware unambiguously past the "just booted" range. The
+                //    takeover check deliberately accepts 0 or 1 (a freshly booted board
+                //    answers the first block with one of them), so a connection can only
+                //    be *guaranteed* to report a takeover once the counter is past that.
+                while seq(&mcu) < 2 {
+                    clock
+                        .get_clock()
+                        .await
+                        .expect("get_clock while nudging the counter past the fresh range");
+                }
+                let running_at = seq(&mcu);
+                // The old session has to be gone before the port is reopened: `Drop`
+                // aborts both transport tasks, and their finishing is the port closing.
+                // Poll that instead of guessing how long the runtime needs.
+                let transport = [&mcu.recv_handle, &mcu.send_handle].map(|handles| {
+                    handles
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .as_ref()
+                        .expect("both transport tasks are running here")
+                        .abort_handle()
+                });
+                drop(clock);
+                drop(mcu);
+                wait_until(
+                    Duration::from_secs(5),
+                    Duration::from_millis(10),
+                    || transport.iter().all(|handle| handle.is_finished()),
+                    "the old session's transport tasks finish before the port reopens",
+                )
+                .await;
 
-        // 4. The board was never reset, so its counter carried on from where
-        //    the first connection left it. The new connection numbers its first
-        //    block 0, which the firmware cannot place: it naks with its own
-        //    number, and the transport has to adopt it and put the request back
-        //    on the wire under that number.
-        let mcu = Mcu::connect("mcu", open())
-            .await
-            .expect("the second identify must complete by taking the session over");
-        assert!(
-            mcu.took_over_session(),
-            "the board was still running at sequence {running_at}; \
+                // 4. The board was never reset, so its counter carried on from where
+                //    the first connection left it. The new connection numbers its first
+                //    block 0, which the firmware cannot place: it naks with its own
+                //    number, and the transport has to adopt it and put the request back
+                //    on the wire under that number.
+                let mcu = Mcu::connect("mcu", open())
+                    .await
+                    .expect("the second identify must complete by taking the session over");
+                assert!(
+                    mcu.took_over_session(),
+                    "the board was still running at sequence {running_at}; \
              the new connection had to take it over"
-        );
-        println!(
-            "connect #2: took_over={} adopted sequence {}",
-            mcu.took_over_session(),
-            seq(&mcu),
-        );
+                );
+                println!(
+                    "connect #2: took_over={} adopted sequence {}",
+                    mcu.took_over_session(),
+                    seq(&mcu),
+                );
 
-        // 5. And the taken-over session is genuinely usable, not just identified.
-        let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
-        for round in 0..40 {
-            clock
-                .get_clock()
-                .await
-                .unwrap_or_else(|e| panic!("get_clock after takeover (round {round}) failed: {e}"));
-        }
+                // 5. And the taken-over session is genuinely usable, not just identified.
+                let clock = McuClock::new(Arc::clone(&mcu), ManualReactor::shared());
+                for round in 0..40 {
+                    clock.get_clock().await.unwrap_or_else(|e| {
+                        panic!("get_clock after takeover (round {round}) failed: {e}")
+                    });
+                }
+            },
+        );
     }
 
     /// How many resets the R2 case performs.
@@ -6094,93 +6093,92 @@ mod tests {
     #[tokio::test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     async fn test_firmware_reset_comes_back_three_times_on_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_firmware_reset_comes_back_three_times_on_a_real_board",
             &crate::hardware_test::Requires::new().mcu(),
-        ) else {
-            return;
-        };
-
-        let mut mcu = Mcu::connect(
-            "mcu",
-            machine.open_mcu().expect("the board's transport must open"),
-        )
-        .await
-        .expect("identify must complete on the board as it is now");
-        // The reboot is the firmware's own `reset` command. A firmware that does
-        // not declare it cannot be rebooted from the host at all — R2's reboot half
-        // has nothing to drive there (a `config_reset` board is cleared in place,
-        // not restarted) — so report the skip in the same shape the framework uses
-        // instead of pretending to have tested it.
-        if !mcu.has_message(Reset::NAME) {
-            println!(
+            |machine| async move {
+                let mut mcu = Mcu::connect(
+                    "mcu",
+                    machine.open_mcu().expect("the board's transport must open"),
+                )
+                .await
+                .expect("identify must complete on the board as it is now");
+                // The reboot is the firmware's own `reset` command. A firmware that does
+                // not declare it cannot be rebooted from the host at all — R2's reboot half
+                // has nothing to drive there (a `config_reset` board is cleared in place,
+                // not restarted) — so report the skip in the same shape the framework uses
+                // instead of pretending to have tested it.
+                if !mcu.has_message(Reset::NAME) {
+                    println!(
                 "HW-IGNORED: test_firmware_reset_comes_back_three_times_on_a_real_board: the \
                  firmware declares no 'reset' command, so the host cannot reboot it — R2's \
                  reboot half has nothing to drive on this board"
             );
-            return;
-        }
-        println!(
-            "connected: took_over={} (the board as it is now, before any reset)",
-            mcu.took_over_session(),
-        );
+                    return;
+                }
+                println!(
+                    "connected: took_over={} (the board as it is now, before any reset)",
+                    mcu.took_over_session(),
+                );
 
-        for round in 1..=RESET_ROUNDS {
-            let started = Instant::now();
+                for round in 1..=RESET_ROUNDS {
+                    let started = Instant::now();
 
-            // 1. Reboot the firmware on the live connection, the way
-            //    `before_firmware_restart` does for `restart_method: command`:
-            //    `reset`, flushed so the bytes leave the host before the port is
-            //    closed. The flush often reports the transport going away as the
-            //    board reboots; the command was written first, so that is not an
-            //    error.
-            mcu.send_msg(&Reset).unwrap_or_else(|err| {
-                panic!("round {round}: the firmware rejected 'reset': {err}")
-            });
-            let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
-            // Let the flushed bytes reach the firmware: closing the port
-            // immediately could cut a write the tty driver still holds, and a
-            // firmware that never saw `reset` never comes back.
-            sleep(RESET_DISCONNECT_DELAY).await;
-            // The old session must be the port's only owner, or dropping it closes
-            // nothing and its tasks keep reading the tty into the next session.
-            assert_eq!(
-                Arc::strong_count(&mcu),
-                1,
-                "round {round}: another handle still holds the session; the old tasks \
+                    // 1. Reboot the firmware on the live connection, the way
+                    //    `before_firmware_restart` does for `restart_method: command`:
+                    //    `reset`, flushed so the bytes leave the host before the port is
+                    //    closed. The flush often reports the transport going away as the
+                    //    board reboots; the command was written first, so that is not an
+                    //    error.
+                    mcu.send_msg(&Reset).unwrap_or_else(|err| {
+                        panic!("round {round}: the firmware rejected 'reset': {err}")
+                    });
+                    let _ = mcu.flush(RESET_FLUSH_TIMEOUT).await;
+                    // Let the flushed bytes reach the firmware: closing the port
+                    // immediately could cut a write the tty driver still holds, and a
+                    // firmware that never saw `reset` never comes back.
+                    sleep(RESET_DISCONNECT_DELAY).await;
+                    // The old session must be the port's only owner, or dropping it closes
+                    // nothing and its tasks keep reading the tty into the next session.
+                    assert_eq!(
+                        Arc::strong_count(&mcu),
+                        1,
+                        "round {round}: another handle still holds the session; the old tasks \
                  would stay on the port"
-            );
-            drop(mcu);
+                    );
+                    drop(mcu);
 
-            // 2. Reopen while the firmware reboots; identify runs in
-            //    `Mcu::connect`.
-            let reconnected = reopen_after_reset(&machine).await.unwrap_or_else(|last| {
-                panic!("round {round}: the board did not come back after 'reset': {last}")
-            });
+                    // 2. Reopen while the firmware reboots; identify runs in
+                    //    `Mcu::connect`.
+                    let reconnected = reopen_after_reset(&machine).await.unwrap_or_else(|last| {
+                        panic!("round {round}: the board did not come back after 'reset': {last}")
+                    });
 
-            // 3. A booted firmware is what answers: a board that never rebooted
-            //    answers the new connection's first block with its old sequence,
-            //    and the transport takes that session over (`took_over_session`).
-            assert!(
-                !reconnected.took_over_session(),
-                "round {round}: the reconnected firmware was still the pre-reset \
+                    // 3. A booted firmware is what answers: a board that never rebooted
+                    //    answers the new connection's first block with its old sequence,
+                    //    and the transport takes that session over (`took_over_session`).
+                    assert!(
+                        !reconnected.took_over_session(),
+                        "round {round}: the reconnected firmware was still the pre-reset \
                  session — it did not reboot"
-            );
+                    );
 
-            // 4. The new session is usable, not just identified.
-            let clock = McuClock::new(Arc::clone(&reconnected), ManualReactor::shared());
-            clock.get_clock().await.unwrap_or_else(|err| {
-                panic!("round {round}: get_clock failed on the reconnected board: {err}")
-            });
-            drop(clock);
+                    // 4. The new session is usable, not just identified.
+                    let clock = McuClock::new(Arc::clone(&reconnected), ManualReactor::shared());
+                    clock.get_clock().await.unwrap_or_else(|err| {
+                        panic!("round {round}: get_clock failed on the reconnected board: {err}")
+                    });
+                    drop(clock);
 
-            println!(
-                "reset round {round}/{RESET_ROUNDS}: rebooted, identified and answered \
+                    println!(
+                        "reset round {round}/{RESET_ROUNDS}: rebooted, identified and answered \
                  get_clock in {:?}",
-                started.elapsed(),
-            );
-            mcu = reconnected;
-        }
+                        started.elapsed(),
+                    );
+                    mcu = reconnected;
+                }
+            },
+        );
     }
 
     // -----------------------------------------------------------------------

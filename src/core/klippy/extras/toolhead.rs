@@ -8261,17 +8261,17 @@ mod tests {
     #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     fn test_r4_x_axis_homes_to_its_position_endstop_on_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::case(
             "test_r4_x_axis_homes_to_its_position_endstop_on_a_real_board",
             &r4_single_axis_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let started = machine.bring_up().expect("the machine comes up");
+            |machine| {
+                let started = machine.bring_up().expect("the machine comes up");
 
-        r4_home_and_assert(started.printer(), "G28 X\n", &[X_AXIS]);
+                r4_home_and_assert(started.printer(), "G28 X\n", &[X_AXIS]);
 
-        // `started` drops here, which is what takes the session down.
+                // `started` drops here, which is what takes the session down.
+            },
+        );
     }
 
     /// R4 — every axis homes on a real board (the `G28` form of the case).
@@ -8316,17 +8316,17 @@ mod tests {
     #[test]
     #[ignore = "hardware: needs KLIPPERX_HW_CONFIG"]
     fn test_r4_all_axes_home_on_a_real_board() {
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::case(
             "test_r4_all_axes_home_on_a_real_board",
             &r4_all_axes_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let started = machine.bring_up().expect("the machine comes up");
+            |machine| {
+                let started = machine.bring_up().expect("the machine comes up");
 
-        r4_home_and_assert(started.printer(), "G28\n", &[X_AXIS, Y_AXIS, Z_AXIS]);
+                r4_home_and_assert(started.printer(), "G28\n", &[X_AXIS, Y_AXIS, Z_AXIS]);
 
-        // `started` drops here, which is what takes the session down.
+                // `started` drops here, which is what takes the session down.
+            },
+        );
     }
 
     /// The declaration the two R4 cases run under is the one the config is

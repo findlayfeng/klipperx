@@ -20,7 +20,7 @@ pub mod wrapper;
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub use access::AccessTracking;
@@ -339,30 +339,15 @@ impl Config {
                                 )
                             })?;
 
-                        let include_source =
-                            Self::resolve_include_source(include_path_str, source)?;
-
-                        if visited.contains(&include_source) {
-                            return Err(format!(
-                                "Line {}: Circular include detected: {}",
-                                line_num, include_source
-                            ));
-                        }
-
-                        visited.insert(include_source.clone());
-                        let included_content = Self::read_source(&include_source)?;
-                        let (included_config, mut included_sources) = Self::parse_with_includes(
-                            &included_content,
-                            &include_source,
+                        Self::include_spec_into(
+                            include_path_str,
+                            source,
                             visited,
                             resolve_includes,
+                            &mut config,
+                            &mut sources,
+                            &format!("Line {}: ", line_num),
                         )?;
-                        sources.push(include_source.clone());
-                        sources.append(&mut included_sources);
-
-                        for section in included_config.sections_vec() {
-                            config.add_section(section.clone());
-                        }
                     } else {
                         config.add_section(section);
                     }
@@ -423,29 +408,68 @@ impl Config {
                     "[include] section requires a 'path' parameter or sub field".to_string()
                 })?;
 
-                let include_source = Self::resolve_include_source(include_path_str, source)?;
-                if visited.contains(&include_source) {
-                    return Err(format!("Circular include detected: {}", include_source));
-                }
-                visited.insert(include_source.clone());
-                let included_content = Self::read_source(&include_source)?;
-                let (included_config, mut included_sources) = Self::parse_with_includes(
-                    &included_content,
-                    &include_source,
+                Self::include_spec_into(
+                    include_path_str,
+                    source,
                     visited,
                     resolve_includes,
+                    &mut config,
+                    &mut sources,
+                    "",
                 )?;
-                sources.push(include_source.clone());
-                sources.append(&mut included_sources);
-                for section in included_config.sections_vec() {
-                    config.add_section(section.clone());
-                }
             } else {
                 config.add_section(section);
             }
         }
 
         Ok((config, sources))
+    }
+
+    /// Splice one `[include <spec>]` into `config`, in the order the spec
+    /// names its files.
+    ///
+    /// A spec may name several files (`[include *.cfg]`); upstream resolves it
+    /// with `glob.glob`, sorts the matches and parses them in that order
+    /// (`klippy/configfile.py:181-195`). The order is behaviour, not detail: a
+    /// later file's options win over an earlier file's when both define the
+    /// same section, exactly as a later in-file duplicate would.
+    ///
+    /// `line_prefix` is `"Line N: "` for the include that closed the section
+    /// being parsed and empty for the trailing section, which carries no line.
+    #[allow(clippy::too_many_arguments)]
+    fn include_spec_into(
+        spec: &str,
+        source: &ConfigSource,
+        visited: &mut HashSet<ConfigSource>,
+        resolve_includes: bool,
+        config: &mut Self,
+        sources: &mut Vec<ConfigSource>,
+        line_prefix: &str,
+    ) -> Result<(), String> {
+        for include_source in Self::resolve_include_sources(spec, source)? {
+            if visited.contains(&include_source) {
+                return Err(format!(
+                    "{}Circular include detected: {}",
+                    line_prefix, include_source
+                ));
+            }
+
+            visited.insert(include_source.clone());
+            let included_content = Self::read_source(&include_source)?;
+            let (included_config, mut included_sources) = Self::parse_with_includes(
+                &included_content,
+                &include_source,
+                visited,
+                resolve_includes,
+            )?;
+            sources.push(include_source.clone());
+            sources.append(&mut included_sources);
+
+            for section in included_config.sections_vec() {
+                config.add_section(section.clone());
+            }
+        }
+        Ok(())
     }
 
     /// Read content from a ConfigSource
@@ -521,41 +545,123 @@ impl Config {
         }
     }
 
-    /// Resolve an include path relative to the current config's source.
-    pub(crate) fn resolve_include_source(
+    /// Resolve one `[include …]` spec to the sources it names.
+    ///
+    /// Upstream `_resolve_include` (`klippy/configfile.py:181-195`) joins the
+    /// spec onto the including file's directory, globs the result and sorts the
+    /// matches; a spec without glob magic must name exactly one existing file,
+    /// while a pattern that matches nothing is not an error and includes
+    /// nothing. A URL spec is fetched as given — a pattern has no meaning over
+    /// HTTP, so it is not expanded.
+    pub(crate) fn resolve_include_sources(
         path_param: &str,
         source: &ConfigSource,
-    ) -> Result<ConfigSource, String> {
+    ) -> Result<Vec<ConfigSource>, String> {
         if path_param.starts_with("http://") || path_param.starts_with("https://") {
-            return Ok(ConfigSource::Url(path_param.to_string()));
+            return Ok(vec![ConfigSource::Url(path_param.to_string())]);
         }
 
         let path = Path::new(path_param);
-        match source {
+        let resolved: PathBuf = match source {
             ConfigSource::File(base_path) => {
                 if path.is_absolute() {
-                    Ok(ConfigSource::File(path.to_path_buf()))
+                    path.to_path_buf()
                 } else {
                     let base_dir = base_path.parent().unwrap_or(Path::new("."));
-                    Ok(ConfigSource::File(base_dir.join(path)))
+                    base_dir.join(path)
                 }
             }
             ConfigSource::Url(base_url) => {
-                if let Some(base_dir) = Self::url_parent(base_url) {
-                    let resolved_url = format!("{}/{}", base_dir, path_param);
-                    Ok(ConfigSource::Url(Self::normalize_url_path(&resolved_url)))
-                } else {
-                    Ok(ConfigSource::Url(path_param.to_string()))
-                }
+                // A URL has no filesystem to glob; keep the existing relative
+                // join and hand back the one URL it names.
+                let resolved_url = match Self::url_parent(base_url) {
+                    Some(base_dir) => {
+                        Self::normalize_url_path(&format!("{}/{}", base_dir, path_param))
+                    }
+                    None => path_param.to_string(),
+                };
+                return Ok(vec![ConfigSource::Url(resolved_url)]);
             }
             ConfigSource::None(_) => {
                 let cwd = std::env::current_dir()
                     .map_err(|e| format!("Failed to get current directory: {}", e))?;
-                let resolved_path = cwd.join(path);
-                Ok(ConfigSource::File(resolved_path))
+                cwd.join(path)
+            }
+        };
+        Self::expand_glob(&resolved)
+    }
+
+    /// Expand a resolved include path into sources, sorted.
+    ///
+    /// A path without `*`/`?`/`[` is returned as the single literal source, so
+    /// the "does not exist" error keeps coming from [`Self::read_source`] with
+    /// its path in the message. A pattern yields its matches in sorted order —
+    /// upstream's `include_filenames.sort()` — and an empty set when nothing
+    /// matches.
+    fn expand_glob(resolved: &Path) -> Result<Vec<ConfigSource>, String> {
+        let Some(pattern) = resolved.to_str() else {
+            // Not spellable as a pattern (non-UTF-8 path): a literal source.
+            return Ok(vec![ConfigSource::File(resolved.to_path_buf())]);
+        };
+        if !has_glob_magic(pattern) {
+            return Ok(vec![ConfigSource::File(resolved.to_path_buf())]);
+        }
+
+        let mut matches: Vec<PathBuf> = Vec::new();
+        // A leading `.` in the pattern's last segment is literal in Python's
+        // `glob` (`*.cfg` skips `.hidden.cfg`, `.*.cfg` matches it). The crate
+        // can drop hidden entries, but it would drop them for the literal case
+        // too — so the rule is applied to the matches instead.
+        let last_segment = pattern.rsplit('/').next().unwrap_or(pattern);
+        let leading_dot_is_literal = !last_segment.starts_with('.');
+        // `require_literal_separator` is forced on by the filesystem glob: a
+        // `*` never crosses `/`, which is upstream's non-recursive `glob.glob`.
+        match glob::glob_with(pattern, glob::MatchOptions::new()) {
+            Ok(paths) => {
+                for entry in paths {
+                    // Upstream's `glob.glob` skips entries it cannot stat, so a
+                    // directory the user cannot read narrows the set instead of
+                    // failing the config load.
+                    if let Ok(path) = entry {
+                        if leading_dot_is_literal && is_hidden(&path) {
+                            continue;
+                        }
+                        matches.push(path);
+                    }
+                }
+            }
+            Err(e) => {
+                // `glob.glob` has no such failure mode: an unusable pattern
+                // matches nothing. Report it as empty rather than an error.
+                tracing::debug!(
+                    "Include pattern '{}' is not a usable pattern: {}",
+                    pattern,
+                    e
+                );
+                return Ok(Vec::new());
             }
         }
+        matches.sort();
+        if matches.is_empty() {
+            tracing::debug!(
+                "Include pattern '{}' matched nothing; no file included",
+                pattern
+            );
+        }
+        Ok(matches.into_iter().map(ConfigSource::File).collect())
     }
+}
+
+/// Does this path contain a glob wildcard, as upstream's `glob.has_magic`
+/// judges it (`*`, `?` or an opening `[`)?
+fn has_glob_magic(pattern: &str) -> bool {
+    pattern.contains(['*', '?', '['])
+}
+
+/// Is the file name this path ends in hidden (a leading dot)?
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
 }
 
 impl Default for Config {
@@ -1168,6 +1274,231 @@ mod tests {
         let printer = config.get_section("printer").unwrap();
         assert_eq!(printer.get_str("tampered"), Some("1"));
         assert!(printer.get("delta_radius").is_none());
+    }
+}
+
+/// Tests for `[include <spec>]` glob expansion ([`Config::resolve_include_sources`]).
+///
+/// Upstream's `_resolve_include` joins the spec onto the including file's
+/// directory, globs it and sorts the matches (`klippy/configfile.py:181-195`),
+/// then parses the files in that order — so the sorted order is behaviour and
+/// the tests below pin it down.
+#[cfg(test)]
+mod include_glob_tests {
+    use super::*;
+
+    /// A temporary directory that removes itself on drop.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "klipperx-include-{}-{}-{}",
+                std::process::id(),
+                name,
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).expect("cannot create the test directory");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write `text` to `dir/name`, creating parent directories as needed.
+    fn write(dir: &Path, name: &str, text: &str) -> PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("cannot create the fixture directory");
+        }
+        std::fs::write(&path, text).expect("cannot write the fixture config");
+        path
+    }
+
+    /// `[include *.cfg]` splices every match, in sorted file-name order: a
+    /// later file's option wins over an earlier file's, exactly as a later
+    /// duplicate inside one file does.
+    #[test]
+    fn a_glob_include_splices_every_match_in_sorted_order() {
+        let dir = TempDir::new("sorted");
+        // Files are created out of order on purpose; the parse order comes
+        // from the sorted matches, not from the directory listing.
+        write(
+            &dir.path(),
+            "b.cfg",
+            "[glob_include]\nfrom_b: 1\nwinner: b\n",
+        );
+        write(
+            &dir.path(),
+            "a.cfg",
+            "[glob_include]\nfrom_a: 1\nwinner: a\n",
+        );
+        // The root is not itself named `*.cfg`: a `printer.cfg` here would
+        // match its own pattern and be a circular include, as upstream is too.
+        let root = write(&dir.path(), "main.txt", "[include *.cfg]\n");
+
+        let (config, sources) = Config::from_file(&root).expect("the config parses");
+
+        let section = config
+            .get_section("glob_include")
+            .expect("both matches are spliced into one section");
+        assert_eq!(section.get_str("from_a"), Some("1"));
+        assert_eq!(section.get_str("from_b"), Some("1"));
+        assert_eq!(
+            section.get_str("winner"),
+            Some("b"),
+            "a.cfg is parsed before b.cfg (upstream's include_filenames.sort())"
+        );
+        assert_eq!(
+            sources,
+            vec![
+                ConfigSource::File(root),
+                ConfigSource::File(dir.path().join("a.cfg")),
+                ConfigSource::File(dir.path().join("b.cfg")),
+            ],
+            "the source list is the expansion order"
+        );
+    }
+
+    /// A pattern may name a subdirectory of the including file's directory.
+    #[test]
+    fn a_glob_include_may_name_a_subdirectory() {
+        let dir = TempDir::new("subdir");
+        write(&dir.path(), "sub/a.cfg", "[glob_sub]\nfrom_a: 1\n");
+        write(&dir.path(), "sub/b.cfg", "[glob_sub]\nfrom_b: 1\n");
+        let root = write(&dir.path(), "printer.cfg", "[include sub/*.cfg]\n");
+
+        let (config, sources) = Config::from_file(&root).expect("the config parses");
+
+        let section = config
+            .get_section("glob_sub")
+            .expect("subdir files are spliced");
+        assert_eq!(section.get_str("from_a"), Some("1"));
+        assert_eq!(section.get_str("from_b"), Some("1"));
+        assert_eq!(sources.len(), 3, "root plus the two subdirectory matches");
+    }
+
+    /// A pattern that matches nothing is not an error — upstream only refuses
+    /// an empty set when the spec carries no wildcard.
+    #[test]
+    fn a_glob_include_that_matches_nothing_includes_nothing() {
+        let dir = TempDir::new("nomatch");
+        let root = write(
+            &dir.path(),
+            "printer.cfg",
+            "[include absent/*.cfg]\n[printer]\nkinematics: none\n",
+        );
+
+        let (config, sources) = Config::from_file(&root).expect("a pattern with no match is fine");
+
+        // "Nothing was included" is observable two ways: the source list is
+        // the root alone, and the config holds only the root's own section.
+        assert_eq!(sources, vec![ConfigSource::File(root)]);
+        assert_eq!(config.sections_vec().len(), 1);
+        assert_eq!(
+            config.get_section("printer").unwrap().get_str("kinematics"),
+            Some("none")
+        );
+    }
+
+    /// `*` does not match a leading dot — Python's `glob` reads a leading `.`
+    /// as literal, so a `.hidden.cfg` beside the matches stays out.
+    #[test]
+    fn a_glob_include_does_not_pick_up_a_dotfile() {
+        let dir = TempDir::new("dotfile");
+        write(&dir.path(), ".hidden.cfg", "[glob_dot]\nhidden: 1\n");
+        write(&dir.path(), "shown.cfg", "[glob_shown]\nshown: 1\n");
+        let root = write(&dir.path(), "main.txt", "[include *.cfg]\n");
+
+        let (config, sources) = Config::from_file(&root).expect("the config parses");
+
+        assert!(config.get_section("glob_shown").is_some());
+        assert!(
+            config.get_section("glob_dot").is_none(),
+            "upstream's glob skips a leading dot"
+        );
+        assert_eq!(sources.len(), 2, "root plus the one non-hidden match");
+
+        // A pattern whose last segment starts with `.` is a literal dot: it
+        // does match the hidden file.
+        let dot_root = write(&dir.path(), "dots.txt", "[include .hidden.*]\n");
+        let (dot_config, _) = Config::from_file(&dot_root).expect("the dot pattern parses");
+        assert!(
+            dot_config.get_section("glob_dot").is_some(),
+            "a literal leading dot matches"
+        );
+    }
+
+    /// A spec without a wildcard still names exactly one file, and its absence
+    /// reports the read error for the resolved path.
+    #[test]
+    fn a_literal_include_that_is_missing_reports_the_read_error() {
+        let dir = TempDir::new("missing");
+        let root = write(&dir.path(), "printer.cfg", "[include absent.cfg]\n");
+
+        let error = Config::from_file(&root).expect_err("a missing literal include is an error");
+
+        assert_eq!(
+            error,
+            format!(
+                "Failed to read file '{}': No such file or directory (os error 2)",
+                dir.path().join("absent.cfg").display()
+            )
+        );
+    }
+
+    /// Files reached through a pattern are cycle-checked like any other include.
+    #[test]
+    fn files_reached_through_a_glob_are_cycle_checked() {
+        let dir = TempDir::new("cycle");
+        write(&dir.path(), "a.cfg", "[include b.cfg]\n");
+        write(&dir.path(), "b.cfg", "[include a.cfg]\n");
+        let root = write(&dir.path(), "main.txt", "[include *.cfg]\n");
+
+        let error = Config::from_file(&root).expect_err("the cycle is refused");
+
+        assert!(error.contains("Circular include detected"), "{error}");
+        assert!(
+            error.contains(&dir.path().join("a.cfg").display().to_string()),
+            "the file that closes the cycle is named: {error}"
+        );
+    }
+
+    /// A pattern that matches the config that wrote it is a circular include,
+    /// not a silent self-read.
+    #[test]
+    fn a_glob_that_matches_its_own_root_is_a_circular_include() {
+        let dir = TempDir::new("selfmatch");
+        let root = write(&dir.path(), "printer.cfg", "[include *.cfg]\n");
+
+        let error = Config::from_file(&root).expect_err("the config includes itself");
+
+        assert!(error.contains("Circular include detected"), "{error}");
+        assert!(error.contains("printer.cfg"), "{error}");
+    }
+
+    /// A URL spec is fetched as given: globbing has no meaning over HTTP.
+    #[test]
+    fn a_url_include_is_never_globbed() {
+        let source = ConfigSource::File(PathBuf::from("/tmp/printer.cfg"));
+
+        let sources = Config::resolve_include_sources("https://example.com/*.cfg", &source)
+            .expect("the URL source resolves");
+
+        assert_eq!(
+            sources,
+            vec![ConfigSource::Url("https://example.com/*.cfg".to_string())]
+        );
     }
 }
 

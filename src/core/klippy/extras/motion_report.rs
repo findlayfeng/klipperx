@@ -21,7 +21,7 @@
 //! # Status and shutdown diagnostics
 //!
 //! [`MotionReport`] answers `get_status` with upstream's five keys
-//! (`motion_report.py:232-263`): `live_position` (three kinematics axes plus
+//! (`motion_report.py:232-264`): `live_position` (three kinematics axes plus
 //! one slot per extra axis — the extruder sits in the fourth), `live_velocity`,
 //! `live_extruder_velocity`, and the two registered-name lists `steppers` and
 //! `trapq`. The position comes from the queues themselves at the MCU's
@@ -29,7 +29,7 @@
 //! upstream reads it (`DumpTrapQ.get_trapq_position`).
 //!
 //! On `klippy:analyze_shutdown` it dumps the queue windows around the stop into
-//! the log (`motion_report.py:188-231`): the stopping MCU's steppers, every
+//! the log (`motion_report.py:188-209`): the stopping MCU's steppers, every
 //! registered trapq, and the requested toolhead position at that instant.
 //!
 //! # What is not ported yet
@@ -39,7 +39,7 @@
 //!   no queue to stream and no slot for it in `live_position` — upstream fills
 //!   that slot from its instance.
 //! * The `"Internal error in stepcompress"` shutdown dump
-//!   (`motion_report.py:225-231`): this port reports that error as its own
+//!   (`motion_report.py:221-230`): this port reports that error as its own
 //!   message with no `step_gen_time` detail, so there is no window to dump.
 //! * The drip-timing guard (`motion_queuing.check_drip_timing`,
 //!   `motion_report.py:125-132`), which withholds trapq entries that may still
@@ -117,7 +117,7 @@ const NEVER_CLOCK: u64 = 1 << 63;
 const STATUS_REFRESH_TIME: f64 = 0.250;
 
 /// How far either side of the shutdown time the diagnostics dump
-/// (`_dump_shutdown`'s `duration=0.100`, `motion_report.py:194`).
+/// (`_dump_shutdown`'s `duration=0.100`, `motion_report.py:188`).
 const SHUTDOWN_DUMP_DURATION: f64 = 0.100;
 
 /// One `dump_trapq` row, in header order: `(time, duration, start_velocity,
@@ -230,7 +230,7 @@ struct TrapqPosition {
     velocity: f64,
 }
 
-/// Where the queue is at `print_time` (`motion_report.py:107-121`).
+/// Where the queue is at `print_time` (`motion_report.py:111-123`).
 ///
 /// `moves` is what the read window `0. .. print_time` returns with `max = 1`:
 /// the newest segment that had already started. `None` when the queue holds
@@ -238,19 +238,19 @@ struct TrapqPosition {
 fn trapq_position(moves: &[MoveSegment], print_time: f64) -> Option<TrapqPosition> {
     let segment = moves.first()?;
     // A read past the segment's end holds its end (upstream clamps the same
-    // way, `motion_report.py:113`).
+    // way, `motion_report.py:118`).
     let move_time = (print_time - segment.print_time).clamp(0.0, segment.move_t);
     let coord = segment.coord(move_time);
     Some(TrapqPosition {
         pos: [coord.x(), coord.y(), coord.z()],
         // `start_v + accel * t`, with the queue's halved acceleration doubled
-        // back (`motion_report.py:120`).
+        // back (`motion_report.py:122`).
         velocity: segment.start_v + 2.0 * segment.half_accel * move_time,
     })
 }
 
 /// One `get_status` answer from the quantities already read
-/// (`motion_report.py:232-263`).
+/// (`motion_report.py:232-264`).
 ///
 /// `live_position` is three kinematics axes plus one slot per extra axis; the
 /// caller builds it, so its length is the machine's axis count.
@@ -274,7 +274,8 @@ fn live_status(
 // Shutdown diagnostics (pure log formatting, unit-tested directly)
 // ===========================================================================
 
-/// One stepper's `queue_step` block (`DumpStepper.log_steps`), oldest first.
+/// One stepper's `queue_step` block (`DumpStepper.log_steps`,
+/// `motion_report.py:37-45`), oldest first.
 ///
 /// `None` when the window is empty, which logs nothing (upstream returns
 /// before printing). Unlike the batch stream this does **not** stop at a
@@ -296,7 +297,8 @@ fn stepper_dump_block(stepper: &str, mcu: &str, steps: &[HistoryStep]) -> Option
     Some(out.join("\n"))
 }
 
-/// One trapq's move block (`DumpTrapQ.log_trapq`), oldest first.
+/// One trapq's move block (`DumpTrapQ.log_trapq`, `motion_report.py:101-110`),
+/// oldest first.
 fn trapq_dump_block(name: &str, moves: &[MoveSegment]) -> Option<String> {
     if moves.is_empty() {
         return None;
@@ -324,7 +326,7 @@ fn trapq_dump_block(name: &str, moves: &[MoveSegment]) -> Option<String> {
 }
 
 /// The requested toolhead position at the shutdown time
-/// (`motion_report.py:227-231`) — Python's `"...: %s"` of the `pos` tuple.
+/// (`motion_report.py:202-209`) — Python's `"...: %s"` of the `pos` tuple.
 fn shutdown_position_block(shutdown_time: f64, pos: [f64; 3]) -> String {
     format!(
         "Requested toolhead position at shutdown time {shutdown_time:.6}: ({:?}, {:?}, {:?})",
@@ -335,6 +337,7 @@ fn shutdown_position_block(shutdown_time: f64, pos: [f64; 3]) -> String {
 // ===========================================================================
 // Per-instance batch state
 // ===========================================================================
+
 /// One `dump_stepper` instance: one MCU stepper's stream.
 struct DumpStepper {
     printer: Weak<Printer>,
@@ -412,7 +415,7 @@ fn resolve_trapq(
 }
 
 /// A trapq's position at `print_time`, read through the window that holds the
-/// segment covering it (`DumpTrapQ.get_trapq_position`, `motion_report.py:107`).
+/// segment covering it (`DumpTrapQ.get_trapq_position`, `motion_report.py:111-123`).
 fn read_trapq_position(
     toolhead: &ToolHeadObject,
     trapq: usize,
@@ -457,7 +460,7 @@ pub struct MotionReport {
     status_cache: Mutex<StatusCache>,
 }
 
-/// The cached `get_status` answer (`motion_report.py:146-150`).
+/// The cached `get_status` answer (`motion_report.py:151-157`).
 #[derive(Debug)]
 struct StatusCache {
     next_status_time: f64,
@@ -489,7 +492,7 @@ impl MotionReport {
             )
             .expect("`motion_report` is registered once per machine");
         // `klippy:analyze_shutdown` — the queue windows around a stop
-        // (`motion_report.py:162-163`). The handler holds the object weakly, as
+        // (`motion_report.py:159-161`). The handler holds the object weakly, as
         // the object holds the printer weakly: a strong handle either way is a
         // cycle.
         {
@@ -597,7 +600,7 @@ impl MotionReport {
     }
 
     /// The `get_status` answer, read fresh (upstream's `get_status` body after
-    /// the refresh gate, `motion_report.py:150-263`).
+    /// the refresh gate, `motion_report.py:232-264`).
     ///
     /// The position is read from the queues at the MCU's estimated print time —
     /// not from the planner's commanded position — so a status query shows what
@@ -649,7 +652,7 @@ impl MotionReport {
             };
             live_position[E_AXIS + index] = position.pos[0];
             // Upstream reports the first extra axis' velocity as the extruder's
-            // (`motion_report.py:259-260`).
+            // (`motion_report.py:257-258`).
             if index == 0 {
                 live_extruder_velocity = position.velocity;
             }
@@ -663,7 +666,7 @@ impl MotionReport {
         )
     }
 
-    /// `_handle_analyze_shutdown` (`motion_report.py:225-243`): log the queue
+    /// `_handle_analyze_shutdown` (`motion_report.py:210-230`): log the queue
     /// windows around the stop.
     fn handle_analyze_shutdown(&self, msg: &str, details: &HashMap<String, Value>) {
         for block in self.shutdown_report(msg, details) {
@@ -728,7 +731,7 @@ impl MotionReport {
         )
     }
 
-    /// `_dump_shutdown` (`motion_report.py:195-223`): the stepper queue-step
+    /// `_dump_shutdown` (`motion_report.py:188-209`): the stepper queue-step
     /// windows, every trapq's window and the toolhead's requested position, as
     /// the log blocks to emit.
     fn dump_shutdown(
@@ -786,7 +789,7 @@ impl MotionReport {
 }
 
 impl PrinterObject for MotionReport {
-    /// Upstream's `PrinterMotionReport.get_status` (`motion_report.py:244-263`),
+    /// Upstream's `PrinterMotionReport.get_status` (`motion_report.py:232-264`),
     /// behind its `STATUS_REFRESH_TIME` cache: a client that polls faster than
     /// four times a second gets the last answer rather than another pair of
     /// queue reads.

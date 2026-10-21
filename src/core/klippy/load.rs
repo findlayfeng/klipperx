@@ -129,9 +129,12 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 ///
 /// This is the mechanism, not an allowance for one module: an id here is loaded
 /// whether or not its section exists, unconditionally, the way upstream's list
-/// is. The rest of upstream's list — `gcode_move`, `homing`, `statistics`,
-/// `manual_probe`, `tuning_tower`, `garbage_collection` — is not ported yet, so
-/// those modules are still absent from a config that does not name them.
+/// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
+/// by the toolhead's own factory (which `ensure`s them), and `homing` is the
+/// kinematics layer rather than a loadable module, so none of those three needs
+/// an entry. `tuning_tower` has no implementation here; `statistics` and
+/// `garbage_collection` exist only in part (the `system_stats` object and the
+/// reactor's latency warning stand in for their log summaries).
 const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
 
 /// Every section id this host knows, in load order.

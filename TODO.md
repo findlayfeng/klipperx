@@ -88,10 +88,10 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——除 `sdcard_loop` 的三条命令外均已落地，见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`，以及 `SET_PRESSURE_ADVANCE` 尚未作用于运动，见 H6 节 | F5、F6、F7、C1 |
-| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor` 已落地；余项＝固件按钮查询、`trigger_analog` 宿主节、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
-| H8 | LCD 显示与菜单（display/*）——面板驱动均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi/sh1106）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）与固件 `lcd_hd44780.c`/`lcd_st7920.c`，见 H8 节 | F9、G1b |
+| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
+| H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi，含各自的 `config_*`/send 命令）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`bed_mesh` 的 faulty 区域与 `set_zero_reference`、`skew_correction`/`z_thermal_adjust`/`tuning_tower`，见 H9 节 | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`motion_report` 两端点已落地）——余项＝G2/G3 弧规划、`manual_stepper` 自己的 trapq（出步）与回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点已落地）——余项＝G2/G3 弧规划与 G17–G19 平面选择、`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -112,7 +112,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | # | 事项 | 依赖 |
 |---|---|---|
 | M1 | 桥下游**端口模块化**与**没有 admin 通道的设备**共存：端口按 `[uart_device]`/`[can_device]` 定义、子设备引用端口节名，归属由主机经桥自己的 admin 通道告知桥（分六期：P1 配置面 → P2 固件端口表+端口级命令 → P3 attach 端到端 → P4 判定与传输正交 → P5 CAN 上游/复位 → P6 多站串口（RS-485，后置））。**CAN 下游端口（拓扑 B：CAN 当桥的一个端口，切片载具）已落地并真机验收**，见[协议页](docs/klippy/developer-manual/serial-mux-protocol.md)的 CAN 下游端口一节 | — |
-| M2 | 通过 **admin 流程复位固件**（per-device reset；今天的复位只有线级手段，共享路径被强制成 `command`）——**并入 M1 一起做**：固件命令族落 **P2**（与 `SET_PORT_NODEID` 同机制）、主机侧 `restart_method` 接入落 **P3** | M1 |
+| M2 | 通过 **admin 流程复位固件**（per-device reset）——**已落地**：`restart_method: admin` 在合法值表，桥自身走 `bridge_admin_restart`、下游端口走 `RESET_PORT`/`RESTART_DEVICE`（三传输都实现）；legacy 走端口节 `uart_restart_method`。余项只是真机极性与保持验证 | M1 |
 
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
@@ -136,10 +136,6 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
       **两条兜底**——没有 `[printer]`（lookup 不到 `toolhead`）或资源不可调度
       （`min_schedule_time()` 为 `None`）时保留立即路径（`update_digital_out`/`update_pwm`）。
       **余项**：`heaters` 无队列化消费者待切（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7` 已于 2026-10-03 切换）。
-- [ ] **`output_pin` 的 `static_value` / `TEMPLATE` + `template_evaluator`**（display 模板，
-      `output_pin.py:88-170`）——与开关 GPIO 本身无关；`display_template` 机制已在（工厂表里有
-      `display_template`），缺的是把它接到 `SET_PIN TEMPLATE=`。**语料 0 处使用**，可按需再补
-      （`scale` 已随 T8 落地并归档）。
 
 ### S1 压力测试工具（`klipperx stress`）剩余
 
@@ -211,7 +207,9 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 ### G4 运动命令（G0/G1/G28/G92/M114…）
 
 - [ ] **G4-2 外围**：extra-axes 的 `axis_map` 已落地（`gcode_move` 随 `toolhead:update_extra_axes` 重建，`G1 A…` 按字母寻址并进入规划器；2026-10-18），
-      仍缺 **额外轴真正出步**（`manual_stepper` 的 trapq，见 H10）与 `Coord` 的定容上限（`MAX_AXES = 8`，第 5 个字母轴不映射）；
+      额外轴出步也已落地（`manual_stepper` 自有 trapq，`MOVE=` 与 `G1 A…` 都真出步）。
+      仍缺 **`Coord` 的定容上限**：`MAX_AXES = 8`（E + 4 个字母轴，第 5 个不映射）、
+      `G1_PARAMS` 静态表不为额外字母提供补全、`reset_last_position` 的尾巴沿用上一段（toolhead 只报 4 轴）；
       上游 `ToolHead.manual_move` / `ToolHead.add_extra_axis` 的其余调用方（`toolhead:manual_move` 由 `safe_z_home` 发、
       `toolhead:update_extra_axes` 由 `ToolHeadObject` 发，见下表；`extruder:activate_extruder` 已由 `ACTIVATE_EXTRUDER` 发出）、
       `bed_mesh`（`set_move_transform` 已实现，`bed_tilt` / `exclude_object` 在用）。
@@ -221,10 +219,12 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [ ] `bed_mesh/dump_mesh` 与其余 `*/dump_*`（mux 机制已就绪，实例随各自 extras 落地）。
-      `motion_report/dump_trapq` / `dump_stepper` **已落地**（2026-10-18，`extras/motion_report.rs`）；
-      仍缺的是它的 `get_status`（`live_position`/`live_velocity`/`live_extruder_velocity`）与
-      shutdown 诊断（`analyze_shutdown` 的窗口转储）。
+- [ ] **dump 端点家族残余**（mux 机制已就绪，实例随各自 extras 落地）。已落地：
+      `bed_mesh/dump_mesh`、`motion_report/dump_trapq` 与 `dump_stepper`、`adxl345`/`ldc1612`/`mpu9250`
+      （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`tmc/stallguard_dump`。
+      仍缺：`load_cell_probe/dump_taps`（tap 事件未实现）、`icm20948`/`bmi160`/`lis2dw`/`angle` 四个
+      dump（随未移植的 extras 缺席），以及 `motion_report` 的 `get_status`
+      （`live_position`/`live_velocity`/`live_extruder_velocity`，现返回 `{}`）与其 shutdown 诊断窗口转储。
 
 ### F MCU 基础资源（F6、F8、F9）
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
@@ -244,13 +244,7 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
       `secondary.get_clock()`——`ClockEstimator::new` 把三个字段都清零，未 seed 时它返回 0，
       于是 `adjusted_freq = (0 - sync1_clock)/4 s` 为负、`set_mapping` 发出**错的 offset**
       （频率部分现在由 `time_mapping` 回落到字典频）。修法方向：`SecondarySync::calibrate` /
-      `recalibrate` 加"已有样本"闸门。落点在 `mcu/object.rs`（本轮 6 lane 的边界外，故只登记）。
-
-- [ ] **样本日期比上游晚一个报告周期**（对拍后确认的既有偏移，无差分影响）：上游把最后一个样本
-      定在 `next_clock - report_clock`（`mcu.py:636-646`，老格式 `:635` 同），本仓定在 `next_clock`。
-      两边消费者都再加 `SAMPLE_COUNT * SAMPLE_TIME`，所以这是一个**常量平移**：PID/平滑用差分不受影响，
-      只有 7 s 陈旧判定的绝对边界与报告时刻差一个周期（`adc_temperature` 的 `REPORT_TIME`）。
-      要真“同形”时改 `adc.rs` 的 index 公式并同步现有时序测试。
+      `recalibrate` 加"已有样本"闸门。落点在 `mcu/object.rs`。
 
 #### F6 SPI 总线
 
@@ -286,7 +280,10 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 - [ ] 固件 **buttons 查询**（`config_buttons` / `buttons_add` / `buttons_query` / `buttons_ack`）——
       宿主注册表已在，没有发送方。
-- [ ] `sdcard` / `sdio`、`lcd_hd44780` / `lcd_st7920`、`initial_pins`。
+- [ ] `initial_pins`（固件 `initial_pins.c` 是**编译期**行为，宿主不消费 `INITIAL_PINS` 常量）；
+      `sdcard`/`sdio` **不是缺口**——上游 klippy 没有对应宿主模块（`sdiocmds.c` 只有固件侧，
+      `virtual_sdcard`/`sdcard_loop` 是纯宿主实现）；`lcd_hd44780`/`lcd_st7920` **已落地**
+      （`display/hd44780.rs`、`display/st7920.rs` 的 `config_*` 与 send 命令齐备）。
 - 这些是 extras，不阻塞运动；消费者见 H5（TMC/tmcuart）、H6（加速度计）、
       H7（buttons/trigger_analog）、H8（lcd）。
 
@@ -316,9 +313,6 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `debug_output` 字段继续供语料 harness 使用），每个 MCU 的 `-d` 字典路径同样不做（只服务上游 `-o`）。
       `software_version` 已由宿主 `set_start_args` 注入
       （`src/klippy.rs:324`）并被 `info` 与 `M115` 读取——接线已完成并归档。
-- [ ] **rollover 的 `log_config`**：上游每次 `_read_config` 都把整份配置写进 rollover
-      （`configfile.py:482-487`、`klippy.py:118`），本仓只有 `versions` 块；重启重读上线后，
-      「这次重载的是哪份配置」在日志里看不到。
 - [ ] **`StartArgs.start_reason` 已死**：上游主循环每轮 `start_args['start_reason'] = res`
       （`klippy.py:368`）、`mcu.py:682`/`:1060` 从字典读；本仓 MCU 改读
       `Printer::start_reason()`（`reset_for_restart` 每轮更新，语义一致），
@@ -395,7 +389,7 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 `i2c`/`spi` 复用已有节类型），子设备引用**端口节名**；`[bridge]`/`[bridge_port]`/`bridge_admin`
 都不要（桥与端口从引用推算，legacy 从「无 `uuid:` + uart 端口」推算）；**归属由主机经桥自己的
 admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下游设备完全不参与**——这就是
-"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，覆盖见 [`testing.md`](docs/klippy/developer-manual/testing.md)）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4；CAN **下游端口**（拓扑 B，切片载具）已落地并真机验收，见[协议页](docs/klippy/developer-manual/serial-mux-protocol.md)的 CAN 下游端口一节）、P6 多站串口（RS-485）**整体挂「待测（硬件）」**（需 485 设备，不阻塞进度）。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见 [`TESTING.md`](TESTING.md) 的 M2-1）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见开发手册模块表的 `host_libraries.rs` 行。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 `testing.md` 的 `restart.rs` 行。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
+"与没有 admin 的设备共存"的答案。**依赖**：无；**状态**：✅ 配置面（P1）、固件命令族（P2）、attach 走端口两侧（legacy 与命名，P3）、固件端口对象化（P7）、端口路径运行期化（R1）、一进程一份 host 库（L1）、host 后端按槽多路流（R2）均已落地；**配置驱动的整链端到端已有真固件验收**——真 `klipper.elf` 独立进程当下游（单端口整链 + 双端口同桥并发，覆盖见 [`testing.md`](docs/klippy/developer-manual/testing.md)）。**余项**：L3（linux 控制台接 mux + `-U` 身份）✅、P4 判定与传输正交 ✅（规则 7 显式计入下游台数）、P5 CAN 上游 **部分落地 + 余项挂「待测（硬件）」**（主机侧端口命令的 CAN 单元发送 API + 固件 `MUX_CAN` 载体 + 编译覆盖目标已落；`[can_device]` 下游端口后端 `BRIDGE_PORT_CAN`、CAN 上游 attach 端到端、`vcan` 夹具——**归硬件待测，不阻塞进度**，见 [`TESTING.md`](TESTING.md) 的 M1-4；CAN **下游端口**（拓扑 B，切片载具）已落地并真机验收，见[协议页](docs/klippy/developer-manual/serial-mux-protocol.md)的 CAN 下游端口一节）、P6 多站串口（RS-485）**后端尚未实现**（不是「等硬件」）：主机侧的多站分组已在（`port_flags` + 协议页规则 10），但固件的半双工收发与方向控制、以及宿主侧对应支持**零代码**（`TESTING.md` 自陈；全树无 rs485/half-duplex/direction 实现）——需先写完才谈得上真机验证，需 485 设备才能验收。**已知缺陷**（留档、不阻塞）：原生 USB CDC 的 legacy 设备没有经桥硬复位手段（CDC 感知方案已被用户否掉，见 [`TESTING.md`](TESTING.md) 的 M2-1）；同进程两份 host 库无法一起退出——已按「一进程一份库」规则化并落两道守卫（配置层 + 运行期按路径），见开发手册模块表的 `host_libraries.rs` 行。（原「命名设备在宿主库桥上握手后库不卸载」的诊断已被推翻：真因是测试用默认 current-thread 运行时，见 `testing.md` 的 `restart.rs` 行。）**真机项**：[`TESTING.md`](TESTING.md) 的「M1/M2」一节。**测试策略（2026-10-14）**：真机/外设项后移——先让全部代码在软件侧说得通，等 M1+M2 落地后统一跑一次真机，清单见 [`TESTING.md`](TESTING.md) 的「M1/M2」一节。
 
 **工程余项（不阻塞，已排期）**：
 
@@ -485,7 +479,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] `respond.py`（`RESPOND` / `M118`，批 #29）。
 - 前置：**G1b** 的 `create_gcode_command` 与参数访问器（宏类模块要构造 gcmd）。
 - [ ] 已知偏差（2026-10-18 审出，客服端宏会踩）：无 `[extruder]` 时上游 `printer.toolhead.extruder` 是 `''`（`DummyExtruder.get_name()`），本仓恒为 `"extruder"`，于是 `_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_EXTRUDE` 那类 `!= ''` 守卫在本仓拦不住、直接去查未注册的 `printer['extruder']`。有挤出机时两者一致。
-- [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，`statistics` / `tuning_tower` / `garbage_collection` / `homing` 四个本仓仍无对应实现（`idle_timeout` 已于 2026-10-18 补上，见 `load.rs` 的 `DEFAULT_MODULES`）。
+- [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，本仓 `DEFAULT_MODULES` 只收 `idle_timeout`
+      （`gcode_move`/`manual_probe` 由 toolhead 工厂 `ensure` 无条件建立，不经该表）。逐项现状：
+      `tuning_tower` **真缺**（无文件、无 `TUNING_TOWER`）；`statistics` 只缺 1 Hz 汇总日志（对象已落地，
+      见 H11）；`garbage_collection` 只缺日志汇总（Rust 无 GC 冻结机制，只有延迟告警）；
+      `homing` **不是缺口**（功能在 `motion/kinematics.rs` 的 `Homing` 与 toolhead 内，只是没有同名模块）。
 
 - [x] **归零丢报告不再锁死（2026-10-18 真机）**：`trsync_state` 路由器提前到会话 `attach` 安装、无主 oid 静默、
       `on_restart` 发 `trsync_start(oid,0,0,0)` 断掉被杀进程留下的周期报告；等触发加 5 s 兜底
@@ -553,8 +551,12 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       重走 drip 段，重走出来的步落在 compressor 的 `last_step_clock` 之前 ⇒ `check_line` 报
       `Invalid sequence`。修法：地平线起点取 `max(两处)`，并在未触发分支补上游的收尾（`&[]` 不标
       homed）。仍待真机复验一次。
-- [ ] **both-edge（`dedge`）**：`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，固件配置侧
-      没有 both-edge 步进模式，所以 TMC 不写 `dedge`。属优化项，不影响正确性。
+- [ ] **both-edge（`dedge`）**：宿主侧不选用——`PrinterStepper::get_pulse_duration()` 第二项恒 `false`，
+      `mcu/resource/stepper.rs` 只发 `invert_step` + `step_pulse_ticks`，所以 TMC 从不写 `dedge`。
+      **固件是支持的**：`src/stepper.c` 声明 `STEPPER_STEP_BOTH_EDGE=1`、`invert_step < 0` 走单定时器路径，
+      `Kconfig` 的 `WANT_STEPPER_OPTIMIZED_BOTH_EDGE` 默认 y。缺的是主机侧按
+      `STEPPER_STEP_BOTH_EDGE`/`STEPPER_OPTIMIZED_UNSTEP` + 脉宽算出 `want_both_edges`
+      （上游 `stepper.py:86-113`）并未 `invert_step=-1`。属优化项，不影响正确性。
 - 依赖 F6/F7、C1（stepper 对象）；`tmcuart` 固件资源仍在 **F9** 名下。
 
 ### H6 传感器与块状数据
@@ -575,7 +577,9 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
   - [ ] `dump_taps` / `LOAD_CELL_TEST_TAP` 仍未接（`load_cell_probe` 的探测结果族）。
 
 - [ ] **`angle`**（磁编码传感器）——无文件、无 section。
-- [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `src/sensor_*.c` 已有，宿主未建）。
+- [ ] **其余加速度计**：`icm20948`、`lis2dw`、`lis3dh`、`bmi160`（固件 `sensor_icm20948.c` /
+      `sensor_lis2dw.c` / `sensor_bmi160.c` 已有，宿主未建）。注意 **`lis3dh` 不需要单独的固件支持**：
+      上游 `lis3dh.py` 复用 `lis2dw` 的类型分支，`Kconfig` 也把两者合在一个选项。
 - [ ] **`ads1x1x`**（`ads1x1x.py`）。
 - [ ] **`adxl345` 的寄存器 setup / `_convert_samples` 缩放**（`adxl345.rs:38-40` 自述）。
 - [ ] **`SET_PRESSURE_ADVANCE` 作用于运动**：现在只写槽与 status，运动/求解器不读
@@ -590,15 +594,17 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 `pulse_counter`（批 #8，接通 `tachometer_pin`）、`filament_switch_sensor`、`filament_motion_sensor`
 （各带 `section!`，`SET_FILAMENT_SENSOR` 走 mux 注册）。
 
-- [ ] 固件按钮查询（`buttons.c`）/ `query_adc`——宿主 `[buttons]` 已在（`extras/buttons.rs`），
-      **固件查询没有发送方**（`buttons.rs:42` 自述）。
+- [ ] 固件按钮查询（`buttons.c`）/ `query_adc`——宿主 `[buttons]` 注册表已在但**查询没有发送方**；
+      `query_adc` 整个模块不存在（被它挡住的 `gcode_button` 的 `analog_range` 与 `adc_scaled` 已自述）。
 - [x] `pulse_counter.py`（批 #8：host 侧 `pulse_counter.rs` 落地并接通 `tachometer_pin`；`config_counter`/`query_counter` 按字典编码，真机验证仍待 T6）。
-- [ ] `trigger_analog` 宿主节（`extras/trigger_analog.rs` 现只有滤波设计与 `//!` 说明，**无 `section!`**；
-      固件命令层 `cmd/trigger_analog.rs` 已在，`load_cell_probe` 是现有消费面）。
+- [x] `trigger_analog` —— **不是缺口**：上游本就无 `load_config`/配置段（`trigger_analog.py` 只有
+      `MCU_trigger_analog` 资源类），本仓三件套齐备：滤波设计（`extras/trigger_analog.rs`）、
+      六条报文（`cmd/trigger_analog.rs`）、资源层（`mcu/resource/trigger_analog.rs`），
+      消费面 `load_cell_probe` / `probe_eddy_current`。
 - [ ] 线宽传感器：`hall_filament_width_sensor`、`tsl1401cl_filament_width_sensor`——无文件、无 section
       （断料两项**已落地**，见上）。
-- [ ] 固件 `initial_pins.c` 的初始引脚状态。
-- [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`、`palette2.py`。
+- [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`（含其内嵌 PCA9685 PWM）、`palette2.py`。
+- 固件 `initial_pins.c` 的初始引脚状态归 **F9** 名下（宿主不消费该常量）。
 - 依赖 F3（GPIO）、F5（ADC）、F9。
 
 ### H8 LCD 显示与菜单
@@ -648,14 +654,16 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       **profile 命令族已落地（2026-10-19）**：`BED_MESH_PROFILE`（LOAD/SAVE/REMOVE，存 `[bed_mesh <name>]`、
       `SAVE_CONFIG` 写回）、`BED_MESH_OUTPUT`（`PGP`）、`BED_MESH_MAP`、`BED_MESH_OFFSET`（`X`/`Y`/**`ZFADE`**），
       `BED_MESH_CALIBRATE PROFILE=` 自动存盘；`bed_mesh/dump_mesh` 的 `profiles` 改读真实表。
-      仍未做：faulty 区域替换、`set_zero_reference`（`ZERO_REFERENCE` 无人调用）、`mesh_min`/`mesh_max`
-      在 dump 端点仍取配置选项而非已装载网格。
-- [ ] 调平：`bed_mesh.py` ◐（**已落地**：`[bed_mesh]` 段与全量选项、探测点生成、
-      `BED_MESH_CALIBRATE` 逐点探测存格（按 Y 分行、行内 X 升序）、`BED_MESH_CLEAR`、
-      `bed_mesh/dump_mesh` 端点（2026-10-03）、插值网格（2026-10-06 `07072b9`）、
-      **fade + `MoveSplitter` + move transform 注册（2026-10-06 `e462770`——已标定后 `G1` 真的走网格补偿）**；
-      **待做**：faulty 区域替换、`set_zero_reference`
-      （`BED_MESH_PROFILE`/`OUTPUT`/`MAP`/`OFFSET`）。）
+- [ ] **`bed_mesh` 余项（唯一登记处）**：
+      1. **faulty 区域替换**（上游 `_process_faulty_regions`，`bed_mesh.py:949-1000`）：本仓
+         `FaultyRegion` 只解析成字段（`bed_mesh.rs` 的 `faulty_regions`），插值/探测/`get_status`/dump
+         **全部不看它**；
+      2. **`ZERO_REFERENCE`**：`set_zero_reference`（上游 `bed_mesh.py:1409`）没有命令注册，
+         现在全仓只有模块文档里提到它；
+      3. **dump 端点的 `mesh_params` 界限**：`bed_mesh/dump_mesh` 用配置现算的点算界限，而上游用
+         已装载网格的探测点包围盒（`z_mesh.get_mesh_params()`）——`LOAD=` 一个不同规模的 profile 后两者不同。
+         （注意 `calibration.config.mesh_min/mesh_max` 取配置**是对的**，上游 `dump_calibration` 同样如此；
+         `get_status` 也已用装载网格。）
 - [x] 螺丝：`screws_tilt_adjust` ✅；`bed_screws` **段 + 命令族均已落地**（2026-10-06，`55f534a`：`BED_SCREWS_ADJUST`
       常驻注册，`ACCEPT`/`ADJUSTED`/`ABORT` 随会话注册与注销；粗调→精调两遍；`bed_screws.test` 走真命令转绿）。
       有意偏离一处（已登记）：注册中途失败时本仓收回半组命令并复位，上游会留下半个命令组（`upstream-deviations.md`）。
@@ -701,7 +709,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
       flush/active 回调全部 `catch_unwind`；panic 记 `error!`（带回调名与 panic 文本）后丢弃那个定时器，
       其余照常调度（详见 `docs/klippy/developer-manual/architecture.md`）。
 
-- [ ] `statistics.py`：周期上报主机统计（CPU/内存；`event/stats.rs` 是 MCU 调度时序上报，不是它）。
+- [ ] `statistics.py` 的 **`PrinterStats` 半**：上游每秒打一行主机统计汇总（`statistics.py:47-72`）。
+      对象那半已落地（`extras/system_stats.rs` 无条件注册 `system_stats`，报
+      `sysload`/`cputime`/`memavail`/`dropped_logs`/`dispatch`），本仓以反应堆延迟告警替代该日志行；
+      要补时需要 `PrinterObject` 上的 `stats` 回调位（现在 trait 没有）。
 - （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
   `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
 - [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs`（现迁移至
@@ -729,11 +740,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 ### H12 核心工具补齐
 
-- [ ] `util.py` 的反射与注册表 helper **剩余**：`get_heater` / `get_sensor`
-      （前缀式 `lookup_objects`、`statuses`、`get_status -> serde_json::Value` 已随 FW2
-      落地并归档，见 `printer.rs:622` `:654` `:676`；**Q5** 已定为只读反射）。
-- [ ] `pins.py` 消费侧接口（`get_pin_type` 查询面）——重命名/别名与 `PinType` 已有
-      （`pins.rs:78` `:533`），查询入口随 **H7** 等消费者再补。
+- [ ] 便捷 helper（**参照系待定**）：`get_heater` / `get_sensor` 这类封装。**注意口径**：语料钉定的上游
+      `third_party/klipper/klippy/util.py` **没有**这两个函数——它们是更新版上游才有的东西，
+      本仓在语料里无参照。现有能力已足够：前缀式 `lookup_objects`、`statuses`、
+      `get_status -> serde_json::Value`（`printer.rs`）。按 AGENTS 「一切对照读
+      `third_party/klipper`、语料是最终仲裁」，这条先当「新上游特性、无覆盖」挂着，不排期。
+- [ ] `pins.py` 消费侧 `get_pin_type` 查询面——同样参照系待定：语料钉定的上游 `pins.py` 没有该函数；
+      本仓以 typed 入口（`setup_digital_out`/`setup_pwm`/`setup_adc`）代替上游的 `setup_pin(type, desc)`，
+      `PinType` 与 `lookup_pin` 已有（`pins.rs`）。
 
 ## 未决问题
 

@@ -65,8 +65,8 @@ use crate::core::klippy::reactor::{Reactor, TimerHandle};
 
 use super::aip31068_spi::Aip31068Spi;
 use super::hd44780::Hd44780;
-use super::menu::MenuManager;
 use super::hd44780_spi::Hd44780Spi;
+use super::menu::MenuManager;
 use super::ssd1306::Ssd1306;
 use super::st7920::ST7920;
 use super::uc1701::Uc1701;
@@ -1177,8 +1177,13 @@ mod tests {
                 // registry up (`display/display.py:168-174`), before the
                 // display itself is registered.
                 "display_template",
-                "display",
+                // The menu loads `gcode_macro`, then its key buttons, and
+                // registers itself (`menu.py:713-721`) — all before the display
+                // it belongs to.
                 "gcode_macro",
+                "buttons",
+                "menu",
+                "display",
                 "idle_timeout"
             ]
         );

@@ -79,6 +79,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::gcode_macro::PrinterGCodeMacro;
 use crate::core::klippy::extras::print_stats::PrintStats;
+use crate::core::klippy::extras::sdcard_loop::SdCardFile;
 use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -106,6 +107,10 @@ const DEFAULT_ERROR_GCODE: &str = "
 const PAUSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 section!("virtual_sdcard", order = 30, load = load_config);
+
+/// The name the object is registered under, and the name a consumer looks it
+/// up by (`printer.load_object(config, "virtual_sdcard")`).
+pub const VIRTUAL_SDCARD_OBJECT: &str = "virtual_sdcard";
 
 /// The `[virtual_sdcard]` module object (upstream's `VirtualSD`).
 ///
@@ -769,15 +774,18 @@ impl VirtualSdCard {
             }
 
             *self.cmd_from_sd.lock().unwrap() = false;
-            file_position = next_file_position;
+            // Upstream `self.file_position = self.next_file_position` reads the
+            // slot back rather than reusing the line's own end: a command that
+            // moved the cursor (`SDCARD_LOOP_END` seeking to a loop start)
+            // rewrote it, and this is where the loop picks that up.
+            let current_next = *self.next_file_position.lock().unwrap();
+            file_position = current_next;
             *self.file_position.lock().unwrap() = file_position;
 
             // Skip-around check (upstream `next_file_position !=
             // self.next_file_position`): a command changed the position during
             // `run_script`. Seek to the new position and clear the buffers.
-            let current_next = *self.next_file_position.lock().unwrap();
             if current_next != next_file_position {
-                file_position = *self.file_position.lock().unwrap();
                 if let Some(reader) = self.reader() {
                     if let Err(e) = self
                         .seek_reader(reader, SeekFrom::Start(file_position))
@@ -872,6 +880,31 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// What `[sdcard_loop]` needs from this module (upstream's
+/// `get_file_position`/`set_file_position`/`is_cmd_from_sd`,
+/// `virtual_sdcard.py:233-238`).
+impl SdCardFile for VirtualSdCard {
+    /// `is_cmd_from_sd` (`virtual_sdcard.py:237-238`): `true` only while the
+    /// replay loop is dispatching a line it read from the file.
+    fn is_cmd_from_sd(&self) -> bool {
+        *self.cmd_from_sd.lock().unwrap()
+    }
+
+    /// `get_file_position` (`virtual_sdcard.py:233-234`): the position the loop
+    /// has set for the *next* line, i.e. the line after the one being
+    /// dispatched — which is where a loop body starts.
+    fn file_position(&self) -> u64 {
+        *self.next_file_position.lock().unwrap()
+    }
+
+    /// `set_file_position` (`virtual_sdcard.py:235-236`): the replay loop reads
+    /// this slot back after each line and seeks when it changed, so a loop end
+    /// rewinds the next read by writing the loop start here.
+    fn set_file_position(&self, position: u64) {
+        *self.next_file_position.lock().unwrap() = position;
+    }
 }
 
 impl std::fmt::Debug for VirtualSdCard {

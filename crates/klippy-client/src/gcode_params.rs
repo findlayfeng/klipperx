@@ -337,6 +337,10 @@ pub const BUILTIN: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "SET_Z_THERMAL_ADJUST",
+        &["ENABLE", "TEMP_COEFF", "REF_TEMP"],
+    ),
+    (
         "SHAPER_CALIBRATE",
         &["AXIS", "CHIPS", "MAX_SMOOTHING", "NAME"],
     ),

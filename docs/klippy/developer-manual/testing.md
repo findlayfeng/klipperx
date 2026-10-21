@@ -250,7 +250,7 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
 | ⑫ 配置 include 与依赖减肥（2026-10-21） | `[include]` 对齐上游 `glob.glob`（相对包含者目录、`*`/`?`/`[]` 非递归、不匹配前导点、排序、通配零匹配静默；保留环检测）+ URL 取源从 `reqwest`换 `ureq`（openssl/native-tls/aws-lc 全部离开依赖树，`cargo tree` 442→328 行；新增 10 s/5 s/4 MiB 边界）（+13 个 `fn test_`） | **46.5 s** | 3648 |
 | ⑬ 运动数学与设备层健壮性（5 lane + 直提交，2026-10-21） | `G2`/`G3` 弧与 `G17`–`G19` 平面、压力提前（ESPA 解析积分）真驱动挤出机、`objects/subscribe` 定时器环改 `Weak`、`serial.rs` 设备层九条修补、CAN 读回定布局与写失败即停（+34 个 `fn test_`） | **46.8 s** | 3682 |
 | ⑭ 调平/回放/观测收尾（4 lane + 1 重派，2026-10-21） | `bed_mesh` faulty 替换 + `ZERO_REFERENCE` + dump 界限、`sdcard_loop` 三命令与 `SdCardFile`、`motion_report.get_status` + shutdown 转储、假件步进位置累积（`--task motion` 假板 e2e）、压力提前 pre/post 活跃窗口（+30 个 `fn test_`） | **46.6 s** | 3712 |
-| ⑮ 运动地基与调平余项（6 lane，2026-10-21） | 扫描窗记账（`kin_flush_delay` 运行期化）、`input_shaper` 真驱动步进（`motion/shaper.rs`）、`skew_correction`、`z_thermal_adjust`、`tuning_tower`（+46 个 `fn test_`） | **46.7 s** | 3769 |
+| ⑮ 运动地基与调平余项（6 lane，2026-10-21） | 扫描窗记账（`kin_flush_delay` 运行期化）、`input_shaper` 真驱动步进（`motion/shaper.rs`）、`skew_correction`、`z_thermal_adjust`、`tuning_tower`（+46 个 `fn test_`） | **46.7 s** | 3770 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。

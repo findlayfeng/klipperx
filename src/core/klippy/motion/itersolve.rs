@@ -243,6 +243,13 @@ impl StepKinematics {
         self.pressure_advance = Some(pressure_advance);
     }
 
+    /// The pressure-advance parameters driving this stepper, when it is an
+    /// extruder stepper (`struct extruder_stepper`'s `pa_list` and the shared
+    /// parameter block `SET_PRESSURE_ADVANCE` writes).
+    pub fn pressure_advance(&self) -> Option<&Arc<ExtruderPressureAdvance>> {
+        self.pressure_advance.as_ref()
+    }
+
     /// Install the solver's position hooks (upstream: the `calc_position_cb`
     /// that reads `sk->commanded_pos` and the `post_cb`; `kin_polar.c` is the
     /// only solver in the corpus that has them).

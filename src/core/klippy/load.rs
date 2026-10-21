@@ -132,10 +132,16 @@ include!(concat!(env!("OUT_DIR"), "/section_factories.rs"));
 /// is. Of the rest of upstream's list, `gcode_move` and `manual_probe` are built
 /// by the toolhead's own factory (which `ensure`s them), and `homing` is the
 /// kinematics layer rather than a loadable module, so none of those three needs
-/// an entry. `statistics` and `garbage_collection` exist only in part (the
-/// `system_stats` object and the reactor's latency warning stand in for their
-/// log summaries).
-const DEFAULT_MODULES: &[&str] = &["idle_timeout"];
+/// an entry. `garbage_collection` exists only in part (the reactor's latency
+/// warning stands in for its log summary).
+///
+/// `printer_stats` is here rather than in [`TOOLHEAD_MODULES`] because it needs
+/// no toolhead to attach to: upstream loads it from that same unconditional
+/// list (`toolhead.py:604-614`), which only ever runs with a `[printer]`, but the
+/// once-a-second `Stats` line is most useful on exactly the `[mcu]`-only runs
+/// this host allows (`klippyx stress`, `admin`), where upstream would not boot
+/// at all.
+const DEFAULT_MODULES: &[&str] = &["idle_timeout", "printer_stats"];
 
 /// The rest of upstream's unconditional list: modules that reach into the
 /// toolhead at load time, so they are built only when the config has a
@@ -547,6 +553,7 @@ mod tests {
                 "manual_probe",
                 "pause_resume",
                 "print_stats",
+                "printer_stats",
                 "probe",
                 "probe_eddy_current",
                 "quad_gantry_level",
@@ -877,7 +884,8 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -906,7 +914,8 @@ mod tests {
                 "mcu zboard",
                 "board_pins",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -929,7 +938,8 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
         // The main MCU's id, pinned across the restart below: the allocator is
@@ -957,7 +967,8 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
         // The reborn allocator hands the same main MCU its id again, so nothing
@@ -1028,6 +1039,10 @@ mod tests {
                 "toolhead",
                 "gcode_macro",
                 "idle_timeout",
+                // The once-a-second `Stats` line (`printer_stats`), loaded
+                // after `idle_timeout` by the same unconditional list, and
+                // before `tuning_tower`, which needs the toolhead.
+                "printer_stats",
                 // The toolhead-only half of upstream's unconditional list
                 // (`toolhead.py:611-612`): loaded here because this config has a
                 // `[printer]`, which is the precondition upstream never has to
@@ -1139,7 +1154,8 @@ mod tests {
                 "mcu zboard",
                 "mcu toolhead",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -1194,7 +1210,14 @@ mod tests {
         // (`idle_timeout.py:26`).
         assert_eq!(
             printer.objects(),
-            ["gcode", "configfile", "pins", "gcode_macro", "idle_timeout"]
+            [
+                "gcode",
+                "configfile",
+                "pins",
+                "gcode_macro",
+                "idle_timeout",
+                "printer_stats"
+            ]
         );
     }
 
@@ -1250,7 +1273,8 @@ mod tests {
                 "serial_ports",
                 "mcu",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -1283,7 +1307,8 @@ mod tests {
                 "template_evaluator",
                 "output_pin fan",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -1312,7 +1337,8 @@ mod tests {
                 "board_pins",
                 "board_pins second",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -1340,7 +1366,8 @@ mod tests {
                 "mcu",
                 "i2c_device accel",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }
@@ -1368,7 +1395,8 @@ mod tests {
                 "mcu",
                 "spi_device flash",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
     }

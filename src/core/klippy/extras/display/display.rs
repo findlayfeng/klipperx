@@ -1057,7 +1057,8 @@ mod tests {
                 "display_template",
                 "display",
                 "gcode_macro",
-                "idle_timeout"
+                "idle_timeout",
+                "printer_stats"
             ]
         );
         let display = printer

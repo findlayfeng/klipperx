@@ -72,6 +72,7 @@ pub mod output_pin;
 pub mod pause_resume;
 pub mod pid_calibrate;
 pub mod print_stats;
+pub mod printer_stats;
 pub mod probe;
 pub mod probe_eddy_current;
 pub mod pulse_counter;

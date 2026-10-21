@@ -513,6 +513,7 @@ mod tests {
                 "temperature_probe",
                 "temperature_sensor",
                 "virtual_sdcard",
+                "z_thermal_adjust",
                 "z_tilt",
                 "static_digital_output",
                 "static_pwm_clock",

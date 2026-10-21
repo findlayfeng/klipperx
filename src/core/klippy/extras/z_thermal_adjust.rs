@@ -90,6 +90,8 @@ struct State {
     last_temp_time: f64,
     /// The filtered reading, in °C.
     smoothed_temp: f64,
+    /// `1. / smooth_time`, the filter's per-second gain.
+    inv_smooth_time: f64,
     /// The extremes the filtered reading has reached.
     measured_min: f64,
     measured_max: f64,
@@ -113,11 +115,12 @@ struct State {
 }
 
 impl State {
-    fn new(temp_coeff: f64) -> Self {
+    fn new(temp_coeff: f64, inv_smooth_time: f64) -> Self {
         Self {
             last_temp: 0.0,
             last_temp_time: 0.0,
             smoothed_temp: 0.0,
+            inv_smooth_time,
             measured_min: 0.0,
             measured_max: 0.0,
             temp_coeff,
@@ -143,8 +146,6 @@ pub struct ZThermalAdjust {
     off_above_z: f64,
     /// `max_z_adjustment`: the clamp on the offset's absolute value.
     max_z_adjust_mm: f64,
-    /// `1. / smooth_time`, the filter's per-second gain.
-    inv_smooth_time: f64,
     /// The sensor the readings come from. Held (not just a weak handle) so the
     /// ADC/report callback that drives it keeps upgrading, as
     /// `temperature_sensor` does.
@@ -190,11 +191,10 @@ impl ZThermalAdjust {
         let sensor = heaters.setup_sensor(config, printer)?;
         sensor.setup_minmax(min_temp, max_temp);
 
-        let inv_smooth_time = 1.0 / smooth_time;
-        let state = Arc::new(Mutex::new(State::new(temp_coeff)));
+        let state = Arc::new(Mutex::new(State::new(temp_coeff, 1.0 / smooth_time)));
         let callback_state = Arc::clone(&state);
         sensor.setup_callback(Box::new(move |read_time, temp| {
-            temperature_callback(&callback_state, inv_smooth_time, read_time, temp);
+            temperature_callback(&callback_state, read_time, temp);
         }));
 
         let object = Arc::new(Self {
@@ -202,7 +202,6 @@ impl ZThermalAdjust {
             state,
             off_above_z,
             max_z_adjust_mm,
-            inv_smooth_time,
             sensor,
             target: Mutex::new(None),
             next_transform: Mutex::new(None),
@@ -455,13 +454,13 @@ impl ZThermalAdjust {
 ///
 /// `adj_time` is the share of the gap the reading is allowed to move the
 /// smoothed value, capped at 1 so a reading after a long gap lands on it.
-fn temperature_callback(state: &Mutex<State>, inv_smooth_time: f64, read_time: f64, temp: f64) {
+fn temperature_callback(state: &Mutex<State>, read_time: f64, temp: f64) {
     let mut state = state.lock().unwrap_or_else(|poison| poison.into_inner());
     let time_diff = read_time - state.last_temp_time;
     state.last_temp = temp;
     state.last_temp_time = read_time;
     let temp_diff = temp - state.smoothed_temp;
-    let adj_time = (time_diff * inv_smooth_time).min(1.0);
+    let adj_time = (time_diff * state.inv_smooth_time).min(1.0);
     state.smoothed_temp += temp_diff * adj_time;
     state.measured_min = state.measured_min.min(state.smoothed_temp);
     state.measured_max = state.measured_max.max(state.smoothed_temp);
@@ -786,7 +785,7 @@ mod tests {
         }
         assert_eq!(harness.adjust.off_above_z, UNLIMITED);
         assert_eq!(harness.adjust.max_z_adjust_mm, UNLIMITED);
-        assert!((harness.adjust.inv_smooth_time - 0.5).abs() < 1e-12);
+        assert!((harness.adjust.lock_state().inv_smooth_time - 0.5).abs() < 1e-12);
 
         let configured = Harness::new(&[
             ("temp_coeff", "0.012"),
@@ -795,7 +794,7 @@ mod tests {
             ("max_z_adjustment", "0.5"),
         ]);
         assert_eq!(configured.adjust.lock_state().temp_coeff, 0.012);
-        assert!((configured.adjust.inv_smooth_time - 0.25).abs() < 1e-12);
+        assert!((configured.adjust.lock_state().inv_smooth_time - 0.25).abs() < 1e-12);
         assert_eq!(configured.adjust.off_above_z, 50.0);
         assert_eq!(configured.adjust.max_z_adjust_mm, 0.5);
     }

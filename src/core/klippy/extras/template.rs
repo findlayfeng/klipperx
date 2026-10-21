@@ -135,7 +135,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Enumerator, Object, ObjectRepr, Rest, Value as MjValue, ValueKind};
+use minijinja::value::{
+    from_args, Enumerator, Kwargs, Object, ObjectRepr, Rest, Value as MjValue, ValueKind,
+};
 use minijinja::{
     escape_formatter, AutoEscape, Environment, Error as MjError, ErrorKind, Output, State,
     UndefinedBehavior::Strict,
@@ -212,8 +214,8 @@ impl std::error::Error for TemplateError {}
 // ===========================================================================
 
 /// One name bound in a [`Context`]: a JSON value, the `printer` view, or a
-/// builtin the corpus' templates call.
-#[derive(Debug, Clone)]
+/// callable the body may call.
+#[derive(Clone)]
 pub enum Rt {
     /// Status data, `params`, a `variable_*` literal — the JSON world.
     Json(Value),
@@ -224,7 +226,38 @@ pub enum Rt {
     Printer(PrinterView),
     /// `range` / `action_*`.
     Builtin(Builtin),
+    /// A callable a host bound after the engine was written
+    /// ([`Context::set_callable`]): `[display]`'s `render` and
+    /// `draw_progress_bar` (`display/display.py:79-83`).
+    Callable(HostCallable),
 }
+
+impl fmt::Debug for Rt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Rt::Json(value) => f.debug_tuple("Json").field(value).finish(),
+            Rt::List(items) => f.debug_tuple("List").field(items).finish(),
+            Rt::Printer(view) => f.debug_tuple("Printer").field(view).finish(),
+            Rt::Builtin(builtin) => f.debug_tuple("Builtin").field(builtin).finish(),
+            // A boxed closure has no name to print.
+            Rt::Callable(_) => f.write_str("Callable"),
+        }
+    }
+}
+
+/// A callable a host binds into a [`Context`] with
+/// [`Context::set_callable`] — upstream puts `render` and
+/// `draw_progress_bar` into a layout's context this way
+/// (`display/display.py:79-83`).
+///
+/// It is given the call's positional arguments and its keyword arguments (by
+/// name, the order the engine's keyword map holds them in), both in the JSON
+/// world a `param_*` value lives in, and answers the value the body sees. The
+/// `Err` string is the failure's own wording: the render reports it as
+/// `Error evaluating '<template>': line <n>: <message>`, the frame a body's
+/// failing call gets.
+pub type HostCallable =
+    Arc<dyn Fn(&[Value], &[(String, Value)]) -> Result<Value, String> + Send + Sync>;
 
 /// The callables a template context binds.
 #[derive(Clone)]
@@ -521,7 +554,56 @@ fn rt_value(value: Rt) -> MjValue {
                 ))
             })
         }
+        Rt::Callable(callable) => {
+            MjValue::from_function(move |args: Rest<MjValue>| -> Result<MjValue, MjError> {
+                // The engine hands keyword arguments over as a trailing value,
+                // so `from_args` is what splits `render(name, k=v)` into the
+                // two lists the callable takes.
+                let (positional, kwargs) =
+                    from_args::<(&[MjValue], Kwargs)>(&args).map_err(|err| {
+                        MjError::new(
+                            ErrorKind::InvalidOperation,
+                            err.detail()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| err.to_string()),
+                        )
+                    })?;
+                let positional = positional
+                    .iter()
+                    .map(host_argument)
+                    .collect::<Result<Vec<Value>, MjError>>()?;
+                let mut named = Vec::new();
+                for name in kwargs.args() {
+                    let value: MjValue = kwargs.peek(name).map_err(host_error)?;
+                    named.push((name.to_string(), host_argument(&value)?));
+                }
+                let result = callable(&positional, &named)
+                    .map_err(|message| MjError::new(ErrorKind::InvalidOperation, message))?;
+                Ok(rt_value(Rt::Json(result)))
+            })
+        }
     }
+}
+
+/// One argument a host callable is handed, as the JSON world sees it.
+fn host_argument(value: &MjValue) -> Result<Value, MjError> {
+    serde_json::to_value(value).map_err(|err| {
+        MjError::new(
+            ErrorKind::InvalidOperation,
+            format!("cannot pass this value to a host function: {err}"),
+        )
+    })
+}
+
+/// An engine error as the `MjError` a host callable's plumbing reports.
+fn host_error(error: MjError) -> MjError {
+    MjError::new(
+        ErrorKind::InvalidOperation,
+        error
+            .detail()
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+    )
 }
 
 // ===========================================================================
@@ -546,6 +628,17 @@ impl Context {
     /// `gcode_macro.py:106-113`).
     pub fn insert(&mut self, name: impl Into<String>, value: Rt) {
         self.globals.insert(name.into(), value);
+    }
+
+    /// Bind a callable the body may call — `[display]`'s `render` and
+    /// `draw_progress_bar`, which upstream puts into a layout's context
+    /// (`display/display.py:79-83`).
+    ///
+    /// This is the seam for callables the fixed [`Builtin`] set does not
+    /// carry: the host closes over whatever it draws or renders into, and the
+    /// body calls it by name like any other context value.
+    pub fn set_callable(&mut self, name: impl Into<String>, callable: HostCallable) {
+        self.globals.insert(name.into(), Rt::Callable(callable));
     }
 
     /// The bindings as the engine takes them: one map of minijinja values,
@@ -1442,8 +1535,314 @@ fn string_method(text: &str, method: &str, args: &[MjValue]) -> Result<MjValue, 
         "join" => method_join(text, args),
         "find" => method_find(text, args),
         "count" => method_count(text, args),
+        "format" => method_format(text, args),
         _ => Err(MjError::from(ErrorKind::UnknownMethod)),
     }
+}
+
+/// `str.format(*args, **kwargs)` — the Python format-spec subset the shipped
+/// `display.cfg` needs.
+///
+/// The shipped layout is the one body that calls it, and it writes five
+/// spellings of the same thing: `"{:>4.0%}".format(speed)`,
+/// `"{:^10.0%}"`, `"{:^6.0%}"`, `"{:^4.0%}"` and `"Fan {:^4.0%}"`
+/// (`display.cfg:49,95,127,165,172,182`). The subset here covers those and the
+/// rest of Python's field syntax that reads the same way: automatic and
+/// explicit positional fields, keyword fields, `{{`/`}}`, `[[fill]align]`,
+/// width, `.precision`, and the type codes `s`, `d`, `f`, `%`. Everything else
+/// — a comma grouping, a sign, a nested field, a code this port does not
+/// format — is an error the body hears: a half-read spec would draw a wrong
+/// number rather than fail.
+fn method_format(text: &str, args: &[MjValue]) -> Result<MjValue, MjError> {
+    let (positional, kwargs) = from_args::<(&[MjValue], Kwargs)>(args).map_err(host_error)?;
+    let chars: Vec<char> = text.chars().collect();
+    let mut formatted = String::with_capacity(text.len());
+    let mut auto_index = 0;
+    // Python refuses to mix `{}` and `{0}` in one string; the two facts below
+    // are what it refuses on.
+    let mut auto = false;
+    let mut manual = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '{' if chars.get(i + 1) == Some(&'{') => {
+                formatted.push('{');
+                i += 2;
+            }
+            '}' if chars.get(i + 1) == Some(&'}') => {
+                formatted.push('}');
+                i += 2;
+            }
+            '}' => return Err(format_error("Single '}' encountered in format string")),
+            '{' => {
+                let close = chars[i + 1..]
+                    .iter()
+                    .position(|ch| *ch == '}')
+                    .map(|offset| offset + i + 1)
+                    .ok_or_else(|| format_error("Single '{' encountered in format string"))?;
+                let field: String = chars[i + 1..close].iter().collect();
+                let (name, spec) = match field.split_once(':') {
+                    Some((name, spec)) => (name, spec),
+                    None => (field.as_str(), ""),
+                };
+                let value = format_argument(
+                    name,
+                    positional,
+                    &kwargs,
+                    &mut auto_index,
+                    &mut auto,
+                    &mut manual,
+                )?;
+                formatted.push_str(&format_field(&value, spec)?);
+                i = close + 1;
+            }
+            other => {
+                formatted.push(other);
+                i += 1;
+            }
+        }
+    }
+    Ok(MjValue::from(formatted))
+}
+
+/// The value one `{…}` field names: an automatic field (`{}`), an explicit
+/// position (`{0}`), or a keyword (`{name}`).
+fn format_argument(
+    name: &str,
+    positional: &[MjValue],
+    kwargs: &Kwargs,
+    auto_index: &mut usize,
+    auto: &mut bool,
+    manual: &mut bool,
+) -> Result<MjValue, MjError> {
+    if name.is_empty() {
+        *auto = true;
+        if *manual {
+            return Err(format_error(
+                "cannot switch from manual field specification to automatic field numbering",
+            ));
+        }
+        let index = *auto_index;
+        *auto_index += 1;
+        return positional.get(index).cloned().ok_or_else(|| {
+            format_error(&format!(
+                "Replacement index {index} out of range for positional args tuple"
+            ))
+        });
+    }
+    if name.chars().all(|ch| ch.is_ascii_digit()) {
+        *manual = true;
+        if *auto {
+            return Err(format_error(
+                "cannot switch from automatic field numbering to manual field specification",
+            ));
+        }
+        let index = name.parse::<usize>().map_err(|_| {
+            format_error(&format!(
+                "Replacement index {name} out of range for positional args tuple"
+            ))
+        })?;
+        return positional.get(index).cloned().ok_or_else(|| {
+            format_error(&format!(
+                "Replacement index {index} out of range for positional args tuple"
+            ))
+        });
+    }
+    if !kwargs.has(name) {
+        return Err(format_error(&format!("KeyError: '{name}'")));
+    }
+    kwargs.peek::<MjValue>(name).map_err(host_error)
+}
+
+/// One value under one format spec — the `[[fill]align][width][.precision]
+/// [type]` half of a field.
+fn format_field(value: &MjValue, spec: &str) -> Result<String, MjError> {
+    let chars: Vec<char> = spec.chars().collect();
+    let mut i = 0;
+    let mut fill = ' ';
+    let mut align = None;
+    let is_align = |ch: char| matches!(ch, '<' | '>' | '^' | '=');
+    if chars.len() >= 2 && is_align(chars[1]) {
+        fill = chars[0];
+        align = Some(chars[1]);
+        i = 2;
+    } else if chars.first().copied().is_some_and(is_align) {
+        align = chars.first().copied();
+        i = 1;
+    }
+    let mut digits = String::new();
+    while i < chars.len() && chars[i].is_ascii_digit() {
+        digits.push(chars[i]);
+        i += 1;
+    }
+    let width = if digits.is_empty() {
+        None
+    } else {
+        Some(
+            digits
+                .parse::<usize>()
+                .map_err(|_| invalid_specifier(spec, value))?,
+        )
+    };
+    let mut precision = None;
+    if chars.get(i) == Some(&'.') {
+        i += 1;
+        let mut digits = String::new();
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            digits.push(chars[i]);
+            i += 1;
+        }
+        if digits.is_empty() {
+            return Err(invalid_specifier(spec, value));
+        }
+        precision = Some(
+            digits
+                .parse::<usize>()
+                .map_err(|_| invalid_specifier(spec, value))?,
+        );
+    }
+    let code = chars.get(i).copied();
+    if code.is_some_and(|_| chars.len() != i + 1) {
+        return Err(invalid_specifier(spec, value));
+    }
+    let body = match code {
+        None => plain_body(value, precision),
+        Some('s') => value
+            .as_str()
+            .ok_or_else(|| unknown_code('s', value))
+            .map(|text| truncate(text, precision))?,
+        Some('d') => {
+            if precision.is_some() {
+                return Err(format_error(
+                    "Precision not allowed in integer format specifier",
+                ));
+            }
+            // Only an int (or a bool, which Python counts as one): a float with
+            // `d` is the `Unknown format code` error, not a truncation.
+            let integer = match value.kind() {
+                ValueKind::Bool => Some(i64::from(value.is_true())),
+                _ => value.as_i64(),
+            };
+            format!("{}", integer.ok_or_else(|| unknown_code('d', value))?)
+        }
+        Some('f') => fixed(
+            number(value).ok_or_else(|| unknown_code('f', value))?,
+            precision,
+        ),
+        Some('%') => format!(
+            "{}%",
+            fixed(
+                number(value).ok_or_else(|| unknown_code('%', value))? * 100.0,
+                precision,
+            )
+        ),
+        Some(other) => return Err(unknown_code(other, value)),
+    };
+    Ok(padded(&body, width, fill, align, value))
+}
+
+/// A value with no type code: its Python `str` for text, its own spelling for a
+/// number, cut at `precision` characters.
+fn plain_body(value: &MjValue, precision: Option<usize>) -> String {
+    let body = match value.kind() {
+        ValueKind::String => value.as_str().unwrap_or_default().to_string(),
+        ValueKind::Bool => (if value.is_true() { "True" } else { "False" }).to_string(),
+        ValueKind::None | ValueKind::Undefined => "None".to_string(),
+        ValueKind::Number => match number(value) {
+            // `str(1.0)` is `1.0` and `str(1)` is `1`; the shortest round-trip
+            // spelling is the one Python's `repr` gives a float.
+            Some(number) if value.as_i64().is_some() => format!("{}", number as i64),
+            Some(number) => match precision {
+                Some(precision) => fixed(number, Some(precision)),
+                None => format!("{number:?}"),
+            },
+            None => value.to_string(),
+        },
+        _ => value.to_string(),
+    };
+    truncate(&body, precision)
+}
+
+/// A number with Python's fixed-point spelling: `.precision` digits (6 when the
+/// spec named none, as Python's `f`/`%` default).
+fn fixed(value: f64, precision: Option<usize>) -> String {
+    format!("{:.*}", precision.unwrap_or(6), value)
+}
+
+/// A field's number, booleans counting as `0`/`1` the way Python's do.
+fn number(value: &MjValue) -> Option<f64> {
+    match value.kind() {
+        ValueKind::Bool => Some(if value.is_true() { 1.0 } else { 0.0 }),
+        _ => f64::try_from(value.clone()).ok(),
+    }
+}
+
+/// `text` cut at `precision` characters, Python's meaning of a precision with
+/// no type code.
+fn truncate(text: &str, precision: Option<usize>) -> String {
+    match precision {
+        Some(precision) => text.chars().take(precision).collect(),
+        None => text.to_string(),
+    }
+}
+
+/// The field body padded to `width`: `align` as written, else Python's default
+/// (numbers right, everything else left).
+fn padded(
+    body: &str,
+    width: Option<usize>,
+    fill: char,
+    align: Option<char>,
+    value: &MjValue,
+) -> String {
+    let Some(width) = width else {
+        return body.to_string();
+    };
+    let length = body.chars().count();
+    if length >= width {
+        return body.to_string();
+    }
+    let align = align.unwrap_or(if value.kind() == ValueKind::Number {
+        '>'
+    } else {
+        '<'
+    });
+    let padding = width - length;
+    let (left, right) = match align {
+        '<' => (0, padding),
+        '>' => (padding, 0),
+        '^' => (padding / 2, padding - padding / 2),
+        // `=` pads after the sign, which this port's bodies never write.
+        _ => (padding, 0),
+    };
+    format!(
+        "{}{}{}",
+        fill.to_string().repeat(left),
+        body,
+        fill.to_string().repeat(right)
+    )
+}
+
+/// `Invalid format specifier '<spec>' for object of type '<type>'`.
+fn invalid_specifier(spec: &str, value: &MjValue) -> MjError {
+    format_error(&format!(
+        "Invalid format specifier '{spec}' for object of type '{}'",
+        python_type(value)
+    ))
+}
+
+/// `Unknown format code '<code>' for object of type '<type>'`.
+fn unknown_code(code: char, value: &MjValue) -> MjError {
+    format_error(&format!(
+        "Unknown format code '{code}' for object of type '{}'",
+        python_type(value)
+    ))
+}
+
+/// A `str.format` failure: the wording is CPython's, and the engine frames it
+/// with the template's name and line like any other evaluation error.
+fn format_error(message: &str) -> MjError {
+    MjError::new(ErrorKind::InvalidOperation, message.to_string())
 }
 
 /// The method `method` on the list `value`: the three that would mutate it are
@@ -3632,6 +4031,143 @@ STEPPER_RELEASE";
                 .to_string()
                 .contains("find() argument 'start' must be int, not str"),
             "{error}"
+        );
+    }
+
+    // -- `str.format` ------------------------------------------------------
+
+    /// One `str.format` call as a body writes it, rendered.
+    fn formatted(source: &str) -> String {
+        ok(&format!("{{ {source} }}"))
+    }
+
+    #[test]
+    fn test_str_format_draws_the_specs_the_shipped_layout_writes() {
+        // The five spellings `display.cfg` writes and the field syntax around
+        // them: automatic and explicit fields, a keyword field, the two brace
+        // escapes, and the type codes with Python's default precision.
+        assert_eq!(formatted(r#""{:>4.0%}".format(0.5)"#), " 50%");
+        assert_eq!(formatted(r#""{:^10.0%}".format(0.0)"#), "    0%    ");
+        assert_eq!(formatted(r#""{:^6.0%}".format(0.25)"#), " 25%  ");
+        assert_eq!(formatted(r#""{:^4.0%}".format(1.0)"#), "100%");
+        assert_eq!(formatted(r#""Fan {:^4.0%}".format(0.0)"#), "Fan  0% ");
+        assert_eq!(formatted(r#""{} and {}".format("a", 2)"#), "a and 2");
+        assert_eq!(formatted(r#""{1}{0}".format("a", "b")"#), "ba");
+        assert_eq!(formatted(r#""{name}!".format(name="klipper")"#), "klipper!");
+        assert_eq!(formatted(r#""{{}}".format()"#), "{}");
+        assert_eq!(formatted(r#""{:d}".format(42)"#), "42");
+        assert_eq!(formatted(r#""{:s}".format("ab")"#), "ab");
+        assert_eq!(formatted(r#""{:.2f}".format(0.125)"#), "0.12");
+        assert_eq!(formatted(r#""{:.1f}".format(2.25)"#), "2.2");
+        assert_eq!(formatted(r#""{:%}".format(0.5)"#), "50.000000%");
+        // Python's default alignment is right for a number, left for text.
+        assert_eq!(formatted(r#""{:5}".format(42)"#), "   42");
+        assert_eq!(formatted(r#""{:5}".format("ab")"#), "ab   ");
+        assert_eq!(formatted(r#""{:*^5}".format("ab")"#), "*ab**");
+        assert_eq!(formatted(r#""{:.2}".format("abcdef")"#), "ab");
+    }
+
+    #[test]
+    fn test_str_format_reports_what_it_does_not_read() {
+        // A spec this port does not format fails the render: a half-read spec
+        // would draw a wrong number rather than say so.
+        let cases = [
+            (
+                r#""{:x}".format(1)"#,
+                "Unknown format code 'x' for object of type 'int'",
+            ),
+            (
+                r#""{:d}".format("a")"#,
+                "Unknown format code 'd' for object of type 'str'",
+            ),
+            (
+                r#""{:d}".format(1.5)"#,
+                "Unknown format code 'd' for object of type 'float'",
+            ),
+            (
+                r#""{:,}".format(1)"#,
+                "Unknown format code ',' for object of type 'int'",
+            ),
+            (
+                r#""{:.1d}".format(1)"#,
+                "Precision not allowed in integer format specifier",
+            ),
+            (
+                r#""{} {0}".format(1)"#,
+                "cannot switch from automatic field numbering to manual field specification",
+            ),
+            (
+                r#""{0} {}".format(1)"#,
+                "cannot switch from manual field specification to automatic field numbering",
+            ),
+            (
+                r#""{}".format()"#,
+                "Replacement index 0 out of range for positional args tuple",
+            ),
+            (
+                r#""{1}".format(1)"#,
+                "Replacement index 1 out of range for positional args tuple",
+            ),
+            (r#""{nope}".format()"#, "KeyError: 'nope'"),
+            (r#""{".format()"#, "Single '{' encountered in format string"),
+            (r#""}".format()"#, "Single '}' encountered in format string"),
+        ];
+        for (source, expected) in cases {
+            let error =
+                render(&format!("{{ {source} }}"), &mut context(&[], "")).expect_err(source);
+            assert!(error.to_string().contains(expected), "{source}: {error}");
+        }
+    }
+
+    // -- host callables ----------------------------------------------------
+
+    #[test]
+    fn test_a_host_callable_is_given_the_calls_arguments() {
+        let calls: Arc<Mutex<Vec<(usize, Vec<String>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&calls);
+        let mut context = context(&[], "");
+        context.set_callable(
+            "draw",
+            Arc::new(move |args: &[Value], kwargs: &[(String, Value)]| {
+                record.lock().unwrap().push((
+                    args.len(),
+                    kwargs
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect(),
+                ));
+                Ok(json!("drawn"))
+            }),
+        );
+
+        let text = render("{ draw(2, 3.5, name='a', flag=True) }ok", &mut context)
+            .expect("the call renders");
+
+        // The callable's value is what the body's tag prints.
+        assert_eq!(text, "drawnok");
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(2, vec!["flag=true".to_string(), "name=\"a\"".to_string()])]
+        );
+    }
+
+    #[test]
+    fn test_a_failing_host_callable_fails_the_render_with_its_message() {
+        let mut context = context(&[], "");
+        context.set_callable(
+            "nope",
+            Arc::new(
+                |_: &[Value], _: &[(String, Value)]| -> Result<Value, String> {
+                    Err("KeyError: 'missing'".to_string())
+                },
+            ),
+        );
+
+        let error = render("{ nope() }", &mut context).expect_err("the call fails");
+
+        assert_eq!(
+            error.to_string(),
+            "Error evaluating 'gcode_macro TEST:gcode': line 1: KeyError: 'missing'"
         );
     }
 }

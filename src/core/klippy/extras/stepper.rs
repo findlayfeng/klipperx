@@ -260,14 +260,6 @@ pub struct PrinterStepper {
     /// (`setup_pressure_advance`), applied to the host solver at connect —
     /// upstream's extruder solver carries them (`extruder_stepper_alloc`).
     pressure_advance: Mutex<Option<Arc<ExtruderPressureAdvance>>>,
-    /// The step pulse width in seconds, or `None` while nobody has decided
-    /// (upstream `MCU_stepper._step_pulse_duration`), paired with the
-    /// step-on-both-edges request a driver made (`_req_step_both_edge`).
-    ///
-    /// One slot for the two because they are written together
-    /// ([`PrinterStepper::setup_default_pulse_duration`]) and read together
-    /// ([`PrinterStepper::get_pulse_duration`]).
-    pulse_duration: Mutex<(Option<f64>, bool)>,
 }
 
 impl PrinterStepper {
@@ -494,6 +486,11 @@ impl PrinterStepper {
         let mcu_stepper = pins
             .setup_stepper(&step_pin, &dir_pin, step_pulse_duration)
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?;
+        // Only this section knows whether it wrote `step_pulse_duration`: the
+        // chip path carries just a number, and an unwritten option is what lets
+        // a driver's own default win later (upstream `_step_pulse_duration`
+        // starts as `None`, `klippy/stepper.py:70-73`).
+        mcu_stepper.set_step_pulse_duration(configured_step_pulse_duration);
         // Register the stepper with the endstop's trigger dispatch now, at load:
         // the dispatch creates a per-MCU trsync (and the config callback that
         // reserves its oid) before the configuration is built. This is also
@@ -553,7 +550,6 @@ impl PrinterStepper {
             solver: Mutex::new(None),
             hooks: Mutex::new(None),
             pressure_advance: Mutex::new(None),
-            pulse_duration: Mutex::new((configured_step_pulse_duration, false)),
         })
     }
 
@@ -669,29 +665,24 @@ impl PrinterStepper {
     /// The step pulse width and whether the step is driven on both edges
     /// (upstream `MCU_stepper.get_pulse_duration`, `klippy/stepper.py:68-69`).
     ///
-    /// The width falls back to the 2 µs `config_stepper` would use when nobody
-    /// has decided (`MCU_stepper._build_config`, `:79-80`). The second item is
-    /// always `false`: this port's firmware config side drives the step on one
-    /// edge only, so the both-edge request
-    /// [`PrinterStepper::setup_default_pulse_duration`] records is not applied.
+    /// The record lives on the firmware half, next to the oid it is configured
+    /// with ([`McuStepper::pulse_duration`]): its width falls back to the 2 µs
+    /// `config_stepper` would use when nobody has decided
+    /// (`MCU_stepper._build_config`, `:79-80`), and the flag is the config
+    /// build's both-edge decision, so it is `false` until that build runs.
     pub fn get_pulse_duration(&self) -> (f64, bool) {
-        let (duration, _requested_both_edge) = *self.pulse_duration_guard();
-        (duration.unwrap_or(DEFAULT_STEP_PULSE_DURATION), false)
+        self.mcu_stepper.pulse_duration()
     }
 
     /// Install a default pulse width and record the step-on-both-edges request
     /// (upstream `MCU_stepper.setup_default_pulse_duration`,
     /// `klippy/stepper.py:70-73`): the width wins **only** when the section
     /// wrote no `step_pulse_duration`, so a config option always has
-    /// precedence. The request is stored and not applied — the firmware config
-    /// side has no both-edge step mode (see
-    /// [`PrinterStepper::get_pulse_duration`]).
+    /// precedence. The request is resolved at the config build, where the MCU's
+    /// constants exist (`:87-110`), and decides `invert_step` then.
     pub fn setup_default_pulse_duration(&self, pulse_duration: f64, step_both_edge: bool) {
-        let mut pulse = self.pulse_duration_guard();
-        if pulse.0.is_none() {
-            pulse.0 = Some(pulse_duration);
-        }
-        pulse.1 = step_both_edge;
+        self.mcu_stepper
+            .setup_default_pulse_duration(pulse_duration, step_both_edge);
     }
 
     /// Whether the step distance is in radians, not millimetres (upstream's
@@ -784,12 +775,6 @@ impl PrinterStepper {
 
     fn lock(&self) -> MutexGuard<'_, Option<Stepper>> {
         self.inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-    }
-
-    fn pulse_duration_guard(&self) -> MutexGuard<'_, (Option<f64>, bool)> {
-        self.pulse_duration
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
     }
@@ -1337,9 +1322,9 @@ mod tests {
         let stepper = printer
             .lookup_object_as::<PrinterStepper>("stepper_x")
             .expect("the section registered a stepper object");
-        // TMC's recommended width, and the both-edge request it makes: the
-        // request is recorded rather than applied, so the second item stays
-        // `false`.
+        // TMC's recommended width, and the both-edge request it makes. The
+        // request is only resolved at the config build, which a load-only test
+        // never reaches, so the second item is still `false` here.
         stepper.setup_default_pulse_duration(1e-7, true);
         assert_eq!(stepper.get_pulse_duration(), (1e-7, false));
         // A second driver's default does not move a decided width.

@@ -8,15 +8,151 @@
 //! `last_step_clock = 0` in step with the chain the firmware still carries.
 //! The host-side solver and compressor live in `motion::Stepper`; this is the
 //! wire half, and the two are joined when `[stepper_*]` sections land (FW5e).
+//!
+//! The config build also answers upstream's step-on-both-edges question
+//! (`_build_config`, `klippy/stepper.py:84-116`): it is the first place the
+//! MCU's compile-time constants exist, so it is where `invert_step` becomes
+//! `-1` (the firmware's single-timer path) and, on an older firmware, where
+//! `step_pulse_ticks` becomes `0`.
 
 use std::sync::{Arc, Mutex};
 
 use super::pin::{pin_number, McuChip};
 use crate::core::klippy::cmd::stepper::{ConfigStepper, QueueStep, ResetStepClock, SetNextStepDir};
 use crate::core::klippy::cmd::McuCommand;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, StepBatchClocks};
+use crate::core::klippy::mcu::{ConfigBuilder, Dictionary, Mcu, McuError, StepBatchClocks};
 use crate::core::klippy::motion::stepcompress::StepCommand;
 use crate::core::klippy::pins::{PinParams, PrinterPins};
+
+/// The longest pulse that is still symmetric enough for the step to be driven
+/// on both edges (`MIN_BOTH_EDGE_DURATION`, `klippy/stepper.py:17`).
+const MIN_BOTH_EDGE_DURATION: f64 = 0.000_000_500;
+
+/// The same limit for a firmware that only knows `STEPPER_BOTH_EDGE`
+/// (`MIN_OPTIMIZED_BOTH_EDGE_DURATION`, `klippy/stepper.py:18`).
+const MIN_OPTIMIZED_BOTH_EDGE_DURATION: f64 = 0.000_000_150;
+
+/// The width `config_stepper` gets when nobody has decided one
+/// (`MCU_stepper._build_config`, `klippy/stepper.py:79-80`).
+const DEFAULT_STEP_PULSE_DURATION: f64 = 0.000_002;
+
+/// The step-pulse record a `[stepper_*]` section and this firmware half share.
+///
+/// Upstream keeps all three fields on `MCU_stepper` (`_step_pulse_duration`,
+/// `_req_step_both_edge`, `_step_both_edge`; `klippy/stepper.py:44-45`,
+/// `:70-73`, `:87-110`): a driver records its request at load, and the config
+/// build — the first place the MCU constants exist — resolves it. The section
+/// exposes the record as `PrinterStepper::get_pulse_duration` /
+/// `setup_default_pulse_duration`; the resolution happens here.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct StepPulse {
+    /// The width in seconds, `None` while nobody has decided one. Only a
+    /// section knows "wrote no `step_pulse_duration`", and that is what lets a
+    /// driver's own default win later (`:70-73`).
+    duration: Option<f64>,
+    /// `_req_step_both_edge`: a driver asked for step on both edges.
+    requested_both_edge: bool,
+    /// `_step_both_edge`: the decision the config build resolved.
+    both_edge: bool,
+}
+
+impl StepPulse {
+    /// The width `config_stepper` is built with: the decided one, or the 2 µs
+    /// default (`klippy/stepper.py:79-80`).
+    fn seconds(&self) -> f64 {
+        self.duration.unwrap_or(DEFAULT_STEP_PULSE_DURATION)
+    }
+}
+
+/// The three firmware constants the both-edge decision reads
+/// (`klippy/stepper.py:84-86`). A constant the firmware does not declare
+/// counts as `0`, like upstream's `int(constants.get(name, '0'))`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StepEdgeConstants {
+    /// `STEPPER_STEP_BOTH_EDGE`: this firmware has the both-edge step mode.
+    step_both_edge: bool,
+    /// `STEPPER_BOTH_EDGE`: the older both-edge mode, which needs
+    /// `step_pulse_ticks=0` to arm its single timer.
+    both_edge: bool,
+    /// `STEPPER_OPTIMIZED_UNSTEP`: the firmware toggles the pin itself, which
+    /// beats stepping on both edges.
+    optimized_unstep: bool,
+}
+
+impl StepEdgeConstants {
+    /// Read them off an identified MCU's dictionary (`mcu.get_constants()`,
+    /// `klippy/stepper.py:84-86`).
+    fn from_dictionary(dictionary: Option<&Dictionary>) -> Self {
+        let declared = |name: &str| match dictionary {
+            Some(dictionary) => {
+                matches!(dictionary.constant_f64(name), Some(value) if value != 0.0)
+            }
+            None => false,
+        };
+        Self {
+            step_both_edge: declared("STEPPER_STEP_BOTH_EDGE"),
+            both_edge: declared("STEPPER_BOTH_EDGE"),
+            optimized_unstep: declared("STEPPER_OPTIMIZED_UNSTEP"),
+        }
+    }
+}
+
+/// What `config_stepper` gets once the both-edge question is answered.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct StepConfig {
+    /// `0`/`1` for a single-edge step, `-1` for the both-edge single timer.
+    invert_step: i8,
+    /// The pulse width in seconds; `0` lets an older firmware arm its timer.
+    step_pulse_duration: f64,
+    /// Whether the step is driven on both edges.
+    both_edge: bool,
+}
+
+/// Upstream's both-edge decision chain (`MCU_stepper._build_config`,
+/// `klippy/stepper.py:87-101`), including the order the four vetoes apply in.
+///
+/// `invert_step` is the step pin's own `0`/`1`; the chain turns it into `-1`
+/// (the firmware's single-timer path) only when every veto lets the request
+/// through.
+fn resolve_step_config(
+    invert_step: i8,
+    requested_both_edge: bool,
+    step_pulse_duration: f64,
+    constants: StepEdgeConstants,
+) -> StepConfig {
+    let mut want_both_edges = requested_both_edge;
+    if step_pulse_duration > MIN_BOTH_EDGE_DURATION {
+        // A wide pulse's rise and fall times need not be symmetric (`:88-92`).
+        want_both_edges = false;
+    } else if constants.both_edge && step_pulse_duration > MIN_OPTIMIZED_BOTH_EDGE_DURATION {
+        // An older MCU and a pulse wider than its fast path allows (`:93-95`).
+        want_both_edges = false;
+    } else if !constants.both_edge && !constants.step_both_edge {
+        // This firmware has no both-edge step mode at all (`:96-98`).
+        want_both_edges = false;
+    } else if constants.optimized_unstep {
+        // The firmware's own optimized step/unstep is better (`:99-101`).
+        want_both_edges = false;
+    }
+    if want_both_edges {
+        StepConfig {
+            invert_step: -1,
+            // The older mode only engages with a zero pulse (`:108-110`).
+            step_pulse_duration: if constants.both_edge {
+                0.0
+            } else {
+                step_pulse_duration
+            },
+            both_edge: true,
+        }
+    } else {
+        StepConfig {
+            invert_step,
+            step_pulse_duration,
+            both_edge: false,
+        }
+    }
+}
 
 /// The oid the config callback assigned.
 #[derive(Debug, Default)]
@@ -40,6 +176,9 @@ pub struct McuStepper {
     invert_dir: bool,
     /// Shared with the chip, so runtime sends reach the connected device.
     mcu: Arc<Mutex<Option<Arc<Mcu>>>>,
+    /// The width and the both-edge bookkeeping, shared with the `[stepper_*]`
+    /// section that built this resource ([`StepPulse`]).
+    pulse: Arc<Mutex<StepPulse>>,
 }
 
 impl McuStepper {
@@ -49,6 +188,11 @@ impl McuStepper {
     /// `step_pulse_duration` is the pulse width in seconds, `0` letting the
     /// firmware choose (`config_stepper`). `invert_dir` flips the direction bit
     /// of the wire commands, for a `dir_pin` written with `!`.
+    ///
+    /// The width starts as this argument — a caller that goes through a
+    /// `[stepper_*]` section refines it with
+    /// [`McuStepper::set_step_pulse_duration`], because only the section knows
+    /// whether it wrote the option at all.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         config: Arc<ConfigBuilder>,
@@ -64,6 +208,11 @@ impl McuStepper {
     ) -> Self {
         let state = Arc::new(StepperState::default());
         let callback_state = Arc::clone(&state);
+        let pulse = Arc::new(Mutex::new(StepPulse {
+            duration: Some(step_pulse_duration),
+            ..Default::default()
+        }));
+        let callback_pulse = Arc::clone(&pulse);
         // Weak, not Arc: the registry owns the chip, and the chip owns this
         // callback's `ConfigBuilder` (`mcu/resource/pin.rs` explains the cycle).
         let callback_pins = Arc::downgrade(&pins);
@@ -80,7 +229,7 @@ impl McuStepper {
                     &step_pin,
                     &dir_pin,
                     invert_step,
-                    step_pulse_duration,
+                    &callback_pulse,
                 )
             }))
             .expect("a resource is always built before the configuration is");
@@ -89,7 +238,50 @@ impl McuStepper {
             chip,
             invert_dir,
             mcu,
+            pulse,
         }
+    }
+
+    /// The pulse width and whether the step is driven on both edges
+    /// (upstream `MCU_stepper.get_pulse_duration`, `klippy/stepper.py:68-69`).
+    ///
+    /// The width is the 2 µs default while nobody has decided one; the flag is
+    /// the config build's decision, so it is `false` until that build runs.
+    pub fn pulse_duration(&self) -> (f64, bool) {
+        let pulse = *self.pulse_guard();
+        (pulse.seconds(), pulse.both_edge)
+    }
+
+    /// Record a driver's default pulse width and its step-on-both-edges
+    /// request (upstream `MCU_stepper.setup_default_pulse_duration`,
+    /// `klippy/stepper.py:70-73`): the width wins **only** when nobody has
+    /// decided one, so a `step_pulse_duration` option always outranks it. The
+    /// request is resolved by the config build, not here.
+    pub fn setup_default_pulse_duration(&self, pulse_duration: f64, step_both_edge: bool) {
+        let mut pulse = self.pulse_guard();
+        if pulse.duration.is_none() {
+            pulse.duration = Some(pulse_duration);
+        }
+        pulse.requested_both_edge = step_both_edge;
+    }
+
+    /// Record the `step_pulse_duration` the `[stepper_*]` section itself wrote,
+    /// `None` when it wrote none.
+    ///
+    /// This is the half of upstream's `_step_pulse_duration` initialization the
+    /// chip path cannot carry: [`McuStepper::new`] only takes a number, so the
+    /// record starts as if the option was written and the section corrects it
+    /// right after construction. Without that, a driver's default
+    /// ([`McuStepper::setup_default_pulse_duration`]) could never win over the
+    /// parsed 2 µs default.
+    pub fn set_step_pulse_duration(&self, duration: Option<f64>) {
+        self.pulse_guard().duration = duration;
+    }
+
+    fn pulse_guard(&self) -> std::sync::MutexGuard<'_, StepPulse> {
+        self.pulse
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// The chip this stepper was built on.
@@ -273,25 +465,55 @@ impl StepperState {
         step_pin: &PinParams,
         dir_pin: &PinParams,
         invert_step: i8,
-        step_pulse_duration: f64,
+        pulse: &Mutex<StepPulse>,
     ) -> Result<(), McuError> {
         let step_number = pin_number(mcu, &pins.resolve_pin(chip_name, &step_pin.pin)?, chip_name)?;
         let dir_number = pin_number(mcu, &pins.resolve_pin(chip_name, &dir_pin.pin)?, chip_name)?;
+        // The both-edge decision (`_build_config`, `klippy/stepper.py:84-116`):
+        // the constants only exist once the firmware has identified, which is
+        // why this — and not the section's construction — is where it happens.
+        let constants = StepEdgeConstants::from_dictionary(mcu.dictionary().as_deref());
+        let decided = {
+            let record = *pulse_guard(pulse);
+            resolve_step_config(
+                invert_step,
+                record.requested_both_edge,
+                record.seconds(),
+                constants,
+            )
+        };
+        if !constants.step_both_edge {
+            // Upstream records this through `configfile.deprecate_mcu_code`
+            // (`klippy/stepper.py:103-104`). The config callback has the MCU,
+            // not the printer that owns the `configfile` object, so the
+            // equivalent warning is logged here instead of landing in the
+            // status warnings.
+            tracing::warn!(
+                "MCU '{chip_name}' has deprecated code (it is missing feature \
+                 'STEPPER_STEP_BOTH_EDGE'). Recompiling and flashing is recommended."
+            );
+        }
+        {
+            let mut record = pulse_guard(pulse);
+            record.duration = Some(decided.step_pulse_duration);
+            record.both_edge = decided.both_edge;
+        }
         // The pulse width is written in seconds in the config and becomes clock
         // ticks here, where the firmware frequency is known
         // (`MCU.seconds_to_clock`, `klippy/mcu.py:1184-1185`). The clamp is the
         // floor the option already carries — config bounds it to `0.0..=0.001`
         // (`extras/stepper.rs`) — and it is applied **here** because
         // `seconds_to_clock` refuses a negative duration rather than folding it
-        // onto `0`.
-        let step_pulse_ticks = mcu.seconds_to_clock(step_pulse_duration.max(0.0))? as u32;
+        // onto `0`. A both-edge step on an older MCU resolves to `0`, which is
+        // what arms its single timer.
+        let step_pulse_ticks = mcu.seconds_to_clock(decided.step_pulse_duration.max(0.0))? as u32;
         let oid = builder.create_oid()?;
         *self.oid.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(oid);
         builder.add_config_cmd(&ConfigStepper {
             oid,
             step_pin: step_number as u8,
             dir_pin: dir_number as u8,
-            invert_step,
+            invert_step: decided.invert_step,
             step_pulse_ticks,
         })?;
         // Re-anchor the firmware's step chain whenever a **configured**
@@ -313,6 +535,11 @@ impl StepperState {
         builder.add_restart_cmd(&ResetStepClock { oid, clock: 0 })?;
         Ok(())
     }
+}
+
+/// The shared record's guard, with a poisoned lock treated as usable.
+fn pulse_guard(pulse: &Mutex<StepPulse>) -> std::sync::MutexGuard<'_, StepPulse> {
+    pulse.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
 /// The firmware command a [`StepCommand`] becomes for `oid`.
@@ -355,9 +582,12 @@ pub enum McuStepCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::frame::Frame;
     use crate::core::klippy::interface::devices::frame_mock::FrameMock;
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::mcu::Dictionary;
+    use crate::core::klippy::msg::parser::Parser;
+    use crate::core::klippy::msg::proto::ArgValue;
 
     #[test]
     fn test_a_direction_change_becomes_set_next_step_dir() {
@@ -437,6 +667,11 @@ mod tests {
 
     /// A dictionary with the stepper's two commands and its two pins.
     fn dictionary() -> Dictionary {
+        dictionary_declaring(serde_json::json!({"CLOCK_FREQ": 20000000}))
+    }
+
+    /// The same dictionary, with the given firmware compile-time constants.
+    fn dictionary_declaring(constants: serde_json::Value) -> Dictionary {
         Dictionary::from_json(serde_json::json!({
             "commands": {
                 "allocate_oids count=%c": 2,
@@ -451,9 +686,17 @@ mod tests {
             "enumerations": {
                 "pin": {"PA0": 0, "PA1": 1}
             },
-            "config": {"CLOCK_FREQ": 20000000}
+            "config": constants
         }))
         .unwrap()
+    }
+
+    /// An identified MCU that sends nowhere, declaring `constants`.
+    fn mcu_with(constants: serde_json::Value) -> Mcu {
+        let mcu = Mcu::for_test("mcu", Interface::new(FrameMock::new(Vec::new())));
+        mcu.install_dictionary(dictionary_declaring(constants))
+            .unwrap();
+        mcu
     }
 
     /// An identified MCU that sends nowhere.
@@ -477,10 +720,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_stepper_reanchors_the_firmware_chain_on_a_reused_firmware() {
-        use crate::core::klippy::frame::Frame;
-        use crate::core::klippy::msg::parser::Parser;
-        use crate::core::klippy::msg::proto::ArgValue;
-
         let (chip, _pins) = chip();
         let params = |pin: &str| PinParams {
             chip_name: "mcu".to_string(),
@@ -543,5 +782,211 @@ mod tests {
             !config_names.iter().any(|name| name == "reset_step_clock"),
             "the re-anchor is a restart command, not a config one: {config_names:?}"
         );
+    }
+
+    // =====================================================================
+    // both-edge: upstream's decision chain (`klippy/stepper.py:84-116`)
+    // =====================================================================
+
+    /// The firmware's three both-edge constants, read the way the config build
+    /// reads them — off an identified MCU's dictionary
+    /// (`mcu.get_constants()`, `klippy/stepper.py:84-86`).
+    fn constants_from_firmware(
+        step_both_edge: i64,
+        both_edge: i64,
+        optimized_unstep: i64,
+    ) -> StepEdgeConstants {
+        StepEdgeConstants::from_dictionary(Some(&dictionary_declaring(serde_json::json!({
+            "CLOCK_FREQ": 20000000,
+            "STEPPER_STEP_BOTH_EDGE": step_both_edge,
+            "STEPPER_BOTH_EDGE": both_edge,
+            "STEPPER_OPTIMIZED_UNSTEP": optimized_unstep,
+        }))))
+    }
+
+    /// Build the chip's configuration and return the arguments of its
+    /// `config_stepper` command.
+    fn config_stepper_arguments(chip: &McuChip, mcu: &Mcu) -> Vec<ArgValue> {
+        let built = chip.config().build(mcu).unwrap();
+        let mut parser = Parser::new();
+        mcu.dictionary().unwrap().install(&mut parser).unwrap();
+        let decoded = built
+            .config
+            .iter()
+            .map(|payload| {
+                parser
+                    .decode(Frame::new(0, payload.payload().to_vec()).into())
+                    .unwrap()
+            })
+            .find(|decoded| decoded[0].0.name == "config_stepper")
+            .expect("the configuration carries a config_stepper command");
+        decoded[0].1.clone()
+    }
+
+    /// A constant the firmware does not declare reads as `0`, like upstream's
+    /// `int(constants.get(name, '0'))` (`klippy/stepper.py:84-86`).
+    #[test]
+    fn test_the_both_edge_constants_are_read_off_the_firmware() {
+        let missing = StepEdgeConstants::from_dictionary(Some(&dictionary_declaring(
+            serde_json::json!({"CLOCK_FREQ": 20000000}),
+        )));
+        assert_eq!(missing, StepEdgeConstants::default());
+        assert_eq!(
+            StepEdgeConstants::from_dictionary(None),
+            StepEdgeConstants::default()
+        );
+        assert_eq!(
+            constants_from_firmware(0, 0, 0),
+            StepEdgeConstants::default()
+        );
+        assert_eq!(
+            constants_from_firmware(1, 1, 1),
+            StepEdgeConstants {
+                step_both_edge: true,
+                both_edge: true,
+                optimized_unstep: true,
+            }
+        );
+    }
+
+    /// Rung one: a pulse wider than 500 ns may have asymmetric rise and fall
+    /// times, so it vetoes both edges (`klippy/stepper.py:88-92`).
+    #[test]
+    fn test_a_wide_pulse_duration_vetoes_both_edges() {
+        let firmware = constants_from_firmware(1, 0, 0);
+
+        let vetoed = resolve_step_config(1, true, 600e-9, firmware);
+        assert!(!vetoed.both_edge);
+        assert_eq!(vetoed.invert_step, 1, "the pin's own invert_step survives");
+        assert_eq!(vetoed.step_pulse_duration, 600e-9);
+
+        // Exactly 500 ns is not *wider* than the limit and gets through.
+        assert!(resolve_step_config(1, true, 500e-9, firmware).both_edge);
+    }
+
+    /// Rung two: the older `STEPPER_BOTH_EDGE` mode only runs below 150 ns
+    /// (`klippy/stepper.py:93-95`).
+    #[test]
+    fn test_an_old_firmware_vetoes_both_edges_above_150ns() {
+        let firmware = constants_from_firmware(1, 1, 0);
+
+        let vetoed = resolve_step_config(0, true, 200e-9, firmware);
+        assert!(!vetoed.both_edge);
+        assert_eq!(vetoed.invert_step, 0);
+        assert_eq!(vetoed.step_pulse_duration, 200e-9);
+
+        // At the limit it still runs on both edges, and the old mode is armed
+        // with a zero pulse (`:108-110`).
+        let both = resolve_step_config(0, true, 150e-9, firmware);
+        assert!(both.both_edge);
+        assert_eq!(both.invert_step, -1);
+        assert_eq!(both.step_pulse_duration, 0.0);
+    }
+
+    /// Rung three: neither constant means the firmware cannot drive the step on
+    /// both edges (`klippy/stepper.py:96-98`). The older constant alone is
+    /// enough — that is the single-timer path.
+    #[test]
+    fn test_a_firmware_without_step_both_edge_vetoes_both_edges() {
+        let config = resolve_step_config(0, true, 100e-9, constants_from_firmware(0, 0, 0));
+        assert!(!config.both_edge);
+        assert_eq!(config.invert_step, 0);
+        assert_eq!(config.step_pulse_duration, 100e-9);
+
+        let older = resolve_step_config(0, true, 100e-9, constants_from_firmware(0, 1, 0));
+        assert!(older.both_edge);
+        assert_eq!(older.invert_step, -1);
+        assert_eq!(older.step_pulse_duration, 0.0);
+    }
+
+    /// Rung four: the firmware's own optimized step/unstep beats stepping on
+    /// both edges (`klippy/stepper.py:99-101`).
+    #[test]
+    fn test_optimized_unstep_vetoes_both_edges() {
+        let config = resolve_step_config(0, true, 100e-9, constants_from_firmware(1, 0, 1));
+        assert!(!config.both_edge);
+        assert_eq!(config.invert_step, 0);
+        assert_eq!(config.step_pulse_duration, 100e-9);
+    }
+
+    /// No driver asked: a both-edge-capable firmware still gets the single-edge
+    /// configuration this port has always sent.
+    #[test]
+    fn test_without_a_request_the_single_edge_config_stands() {
+        let config = resolve_step_config(0, false, 100e-9, constants_from_firmware(1, 1, 0));
+        assert!(!config.both_edge);
+        assert_eq!(config.invert_step, 0);
+        assert_eq!(config.step_pulse_duration, 100e-9);
+    }
+
+    /// A cleared chain on an MCU with both constants: `config_stepper` carries
+    /// `invert_step=-1` and `step_pulse_ticks=0` (`klippy/stepper.py:105-116`),
+    /// and the record the section reads reports both edges.
+    #[tokio::test]
+    async fn test_a_both_edge_stepper_is_configured_with_the_single_timer() {
+        let (chip, _pins) = chip();
+        let params = |pin: &str| PinParams {
+            chip_name: "mcu".to_string(),
+            pin: pin.to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        // `extras/stepper.rs` hands the parsed 2 µs default to the chip and then
+        // reports that the section wrote no option, so a driver's own default
+        // (TMC's 100 ns, with the both-edge request) is what decides.
+        let stepper = chip.setup_stepper(params("PA0"), params("PA1"), 0, 0.000_002, false);
+        stepper.set_step_pulse_duration(None);
+        stepper.setup_default_pulse_duration(100e-9, true);
+        let mcu = mcu_with(serde_json::json!({
+            "CLOCK_FREQ": 20000000,
+            "STEPPER_STEP_BOTH_EDGE": 1,
+            "STEPPER_BOTH_EDGE": 1,
+        }));
+
+        assert_eq!(
+            config_stepper_arguments(&chip, &mcu),
+            vec![
+                ArgValue::UInt8(0),   // oid
+                ArgValue::UInt8(0),   // PA0
+                ArgValue::UInt8(1),   // PA1
+                ArgValue::UInt8(255), // invert_step -1, a `%c` on the wire
+                ArgValue::UInt32(0),  // step_pulse_ticks: arms the single timer
+            ]
+        );
+        assert_eq!(stepper.pulse_duration(), (0.0, true));
+    }
+
+    /// Without a request nothing changes: the build keeps the pin's
+    /// `invert_step` and the pulse width in ticks, and the record stays
+    /// single-edge.
+    #[tokio::test]
+    async fn test_a_stepper_without_a_both_edge_request_keeps_the_single_edge_config() {
+        let (chip, _pins) = chip();
+        let params = |pin: &str| PinParams {
+            chip_name: "mcu".to_string(),
+            pin: pin.to_string(),
+            invert: false,
+            pullup: 0,
+            share_type: None,
+        };
+        let stepper = chip.setup_stepper(params("PA0"), params("PA1"), 0, 100e-9, false);
+        let mcu = mcu_with(serde_json::json!({
+            "CLOCK_FREQ": 20000000,
+            "STEPPER_STEP_BOTH_EDGE": 1,
+            "STEPPER_BOTH_EDGE": 1,
+        }));
+
+        assert_eq!(
+            config_stepper_arguments(&chip, &mcu),
+            vec![
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(0),
+                ArgValue::UInt8(1),
+                ArgValue::UInt8(0),
+                ArgValue::UInt32(2), // 100 ns at 20 MHz
+            ]
+        );
+        assert_eq!(stepper.pulse_duration(), (100e-9, false));
     }
 }

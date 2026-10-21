@@ -13,6 +13,9 @@
 //! | `clear()` | blank both text framebuffers | `hd44780.py:129-132` |
 //! | `flush()` | batch the framebuffer differences and send them | `hd44780.py:69-89` |
 //! | `set_glyphs()` | keep the 5x8 icons for the glyphs the layout names | `hd44780.py:109-113` |
+//! | `write_text()` | copy the bytes into the row's text framebuffer | `hd44780.py:104-108` |
+//! | `write_glyph()` | write the slot and its CGRAM bits, or the arrow character | `hd44780.py:114-126` |
+//! | `write_graphics()` | nothing — a text panel has no graphics mode | `hd44780.py:127-128` |
 //!
 //! The framebuffers are upstream's three: two text buffers of `2*line_length`
 //! bytes (`hd44780.py:40-50`), because each of the panel's four rows is driven
@@ -21,12 +24,17 @@
 //! the whole screen. `line_length` is 16 or 20 (`hd44780.py:10-11,26-27`) and
 //! decides the panel's width, and with it the default `display_group`.
 //!
+//! The panels put glyphs on screen through the character generator: the layout
+//! names a `[display_glyph]` by name, [`Hd44780::set_glyphs`] keeps its 5x8
+//! bits, and `write_glyph` writes the glyph's CGRAM slot as the character and
+//! its bits into the generator buffer (`hd44780.py:114-120`). The one glyph
+//! with no icon is drawn as a plain character (`TextGlyphs`, `hd44780.py:13`).
+//!
 //! # What is not here
 //!
-//! * **Text and glyph drawing.** [`super::display`] never draws, so
-//!   `write_text`/`write_glyph`/`write_graphics` (`hd44780.py:104-128`) are not
-//!   ported; [`Hd44780::set_glyphs`] keeps the 5x8 icons because upstream
-//!   collects them there (`hd44780.py:109-113`).
+//! * **`write_graphics`.** Upstream's is `pass` (`hd44780.py:127-128`): a text
+//!   panel has no graphics mode, so a layout's `draw_progress_bar` paints
+//!   nothing on it.
 //! * **`hd44780_spi`**: the SPI backpack variant is a different `lcd_type`, and
 //!   `lcd_type` reports it as a gap.
 //! * **`BACKGROUND_PRIORITY_CLOCK` / `minclock`** (`hd44780.py:9,92-102`):
@@ -56,6 +64,17 @@ const HD44780_DELAY: f64 = 0.000040;
 const LINE_LENGTH_DEFAULT: &str = "20";
 /// The widths `line_length` may choose between (`hd44780.py:11`).
 const LINE_LENGTH_OPTIONS: &[&str] = &["16", "20"];
+
+/// The glyph names a text panel draws as a plain character (`hd44780.py:13`):
+/// the right arrow is the panel's own `0x7e`. Every other glyph comes from a
+/// `[display_glyph]`'s `hd44780_data` and is drawn through the character
+/// generator instead.
+fn text_glyph(name: &str) -> Option<u8> {
+    match name {
+        "right_arrow" => Some(0x7e),
+        _ => None,
+    }
+}
 
 /// One framebuffer and the copy the firmware has already been told about —
 /// upstream's `(new_data, old_data, fb_id)` triples (`hd44780.py:43-50`).
@@ -339,6 +358,59 @@ impl LcdChip for Hd44780 {
             }
         }
     }
+
+    /// Upstream's `HD44780.write_text` (`hd44780.py:104-108`): a run that does
+    /// not fit is cut at the panel's right edge, and the row's other half lives
+    /// in the second text framebuffer.
+    fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+        let line_length = self.state.line_length;
+        // `data[:self.line_length - min(x, self.line_length)]`: empty once the
+        // write starts at or past the edge.
+        let text = if x + text.len() > line_length {
+            &text[..line_length - x.min(line_length)]
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
+        let pos = x + ((row & 0x02) >> 1) * line_length;
+        let mut framebuffers = self.framebuffers();
+        framebuffers.text[row & 1].data[pos..pos + text.len()].copy_from_slice(text);
+    }
+
+    /// Upstream's `HD44780.write_glyph` (`hd44780.py:114-126`): a glyph with an
+    /// icon writes its CGRAM slot as the character and the icon's bits into the
+    /// generator buffer; `right_arrow` is written as its own character; any
+    /// other name draws nothing and costs no cell.
+    fn write_glyph(&self, x: usize, row: usize, name: &str) -> usize {
+        let icon = self
+            .state
+            .icons
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(name)
+            .cloned();
+        if let Some((slot, bits)) = icon {
+            self.write_text(x, row, &[slot]);
+            let mut framebuffers = self.framebuffers();
+            let start = slot as usize * 8;
+            let written = bits.len().min(8);
+            framebuffers.glyph.data[start..start + written].copy_from_slice(&bits[..written]);
+            return 1;
+        }
+        match text_glyph(name) {
+            Some(character) => {
+                self.write_text(x, row, &[character]);
+                1
+            }
+            None => 0,
+        }
+    }
+
+    /// Upstream's `HD44780.write_graphics` is `pass` (`hd44780.py:127-128`): a
+    /// text panel has no graphics mode, so a progress bar paints nothing here.
+    fn write_graphics(&self, _x: usize, _row: usize, _data: &[u8]) {}
 
     /// Every message this panel has handed to the firmware, in order.
     fn sent_messages(&self) -> Vec<SentMessage> {
@@ -855,6 +927,88 @@ mod tests {
             *chip.state.icons.lock().unwrap(),
             HashMap::from([("thermometer".to_string(), (3u8, vec![0x0e; 8]))])
         );
+    }
+
+    /// A panel with `line_length: 16`, for the writes that are cut at the edge.
+    fn narrow_chip() -> Hd44780 {
+        let printer = printer();
+        let mut options = SIX_PINS.to_vec();
+        options.push(("line_length", "16"));
+        let section = display_section(&options);
+        Hd44780::new(&ConfigWrapper::untracked(&section), &printer).expect("the section loads")
+    }
+
+    #[test]
+    fn test_write_text_is_cut_at_the_edge_and_leaves_the_rest_blank() {
+        // `hd44780.py:104-108`: a run past the panel's width is truncated to
+        // what fits, and the cells after it keep the spaces `clear()` left.
+        let chip = narrow_chip();
+
+        chip.write_text(12, 0, b"abcdef");
+
+        assert_eq!(
+            &chip.framebuffers().text[0].data[..],
+            b"            abcd                "
+        );
+
+        // Row 2 is the second half of the first framebuffer, at its own offset
+        // (`pos = x + ((y & 2) >> 1) * line_length`); row 1 would be the
+        // *second* framebuffer's first half.
+        chip.write_text(0, 2, b"xy");
+        assert_eq!(&chip.framebuffers().text[0].data[16..18], b"xy");
+        assert_eq!(
+            &chip.framebuffers().text[1].data[..],
+            b"                                "
+        );
+
+        // A write that starts at or past the edge draws nothing.
+        chip.write_text(16, 1, b"z");
+        chip.write_text(20, 1, b"z");
+        assert_eq!(
+            &chip.framebuffers().text[1].data[..],
+            b"                                "
+        );
+    }
+
+    #[test]
+    fn test_write_glyph_writes_the_slot_and_the_cgram_bits() {
+        // `hd44780.py:114-126`: a glyph with an icon writes its CGRAM slot as
+        // the character and the icon into the generator buffer, `right_arrow`
+        // is its own character (`hd44780.py:13`), and an unknown name draws
+        // nothing and takes no cell.
+        let chip = narrow_chip();
+        let bits = vec![0x0e, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x0a, 0x04];
+        chip.set_glyphs(&BTreeMap::from([(
+            "thermometer".to_string(),
+            Glyph {
+                icon16x16: None,
+                icon5x8: Some((3, bits.clone())),
+            },
+        )]));
+
+        assert_eq!(chip.write_glyph(0, 0, "thermometer"), 1);
+        assert_eq!(chip.write_glyph(1, 0, "right_arrow"), 1);
+        assert_eq!(chip.write_glyph(2, 0, "nope"), 0);
+
+        let framebuffers = chip.framebuffers();
+        assert_eq!(&framebuffers.text[0].data[..4], b"\x03\x7e  ");
+        // The icon lands in slot 3's eight bytes, and the rest of the
+        // generator buffer is still the zeros it started with.
+        assert_eq!(&framebuffers.glyph.data[24..32], &bits[..]);
+        assert_eq!(&framebuffers.glyph.data[..24], &[0u8; 24][..]);
+        assert_eq!(&framebuffers.glyph.data[32..], &[0u8; 32][..]);
+    }
+
+    #[test]
+    fn test_write_graphics_paints_nothing_on_a_text_panel() {
+        // Upstream's `HD44780.write_graphics` is `pass` (`hd44780.py:127-128`):
+        // a layout's progress bar is graphics, and this panel has none.
+        let chip = narrow_chip();
+
+        chip.write_graphics(0, 0, &[0xff; 16]);
+
+        assert_eq!(&chip.framebuffers().text[0].data[..16], b"                ");
+        assert_eq!(&chip.framebuffers().glyph.data[..], &[0u8; 64][..]);
     }
 
     #[test]

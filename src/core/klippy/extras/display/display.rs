@@ -14,6 +14,7 @@
 //! | glyphs | `display_glyph` sections | `display.py:103-114` |
 //! | the group | `display_group`, defaulted from the panel's width | `display.py:194-200` |
 //! | refresh | `klippy:ready` initialises the panel and starts the timer | `display.py:217-241` |
+//! | drawing | each `display_data` item is rendered and drawn, `~glyph~` runs included | `display.py:78-87`, `:247-264` |
 //! | g-code | `SET_DISPLAY_GROUP` | `display.py:207-214`, `:266-271` |
 //!
 //! # The shipped layout
@@ -32,22 +33,29 @@
 //!
 //! # What is not here
 //!
-//! * **Rendering.** See the parent module's docs; the panel is cleared and
-//!   flushed every `REDRAW_TIME`, and nothing is drawn. The menu is wired in
-//!   (`MenuManager`), but its rows are computed, not painted — there is no
-//!   `draw_text`.
-//! * **`draw_text` / `draw_progress_bar`** (`display.py:247-264`): they are the
-//!   drawing half of a render step that does not run.
-//! * **The `display_template` parameter check.** Upstream raises `Invalid
-//!   parameter to display_template <name>` from inside `DisplayTemplate.render`
-//!   (`display.py:45-53`); the rule is [`check_render_params`], and nothing
-//!   calls it yet because nothing renders.
+//! # What is not here
+//!
+//! * **The menu's rows are computed, not painted.** The menu is wired in
+//!   ([`MenuManager`]) and owns the frame while it is open
+//!   (`display.py:227-231`), but [`MenuManager::screen_rows`] hands back the
+//!   rows it would draw — nothing paints them yet, so an open menu shows the
+//!   cleared screen. [`draw_text`] is what a later unit paints them with.
+//! * **`[display_data]` / `[display_glyph]` in the main config.** Only the
+//!   shipped `display.cfg` is read; a config's own layouts and glyphs have no
+//!   factory, so the loader still rejects them (see the parent module's docs).
+//! * **The other panels' drawing.** [`LcdChip::write_text`],
+//!   [`LcdChip::write_glyph`] and [`LcdChip::write_graphics`] have a
+//!   draw-nothing default, and only `hd44780` implements them: `st7920`,
+//!   `uc1701`, `ssd1306`, `hd44780_spi` and `aip31068_spi` need their own font
+//!   tables (`font8x14.VGA_FONT`, `st7920.CharGlyphs`, `uc1701.CharGlyphs`),
+//!   which are a later unit. Those panels therefore render into nothing.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
+use tracing::warn;
 
 use crate::core::klippy::config::section::ConfigSection;
 use crate::core::klippy::config::{Config, ConfigError, ConfigWrapper};
@@ -55,6 +63,9 @@ use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::display_status::ensure as ensure_display_status;
 use crate::core::klippy::extras::led::{
     load_display_template, DisplayTemplates, DISPLAY_TEMPLATES_OBJECT,
+};
+use crate::core::klippy::extras::template::{
+    Builtin, Context, HostCallable, PrinterView, Rt, Template, TemplateError,
 };
 use crate::core::klippy::gcode::{
     sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -124,7 +135,9 @@ const DEFAULT_GROUP_20X4: &str = "_default_20x4";
 ///
 /// The framework's half of the contract is small: bring the panel up, blank it
 /// and flush it on every redraw, say how wide it is (the default `display_group`
-/// depends on that), and take the glyphs it may draw.
+/// depends on that), take the glyphs it may draw, and accept the three drawing
+/// calls a rendered layout makes. Panels that have no font table here keep the
+/// draw-nothing default of the three `write_*` methods (module docs).
 pub trait LcdChip: Send + Sync {
     /// Bring the panel up (`display.py:218`).
     fn init(&self);
@@ -136,6 +149,17 @@ pub trait LcdChip: Send + Sync {
     fn get_dimensions(&self) -> (usize, usize);
     /// Take the glyphs the layout may name (`display.py:193`).
     fn set_glyphs(&self, glyphs: &BTreeMap<String, Glyph>);
+    /// Write text into the panel's character cells, starting at column `x`
+    /// (`display.py:251`).
+    fn write_text(&self, _x: usize, _row: usize, _text: &[u8]) {}
+    /// Draw the glyph named `name` at (`x`, `row`), returning how many character
+    /// cells it took (`display.py:254`).
+    fn write_glyph(&self, _x: usize, _row: usize, _name: &str) -> usize {
+        0
+    }
+    /// Write one 16-byte graphics column at (`x`, `row`) — a pixel column,
+    /// which only a panel with a graphics mode has (`display.py:263`).
+    fn write_graphics(&self, _x: usize, _row: usize, _data: &[u8]) {}
     /// Every message this panel has handed to the firmware, in order (tests and
     /// diagnostics): a panel that loaded but never wrote to the firmware is a
     /// blank screen, not a working one.
@@ -172,7 +196,7 @@ pub struct Glyph {
 // ===========================================================================
 
 /// One `[display_data <group> <item>]` row (`display.py:57-77`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct DisplayDataItem {
     /// The screen row.
     pub row: usize,
@@ -182,11 +206,14 @@ pub struct DisplayDataItem {
     pub identifier: String,
     /// The item's `text` option as written (its template source).
     pub text: String,
+    /// That `text` compiled, the way upstream compiles it while building the
+    /// group (`gcode_macro.load_template(c, 'text')`, `display.py:70`).
+    template: Template,
 }
 
 /// One `display_data` group: its items, ordered by screen position
 /// (`display.py:68-77`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct DisplayGroup {
     items: Vec<DisplayDataItem>,
 }
@@ -216,6 +243,8 @@ pub struct PrinterLCD {
     display_templates: Arc<DisplayTemplates>,
     /// The menu, on the primary display only (`display.py:184-188`).
     menu: Mutex<Option<Arc<MenuManager>>>,
+    /// The printer a layout's bodies read statuses through.
+    printer: Arc<Printer>,
     /// The reactor the refresh timer lives on.
     reactor: Arc<dyn Reactor>,
     /// The refresh timer, registered at ready.
@@ -287,6 +316,7 @@ impl PrinterLCD {
             show_data_group: Mutex::new(dgroup),
             display_templates,
             menu: Mutex::new(None),
+            printer: Arc::clone(printer),
             reactor: printer.reactor(),
             timer: Mutex::new(None),
             redraw_request_pending: AtomicBool::new(false),
@@ -371,8 +401,12 @@ impl PrinterLCD {
     /// One refresh (`display.py:222-241`).
     ///
     /// The menu is asked first, exactly as upstream: while it is open it owns
-    /// the screen and the group is not drawn. Neither half draws yet (module
-    /// docs), so the panel is cleared and flushed either way.
+    /// the screen and the group is not drawn (`display.py:227-231`). Otherwise
+    /// the frame is the active layout redrawn from scratch — clear, render and
+    /// draw the group's items, flush — and what the render raises is swallowed
+    /// and logged (`display.py:234-237`), so a broken layout shows the part it
+    /// managed to draw instead of stopping the printer. The menu's own rows are
+    /// still only computed (module docs).
     fn screen_update_event(&self, eventtime: f64) -> Option<f64> {
         if self.redraw_request_pending.swap(false, Ordering::SeqCst) {
             *self.redraw_time.lock().unwrap_or_else(|p| p.into_inner()) =
@@ -385,6 +419,19 @@ impl PrinterLCD {
             if menu.screen_update_event(eventtime) {
                 self.lcd_chip.flush();
                 return Some(eventtime + REDRAW_TIME);
+            }
+        }
+        // With the menu closed the group owns the frame; whatever a layout
+        // raises is swallowed here (`display.py:234-237`).
+        let group = self.show_data_group();
+        if let Some(group) = self.display_data_groups.get(&group) {
+            if let Err(err) = show_group(
+                &self.lcd_chip,
+                group,
+                &self.display_templates,
+                &self.printer,
+            ) {
+                warn!("Error during display screen update: {err}");
             }
         }
         self.lcd_chip.flush();
@@ -779,6 +826,8 @@ fn parse_data_item(config: &ConfigWrapper) -> Result<(String, DisplayDataItem), 
         ))
     })?;
     let text = config.get("text", None)?;
+    let template = Template::parse(&format!("{identifier}:text"), &text)
+        .map_err(|error| ConfigError::new(error.to_string()))?;
     Ok((
         group,
         DisplayDataItem {
@@ -786,6 +835,7 @@ fn parse_data_item(config: &ConfigWrapper) -> Result<(String, DisplayDataItem), 
             col,
             identifier,
             text,
+            template,
         },
     ))
 }
@@ -904,9 +954,8 @@ fn skip_published(section: &ConfigSection, main: &BTreeSet<String>) -> bool {
 /// Upstream's `DisplayTemplate.render` (`display/display.py:45-53`) copies the
 /// template's `param_*` values and then updates them with the call's keywords:
 /// the sizes only match while every keyword the call passes is one the template
-/// already declares. That rule is user-visible text, so it is kept here even
-/// though nothing renders yet — the caller is the render step that lands with
-/// the template engine.
+/// already declares. That rule is user-visible text, so it is kept here —
+/// [`render_callable`] is the caller, the body's `render(...)`.
 ///
 /// # Errors
 /// `Invalid parameter to display_template <name>` for a keyword the template
@@ -922,6 +971,183 @@ pub fn check_render_params(
     Err(ConfigError::new(format!(
         "Invalid parameter to display_template {template_name}"
     )))
+}
+
+// ===========================================================================
+// The render step
+// ===========================================================================
+
+/// The context a layout's bodies render against, including the two callables
+/// this step owns.
+///
+/// Upstream's `DisplayGroup.show` builds one context from the first item's
+/// `create_template_context` and then adds `render` and `draw_progress_bar`
+/// (`display.py:78-83`); the globals are the ones `create_template_context`
+/// binds (`gcode_macro.py:106-113`).
+type ContextFactory = Arc<dyn Fn() -> Context + Send + Sync>;
+
+/// Build that context. `chip` is what `draw_progress_bar` paints into; a
+/// nested `render()` builds its own context through the same factory, which is
+/// what upstream's `dict(context)` copy gives it (`display.py:50`).
+pub(crate) fn layout_context(
+    chip: &Arc<dyn LcdChip>,
+    templates: &Arc<DisplayTemplates>,
+    printer: &Arc<Printer>,
+) -> Context {
+    let factory: ContextFactory = {
+        let chip = Arc::clone(chip);
+        let templates = Arc::clone(templates);
+        let printer = Arc::clone(printer);
+        Arc::new(move || layout_context(&chip, &templates, &printer))
+    };
+
+    let mut context = Context::new();
+    context.insert(
+        "printer",
+        Rt::Printer(PrinterView::new(Arc::clone(printer))),
+    );
+    context.insert(
+        "action_respond_info",
+        Rt::Builtin(Builtin::RespondInfo(Arc::clone(printer))),
+    );
+    context.insert("action_raise_error", Rt::Builtin(Builtin::RaiseError));
+    context.insert("range", Rt::Builtin(Builtin::Range));
+    context.set_callable("render", render_callable(Arc::clone(templates), factory));
+    context.set_callable("draw_progress_bar", progress_bar_callable(Arc::clone(chip)));
+    context
+}
+
+/// `context['render']` — a body's `render("<template>", k=v)`
+/// (`display.py:80-82`).
+///
+/// The keyword arguments are the call's own: one the template does not declare
+/// is upstream's `Invalid parameter to display_template <name>`
+/// (`display.py:43-47`, [`check_render_params`]), and an unknown template name
+/// is the `KeyError` its `templates[name]` lookup raises.
+fn render_callable(templates: Arc<DisplayTemplates>, factory: ContextFactory) -> HostCallable {
+    Arc::new(move |args, kwargs| {
+        let name = args.first().and_then(Value::as_str).ok_or_else(|| {
+            "TypeError: render() missing 1 required positional argument: 'name'".to_string()
+        })?;
+        let declared = templates
+            .param_names(name)
+            .ok_or_else(|| format!("KeyError: '{name}'"))?;
+        let params: Vec<(String, Value)> = kwargs.to_vec();
+        let written: Vec<&str> = params.iter().map(|(key, _)| key.as_str()).collect();
+        check_render_params(&declared, name, &written).map_err(|error| error.to_string())?;
+        let text = templates
+            .render(name, &mut factory(), &params)
+            .ok_or_else(|| format!("KeyError: '{name}'"))?;
+        text.map(Value::String).map_err(|error| error.to_string())
+    })
+}
+
+/// `context['draw_progress_bar']` — a body's
+/// `draw_progress_bar(row, col, width, value)` (`display.py:83`, `:259-264`).
+///
+/// It paints into the panel and returns `""`, which is what upstream's
+/// `PrinterLCD.draw_progress_bar` returns: the bar is graphics, not text.
+fn progress_bar_callable(chip: Arc<dyn LcdChip>) -> HostCallable {
+    Arc::new(move |args, _kwargs| {
+        let row = cell_argument(args, 0, "row")?;
+        let col = cell_argument(args, 1, "col")?;
+        let width = cell_argument(args, 2, "width")?;
+        let value = args.get(3).and_then(Value::as_f64).ok_or_else(|| {
+            "TypeError: draw_progress_bar() argument 'value' must be a number".to_string()
+        })?;
+        draw_progress_bar(&*chip, row, col, width, value);
+        Ok(Value::String(String::new()))
+    })
+}
+
+/// One `draw_progress_bar` cell argument, or the wording Python's own missing
+/// argument would get.
+fn cell_argument(args: &[Value], at: usize, name: &str) -> Result<usize, String> {
+    args.get(at)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .ok_or_else(|| {
+            format!("TypeError: draw_progress_bar() argument '{name}' must be an integer")
+        })
+}
+
+/// Draw one layout: upstream's `DisplayGroup.show` (`display.py:78-87`).
+///
+/// Every item's `text` is rendered in the group's context and drawn at the
+/// item's own `position` — with its newlines dropped, as upstream drops them
+/// before drawing (`display.py:86`).
+///
+/// # Errors
+/// The first body that fails to render, worded by the engine or by the
+/// callable it called: the items already drawn stay on the panel, which is
+/// upstream's behaviour too (the exception ends the group's frame,
+/// `display.py:234-237`).
+pub(crate) fn show_group(
+    chip: &Arc<dyn LcdChip>,
+    group: &DisplayGroup,
+    templates: &Arc<DisplayTemplates>,
+    printer: &Arc<Printer>,
+) -> Result<(), TemplateError> {
+    let mut context = layout_context(chip, templates, printer);
+    for item in &group.items {
+        let text = item.template.render(&mut context)?;
+        draw_text(&**chip, item.row, item.col, &text.replace('\n', ""));
+    }
+    Ok(())
+}
+
+/// Write one item's `mixed_text` at (`row`, `col`): upstream's
+/// `PrinterLCD.draw_text` (`display.py:247-258`).
+///
+/// The text is split on `~`: the even runs are text and cost their length in
+/// cells, the odd ones are glyph names and cost what the panel's
+/// [`LcdChip::write_glyph`] says it drew. Returns the column the write ended
+/// at — upstream returns it for the menu, which this host does not have.
+pub fn draw_text(chip: &dyn LcdChip, row: usize, col: usize, mixed_text: &str) -> usize {
+    let mut pos = col;
+    for (index, text) in mixed_text.split('~').enumerate() {
+        if index % 2 == 0 {
+            chip.write_text(pos, row, text.as_bytes());
+            pos += text.len();
+        } else {
+            pos += chip.write_glyph(pos, row, text);
+        }
+    }
+    pos
+}
+
+/// Paint a progress bar into the panel: upstream's
+/// `PrinterLCD.draw_progress_bar` (`display.py:259-264`).
+///
+/// The bar is a bitmap over `row`, `width` 8-pixel columns wide, sent as one
+/// 16-byte graphics column per cell — `0xff` above and below, the middle 14
+/// bytes the bar. Bit `k` of that bitmap is set when `k` is at or past
+/// `int(width * 8 * (1. - value) + .5)` (the empty part of the bar), or when it
+/// is the first or the last bit (the frame's two edges); column `i` (0 = the
+/// rightmost) sends bits `i * 8` … `i * 8 + 7`.
+///
+/// The bits are computed one at a time rather than as Python's
+/// `-1 << n | …` on an arbitrary-precision int, so a bar wider than 128 bits
+/// still works; a `value` above 1. is past full and draws a full bar, where
+/// Python's negative shift would raise and abandon the frame.
+pub fn draw_progress_bar(chip: &dyn LcdChip, row: usize, col: usize, width: usize, value: f64) {
+    let bits = width * 8;
+    let filled = (bits as f64 * (1.0 - value) + 0.5).trunc() as i64;
+    for column in 0..width {
+        let mut byte = 0u8;
+        for bit_index in 0..8 {
+            let bit = column * 8 + bit_index;
+            if bit as i64 >= filled || bit == 0 || bit + 1 == bits {
+                byte |= 1 << bit_index;
+            }
+        }
+        // Above and below the bar's 14 pixel rows the column is solid.
+        let mut data = Vec::with_capacity(16);
+        data.push(0xff);
+        data.extend(std::iter::repeat(byte).take(14));
+        data.push(0xff);
+        chip.write_graphics(col + width - 1 - column, row, &data);
+    }
 }
 
 // ===========================================================================
@@ -1536,5 +1762,369 @@ mod tests {
         assert_eq!(message, json!("Printing"));
         assert_eq!(progress, json!(0.25));
         assert_eq!(group, "_default_20x4");
+    }
+
+    // -- the render step ---------------------------------------------------
+
+    /// A 20x4 text panel with a graphics layer: the render step's writes land
+    /// in character cells the test can read back, the way a real panel's
+    /// framebuffers hold them. A glyph name is one cell, marked `#` (a real
+    /// panel draws the icon there).
+    struct FakePanel {
+        state: Mutex<FakePanelState>,
+    }
+
+    #[derive(Default)]
+    struct FakePanelState {
+        rows: Vec<Vec<u8>>,
+        graphics: BTreeMap<(usize, usize), Vec<u8>>,
+    }
+
+    impl FakePanel {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakePanelState {
+                    rows: vec![vec![b' '; 20]; 4],
+                    ..FakePanelState::default()
+                }),
+            })
+        }
+
+        /// One row as the characters it holds.
+        fn row(&self, row: usize) -> String {
+            String::from_utf8(self.state.lock().unwrap().rows[row].clone())
+                .expect("the frame is ASCII")
+        }
+
+        /// One graphics column as it was written.
+        fn graphics(&self, row: usize, x: usize) -> Option<Vec<u8>> {
+            self.state.lock().unwrap().graphics.get(&(row, x)).cloned()
+        }
+    }
+
+    impl LcdChip for FakePanel {
+        fn init(&self) {}
+
+        fn clear(&self) {
+            let mut state = self.state.lock().unwrap();
+            for row in state.rows.iter_mut() {
+                row.fill(b' ');
+            }
+            // A panel's `clear()` blanks its graphics too (`st7920.py:129-134`).
+            state.graphics.clear();
+        }
+
+        fn flush(&self) {}
+
+        fn get_dimensions(&self) -> (usize, usize) {
+            (20, 4)
+        }
+
+        fn set_glyphs(&self, _glyphs: &BTreeMap<String, Glyph>) {}
+
+        fn write_text(&self, x: usize, row: usize, text: &[u8]) {
+            let mut state = self.state.lock().unwrap();
+            let line = &mut state.rows[row];
+            for (offset, byte) in text.iter().enumerate() {
+                if let Some(cell) = line.get_mut(x + offset) {
+                    *cell = *byte;
+                }
+            }
+        }
+
+        fn write_glyph(&self, x: usize, row: usize, _name: &str) -> usize {
+            self.write_text(x, row, b"#");
+            1
+        }
+
+        fn write_graphics(&self, x: usize, row: usize, data: &[u8]) {
+            self.state
+                .lock()
+                .unwrap()
+                .graphics
+                .insert((row, x), data.to_vec());
+        }
+
+        fn sent_messages(&self) -> Vec<SentMessage> {
+            Vec::new()
+        }
+    }
+
+    /// A `display_data` item as the loader builds one.
+    fn item(row: usize, col: usize, text: &str) -> DisplayDataItem {
+        let identifier = format!("display_data _test r{row}c{col}");
+        DisplayDataItem {
+            row,
+            col,
+            identifier: identifier.clone(),
+            text: text.to_string(),
+            template: Template::parse(&format!("{identifier}:text"), text)
+                .expect("the body parses"),
+        }
+    }
+
+    fn group(items: Vec<DisplayDataItem>) -> DisplayGroup {
+        DisplayGroup { items }
+    }
+
+    /// A machine with a `[display]` section and the two statuses the shipped
+    /// layouts read unguarded: `gcode_move.speed_factor` and
+    /// `toolhead.extruder` (the guarded ones — `extruder`, `fan`,
+    /// `virtual_sdcard` — stay absent, so their items render empty).
+    fn layout_machine() -> Arc<Printer> {
+        struct Stub(Value);
+        impl PrinterObject for Stub {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                self.0.clone()
+            }
+        }
+        let printer = machine();
+        printer
+            .load_config(&display_config(ST7920_SECTION))
+            .expect("the section loads");
+        printer
+            .add_object("gcode_move", Arc::new(Stub(json!({ "speed_factor": 1.0 }))))
+            .expect("the name is free");
+        printer
+            .add_object(
+                "toolhead",
+                Arc::new(Stub(json!({
+                    "extruder": "extruder",
+                    "position": { "x": 0.0, "y": 0.0, "z": 0.0 },
+                    "estimated_print_time": 0.0,
+                }))),
+            )
+            .expect("the name is free");
+        printer
+    }
+
+    /// The layout machine's display and the panel a frame is drawn into.
+    fn layout_panel(printer: &Arc<Printer>) -> (Arc<DisplayTemplates>, Arc<FakePanel>) {
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        (Arc::clone(display.display_templates()), FakePanel::new())
+    }
+
+    #[test]
+    fn test_a_group_is_rendered_into_the_panel_at_its_positions() {
+        // The render step end to end: each item's `text` is rendered (with its
+        // `{% set %}`), its `~glyph~` runs become cells, its newlines are
+        // dropped, and a write past the edge is cut there.
+        let printer = machine();
+        let templates = Arc::new(DisplayTemplates::default());
+        let panel = FakePanel::new();
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        let group = group(vec![
+            item(0, 0, "{% set who = \"world\" %}hi { who }"),
+            item(1, 2, "~right_arrow~ { 2 + 3 }"),
+            item(2, 0, "one\ntwo"),
+            item(3, 19, "abc"),
+        ]);
+
+        show_group(&chip, &group, &templates, &printer).expect("the group renders");
+
+        assert_eq!(panel.row(0), "hi world            ");
+        assert_eq!(panel.row(1), "  # 5               ");
+        assert_eq!(panel.row(2), "onetwo              ");
+        assert_eq!(panel.row(3), "                   a");
+    }
+
+    #[test]
+    fn test_a_group_reads_its_statuses_at_render_time() {
+        // The frame follows the data: the same group drawn twice around a
+        // changed status is two different frames.
+        struct Shared(Arc<Mutex<Value>>);
+        impl PrinterObject for Shared {
+            fn get_status(&self, _eventtime: f64) -> Value {
+                self.0.lock().unwrap().clone()
+            }
+        }
+        let printer = machine();
+        let speed = Arc::new(Mutex::new(json!({ "speed_factor": 1.0 })));
+        printer
+            .add_object("gcode_move", Arc::new(Shared(Arc::clone(&speed))))
+            .expect("the name is free");
+        let templates = Arc::new(DisplayTemplates::default());
+        let panel = FakePanel::new();
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        let group = group(vec![item(
+            1,
+            0,
+            "~feedrate~\n  { \"{:^4.0%}\".format(printer.gcode_move.speed_factor) }",
+        )]);
+
+        show_group(&chip, &group, &templates, &printer).expect("the group renders");
+        assert_eq!(panel.row(1), "#  100%             ");
+
+        *speed.lock().unwrap() = json!({ "speed_factor": 0.5 });
+        panel.clear();
+        show_group(&chip, &group, &templates, &printer).expect("the group renders again");
+        assert_eq!(panel.row(1), "#  50%              ");
+    }
+
+    #[test]
+    fn test_a_failing_item_keeps_the_frame_drawn_so_far() {
+        let printer = machine();
+        let templates = Arc::new(DisplayTemplates::default());
+        let panel = FakePanel::new();
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+        let group = group(vec![
+            item(0, 0, "first"),
+            item(1, 0, "{ nope }"),
+            item(2, 0, "third"),
+        ]);
+
+        let error = show_group(&chip, &group, &templates, &printer).expect_err("the item fails");
+
+        // The frame stops at the failing item — nothing after it is drawn — and
+        // what came before stays, which is what upstream's `except` does
+        // (`display.py:234-237`). The error names the item's own template.
+        assert!(error.to_string().contains("undefined value"), "{error}");
+        assert!(
+            error.to_string().contains("display_data _test r1c0:text"),
+            "{error}"
+        );
+        assert_eq!(panel.row(0), "first               ");
+        assert_eq!(panel.row(1), "                    ");
+        assert_eq!(panel.row(2), "                    ");
+    }
+
+    #[test]
+    fn test_a_render_call_is_checked_against_the_templates_parameters() {
+        // `render()` is the display's own callable: an undeclared keyword is
+        // upstream's `Invalid parameter` and an unknown name is the `KeyError`
+        // its lookup raises.
+        let printer = layout_machine();
+        let (templates, panel) = layout_panel(&printer);
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+
+        let refused = group(vec![item(
+            0,
+            0,
+            "{ render('_heater_temperature', nope=1) }",
+        )]);
+        let error = show_group(&chip, &refused, &templates, &printer).expect_err("the call fails");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid parameter to display_template _heater_temperature"),
+            "{error}"
+        );
+
+        let missing = group(vec![item(0, 0, "{ render('_nope') }")]);
+        let error = show_group(&chip, &missing, &templates, &printer).expect_err("the call fails");
+        assert!(error.to_string().contains("KeyError: '_nope'"), "{error}");
+    }
+
+    #[test]
+    fn test_draw_progress_bar_paints_eight_bits_per_cell() {
+        let panel = FakePanel::new();
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+
+        // Half full over four columns is 32 bits, `int(32 * .5 + .5)` = 16 of
+        // them empty: the two rightmost columns are solid, the two leftmost
+        // hold only the bar's frame bits (the bottom one).
+        draw_progress_bar(&*chip, 2, 1, 4, 0.5);
+
+        assert_eq!(panel.graphics(2, 4), Some(column(0x01)));
+        assert_eq!(panel.graphics(2, 3), Some(column(0x00)));
+        assert_eq!(panel.graphics(2, 2), Some(column(0xff)));
+        assert_eq!(panel.graphics(2, 1), Some(column(0xff)));
+        assert_eq!(panel.graphics(2, 0), None);
+    }
+
+    /// One graphics column: a solid row, the bar's fourteen pixel rows, and a
+    /// solid row (`display.py:263`).
+    fn column(byte: u8) -> Vec<u8> {
+        let mut data = vec![0xff];
+        data.extend(std::iter::repeat(byte).take(14));
+        data.push(0xff);
+        data
+    }
+
+    #[test]
+    fn test_the_shipped_layouts_render_a_frame() {
+        // The three `display_data` groups the shipped `display.cfg` defines,
+        // each rendered into a panel with `gcode_move.speed_factor` at 1.0 and
+        // nothing else running (`display_status` at 0%, `idle_timeout` at
+        // `00:00`, `Ready`), and with the two guarded items — `extruder`/`fan`
+        // — absent. Each row is the characters the panel would show, in order.
+        let printer = layout_machine();
+        let (templates, panel) = layout_panel(&printer);
+        let display = printer
+            .lookup_object_as::<PrinterLCD>("display")
+            .expect("the display");
+        let chip: Arc<dyn LcdChip> = Arc::clone(&panel) as Arc<dyn LcdChip>;
+
+        // `_default_16x4`: the feedrate glyph and its speed on row 1, the
+        // progress text and the clock on row 2, the status line on row 3. The
+        // progress bar is ten graphics columns on row 2, not text.
+        panel.clear();
+        let group = &display.display_data_groups()["_default_16x4"];
+        show_group(&chip, group, &templates, &printer).expect("_default_16x4");
+        assert_eq!(
+            [panel.row(0), panel.row(1), panel.row(2), panel.row(3)],
+            [
+                "                    ",
+                "          #100%     ",
+                "    0%     00:00    ",
+                "Ready               ",
+            ]
+        );
+        assert_eq!(graphics_columns(&panel), row_columns(2, 0, 10));
+
+        // `_multiextruder_16x4`: the same rows with the second extruder and a
+        // four-character progress field, and its bar six columns wide on row 1.
+        panel.clear();
+        let group = &display.display_data_groups()["_multiextruder_16x4"];
+        show_group(&chip, group, &templates, &printer).expect("_multiextruder_16x4");
+        assert_eq!(
+            [panel.row(0), panel.row(1), panel.row(2), panel.row(3)],
+            [
+                "                    ",
+                "            0%      ",
+                "           00:00    ",
+                "Ready               ",
+            ]
+        );
+        assert_eq!(graphics_columns(&panel), row_columns(1, 10, 6));
+
+        // `_default_20x4`: four rows of items at two columns each — the
+        // feedrate, the progress and the clock all carry their glyph — and no
+        // progress bar, so no graphics at all.
+        panel.clear();
+        let group = &display.display_data_groups()["_default_20x4"];
+        show_group(&chip, group, &templates, &printer).expect("_default_20x4");
+        assert_eq!(
+            [panel.row(0), panel.row(1), panel.row(2), panel.row(3)],
+            [
+                "                    ",
+                "                    ",
+                "#100%   # 0%  #00:00",
+                "Ready               ",
+            ]
+        );
+        assert_eq!(graphics_columns(&panel), Vec::new());
+    }
+
+    /// Every graphics column a panel was written, in `(row, x)` order.
+    fn graphics_columns(panel: &FakePanel) -> Vec<(usize, usize)> {
+        let mut columns: Vec<(usize, usize)> = panel
+            .state
+            .lock()
+            .unwrap()
+            .graphics
+            .keys()
+            .copied()
+            .collect();
+        columns.sort();
+        columns
+    }
+
+    /// The `width` columns starting at (`row`, `col`), as [`graphics_columns`]
+    /// reports them.
+    fn row_columns(row: usize, col: usize, width: usize) -> Vec<(usize, usize)> {
+        (col..col + width).map(|x| (row, x)).collect()
     }
 }

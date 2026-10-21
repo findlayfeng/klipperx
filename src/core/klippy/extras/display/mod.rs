@@ -21,28 +21,27 @@
 //!
 //! # What is not here
 //!
-//! * **Rendering.** Templates, layouts and glyphs are parsed and stored, but no
-//!   template is evaluated and nothing is drawn onto a panel: `display.cfg`
-//!   needs `{% set %}` (supported since template batch #9), plus `|abs`,
-//!   `"%3.0f" % …` and `.format`, which the template engine
-//!   (`super::template`) does not have yet. A refresh clears the panel and
-//!   flushes the framebuffer differences, exactly as upstream does around its
-//!   own (swallowed) render step (`display/display.py:234-237`), so the screen
-//!   stays blank rather than the printer failing to come up.
-//! * **The menu.** [`menu`] ports `menu.py` + `menu_keys.py` and reads the
-//!   shipped `menu.cfg`; a config's `[menu <name>]` sections are read in place
-//!   (no section factory of their own — the manager reads its siblings, as
-//!   upstream's `get_prefix_sections` does). The menu's rows are laid out but
-//!   not painted, for the reason above; the key buttons register through
-//!   `buttons`, whose registry has no rotary encoder here.
-//! * **The other panels.** `st7920`, `hd44780`, `hd44780_spi`, `uc1701`,
-//!   `ssd1306` and `aip31068_spi` have drivers; `sh1106` and `emulated_st7920`
-//!   are accepted by `lcd_type` (so its error wording stays upstream's) and
-//!   refused with a message naming the gap.
+//! * **The menu's rows are computed, not painted.** [`menu`] ports `menu.py` +
+//!   `menu_keys.py` and reads the shipped `menu.cfg`; a config's `[menu <name>]`
+//!   sections are read in place (no section factory of their own — the manager
+//!   reads its siblings, as upstream's `get_prefix_sections` does). The rows it
+//!   lays out are handed back by `MenuManager::screen_rows`, not drawn — the
+//!   framework's [`display::draw_text`]/[`display::draw_progress_bar`] is what a
+//!   later unit paints them with; the key buttons register through `buttons`,
+//!   whose registry has no rotary encoder here.
+//! * **The other panels' drawing.** `st7920`, `hd44780`, `hd44780_spi`,
+//!   `uc1701`, `ssd1306` and `aip31068_spi` have drivers; `sh1106` and
+//!   `emulated_st7920` are accepted by `lcd_type` (so its error wording stays
+//!   upstream's) and refused with a message naming the gap. Of the six, only
+//!   [`hd44780`] draws: the font tables the others write glyphs from
+//!   (`font8x14.VGA_FONT`, `st7920.CharGlyphs`, `uc1701.CharGlyphs`) are a
+//!   later unit, so their [`display::LcdChip::write_text`] and friends are the
+//!   draw-nothing defaults and their panels stay blank while the layout renders.
 //! * **`[display_data]`/`[display_glyph]` in the main config.** Only the shipped
 //!   `display.cfg` is read; a main config's own layouts and glyphs are still
 //!   rejected as unknown sections, because the loader claims a section through
-//!   its factory table and neither has a factory here.
+//!   its factory table and neither has a factory here. The shipped three groups
+//!   are the layouts a machine can show today.
 
 pub mod aip31068_spi;
 pub mod display;

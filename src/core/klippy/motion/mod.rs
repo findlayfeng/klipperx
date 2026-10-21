@@ -28,6 +28,7 @@ pub mod plan;
 pub mod pressure_advance;
 pub mod queuing;
 pub mod rotary_delta;
+pub mod shaper;
 pub mod stepcompress;
 pub mod stepper;
 pub mod toolhead;
@@ -47,6 +48,7 @@ pub use kinematics::{
 pub use plan::{LookAheadQueue, Move, MoveLimits};
 pub use pressure_advance::ExtruderPressureAdvance;
 pub use queuing::MotionQueuing;
+pub use shaper::{KinematicShaper, ShaperPulse, ShaperPulses};
 pub use stepcompress::{GracePolicy, HistoryStep, StepCommand, StepCompressError, StepCompressor};
 pub use stepper::Stepper;
 pub use toolhead::ToolHead;

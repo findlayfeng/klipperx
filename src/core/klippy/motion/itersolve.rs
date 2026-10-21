@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::core::klippy::mathutil::Xyz;
 
 use super::pressure_advance::{ExtruderPressureAdvance, PressureAdvanceEntry};
+use super::shaper::KinematicShaper;
 use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
@@ -114,7 +115,9 @@ pub type PositionPost = fn(commanded: &mut f64);
 /// A solver that reads only the segment it is asked about gets a one-segment
 /// window ([`SegmentWindow::single`]); the pressure-advance extruder needs its
 /// neighbours for the smoothing window (`kin_extruder.c`'s
-/// `pa_range_integrate` walks the list both ways).
+/// `pa_range_integrate` walks the list both ways), and so does an input shaper,
+/// whose impulse times reach into the segments either side of the one being
+/// generated (`kin_shaper.c`'s `calc_position`).
 #[derive(Debug, Clone, Copy)]
 pub struct SegmentWindow<'a> {
     cuts: &'a [MoveSegment],
@@ -132,8 +135,28 @@ impl<'a> SegmentWindow<'a> {
         }
     }
 
+    /// A window over `cuts`, oldest first, with `index` being the segment being
+    /// generated.
+    pub fn new(cuts: &'a [MoveSegment], index: usize) -> Self {
+        Self {
+            cuts,
+            index,
+            schedule: &[],
+        }
+    }
+
+    /// The segments around the one being generated, oldest first.
+    pub fn cuts(&self) -> &'a [MoveSegment] {
+        self.cuts
+    }
+
+    /// Where the segment being generated sits in [`Self::cuts`].
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
     /// The segment being generated.
-    fn segment(&self) -> &'a MoveSegment {
+    pub fn segment(&self) -> &'a MoveSegment {
         &self.cuts[self.index]
     }
 }
@@ -167,6 +190,10 @@ pub struct StepKinematics {
     /// (`struct extruder_stepper`'s `pa_list`): the position function becomes
     /// the smoothed `pa_position` (`kin_extruder.c:124-136`).
     pressure_advance: Option<Arc<ExtruderPressureAdvance>>,
+    /// The input shaper, when this stepper is shaped: the position function
+    /// becomes the shaper's convolution of the coordinate it reads
+    /// (`struct input_shaper`, `kin_shaper.c:17-23`).
+    shaper: Option<Arc<KinematicShaper>>,
     /// The time before the first move this stepper is active in that it also
     /// generates steps in (`gen_steps_pre_active`).
     gen_steps_pre_active: f64,
@@ -188,6 +215,7 @@ impl StepKinematics {
             unwrap: None,
             post: None,
             pressure_advance: None,
+            shaper: None,
             gen_steps_pre_active: 0.0,
             gen_steps_post_active: 0.0,
         }
@@ -250,6 +278,31 @@ impl StepKinematics {
         self.pressure_advance.as_ref()
     }
 
+    /// Shape this stepper's position function (`input_shaper_set_sk` plus
+    /// `input_shaper_update_sk`, `kin_shaper.c:226-279`), or take the shaper off
+    /// again with `None`.
+    ///
+    /// The step generation window follows the impulses, as upstream's
+    /// `shaper_note_generation_time` recomputes it on every change: the shaped
+    /// motion reaches the outermost impulse times past the first and last move
+    /// the stepper is active in, and steps there are not final
+    /// (`gen_steps_pre_active`/`gen_steps_post_active`). The caller rescans the
+    /// queue's windows afterwards
+    /// ([`ToolHead::recompute_scan_windows`](super::toolhead::ToolHead::recompute_scan_windows)).
+    pub fn set_input_shaper(&mut self, shaper: Option<Arc<KinematicShaper>>) {
+        let (pre_active, post_active) = match &shaper {
+            Some(shaper) => shaper.generation_window(self.active_flags),
+            None => (0.0, 0.0),
+        };
+        self.set_generation_window(pre_active, post_active);
+        self.shaper = shaper;
+    }
+
+    /// The shaper driving this stepper, when it is shaped.
+    pub fn input_shaper(&self) -> Option<&Arc<KinematicShaper>> {
+        self.shaper.as_ref()
+    }
+
     /// Install the solver's position hooks (upstream: the `calc_position_cb`
     /// that reads `sk->commanded_pos` and the `post_cb`; `kin_polar.c` is the
     /// only solver in the corpus that has them).
@@ -261,11 +314,12 @@ impl StepKinematics {
     /// One position-fn evaluation: the raw result, unwrapped against the
     /// commanded position (`polar_stepper_angle_calc_position`).
     fn eval(&self, window: SegmentWindow<'_>, move_time: f64) -> f64 {
-        let raw = match &self.pressure_advance {
-            Some(pressure_advance) => {
-                pressure_advance.position(window.cuts, window.index, move_time, window.schedule)
-            }
-            None => self.position.call(window.segment(), move_time),
+        let raw = if let Some(pressure_advance) = &self.pressure_advance {
+            pressure_advance.position(window.cuts, window.index, move_time, window.schedule)
+        } else if let Some(shaper) = &self.shaper {
+            shaper.position(window, move_time, self.active_flags, &self.position)
+        } else {
+            self.position.call(window.segment(), move_time)
         };
         match self.unwrap {
             Some(unwrap) => unwrap(raw, self.commanded_pos),
@@ -343,10 +397,14 @@ impl StepKinematics {
     /// A stepper only steps while it is active, but its position function may
     /// read the moves around the one it is asked about: pressure advance
     /// averages over `2 * hst = smooth_time` of the trapq (`pa_range_integrate`,
-    /// `kin_extruder.c:89-116`), so the `hst` before its first active move and
-    /// after its last one really does move the extruder. Generating only inside
-    /// the active moves would squeeze that motion into the move's own span — a
-    /// jump at the start and at the end of every extrusion. The two windows
+    /// `kin_extruder.c:89-116`), and an input shaper's impulses reach into the
+    /// segments either side of the one being generated (`calc_position`,
+    /// `kin_shaper.c:120-152`). So the `hst` before its first active move and
+    /// after its last one really does move the extruder, and the shaped motion
+    /// starts before and ends after the moves an axis is active in. Generating
+    /// only inside the active moves would squeeze that motion into the move's
+    /// own span — a jump at the start and at the end of every extrusion, and at
+    /// both ends of every shaped move. The two windows
     /// (`gen_steps_pre_active`, `gen_steps_post_active`) make the generator
     /// visit the silent moves inside that reach as well.
     ///
@@ -363,17 +421,19 @@ impl StepKinematics {
         if self.step_dist == 0.0 {
             return Ok(());
         }
-        // The pressure-advance position function reads the segments around the
-        // one it is asked about, including the ones already finalized into the
-        // history (`kin_extruder.c` walks the trapq list both ways). Copy them
-        // into one slice, oldest first, only when this stepper needs them — and
-        // take one snapshot of the parameters, so the position function itself
-        // needs no lock.
+        // The pressure-advance and shaper position functions read the segments
+        // around the one they are asked about, including the ones already
+        // finalized into the history (`kin_extruder.c` and `kin_shaper.c` walk
+        // the trapq list both ways). Copy them into one slice, oldest first,
+        // only when this stepper needs them — and take one snapshot of the
+        // pressure-advance parameters, so the position function itself needs no
+        // lock.
         let schedule: Vec<PressureAdvanceEntry> = match &self.pressure_advance {
             Some(pressure_advance) => pressure_advance.schedule(),
             None => Vec::new(),
         };
-        let cuts: Vec<MoveSegment> = if self.pressure_advance.is_some() {
+        let reads_neighbouring_moves = self.pressure_advance.is_some() || self.shaper.is_some();
+        let cuts: Vec<MoveSegment> = if reads_neighbouring_moves {
             let mut cuts: Vec<MoveSegment> = trapq.history().iter().rev().copied().collect();
             cuts.extend(trapq.moves().iter().copied());
             cuts

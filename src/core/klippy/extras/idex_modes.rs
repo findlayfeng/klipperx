@@ -779,6 +779,8 @@ fn cmd_restore_dual_carriage_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use crate::core::klippy::config::Config;
     use crate::core::klippy::event::KlippyEvent;
     use crate::core::klippy::mathutil::Coord;
@@ -920,6 +922,64 @@ mod tests {
             .run_script_sync("RESTORE_DUAL_CARRIAGE_STATE")
             .unwrap();
         assert_eq!(module.active_carriage(), 0, "the saved index is restored");
+    }
+
+    /// Every switch and restore fires `dual_carriage:update_kinematics` once —
+    /// upstream's `DualCarriagesRail.apply_transform` event
+    /// (`idex_modes.py:383`), which is how the shaping layer learns that the
+    /// kinematics under it changed (`input_shaper.py:153-168`) — and never while
+    /// the carriage state is locked: the handler flushes step generation, which
+    /// must not run under a state lock the flush path could reach back into.
+    /// The probe takes the lock with `try_lock`, so a regression to firing the
+    /// event inside the lock fails instead of deadlocking the gate.
+    #[test]
+    fn a_switch_fires_the_update_kinematics_event_outside_the_lock() {
+        let (printer, result) = load(&cartesian_config("cartesian"));
+        result.unwrap();
+        let module = module(&printer);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        let fired = Arc::new(AtomicUsize::new(0));
+        let unlocked = Arc::new(AtomicUsize::new(0));
+        printer.register_event_handler(
+            KlippyEvent::DualCarriageUpdateKinematics,
+            Box::new({
+                let module = Arc::clone(&module);
+                let fired = Arc::clone(&fired);
+                let unlocked = Arc::clone(&unlocked);
+                move |_| {
+                    fired.fetch_add(1, Ordering::SeqCst);
+                    if module.shared.try_lock().is_ok() {
+                        unlocked.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }),
+        );
+
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=1")
+            .unwrap();
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "a switch re-points");
+        gcode
+            .run_script_sync("SET_DUAL_CARRIAGE CARRIAGE=0")
+            .unwrap();
+        gcode
+            .run_script_sync("SAVE_DUAL_CARRIAGE_STATE NAME=s")
+            .unwrap();
+        gcode
+            .run_script_sync("RESTORE_DUAL_CARRIAGE_STATE NAME=s")
+            .unwrap();
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            3,
+            "every switch and every restore fires the event once"
+        );
+        assert_eq!(
+            unlocked.load(Ordering::SeqCst),
+            3,
+            "the event must not fire with the carriage state locked"
+        );
     }
 
     /// `CARRIAGE=` takes a carriage **name** first (`idex_modes.py:243-254`):

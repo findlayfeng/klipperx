@@ -619,6 +619,29 @@ mod tests {
         assert!(object.shaping(&object.lock()).is_none());
     }
 
+    /// A connected `kinematics: none` toolhead on `printer`: no rails, but the
+    /// real flush path, which is all the shaping seam needs.
+    async fn connect_none_toolhead(printer: &Arc<Printer>) -> Arc<ToolHeadObject> {
+        let mut section = ConfigSection::new("printer", None);
+        for (key, value) in [
+            ("kinematics", "none"),
+            ("max_velocity", "300"),
+            ("max_accel", "3000"),
+        ] {
+            section
+                .parameters
+                .insert(key.to_string(), ConfigValue::Single(value.to_string()));
+        }
+        let object = ToolHeadObject::new(&ConfigWrapper::untracked(&section), printer)
+            .expect("kinematics: none builds");
+        printer.add_object("toolhead", Arc::new(object)).unwrap();
+        let toolhead = printer
+            .lookup_object_as::<ToolHeadObject>("toolhead")
+            .expect("the toolhead is registered");
+        toolhead.connect().await.expect("the toolhead connects");
+        toolhead
+    }
+
     /// Installing new impulses flushes step generation first: the segments
     /// planned without them have to be generated with the solver they were
     /// planned for (`input_shaper.py:170`, `_update_input_shaping` opens with
@@ -632,26 +655,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn set_input_shaper_flushes_step_generation_first() {
         let printer = printer(&[]);
-        let toolhead = {
-            let mut section = ConfigSection::new("printer", None);
-            for (key, value) in [
-                ("kinematics", "none"),
-                ("max_velocity", "300"),
-                ("max_accel", "3000"),
-            ] {
-                section
-                    .parameters
-                    .insert(key.to_string(), ConfigValue::Single(value.to_string()));
-            }
-            let object = ToolHeadObject::new(&ConfigWrapper::untracked(&section), &printer)
-                .expect("kinematics: none builds");
-            printer.add_object("toolhead", Arc::new(object)).unwrap();
-            let toolhead = printer
-                .lookup_object_as::<ToolHeadObject>("toolhead")
-                .expect("the toolhead is registered");
-            toolhead.connect().await.expect("the toolhead connects");
-            toolhead
-        };
+        let toolhead = connect_none_toolhead(&printer).await;
         let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         toolhead.register_flush_callback(Box::new({
             let flushes = Arc::clone(&flushes);
@@ -683,6 +687,61 @@ mod tests {
             .await
             .expect("the line applies");
         assert_eq!(count(), 2, "removing the shaper flushes too");
+    }
+
+    /// A dual carriage changed the kinematics under the shaper: the event
+    /// `idex_modes` fires on a switch re-hands the impulses to the motion
+    /// (`_update_kinematics`, `input_shaper.py:153-168`) — the flush upstream
+    /// opens with (`:157`), the impulses installed on the steppers again, and
+    /// the queue's windows rescanned. A section that shapes nothing is a quiet
+    /// no-op, and sending the event twice re-takes the shapers' lock, which a
+    /// handler that kept it would not survive.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dual_carriage_switch_reapplies_the_shaping() {
+        let printer = printer(&[]);
+        let object = input_shaper(&printer);
+        let toolhead = connect_none_toolhead(&printer).await;
+        let flushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        toolhead.register_flush_callback(Box::new({
+            let flushes = Arc::clone(&flushes);
+            move |_| {
+                flushes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("the dispatcher");
+        let count = || flushes.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Nothing shaped yet: the event flushes (upstream's handler opens with
+        // it) and installs nothing — no impulses, no error.
+        printer.send_event(&KlippyEvent::DualCarriageUpdateKinematics);
+        assert_eq!(count(), 1, "the switch flushes the plan once");
+        assert!(object.shaping(&object.lock()).is_none());
+        assert_ne!(
+            printer.get_state_message().category,
+            PrinterState::Error,
+            "a flush failure would land in the printer's error state"
+        );
+
+        // With x shaped, the switch re-installs the same impulses and flushes
+        // again; a second switch does the same, taking the lock each time.
+        gcode
+            .run_script("SET_INPUT_SHAPER SHAPER_TYPE_X=mzv SHAPER_FREQ_X=50")
+            .await
+            .expect("the line applies");
+        assert_eq!(count(), 2, "installing a shaper flushes the plan once");
+        let installed = object.shaping(&object.lock()).expect("x is shaped");
+        for expected in [3, 4] {
+            printer.send_event(&KlippyEvent::DualCarriageUpdateKinematics);
+            assert_eq!(count(), expected, "each switch flushes once");
+            assert_eq!(
+                object.shaping(&object.lock()).as_deref(),
+                Some(installed.as_ref()),
+                "the switch re-installs the impulses the shaper holds"
+            );
+            assert_ne!(printer.get_state_message().category, PrinterState::Error);
+        }
     }
 
     /// Run `script` and return the error, if any, together with the lines the

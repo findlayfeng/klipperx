@@ -2496,9 +2496,8 @@ impl Mcu {
     /// to `0` — a clock that has already passed, so the firmware runs the
     /// command at once instead of the caller seeing its own arithmetic bug.
     /// The check is here, at the one entry every conversion goes through; a
-    /// call site that legitimately has an already-elapsed time clamps it to
-    /// zero itself, with the reason next to it (e.g. `McuStepper`'s pulse
-    /// width, `resource/stepper.rs`).
+    /// caller whose value has a floor of its own applies it before the call and
+    /// says why there (`McuStepper`'s pulse width, `resource/stepper.rs`).
     ///
     /// # Errors
     /// As [`Mcu::clock_freq`], plus [`McuError::Config`] when `seconds` is

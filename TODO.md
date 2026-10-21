@@ -223,10 +223,10 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 - [ ] **dump 端点家族残余**（mux 机制已就绪，实例随各自 extras 落地）。已落地：
       `bed_mesh/dump_mesh`、`motion_report/dump_trapq` 与 `dump_stepper`、`adxl345`/`ldc1612`/`mpu9250`
       （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`load_cell_probe/dump_taps`（2026-10-21）、
-      `tmc/stallguard_dump`。
-      仍缺：`icm20948`/`bmi160`/`lis2dw`/`angle` 四个
-      dump（随未移植的 extras 缺席），以及 `motion_report` 的 `get_status`
-      （`live_position`/`live_velocity`/`live_extruder_velocity`，现返回 `{}`）与其 shutdown 诊断窗口转储。
+      `tmc/stallguard_dump`；**`icm20948`/`bmi160`/`lis2dw`/`angle` 四个 dump 于 2026-10-22 随各自驱动落地**。
+      **口径更正（2026-10-22）**：本条曾写「`motion_report` 的 `get_status` 现返回 `{}`、shutdown 诊断缺失」，
+      那是**过期断言** —— `extras/motion_report.rs` 早已有 `live_position`/`live_velocity`/
+      `live_extruder_velocity` 与 `steppers`，并在 `klippy:analyze_shutdown` 转储 queue/trapq 窗口。
 
 ### F MCU 基础资源（F6、F8、F9）
 上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
@@ -821,7 +821,9 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `HW-TIMEOUT: <用例>: still at <阶段> after <时长>`；板锁 `LOCK_EX|LOCK_NB` 轮询、`LOCK_TIMEOUT=600 s`
       （大于用例预算，慢前驱不误报）；teardown 先关加热/输出再拆机器；`apply_id_addressed_transport`
       补齐 `host_mux`/`host_port_paths`。
-- [ ] 注释/文档与实现不符的存量：`mcu/ids.rs` 称串口 id「无人消费」；`resource/stepper.rs` 称 `step_pulse_duration=0`
-      让固件自己挑（实际是零脉宽）；`MoveSlots` 把 `set_next_step_dir` 说成占槽（真正占槽的是 `queue_step`/`queue_digital_out`/
-      `queue_pwm_out`/`queue_pca9685_out`）。
+- [x] **注释/文档与实现不符的存量 —— 已修（2026-10-22）**：`mcu/ids.rs` 的「串口 id 无人消费」改成实情
+      （它落进 `McuConfig.id`，是传输层开链的前置条件，且与 CAN node id 共用一条序列）；`MoveSlots` 的
+      move-class 名单去掉 `set_next_step_dir`（固件 `stepper.c:294-301` 只置标志、不 `move_alloc`，
+      本仓也确实走普通发送路径）；`resource/stepper.rs` 的「`step_pulse_duration=0` 让固件自己挑」按
+      上游 `stepper.py:108-110` 的实情写成「老 MCU 的 both-edge 模式靠零脉宽开启」。
 

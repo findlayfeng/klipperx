@@ -58,12 +58,13 @@ impl McuCommand for QueryMpu9250 {
 /// reply is the shared `sensor_bulk_status`.
 ///
 /// Upstream's `bulk_sensor.FixedFreqReader.setup_query_command` takes this as
-/// a string, so each sensor names its own status request. This host's reader
-/// binds the LDC1612 spelling (`query_status_ldc1612`), so the MPU9250 data
-/// path is not wired yet — see the module docs of `extras::mpu9250`. The name
-/// is kept here, next to the command it belongs to, so the generalization has
-/// its constant ready.
+/// a string, so each sensor names its own status request; `[mpu9250]` builds
+/// the reader with this name (see `extras::mpu9250`).
 pub const QUERY_MPU9250_STATUS: &str = "query_mpu9250_status";
+
+/// The status query's message format (`query_mpu9250_status oid=%c`), the
+/// `msgformat` half of upstream's `setup_query_command`.
+pub const QUERY_MPU9250_STATUS_MSGFORMAT: &str = "query_mpu9250_status oid=%c";
 
 // ===========================================================================
 // Tests

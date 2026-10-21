@@ -48,7 +48,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use serde_json::{json, Value};
 
-use crate::core::klippy::cmd::adxl345::{ConfigAdxl345, QueryAdxl345};
+use crate::core::klippy::cmd::adxl345::{ConfigAdxl345, QueryAdxl345, QueryAdxl345Status};
+use crate::core::klippy::cmd::McuCommand;
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, FixedFreqReader, LifecycleCb,
@@ -552,7 +553,7 @@ impl Adxl345 {
             ffreader: FixedFreqReader::with_payload_format(
                 chip_smooth,
                 "BBBBB",
-                "query_adxl345_status oid=%c",
+                &format!("{} oid=%c", QueryAdxl345Status::NAME),
             )
             .map_err(|err| ConfigError::new(format!("{identifier}: {err}")))?,
             last_error_count: Mutex::new(0),

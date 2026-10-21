@@ -160,10 +160,10 @@ impl PrinterExtruderStepper {
     /// value (`kinematics/extruder.py:32-34`) — plus the two motion-sync
     /// commands every extruder stepper registers (`:37-42`):
     /// `SET_EXTRUDER_ROTATION_DISTANCE` on this stepper and
-    /// `SYNC_EXTRUDER_MOTION` on its binding. Both flush step generation first
-    /// (`toolhead.flush_step_generation`, `:120,135`), so the handlers are
-    /// futures like upstream's own bodies are allowed to be elsewhere; nothing
-    /// queued is stepped over by the change.
+    /// `SYNC_EXTRUDER_MOTION` on its binding. Both flush step generation before
+    /// they change anything (`toolhead.flush_step_generation`, `:120,135`),
+    /// which is why their handlers are futures: nothing already queued is
+    /// stepped with the old state.
     fn register_commands(&self, printer: &Arc<Printer>) -> Result<(), ConfigError> {
         let gcode = printer
             .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)

@@ -79,6 +79,7 @@ use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::gcode_macro::PrinterGCodeMacro;
 use crate::core::klippy::extras::print_stats::PrintStats;
+use crate::core::klippy::extras::sdcard_loop::SdCardFile;
 use crate::core::klippy::extras::template::{Builtin, Context, PrinterView, Rt, Template};
 use crate::core::klippy::gcode::{
     CommandError, CommandFuture, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -106,6 +107,10 @@ const DEFAULT_ERROR_GCODE: &str = "
 const PAUSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 section!("virtual_sdcard", order = 30, load = load_config);
+
+/// The name the object is registered under, and the name a consumer looks it
+/// up by (`printer.load_object(config, "virtual_sdcard")`).
+pub const VIRTUAL_SDCARD_OBJECT: &str = "virtual_sdcard";
 
 /// The `[virtual_sdcard]` module object (upstream's `VirtualSD`).
 ///
@@ -769,15 +774,18 @@ impl VirtualSdCard {
             }
 
             *self.cmd_from_sd.lock().unwrap() = false;
-            file_position = next_file_position;
+            // Upstream `self.file_position = self.next_file_position` reads the
+            // slot back rather than reusing the line's own end: a command that
+            // moved the cursor (`SDCARD_LOOP_END` seeking to a loop start)
+            // rewrote it, and this is where the loop picks that up.
+            let current_next = *self.next_file_position.lock().unwrap();
+            file_position = current_next;
             *self.file_position.lock().unwrap() = file_position;
 
             // Skip-around check (upstream `next_file_position !=
             // self.next_file_position`): a command changed the position during
             // `run_script`. Seek to the new position and clear the buffers.
-            let current_next = *self.next_file_position.lock().unwrap();
             if current_next != next_file_position {
-                file_position = *self.file_position.lock().unwrap();
                 if let Some(reader) = self.reader() {
                     if let Err(e) = self
                         .seek_reader(reader, SeekFrom::Start(file_position))
@@ -872,6 +880,31 @@ fn walk_dir(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// What `[sdcard_loop]` needs from this module (upstream's
+/// `get_file_position`/`set_file_position`/`is_cmd_from_sd`,
+/// `virtual_sdcard.py:233-238`).
+impl SdCardFile for VirtualSdCard {
+    /// `is_cmd_from_sd` (`virtual_sdcard.py:237-238`): `true` only while the
+    /// replay loop is dispatching a line it read from the file.
+    fn is_cmd_from_sd(&self) -> bool {
+        *self.cmd_from_sd.lock().unwrap()
+    }
+
+    /// `get_file_position` (`virtual_sdcard.py:233-234`): the position the loop
+    /// has set for the *next* line, i.e. the line after the one being
+    /// dispatched — which is where a loop body starts.
+    fn file_position(&self) -> u64 {
+        *self.next_file_position.lock().unwrap()
+    }
+
+    /// `set_file_position` (`virtual_sdcard.py:235-236`): the replay loop reads
+    /// this slot back after each line and seeks when it changed, so a loop end
+    /// rewinds the next read by writing the loop start here.
+    fn set_file_position(&self, position: u64) {
+        *self.next_file_position.lock().unwrap() = position;
+    }
 }
 
 impl std::fmt::Debug for VirtualSdCard {
@@ -1571,6 +1604,31 @@ mod tests {
         (reactor, printer, object, gcode)
     }
 
+    /// A printer with `[virtual_sdcard]` and `[sdcard_loop]` loaded, keeping
+    /// the `ManualReactor` so the test can fire timers with `run_due()`.
+    fn machine_with_loop(
+        dir: &Path,
+    ) -> (
+        Arc<ManualReactor>,
+        Arc<Printer>,
+        Arc<VirtualSdCard>,
+        Arc<GCodeDispatch>,
+    ) {
+        let text = format!("[virtual_sdcard]\npath: {}\n[sdcard_loop]\n", dir.display());
+        let (config, _) = Config::from_text(&text).expect("the sections parse");
+        let reactor = Arc::new(ManualReactor::new());
+        let printer = Arc::new(Printer::new(Arc::clone(&reactor) as Arc<dyn Reactor>));
+        printer.load_config(&config).expect("the config loads");
+        printer.send_event(&KlippyEvent::KlippyReady);
+        let object = printer
+            .lookup_object_as::<VirtualSdCard>(VIRTUAL_SDCARD_OBJECT)
+            .expect("the object is registered");
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .expect("gcode is registered");
+        (reactor, printer, object, gcode)
+    }
+
     /// A printer with a custom `on_error_gcode` and the reactor kept.
     fn machine_with_reactor_and_error_gcode(
         dir: &Path,
@@ -1795,6 +1853,103 @@ mod tests {
         assert_eq!(
             status_str(&object, "file_path"),
             Some("job.gcode".to_string())
+        );
+    }
+
+    /// `SDCARD_LOOP_BEGIN`/`SDCARD_LOOP_END` in a replayed file play the body
+    /// the requested number of times (`sdcard_loop.py:42-62`): the end rewinds
+    /// the read cursor to the loop start, and the replay loop's skip-around
+    /// check seeks there before reading the next line.
+    #[tokio::test]
+    async fn replay_loops_a_section_count_times() {
+        let dir = TempDir::new("replay_loop");
+        let path = dir.path();
+        // Body = one M21, played twice, then one more M21 outside the loop.
+        std::fs::write(
+            path.join("loop.gcode"),
+            "SDCARD_LOOP_BEGIN COUNT=2\nM21\nSDCARD_LOOP_END\nM21\n",
+        )
+        .unwrap();
+
+        let (reactor, printer, object, gcode) = machine_with_loop(path);
+        let lines = captured_lines(&printer);
+
+        gcode.run_script("M23 loop.gcode").await.unwrap();
+        gcode.run_script("M24").await.unwrap();
+        reactor.run_due();
+        settle(&object).await;
+
+        let out = emitted(&lines);
+        let sd_ok = out.iter().filter(|l| l == &"SD card ok").count();
+        assert_eq!(
+            sd_ok, 3,
+            "the loop body played twice plus the tail once in {out:?}"
+        );
+        assert!(
+            out.iter().any(|l| l == "Done printing file"),
+            "the file still reached EOF in {out:?}"
+        );
+        assert_eq!(
+            object.print_stats.get_status(0.0)["state"].as_str(),
+            Some("complete")
+        );
+    }
+
+    /// `SDCARD_LOOP_END` with no open loop plays the file straight through: the
+    /// empty stack is a no-op, so nothing seeks back (`sdcard_loop.py:47-49`).
+    #[tokio::test]
+    async fn replay_loop_end_without_begin_does_not_repeat() {
+        let dir = TempDir::new("replay_loop_empty");
+        let path = dir.path();
+        std::fs::write(path.join("flat.gcode"), "SDCARD_LOOP_END\nM21\n").unwrap();
+
+        let (reactor, printer, object, gcode) = machine_with_loop(path);
+        let lines = captured_lines(&printer);
+
+        gcode.run_script("M23 flat.gcode").await.unwrap();
+        gcode.run_script("M24").await.unwrap();
+        reactor.run_due();
+        settle(&object).await;
+
+        let out = emitted(&lines);
+        let sd_ok = out.iter().filter(|l| l == &"SD card ok").count();
+        assert_eq!(sd_ok, 1, "the single M21 ran once in {out:?}");
+        assert!(out.iter().any(|l| l == "Done printing file"));
+    }
+
+    /// The context rule is upstream's: `_BEGIN`/`_END` refuse a command that
+    /// did not come from the file, `_DESIST` refuses one that did
+    /// (`sdcard_loop.py:24-39`).
+    #[tokio::test]
+    async fn loop_commands_only_work_in_their_own_context() {
+        let dir = TempDir::new("loop_context");
+        let path = dir.path();
+        let (_reactor, _printer, object, gcode) = machine_with_loop(path);
+
+        // From the host: BEGIN and END refuse, DESIST works.
+        let err = gcode
+            .run_script("SDCARD_LOOP_BEGIN COUNT=2")
+            .await
+            .expect_err("not from the SD file");
+        assert_eq!(err.to_string(), "Only permitted in SD file.");
+        let err = gcode
+            .run_script("SDCARD_LOOP_END")
+            .await
+            .expect_err("not from the SD file");
+        assert_eq!(err.to_string(), "Only permitted in SD file.");
+        gcode.run_script("SDCARD_LOOP_DESIST").await.unwrap();
+
+        // From the file: DESIST is the one that refuses.
+        std::fs::write(path.join("desist.gcode"), "SDCARD_LOOP_DESIST\n").unwrap();
+        gcode.run_script("M23 desist.gcode").await.unwrap();
+        gcode.run_script("M24").await.unwrap();
+        _reactor.run_due();
+        settle(&object).await;
+        let stats = object.print_stats.get_status(0.0);
+        assert_eq!(stats["state"].as_str(), Some("error"));
+        assert_eq!(
+            stats["message"].as_str(),
+            Some("Only permitted outside of a SD file.")
         );
     }
 

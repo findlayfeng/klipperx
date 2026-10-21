@@ -39,14 +39,16 @@ const MIN_KIN_TIME: f64 = 0.100;
 /// `klippy/extras/motion_queuing.py:17`, `chelper/stepcompress.c:504`).
 ///
 /// Upstream starts `kin_flush_delay` here and only raises it for a stepper with
-/// a wider generation window (`motion_queuing.py:120-140`): an extruder's half
-/// step time (`kin_extruder.c:145`) or an input shaper's pulse span
-/// (`kin_shaper.c:202-218`). This host models neither window (see
-/// [`StepKinematics::generate_steps`](super::itersolve::StepKinematics::generate_steps)),
-/// so the filter is the whole delay — upstream's own initial value, not an
-/// approximation of a wider one. It shifts the floor by the same 1 ms there too
-/// (the buffer term dominates there as well), which is why it does not change
-/// the host's step lead on its own.
+/// a wider step generation window (`motion_queuing.py:120-140`): an extruder's
+/// half smooth time (`kin_extruder.c:145`) or an input shaper's pulse span
+/// (`kin_shaper.c:202-218`). The extruder's window is now generated
+/// ([`StepKinematics::generate_steps`](super::itersolve::StepKinematics::generate_steps)),
+/// but this host has no equivalent of that scan-windows pass, so the filter alone
+/// is used: the floor and the history expiry are still computed as if every
+/// window were zero. Safe for history (`MOVE_HISTORY_EXPIRE` keeps far more than
+/// any `hst`); the cost is that a change landing inside a half smooth time of the
+/// horizon may rewrite steps already generated — see the `smooth_time` item in
+/// `TODO.md`.
 const KIN_FLUSH_DELAY: f64 = 0.001;
 
 /// Where the toolhead reads the MCU's estimated print time from

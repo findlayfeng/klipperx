@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use crate::core::klippy::mathutil::Xyz;
 
-use super::pressure_advance::{ExtruderPressureAdvance, PressureAdvanceEntry};
+use super::pressure_advance::{half_smooth_time, ExtruderPressureAdvance, PressureAdvanceEntry};
 use super::stepcompress::{StepCompressError, StepCompressor};
 use super::trapq::{MoveSegment, Trapq};
 
@@ -167,6 +167,12 @@ pub struct StepKinematics {
     /// (`struct extruder_stepper`'s `pa_list`): the position function becomes
     /// the smoothed `pa_position` (`kin_extruder.c:124-136`).
     pressure_advance: Option<Arc<ExtruderPressureAdvance>>,
+    /// The time before the first move this stepper is active in that it also
+    /// generates steps in (`gen_steps_pre_active`).
+    gen_steps_pre_active: f64,
+    /// The time after the last move this stepper is active in that it also
+    /// generates steps in (`gen_steps_post_active`).
+    gen_steps_post_active: f64,
 }
 
 impl StepKinematics {
@@ -182,7 +188,30 @@ impl StepKinematics {
             unwrap: None,
             post: None,
             pressure_advance: None,
+            gen_steps_pre_active: 0.0,
+            gen_steps_post_active: 0.0,
         }
+    }
+
+    /// Widen step generation to the `pre_active` seconds before the first move
+    /// this stepper is active in and the `post_active` seconds after the last
+    /// (`gen_steps_pre_active`/`gen_steps_post_active`).
+    ///
+    /// A solver whose position function reads only the move it is asked about
+    /// (every kinematic solver) leaves both at zero. The pressure-advance
+    /// extruder does not set them: its window is the live `hst`, which changes
+    /// with `SET_PRESSURE_ADVANCE`, so [`StepKinematics::generate_steps`] derives
+    /// it per call instead.
+    pub fn set_generation_window(&mut self, pre_active: f64, post_active: f64) {
+        self.gen_steps_pre_active = pre_active;
+        self.gen_steps_post_active = post_active;
+    }
+
+    /// The generation window this stepper was given, in seconds before the
+    /// first and after the last move it is active in
+    /// (`gen_steps_pre_active`, `gen_steps_post_active`).
+    pub fn generation_window(&self) -> (f64, f64) {
+        (self.gen_steps_pre_active, self.gen_steps_post_active)
     }
 
     /// Drive this stepper's position function with pressure advance
@@ -281,17 +310,17 @@ impl StepKinematics {
     }
 
     /// Generate the steps for `trapq` up to `flush_time`
-    /// (`itersolve_generate_steps`, `chelper/itersolve.c:147-204`).
+    /// (`itersolve_generate_steps`, `chelper/itersolve.c:147-208`).
     ///
-    /// Upstream's `gen_steps_pre_active`/`gen_steps_post_active` window is not
-    /// implemented. A plain cartesian axis needs neither, but **pressure advance
-    /// does**: upstream sets both to `hst = smooth_time/2` on the extruder
-    /// (`extruder_set_pressure_advance` in `kin_extruder.c`), so that stepper
-    /// also generates steps in the `hst` before its first move and after its
-    /// last. Without it the first and last `hst` of an extrusion are compressed
-    /// into the move instead of spread across the boundary — a small extruder
-    /// jump at starts and stops. Registered in `TODO.md`; the input shaper (H6)
-    /// needs the same window for its own reason.
+    /// A stepper only steps while it is active, but its position function may
+    /// read the moves around the one it is asked about: pressure advance
+    /// averages over `2 * hst = smooth_time` of the trapq (`pa_range_integrate`,
+    /// `kin_extruder.c:89-116`), so the `hst` before its first active move and
+    /// after its last one really does move the extruder. Generating only inside
+    /// the active moves would squeeze that motion into the move's own span — a
+    /// jump at the start and at the end of every extrusion. The two windows
+    /// (`gen_steps_pre_active`, `gen_steps_post_active`) make the generator
+    /// visit the silent moves inside that reach as well.
     ///
     /// # Errors
     /// An internal [`StepCompressError`] from the compressor.
@@ -324,37 +353,81 @@ impl StepKinematics {
             Vec::new()
         };
         let first_queued = cuts.len().saturating_sub(trapq.moves().len());
-        for (queued, segment) in trapq.moves().iter().enumerate() {
+        // Upstream rewrites both fields from the live `hst` on every
+        // `SET_PRESSURE_ADVANCE` (`kin_extruder.c:143-145`), so the extruder's
+        // window is derived from the snapshot here rather than cached in the
+        // stepper: a change is then in force for the very next flush.
+        let (pre_active, post_active) = match self.pressure_advance {
+            Some(_) => {
+                let hst = half_smooth_time(&schedule);
+                (hst, hst)
+            }
+            None => self.generation_window(),
+        };
+        let moves = trapq.moves();
+        let mut force_steps_time = self.last_move_time + post_active;
+        let mut skip_count = 0;
+        let mut index = 0;
+        while index < moves.len() {
+            let segment = &moves[index];
+            let move_start = segment.print_time;
             let move_end = segment.end_time();
             if move_end <= last_flush_time {
-                // Already generated past this segment.
+                // Already generated past this segment (upstream advances `m`
+                // over these before the loop).
+                index += 1;
                 continue;
             }
-            if !self.is_active(segment) {
-                if segment.print_time >= flush_time {
+            if self.is_active(segment) {
+                if skip_count > 0 && pre_active > 0.0 {
+                    // Steps leading up to stepper activity: from the silent
+                    // move that covers `move_start - pre_active` (but no further
+                    // back than the moves actually skipped, and never over time
+                    // already generated or inside the previous post window).
+                    let abs_start = (move_start - pre_active)
+                        .max(last_flush_time)
+                        .max(force_steps_time);
+                    // `skip_count` silent moves precede this one, so `index` is
+                    // at least that large and the walk stays inside the queue.
+                    let mut first = index - 1;
+                    let mut remaining = skip_count - 1;
+                    while remaining > 0 && moves[first].print_time > abs_start {
+                        first -= 1;
+                        remaining -= 1;
+                    }
+                    for queued in first..index {
+                        let window =
+                            segment_window(&cuts, &schedule, first_queued, queued, &moves[queued]);
+                        self.gen_steps_range(sc, window, abs_start, flush_time)?;
+                    }
+                }
+                // Steps for this move.
+                let window = segment_window(&cuts, &schedule, first_queued, index, segment);
+                self.gen_steps_range(sc, window, last_flush_time, flush_time)?;
+                if move_end >= flush_time {
+                    self.last_move_time = flush_time;
                     return Ok(());
                 }
-                continue;
-            }
-            let start = last_flush_time.max(segment.print_time);
-            let end = flush_time.min(move_end);
-            if start < end {
-                let window = if self.pressure_advance.is_some() {
-                    SegmentWindow {
-                        cuts: &cuts,
-                        index: first_queued + queued,
-                        schedule: &schedule,
-                    }
+                skip_count = 0;
+                self.last_move_time = move_end;
+                force_steps_time = self.last_move_time + post_active;
+            } else {
+                if move_start < force_steps_time {
+                    // Steps just past stepper activity: the tail of the last
+                    // active move's smoothing window.
+                    let abs_end = force_steps_time.min(flush_time);
+                    let window = segment_window(&cuts, &schedule, first_queued, index, segment);
+                    self.gen_steps_range(sc, window, last_flush_time, abs_end)?;
+                    skip_count = 1;
                 } else {
-                    SegmentWindow::single(segment)
-                };
-                self.gen_steps_range(sc, window, start, end)?;
+                    // This move does not concern this stepper.
+                    skip_count += 1;
+                }
+                if flush_time + pre_active <= move_end {
+                    return Ok(());
+                }
             }
-            if move_end >= flush_time {
-                self.last_move_time = flush_time;
-                return Ok(());
-            }
-            self.last_move_time = move_end;
+            index += 1;
         }
         self.last_move_time = flush_time;
         Ok(())
@@ -485,6 +558,31 @@ impl StepKinematics {
             post(&mut self.commanded_pos);
         }
         Ok(())
+    }
+}
+
+/// The window a stepper reads while generating the range of queued move
+/// `index` (an index into [`Trapq::moves`]).
+///
+/// `cuts` is the trapq neighbourhood the pressure-advance integrator needs,
+/// oldest first, with `first_queued` being where the queued moves start in it —
+/// it is empty for a solver that has no pressure advance, which reads only the
+/// segment itself.
+fn segment_window<'a>(
+    cuts: &'a [MoveSegment],
+    schedule: &'a [PressureAdvanceEntry],
+    first_queued: usize,
+    index: usize,
+    segment: &'a MoveSegment,
+) -> SegmentWindow<'a> {
+    if cuts.is_empty() {
+        SegmentWindow::single(segment)
+    } else {
+        SegmentWindow {
+            cuts,
+            index: first_queued + index,
+            schedule,
+        }
     }
 }
 
@@ -847,6 +945,167 @@ mod tests {
             (sk.commanded_pos() - 3.0).abs() < 0.02,
             "expected 2.5 mm nominal + the 0.5 mm lead, got {}",
             sk.commanded_pos()
+        );
+    }
+
+    /// The absolute print times of the steps in `commands`, reconstructed from
+    /// the compressor's `queue_step` runs at `mcu_freq` ticks per second.
+    ///
+    /// `clock` carries the last step clock from batch to batch (each run's first
+    /// step is `interval` ticks after the previous step), and the compressor
+    /// starts at clock zero for print time zero, so clocks are print times times
+    /// `mcu_freq` (within the compressor's `MAX_STEPCOMPRESS_ERROR`).
+    fn step_print_times(commands: &[StepCommand], mcu_freq: f64, clock: &mut u64) -> Vec<f64> {
+        let mut times = Vec::new();
+        for command in commands {
+            let StepCommand::QueueStep {
+                interval,
+                count,
+                add,
+                ..
+            } = command
+            else {
+                continue;
+            };
+            let mut ticks = i64::from(*interval);
+            for _ in 0..*count {
+                *clock += ticks as u64;
+                times.push(*clock as f64 / mcu_freq);
+                ticks += i64::from(*add);
+            }
+        }
+        times
+    }
+
+    /// An extruder trapq of raw segments `(print_time, duration, active)`,
+    /// oldest first: an active one extrudes at 10 mm/s and carries both
+    /// `axes_r` components (so pressure advance applies to it), an inactive one
+    /// holds the extrusion amount with `axes_r` all zero — the shape of the null
+    /// move a time gap gets (`trapq_add_move`, `chelper/trapq.c:100-117`), in
+    /// which the extruder stepper is not active.
+    fn window_trapq(segments: &[(f64, f64, bool)]) -> Trapq {
+        let mut trapq = Trapq::new();
+        let mut position = 0.0;
+        for (print_time, duration, active) in segments {
+            let speed = if *active { 10.0 } else { 0.0 };
+            let axis = if *active { 1.0 } else { 0.0 };
+            trapq.append(
+                *print_time,
+                0.0,
+                *duration,
+                0.0,
+                Xyz::new(position, 0.0, 0.0),
+                Xyz::new(axis, axis, 0.0),
+                speed,
+                speed,
+                0.0,
+            );
+            position += speed * duration;
+        }
+        trapq
+    }
+
+    /// The step print times of an extruder solver over `trapq`, with `pa` and
+    /// `smooth_time` in force from the start, generated up to `flush_time`.
+    fn extruder_step_times(
+        trapq: &Trapq,
+        pressure_advance: f64,
+        smooth_time: f64,
+        flush_time: f64,
+    ) -> Vec<f64> {
+        let mut sk = StepKinematics::new(0.01, extruder_position_fn(), extruder_active_flags());
+        sk.set_pressure_advance(ExtruderPressureAdvance::new(pressure_advance, smooth_time));
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        sk.generate_steps(trapq, &mut sc, flush_time).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        let mut clock = 0;
+        step_print_times(&sc.take_commands(), 1_000_000.0, &mut clock)
+    }
+
+    /// The `post_active` window: the smoothing window keeps moving the extruder
+    /// for `hst` after the last move it is active in, so steps are due there too.
+    /// Without the window that tail is never generated — the extruder would jump
+    /// back to the nominal position at the end of the extrusion.
+    #[test]
+    fn test_pressure_advance_generates_the_post_active_window() {
+        // 0.1 s of extrusion at 10 mm/s, then 0.1 s of a silent gap.
+        // hst = 0.02 s, so steps are due up to 0.12 s.
+        let trapq = window_trapq(&[(0.0, 0.1, true), (0.1, 0.1, false)]);
+
+        let times = extruder_step_times(&trapq, 0.05, 0.040, 0.2);
+        assert!(
+            times.iter().any(|time| *time > 0.1),
+            "the post window must carry steps past the last active move: {times:?}"
+        );
+
+        // Pressure advance off: `hst` is zero, so there is no window and the
+        // gap after 0.1 s must stay silent.
+        let times = extruder_step_times(&trapq, 0.05, 0.0, 0.2);
+        assert!(
+            times.iter().all(|time| *time <= 0.1),
+            "no window means no steps after the last active move: {times:?}"
+        );
+    }
+
+    /// The `pre_active` window: the smoothing window already moves the extruder
+    /// in the `hst` before the first move it is active in, so the first step is
+    /// due there rather than at the move's start.
+    #[test]
+    fn test_pressure_advance_generates_the_pre_active_window() {
+        // 0.1 s of silence, then 0.1 s of extrusion at 10 mm/s. hst = 0.02 s, so
+        // the smoothing window reaches back to 0.08 s.
+        let trapq = window_trapq(&[(0.0, 0.1, false), (0.1, 0.1, true)]);
+
+        let times = extruder_step_times(&trapq, 0.05, 0.040, 0.15);
+        let first = *times.first().expect("the window must generate steps");
+        assert!(
+            first < 0.1,
+            "the pre window must start the steps before the move at 0.1 s: {first}"
+        );
+        assert!(
+            first > 0.08 - 0.01,
+            "the window is hst wide, so the first step cannot be earlier: {first}"
+        );
+
+        // Pressure advance off: no window, so nothing before the move.
+        let times = extruder_step_times(&trapq, 0.05, 0.0, 0.15);
+        let first = *times.first().expect("the move itself must generate steps");
+        assert!(
+            first >= 0.1,
+            "no window means no steps before the first active move: {first}"
+        );
+    }
+
+    /// Two flushes of one solver carry on where the previous one stopped: the
+    /// windows must not re-generate the range already sent, and no step may land
+    /// before an earlier one.
+    #[test]
+    fn test_generate_steps_windows_are_idempotent() {
+        let trapq = window_trapq(&[(0.0, 0.1, true), (0.1, 0.1, false)]);
+        let mut sk = StepKinematics::new(0.01, extruder_position_fn(), extruder_active_flags());
+        sk.set_pressure_advance(ExtruderPressureAdvance::new(0.05, 0.040));
+        let mut sc = StepCompressor::new(0, 1_000_000.0);
+        let mut clock = 0;
+
+        sk.generate_steps(&trapq, &mut sc, 0.1).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        let mut times = step_print_times(&sc.take_commands(), 1_000_000.0, &mut clock);
+        let first_batch = times.len();
+        assert!(first_batch > 0, "the first flush must generate steps");
+
+        sk.generate_steps(&trapq, &mut sc, 0.2).unwrap();
+        sc.flush(u64::MAX).unwrap();
+        let second = step_print_times(&sc.take_commands(), 1_000_000.0, &mut clock);
+        assert!(!second.is_empty(), "the second flush must add the tail");
+        assert!(
+            second[0] >= 0.1 - 1e-3,
+            "the second flush must not repeat the first: {:?}",
+            &second[..second.len().min(5)]
+        );
+        times.extend(second);
+        assert!(
+            times.windows(2).all(|pair| pair[1] > pair[0]),
+            "steps must neither repeat nor go backwards: {times:?}"
         );
     }
 }

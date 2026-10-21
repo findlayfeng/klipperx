@@ -66,22 +66,25 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 按「打印任务」链路列出（细节与证据见 [`TODO.md`](TODO.md) 与[客户端/开发手册](docs/README.md)）：
 
-1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M29`/`SDCARD_PRINT_FILE`）、`print_stats` 与
-   `pause_resume/{pause,resume,cancel}` 三个端点都已落地（`api/endpoints/pause_resume.rs`）；
-   剩下 `sdcard_loop` 的 `SDCARD_LOOP_*` 与文件回放未接。
+1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M29`/`SDCARD_PRINT_FILE`）、`print_stats`、
+   `pause_resume/{pause,resume,cancel}` 三个端点、`sdcard_loop` 的 `SDCARD_LOOP_BEGIN/END/DESIST` 与回放游标接缝
+   都已落地（见 [`TODO.md`](TODO.md) H4）。
 2. **温度语义**：`M105` 的 gcode_id 表已接线（`heaters.rs:417` 的 `gcode_id_to_sensor`，
    没有登记传感器时才回 `T:0`）；`M190`/`M109` 按等待版本注册（`extruder.rs:263`、
    `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`a802cdc`）。
 3. **运行时参数**：`M204`/`SET_VELOCITY_LIMIT` 已注册（2026-10-04），改完**同时**进状态与
-   规划器；`SET_PRESSURE_ADVANCE` 会记录但**不作用于运动**（PA 只存值，运动层未消费）。
+   规划器；`SET_PRESSURE_ADVANCE` 也**真驱动运动**（2026-10-21）：挤出机求解器按 `pa × 速度` 提前/回抽、
+   再按 `smooth_time` 做三角窗解析积分平滑，生成窗口（pre/post）已实现，新值从已规划运动末端生效。
 4. **常见宏依赖**：`save_variables`（`SAVE_VARIABLE`）已落地（2026-10-04），宏可读写
    `printer.save_variables.variables`；`delayed_gcode`、`respond` 与 `gcode_macro` 的
    `rename_existing` 连接期换名（KAMP / `M600` 这类常见 `printer.cfg` 靠它）也都已落地
-   （2026-10-06，`5ba2356`）。仍缺 `G2/G3`（`gcode_arcs`）与 `M600`。
-5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），但
-   `ToolHead.wait_moves` 不等待 MCU、`MIN_KIN_TIME`/`kin_flush_delay` 未建模、`send_wait_ack`
-   还没有对应原语（`motion/toolhead.rs:440-470`、`mcu/mod.rs:2639-2650`），真机上尚未验证
-   （见 [`TESTING.md`](TESTING.md) 的 R11）。
+   （2026-10-06，`5ba2356`）。`G2/G3` 圆弧与 `G17`–`G19` 平面选择也已落地（2026-10-21）；
+   仍缺 `M600`（需 `[pause_resume]` 的 `RESUME` 宏组合，属配置层）。
+5. **真机时序**：消息的 `min_clock`/`req_clock` 闸已建模（`mcu/mod.rs:149-176`），`M400` 现在真的等
+   MCU 的估计时钟追上 `print_time`（有界四条出口），`MIN_KIN_TIME`/`kin_flush_delay` 也已对齐上游；
+   仍缺 `send_wait_ack`（现只是 flush）与 `kin_flush_delay` 的**窗口记账**（`motion_queuing` 的
+   `check_step_generation_scan_windows` 未移植）——后者让「改 PA/改运动学位置」在 `hst` 内可能撞
+   `Invalid sequence`。真机未验证，见 [`TESTING.md`](TESTING.md) 的 R11。
 6. **硬件侧**：三轴 step/dir 与 endstop 接线、挤出机与加热器接线、以及按接线写一份 config。
 
 ## 快速上手

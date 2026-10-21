@@ -33,9 +33,11 @@
 //!
 //! # What is not here
 //!
-//! A device protocol, a shutdown message (`config_spi_shutdown`), and the
-//! `spi_transfer_with_preface` optimisation. The section only moves bytes; a
-//! driver declares what they mean.
+//! A device protocol, and any use of the bus's `setup_shutdown_msg` or
+//! `transfer_with_preface`. The section only moves bytes; a driver declares
+//! what they mean, and reaches both methods through [`SpiDevice::device`] —
+//! `setup_shutdown_msg` while the configuration is still being built, since the
+//! message is part of the config package.
 
 use std::sync::Arc;
 

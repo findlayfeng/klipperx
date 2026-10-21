@@ -2855,31 +2855,51 @@ impl Mcu {
         waiting_for: Option<&str>,
         clocks: SendClocks,
     ) -> Result<(), MsgError> {
+        let payload = self.parser.encode(name, args)?;
+        self.enqueue_block(
+            payload,
+            &self.describe_command(name, args),
+            waiting_for,
+            clocks,
+        )
+    }
+
+    /// Queue one already-encoded **block** — one or more messages' bytes — to be
+    /// written to the wire together.
+    ///
+    /// [`Mcu::enqueue`] is this for the single-message case; a caller that puts
+    /// two messages in one block ([`Mcu::call_two`](crate::core::klippy::cmd::Mcu::call_two),
+    /// upstream's `send_with_preface`) passes the merged bytes here, and the
+    /// whole block is then one frame — one acknowledgement — while the firmware
+    /// still runs each message in it in turn.
+    ///
+    /// `describe` names the block in the log lines and in the queue-full error;
+    /// it is the caller's because a merged block has no single command name.
+    fn enqueue_block(
+        &self,
+        payload: Payload,
+        describe: &str,
+        waiting_for: Option<&str>,
+        clocks: SendClocks,
+    ) -> Result<(), MsgError> {
         // A closed session refuses at once: the send task is already gone, and
         // a message that merely queued would wait for a reader that never comes.
         if self.is_closed() {
             return Err(MsgError::new(format!(
-                "{}: the connection is closed",
-                self.describe_command(name, args)
+                "{describe}: the connection is closed"
             )));
         }
-        let payload = self.parser.encode(name, args)?;
         match waiting_for {
-            Some(response) => debug!(
-                "[{}] send {} (waiting for {response})",
-                self.name,
-                self.describe_command(name, args)
-            ),
-            None => debug!("[{}] send {}", self.name, self.describe_command(name, args)),
+            Some(response) => debug!("[{}] send {describe} (waiting for {response})", self.name),
+            None => debug!("[{}] send {describe}", self.name),
         }
         // A gated message says what holds it: `min`/`req` against the estimate
         // at the moment it joins the queue (the park line reports the same
         // three numbers once the send task has it).
         if clocks != SendClocks::default() {
             debug!(
-                "[{}] gate in: {} min={} req={} est={}",
+                "[{}] gate in: {describe} min={} req={} est={}",
                 self.name,
-                self.describe_command(name, args),
                 show_gate(clocks.min_clock),
                 show_gate(clocks.req_clock),
                 show_est(self.gate_clock().estimated_clock()),
@@ -2903,7 +2923,7 @@ impl Mcu {
                 // send task; a level would read as a full queue.
                 TrySendError::Closed(_) => String::new(),
             };
-            MsgError::new(format!("{}: {e}{level}", self.describe_command(name, args)))
+            MsgError::new(format!("{describe}: {e}{level}"))
         })?;
         Ok(())
     }
@@ -2997,13 +3017,16 @@ impl Mcu {
     ///
     /// Called as a field of the log line, so neither the lookup nor the
     /// formatting happens unless DEBUG is on.
-    fn describe_command(&self, name: &str, args: &[ArgValue]) -> String {
+    /// A block's description for the log lines and error text: the message's
+    /// declaration with this call's arguments filled in. `pub(crate)` because
+    /// the typed calls in [`cmd`](crate::core::klippy::cmd) describe merged
+    /// two-message blocks the same way.
+    pub(crate) fn describe_command(&self, name: &str, args: &[ArgValue]) -> String {
         match self.parser.lookup(name) {
             Some(msg) => describe_message(&msg, args),
             None => name.to_string(),
         }
     }
-
     /// Send a command and wait for the response message.
     ///
     /// This is a synchronous request/response pattern: the command is sent,
@@ -3111,25 +3134,63 @@ impl Mcu {
             );
         }
 
-        // 2. Create a oneshot channel for the response.
+        // 2. Encode its block. One command is one message, and one message is
+        // the whole block here. An argument that does not fit its declaration
+        // fails like a send that never left.
+        let describe = self.describe_command(command, args);
+        let payload = self
+            .parser
+            .encode(command, args)
+            .map_err(|e| McuCallError::SendFailed(e.msg))?;
+
+        self.call_gated_block(payload, &describe, oid, response_name, timeout, clocks)
+            .await
+    }
+
+    /// Shared body of the synchronous calls once the block's bytes exist.
+    ///
+    /// This is steps 3–5 of [`Mcu::call_gated_oid`], unchanged: register the
+    /// pending call, queue the block, wait for the answer, cancel the
+    /// registration on every failure path. The only thing the caller decides is
+    /// what the block is — one message ([`Mcu::call_gated_oid`]) or several
+    /// ([`Mcu::call_two`](crate::core::klippy::cmd::Mcu::call_two)).
+    ///
+    /// A block is **one** frame on the wire and therefore **one**
+    /// acknowledgement, however many messages it carries: the firmware's
+    /// sequence counter answers blocks, not messages (`serialqueue.c:209`). The
+    /// messages inside are still dispatched one at a time by the firmware, so a
+    /// two-message block is two `spidev_transfer` calls for the SPI driver.
+    ///
+    /// `describe` names the block in the log lines and in the queue-full error;
+    /// it is the caller's because a merged block has no single command name.
+    pub(crate) async fn call_gated_block(
+        &self,
+        payload: Payload,
+        describe: &str,
+        oid: Option<u8>,
+        response_name: &str,
+        timeout: Duration,
+        clocks: SendClocks,
+    ) -> Result<Vec<ArgValue>, McuCallError> {
+        // 3. Create a oneshot channel for the response.
         let (tx, rx) = oneshot::channel::<Vec<ArgValue>>();
 
-        // 3. Register the pending call — with its `oid`, when it has one. The
+        // 4. Register the pending call — with its `oid`, when it has one. The
         // token it returns is this call's handle for the cleanup paths below.
         let token = self
             .pending_calls
             .register(response_name.to_string(), oid, tx)
             .await;
 
-        // 4. Send the command. Its line names the response it is waiting for.
-        if let Err(e) = self.enqueue(command, args, Some(response_name), clocks) {
-            warn!("Failed to send command '{}': {e}", command);
+        // 5. Send the block. Its line names the response it is waiting for.
+        if let Err(e) = self.enqueue_block(payload, describe, Some(response_name), clocks) {
+            warn!("Failed to send command '{}': {e}", describe);
             // Clean up the pending call on send failure.
             self.pending_calls.cancel(token).await;
             return Err(McuCallError::SendFailed(e.msg));
         }
 
-        // 5. Wait for the response. A successful resolve already consumed the
+        // 6. Wait for the response. A successful resolve already consumed the
         // registration, so only the failure paths need to clean up.
         match tokio::time::timeout(timeout, rx).await {
             // The response itself was logged where it was decoded, with its
@@ -3277,6 +3338,17 @@ impl Mcu {
         &self,
     ) -> Option<Arc<crate::core::klippy::interface::SimulatorDevice>> {
         self.interface.simulator_device()
+    }
+
+    /// How many typed calls are waiting for an answer.
+    ///
+    /// Every call registers an entry before its block goes out and has to hand
+    /// it back on every failure path; one left behind would take the next
+    /// answer for that name ([`PendingCalls::resolve`] hands a message to the
+    /// first registration it matches) and the live call would time out. Tests
+    /// pin that a failed call leaves nothing behind.
+    pub(crate) async fn pending_call_count(&self) -> usize {
+        self.pending_calls.len().await
     }
 
     /// Whether both transport tasks have finished — the test seam behind

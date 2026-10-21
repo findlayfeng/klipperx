@@ -34,17 +34,31 @@
 //!
 //! # Deliberate deviations from upstream
 //!
-//! **A chain write is two messages, not one batch.** Upstream sends the write
-//! frame and the dummy read frame with `spi_transfer_with_preface`, which runs
-//! them as one chip-select pulse (`tmc2130.py:229-230`); this host has one
-//! message per transfer, so the preface goes out as a clocked `spi_send`
-//! immediately followed by the read-back `spi_transfer` (see
-//! [`TmcSpiChain::write_and_read_back`]). One send queue keeps the two in order,
-//! but they may land in different acknowledgement blocks, and messages queued
-//! meanwhile may slip between them. A read-back disturbed that way fails its
-//! attempt; five failed attempts raise upstream's `Unable to write tmc spi
-//! '<name>' register <REG>` (`tmc2130.py:288-294`), so a disturbed write is
-//! reported rather than silently accepted.
+//! **A chain write is two messages, not one acknowledgement.** Upstream sends
+//! the write frame and the dummy read frame with `spi_transfer_with_preface`
+//! (`tmc2130.py:229-230`): it encodes the preface as `spi_send` and the read as
+//! `spi_transfer` and puts both in one block, waiting one acknowledgement
+//! (`klippy/extras/bus.py:117-122`, `klippy/mcu.py:104-111`), so the firmware
+//! runs them back to back — still two chip-select pulses, one per message
+//! (`src/spicmds.c:113-132`), which is what latches the write frame. Here the
+//! preface goes out as a clocked `spi_send` immediately followed by the
+//! read-back `spi_transfer` (see [`TmcSpiChain::write_and_read_back`]). One send
+//! queue keeps the two in order, but they may land in different acknowledgement
+//! blocks, and messages queued meanwhile may slip between them. A read-back
+//! disturbed by an interleaved message fails its attempt; five failed attempts
+//! raise upstream's `Unable to write tmc spi '<name>' register <REG>`
+//! (`tmc2130.py:288-294`), so a disturbed write is reported rather than silently
+//! accepted.
+//!
+//! **The fix exists and is not switched on yet.**
+//! [`McuSpi::transfer_with_preface`](crate::core::klippy::mcu::McuSpi::transfer_with_preface)
+//! now puts exactly that pair — `spi_send` then `spi_transfer` — in one block and
+//! waits one acknowledgement (`Mcu::call_two`), so the disturbance window above
+//! closes and a write costs one round trip instead of two. Moving
+//! [`TmcSpiChain::write_and_read_back`] onto it is left to its own unit. The
+//! chip-select count does **not** change with that move: two messages are two
+//! `spidev_transfer` calls either way, so it is a timing fix, not a protocol
+//! change.
 //!
 //! **A chain read is one frame, not two.** Upstream's `reg_read` queues the read
 //! frame with `spi_send` and then transfers the same bytes again

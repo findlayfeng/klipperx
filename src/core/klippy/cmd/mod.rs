@@ -474,6 +474,65 @@ impl Mcu {
         .await
     }
 
+    /// Two commands in **one** wire block, one acknowledgement, and the second
+    /// command's typed answer: upstream's `CommandQueryWrapper.send_with_preface`
+    /// (`klippy/mcu.py:104-111`).
+    ///
+    /// Upstream's SPI form is `MCU_SPI.spi_transfer_with_preface`
+    /// (`klippy/extras/bus.py:117-122`): the preface goes to `spi_send` and the
+    /// read to `spi_transfer`, and both are encoded into one send — so the pair
+    /// is one block, one ack, and the messages are still dispatched one at a
+    /// time by the firmware (`src/spicmds.c:113-132`), one chip-select pulse
+    /// each.
+    ///
+    /// The preface has to be a command the firmware answers **nothing** to, or
+    /// its answer would arrive first and be the one this call decodes.
+    ///
+    /// One block is one frame, so the two messages must together fit
+    /// `MESSAGE_PAYLOAD_MAX` ([`Payload::try_merge`]); a longer pair is refused
+    /// instead of being split into two blocks with two acknowledgements.
+    ///
+    /// # Errors
+    /// As [`Mcu::call_msg`]: [`McuError::NotIdentified`] before the handshake,
+    /// [`McuError::UnknownMessage`] for a name the firmware does not declare,
+    /// [`McuError::Msg`] when either message or the merged block cannot be
+    /// encoded, [`McuError::Call`] when the exchange fails or times out, and
+    /// [`McuError::Decode`] when the answer cannot be decoded.
+    pub(crate) async fn call_two<A: McuCommand, B: McuCommand, R: McuResponse>(
+        &self,
+        first: &A,
+        second: &B,
+        oid: u8,
+        timeout: Duration,
+    ) -> Result<R, McuError> {
+        let dictionary = self.require_dictionary()?;
+        self.require_message(A::NAME)?;
+        self.require_message(B::NAME)?;
+        let msg = self.require_message(R::NAME)?;
+
+        let mut block = self.encode(A::NAME, &first.args())?;
+        block.try_merge(&self.encode(B::NAME, &second.args())?)?;
+        let describe = format!(
+            "{}, {}",
+            self.describe_command(A::NAME, &first.args()),
+            self.describe_command(B::NAME, &second.args())
+        );
+
+        let values = self
+            .call_gated_block(
+                block,
+                &describe,
+                Some(oid),
+                R::NAME,
+                timeout,
+                SendClocks::default(),
+            )
+            .await?;
+
+        let params = Params::new(msg, &values).with_dictionary(dictionary);
+        R::decode(&params)
+    }
+
     /// [`Mcu::call_msg`] with scheduling gates on the request ([`SendClocks`]).
     ///
     /// `endstop_query_state` carries upstream's `minclock`
@@ -1176,6 +1235,204 @@ mod tests {
         assert!(
             matches!(err, McuError::Call(McuCallError::Timeout(_))),
             "{err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Mcu::call_two
+    // -----------------------------------------------------------------------
+
+    /// `spi_send` (answers nothing) and `spi_transfer` (answers once) — the pair
+    /// upstream's `spi_transfer_with_preface` encodes into one block
+    /// (`klippy/extras/bus.py:117-122`, `klippy/mcu.py:104-111`).
+    fn spi_pair_dictionary() -> Dictionary {
+        Dictionary::from_json(json!({
+            "commands": {
+                "spi_send oid=%c data=%*s": 54,
+                "spi_transfer oid=%c data=%*s": 55
+            },
+            "responses": {"spi_transfer_response oid=%c response=%*s": 56}
+        }))
+        .unwrap()
+    }
+
+    struct SpiSendStub {
+        oid: u8,
+        data: Vec<u8>,
+    }
+
+    impl McuCommand for SpiSendStub {
+        const NAME: &'static str = "spi_send";
+        fn args(&self) -> Vec<ArgValue> {
+            vec![
+                ArgValue::UInt8(self.oid),
+                ArgValue::Bytes(self.data.clone()),
+            ]
+        }
+    }
+
+    struct SpiTransferStub {
+        oid: u8,
+        data: Vec<u8>,
+    }
+
+    impl McuCommand for SpiTransferStub {
+        const NAME: &'static str = "spi_transfer";
+        fn args(&self) -> Vec<ArgValue> {
+            vec![
+                ArgValue::UInt8(self.oid),
+                ArgValue::Bytes(self.data.clone()),
+            ]
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct SpiTransferStubResponse {
+        oid: u8,
+        response: Vec<u8>,
+    }
+
+    impl McuResponse for SpiTransferStubResponse {
+        const NAME: &'static str = "spi_transfer_response";
+        fn decode(params: &Params<'_>) -> Result<Self, McuError> {
+            Ok(Self {
+                oid: params.get_u8("oid")?,
+                response: params.get_bytes("response")?,
+            })
+        }
+    }
+
+    /// ## One block, one ack
+    ///
+    /// The mapping's `input` is the **whole block** — both message ids, both
+    /// sets of arguments, in one frame — and `FrameMock` refuses a frame that is
+    /// not byte for byte that block. A second send would also find no mapping
+    /// left, so one acknowledgement is all the exchange can consume.
+    #[tokio::test]
+    async fn test_call_two_sends_both_messages_as_one_block() {
+        let preface = vec![0x9f];
+        let read = vec![0x00, 0x00, 0x00];
+        let answer = vec![0xef, 0x40, 0x17];
+        let mappings = vec![MappingEntry {
+            input: frame(
+                0,
+                &[
+                    // `spi_send oid=%c data=%*s` (id 54).
+                    ArgValue::UInt8(54),
+                    ArgValue::UInt8(1),
+                    ArgValue::Bytes(preface.clone()),
+                    // `spi_transfer oid=%c data=%*s` (id 55) in the same frame.
+                    ArgValue::UInt8(55),
+                    ArgValue::UInt8(1),
+                    ArgValue::Bytes(read.clone()),
+                ],
+            ),
+            // Only the second message answers, so one response frame.
+            outputs: vec![frame(
+                0,
+                &[
+                    ArgValue::UInt8(56),
+                    ArgValue::UInt8(1),
+                    ArgValue::Bytes(answer.clone()),
+                ],
+            )],
+        }];
+        let mcu = mcu_with(spi_pair_dictionary(), mappings);
+
+        let response = mcu
+            .call_two::<SpiSendStub, SpiTransferStub, SpiTransferStubResponse>(
+                &SpiSendStub {
+                    oid: 1,
+                    data: preface,
+                },
+                &SpiTransferStub { oid: 1, data: read },
+                1,
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response,
+            SpiTransferStubResponse {
+                oid: 1,
+                response: answer
+            }
+        );
+        assert_eq!(
+            mcu.pending_call_count().await,
+            0,
+            "the one answer consumed the one registration"
+        );
+    }
+
+    /// A block nobody answers times out like a single call, and hands its
+    /// registration back — a leftover would take the *next* answer for that
+    /// response name.
+    #[tokio::test]
+    async fn test_call_two_times_out_and_leaves_no_registration() {
+        let mcu = mcu_with(spi_pair_dictionary(), Vec::new());
+
+        let err = mcu
+            .call_two::<SpiSendStub, SpiTransferStub, SpiTransferStubResponse>(
+                &SpiSendStub {
+                    oid: 1,
+                    data: vec![0x00],
+                },
+                &SpiTransferStub {
+                    oid: 1,
+                    data: vec![0x00, 0x00],
+                },
+                1,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, McuError::Call(McuCallError::Timeout(_))),
+            "{err:?}"
+        );
+        assert_eq!(
+            mcu.pending_call_count().await,
+            0,
+            "a timed-out call takes its registration with it"
+        );
+    }
+
+    /// A block that never leaves the host cancels its registration too: this is
+    /// the path where the registration exists before the send is attempted.
+    #[tokio::test]
+    async fn test_call_two_that_cannot_be_sent_leaves_no_registration() {
+        let mcu = mcu_with(spi_pair_dictionary(), Vec::new());
+        mcu.close();
+
+        let err = mcu
+            .call_two::<SpiSendStub, SpiTransferStub, SpiTransferStubResponse>(
+                &SpiSendStub {
+                    oid: 1,
+                    data: vec![0x00],
+                },
+                &SpiTransferStub {
+                    oid: 1,
+                    data: vec![0x00, 0x00],
+                },
+                1,
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+
+        match &err {
+            McuError::Call(McuCallError::SendFailed(msg)) => {
+                assert!(msg.contains("the connection is closed"), "{msg}");
+            }
+            other => panic!("expected a send failure, got {other:?}"),
+        }
+        assert_eq!(
+            mcu.pending_call_count().await,
+            0,
+            "a send that failed cancels the registration it made first"
         );
     }
 }

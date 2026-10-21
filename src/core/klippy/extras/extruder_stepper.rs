@@ -372,7 +372,7 @@ pub(crate) async fn cmd_set_extruder_rotation_distance(
         // The live solver keeps its own copy of the step distance; upstream's
         // `MCU_stepper.set_rotation_distance` rewrites it in place.
         if let Some(toolhead) = &toolhead {
-            toolhead.set_stepper_step_dist(name, stepper.step_dist())?;
+            toolhead.set_stepper_step_dist(stepper.name(), stepper.step_dist())?;
         }
         distance
     } else {
@@ -539,10 +539,12 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::Config;
     use crate::core::klippy::event::KlippyEvent;
+    use crate::core::klippy::interface::devices::responder_mcu::ResponderMcu;
     use crate::core::klippy::mathutil::{Coord, Xyz};
     use crate::core::klippy::motion::trapq::Trapq;
     use crate::core::klippy::motion::Stepper;
-    use crate::core::klippy::reactor::ManualReactor;
+    use crate::core::klippy::printer::PrinterState;
+    use crate::core::klippy::reactor::{ManualReactor, TokioReactor};
     use std::time::Duration;
 
     /// The fake firmware's clock rate, for a solver built without one.
@@ -979,5 +981,270 @@ mod tests {
         assert_eq!(scheduled.smooth_time, 0.04);
         assert!(move_end > 0.0, "the parked move must take time: {move_end}");
         assert_eq!(scheduled.print_time, move_end);
+    }
+
+    // -----------------------------------------------------------------------
+    // The motion seam: the bound extruder's steps, over the fake firmware
+    // -----------------------------------------------------------------------
+
+    /// The corpus's section body, as the machine config below carries it
+    /// (`test/klippy/pressure_advance.cfg:52-58`).
+    const SYNCED_SECTION: &str = "extruder: extruder\nstep_pin: PH5\ndir_pin: PH6\n\
+        microsteps: 16\nrotation_distance: 28.2\n";
+
+    /// The `atmega2560` dictionary the fake board serves, or `None` when
+    /// `build.rs` did not build it (`KLIPPERX_ARCHES` decides which exist), so
+    /// a test skips instead of failing on a product it never got.
+    fn board() -> Option<ResponderMcu> {
+        ResponderMcu::new("mcu", "atmega2560.dict")
+    }
+
+    /// A running machine: the fake firmware, one `[extruder]` whose extrusion is
+    /// the motion to follow, and `[extruder_stepper my_extra_stepper]` carrying
+    /// `section`. `kinematics: none`: the extruder queues on its own trapq,
+    /// which is the queue the extra stepper reads.
+    fn sync_machine_config(board: &ResponderMcu, section: &str) -> String {
+        format!(
+            "[mcu]\ntest: dict={}\n\
+             [printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n\
+             [extruder]\nstep_pin: PF2\ndir_pin: PF3\nmicrosteps: 16\n\
+             rotation_distance: 33.500\nnozzle_diameter: 0.400\nfilament_diameter: 1.750\n\
+             heater_pin: PB4\nsensor_type: EPCOS 100K B57560G104F\nsensor_pin: PK5\n\
+             control: pid\npid_Kp: 22.2\npid_Ki: 1.08\npid_Kd: 114\n\
+             min_temp: 0\nmax_temp: 300\nmin_extrude_temp: 0\n\
+             [extruder_stepper my_extra_stepper]\n{section}",
+            board.dict().display()
+        )
+    }
+
+    /// Load the config and bring the whole machine up — the MCU handshake, the
+    /// extruder steppers' own connect and the toolhead's, in that order.
+    async fn up_machine(board: &ResponderMcu, section: &str) -> Arc<Printer> {
+        let (config, _) =
+            Config::from_text(&sync_machine_config(board, section)).expect("the config parses");
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = crate::core::klippy::api::StartArgs::collect(
+            "extruder_stepper.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            printer.load_config(&config).expect("the config loads");
+            printer.bring_up().await;
+        })
+        .await
+        .expect("the machine comes up within the bound");
+        let state = printer.get_state_message();
+        assert_eq!(state.category, PrinterState::Ready, "{}", state.message);
+        printer
+    }
+
+    fn the_toolhead(printer: &Arc<Printer>) -> Arc<ToolHeadObject> {
+        printer
+            .lookup_object_as::<ToolHeadObject>(TOOLHEAD_OBJECT)
+            .expect("the toolhead is registered")
+    }
+
+    /// Push one line through the dispatcher and generate every step the move
+    /// queued, so the counts below are what the firmware would have been sent.
+    async fn run_and_flush(printer: &Arc<Printer>, script: &str) {
+        let gcode = gcode(printer);
+        let toolhead = the_toolhead(printer);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            gcode.run_script(script).await.expect("the line runs");
+            toolhead
+                .flush_step_generation()
+                .await
+                .expect("the steps generate and send");
+        })
+        .await
+        .expect("the line and its flush finish within the bound");
+    }
+
+    /// The steps `name` has generated so far and the firmware stepper (oid)
+    /// they went down.
+    fn generated(toolhead: &Arc<ToolHeadObject>, name: &str) -> (i64, u8) {
+        let history = toolhead
+            .stepper_step_history(name, 256, 0, u64::MAX)
+            .unwrap_or_else(|| panic!("{name} is in the motion queue"));
+        let steps = history.steps.iter().map(|run| run.step_count).sum();
+        let oid = toolhead
+            .mcu_stepper(name)
+            .expect("the firmware stepper was registered")
+            .oid()
+            .expect("the stepper is configured");
+        (steps, oid)
+    }
+
+    /// Binding at connect is what makes the motor **move**: 1 mm of extrusion
+    /// (`G1 E1`) reaches this stepper's own firmware stepper as its own count of
+    /// steps — 28.2 mm / (200 · 16) per step, not the extruder's 33.5. Upstream's
+    /// `sync_to_extruder` points the stepper at the extruder's trapq
+    /// (`kinematics/extruder.py:63-65`); the toolhead's connect is where the
+    /// host stepper joins the motion queue, before which nothing can step.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_bound_stepper_takes_the_extruders_steps() {
+        let Some(board) = board() else {
+            return;
+        };
+        let printer = up_machine(&board, SYNCED_SECTION).await;
+        let outcome = async {
+            let toolhead = the_toolhead(&printer);
+            assert_eq!(
+                the_stepper(&printer).bound_extruder().as_deref(),
+                Some("extruder"),
+                "the `extruder` option binds at connect"
+            );
+
+            run_and_flush(&printer, "G92 E0\nG1 E1 F600").await;
+            let (extra_steps, extra_oid) =
+                generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let (extruder_steps, extruder_oid) = generated(&toolhead, "extruder");
+            // 1 mm / 0.0088125 = 113.5 steps on the extra stepper, 1 mm /
+            // 0.01046875 = 95.5 on the extruder: the same extrusion, a
+            // different count on each motor, and neither is a copy of the
+            // other.
+            assert!(
+                (extra_steps as f64 - 113.5).abs() <= 1.0,
+                "the extra stepper took {extra_steps} steps, expected ~113.5"
+            );
+            assert!(
+                (extruder_steps as f64 - 95.5).abs() <= 1.0,
+                "the extruder took {extruder_steps} steps, expected ~95.5"
+            );
+            assert_ne!(
+                extra_oid, extruder_oid,
+                "each motor steps down its own firmware stepper"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `SYNC_EXTRUDER_MOTION … MOTION_QUEUE=` detaches the motor from the
+    /// extrusion: the next millimetre steps the extruder and **not** this
+    /// stepper (`kinematics/extruder.py:56-58`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_detached_stepper_takes_no_more_steps() {
+        let Some(board) = board() else {
+            return;
+        };
+        let printer = up_machine(&board, SYNCED_SECTION).await;
+        let outcome = async {
+            let toolhead = the_toolhead(&printer);
+            run_and_flush(&printer, "G92 E0\nG1 E1 F600").await;
+            let (before_extra, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let (before_extruder, _) = generated(&toolhead, "extruder");
+            assert!(before_extra > 0, "the bound motor stepped first");
+
+            run_and_flush(
+                &printer,
+                "SYNC_EXTRUDER_MOTION EXTRUDER=my_extra_stepper MOTION_QUEUE=",
+            )
+            .await;
+            assert_eq!(
+                the_stepper(&printer).bound_extruder(),
+                None,
+                "an empty motion queue unbinds"
+            );
+
+            run_and_flush(&printer, "G1 E2 F600").await;
+            let (after_extra, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let (after_extruder, _) = generated(&toolhead, "extruder");
+            assert_eq!(
+                after_extra, before_extra,
+                "a detached stepper must not step with the extrusion"
+            );
+            assert!(
+                after_extruder > before_extruder,
+                "the extruder itself kept extruding: {before_extruder} -> {after_extruder}"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// `SET_EXTRUDER_ROTATION_DISTANCE` rewrites the step distance, and the
+    /// **next** extrusion converts with it: halving 28.2 mm to 14.1 mm doubles
+    /// the steps the same millimetre of filament takes (upstream
+    /// `MCU_stepper.set_rotation_distance`, `klippy/stepper.py:138-143` — the
+    /// live solver's conversion is `ToolHeadObject::set_stepper_step_dist`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_a_rotation_distance_change_rescales_the_generated_steps() {
+        let Some(board) = board() else {
+            return;
+        };
+        let printer = up_machine(&board, SYNCED_SECTION).await;
+        let outcome = async {
+            let toolhead = the_toolhead(&printer);
+            run_and_flush(&printer, "G92 E0\nG1 E1 F600").await;
+            let (before, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+
+            run_and_flush(
+                &printer,
+                "SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=my_extra_stepper DISTANCE=14.1",
+            )
+            .await;
+            assert!(
+                (the_stepper(&printer).stepper.step_dist() - 14.1 / (200.0 * 16.0)).abs() < 1e-12,
+                "the recorded step distance follows the command"
+            );
+
+            run_and_flush(&printer, "G1 E2 F600").await;
+            let (after, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let taken = (after - before) as f64;
+            assert!(
+                (taken - 227.0).abs() <= 2.0,
+                "1 mm at 14.1 mm/(200·16) is ~227 steps, got {taken}"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
+    }
+
+    /// A section whose `extruder` option is empty never binds: its motor stays
+    /// detached (`set_trapq(None)`), so extrusion steps the extruder alone and
+    /// leaves this stepper alone — the same machine behaviour as before the
+    /// motion seam existed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_unbound_stepper_never_steps_and_leaves_the_extruder_alone() {
+        let Some(board) = board() else {
+            return;
+        };
+        let printer = up_machine(
+            &board,
+            "extruder: \nstep_pin: PH5\ndir_pin: PH6\nmicrosteps: 16\nrotation_distance: 28.2\n",
+        )
+        .await;
+        let outcome = async {
+            let toolhead = the_toolhead(&printer);
+            assert_eq!(
+                the_stepper(&printer).bound_extruder(),
+                None,
+                "an empty `extruder` option binds nothing"
+            );
+
+            run_and_flush(&printer, "G92 E0\nG1 E1 F600").await;
+            let (extra_steps, _) = generated(&toolhead, "extruder_stepper my_extra_stepper");
+            let (extruder_steps, _) = generated(&toolhead, "extruder");
+            assert_eq!(extra_steps, 0, "an unbound stepper generates no steps");
+            assert!(
+                (extruder_steps as f64 - 95.5).abs() <= 1.0,
+                "the extruder still steps alone: {extruder_steps}"
+            );
+            Ok::<(), String>(())
+        }
+        .await;
+        printer.teardown();
+        outcome.unwrap();
     }
 }

@@ -2459,8 +2459,13 @@ impl ToolHeadObject {
     /// The solver's copy is what turns a position into steps, so the next
     /// generation counts the new distance. `commanded_pos` is left where it is:
     /// the trapq's positions are absolute, so the motor keeps its place and only
-    /// the conversion changes (upstream re-derives its offset so its *reported*
-    /// position stays continuous, `_set_mcu_position`, `:186-189`).
+    /// the conversion changes (upstream additionally re-derives its counter
+    /// offset, `_set_mcu_position`, `:186-189`).
+    ///
+    /// The stepper's other copy of the distance — what motion reporting calls
+    /// its mm/step, and what its own counter is derived from — keeps the value
+    /// it was built with: that counter is the firmware's step count, which is
+    /// not a distance.
     ///
     /// # Errors
     /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"

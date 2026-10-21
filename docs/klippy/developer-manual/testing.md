@@ -250,6 +250,7 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
 | ⑫ 配置 include 与依赖减肥（2026-10-21） | `[include]` 对齐上游 `glob.glob`（相对包含者目录、`*`/`?`/`[]` 非递归、不匹配前导点、排序、通配零匹配静默；保留环检测）+ URL 取源从 `reqwest`换 `ureq`（openssl/native-tls/aws-lc 全部离开依赖树，`cargo tree` 442→328 行；新增 10 s/5 s/4 MiB 边界）（+13 个 `fn test_`） | **46.5 s** | 3648 |
 | ⑬ 运动数学与设备层健壮性（5 lane + 直提交，2026-10-21） | `G2`/`G3` 弧与 `G17`–`G19` 平面、压力提前（ESPA 解析积分）真驱动挤出机、`objects/subscribe` 定时器环改 `Weak`、`serial.rs` 设备层九条修补、CAN 读回定布局与写失败即停（+34 个 `fn test_`） | **46.8 s** | 3682 |
 | ⑭ 调平/回放/观测收尾（4 lane + 1 重派，2026-10-21） | `bed_mesh` faulty 替换 + `ZERO_REFERENCE` + dump 界限、`sdcard_loop` 三命令与 `SdCardFile`、`motion_report.get_status` + shutdown 转储、假件步进位置累积（`--task motion` 假板 e2e）、压力提前 pre/post 活跃窗口（+30 个 `fn test_`） | **46.6 s** | 3712 |
+| ⑮ 运动地基与调平余项（6 lane，2026-10-21） | 扫描窗记账（`kin_flush_delay` 运行期化）、`input_shaper` 真驱动步进（`motion/shaper.rs`）、`skew_correction`、`z_thermal_adjust`、`tuning_tower`（+46 个 `fn test_`） | **46.7 s** | 3769 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。
@@ -615,6 +616,7 @@ git config core.hooksPath .githooks
 | `stepcompress.rs` | 等间隔→一条 move、加速/减速/二次曲线段与上游对拍；方向切换插 dir 命令、大空隙变单步重锚、SDS 过滤在反向前丢步；flush 等 move clock、`set_last_position` 记 history 标记、`find_past_position` 与发出的时刻表一致、history 过期清理；抖动序列与上游对拍；一整段压缩重建出请求的每一步 |
 | `trapq.rs` | 梯形变三段、相位连续、时间空隙填静止段、坐标沿加速度走；`finalize_moves` 过期段、`extract_old` 按窗口取段 |
 | `itersolve.rs` | cartesian 只读自己的轴、corexy 读 x±y、corexz 读 x±z；不动的 stepper 是惰性的；步距处生成步进、`generate` 走完整 trapq、位置坐标往返；**压力提前真驱动步进（2026-10-21）**：`test_pressure_advance_drives_the_extruder_steps`——同一段移动 nominal 1 mm，带 pa 出 1.5 mm；中途 `SET_PRESSURE_ADVANCE` 改值后从下一段起生效（2.5 → 3.0 mm） |
+| `shaper.rs` | **整形位置函数（6 测，2026-10-21）**：脉冲归一化与重心归零（`Σa=1`、`Σa·t=0`）、生成窗口取脉冲时间极值（正负两种符号）、匀速段不做整形、整形位置 = 延迟位置加权和（与独立计算的 Σ 对账，带容差）、装饰后的求解器看到整形坐标、无脉冲轴原样走内层 |
 | `pressure_advance.rs` | **ESPA 平滑（5 测，2026-10-21）**：`pa = 0` 时与旧行为**逐点相等**（3 段 × 21 个时间点，`assert_eq!` 对 `segment.coord(t).x()`，**回归保护**）；`pa > 0` 时进给率变化处出现超前/滞后且量值等于 `pa × 速度`（容差）；`smooth_time` 变大时过渡更平缓（单调性断言）；改值后下一段立即生效；解析积分与数值积分对账 |
 | `stepper.rs` | cartesian stepper 只动自己的轴、每个 stepper 在自己的 MCU 时钟里生成、`mcu_position` / `past_position`、`generate` 交出该 stepper 的命令 |
 | `toolhead.rs` | 额外轴（挤出机）在自己的 trapq 检查与排队、限制拐角；move 到 trapq 生成 `queue_step`；两条共线 move 保住拐角速度；`dwell` 推进 print time；`drip_move` 直灌 trapq（零长度不做事）；未 homed 轴拒绝、零长 move 忽略；**C5 五测（两组转红）**：实时 est 打底（`print_time ≥ live_est + BUFFER_TIME_START`，回退成 connect 快照即 5 条全红）、`need_prime_rearm::{wait_moves,dwell,flush_step_generation}` 三条复位路径（去复位恰好 3 条红）、入队批 `req`/`completion` 域界（`req ≤ est+0.100`、`completion ≥ est`）；`wait_moves_state()` 快照（`special_queuing_state`/`print_time`/est 同一次锁内取出，供 `M400` 的等待环逐轮重读） |

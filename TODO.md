@@ -87,10 +87,10 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——三者主体**均已落地**（含单测）；`rename_existing` 连接期换名已落地（2026-10-06，`5ba2356`），余项＝`printer.objects` 的可枚举反射（Q5），见 H3 节 | G1b、Q5 |
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——**均已落地**（`sdcard_loop` 的三条命令与 `SdCardFile` 接缝 2026-10-21），见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查），余项＝both-edge 未启用与两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
-| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前的三条余项与 `input_shaper` 未作用到运动（窗口机制已就绪），见 H6 节 | F5、F6、F7、C1 |
+| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi，含各自的 `config_*`/send 命令）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝`skew_correction`/`tuning_tower` 两个未移植项（`bed_mesh` 的 faulty/`ZERO_REFERENCE` 与 `z_thermal_adjust` 已 2026-10-21 落地），见 H9 节 | C1、F8 |
+| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
@@ -486,7 +486,10 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [ ] 已知偏差（2026-10-18 审出，客服端宏会踩）：无 `[extruder]` 时上游 `printer.toolhead.extruder` 是 `''`（`DummyExtruder.get_name()`），本仓恒为 `"extruder"`，于是 `_TOOLHEAD_PARK_PAUSE_CANCEL`/`_CLIENT_EXTRUDE` 那类 `!= ''` 守卫在本仓拦不住、直接去查未注册的 `printer['extruder']`。有挤出机时两者一致。
 - [ ] 上游 `toolhead.py:604-614` 的无条件加载表里，本仓 `DEFAULT_MODULES` 只收 `idle_timeout`
       （`gcode_move`/`manual_probe` 由 toolhead 工厂 `ensure` 无条件建立，不经该表）。逐项现状：
-      `tuning_tower` **真缺**（无文件、无 `TUNING_TOWER`）；`statistics` 只缺 1 Hz 汇总日志（对象已落地，
+      `tuning_tower` 已落地（2026-10-21，`extras/tuning_tower.rs`），但**只在自己节存在时装载**：
+      上游是无条件加载（`TUNING_TOWER` 不写节也能用），本仓的工厂在装载期就调 `gcode_move::ensure`
+      （会建 toolhead），在没有 `[printer]` 的配置上会挂——要做到无条件，需把该查询延到 `klippy:connect`；
+      `statistics` 只缺 1 Hz 汇总日志（对象已落地，
       见 H11）；`garbage_collection` 只缺日志汇总（Rust 无 GC 冻结机制，只有延迟告警）；
       `homing` **不是缺口**（功能在 `motion/kinematics.rs` 的 `Homing` 与 toolhead 内，只是没有同名模块）。
 
@@ -595,11 +598,15 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
          变更不 `flush_step_generation`（扫描窗记账已落地，能挡住大部分，但 flush 本身仍缺）；
       2. `[extruder_stepper <name>]` 自己的 `pressure_advance` 仍只记录/上报，未接求解器（默认 0 与上游一致）；
       3. `find_past_position` 仍是 stub，pa 领先量不经 MCU 计数进 `motion_report`。
-- [ ] **`input_shaper` 未作用到运动**（单独一项）：`extras/input_shaper.rs` 现在只做参数校验/上报，
-      `update_input_shaping` 是空缝——既不碰 trapq 也不碰 position function（上游 `kin_shaper.c` 的
-      `input_shaper_alloc`/`set_sk`/`update_sk` 未移植）。**两侧地基都已就绪（2026-10-21）**：
-      `StepKinematics::set_generation_window(pre, post)` 写窗口、`ToolHead::recompute_scan_windows()` 记账，
-      shaper 落地时只需按脉冲跳度写窗口并在参数变更后调一次扫描。
+- [x] **`input_shaper` 已作用到运动（2026-10-21）**：`motion/shaper.rs` 移植 `kin_shaper.c` 的整形位置函数
+      （脉冲归一化 + 重心归零、按 `SegmentWindow` 定位、`DUMMY_T` 合成段喂内层 solver），
+      `extras/toolhead.rs` 把脉冲装到主 trapq 的每个 stepper，窗口取活跃轴脉冲极值、扫描窗随之变宽。
+      无脉冲轴短路走内层（零开销）。
+- [ ] **`input_shaper` 的余项**：
+      1. 装/换整形前不 `flush_step_generation`（同 PA 那条）；
+      2. `resonance_tester` 从不调 `disable_shaping`/`enable_shaping`——它的运动路径未落地，落地时需补；
+      3. 双滑车重指向（`dual_carriage:update_kinematics`）无人发送，整形层不会跟着换；
+      4. 边界行为：窗口越到首/尾 trapq 段之外时被**裁剪**（上游会走进哨兵段），表现为首次移动的小起点偏移。
 - [ ] 各传感器的 `*/dump_*` 端点仍在 **B4** 名下。
 - 依赖 F5/F6/F7、C1。
 
@@ -678,8 +685,11 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] **`z_thermal_adjust` —— 已落地（2026-10-21）**：`[z_thermal_adjust]` 全选项（`temp_coeff`/`min_temp`/`max_temp`/`smooth_time`/`z_adjust_off_above`）、
       传感器注册（`M105` 与 `TEMPERATURE_WAIT` 可用）、一阶平滑滤波、**变换链里加 Z 补偿**、
       `SET_Z_THERMAL_ADJUST` 命令族与 `get_status` 六键；`homing:home_rails_end` 带 Z 时重锚参考。
-- [ ] 校准：`delta_calibrate` ✅（段+`DELTA_CALIBRATE`/`DELTA_ANALYZE` 落地 2026-09-24 批 #5，`delta_calibrate.test` 转绿）、`axis_twist_compensation` ✅（批 #36）；**未移植**：`skew_correction`、
-      `tuning_tower`（无文件、无 section，语料不覆盖）。
+- [x] 校准：`delta_calibrate` ✅、`axis_twist_compensation` ✅、**`skew_correction` ✅（2026-10-21）**：
+      三平面斜切矩阵走变换链（`SKEW_PROFILE` LOAD/SAVE/REMOVE 与 `SAVE_CONFIG` 写回、`SET_SKEW`/
+      `CALC_MEASURED_SKEW`/`GET_CURRENT_SKEW` 文案逐字对齐上游）；**`tuning_tower` ✅（同日）**：
+      按移动变换触发（非定时器）、`TUNING_TOWER` 七个参数词与三条报错文案逐字对齐。
+      语料对两者零覆盖，验收靠单测。
 - [x] 回零周边：`homing_heaters`（批 #31）已落地；事件 `probe:update_results` 已带载荷并触发（批 #36），`homing:*` 四个已随 toolhead 产线触发（见事件清单）。
 - 依赖 C1、F8（endstop/trsync）、H3（宏）、H12（`mathutil`）。
 

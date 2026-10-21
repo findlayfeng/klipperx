@@ -697,7 +697,7 @@ SET_PIN PIN=pwm_fan VALUE=0.25  ; PWM：25% 占空比
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `SET_INPUT_SHAPER` | `SHAPER_TYPE_X/Y/Z`、`SHAPER_FREQ_X/Y/Z`、`DAMPING_RATIO_X/Y/Z`（均可选） | 缺省参数则报告当前值，如 `shaper_type_x:mzv(5,0.6) shaper_freq_x:22.200 damping_ratio_x:0.100000`（顺序 x→y→z）；错误文案对上游：`Unsupported shaper type: %s`、`Too high value of damping_ratio=%.3f for shaper %s on axis %c`。参数只改上报值（系数未接到步进生成，见 `[input_shaper]` 的 gap） |
+| `SET_INPUT_SHAPER` | `SHAPER_TYPE_X/Y/Z`、`SHAPER_FREQ_X/Y/Z`、`DAMPING_RATIO_X/Y/Z`（均可选） | 缺省参数则报告当前值，如 `shaper_type_x:mzv(5,0.6) shaper_freq_x:22.200 damping_ratio_x:0.100000`（顺序 x→y→z）；错误文案对上游：`Unsupported shaper type: %s`、`Too high value of damping_ratio=%.3f for shaper %s on axis %c`。参数**现在就改运动**（2026-10-21）：新脉冲立即装到主 trapq 的每个 stepper，生成窗口与 `kin_flush_delay` 跟着重算 |
 
 ### SET_EXTRUDER_ROTATION_DISTANCE / SYNC_EXTRUDER_MOTION — 挤出机（mux 键 `EXTRUDER`，wave-2）
 

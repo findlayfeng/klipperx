@@ -88,7 +88,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——**均已落地**（`sdcard_loop` 的三条命令与 `SdCardFile` 接缝 2026-10-21），见 H4 节 | F9、C1 |
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查）；both-edge 已按上游判定链启用（2026-10-21），余项＝两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
-| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
+| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_*` 四型（开关/运动/hall/tsl1401cl）、`trigger_analog` 三件套、**固件按钮查询（2026-10-21）**均已落地；余项＝`query_adc`（模拟按键）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——**✅ 收官（2026-10-21）**：六个驱动全会画（`VGA_FONT` 已 vendor）、菜单引擎 + 渲染通路 + 菜单行绘制、`[display_data]`/`[display_glyph]` 主配置 factory；余项只剩 `emulated_st7920`/`sh1106` 两种面板类型（`lcd_type` 接受但报缺口），见 H8 节 | — |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
@@ -301,8 +301,13 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `MCU_trigger_analog` 资源类），本仓三件套齐备：滤波设计（`extras/trigger_analog.rs`）、
       六条报文（`cmd/trigger_analog.rs`）、资源层（`mcu/resource/trigger_analog.rs`），
       消费面 `load_cell_probe` / `probe_eddy_current`。
-- [ ] 线宽传感器：`hall_filament_width_sensor`、`tsl1401cl_filament_width_sensor`——无文件、无 section
-      （断料两项**已落地**，见上）。
+- [x] **线宽传感器 `hall_filament_width_sensor` / `tsl1401cl_filament_width_sensor` —— 已落地（2026-10-21）**：
+      两个模块按上游逐行实现（hall：`ADC_REPORT_TIME=0.5`/`SAMPLE_TIME=0.03`/`COUNT=15`、`round(read*10000)`、
+      两点线性换算 `diameter_new` + `(5*d+new)/6` 平滑、`update_filament_array` 的 interval/delay 入队、
+      三个 pending 旗 → `M221 S100`、宽度超出 `[runout_dia_min, runout_dia_max]` 走 runout 语义；
+      tsl1401cl：线性 CCD 读数换算 + `_process_measurement`），并注册 `M404`/`M405`/`M406`/`M407`
+      与 `QUERY_FILAMENT_WIDTH`；`RunoutHelper` 补了 `sensor_enabled` 写入口（上游四个写入点的入口）。
+      测量定时器**有界**（测试入口单步驱动，不留永久定时器）。
 - [ ] 固件 `initial_pins.c` 的初始引脚状态。
 - [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`、`palette2.py`。
 - 依赖 F3（GPIO）、F5（ADC）、F9。

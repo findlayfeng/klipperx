@@ -1084,6 +1084,22 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 
 段/命令层/接口与 mux 端点 `mpu9250/dump_mpu9250`（key `sensor`）已落地（带名节按 identifier 注册）。**gap**：同 ADXL345 的 bulk 数据通路（需 `">hhh"` 与 `query_mpu9250_status`），`ACCELEROMETER_*` 命令随之延后。
 
+### `[hall_filament_width_sensor]` / `[tsl1401cl_filament_width_sensor]` — 线宽传感器（2026-10-21）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `adc_pin` / `adc1_pin`、`adc2_pin` | —（hall 必填其一） | 采样脚；hall 支持双通道（`RawHallFilamentWidthSensor`） |
+| `Cal_dia1` / `Cal_dia2`、`Raw_dia1` / `Raw_dia2` | `1.50` / `2.00`、`100` / `200` | 标定点（两点线性换算） |
+| `nominal_filament_dia` | `1.75` | 名义线宽（无读数时用它） |
+| `measurement_interval` / `measurement_delay` | `10` / `100` | 测量间隔与延迟（mm） |
+| `enable` | `False` 等价 | 段里有 `switch_pin`/`enable` 时按上游启用；`M405`/`M406` 运行期开关 |
+| `runout_dia_min` / `runout_dia_max` | `0.1` / `5.0` | 超出区间按 runout 处理 |
+
+两个模块按上游逐行实现：hall 的 `round(read*10000)` → 两点线性 `diameter_new` → `(5*d+new)/6` 平滑 →
+`update_filament_array` 按 `interval`/`delay` 入队（`Filament width:%.3f` 日志），三个 pending 旗触发 `M221 S100`，
+宽度出窗与断料走 `RunoutHelper`；tsl1401cl 用线性 CCD 读数换算 + `_process_measurement`。命令面：
+`M404`（设定名义线宽/日志）、`M405`/`M406`（开/关）、`M407`（报告当前直径）、`QUERY_FILAMENT_WIDTH`。
+
 ### `[buttons]` — 按钮/编码器注册表（wave-2，2026-10-21 补齐固件查询）
 
 `[buttons]` 无配置节，是被 `[filament_switch_sensor]`/`[filament_motion_sensor]`/`[gcode_button]` 用 `load_object` 拉起的注册表（`register_debounce_button` / `register_buttons`）。**固件查询 2026-10-21 落地**：`config_buttons`/`buttons_add`/`buttons_query`/`buttons_ack` 四条命令 + `buttons_state` 应答，每 **8 个引脚**一个固件对象（`src/buttons.c:76-78`），查询周期 `QUERY_TIME=2 ms`、`RETRANSMIT_COUNT=50`；`pull_up` 由引脚上的 `~` 决定（线上为 `0xff`）、`invert` 取反电平，宿主侧去抖按 `debounce_delay`。回调在 reactor 上触发（同上游 `register_async_callback`），所以真板上的引脚变化会真的驱动 filament/`gcode_button` 回调。**余项**：`analog_range`（模拟按键）仍缺 `query_adc` 模块，`[gcode_button]` 照旧读后拒绝；`register_buttons` 的失败目前只 `error!` 记录、不是上游的配置错。

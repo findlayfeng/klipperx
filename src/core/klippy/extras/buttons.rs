@@ -295,6 +295,14 @@ impl McuButtons {
     /// Upstream's `MCU_buttons.handle_buttons_state` (`buttons.py:58-83`). The
     /// ack goes out first, before any consumer code runs, so a slow consumer
     /// cannot make the firmware retransmit what the host already has.
+    ///
+    /// The consumers themselves run from a reactor callback (`call_later(0.)`),
+    /// which is where upstream's `register_async_callback` puts them
+    /// (`buttons.py:81-82`): they are a runout check and user gcode templates,
+    /// and this runs on the receive task — a consumer that asks the MCU
+    /// anything could not be answered from there. The eventtime is captured
+    /// first, at the receipt upstream dates the callback with (`#receive_time`,
+    /// `buttons.py:74`).
     fn handle_report(&self, report: &ButtonsState) {
         let Some((count, calls)) = self.take_report(report) else {
             return;
@@ -313,14 +321,21 @@ impl McuButtons {
                 count
             ),
         }
-        let eventtime = self
-            .printer
-            .upgrade()
-            .map(|printer| printer.eventtime())
-            .unwrap_or(0.0);
-        for (callback, state) in calls {
-            callback(eventtime, state);
+        if calls.is_empty() {
+            return;
         }
+        let Some(printer) = self.printer.upgrade() else {
+            return;
+        };
+        let eventtime = printer.eventtime();
+        printer.reactor().call_later(
+            0.,
+            Box::new(move |_| {
+                for (callback, state) in calls {
+                    callback(eventtime, state);
+                }
+            }),
+        );
     }
 
     /// The state half of [`McuButtons::handle_report`]: how many bytes have to
@@ -1143,21 +1158,8 @@ mod tests {
         )
         .await;
 
-        wait_until(
-            Duration::from_secs(1),
-            Duration::from_millis(5),
-            || !calls.lock().unwrap().is_empty(),
-            "the injected buttons_state never reached the callback",
-        )
-        .await;
-        assert_eq!(
-            *calls.lock().unwrap(),
-            vec![(0.5, true)],
-            "!(0) is pressed, dated at the reactor time the report arrived"
-        );
-
-        // And the byte is acknowledged, which is what stops the retransmission.
         let ack = wire_bytes(BUTTONS_ACK, &[ArgValue::UInt8(0), ArgValue::UInt8(1)]);
+        // And the byte is acknowledged, which is what stops the retransmission.
         wait_until(
             Duration::from_secs(1),
             Duration::from_millis(5),
@@ -1166,6 +1168,20 @@ mod tests {
         )
         .await;
         assert_eq!(the_group(&world.buttons).lock().ack_count, 1);
+
+        // The consumers run from the reactor, not from the report path, so they
+        // are still pending until it steps (upstream's
+        // `register_async_callback`).
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "the callback must not run on the receive task"
+        );
+        world.reactor.run_due();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![(0.5, true)],
+            "!(0) is pressed, dated at the reactor time the report arrived"
+        );
     }
 
     /// ③ The same report again is a retransmission: the firmware's `ack_count`

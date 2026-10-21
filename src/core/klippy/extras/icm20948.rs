@@ -22,11 +22,11 @@
 //! Upstream's `icm20948.py` reads the accelerometer and nothing else: the FIFO
 //! entries it configures hold the three accel axes, `_convert_samples` unpacks
 //! exactly those three words, and the dump endpoint's header is the
-//! accelerometer's four columns. There is no gyro path in upstream — the chip's
-//! gyro axes are switched *off* at start (`PWR_MGMT_2 = 0x07` disables the three
-//! gyro axes and leaves the accelerometer running) — and `resonance_tester`,
-//! the consumer of this interface, measures acceleration only. This port adds
-//! no gyro stream of its own.
+//! accelerometer's four columns. There is no gyro path in upstream: the chip is
+//! left with upstream's `SET_PWR_MGMT_2_ACCEL_ON` write (`0x07`, the
+//! accelerometer side selected), the FIFO is only ever read as accel entries,
+//! and `resonance_tester`, the consumer of this interface, measures
+//! acceleration only. This port adds no gyro stream of its own.
 //!
 //! # The accelerometer interface
 //!
@@ -147,7 +147,7 @@ const SET_PWR_MGMT_1_WAKE: u8 = 0x01;
 /// Back to sleep (`SET_PWR_MGMT_1_SLEEP`).
 const SET_PWR_MGMT_1_SLEEP: u8 = 0x41;
 
-/// Accelerometer axes on, gyro axes off (`SET_PWR_MGMT_2_ACCEL_ON`).
+/// Upstream's `SET_PWR_MGMT_2_ACCEL_ON` (the accelerometer side selected).
 const SET_PWR_MGMT_2_ACCEL_ON: u8 = 0x07;
 
 /// Everything off (`SET_PWR_MGMT_2_OFF`).
@@ -199,8 +199,8 @@ fn device_name(dev_id: u8) -> Option<&'static str> {
     })
 }
 
-/// The writes `_start_measurements` issues first: wake the chip and turn the
-/// accelerometer axes on (which also switches the gyro axes off).
+/// The writes `_start_measurements` issues first: wake the chip, then leave
+/// the accelerometer side selected (`SET_PWR_MGMT_2_ACCEL_ON`).
 fn setup_writes() -> [(u8, u8); 2] {
     [
         (REG_PWR_MGMT_1, SET_PWR_MGMT_1_WAKE),
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_the_register_sequence_is_upstreams() {
-        // Wake, accelerometer axes on (the gyro axes stay off).
+        // Wake, then upstream's accelerometer-on write.
         assert_eq!(setup_writes(), [(0x06, 0x01), (0x07, 0x07)]);
         assert_eq!(
             config_writes(4500).expect("the supported rate"),

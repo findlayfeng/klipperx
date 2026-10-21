@@ -89,7 +89,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查）；both-edge 已按上游判定链启用（2026-10-21），余项＝两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
-| H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地（hd44780/st7920/uc1701/ssd1306/aip31068_spi/hd44780_spi，含各自的 `config_*`/send 命令）；余项＝菜单族（`menu.py`/`menu_keys.py`/`display.cfg`/`menu.cfg`）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
+| H8 | LCD 显示与菜单（display/*）——面板驱动与固件命令均已落地；**菜单引擎 2026-10-21 落地**（`menu.py`/`menu_keys.py` + 嵌入 `menu.cfg` + 四个 `menu:*` 事件）；余项＝渲染通路（`draw_text`/驱动字库）、个别驱动的 `set_glyphs`、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
@@ -644,9 +644,18 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 - [x] **面板驱动全部落地（2026-10-06 复核）**：`display/display.rs` 的框架与分派里已含
       `hd44780`、`hd44780_spi`、`st7920`（SPI）、`uc1701`、`ssd1306`/`sh1106`、`aip31068_spi`（批 #7/#13/#28 + 后续），
       均为 storage-only。
+- [x] **菜单引擎已落地（2026-10-21）**：`display/menu.rs`（2599 行）移植 `menu.py` 的 `MenuElement`/`MenuContainer`/
+      `MenuCommand`/`MenuInput`/`MenuList`/`MenuVSDList` 与 `MenuManager`（树构建、`up/down/back/exit`、输入项的
+      value/min/max/step 求值与 `fast_rate` 加速、长名滚动、`heartbeat`、VSD 列表从 `virtual_sdcard` 列文件、
+      脚本构造为 gcode 命令后排队）；`menu_keys.rs` 的键名→事件映射与 section 名解析；出货 `menu.cfg` 作
+      **嵌入资产**（782 行、82 个 item，内置默认 → `printer.cfg` 同名 section 覆盖，带漂移守卫测试），
+      只在主 `[display]`（section 名 == `display`）挂载。四个 `menu:*` 事件已发（`init` 构建末尾、`begin` 推根前、
+      `populate` 容器重建后、`exit` 停用前；**载荷**：上游传 `self` 对象引用，本仓事件无载荷 ⇒ 处理器按对象名
+      `menu` 查）。
+- [ ] **屏幕内容仍不渲染**：`draw_text`/`draw_progress_bar`、`display_data` 组的 `show()`、各驱动
+      `write_text`/`write_glyph`/`write_graphics` 与字库都未接（`display.rs` 刷新只 clear/flush）；
+      另 `[display_data]` 无主配置 factory，出货 layout 是唯一来源。
 - [ ] 个别驱动的 `set_glyphs`：`uc1701`、`hd44780_spi`、`aip31068_spi` 自述未移植字形写入。
-- [ ] 菜单：`display/menu.py`、`display/menu_keys.py`、`display.cfg`、`menu.cfg`；
-      事件 `menu:*`（`display/` 下无 menu 文件）。
 - 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
 
 ### H9 探测 / 调平 / 校准
@@ -961,14 +970,14 @@ admin 通道**用端口级命令 `SET_PORT_NODEID(index, id)` 告知桥，**下�
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `menu:populate` | 菜单填充 | 无 | `klippy/extras/display/menu.py:346` | display |
-| `menu:init` | 菜单初始化 | 无 | `klippy/extras/display/menu.py:722` | display |
-| `menu:begin` | 菜单开始 | 无 | `klippy/extras/display/menu.py:754` | display |
-| `menu:exit` | 菜单退出 | 无 | `klippy/extras/display/menu.py:913` | display |
+| `menu:populate` | 菜单填充 | 无（上游传容器对象） | `klippy/extras/display/menu.py:346` | ✅ 已触发（`menu.rs` 容器 `populate` 末尾，锁外） |
+| `menu:init` | 菜单初始化 | 无（上游传 manager） | `klippy/extras/display/menu.py:722` | ✅ 已触发（`MenuManager::new` 末尾） |
+| `menu:begin` | 菜单开始 | 无（上游传 manager） | `klippy/extras/display/menu.py:754` | ✅ 已触发（`begin` 推根之前） |
+| `menu:exit` | 菜单退出 | 无（上游传 manager） | `klippy/extras/display/menu.py:913` | ✅ 已触发（`exit` 置 `running=false` 之前） |
 
-> 依赖 display/menu 模块，优先级最低。上游 `menu.send_event` 实际发 `"menu:" + <名>`，
-> 共四个（2026-09-23 复核行号：populate 346 / init 722 / begin 754 / exit 913）；曾列出的
-> 「`menu:`（空名）」行是前缀构造的误拆，已删除，事件总数仍为 35（本仓库 decl 恰好 35 个）。
+> 上游 `menu.send_event` 实际发 `"menu:" + <名>` 并附 `self` 作载荷；本仓四个事件无载荷，
+> 处理者按对象名 `menu` 查。四条发送点由 `test_the_lifecycle_raises_the_four_menu_events` 铉住
+> （`init` → `begin` → `populate` → `exit` 顺序）。
 
 ### 依赖关系总结
 

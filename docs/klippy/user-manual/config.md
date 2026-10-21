@@ -1155,9 +1155,9 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `hd44780_spi` 面板选项 | — | `latch_pin`（必填）、`line_length`（16\|20，默认 20）、`hd44780_protocol_init`（默认 True）、`spi_*`；每位按高/低半字节、每半字节三帧（`data`/`data\|E`/`data`，RS=bit1、E=bit3，批 #30） |
 | `aip31068_spi` 面板选项 | — | `latch_pin`（必填，SPI cs/latch）、`line_length`（16\|20，默认 20）、`spi_speed`（≥100000，默认 100 kHz）、`spi_bus`/`spi_software_*`；传输是 9-bit 字（`encode`/`encoded_groups`，批 #28） |
 | `display_group` | `_default_16x4` | 组来自随模块发布的 `display.cfg`（20 列时默认 `_default_20x4`）；未知组报 `Unknown display_data group '%s'` |
-| 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` **只被读取**（菜单未实现） |
+| 菜单/按键选项 | — | `menu_root`/`menu_timeout`/`menu_reverse_navigation`/`encoder_pins`/`encoder_steps_per_detent`/`encoder_fast_rate`/`click_pin`/`back_pin`/`up_pin`/`down_pin`/`kill_pin`/`analog_range_*`/`analog_pullup_resistor` —— 2026-10-21 起**菜单引擎已消费**（`display/menu.rs`） |
 
-gap（如实登记）：**屏幕内容不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储；刷新只 clear/flush）；**菜单未实现**（无 `menu` 对象、无 `menu:*` 事件、不装载 `menu.cfg`）；随模块发布的 `display.cfg` 为 **vendored 副本**（有漂移守卫测试）。
+gap（如实登记，2026-10-21 重核）：**屏幕内容仍不渲染**（`display_template`/`display_data`/`display_glyph` 只解析+存储，刷新只 clear/flush；`draw_text`/`draw_progress_bar` 与各驱动 `write_text`/字库未接）；**菜单引擎已落地**（`menu` 对象、四个 `menu:*` 事件、嵌入 `menu.cfg` 在内置默认之上被 `printer.cfg` 同名覆盖，只在主 `[display]` 挂载；按键选项已消费）；随模块发布的 `display.cfg`/`menu.cfg` 为 **vendored 副本**（各带漂移守卫测试）。
 
 ### `[fan_generic <name>]` — 通用风扇（批 #18）
 

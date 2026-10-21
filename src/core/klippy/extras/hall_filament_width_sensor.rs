@@ -3,12 +3,13 @@
 //!
 //! Two analog inputs (`adc1`, `adc2`) sit either side of the filament. The sum
 //! of their raw counts maps to a diameter through the calibration line
-//! `Cal_dia1`/`Cal_dia2` × `Raw_dia1`/`Raw_dia2` (`:122-125`), smoothed 5/6 old
-//! + 1/6 new on every `adc2` report (`:126`). Every `measurement_interval` mm of
-//! extrusion the smoothed diameter is queued `measurement_delay` mm ahead of the
-//! nozzle (`:130-149`). The queue decides the flow compensation (`M221`) the way
-//! upstream's `extrude_factor_update_event` does (`:151-209`), and the same
-//! diameter drives the shared [`RunoutHelper`] as a runout condition
+//! `Cal_dia1`/`Cal_dia2` × `Raw_dia1`/`Raw_dia2` (`:122-125`), smoothed on every
+//! `adc2` report as five sixths of the old diameter plus one sixth of the new one
+//! (`:126`). Every `measurement_interval` mm of extrusion the smoothed diameter is
+//! queued `measurement_delay` mm ahead of the nozzle (`:130-149`). The queue
+//! decides the flow compensation (`M221`) the way upstream's
+//! `extrude_factor_update_event` does (`:151-209`), and the same diameter drives
+//! the shared [`RunoutHelper`] as a runout condition
 //! (`min_diameter`..`max_diameter`, `:175-176`).
 //!
 //! # The timer

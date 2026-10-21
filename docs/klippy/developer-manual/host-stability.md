@@ -19,6 +19,11 @@ scripts/host-stability.sh                 # 默认：满配，不接真板
 （优先用仓库的 `venv/bin/python`，没有就退到系统的；脚本只用标准库）。
 不需要 `ss`/`lsof`/`jq`，也不占 7125（默认用自己的 7150 端口，跑完即释放）。
 
+**二进制太旧会被当成失败，而不是静默通过。** 如果报告里出现
+`system_stats answered without dispatch/dropped_logs`，说明手上的 `klipperx`
+早于这个对象（查未知对象会回一个空对象，正好是「看起来没事」的形状）——
+重新 `cargo build --release` 就是。脚本对这类缺失一律 FAIL。
+
 ## 它做什么
 
 | 阶段 | 时长 | 干什么 | 硬判据（不过就 FAIL） |
@@ -61,10 +66,10 @@ scripts/host-stability.sh                 # 默认：满配，不接真板
 
 | 阶段 | 结果 |
 |---|---|
-| A 空载 60 s | 线程 37 恒定、RSS +20 kB、`dropped_logs` 0、`lateness_avg` 1.2–1.3 ms |
-| B API | 100 次 0 失败，p50 3 ms / p99 4 ms |
-| C 60 次重启 | 60/60 接受、线程 37 恒定、RSS +452 kB（递减） |
-| D 调度（满载） | `klippy-mcu` 最差均值 0.27 µs |
+| A 空载 60 s | 线程 38 恒定、RSS +24 kB、`dropped_logs` 0、`busy_avg`/`lateness_avg` 0.83→1.10 ms |
+| B API | 100 次 0 失败，p50 3 ms / p99 4 ms；同窗口 8 线程有活动、机器 runtime 占 1% 一个核 |
+| C 60 次重启 | 60/60 接受、线程 38 恒定、RSS +624 kB（递减） |
+| D 调度（满载） | `klippy-mcu` 最差均值 0.15 µs；`log-writer` 出现在表里（7 次调度 / 0.1 ms） |
 | 限 2 核 / `CPUQuota=25%` | 最差 9.28 µs / 5.60 µs（同一台机器，用来模拟卡片机） |
 
 卡片机上预期：A/C 两项应当与上面接近（线程数与实现相关，RSS 增幅会更大），

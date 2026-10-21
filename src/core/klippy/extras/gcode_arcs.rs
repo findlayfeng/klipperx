@@ -490,6 +490,20 @@ mod tests {
         load_config(&ConfigWrapper::untracked(&section(options)), printer)
     }
 
+    /// A printer with just the `gcode` dispatcher, which is all
+    /// [`GCodeArcs::new`] needs — it creates `gcode_move` itself, as upstream's
+    /// `load_object` does.
+    fn bare_printer() -> Arc<Printer> {
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        printer
+    }
+
     /// A move target that records what it was asked and stands where the last
     /// move left it — the toolhead, as far as the arc cares.
     struct RecordingTarget {
@@ -583,7 +597,7 @@ mod tests {
     fn a_missing_resolution_defaults_to_one_and_is_recorded() {
         let sect = section(&[]);
         let access = AccessTracking::shared();
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let printer = bare_printer();
         let arcs =
             GCodeArcs::new(&wrapper(&sect, &access), &printer).expect("the empty section loads");
         assert_eq!(arcs.resolution(), 1.0);
@@ -596,7 +610,7 @@ mod tests {
     fn a_written_resolution_is_parsed_and_recorded() {
         let sect = section(&[("resolution", "0.5")]);
         let access = AccessTracking::shared();
-        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let printer = bare_printer();
         let arcs = GCodeArcs::new(&wrapper(&sect, &access), &printer).expect("0.5 parses");
         assert_eq!(arcs.resolution(), 0.5);
         assert!(access.contains("gcode_arcs", "resolution"));
@@ -681,7 +695,9 @@ mod tests {
         );
         assert_eq!(commands["G3"]["parameters"], commands["G2"]["parameters"]);
         for plane_selector in ["G17", "G18", "G19"] {
-            assert_eq!(commands[plane_selector]["parameters"], json!([]));
+            // A selector reads no word at all, so it declares none and its
+            // status carries no `parameters` field.
+            assert!(commands[plane_selector].get("parameters").is_none());
         }
     }
 
@@ -718,22 +734,27 @@ mod tests {
     fn g3_sweeps_the_opposite_way() {
         let (printer, gcode, target) = machine();
         load(&printer, &[]).unwrap();
-        start_at(&gcode, &target, "X30 Y10");
 
-        gcode.run_script_sync("G3 X30 Y30 I-10 J0").unwrap();
-        let clockwise_first = {
-            gcode.run_script_sync("G2 X30 Y10 I-10 J0").unwrap();
-            target.moves()
-        };
+        // A half circle about (20, 20) with radius 10: start at (30, 20), end
+        // at (10, 20) — `floor(π·10) = 31` segments each way.
+        start_at(&gcode, &target, "X30 Y20");
+        gcode.run_script_sync("G3 X10 Y20 I-10 J0").unwrap();
+        let counter_clockwise = target.moves();
+        assert_eq!(counter_clockwise.len(), 31);
+        let last = counter_clockwise.last().unwrap().0;
+        assert_eq!((last.x(), last.y()), (10., 20.));
+        assert!(
+            counter_clockwise[0].0.y() > 20.,
+            "counter-clockwise goes over the top"
+        );
 
-        // A half circle each way over the same centre and radius: the segment
-        // count is `floor(π·10)`.
-        assert_eq!(clockwise_first.len(), 31);
-        assert_eq!(clockwise_first.last().unwrap().0.x(), 30.);
-        assert_eq!(clockwise_first.last().unwrap().0.y(), 10.);
-        // Counter-clockwise from the bottom of the circle goes through X > 30
-        // first; clockwise goes through X < 30 first.
-        assert!(clockwise_first[0].0.x() < 30.);
+        start_at(&gcode, &target, "X30 Y20");
+        gcode.run_script_sync("G2 X10 Y20 I-10 J0").unwrap();
+        let clockwise = target.moves();
+        assert_eq!(clockwise.len(), 31);
+        let last = clockwise.last().unwrap().0;
+        assert_eq!((last.x(), last.y()), (10., 20.));
+        assert!(clockwise[0].0.y() < 20., "clockwise goes under the bottom");
     }
 
     /// `R` is refused with upstream's own message (`gcode_arcs.py:63-64`):
@@ -911,9 +932,14 @@ mod tests {
 
         let moves = target.moves();
         assert_eq!(moves.len(), 62);
+        // `gcode_move` accumulates a relative `E`, so the recorded position
+        // grows by one segment's share per move.
+        let mut previous = 0.;
         for (position, _speed) in &moves {
-            assert!((position.e() - 1.0 / 62.0).abs() < 1e-12);
+            assert!((position.e() - previous - 1.0 / 62.0).abs() < 1e-12);
+            previous = position.e();
         }
+        assert!((previous - 1.0).abs() < 1e-12);
     }
 
     /// `F` reaches every segment (`gcode_arcs.py:164-165`) and so sets the

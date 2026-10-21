@@ -1207,11 +1207,12 @@ mod tests {
         assert_eq!(completion.reason(), Some(TriggerReason::EndstopHit));
     }
 
-    /// An identified fake MCU whose sends a test can read back as raw blocks.
+    /// A chip over `mcu`, for the tests that script and read the wire.
     ///
-    /// A `RecordingWire`, not a `FrameMock`: the frame mock accepts only what a
-    /// mapping entry scripts, so an unsolicited `trsync_trigger` would never be
-    /// recorded.
+    /// The tests build the MCU themselves (a `RecordingWire`, not a `FrameMock`:
+    /// the frame mock accepts only what a mapping entry scripts, so an
+    /// unsolicited `trsync_trigger` would never be recorded); this gives that
+    /// MCU the same chip the `chip()` fixture builds.
     fn chip_over(mcu: Arc<Mcu>) -> McuChip {
         let chip = McuChip::new(
             "mcu".to_string(),

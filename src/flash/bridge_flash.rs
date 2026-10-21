@@ -602,10 +602,14 @@ fn assign_through_shared(
     let written = handle.send_admin(&unit[HEADER_BYTES..]);
     // Nothing is waited for when nothing was written: a refused write is the
     // caller's error, and a full window behind it would only hide it.
-    let confirmed = written.is_ok() && serial::answers_for(&answers, uuid, ASSIGN_CONFIRM_WINDOW);
+    let answered = match written {
+        Ok(()) => serial::answers_for(&answers, uuid, ASSIGN_CONFIRM_WINDOW),
+        Err(e) => Err(e),
+    };
+    // The listener goes either way: a later scan (or a tunnel) finds the port as
+    // it was, and the wait's own error is returned below rather than here.
     handle.clear_unit_sink(ADMIN_REPLY);
-    written?;
-    Ok(if confirmed {
+    Ok(if answered? {
         AssignReport::Confirmed
     } else {
         AssignReport::Sent
@@ -4088,7 +4092,8 @@ mod tests {
         });
 
         assert!(
-            !serial::answers_for(&answers, uuid, Duration::from_millis(500)),
+            !serial::answers_for(&answers, uuid, Duration::from_millis(500))
+                .expect("the listener is live for the whole window"),
             "another board's answer is not this one's confirmation"
         );
         responder.join().expect("the responder thread");

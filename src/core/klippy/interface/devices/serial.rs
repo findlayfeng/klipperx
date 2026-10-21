@@ -2510,24 +2510,34 @@ fn wait_for_ack(port: &SharedSerialPort, slot: &McuSlot, timeout: Duration) -> O
 /// port may be talking, and its answer is not this board's confirmation. A unit
 /// that does not parse as an answer, or names another UUID, is dropped and the
 /// wait goes on.
+///
+/// `Ok(false)` is the window running out with no answer — the ordinary outcome
+/// for a device that adopts its assignment in silence. A receiver that is
+/// **disconnected** is not an empty window: the sender lives in the port's
+/// listener table, so its going away means the port (or the listener) was taken
+/// down under the wait, which is [`InterfaceError::ConnectionLost`] and must not
+/// be read as "the board is silent".
 pub(crate) fn answers_for(
     answers: &std::sync::mpsc::Receiver<Vec<u8>>,
     uuid: [u8; 6],
     window: Duration,
-) -> bool {
+) -> Result<bool, InterfaceError> {
     let deadline = Instant::now() + window;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return false;
+            return Ok(false);
         }
         match answers.recv_timeout(remaining) {
             Ok(unit) => {
                 if UnassignedNode::from_unit(&unit).is_some_and(|node| node.uuid == uuid) {
-                    return true;
+                    return Ok(true);
                 }
             }
-            Err(_) => return false,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(false),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(InterfaceError::ConnectionLost)
+            }
         }
     }
 }
@@ -3180,8 +3190,9 @@ impl SharedSerialHandle {
     /// # Errors
     /// [`InterfaceError::Other`] for an id the wire cannot address,
     /// [`InterfaceError::ConnectionLost`] when the port or this handle has been
-    /// shut down, and [`InterfaceError::SendError`] when the write fails. A
-    /// silent device is not an error.
+    /// shut down, or when the listener is taken down under the wait, and
+    /// [`InterfaceError::SendError`] when the write fails. A silent device is not
+    /// an error.
     pub fn name_can_device(&self, uuid: [u8; 6], mcu_id: u32) -> Result<bool, InterfaceError> {
         let unit = set_node_id_for(uuid, mcu_id).ok_or_else(|| {
             InterfaceError::Other(format!(
@@ -3197,10 +3208,12 @@ impl SharedSerialHandle {
         let written = self.send_admin(&unit[HEADER_BYTES..]);
         // Nothing is waited for when nothing was written: a refused write is the
         // caller's error, and a full window behind it would only hide it.
-        let answered = written.is_ok() && answers_for(&answers, uuid, CAN_ASSIGN_CONFIRM_WINDOW);
+        let answered = match written {
+            Ok(()) => answers_for(&answers, uuid, CAN_ASSIGN_CONFIRM_WINDOW),
+            Err(e) => Err(e),
+        };
         self.clear_unit_sink(ADMIN_REPLY);
-        written?;
-        Ok(answered)
+        answered
     }
 
     /// Take this handle's slot out of the port's map — only when the entry
@@ -3955,6 +3968,42 @@ mod mux_tests {
         assert!(
             !handle.port.units.has(ADMIN_REPLY),
             "the listener outlived the wait no more here than it did with an answer"
+        );
+    }
+
+    /// The answer wait tells a silent device from a listener that went away.
+    ///
+    /// A window that runs out is `Ok(false)` — a device adopting its assignment
+    /// without answering — while a receiver whose sender is gone is the port's
+    /// listener table losing the sink under the wait, and that is a lost
+    /// connection rather than silence.
+    #[test]
+    fn the_answer_wait_tells_silence_from_a_listener_that_went_away() {
+        let uuid = [1, 2, 3, 4, 5, 6];
+        let window = Duration::from_millis(50);
+
+        let (sink, answers) = UnitSink::channel();
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Ok(false),
+            "a silent device is not an error"
+        );
+        assert!(
+            sink.deliver(&admin_answer(uuid, None)),
+            "the listener is still there"
+        );
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Ok(true),
+            "an answer naming this uuid is the confirmation"
+        );
+
+        // The port's registry dropping the sink is what disconnects the wait.
+        drop(sink);
+        assert_eq!(
+            answers_for(&answers, uuid, window),
+            Err(InterfaceError::ConnectionLost),
+            "a listener that went away is a lost connection, not silence"
         );
     }
 

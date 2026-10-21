@@ -89,7 +89,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查）；both-edge 已按上游判定链启用（2026-10-21），余项＝两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
 | H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_switch_sensor`/`filament_motion_sensor`、`trigger_analog` 三件套已落地；余项＝固件按钮查询与 `query_adc`、线宽传感器（hall_*/tsl1401cl）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
-| H8 | LCD 显示与菜单（display/*）——面板驱动、**菜单引擎、渲染通路与菜单行绘制均于 2026-10-21 落地**（出货 3 个 layout + 菜单帧都有字节断言；`hd44780` 会画字与图标）；余项＝其余五个驱动的字库表、`[display_data]` 主配置 factory、`emulated_st7920`/`sh1106`，见 H8 节 | F9、G1b |
+| H8 | LCD 显示与菜单（display/*）——**✅ 收官（2026-10-21）**：六个驱动全会画（`VGA_FONT` 已 vendor）、菜单引擎 + 渲染通路 + 菜单行绘制、`[display_data]`/`[display_glyph]` 主配置 factory；余项只剩 `emulated_st7920`/`sh1106` 两种面板类型（`lcd_type` 接受但报缺口），见 H8 节 | — |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
 | H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
@@ -326,9 +326,11 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       只在主 `[display]`（section 名 == `display`）挂载。四个 `menu:*` 事件已发（`init` 构建末尾、`begin` 推根前、
       `populate` 容器重建后、`exit` 停用前；**载荷**：上游传 `self` 对象引用，本仓事件无载荷 ⇒ 处理器按对象名
       `menu` 查）。
-- [ ] **只剩 `hd44780` 会画**：`st7920`/`uc1701`/`ssd1306`/`hd44780_spi`/`aip31068_spi` 的
-      `write_text`/`write_glyph`/`write_graphics` 仍是「什么都不画」的默认实现，缺的是各自的字库表
-      （`font8x14.VGA_FONT`、`st7920/uc1701.CharGlyphs` 等）——layout 会渲染、但面板仍空白。
+- [x] **六个驱动全会画（2026-10-21）**：`hd44780_spi`、`aip31068_spi`、`st7920`、`uc1701`、`ssd1306`
+      的 `write_text`/`write_glyph`/`write_graphics` 全部按上游实现（`st7920` 的 row starts 与
+      `write_glyph` 的 cache、`uc1701` 的 `_swizzle_bits` + 预 swizzle 字库 + XOR graphics、两个
+      字符屏走 CGRAM/字符发生器）。字库 `third_party/klipper/klippy/extras/display/font8x14.py` 的
+      `VGA_FONT` 逐字节搬成 `display/font8x14.rs`，并有对上游文件的漂移守卫测试。
 - [x] **菜单行已画进面板（2026-10-21）**：`screen_update_event(chip, eventtime)` 打开菜单时把
       `draw_rows` 的每行从第 0 列写进面板（`MenuRow{prefix,text,suffix}` 三段拼成恰好 `cols` 字符的一整行，
       与上游三次 `draw_text` 写同一批单元格等价），行号/选中标记（`>`、编辑态 `*`）/容器后缀 `>`/滚动指示
@@ -339,7 +341,9 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       同名 section 仍按 `display.py:126-128` 覆盖出货项（组大小不变、`identifier` 指向主配置那条）。
       **口径更正**：主配置写这两个节此前其实**已经能用**（`check_unused` 接受「选项被读过」的 section），
       真缺口是 **schema 成员资格**（未知 section 检查与 `load` 的 factory 表）；本条按后者的语义结项。
-- [ ] 个别驱动的 `set_glyphs`：`uc1701`、`hd44780_spi`、`aip31068_spi` 自述未移植字形写入。
+- [x] **`set_glyphs` 随画字一起落地（2026-10-21）**：`uc1701` 的 `_swizzle_bits` + `icons`、
+      `hd44780_spi`/`aip31068_spi` 的 CGRAM 槽与 8 字节图标、`st7920` 的 `cache_glyph`/`cached_glyphs`
+      都已实现（不再是「只存不画」）。
 - 依赖 F9（固件侧 LCD）、G1b（`create_gcode_command`，菜单脚本要构造 gcmd）。
 
 ### H9 探测 / 调平 / 校准

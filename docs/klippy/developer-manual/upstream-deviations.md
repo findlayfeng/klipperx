@@ -63,7 +63,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 |---|---|---|
 | `Z_OFFSET_APPLY_ENDSTOP` 的 delta 变体 | 上游把 delta 处理函数**重注册到同名命令**上覆盖普通变体（`manual_probe.py:74-79`） | 本仓按 `kinematics: delta` **二选一注册**（`register_command` 对重名报错，与上游 `gcode.py:142-144` 同款）——对外行为等价 | [G-Code 命令参考](../user-manual/gcode-commands.md) |
 | `BED_SCREWS_ADJUST` 命令族的失败收尾 | 上游在三条命令注册中途失败时会留下半个命令组与卡住的 `state='adjust'` | 本仓把已注册的那部分收回并复位会话（`manual_probe` 的命令不被碰）——唯一有意偏离，已在模块 doc 记明 | [配置手册 `[bed_screws]`](../user-manual/config.md)、[模块表](README.md) |
-| `[display]` 菜单与渲染 | **都已落地（2026-10-21）**：`menu.py`/`menu_keys.py` + 嵌入 `menu.cfg` + 四个 `menu:*` 事件；渲染 step（`render`/`draw_progress_bar` 宿主可调用注入、`draw_text`、`~glyph~`）与 `hd44780` 画字/图标；出货 3 个 layout 有帧缓冲字节断言。残余偏差：`menu:*` 载荷上游是 `self` 对象、本仓无载荷（按对象名 `menu` 查）；其余五个驱动缺字库表 ⇒ 面板空白；`[display_data]`/`[display_glyph]` 的主配置 factory 2026-10-21 落地（此前只靠「选项被读过」侥幸可用，schema 检查会判未知节） | [配置手册 `../user-manual/config.md`](../user-manual/config.md) |
+| `[display]` 菜单与渲染 | **都已落地（2026-10-21）**：`menu.py`/`menu_keys.py` + 嵌入 `menu.cfg` + 四个 `menu:*` 事件；渲染 step（`render`/`draw_progress_bar` 宿主可调用注入、`draw_text`、`~glyph~`）与 `hd44780` 画字/图标；出货 3 个 layout 有帧缓冲字节断言。残余偏差：`menu:*` 载荷上游是 `self` 对象、本仓无载荷（按对象名 `menu` 查）；六个驱动全会画（`font8x14.VGA_FONT` 已逐字节 vendor）；`[display_data]`/`[display_glyph]` 的主配置 factory 2026-10-21 落地（此前只靠「选项被读过」侥幸可用，schema 检查会判未知节） | [配置手册 `../user-manual/config.md`](../user-manual/config.md) |
 | 上游无、本仓有 | 通用 `[i2c_device]` / `[spi_device]` 节与 `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` 调试命令、`KlipperX` 自有调试总线命令 —— 属**本仓扩展**，上游没有对应物 | [配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 
 ## 2. 行为偏移（同功能，两种表现）

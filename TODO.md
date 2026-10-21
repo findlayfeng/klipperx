@@ -308,8 +308,16 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       tsl1401cl：线性 CCD 读数换算 + `_process_measurement`），并注册 `M404`/`M405`/`M406`/`M407`
       与 `QUERY_FILAMENT_WIDTH`；`RunoutHelper` 补了 `sensor_enabled` 写入口（上游四个写入点的入口）。
       测量定时器**有界**（测试入口单步驱动，不留永久定时器）。
-- [ ] 固件 `initial_pins.c` 的初始引脚状态。
-- [ ] 特定板/芯片：`samd_sercom.py`、`replicape.py`、`palette2.py`。
+- [x] **`INITIAL_PINS` —— 已经可用，无需添加（2026-10-22 核实）**：根 `Kconfig` 直接 `source "src/Kconfig"`
+      （上游那份），`config INITIAL_PINS` 在其 `src/Kconfig:488`，构建出的 `.config` 里有
+      `CONFIG_INITIAL_PINS=""`，`firmware-build.md` 也已把它列为**共享**选项。固件侧在
+      `src/initial_pins.c` 的 `DECL_INIT` 里按编译期清单驱动引脚（默认输出高电平，引脚名前加 `!` 为低）；
+      宿主不消费它，也没有 `get_status` 字段——本来就是纯编译期行为。手册已补语法说明。
+- [x] **特定板/芯片三项判定（2026-10-22 拍板：暂不实现）**：`samd_sercom.py`（SAMD 的 pad→SERCOM 分配器）、
+      `replicape.py`（BeagleBone Replicape 扩展板）、`palette2.py`（Palette2 拼接器串口协议客户端）
+      都绑定具体上游硬件/运行时，且无对应设备可验证；已登记进
+      [`upstream-deviations.md` §1.2 的「上游有、本仓不做」表](../docs/klippy/developer-manual/upstream-deviations.md)
+      （含各自行数与代价）。需要时按新增单元重新立项。
 - 依赖 F3（GPIO）、F5（ADC）、F9。
 
 ### H8 LCD 显示与菜单

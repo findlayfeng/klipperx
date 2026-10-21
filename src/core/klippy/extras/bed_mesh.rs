@@ -41,15 +41,15 @@
 //!   measures from).
 //! - `ZERO_REFERENCE` (`X=`/`Y=`): shift both stored grids so the mesh reads
 //!   zero at that point (`ZMesh.set_zero_reference`, `bed_mesh.py:1405-1413`).
-//!
-//! **Not implemented yet** (tracked in `TODO.md` H9, next units):
-//!
-//! - faulty-region substitution (`_process_faulty_regions`): the regions are
-//!   parsed and probed like any other point.
+//! - faulty-region substitution (`_process_faulty_regions`, `bed_mesh.py:952-1004`):
+//!   a probe point inside a `faulty_region_<N>` is probed as up to four points
+//!   on that region's edges, whose readings average back into its one grid
+//!   value ([`faulty_substitutes`], [`collapse_substitutes`]).
 //!
 //! The load side is complete: every option below is claimed, which is what the
-//! corpus needs, and the gaps above are capability gaps, not silent shortcuts —
-//! they are listed in the manual and the task list.
+//! corpus needs. `BED_MESH_OUTPUT PGP=` still prints the generated points
+//! without upstream's `(Substitute)` column: that print is what is missing, not
+//! the substitution the calibration itself runs.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
@@ -1454,6 +1454,179 @@ fn pad_round_rows(rows: Vec<Vec<f64>>, x_count: usize) -> Result<Vec<Vec<f64>>, 
     Ok(padded)
 }
 
+/// How far outside a `faulty_region_<N>` rectangle a point may sit and still
+/// count as inside it (`_process_faulty_regions`, `bed_mesh.py:976`).
+const FAULTY_REGION_TOLERANCE: f64 = 1e-5;
+
+/// How far outside the generated grid a substitute point may sit and still be
+/// probed (`_process_faulty_regions`, `bed_mesh.py:976`).
+const FAULTY_SUBSTITUTE_TOLERANCE: f64 = 1e-6;
+
+/// Whether `(x, y)` sits inside a `faulty_region_<N>` rectangle, up to
+/// [`FAULTY_REGION_TOLERANCE`].
+fn in_faulty_region(x: f64, y: f64, region: FaultyRegion) -> bool {
+    let (min_x, min_y, max_x, max_y) = region;
+    x >= min_x - FAULTY_REGION_TOLERANCE
+        && x <= max_x + FAULTY_REGION_TOLERANCE
+        && y >= min_y - FAULTY_REGION_TOLERANCE
+        && y <= max_y + FAULTY_REGION_TOLERANCE
+}
+
+/// The smallest and largest X/Y of a generated grid — the bounds a substitute
+/// point has to stay inside.
+fn grid_bounds(points: &[(f64, f64)]) -> ((f64, f64), (f64, f64)) {
+    let mut min = (f64::INFINITY, f64::INFINITY);
+    let mut max = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for &(x, y) in points {
+        min = (min.0.min(x), min.1.min(y));
+        max = (max.0.max(x), max.1.max(y));
+    }
+    (min, max)
+}
+
+/// The stand-in points for the probe points a `faulty_region_<N>` covers —
+/// `_process_faulty_regions` (`bed_mesh.py:952-1004`).
+///
+/// A point inside a region is probed as up to four points on that region's own
+/// edges — `(min_x, y)`, `(x, min_y)`, `(x, max_y)`, `(max_x, y)` — whose Z
+/// values are averaged back into the one value the grid stores
+/// ([`collapse_substitutes`]). A zig-zag row that runs right to left swaps the
+/// first and last candidate, so the toolhead keeps travelling the way it was.
+/// A candidate outside the grid (a rectangular bed) or outside the radius (a
+/// round one) is dropped.
+///
+/// The map is keyed by the substitute's index in `points` and iterates in that
+/// order, which is the order [`collapse_substitutes`] folds the results back.
+///
+/// # Errors
+/// Upstream's `bed_mesh: Unable to generate coordinates for faulty region at
+/// index: %d` when every candidate falls off the bed.
+fn faulty_substitutes(
+    options: &BedMeshOptions,
+    points: &[(f64, f64)],
+) -> Result<BTreeMap<usize, Vec<(f64, f64)>>, CommandError> {
+    let mut substitutes = BTreeMap::new();
+    if options.faulty_regions.is_empty() {
+        return Ok(substitutes);
+    }
+    let ((min_pt_x, min_pt_y), (max_pt_x, max_pt_y)) = grid_bounds(points);
+    let mut reversed = false;
+    for (index, &(x, y)) in points.iter().enumerate() {
+        if index > 0 && y != points[index - 1].1 {
+            // The first point of a new row: the zig-zag turns around
+            // (`generate_points`).
+            reversed = !reversed;
+        }
+        let Some(region) = options
+            .faulty_regions
+            .iter()
+            .copied()
+            .find(|region| in_faulty_region(x, y, *region))
+        else {
+            continue;
+        };
+        let (min_x, min_y, max_x, max_y) = region;
+        let mut candidates = vec![(min_x, y), (x, min_y), (x, max_y), (max_x, y)];
+        if reversed {
+            let last = candidates.len() - 1;
+            candidates.swap(0, last);
+        }
+        candidates.retain(|&(candidate_x, candidate_y)| {
+            if let Some(radius) = options.mesh_radius {
+                let dx = candidate_x - options.mesh_origin[0];
+                let dy = candidate_y - options.mesh_origin[1];
+                (dx * dx + dy * dy).sqrt() <= radius
+            } else {
+                candidate_x >= min_pt_x - FAULTY_SUBSTITUTE_TOLERANCE
+                    && candidate_x <= max_pt_x + FAULTY_SUBSTITUTE_TOLERANCE
+                    && candidate_y >= min_pt_y - FAULTY_SUBSTITUTE_TOLERANCE
+                    && candidate_y <= max_pt_y + FAULTY_SUBSTITUTE_TOLERANCE
+            }
+        });
+        if candidates.is_empty() {
+            return Err(CommandError::new(format!(
+                "bed_mesh: Unable to generate coordinates for faulty region at \
+                 index: {index}"
+            )));
+        }
+        substitutes.insert(index, candidates);
+    }
+    Ok(substitutes)
+}
+
+/// The path a calibration walks: the generated points in order, each faulty
+/// one replaced by its whole group of substitutes — `get_std_path`
+/// (`bed_mesh.py:1010-1017`).
+fn probe_path(
+    points: &[(f64, f64)],
+    substitutes: &BTreeMap<usize, Vec<(f64, f64)>>,
+) -> Vec<(f64, f64)> {
+    if substitutes.is_empty() {
+        return points.to_vec();
+    }
+    let mut path = Vec::with_capacity(points.len());
+    for (index, &point) in points.iter().enumerate() {
+        match substitutes.get(&index) {
+            Some(group) => path.extend_from_slice(group),
+            None => path.push(point),
+        }
+    }
+    path
+}
+
+/// Fold the probed values back onto the generated grid — the faulty-region
+/// half of `probe_finalize` (`bed_mesh.py:675-700`): a faulty point stores the
+/// average of its substitutes' readings, every other point its own reading.
+///
+/// `positions` holds one value per point of [`probe_path`], in path order; the
+/// returned vector holds one value per generated point, in grid order. A group
+/// of `n` substitutes pushes the points after it along by `n - 1`, which is what
+/// `index_offset` keeps track of while the groups are walked in index order.
+///
+/// With no substitutes the path is the grid, so the readings are handed back
+/// untouched.
+///
+/// # Panics
+/// When `positions` is not as long as [`probe_path`] makes it: the slices below
+/// assume one reading per path point and would otherwise fold the wrong values
+/// into the grid.
+fn collapse_substitutes(
+    points: &[(f64, f64)],
+    positions: &[f64],
+    substitutes: &BTreeMap<usize, Vec<(f64, f64)>>,
+) -> Vec<f64> {
+    if substitutes.is_empty() {
+        return positions.to_vec();
+    }
+    debug_assert_eq!(
+        positions.len(),
+        points.len()
+            + substitutes
+                .values()
+                .map(|group| group.len() - 1)
+                .sum::<usize>(),
+        "one probed value per point of the probe path"
+    );
+    let mut corrected = Vec::with_capacity(points.len());
+    let mut index_offset = 0usize;
+    let mut start_index = 0usize;
+    for (&index, group) in substitutes {
+        corrected.extend_from_slice(&positions[start_index..index + index_offset]);
+        let window = &positions[index + index_offset..index + index_offset + group.len()];
+        let average = window.iter().sum::<f64>() / group.len() as f64;
+        let (x, y) = points[index];
+        info!(
+            "bed_mesh: Replacing value at faulty index {index} ({x:.4}, {y:.4}): \
+             avg value = {average:.6}"
+        );
+        index_offset += group.len() - 1;
+        start_index = index + index_offset + 1;
+        corrected.push(average);
+    }
+    corrected.extend_from_slice(&positions[start_index..]);
+    corrected
+}
+
 /// Upstream's `MoveSplitter` (`bed_mesh.py:1257-1319`): walk one move and
 /// return it as slices, each carrying the mesh's Z adjustment at its own end.
 ///
@@ -1884,23 +2057,30 @@ impl BedMesh {
                             // (`bed_mesh.py:648`).
                             Self::apply_mesh(&state, &printer, None)?;
 
-                            let (points, speed, move_z, algorithm) = {
+                            let (points, substitutes, speed, move_z, algorithm) = {
                                 let state = state.lock().unwrap_or_else(|p| p.into_inner());
                                 let options = &state.options;
+                                let points = generate_points(options)?;
+                                let substitutes = faulty_substitutes(options, &points)?;
                                 (
-                                    generate_points(options)?,
+                                    points,
+                                    substitutes,
                                     options.speed,
                                     options.horizontal_move_z,
                                     options.algorithm.clone(),
                                 )
                             };
+                            // A faulty point is probed as its substitutes
+                            // (`bed_mesh.py:1010-1017`), and their readings are
+                            // averaged back into its one grid value afterwards.
+                            let path = probe_path(&points, &substitutes);
                             let offsets = probe.offsets();
 
                             // Probe every point in one session
                             // (`bed_mesh.py:ProbeManager.start_probe`).
                             probe.start_probe_session(gcmd)?;
-                            let mut probed = Vec::with_capacity(points.len());
-                            for (x, y) in &points {
+                            let mut probed = Vec::with_capacity(path.len());
+                            for (x, y) in &path {
                                 let mut target =
                                     Coord::new(x - offsets.x, y - offsets.y, move_z, 0.0);
                                 target.set_axis(Z_AXIS, move_z);
@@ -1916,11 +2096,14 @@ impl BedMesh {
                             }
                             probe.end_probe_session()?;
 
-                            // Store the grid: grouped into rows by Y, each
-                            // row X-ascending (`bed_mesh.py:713-741`), with a
-                            // round bed's short rows padded into the square
-                            // grid the mesh needs (`bed_mesh.py:749-771`).
-                            let rows = rows_by_y(&points, &probed);
+                            // Store the grid: the substitutes' readings averaged
+                            // back onto the faulty points, then grouped into
+                            // rows by Y, each row X-ascending
+                            // (`bed_mesh.py:675-741`), with a round bed's short
+                            // rows padded into the square grid the mesh needs
+                            // (`bed_mesh.py:749-771`).
+                            let values = collapse_substitutes(&points, &probed, &substitutes);
+                            let rows = rows_by_y(&points, &values);
                             let loaded = {
                                 let state = state.lock().unwrap_or_else(|p| p.into_inner());
                                 let options = &state.options;
@@ -2186,9 +2369,9 @@ fn lock(state: &Arc<Mutex<MeshState>>) -> MutexGuard<'_, MeshState> {
 /// `BedMeshCalibrate.print_generated_points` (`bed_mesh.py:352-372`) as the
 /// text it hands `respond_info`.
 ///
-/// A round bed's rows below the table carry a zero reference and a faulty
-/// region's substitutes; neither is written yet — the reference is not set and
-/// a faulty region is probed like any other point.
+/// The table lists the generated points only: upstream appends a `(Substitute)`
+/// column naming a faulty point's stand-ins, which this print does not write
+/// yet.
 fn print_generated_points(points: &[(f64, f64)], offsets: [f64; 2]) -> String {
     let mut msg = String::from("bed_mesh: generated points\nIndex |  Tool Adjusted  |   Probe");
     for (index, (x, y)) in points.iter().enumerate() {
@@ -2939,6 +3122,202 @@ mod tests {
                 vec![0.5, 0.4, 0.3],
                 vec![0.6, 0.7, 0.8],
             ]
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Faulty-region substitution
+    // -----------------------------------------------------------------------
+
+    /// The options a faulty-region test starts from: a 0–20mm, 3×3 direct
+    /// grid, so the probe points are the 10mm-spaced corners and centre.
+    fn faulty_options(regions: &[(&str, &str)]) -> BedMeshOptions {
+        let mut written = vec![
+            ("mesh_min", "0,0"),
+            ("mesh_max", "20,20"),
+            ("probe_count", "3,3"),
+            ("mesh_pps", "0"),
+        ];
+        written.extend_from_slice(regions);
+        options(&written)
+    }
+
+    /// A probe point inside a `faulty_region_<N>` is stood in for by the four
+    /// points on that region's edges (`bed_mesh.py:952-1004`), and a zig-zag
+    /// row running right to left probes them in the reverse order — the first
+    /// and last candidates swap.
+    #[test]
+    fn faulty_region_substitutes_the_four_edges() {
+        let read = faulty_options(&[
+            ("faulty_region_1_min", "5,5"),
+            ("faulty_region_1_max", "15,15"),
+        ]);
+        let points = generate_points(&read).unwrap();
+        // Row 1 runs right to left: (20,10), (10,10), (0,10).
+        assert_eq!(points[4], (10.0, 10.0));
+
+        let substitutes = faulty_substitutes(&read, &points).unwrap();
+
+        // Only the centre is faulty; its row runs backwards, so the group
+        // starts at `max_x` and ends at `min_x`.
+        assert_eq!(
+            substitutes,
+            BTreeMap::from([(
+                4,
+                vec![(15.0, 10.0), (10.0, 5.0), (10.0, 15.0), (5.0, 10.0)],
+            )])
+        );
+        // The probe path puts the whole group where that one point was.
+        assert_eq!(
+            probe_path(&points, &substitutes),
+            vec![
+                (0.0, 0.0),
+                (10.0, 0.0),
+                (20.0, 0.0),
+                (20.0, 10.0),
+                (15.0, 10.0),
+                (10.0, 5.0),
+                (10.0, 15.0),
+                (5.0, 10.0),
+                (0.0, 10.0),
+                (0.0, 20.0),
+                (10.0, 20.0),
+                (20.0, 20.0),
+            ]
+        );
+    }
+
+    /// A candidate outside the generated grid is dropped, and a row that runs
+    /// left to right keeps `min_x` first (`bed_mesh.py:976-1004`).
+    #[test]
+    fn faulty_candidates_outside_the_grid_are_dropped() {
+        // The region covers (10, 0) on the left-to-right first row; its
+        // `(x, min_y)` candidate sits below the grid and is dropped.
+        let read = faulty_options(&[
+            ("faulty_region_1_min", "5,-5"),
+            ("faulty_region_1_max", "15,5"),
+        ]);
+        let points = generate_points(&read).unwrap();
+
+        let substitutes = faulty_substitutes(&read, &points).unwrap();
+
+        assert_eq!(
+            substitutes,
+            BTreeMap::from([(1, vec![(5.0, 0.0), (10.0, 5.0), (15.0, 0.0)])])
+        );
+    }
+
+    /// A round bed drops the candidates that fall outside its radius instead
+    /// of outside the grid (`bed_mesh.py:976-1004`).
+    #[test]
+    fn faulty_candidates_outside_a_round_bed_are_dropped() {
+        let read = options(&[
+            ("mesh_radius", "20"),
+            ("mesh_origin", "0,0"),
+            ("round_probe_count", "3"),
+            ("mesh_pps", "0"),
+            ("faulty_region_1_min", "-25,-5"),
+            ("faulty_region_1_max", "-5,5"),
+        ]);
+        let points = generate_points(&read).unwrap();
+        // Only the point on the rim is faulty.
+        assert_eq!(points[3], (-20.0, 0.0));
+
+        let substitutes = faulty_substitutes(&read, &points).unwrap();
+
+        // Three of the four candidates sit 20.6mm or 25mm from the centre,
+        // past the 20mm radius; only `(max_x, y)` stays.
+        assert_eq!(substitutes, BTreeMap::from([(3, vec![(-5.0, 0.0)])]));
+    }
+
+    /// A region whose every candidate falls off the bed is refused with
+    /// upstream's wording, naming the grid index (`bed_mesh.py:994-1000`).
+    #[test]
+    fn a_faulty_region_without_a_reachable_substitute_is_refused() {
+        // Every edge of this region lies outside the 0–20mm grid, so the first
+        // probe point it covers has nowhere to go.
+        let read = faulty_options(&[
+            ("faulty_region_1_min", "-10,-10"),
+            ("faulty_region_1_max", "30,30"),
+        ]);
+        let points = generate_points(&read).unwrap();
+
+        let error = faulty_substitutes(&read, &points).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "bed_mesh: Unable to generate coordinates for faulty region at index: 0"
+        );
+    }
+
+    /// The substitutes' readings average back into the one value the grid
+    /// stores for the faulty point (`bed_mesh.py:675-700`); every other point
+    /// keeps its own reading, and the grid goes back together row by row.
+    #[test]
+    fn substituted_readings_average_back_onto_the_faulty_point() {
+        let read = faulty_options(&[
+            ("faulty_region_1_min", "5,5"),
+            ("faulty_region_1_max", "15,15"),
+        ]);
+        let points = generate_points(&read).unwrap();
+        let substitutes = faulty_substitutes(&read, &points).unwrap();
+        // The path probes the centre's four stand-ins at positions 4…7.
+        assert_eq!(probe_path(&points, &substitutes).len(), 12);
+        let positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
+
+        let corrected = collapse_substitutes(&points, &positions, &substitutes);
+
+        assert_eq!(corrected.len(), 9);
+        for (value, expected) in corrected
+            .iter()
+            .zip([0.1, 0.2, 0.3, 0.4, 0.65, 0.9, 1.0, 1.1, 1.2])
+        {
+            assert!((value - expected).abs() < 1e-12, "{value} != {expected}");
+        }
+        // The averaged value sits where the faulty point belongs in the grid.
+        let rows = rows_by_y(&points, &corrected);
+        assert!((rows[1][1] - 0.65).abs() < 1e-12, "{:?}", rows[1]);
+        assert_eq!((rows[0].len(), rows[1].len(), rows[2].len()), (3, 3, 3));
+    }
+
+    /// Groups of different lengths fold back in index order: each one shifts
+    /// the points after it by `len - 1` (`bed_mesh.py:675-700`).
+    #[test]
+    fn substitute_groups_of_different_lengths_fold_back_in_order() {
+        let points = generate_points(&faulty_options(&[])).unwrap();
+        let substitutes = BTreeMap::from([
+            (0usize, vec![(0.0, 0.0); 2]),
+            (8usize, vec![(20.0, 20.0); 3]),
+        ]);
+        // 9 grid points, plus one extra reading for each group: 12.
+        let positions = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
+
+        let corrected = collapse_substitutes(&points, &positions, &substitutes);
+
+        assert_eq!(corrected.len(), 9);
+        for (value, expected) in corrected
+            .iter()
+            .zip([0.15, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.1])
+        {
+            assert!((value - expected).abs() < 1e-12, "{value} != {expected}");
+        }
+    }
+
+    /// Without a `faulty_region_<N>` nothing changes: the path is the generated
+    /// grid and the readings are stored as probed.
+    #[test]
+    fn a_grid_without_faulty_regions_is_probed_as_it_is() {
+        let read = faulty_options(&[]);
+        let points = generate_points(&read).unwrap();
+
+        let substitutes = faulty_substitutes(&read, &points).unwrap();
+
+        assert!(substitutes.is_empty());
+        assert_eq!(probe_path(&points, &substitutes), points);
+        let positions: Vec<f64> = (0..points.len()).map(|index| index as f64).collect();
+        assert_eq!(
+            collapse_substitutes(&points, &positions, &substitutes),
+            positions
         );
     }
 

@@ -629,7 +629,7 @@ fn next_midnight(now: i64) -> i64 {
     // SAFETY: `localtime_r` writes into a `tm` this frame owns; `mktime`
     // normalizes that struct and reports the instant, or -1.
     unsafe {
-        let at: libc::time_t = now as libc::time_t;
+        let at: libc::c_long = now as libc::c_long;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&at, &mut tm).is_null() {
             return now + ROTATION_PERIOD;
@@ -818,7 +818,7 @@ fn local_time(format: &[u8], at: i64) -> String {
     // which is bounded by the buffer length. The format string is a static C
     // string, null-terminated by its callers.
     unsafe {
-        let at: libc::time_t = at as libc::time_t;
+        let at: libc::c_long = at as libc::c_long;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&at, &mut tm).is_null() {
             return "?".to_string();

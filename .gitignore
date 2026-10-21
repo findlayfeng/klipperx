@@ -26,6 +26,8 @@
 /.staging/
 # `scripts/host-stability.sh` defaults to `$PWD/host-stability-<timestamp>/`.
 /host-stability-*/
+# `cargo build --timings` reports people copy into the tree.
+/cargo-timing-*.html
 
 src/core/klippy/upstream_generated/cases/
 src/core/klippy/upstream_generated/fixtures/

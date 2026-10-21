@@ -174,15 +174,23 @@ CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build --release 2>&1 | g
 
 ### 三个提速手段（按性价比）
 
-1. **交叉编译（最有效）**：卡上只跑二进制。
+1. **交叉编译（最有效）**：卡上只跑二进制。**用仓库里的脚本**，别手拼环境变量
+   （`ring` 的 C/asm 走的是 `CC_<triple>`，cargo 走的是 `CARGO_TARGET_<TRIPLE>_LINKER`，
+   两套名字容易漏）：
    ```bash
-   rustup target add aarch64-unknown-linux-gnu
-   sudo apt install gcc-aarch64-linux-gnu
-   CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
-     cargo build --release --target aarch64-unknown-linux-gnu
-   # `ring` 的 C/asm 用同一个交叉编译器：
-   CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+   scripts/build-target.sh                    # aarch64 + x86_64，glibc
+   scripts/build-target.sh --musl             # 同样两个，静态 musl（推荐给卡片机）
+   scripts/build-target.sh --all --dry-run    # 先看它会跑什么、缺什么
    ```
+   产物落在 `out/cross/<triple>/`（二进制 + sha256 + `file` 判定），不碰 `target/`。
+   缺 rust target 或交叉 gcc 时脚本会跳过并打印该装的包。
+
+   **`gnu` 还是 `musl` 比架构更重要**：`*-gnu` 链的是**构建机**的 glibc，在新发行版上编出来的
+   二进制到 Debian 12（glibc 2.36）会直接 `GLIBC_2.38 not found`。脚本会给每个 gnu 产物打印
+   它要求的最低 `GLIBC_x.y`，拿去和卡上 `ldd --version` 对。`*-musl` 是静态的、哪都能跑，
+   代价是**静态 musl 不能 `dlopen`**，所以 `host_library:`（`[mcu]` 用 klipper 主机库）在那个
+   构建里不可用；USB/串口/CAN/TUI/Mainsail 辅助/URL include 都是纯系统调用，照常工作。
+
 2. **限并发 + 换 target 目录**：`CARGO_BUILD_JOBS=2`（别让 rustc 把内存吃满换页），
    `CARGO_TARGET_DIR=/mnt/ssd/kx-target`（USB SSD/eMMC 都行；`/dev/shm` 在 3.9 GB 机器上放不下全量）。
 3. **少写产物**：`[profile.release] strip = "symbols"` 已在仓库里——release 二进制从 26.1 MB

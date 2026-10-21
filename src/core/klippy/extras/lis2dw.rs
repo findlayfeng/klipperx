@@ -38,10 +38,11 @@
 //!
 //! # Units
 //!
-//! Upstream's `lis2dw.py` defines its own `FREEFALL_ACCEL = 9.80665`, *not*
-//! `9.80665 * 1000.` as `adxl345.py` and `mpu9250.py` do, so these samples come
-//! out in m/s² — 1000× smaller than the other two accelerometers' mm/s². The
-//! constants below keep upstream's values.
+//! Upstream's `lis2dw.py` defines its own `FREEFALL_ACCEL = 9.80665` (not
+//! `9.80665 * 1000.` as `adxl345.py` and `mpu9250.py` do) because its per-LSB
+//! sensitivities are in **mg** rather than g: 1 mg is 9.80665 mm/s². The
+//! samples are therefore mm/s², the same unit the other two accelerometers
+//! report — 4096 LSB at the LIS2DW's ±4g scale is ~19602 mm/s² (2 g).
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -116,12 +117,13 @@ const SAMPLE_FIELDS: usize = 3;
 /// `BYTES_PER_SAMPLE`, upstream's `"<hhh"`).
 const SAMPLE_FORMAT: &str = "<hhh";
 
-/// The chips' fixed output data rate (`self.data_rate`, `1600` / `1344`) and
-/// the sensitivity per raw LSB.
+/// Upstream's gravity factor for the two sensitivities below
+/// (`FREEFALL_ACCEL` in `lis2dw.py`).
 ///
-/// Upstream folds gravity into the scale constants with its own unscaled
-/// `FREEFALL_ACCEL = 9.80665` (`LIS2DW_SCALE` / `LIS3DH_SCALE`), so the samples
-/// are in m/s² — see the module docs.
+/// It is 9.80665 rather than `adxl345.py`'s `9.80665 * 1000.` because the
+/// per-LSB constants folded into it are in mg (1 mg = 9.80665 mm/s²), so the
+/// two scales come out in mm/s² per raw LSB — the unit the samples are
+/// reported in (`LIS2DW_SCALE` / `LIS3DH_SCALE`).
 const FREEFALL_ACCEL: f64 = 9.80665;
 const LIS2DW_SCALE: f64 = FREEFALL_ACCEL * 1.952 / 4.;
 const LIS3DH_SCALE: f64 = FREEFALL_ACCEL * 11.718 / 16.;
@@ -155,7 +157,8 @@ fn dev_id(chip: LisChipType) -> u8 {
     }
 }
 
-/// Full-scale sensitivity per raw LSB (`LIS2DW_SCALE` / `LIS3DH_SCALE`).
+/// Full-scale sensitivity per raw LSB in mm/s² (`LIS2DW_SCALE` /
+/// `LIS3DH_SCALE`).
 fn sample_scale(chip: LisChipType) -> f64 {
     match chip {
         LisChipType::Lis2dw => LIS2DW_SCALE,
@@ -163,7 +166,7 @@ fn sample_scale(chip: LisChipType) -> f64 {
     }
 }
 
-/// The chip's fixed output data rate (`self.data_rate`): 1600 Hz for the
+/// The chips' fixed output data rate (`self.data_rate`): 1600 Hz for the
 /// LIS2DW, 1344 Hz for the LIS3DH.
 fn data_rate(chip: LisChipType) -> u32 {
     match chip {
@@ -980,24 +983,29 @@ mod tests {
         let rows = convert_samples(&unit_axes(LIS2DW_SCALE), &[(1.5, payload)]);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], 1.5);
-        // 4096 LSB * (9.80665 * 1.952 / 4) m/s² per LSB, rounded to 6 digits.
+        // 4096 LSB * (9.80665 * 1.952 / 4) mm/s² per LSB, rounded to 6 digits
+        // (~2 g, the chip's full-scale reading for 4096 of its 14-bit counts).
         assert!((rows[0][1] - 19602.002739).abs() < 1e-6, "{rows:?}");
         assert!((rows[0][2] - -4.785645).abs() < 1e-6, "{rows:?}");
         assert!((rows[0][3] - -19602.002739).abs() < 1e-6, "{rows:?}");
     }
 
     #[test]
-    fn test_convert_samples_scales_lis3dh_counts() {
-        // The LIS3DH's 12-bit readings sit in the high bits of the same words;
-        // 0x1234 is one (0x123 left-justified), 0xf000 is -4096.
-        let rows = convert_samples(
-            &unit_axes(LIS3DH_SCALE),
-            &[(0.25, [0x1234, 0x0000, -0x1000])],
-        );
-        // 4660 LSB * (9.80665 * 11.718 / 16) m/s² per LSB.
-        assert!((rows[0][1] - 33468.797069).abs() < 1e-6, "{rows:?}");
+    fn test_lis3dh_raw_bytes_decode_and_convert_to_physical_values() {
+        // The LIS3DH left-justifies its 12-bit reading in the same 16-bit word:
+        // 0x123 → 0x1230 (+4656) and 0x8ab → 0x8ab0 (-30032, the 12-bit sign
+        // bit carried through the word's sign extension).
+        let format = SampleFormat::parse(SAMPLE_FORMAT).expect("a valid struct format");
+        let bytes = [0x30, 0x12, 0x00, 0x00, 0xb0, 0x8a];
+        let payload = <[i32; SAMPLE_FIELDS]>::decode(&format, &bytes).expect("six good bytes");
+        assert_eq!(payload, [0x1230, 0, -30032]);
+
+        let rows = convert_samples(&unit_axes(LIS3DH_SCALE), &[(0.25, payload)]);
+        assert_eq!(rows[0][0], 0.25);
+        // 4656 / -30032 LSB * (9.80665 * 11.718 / 16) mm/s² per LSB.
+        assert!((rows[0][1] - 33440.068488).abs() < 1e-6, "{rows:?}");
         assert_eq!(rows[0][2], 0.0);
-        assert!((rows[0][3] - -29418.067123).abs() < 1e-6, "{rows:?}");
+        assert!((rows[0][3] - -215694.187462).abs() < 1e-6, "{rows:?}");
     }
 
     #[test]

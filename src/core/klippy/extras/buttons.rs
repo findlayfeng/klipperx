@@ -1100,6 +1100,14 @@ mod tests {
         )
         .await;
         let query = sent.lock().unwrap()[0].clone();
+        // The wire bytes, apart from the clock (the live connection's): the
+        // firmware id, the oid, then `rest_ticks`/`retransmit_count`/`invert`.
+        assert_eq!(&query[0..2], &[52, 0], "id and oid");
+        assert_eq!(
+            &query[query.len() - 4..],
+            &[0x8f, 0x50, 0x32, 0x01],
+            "rest_ticks = 2000 (VLQ), retransmit_count = 50, invert = 1 from !PA1"
+        );
         let fields = decode_payload(BUTTONS_QUERY, &query);
         assert_eq!(fields[0], ArgValue::UInt8(0), "oid");
         let clock = match fields[1] {

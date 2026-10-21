@@ -1314,8 +1314,8 @@ pub(crate) fn open_socket(wire: CanWire) -> Result<File, InterfaceError> {
 /// and leaving the descriptor blocking keeps every other call as it was.
 fn set_send_timeout(socket: &File) -> Result<(), InterfaceError> {
     let timeout = libc::timeval {
-        tv_sec: SEND_TIMEOUT.as_secs() as libc::time_t,
-        tv_usec: SEND_TIMEOUT.subsec_micros() as libc::suseconds_t,
+        tv_sec: SEND_TIMEOUT.as_secs() as libc::c_long,
+        tv_usec: SEND_TIMEOUT.subsec_micros() as libc::c_long,
     };
     // SAFETY: the option value is a `timeval` of the length passed.
     let rc = unsafe {
@@ -2470,8 +2470,8 @@ mod tests {
         // rounded *up* — never as the unbounded wait, which is zero.
         assert_eq!(read_back.tv_sec, 0, "a sub-second deadline");
         assert!(
-            read_back.tv_usec >= SEND_TIMEOUT.as_micros() as libc::suseconds_t
-                && read_back.tv_usec < 2 * SEND_TIMEOUT.as_micros() as libc::suseconds_t,
+            read_back.tv_usec >= SEND_TIMEOUT.as_micros() as libc::c_long
+                && read_back.tv_usec < 2 * SEND_TIMEOUT.as_micros() as libc::c_long,
             "the deadline is {} ms, rounded up to a tick: {} us",
             SEND_TIMEOUT.as_millis(),
             read_back.tv_usec

@@ -146,3 +146,59 @@ make
 发起 `make`，用 `test/configs/*.config` 作为目标，并把 `OUT`/`KCONFIG_CONFIG` 外移到 Cargo 的
 `OUT_DIR`。它不经过根 `Makefile`，也不读写仓库根的 `.config`/`out/firmware/`；两者可以并行，
 互不影响。根构建只面向「开发者自己的板子」。
+
+## 在卡片机（RK3328 / RK3566 / CM4 这一级）上构建
+
+宿主的 `cargo build --release` 与上面板子固件的 `make` 是两件事：这里编的是**主机二进制**
+（`klipperx`），固件仍然是 `make`。卡片机上它慢，慢在 CPU 与内存，不在盘。
+
+**实测（3.9 GB / 4×A53 的 RK3566，增量一次 30 个 crate）**：`12m57s`，≈26 s/crate。
+参考对照（32×Zen4）：`klipperx` 自己编一次 **19 s、峰值 RSS 约 2.5 GB**。也就是说这个 crate
+在 A53 上大致 3–5 分钟，而 `icu_normalizer`（`url → idna` 带进来的 ICU4X 数据）、
+`rustls`/`rustls-webpki`/`ring`、`minijinja`、`ratatui` 各是几十秒级。
+
+### 先定位，别猜
+
+```bash
+cargo build --release --timings        # target/cargo-timings/*.html，看哪条独占、并行度在哪塌
+touch src/lib.rs  && /usr/bin/time -f "lib %e s %M kB" cargo build --release -p klipperx --lib
+touch src/main.rs && /usr/bin/time -f "bin+link %e s %M kB" cargo build --release -p klipperx --bin klipperx
+vmstat 1                               # si/so 非零 = 在换页（在 TF 上换页等于自杀）；wa 高 = 在等盘
+CARGO_LOG=cargo::core::compiler::fingerprint=info cargo build --release 2>&1 | grep -i dirty
+```
+
+判读：`klipperx` 这一段吃 **2.5 GB**，4 核上 `cargo` 默认 `-j4` 同时编几个大 crate 就会超 3.9 GB →
+一旦 `vmstat` 的 `si/so` 非零，进度条「不动」其实是 swap 落在慢盘上。`build.rs` 负责嵌入资产
+（Mainsail + config/docs），它对 `assets/mainsail` 与那两棵树做了 `rerun-if-changed`，慢盘上每次
+构建都要 `stat` 几千个文件——所以 build script 段异常长也可能是盘。
+
+### 三个提速手段（按性价比）
+
+1. **交叉编译（最有效）**：卡上只跑二进制。**用仓库里的脚本**，别手拼环境变量
+   （`ring` 的 C/asm 走的是 `CC_<triple>`，cargo 走的是 `CARGO_TARGET_<TRIPLE>_LINKER`，
+   两套名字容易漏）：
+   ```bash
+   scripts/build-target.sh                    # aarch64 + x86_64，glibc
+   scripts/build-target.sh --musl             # 同样两个，静态 musl（推荐给卡片机）
+   scripts/build-target.sh --all --dry-run    # 先看它会跑什么、缺什么
+   ```
+   产物落在 `out/cross/<triple>/`（二进制 + sha256 + `file` 判定），不碰 `target/`。
+   缺 rust target 或交叉 gcc 时脚本会跳过并打印该装的包。
+
+   **`gnu` 还是 `musl` 比架构更重要**：`*-gnu` 链的是**构建机**的 glibc，在新发行版上编出来的
+   二进制到 Debian 12（glibc 2.36）会直接 `GLIBC_2.38 not found`。脚本会给每个 gnu 产物打印
+   它要求的最低 `GLIBC_x.y`，拿去和卡上 `ldd --version` 对。`*-musl` 是静态的、哪都能跑，
+   代价是**静态 musl 不能 `dlopen`**，所以 `host_library:`（`[mcu]` 用 klipper 主机库）在那个
+   构建里不可用；USB/串口/CAN/TUI/Mainsail 辅助/URL include 都是纯系统调用，照常工作。
+
+2. **限并发 + 换 target 目录**：`CARGO_BUILD_JOBS=2`（别让 rustc 把内存吃满换页），
+   `CARGO_TARGET_DIR=/mnt/ssd/kx-target`（USB SSD/eMMC 都行；`/dev/shm` 在 3.9 GB 机器上放不下全量）。
+3. **少写产物**：`[profile.release] strip = "symbols"` 已在仓库里——release 二进制从 26.1 MB
+   降到 **20.8 MB**（`klippy` 18.4 MB），链接阶段少写 5.3 MB，运行期无影响。**不要开 LTO**：
+   默认就是关的，开了在 A53 上是几十分钟的量级，我们这点负载换不回来。
+
+### 这个项目的依赖里，谁需要 C 编译器
+
+只有 **`ring`**（`ureq → rustls → ring`，TLS）。`flate2` 用纯 Rust 后端（`miniz_oxide`），
+没有 zlib；`openssl` 已经完全不在依赖树里（`cargo tree -i openssl-sys` 应为空）。所以卡上只需要
+`gcc`，不需要 `libssl-dev`/`pkg-config`。

@@ -123,6 +123,27 @@ threads_of() { ls "/proc/$1/task" 2>/dev/null | wc -l; }
 rss_of() { awk '/VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null; }
 query() { "$BIN" api -a "tcp:127.0.0.1:$PORT" objects/query "$1" 2>/dev/null; }
 
+# One line of numbers from `system_stats`: busy_avg lateness_avg over_threshold dropped_logs.
+# Exits non-zero (rather than printing blanks) when a key is missing, so a binary
+# that predates `system_stats` cannot look like a pass: an unknown object answers
+# with an empty object, which is exactly the shape that would otherwise be
+# mistaken for "nothing wrong".
+read_dispatch() {
+    query '{"objects":{"system_stats":["dispatch","dropped_logs"]}}' | "$PY" -c '
+import json, sys
+status = json.load(sys.stdin)["status"]["system_stats"]
+rounds = status["dispatch"]
+print(
+    "%.6f %.6f %d %d"
+    % (
+        rounds["busy_avg_s"],
+        rounds["lateness_avg_s"],
+        rounds["over_threshold"],
+        status["dropped_logs"],
+    )
+)' 2>/dev/null
+}
+
 start_host() {
     # $1 = config path; echoes the pid.
     "$BIN" klippy -a "tcp:127.0.0.1:$PORT" --logfile "$RAW/klippy.log" "$1" \
@@ -145,10 +166,22 @@ if ! wait_ready "$PID"; then
     exit 1
 fi
 T0=$(threads_of "$PID"); R0=$(rss_of "$PID")
-D0=$(query '{"objects":{"system_stats":null}}' | "$PY" -c 'import json,sys; d=json.load(sys.stdin)["status"]["system_stats"]; print("%.6f %.6f %d %d" % (d["dispatch"]["busy_avg_s"], d["dispatch"]["lateness_avg_s"], d["dispatch"]["over_threshold"], d["dropped_logs"]))' 2>/dev/null)
+if ! D0=$(read_dispatch); then
+    fail "\`system_stats\` answered without \`dispatch\`/\`dropped_logs\` — this binary predates the object, so the rest of stage A would be meaningless. Rebuild: \`cargo build --release\`"
+    kill -TERM "$PID" 2>/dev/null
+    say ""
+    echo "wrote $REPORT"
+    exit 1
+fi
 sleep "$SOAK"
 T1=$(threads_of "$PID"); R1=$(rss_of "$PID")
-D1=$(query '{"objects":{"system_stats":null}}' | "$PY" -c 'import json,sys; d=json.load(sys.stdin)["status"]["system_stats"]; print("%.6f %.6f %d %d" % (d["dispatch"]["busy_avg_s"], d["dispatch"]["lateness_avg_s"], d["dispatch"]["over_threshold"], d["dropped_logs"]))' 2>/dev/null)
+if ! D1=$(read_dispatch); then
+    fail "the host stopped answering \`objects/query\` during the soak (see $RAW/klippy.log)"
+    kill -TERM "$PID" 2>/dev/null
+    say ""
+    echo "wrote $REPORT"
+    exit 1
+fi
 
 say "| measure | start | end |"
 say "|---|---|---|"
@@ -163,12 +196,12 @@ if [ "$GROW" -le 2048 ]; then
 else
     fail "RSS grew ${GROW} kB over ${SOAK}s (> 2 MiB: watch it over a longer soak)"
 fi
-DROPPED=$(echo "${D1:-0 0 0 0}" | awk '{print $4}')
-DROP0=$(echo "${D0:-0 0 0 0}" | awk '{print $4}')
-[ "${DROPPED:-0}" = "${DROP0:-0}" ] && pass "no log records dropped (\`dropped_logs\` = $DROPPED)" || fail "log records were dropped: $DROP0 -> $DROPPED (the writer cannot keep up: slow disk or too much logging)"
-OVERT=$(echo "${D1:-0 0 0 0}" | awk '{print $3}')
-[ "${OVERT:-0}" = "0" ] && pass "no dispatch round over the 50 ms threshold" || advisory "$OVERT dispatch round(s) over 50 ms (look at \`Reactor busy\` in $RAW/klippy.log)"
-LAT=$(echo "${D1:-0 0 0 0}" | awk '{print $2}')
+DROPPED=$(echo "$D1" | awk '{print $4}')
+DROP0=$(echo "$D0" | awk '{print $4}')
+[ "${DROPPED:-x}" = "${DROP0:-y}" ] && pass "no log records dropped (\`dropped_logs\` = $DROPPED)" || fail "log records were dropped: $DROP0 -> $DROPPED (the writer cannot keep up: slow disk or too much logging)"
+OVERT=$(echo "$D1" | awk '{print $3}')
+[ "${OVERT:-x}" = "0" ] && pass "no dispatch round over the 50 ms threshold" || advisory "$OVERT dispatch round(s) over 50 ms (look for \`Reactor busy\` in $RAW/klippy.log)"
+LAT=$(echo "$D1" | awk '{print $2}')
 say "- info: mean callback lateness is ${LAT}s; 1-2 ms is the tokio timer wheel, not a stall"
 
 # ---------------------------------------------------------------- B api latency

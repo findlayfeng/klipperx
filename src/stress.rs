@@ -22,6 +22,18 @@
 //! be cleared by a `reset`, the ramp only goes up — the result is a bracket, kept
 //! tight by making each stage a small multiple of the one before.
 //!
+//! The ramp is bounded by the machine as well as by the MCU: it only ever steps one
+//! direction and reads no position back, so on a real printer it would walk the
+//! carriage into the end of its axis. A section that names its stroke
+//! (`position_max`) beside its geometry therefore bounds how many steps the run may
+//! queue — [`TRAVEL_FRACTION`] of the tightest axis's travel — and the ramp stops
+//! there with a line saying so, because running out of room is not a step-rate
+//! answer and must not read like one. A section that names no stroke (a
+//! `manual_stepper`) leaves the ramp unbounded, which the run says once rather than
+//! stopping. Three exits are told apart: the firmware shut down (**is** the
+//! measurement), the travel bound was reached (no measurement, still a success),
+//! and the board stopped answering (a lost link, which fails the command).
+//!
 //! This is a **bench tool**, not part of the host: it takes the MCU over (the
 //! config handshake resets a board carrying a different configuration) and leaves
 //! it shut down when it finds the limit. A real `printer.cfg` is not required —

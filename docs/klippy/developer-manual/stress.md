@@ -80,9 +80,17 @@ ramp 同步下发，然后按段加大步频。`dir_pin` 与 `step_pin` 不同�
     375000 steps/s (interval 192 ticks, 50x3750 = 187500 steps over 500 ms): queued
   firmware SHUT DOWN at 375000 steps/s: Stepper too far in past
   last rate it survived: 339623 steps/s
+  upstream Benchmarks.md caliber (1 steppers):  340K steps/s
 ```
 
 即真值落在 **339 623 – 375 000 步/秒**之间（10.4% 的包围盒）；这块板大约 34 万步/秒就能稳定跑。
+
+爬坡收尾会并列打两行，两种口径是同一个物理量（`interval` 就是上游的 `ticks`）：
+
+- `last rate it survived`：**每步进器**步频（`freq / interval`，本仓压测表用的口径）；
+- `upstream Benchmarks.md caliber`：**整机**步频——同时驱动的步进器数 × 每步进器步频，
+  四舍五入到 K——与上游 [Benchmarks.md](https://www.klipper3d.org/Benchmarks.html) 发布表
+  同口径（上游固定 3 步进器 bisect `ticks`，本仓自动爬坡，方法不同但数字可直接对比）。
 
 ## 任务二：运动链路冒烟（`--task motion`）
 

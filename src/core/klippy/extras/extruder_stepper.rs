@@ -473,19 +473,27 @@ fn attach_trapq(
         return Ok(());
     }
     let name = stepper.name();
-    if let Some(extruder) = extruder {
-        toolhead
-            .set_stepper_position(name, extruder.last_position())
-            .map_err(|err| ConfigError::new(err.to_string()))?;
-        toolhead
-            .set_stepper_trapq(name, extruder.trapq())
-            .map_err(|err| ConfigError::new(err.to_string()))?;
-    } else {
-        toolhead
-            .set_stepper_trapq(name, None)
-            .map_err(|err| ConfigError::new(err.to_string()))?;
-    }
-    Ok(())
+    let (trapq, position) = match extruder.and_then(|extruder| extruder.trapq()) {
+        Some(trapq) => {
+            let extruder = extruder.expect("a trapq means an extruder");
+            // Upstream seeds from `extruder.last_position` (`:63`), the planned
+            // end of the extrusion — after its own flush that *is* the position
+            // the queue has been generated to. This port's flush horizon can
+            // stop short of the queue's end (the "nothing more than ~0.7 s
+            // ahead" bound in `Connected::generate`), so the seed is the
+            // position the extruder's own stepper reached: the same value
+            // whenever the flush covered the queue, and the consistent one when
+            // it did not.
+            let position = toolhead
+                .stepper_commanded_position(extruder.name())
+                .unwrap_or_else(|| extruder.last_position());
+            (Some(trapq), position)
+        }
+        None => (None, 0.0),
+    };
+    toolhead
+        .sync_stepper_to_trapq(name, trapq, position)
+        .map_err(|err| ConfigError::new(err.to_string()))
 }
 
 /// The toolhead, when the machine is up far enough to have one: a command run

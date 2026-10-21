@@ -2451,6 +2451,55 @@ impl ToolHeadObject {
         Ok(())
     }
 
+    /// Put one motion stepper on another axis' trapq: its solver at
+    /// `position`, reading `trapq` (or off every queue with `None`), with the
+    /// step-generation horizon it sat at so far carried over.
+    ///
+    /// This is the stepper half of upstream's
+    /// `ExtruderStepper.sync_to_extruder`
+    /// (`kinematics/extruder.py:52-65`, after its
+    /// `toolhead.flush_step_generation()`): an `[extruder_stepper]` joins the
+    /// extruder it is bound to, and leaves without a queue when detached.
+    ///
+    /// Carrying the horizon is upstream's `sk->last_flush_time = flush_time`
+    /// before its `if (!sk->tq) return 0` (`itersolve.c:154-159`): a queue pass
+    /// advances the horizon of a stepper with no trapq too. Without it a stepper
+    /// that sat off the queue would re-walk every move this connection generated
+    /// while it was away and queue those steps behind the ones already on the
+    /// wire — `check_line`'s "Invalid sequence" (`motion/queuestepcompress.rs`'s
+    /// `check_line`, and the note on `Connected::generate`).
+    ///
+    /// # Errors
+    /// "Printer is not ready" before connect, or "Unknown stepper '<name>'"
+    /// when no motion stepper answers to `name`.
+    pub fn sync_stepper_to_trapq(
+        &self,
+        name: &str,
+        trapq: Option<usize>,
+        position: f64,
+    ) -> Result<(), CommandError> {
+        let mut guard = self.lock();
+        let connected = guard
+            .as_mut()
+            .ok_or_else(|| CommandError::new("Printer is not ready"))?;
+        let horizon = connected
+            .last_step_gen_time
+            .max(connected.toolhead.last_step_gen_time());
+        let stepper = connected
+            .toolhead
+            .motion_queuing_mut()
+            .steppers_mut()
+            .iter_mut()
+            .find(|stepper| stepper.name() == name)
+            .ok_or_else(|| CommandError::new(format!("Unknown stepper '{name}'")))?;
+        // Upstream's `set_position([extruder.last_position, 0., 0.])` then
+        // `set_trapq(extruder.get_trapq())` (`kinematics/extruder.py:63-65`).
+        stepper.set_position(Xyz::new(position, 0.0, 0.0));
+        stepper.set_trapq(trapq);
+        stepper.kinematics_mut().last_flush_time = horizon;
+        Ok(())
+    }
+
     /// Change one motion stepper's step distance — the `_step_dist` half of
     /// upstream's `MCU_stepper.set_rotation_distance`
     /// (`klippy/stepper.py:138-143`, which rewrites it before re-pointing the

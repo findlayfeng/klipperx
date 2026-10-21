@@ -876,18 +876,17 @@ impl ToolHead {
         if let Some(kinematics) = &mut self.kinematics {
             kinematics.set_position(newpos, homing_axes);
         }
-        // Each kinematic motor is told where the toolhead is. An extra axis'
-        // stepper is left alone: it tracks its own trapq, whose positions are
-        // the axis' own (the extrusion amount), and forcing the toolhead's
-        // coordinate into it would make it step the whole gap on the next
-        // range. Upstream's `ToolHead.set_position` (`toolhead.py:383-390`)
-        // likewise only rewrites the main trapq (`trapq_set_position`).
+        // Each stepper that reads the **main** trapq is told where the toolhead
+        // is. One that reads another queue is left alone: it tracks that
+        // queue's own coordinates (an extra axis' stepper follows the extrusion
+        // amount, an `[extruder_stepper]` follows the extruder it is bound to),
+        // and forcing the toolhead's coordinate into it would make it step the
+        // whole gap on the next range. Upstream's `ToolHead.set_position`
+        // (`toolhead.py:383-390`) likewise only rewrites the main trapq
+        // (`trapq_set_position`).
+        let main_trapq = self.main_trapq;
         for stepper in self.motion_queuing.steppers_mut() {
-            if self
-                .extra_axes
-                .iter()
-                .any(|axis| axis.name() == stepper.name())
-            {
+            if stepper.trapq_id() != Some(main_trapq) {
                 continue;
             }
             stepper.set_position(newpos.into());

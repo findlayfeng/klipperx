@@ -270,7 +270,12 @@ impl VirtualSdCard {
     ///
     /// Returns `Vec<(relative_path, size)>` sorted by lowercase path.
     /// Returns `Err` when the directory cannot be read.
-    fn get_file_list(&self, check_subdirs: bool) -> Result<Vec<(String, u64)>, String> {
+    /// The SD card's files (`virtual_sdcard.py:79-103`): name and size, sorted
+    /// case-insensitively.
+    ///
+    /// `pub(crate)` for the menu's `vsdlist` (`display/menu.py:568-576`, which
+    /// calls it with `check_subdirs=False`).
+    pub(crate) fn get_file_list(&self, check_subdirs: bool) -> Result<Vec<(String, u64)>, String> {
         let root = Path::new(&self.sdcard_dirname);
         if check_subdirs {
             let mut flist = Vec::new();

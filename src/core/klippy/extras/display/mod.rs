@@ -17,6 +17,7 @@
 //! | `[display_template <name>]` | `display/display.py:168` (no file of its own) | lives in [`led`](super::led) |
 //! | `[display_data <group> <item>]` | `display/display.py:56` | shipped `display.cfg` only |
 //! | `[display_glyph <name>]` | `display/display.py:103` | shipped `display.cfg` only |
+//! | `[menu <name>]` | `display/menu.py:1035` | read by [`menu::MenuManager`]; shipped `menu.cfg` first, then the main config |
 //!
 //! # What is not here
 //!
@@ -28,9 +29,12 @@
 //!   flushes the framebuffer differences, exactly as upstream does around its
 //!   own (swallowed) render step (`display/display.py:234-237`), so the screen
 //!   stays blank rather than the printer failing to come up.
-//! * **The menu.** `menu.cfg` is not loaded: no `menu` object, no `menu:*`
-//!   events, no menu drawing. The menu options a config writes are still read
-//!   (see [`display::PrinterLCD`]), because `check_unused` requires a reader.
+//! * **The menu.** [`menu`] ports `menu.py` + `menu_keys.py` and reads the
+//!   shipped `menu.cfg`; a config's `[menu <name>]` sections are read in place
+//!   (no section factory of their own — the manager reads its siblings, as
+//!   upstream's `get_prefix_sections` does). The menu's rows are laid out but
+//!   not painted, for the reason above; the key buttons register through
+//!   `buttons`, whose registry has no rotary encoder here.
 //! * **The other panels.** `st7920`, `hd44780`, `hd44780_spi`, `uc1701`,
 //!   `ssd1306` and `aip31068_spi` have drivers; `sh1106` and `emulated_st7920`
 //!   are accepted by `lcd_type` (so its error wording stays upstream's) and
@@ -44,6 +48,7 @@ pub mod aip31068_spi;
 pub mod display;
 pub mod hd44780;
 pub mod hd44780_spi;
+pub mod menu;
 pub mod ssd1306;
 pub mod st7920;
 pub mod uc1701;

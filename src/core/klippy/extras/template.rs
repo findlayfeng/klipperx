@@ -135,7 +135,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use minijinja::syntax::SyntaxConfig;
-use minijinja::value::{Enumerator, Object, ObjectRepr, Value as MjValue, ValueKind};
+use minijinja::value::{Enumerator, Object, ObjectRepr, Rest, Value as MjValue, ValueKind};
 use minijinja::{
     escape_formatter, AutoEscape, Environment, Error as MjError, ErrorKind, Output, State,
     UndefinedBehavior::Strict,
@@ -1022,6 +1022,7 @@ fn environment() -> Environment<'static> {
     env.add_filter("float", filter_float);
     env.add_filter("min", filter_min);
     env.add_filter("max", filter_max);
+    env.add_filter("format", filter_format);
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
     env.set_formatter(format_output);
@@ -1199,6 +1200,91 @@ fn filter_min(value: MjValue) -> Result<MjValue, MjError> {
 /// `| max` — the largest item of a sequence, as `| min` reads it.
 fn filter_max(value: MjValue) -> Result<MjValue, MjError> {
     extreme("max", value, false)
+}
+
+/// `|format` with Python's integer conversions over floats.
+///
+/// The menu's input names are `{'%3d' % (menu.input*100)}%`
+/// (`menu.cfg:118`): a **float** formatted with `%d`. Python truncates it
+/// toward zero, while the engine refuses it outright (`'float' cannot be
+/// formatted in decimal format ('d')`). Every such tag is rewritten into this
+/// filter ([`rewrite_printf_formatting`]), so the coercion belongs here: the
+/// argument each `%d`/`%i`/`%u`/`%o`/`%x`/`%X`/`%c` conversion consumes is
+/// truncated to an integer first. An argument that is already an integer is
+/// passed through untouched.
+fn filter_format(
+    state: &State,
+    format_str: &MjValue,
+    args: Rest<MjValue>,
+) -> Result<MjValue, MjError> {
+    let Some(text) = format_str.as_str() else {
+        return minijinja::filters::format(state, format_str, args);
+    };
+    let mut coerced = args.0;
+    for (index, conversion) in printf_conversions(text).into_iter().enumerate() {
+        if !matches!(conversion, b'd' | b'i' | b'u' | b'o' | b'x' | b'X' | b'c') {
+            continue;
+        }
+        let Some(argument) = coerced.get_mut(index) else {
+            break;
+        };
+        // `is_integer` tells `42` from `42.0`; only the latter needs the
+        // truncation Python's `%d` would have done.
+        if !argument.is_number() || argument.is_integer() {
+            continue;
+        }
+        let Ok(value) = f64::try_from(argument.clone()) else {
+            continue;
+        };
+        *argument = MjValue::from(value.trunc() as i64);
+    }
+    minijinja::filters::format(state, format_str, Rest(coerced))
+}
+
+/// The conversion characters a printf format consumes arguments with, in order.
+///
+/// A `*` width or precision consumes one too, so it is reported as a `w` — an
+/// entry that shifts the positions after it without ever being an integer
+/// conversion.
+fn printf_conversions(text: &str) -> Vec<u8> {
+    const FLAGS_AND_WIDTH: &[u8] = b"-+ #0123456789.hlL";
+    let bytes = text.as_bytes();
+    let mut conversions = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'%' {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        if bytes.get(index) == Some(&b'%') {
+            index += 1;
+            continue;
+        }
+        if bytes.get(index) == Some(&b'(') {
+            // A mapping operand (not a shape the rewrite produces): the
+            // argument positions are not positional, so stop reading.
+            break;
+        }
+        while let Some(&byte) = bytes.get(index) {
+            if byte == b'*' {
+                conversions.push(b'w');
+                index += 1;
+                continue;
+            }
+            if FLAGS_AND_WIDTH.contains(&byte) {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+        let Some(&conversion) = bytes.get(index) else {
+            break;
+        };
+        conversions.push(conversion);
+        index += 1;
+    }
+    conversions
 }
 
 fn extreme(filter: &str, value: MjValue, least: bool) -> Result<MjValue, MjError> {

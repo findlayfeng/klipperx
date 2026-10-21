@@ -5374,6 +5374,60 @@ mod tests {
         );
     }
 
+    /// A move whose message never reaches the queue keeps no slot: the entry
+    /// [`Mcu::move_clocks`] took is given back through
+    /// [`Mcu::release_move_slot`]. The pool only drops an entry when a later
+    /// `record` finds its completion clock behind the estimate, so a ghost entry
+    /// is never pruned — it holds a slot the firmware never handed out, and once
+    /// `pending` is over capacity it pushes the floor onto clocks that have long
+    /// passed. Both move senders take their clocks from `move_clocks`, so both
+    /// are checked here; the session is closed to make the send refuse.
+    #[tokio::test]
+    async fn test_a_move_that_never_queues_gives_its_slot_back() {
+        const BASE: u64 = 1_000_000;
+        let (mcu, _recorder) = gate_mcu(vec![], BASE);
+        mcu.set_move_slot_capacity(1);
+        let pending = || {
+            mcu.move_slots
+                .lock()
+                .expect("move slots lock poisoned")
+                .report()
+                .0
+        };
+
+        // One move goes in: the pool holds its entry.
+        mcu.send_move("get_clock", &[], BASE, BASE + 1_600_000)
+            .unwrap();
+        assert_eq!(pending(), 1, "the queued move does not hold a slot");
+
+        // The session ends, so every later send is refused at the door.
+        mcu.close();
+        wait_until(
+            Duration::from_secs(1),
+            Duration::from_millis(5),
+            || mcu.send_buf_tx.is_closed(),
+            "the send task did not go away",
+        )
+        .await;
+
+        let err = mcu
+            .send_move("get_clock", &[], BASE, BASE + 3_200_000)
+            .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        assert_eq!(pending(), 1, "the refused move kept its slot");
+
+        // The step path's already-encoded payload takes its slot the same way.
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_move_payload(Payload::from_raw(vec![5]), BASE, BASE + 4_800_000),
+        )
+        .await
+        .expect("a refused payload send must not wait for room")
+        .unwrap_err();
+        assert!(err.to_string().contains("closed"), "{err}");
+        assert_eq!(pending(), 1, "the refused payload kept its slot");
+    }
+
     /// ③ The safety window around a slot-starved send: with the pool full, the
     /// move is released by its floor **and** goes no later than its own start
     /// clock minus `MIN_SCHEDULE_TIME` — the upper edge is asserted against the

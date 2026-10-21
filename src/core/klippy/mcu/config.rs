@@ -1215,6 +1215,31 @@ mod tests {
         assert_eq!(mcu.seconds_to_clock(0.0).unwrap(), 0);
     }
 
+    /// A duration the host cannot mean — negative, or not a finite number — is
+    /// refused rather than folded onto clock 0. Upstream's
+    /// `int(time * freq)` keeps a negative sign and raises on a NaN
+    /// (`klippy/mcu.py:1140-1141`); the `as u64` cast here would turn both into
+    /// "now", i.e. run the command at once instead of showing the caller its own
+    /// arithmetic bug. Zero is still a real answer, and an ordinary duration is
+    /// unchanged (see the test above).
+    #[tokio::test]
+    async fn test_seconds_to_clock_refuses_a_negative_or_non_finite_duration() {
+        let mcu = identified_mcu();
+
+        for seconds in [-0.001, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = mcu.seconds_to_clock(seconds).unwrap_err();
+            assert!(
+                matches!(err, McuError::Config(_)),
+                "{seconds} must be a config error: {err:?}"
+            );
+            assert!(
+                err.to_string()
+                    .contains("is not a finite, non-negative number of seconds"),
+                "{seconds}: {err}"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // configure — the connection handshake
     // -----------------------------------------------------------------------

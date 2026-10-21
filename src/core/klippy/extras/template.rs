@@ -103,7 +103,7 @@
 //! | `{-3.5}` | `3.5`: `-` right after the opening brace is the whitespace-control marker (`{{-`'s, with single-brace delimiters), which swallows the sign — measured against `jinja2.Environment('{%','%}','{','}')` | same; a negative literal after `{` needs the space (`{ -3.5}`), and no corpus body writes `{-` |
 //! | a container joined with `~` | `str()` of it, elements `repr`-quoted: `'x' ~ {'call': 'PAUSE'}` is `x{'call': 'PAUSE'}` | the engine's `Display`, elements unquoted: `'x' ~ {'call': 'PAUSE'}` is `x{call: PAUSE}` — `~` joins through `Display` before the formatter sees a string, so only a whole tag (`{ … }`) gets Python's spelling |
 //! | printing a *silent* undefined (`{x if c}`, which has no `else`) | blank | an `undefined value` error: the engine's own formatter lets *that* one print nothing (it tells the two kinds of undefined apart), a custom formatter does not — `ValueKind::Undefined` is one kind — so the strict check [`format_output`] repeats covers both; a *default* undefined (`{nope}`) is the error it always was |
-//! | `"…%s…" % value` (a **string literal** directly left of `%`) | Python's printf formatting | rewritten at compile time into the engine's `\|format` filter, which is the same printf formatting with its arguments passed separately: `{"Restoring \"%s\"" % x}` → `{"Restoring \"%s\""\|format(x)}` ([`rewrite_printf_formatting`]). Both tag kinds carry expressions, so `{ … }` and `{% … %}` are both rewritten; a `{# … #}` comment is not. Narrow on purpose: the literal must be alone on the left and its `%` must end an operand position — any other `%` stays the remainder operator, and a formatting this rewrite cannot read fails the load the way it did before rather than mis-rendering |
+//! | `"…%s…" % value` (a **string literal** directly left of `%`) | Python's printf formatting | rewritten at compile time into this port's `\|printf` filter, which is the same printf formatting with its arguments passed separately: `{"Restoring \"%s\"" % x}` → `{"Restoring \"%s\""\|printf(x)}` ([`rewrite_printf_formatting`]). The `\|printf` filter is [`filter_printf`]: Python's `%` formatting lets an integer conversion code truncate a float, which `\|printf` does and `str.format` (the `.format(...)` method) refuses — see the `str format` row. Both tag kinds carry expressions, so `{ … }` and `{% … %}` are both rewritten; a `{# … #}` comment is not. Narrow on purpose: the literal must be alone on the left and its `%` must end an operand position — any other `%` stays the remainder operator, and a formatting this rewrite cannot read fails the load the way it did before rather than mis-rendering |
 //! | `"%(key)s" % {'key': v}` (a mapping operand) | formatted from the mapping | unsupported: the operand right of `%` is a dict literal this rewrite does not read, so the tag keeps its Python spelling and fails the load (`%` is the remainder, which a string left operand cannot take); `\|format` reads a mapping only when the whole operand is one map value |
 //! | a method that mutates a **list** (`append`, `extend`, `pop`) | appends/extends/pops in place | `None`, and the list is unchanged: the engine's lists are **values**, so nothing can write back to the list a body holds. A body that collects into one (`{% set _d = prompt_txt.append(…) %}`, `mainsail.cfg`'s abort prompt) therefore reads an **empty** list afterwards — one `debug!` line per process records that the degradation happened. The read-only methods (`index`, `count`) are Python's own |
 //!
@@ -723,15 +723,20 @@ impl Template {
 // Python's `%` formatting
 // ===========================================================================
 
-/// Rewrite Python's string formatting into the engine's `\|format` filter.
+/// Rewrite Python's string formatting into this port's `\|printf` filter.
 ///
 /// Upstream runs Jinja2, where a string on the left of `%` is Python's printf
 /// formatting (`"Restoring \"%s\"" % printer.toolhead.extruder`); this engine's
-/// `%` is the remainder operator and refuses a string operand outright. Its
-/// `format` filter is printf formatting with the arguments passed separately
-/// (`"%s, %s!"\|format(a, b)`), so such a formatting is rewritten into that call
+/// `%` is the remainder operator and refuses a string operand outright. A
+/// filter is printf formatting with the arguments passed separately
+/// (`"%s, %s!"\|printf(a, b)`), so such a formatting is rewritten into that call
 /// — the eleven in `mainsail.cfg`, eight inside a `{ … }` tag and three inside
 /// a `{% set %}` (`145`, `152`, `163`).
+///
+/// The filter is [`filter_printf`], not the engine's own `format`:
+/// `[filter_printf`] keeps Python's `%`-formatting rule that an integer
+/// conversion code takes a float and truncates it, which the `{ … }`-tag
+/// spelling of `\|format` must not do.
 ///
 /// Both tag kinds carry expressions, so both are rewritten; the rewrite is
 /// narrow on purpose, so every other `%` keeps the engine's own meaning:
@@ -841,7 +846,7 @@ fn rewrite_tag_body(body: &str) -> Option<String> {
     Some(rewritten)
 }
 
-/// The `"…"\|format(…)` call replacing the formatting whose `%` sits at `pct`,
+/// The `"…"\|printf(…)` call replacing the formatting whose `%` sits at `pct`,
 /// the index of the literal it starts at, and the index just past the operand
 /// it replaces.
 fn printf_call(body: &str, pct: usize) -> Option<(usize, String, usize)> {
@@ -873,7 +878,7 @@ fn printf_call(body: &str, pct: usize) -> Option<(usize, String, usize)> {
         literal,
         // The literal without the whitespace the `%` was padded with.
         format!(
-            "{}|format({})",
+            "{}|printf({})",
             &body[literal..string_close(bytes, literal)? + 1],
             arguments
         ),
@@ -1092,9 +1097,126 @@ fn skip_whitespace(bytes: &[u8], from: usize) -> usize {
     i
 }
 
+/// Python's `%` formatting for the calls [`rewrite_printf_formatting`] makes
+/// — the `\|printf` filter those calls name.
+///
+/// Its one Python rule is the one the `%` spelling has: an integer conversion
+/// code (`d`, `i`, `u`, `o`, `x`, `X`) takes a float and truncates it toward
+/// zero (`"%d" % 2.7` is `"2"`, `"%d" % -2.7` is `"-2"`).
+///
+/// The `\|format` filter the rewrite used to emit carries the same rule from
+/// the menu's own tags ([`filter_format`], `menu.cfg:118`); the two exist side
+/// by side because that one is the port's older spelling and this one names the
+/// `%` spelling the rewrite produces. Neither touches Python's *other* spelling:
+/// `"{:d}".format(2.7)` still raises, which is [`string_method`]'s `format`.
+fn filter_printf(
+    state: &State,
+    format_str: &MjValue,
+    format_args: Rest<MjValue>,
+) -> Result<MjValue, MjError> {
+    let Rest(values) = format_args;
+    let values = printf_int_coercions(format_str.as_str().unwrap_or_default(), values);
+    minijinja::filters::format(state, format_str, Rest(values))
+}
+
+/// The floats a printf format reads with an integer code, truncated the way
+/// Python truncates them; every other argument is handed on unchanged.
+fn printf_int_coercions(format: &str, values: Vec<MjValue>) -> Vec<MjValue> {
+    let mut values = values;
+    for (index, conversion) in printf_argument_codes(format).into_iter().enumerate() {
+        let Some(code) = conversion else {
+            continue;
+        };
+        if !matches!(code, 'd' | 'i' | 'u' | 'o' | 'x' | 'X') {
+            continue;
+        }
+        let Some(value) = values.get_mut(index) else {
+            continue;
+        };
+        if value.kind() != ValueKind::Number {
+            continue;
+        }
+        // An integral float (`0.0`) is still a float, and the engine's
+        // `as_i64` answers one — so the value's JSON form is what tells the two
+        // apart, and only a float is truncated.
+        let Ok(Value::Number(number)) = serde_json::to_value(&*value) else {
+            continue;
+        };
+        if !number.is_f64() {
+            continue;
+        }
+        let Some(floating) = number.as_f64() else {
+            continue;
+        };
+        // Python truncates toward zero. A float past `i64`'s range saturates
+        // here rather than failing: the formatting still renders.
+        *value = MjValue::from(floating.trunc() as i64);
+    }
+    values
+}
+
+/// The conversion code each argument of a printf format is read by, in order:
+/// `None` for a `*` width or precision (which takes an argument too), `Some`
+/// for the code of the conversion it belongs to. `%%` takes no argument.
+///
+/// A `*` width is scanned even though the engine's `format` filter refuses that
+/// spec: the scan has to stay in step with the arguments, or a later integer
+/// code would truncate the wrong one.
+fn printf_argument_codes(format: &str) -> Vec<Option<char>> {
+    let chars: Vec<char> = format.chars().collect();
+    let mut conversions = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if chars.get(i) == Some(&'%') {
+            i += 1;
+            continue;
+        }
+        while matches!(chars.get(i), Some('#' | '0' | '-' | ' ' | '+')) {
+            i += 1;
+        }
+        if chars.get(i) == Some(&'*') {
+            conversions.push(None);
+            i += 1;
+        } else {
+            while chars.get(i).is_some_and(char::is_ascii_digit) {
+                i += 1;
+            }
+        }
+        if chars.get(i) == Some(&'.') {
+            i += 1;
+            if chars.get(i) == Some(&'*') {
+                conversions.push(None);
+                i += 1;
+            } else {
+                while chars.get(i).is_some_and(char::is_ascii_digit) {
+                    i += 1;
+                }
+            }
+        }
+        while matches!(chars.get(i), Some('h' | 'l' | 'L')) {
+            i += 1;
+        }
+        if let Some(code) = chars.get(i).copied() {
+            conversions.push(Some(code));
+            i += 1;
+        }
+    }
+    conversions
+}
+
+// ===========================================================================
+// The environment
+// ===========================================================================
+
 /// The environment every body is compiled into: upstream's delimiters,
-/// undefined behavior and escaping, this port's trailing-newline rule, the four
-/// filters the corpus spells differently, the two Jinja2 globals the corpus
+/// undefined behavior and escaping, this port's trailing-newline rule, the five
+/// filters the corpus spells differently (including [`filter_printf`], which
+/// the `%` rewrite above emits), the two Jinja2 globals the corpus
 /// (`range`) and this module's stepper-macro test (`namespace`) call, and the
 /// unknown-method callback that answers `str`/`list` method calls
 /// ([`unknown_method`]).
@@ -1116,6 +1238,7 @@ fn environment() -> Environment<'static> {
     env.add_filter("min", filter_min);
     env.add_filter("max", filter_max);
     env.add_filter("format", filter_format);
+    env.add_filter("printf", filter_printf);
     env.add_function("range", minijinja::functions::range);
     env.add_function("namespace", minijinja::functions::namespace);
     env.set_formatter(format_output);
@@ -2562,13 +2685,13 @@ mod tests {
         let not_hot_enough: &str = r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME" % printer.toolhead.extruder) %}"#;
         assert_eq!(
             &*rewrite_printf_formatting(not_hot_enough),
-            r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME"|format(printer.toolhead.extruder)) %}"#
+            r#"{% set _d = prompt_txt.append("\"%s\" not hot enough, please heat up again and press RESUME"|printf(printer.toolhead.extruder)) %}"#
         );
 
         let no_filament: &str = r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]) %}"#;
         assert_eq!(
             &*rewrite_printf_formatting(no_filament),
-            r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])) %}"#
+            r#"{% set _d = prompt_txt.append("\"%s\" detects no filament, please load filament and press RESUME"|printf((client.runout_sensor.split(" "))[1])) %}"#
         );
 
         // `.append(…)` and `.split(…)` are Python **methods** this port's
@@ -2604,7 +2727,7 @@ mod tests {
         let source: &str = r#"{"\"%s\" detects no filament, please load filament and press RESUME" % (client.runout_sensor.split(" "))[1]}"#;
         assert_eq!(
             &*rewrite_printf_formatting(source),
-            r#"{"\"%s\" detects no filament, please load filament and press RESUME"|format((client.runout_sensor.split(" "))[1])}"#
+            r#"{"\"%s\" detects no filament, please load filament and press RESUME"|printf((client.runout_sensor.split(" "))[1])}"#
         );
         // `.split(…)` is a Python method this port's engine does not have yet,
         // so the render binds what the call would have produced.
@@ -2692,8 +2815,8 @@ mod tests {
     fn every_printf_in_the_vendored_mainsail_file_is_rewritten() {
         let source = include_str!("mainsail.cfg");
         let rewritten = rewrite_printf_formatting(source);
-        assert_eq!(source.matches("|format(").count(), 0);
-        assert_eq!(rewritten.matches("|format(").count(), 11);
+        assert_eq!(source.matches("|printf(").count(), 0);
+        assert_eq!(rewritten.matches("|printf(").count(), 11);
         assert_eq!(rewritten.lines().count(), source.lines().count());
     }
 
@@ -4168,6 +4291,66 @@ STEPPER_RELEASE";
         assert_eq!(
             error.to_string(),
             "Error evaluating 'gcode_macro TEST:gcode': line 1: KeyError: 'missing'"
+        );
+    }
+
+    // -- `|printf`, the `%` spelling ---------------------------------------
+
+    #[test]
+    fn test_printf_truncates_a_float_where_an_integer_code_asks_for_one() {
+        // Python's `%` formatting: an integer conversion code takes a float and
+        // truncates it, which is what `rewrite_printf_formatting`'s `|printf`
+        // keeps.
+        assert_eq!(ok(r#"{"%02d:%02d" % (0.0, 0.0)}"#), "00:00");
+        assert_eq!(ok(r#"{"%d" % 2.7}"#), "2");
+        // Toward zero, not floor: -2.7 is -2, not -3. (The `%` rewrite does not
+        // read a unary minus as an operand, so this one is spelled as the
+        // filter the rewrite emits.)
+        assert_eq!(ok(r#"{"%d"|printf(-2.7)}"#), "-2");
+        assert_eq!(ok(r#"{"%x" % 15.9}"#), "f");
+        // The other conversions take the value as it is.
+        assert_eq!(ok(r#"{"%f" % 2.5}"#), "2.500000");
+        assert_eq!(ok(r#"{"%s" % 3}"#), "3");
+    }
+
+    #[test]
+    fn test_str_format_refuses_a_float_where_the_printf_filters_truncate_it() {
+        // Two spellings, two Python rules. `str.format` (the method) refuses an
+        // integer code over a float…
+        let error = render(r#"{"{:d}".format(2.7)}"#, &mut context(&[], ""))
+            .expect_err("str.format refuses a float");
+        assert!(
+            error
+                .to_string()
+                .contains("Unknown format code 'd' for object of type 'float'"),
+            "{error}"
+        );
+
+        // …while both printf filters truncate it, each from its own spelling:
+        // `|format` for the menu's own tags (`menu.cfg:118`), `|printf` for the
+        // calls `rewrite_printf_formatting` produces.
+        assert_eq!(ok(r#"{"%d"|format(2.7)}"#), "2");
+        assert_eq!(ok(r#"{"%d"|printf(2.7)}"#), "2");
+    }
+
+    /// The beneficiary outside `[display]`: a client that stores
+    /// `pause_at_layer.layer` as a float (`SET_GCODE_VARIABLE … VALUE=12.0`)
+    /// now renders `mainsail.cfg:207`'s `%d` instead of failing the macro.
+    #[test]
+    fn test_mainsail_pause_at_layer_renders_a_float_layer() {
+        let mut context = context(&[], "");
+        context.insert(
+            "pause_at_layer",
+            Rt::Json(json!({"call": "PAUSE_AT_LAYER", "layer": 12.0})),
+        );
+
+        assert_eq!(
+            render(
+                r#"{"%s, forced by pause_at_layer [%d]" % (pause_at_layer.call, pause_at_layer.layer)}"#,
+                &mut context
+            )
+            .expect("mainsail.cfg:207 renders"),
+            "PAUSE_AT_LAYER, forced by pause_at_layer [12]"
         );
     }
 }

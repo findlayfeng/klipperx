@@ -431,9 +431,9 @@ const SET_PRESSURE_ADVANCE_PARAMS: &[&str] = &["ADVANCE", "SMOOTH_TIME"];
 /// and `minval=0., maxval=.200` on `SMOOTH_TIME`).
 ///
 /// The new value is active from the print time the extruder has already
-/// planned up to — upstream hands it to `register_lookahead_callback`, which
-/// fires with exactly that time (`extruder.py:82-86`) — so segments the step
-/// generator has stepped over keep the value they were stepped with.
+/// planned up to: the command registers a lookahead callback, which fires with
+/// exactly that time (`extruder.py:83-86` → `toolhead.py:526-531`) — so segments
+/// the step generator has stepped over keep the value they were stepped with.
 ///
 /// A changed **smooth time** is the exception: the smoothing filter's width is
 /// part of how a segment is stepped, so upstream flushes step generation first
@@ -476,17 +476,29 @@ fn set_pressure_advance(
         }
     }
     // With the plan generated, upstream dates the new value at time zero
-    // (`espa(sk, 0., …)`, `:81`); without a smooth time change it lands at the
-    // print time the planner has reached (`:83-86`).
-    let print_time = if smooth_time_changed {
-        0.0
+    // (`espa(sk, 0., …)`, `:81`); without a smooth time change it registers a
+    // lookahead callback that writes it when the look-ahead flushes
+    // (`:83-86` → `toolhead.py:526-531`).
+    //
+    // The reported values are the command's, immediately either way: upstream's
+    // `self.pressure_advance = pressure_advance` runs in the command body
+    // (`:87-88`), not when the scheduled change lands.
+    pressure_advance.set_reported(value, smooth);
+    if smooth_time_changed {
+        pressure_advance.set_from(0.0, value, smooth);
+    } else if let Some(toolhead) = &toolhead {
+        // The callback fires with the end time of the move it was parked
+        // against — or at once, with the last move time, when the look-ahead
+        // is empty — so nothing the step generator already stepped over moves.
+        let pressure_advance = Arc::clone(pressure_advance);
+        toolhead.register_lookahead_callback(Box::new(move |print_time| {
+            pressure_advance.set_from(print_time, value, smooth);
+        }));
     } else {
-        toolhead
-            .as_ref()
-            .map(|toolhead| toolhead.get_last_move_time())
-            .unwrap_or(0.0)
-    };
-    pressure_advance.set(print_time, value, smooth);
+        // No toolhead: nothing has been planned, so there is no flush point to
+        // wait for.
+        pressure_advance.set_from(0.0, value, smooth);
+    }
     // The extruder stepper's step generation window is half its smooth time, so
     // only a changed smooth time changes how far generated steps are still open
     // to rewriting: rescan and update the flush delay

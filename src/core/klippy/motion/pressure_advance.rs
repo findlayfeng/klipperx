@@ -42,7 +42,15 @@
 //! position of segments the step generator has already stepped over, and the
 //! solver would try to make up the difference in one clock tick.
 //!
-//! The parameters live behind a rarely-taken mutex: [`ExtruderPressureAdvance::set`]
+//! The command dates the change by registering a lookahead callback
+//! (`extruder.py:83-86` → `toolhead.py:526-531`): the callback fires with the
+//! end time of the last queued move — at once, at the last move time, when
+//! nothing is queued — so a value-only change never disturbs a position the
+//! step generator has already produced. What the command *reports* (status and
+//! its own next defaults) moves immediately instead
+//! ([`ExtruderPressureAdvance::set_reported`]).
+//!
+//! The parameters live behind a rarely-taken mutex: [`ExtruderPressureAdvance::set_from`]
 //! writes it from the g-code command, and the step generator takes one snapshot
 //! per [`StepKinematics::generate_steps`](super::itersolve::StepKinematics)
 //! call, so the position function itself runs without a lock.
@@ -120,17 +128,29 @@ impl ExtruderPressureAdvance {
         )
     }
 
-    /// Record new values, in force from print time `print_time` on
+    /// Record the values status reports and the next command's defaults read,
+    /// at once — upstream's `self.pressure_advance = pressure_advance`
+    /// (`kinematics/extruder.py:87-88`), which runs while the command is
+    /// handled, not when the change takes effect.
+    pub fn set_reported(&self, pressure_advance: f64, smooth_time: f64) {
+        self.reported_pressure_advance
+            .store(pressure_advance.to_bits(), Ordering::Relaxed);
+        self.reported_smooth_time
+            .store(smooth_time.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Put values in force from print time `print_time` on
     /// (`extruder_set_pressure_advance`, `kin_extruder.c:167-172`).
     ///
     /// Segments that start before `print_time` keep the value they had — they
     /// may already have been stepped. Entries later than `print_time` are
     /// dropped: a command cannot schedule a change behind one already queued.
-    pub fn set(&self, print_time: f64, pressure_advance: f64, smooth_time: f64) {
-        self.reported_pressure_advance
-            .store(pressure_advance.to_bits(), Ordering::Relaxed);
-        self.reported_smooth_time
-            .store(smooth_time.to_bits(), Ordering::Relaxed);
+    ///
+    /// The command reaches this from the lookahead callback it registers, so
+    /// `print_time` is the end of the last move that was queued when it ran
+    /// (`extruder.py:83-86` → `toolhead.py:526-531`); the one write that lands
+    /// at time zero instead is the smooth-time flush (`extruder.py:75-83`).
+    pub fn set_from(&self, print_time: f64, pressure_advance: f64, smooth_time: f64) {
         let mut schedule = self.lock();
         schedule.retain(|entry| entry.print_time < print_time);
         schedule.push(PressureAdvanceEntry::new(
@@ -138,6 +158,14 @@ impl ExtruderPressureAdvance {
             pressure_advance,
             smooth_time,
         ));
+    }
+
+    /// Both halves at once — report the values now and put them in force from
+    /// `print_time` on. The flush path uses it with `print_time` 0 (upstream's
+    /// `espa(sk, 0., …)`).
+    pub fn set(&self, print_time: f64, pressure_advance: f64, smooth_time: f64) {
+        self.set_reported(pressure_advance, smooth_time);
+        self.set_from(print_time, pressure_advance, smooth_time);
     }
 
     /// The schedule the step generator reads, oldest first.

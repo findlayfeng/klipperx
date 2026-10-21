@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["full"] }
 ureq = "2.12"
 hex = "0.4"
+glob = "0.3"
 nusb = "0.2.7"
 minijinja = { version = "2.24", features = ["custom_syntax", "json"] }
 

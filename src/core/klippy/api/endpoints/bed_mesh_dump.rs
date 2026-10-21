@@ -49,7 +49,7 @@ use crate::core::klippy::api::protocol::{ApiError, Request};
 use crate::core::klippy::api::registry::{Endpoint, EndpointContext, EndpointFuture};
 use crate::core::klippy::api::{Api, ApiWiring, RegistrationError};
 use crate::core::klippy::extras::bed_mesh::{
-    generate_points, BedMesh, BedMeshOptions, BED_MESH_OBJECT,
+    generate_points, BedMesh, BedMeshOptions, MeshParams, BED_MESH_OBJECT,
 };
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -151,15 +151,16 @@ fn current_mesh(bed: &BedMesh) -> Result<Value, ApiError> {
     let Some(mesh) = bed.loaded_mesh() else {
         return Ok(json!({}));
     };
-    let options = bed.options();
-    let points = probe_points(&options)?;
     Ok(json!({
         "name": mesh.name,
         "probed_matrix": mesh.rows,
         // The interpolation grid, reported to 6 decimals as upstream's
         // `get_mesh_matrix` does (`bed_mesh.py:1360-1364`).
         "mesh_matrix": mesh.z_mesh.get_mesh_matrix(),
-        "mesh_params": mesh_params(&options, &points),
+        // The loaded grid's own parameters (`z_mesh.get_mesh_params()`,
+        // `bed_mesh.py:296-302`), not the running config's: a `LOAD=` may
+        // install a grid of another size.
+        "mesh_params": mesh_params(&mesh.params),
     }))
 }
 
@@ -185,22 +186,21 @@ fn probe_points(options: &BedMeshOptions) -> Result<Vec<(f64, f64)>, ApiError> {
     generate_points(options).map_err(|err| ApiError::CommandError(err.to_string()))
 }
 
-/// The `mesh_params` of a loaded grid: upstream's `mesh_config` plus the
-/// bounds of the probed points (`bed_mesh.py:676-686`).
-fn mesh_params(options: &BedMeshOptions, points: &[(f64, f64)]) -> Value {
-    let [x_count, y_count] = options.counts();
-    let (min_x, max_x, min_y, max_y) = bounds(points);
+/// The `mesh_params` of the loaded grid — `z_mesh.get_mesh_params()`
+/// (`bed_mesh.py:296-302`): the parameters the grid was sampled with, whose
+/// `min_x`…`max_y` are the bounds of its probe points (`bed_mesh.py:668-671`).
+fn mesh_params(params: &MeshParams) -> Value {
     json!({
-        "min_x": min_x,
-        "max_x": max_x,
-        "min_y": min_y,
-        "max_y": max_y,
-        "x_count": x_count,
-        "y_count": y_count,
-        "mesh_x_pps": options.mesh_pps[0],
-        "mesh_y_pps": options.mesh_pps[1],
-        "algo": options.algorithm,
-        "tension": options.bicubic_tension,
+        "min_x": params.min_x,
+        "max_x": params.max_x,
+        "min_y": params.min_y,
+        "max_y": params.max_y,
+        "x_count": params.x_count,
+        "y_count": params.y_count,
+        "mesh_x_pps": params.mesh_x_pps,
+        "mesh_y_pps": params.mesh_y_pps,
+        "algo": params.algo.name(),
+        "tension": params.tension,
     })
 }
 
@@ -227,24 +227,6 @@ fn mesh_config(options: &BedMeshOptions) -> Value {
         "origin": origin,
         "radius": options.mesh_radius,
     })
-}
-
-/// The bounds of the probe points — upstream takes `min_x`…`max_y` from the
-/// generated points too (`bed_mesh.py:676-680`).
-fn bounds(points: &[(f64, f64)]) -> (f64, f64, f64, f64) {
-    let mut bounds = (
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-        f64::INFINITY,
-        f64::NEG_INFINITY,
-    );
-    for (x, y) in points {
-        bounds.0 = bounds.0.min(*x);
-        bounds.1 = bounds.1.max(*x);
-        bounds.2 = bounds.2.min(*y);
-        bounds.3 = bounds.3.max(*y);
-    }
-    bounds
 }
 
 // ===========================================================================
@@ -414,6 +396,103 @@ mod tests {
             })
         );
         assert_eq!(answer["profiles"], json!({}));
+    }
+
+    /// A machine whose config carries a `[bed_mesh <name>]` profile of another
+    /// scale, read at load — the grid a `LOAD=` installs instead of the
+    /// running configuration's.
+    fn printer_with_stored_profile(text: &str) -> (Arc<Printer>, Arc<GCodeDispatch>) {
+        use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
+        use crate::core::klippy::config::{AccessTracking, Config};
+
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        printer
+            .add_object(
+                GCODE_OBJECT,
+                Arc::new(GCodeDispatch::new(Arc::clone(&printer))),
+            )
+            .unwrap();
+        let configfile = Arc::new(PrinterConfig::new(
+            AccessTracking::shared(),
+            serde_json::Map::new(),
+        ));
+        printer
+            .add_object(
+                CONFIGFILE_OBJECT,
+                Arc::clone(&configfile) as Arc<dyn PrinterObject>,
+            )
+            .unwrap();
+        let (config, _) = Config::from_text(text).expect("the test config parses");
+        let bed_mesh = config
+            .get_section("bed_mesh")
+            .expect("a [bed_mesh] section");
+        let wrapper = ConfigWrapper::with_config(
+            bed_mesh,
+            AccessTracking::shared(),
+            Some(configfile),
+            &config,
+        );
+        let bed = Arc::new(BedMesh::new(&wrapper, &printer).expect("the test section is valid"));
+        printer.add_object(BED_MESH_OBJECT, bed).unwrap();
+        printer.send_event(&crate::core::klippy::event::KlippyEvent::KlippyReady);
+        let gcode = printer
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        (printer, gcode)
+    }
+
+    /// `mesh_params` is the **loaded** grid's parameters, not the running
+    /// configuration's: a `4×4` profile over `10…250`/`20…200` reports its own
+    /// bounds after `LOAD=`, while `calibration.config` keeps the configured
+    /// `mesh_min`/`mesh_max` (`bed_mesh.py:296-302`, `bed_mesh.py:629-641`).
+    #[tokio::test]
+    async fn test_mesh_params_follow_the_loaded_grid_and_the_config_keeps_its_bounds() {
+        let (printer, gcode) = printer_with_stored_profile(
+            "[bed_mesh]\nmesh_min: 0,0\nmesh_max: 100,100\nprobe_count: 3,3\n\
+             [bed_mesh shop]\nversion: 1\npoints:\n\
+             \x20 0.100000, 0.200000, 0.300000, 0.400000\n\
+             \x20 0.500000, 0.600000, 0.700000, 0.800000\n\
+             \x20 0.900000, 1.000000, 1.100000, 1.200000\n\
+             \x20 1.300000, 1.400000, 1.500000, 1.600000\n\
+             min_x: 10.0\nmax_x: 250.0\nmin_y: 20.0\nmax_y: 200.0\n\
+             x_count: 4\ny_count: 4\nmesh_x_pps: 1\nmesh_y_pps: 1\n\
+             algo: direct\ntension: 0.2\n",
+        );
+
+        gcode
+            .run_script("BED_MESH_PROFILE LOAD=shop")
+            .await
+            .expect("the stored profile loads");
+
+        let answer = dump(
+            Arc::clone(&printer),
+            r#"{"method":"bed_mesh/dump_mesh","params":{"mesh_args":{}}}"#,
+        )
+        .await
+        .unwrap();
+
+        // The loaded grid's own bounding box, not the running config's.
+        assert_eq!(
+            answer["current_mesh"]["mesh_params"],
+            json!({
+                "min_x": 10.0, "max_x": 250.0,
+                "min_y": 20.0, "max_y": 200.0,
+                "x_count": 4, "y_count": 4,
+                "mesh_x_pps": 1, "mesh_y_pps": 1,
+                "algo": "direct", "tension": 0.2
+            })
+        );
+        // `calibration` still describes the configuration being run.
+        assert_eq!(
+            answer["calibration"]["config"]["mesh_min"],
+            json!([0.0, 0.0])
+        );
+        assert_eq!(
+            answer["calibration"]["config"]["mesh_max"],
+            json!([100.0, 100.0])
+        );
+        assert_eq!(answer["calibration"]["config"]["x_count"], 3);
+        assert_eq!(answer["calibration"]["config"]["algo"], "lagrange");
     }
 
     /// The profile manager's own answer, not a hard-coded `{}`: a saved profile

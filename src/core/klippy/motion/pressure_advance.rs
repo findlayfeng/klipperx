@@ -178,12 +178,13 @@ impl ExtruderPressureAdvance {
 }
 
 /// Half the smoothing window, from the newest schedule entry — upstream keeps
-/// one `half_smooth_time` per solver (`kin_extruder.c:143-145`) — or zero when
+/// one `half_smooth_time` per solver (`kin_extruder.c:144-145`) — or zero when
 /// pressure advance is off.
 ///
-/// The step generator also reads it as the extruder's generation window
-/// (`generation_window`): the same `hst` is how far the smoothing reaches past
-/// the first and last active move.
+/// The extruder's step generation window is the same number: the smoothing
+/// reaches `hst` past the first and last active move
+/// ([`StepKinematics::effective_generation_window`](super::itersolve::StepKinematics::effective_generation_window)
+/// derives it from the live parameters).
 pub(crate) fn half_smooth_time(schedule: &[PressureAdvanceEntry]) -> f64 {
     match schedule.last() {
         Some(entry) => 0.5 * entry.smooth_time,

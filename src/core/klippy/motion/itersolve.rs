@@ -218,7 +218,7 @@ impl StepKinematics {
     /// [`StepKinematics::generate_steps`] uses it: the live half smooth time
     /// for a pressure-advance stepper — upstream rewrites both
     /// `gen_steps_pre_active`/`gen_steps_post_active` from it on every
-    /// `SET_PRESSURE_ADVANCE` (`kin_extruder.c:142-145`) — else the stored
+    /// `SET_PRESSURE_ADVANCE` (`kin_extruder.c:144-145`) — else the stored
     /// [`StepKinematics::generation_window`].
     ///
     /// The motion queue's scan pass reads it
@@ -382,7 +382,7 @@ impl StepKinematics {
         };
         let first_queued = cuts.len().saturating_sub(trapq.moves().len());
         // Upstream rewrites both fields from the live `hst` on every
-        // `SET_PRESSURE_ADVANCE` (`kin_extruder.c:143-145`), so the extruder's
+        // `SET_PRESSURE_ADVANCE` (`kin_extruder.c:144-145`), so the extruder's
         // window is derived from the live values here rather than cached in the
         // stepper: a change is then in force for the very next flush, and the
         // queue's scan pass reads the same window

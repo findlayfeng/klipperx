@@ -1461,12 +1461,13 @@ impl PrinterObject for ToolHeadObject {
 
             // Every stepper is in the queue now, so scan their step generation
             // windows once (`motion_queuing.check_step_generation_scan_windows`,
-            // `motion_queuing.py:126-140`). This is where upstream's extruder
-            // `_handle_connect` leaves the state (`kinematics/extruder.py:57`
-            // via `_set_pressure_advance`): an extruder configured with
-            // pressure advance has its half smooth time as its window, and the
-            // scan is what puts it into the flush delay. It cannot run at the
-            // stepper's own connect — the planner holds no stepper then.
+            // `motion_queuing.py:126-138`). This is where upstream's extruder
+            // `_handle_connect` leaves the state (`kinematics/extruder.py:41-42`
+            // → `_set_pressure_advance` → the scan at `:82`): an extruder
+            // configured with pressure advance has its half smooth time as its
+            // window, and the scan is what puts it into the flush delay. It
+            // cannot run at the stepper's own connect — the planner holds no
+            // stepper then.
             toolhead.recompute_scan_windows();
 
             // The auto-enable chain (`MCU_stepper.add_active_callback`):
@@ -1960,13 +1961,13 @@ impl ToolHeadObject {
 
     /// Rescan the steppers' step generation windows and update the flush delay
     /// (`motion_queuing.check_step_generation_scan_windows`,
-    /// `motion_queuing.py:126-140`).
+    /// `motion_queuing.py:126-138`).
     ///
     /// Upstream calls it from the places a window changes: the extruder's
-    /// `_handle_connect`, its `_set_pressure_advance` and its
-    /// `sync_to_extruder` (`kinematics/extruder.py:57,66,82`), plus
-    /// `input_shaper`'s two. The window decides how far a printing change can
-    /// still rewrite generated steps
+    /// `_set_pressure_advance` (`kinematics/extruder.py:82`, which
+    /// `_handle_connect` reaches at `:41-42`) and its `sync_to_extruder`
+    /// (`:57,66`), plus `input_shaper`'s two. The window decides how far a
+    /// change to the smoothing can still rewrite generated steps
     /// ([`crate::core::klippy::motion::toolhead::ToolHead::recompute_scan_windows`]).
     ///
     /// Before connect there is no planner and nothing to scan.
@@ -2960,7 +2961,7 @@ impl Connected {
         let step_gen_time = self.horizon(self.toolhead.print_time(), start_time);
         let batches = self.toolhead.flush_step_generation(step_gen_time)?;
         // History is only final outside the widest stepper window
-        // (`_advance_flush_time`, `motion_queuing.py:157-158`: `trapq_free_time
+        // (`_advance_flush_time`, `motion_queuing.py:152,155`: `trapq_free_time
         // = step_gen_time - kin_flush_delay`): a step inside that window can
         // still be rewritten by a smoothing change.
         let trapq_free_time = step_gen_time - self.toolhead.kin_flush_delay();

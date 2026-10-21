@@ -463,8 +463,9 @@ fn set_pressure_advance(
     // a changed smooth time changes how far generated steps are still open to
     // rewriting: rescan and update the flush delay
     // (`motion_queuing.check_step_generation_scan_windows`,
-    // `kinematics/extruder.py:66,82`). Upstream also flushes step generation
-    // first when the smooth time changed (`extruder.py:80-82`); this host has no
+    // `kinematics/extruder.py:82`; the detach/bind scan at `:57,66` has no
+    // counterpart here yet). Upstream also flushes step generation first when
+    // the smooth time changed (`kinematics/extruder.py:79`); this host has no
     // equivalent (a flush here would need the flush task), so only the
     // bookkeeping moves — the wider window holds the print-time floor and the
     // history expiry back instead.

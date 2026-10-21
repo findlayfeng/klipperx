@@ -40,8 +40,8 @@ const MIN_KIN_TIME: f64 = 0.100;
 ///
 /// It is the floor of [`ToolHead::kin_flush_delay`], which upstream starts here
 /// and only raises for a stepper with a wider step generation window
-/// (`motion_queuing.py:120-127`): an extruder's half smooth time
-/// (`kin_extruder.c:142-145`) or an input shaper's pulse span
+/// (`motion_queuing.py:123-138`): an extruder's half smooth time
+/// (`kin_extruder.c:144-145`) or an input shaper's pulse span
 /// (`kin_shaper.c:202-218`). `recompute_scan_windows` runs the same scan over
 /// this toolhead's steppers; with no stepper, or none with a window, the filter
 /// alone is in force.
@@ -183,13 +183,13 @@ pub struct ToolHead {
     /// `_calc_print_time`'s floor (`toolhead.py:263` → `motion_queuing.py:191`).
     last_step_gen_time: f64,
     /// The widest step generation window among the steppers, in seconds —
-    /// upstream's `motion_queuing.kin_flush_delay` (`motion_queuing.py:125-140`),
+    /// upstream's `motion_queuing.kin_flush_delay` (`motion_queuing.py:126-138`),
     /// kept in step by [`Self::recompute_scan_windows`].
     ///
     /// It is added to the print-time floor (`calc_step_gen_restart`,
     /// `motion_queuing.py:190-192`) and subtracted from the trapq free time
     /// before history is expired (`_advance_flush_time`,
-    /// `motion_queuing.py:157-158`): steps inside it may still be rewritten by
+    /// `motion_queuing.py:152,155`): steps inside it may still be rewritten by
     /// a change to the smoothing, so nothing inside it can be treated as
     /// finished.
     kin_flush_delay: f64,
@@ -669,7 +669,7 @@ impl ToolHead {
     }
 
     /// The widest step generation window among this toolhead's steppers
-    /// (`motion_queuing.get_kin_flush_delay`, `motion_queuing.py:124-125`).
+    /// (`motion_queuing.get_kin_flush_delay`, `motion_queuing.py:123-124`).
     ///
     /// Never below the step filter ([`SDS_CHECK_TIME`]), because with no
     /// stepper, or none whose position function reaches past its own move, the
@@ -680,7 +680,7 @@ impl ToolHead {
 
     /// Rescan every stepper's step generation window and keep the widest
     /// (`motion_queuing.check_step_generation_scan_windows`,
-    /// `motion_queuing.py:126-140`).
+    /// `motion_queuing.py:126-138`).
     ///
     /// A stepper's window is how far, in seconds, its steps reach past the
     /// first and last move it is active in: an extruder's half smooth time, an
@@ -1290,7 +1290,7 @@ mod tests {
     }
 
     /// A pressure-advance stepper with `smooth_time`, on the main trapq: the
-    /// window steps are generated over is half of it (`kin_extruder.c:142`).
+    /// window steps are generated over is half of it (`kin_extruder.c:144-145`).
     fn pressure_advance_stepper(
         name: &str,
         oid: u32,
@@ -1303,7 +1303,7 @@ mod tests {
     }
 
     /// The flush delay starts at the step filter and only the scan pass raises
-    /// it (`check_step_generation_scan_windows`, `motion_queuing.py:125-140`):
+    /// it (`check_step_generation_scan_windows`, `motion_queuing.py:126-138`):
     /// with no stepper — and with steppers whose position function reads only
     /// the move it is asked about — it stays at `SDS_CHECK_TIME`.
     #[test]
@@ -1319,7 +1319,7 @@ mod tests {
 
     /// An extruder with pressure advance reaches half a smooth time past the
     /// moves it is active in, and that window is the flush delay
-    /// (`kin_extruder.c:142-145` → `motion_queuing.py:126-140`).
+    /// (`kin_extruder.c:144-145` → `motion_queuing.py:126-138`).
     #[test]
     fn test_a_pressure_advance_stepper_raises_the_flush_delay_to_half_its_smooth_time() {
         let mut toolhead = toolhead();

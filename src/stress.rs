@@ -4717,32 +4717,32 @@ mod tests {
         const DISTANCE_MM: f64 = 5.0;
         const SPEED_MM_S: f64 = 10.0;
 
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_r5_single_axis_move_matches_the_firmware_step_count",
             &r5_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
-        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
-        let mcu = connect(&mcu_config).await.expect("the board identifies");
-        let section = named_stepper(
-            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
-            "stepper_x",
+            |machine| async move {
+                let mcu_config =
+                    resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+                let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+                let mcu = connect(&mcu_config).await.expect("the board identifies");
+                let section = named_stepper(
+                    find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+                    "stepper_x",
+                );
+                move_one_axis(
+                    &mcu_config,
+                    mcu,
+                    &BoardLink::Own,
+                    &pins,
+                    section,
+                    DISTANCE_MM,
+                    SPEED_MM_S,
+                )
+                .await
+                .expect("R5: the firmware's step count must match the move");
+            },
         );
-        move_one_axis(
-            &mcu_config,
-            mcu,
-            &BoardLink::Own,
-            &pins,
-            section,
-            DISTANCE_MM,
-            SPEED_MM_S,
-        )
-        .await
-        .expect("R5: the firmware's step count must match the move");
     }
-
     /// R11 — a short, controlled step soak against a real board.
     ///
     /// `TESTING.md`'s R11 (lines 85-87) asks that continuous stepping leave the
@@ -4780,30 +4780,33 @@ mod tests {
         /// How long the soak drives, in seconds.
         const SECONDS: f64 = 2.0;
 
-        let Some(machine) = crate::hardware_test::acquire(
+        crate::hardware_test::async_case(
             "test_r11_short_soak_holds_a_safe_step_rate",
             &r11_requires(),
-        ) else {
-            return; // reported as HW-IGNORED; the test passes without a board
-        };
-        let mcu_config = resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
-        let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
-        let mcu = connect(&mcu_config).await.expect("the board identifies");
-        let section = named_stepper(
-            find_steppers(machine.config(), "mcu", &mcu, &pins).0,
-            "stepper_x",
+            |machine| async move {
+                let mcu_config =
+                    resolve_mcu(machine.config(), "mcu").expect("the [mcu] section resolves");
+                let pins = build_pin_registry(machine.config()).expect("the pin registry builds");
+                let mcu = connect(&mcu_config).await.expect("the board identifies");
+                let section = named_stepper(
+                    find_steppers(machine.config(), "mcu", &mcu, &pins).0,
+                    "stepper_x",
+                );
+                let rate = step_soak(
+                    &mcu_config,
+                    mcu,
+                    &BoardLink::Own,
+                    &pins,
+                    section,
+                    RATE,
+                    SECONDS,
+                )
+                .await
+                .expect(
+                    "R11: the firmware must hold the safe rate without a shutdown or a lost step",
+                );
+                println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
+            },
         );
-        let rate = step_soak(
-            &mcu_config,
-            mcu,
-            &BoardLink::Own,
-            &pins,
-            section,
-            RATE,
-            SECONDS,
-        )
-        .await
-        .expect("R11: the firmware must hold the safe rate without a shutdown or a lost step");
-        println!("R11: held {rate:.0} steps/s for {SECONDS} s with no shutdown");
     }
 }

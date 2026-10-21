@@ -1249,4 +1249,215 @@ mod tests {
         assert!(config.get_section("display").is_some());
         assert_eq!(DIMENSIONS, (16, 4));
     }
+
+    // -- the emulated panel (software SPI) ---------------------------------
+
+    /// An `lcd_type: emulated_st7920` section: the three `spi_software_*` pins
+    /// and the enable line upstream's `EmulatedST7920` reads
+    /// (`st7920.py:211-227`), overridden by `options`.
+    fn emulated_section(options: &[(&str, &str)]) -> ConfigSection {
+        let mut all = vec![
+            ("lcd_type", "emulated_st7920"),
+            ("spi_software_miso_pin", "PB4"),
+            ("spi_software_mosi_pin", "PB5"),
+            ("spi_software_sclk_pin", "PB3"),
+            ("en_pin", "PC4"),
+        ];
+        all.extend_from_slice(options);
+        display_section(&all)
+    }
+
+    /// An emulated panel on the main MCU.
+    fn emulated_chip(options: &[(&str, &str)]) -> Result<ST7920, ConfigError> {
+        let printer = printer();
+        ST7920::new_emulated(
+            &ConfigWrapper::untracked(&emulated_section(options)),
+            &printer,
+        )
+    }
+
+    /// One SPI frame, as the byte list the firmware is handed: the sync byte,
+    /// then every byte as its high nibble and its low nibble shifted up
+    /// (`st7920.py:230-245`).
+    fn frame(cmds: &[u8], is_data: bool) -> SentMessage {
+        SentMessage {
+            is_data,
+            bytes: spi_frame(cmds, is_data),
+        }
+    }
+
+    #[test]
+    fn test_the_emulated_panel_reads_its_software_spi_bus_and_enable_line() {
+        // The three pins and `en_pin` are required and must sit on one MCU
+        // (`st7920.py:211-224`), and `spi_speed` is bounded below by 100 kHz
+        // (`st7920.py:227`).
+        let chip = emulated_chip(&[]).expect("the panel loads");
+        assert_eq!(chip.get_dimensions(), (16, 4));
+        assert_eq!(chip.sent_message_count(), 0);
+
+        let err = emulated_chip(&[("spi_speed", "99999")])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'spi_speed' in section 'display' must have minimum of 100000"
+        );
+
+        let err = emulated_chip(&[("spi_speed", "500000")]).map(|_| ());
+        assert!(err.is_ok(), "500 kHz is above the minimum: {err:?}");
+
+        let err = emulated_chip(&[("spi_software_sclk_pin", "board2:PB3")])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.to_string(), "st7920 all pins must be on same mcu");
+
+        let err = emulated_chip(&[("en_pin", "board2:PC4")])
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Pin board2:PC4 must be on mcu mcu");
+    }
+
+    #[test]
+    fn test_the_spi_frame_carries_the_sync_byte_and_two_nibbles_per_byte() {
+        // `0xf8` starts a command frame and `0xfa` a data one; each protocol
+        // byte becomes its high nibble then its low nibble shifted up
+        // (`st7920.py:231-244`).
+        assert_eq!(
+            spi_frame(&[0x24, 0x40], false),
+            vec![0xf8, 0x20, 0x40, 0x40, 0x00]
+        );
+        assert_eq!(spi_frame(&[0x20], true), vec![0xfa, 0x20, 0x00]);
+        assert_eq!(
+            spi_frame(&[0x0f, 0xf0], true),
+            vec![0xfa, 0x00, 0xf0, 0xf0, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_the_emulated_panel_draws_the_same_text_bytes() {
+        // The framebuffer and its row halves are the parallel panel's
+        // (`st7920.py:94-97`); the emulated one only changes the transport.
+        let chip = emulated_chip(&[]).expect("the panel loads");
+
+        chip.write_text(14, 0, b"abc");
+        chip.write_text(0, 1, b"two");
+        chip.write_text(15, 2, b"z");
+
+        let framebuffers = chip.framebuffers();
+        assert_eq!(
+            hex(&framebuffers.text.data),
+            format!(
+                "{}{}{}{}{}{}",
+                "20".repeat(14),
+                "6162",
+                "20".repeat(15),
+                "7a",
+                "74776f",
+                "20".repeat(29)
+            )
+        );
+    }
+
+    /// An AVR dictionary with the SPI commands, when this build produced it.
+    fn fake_dictionary() -> Option<std::path::PathBuf> {
+        let dict = klipperx_test_support::test_dicts_dir().join("atmega2560.dict");
+        dict.is_file().then_some(dict)
+    }
+
+    /// The emulated panel against the dictionary-driven fake firmware: the
+    /// power-up commands and the first flush leave as SPI frames, one
+    /// `spi_send` each, with the extended-mode switch riding in the first
+    /// graphics frame (`st7920.py:230-256`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_the_emulated_panel_writes_spi_frames_to_the_fake_firmware() {
+        use crate::core::klippy::api::StartArgs;
+        use crate::core::klippy::extras::display::display::PrinterLCD;
+        use crate::core::klippy::printer::PrinterState;
+        use crate::core::klippy::reactor::TokioReactor;
+
+        let Some(dict) = fake_dictionary() else {
+            return;
+        };
+        let section = emulated_section(&[]);
+        let text = format!(
+            "[mcu]\ntest: dict={}\n[display]\n{}",
+            dict.display(),
+            section
+                .parameters
+                .iter()
+                .map(|(key, value)| format!(
+                    "{key}: {}\n",
+                    match value {
+                        ConfigValue::Single(text) => text.clone(),
+                        other => panic!("unexpected option value {other:?}"),
+                    }
+                ))
+                .collect::<String>()
+        );
+        let config = Config::from_text(&text).expect("the config parses").0;
+        let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+        let printer = Arc::new(Printer::new(reactor));
+        let mut start_args = StartArgs::collect(
+            "display.cfg",
+            None,
+            crate::core::klippy::api::endpoints::info::NO_KLIPPER_PATH,
+        );
+        start_args.debug_output = Some("_test_output".to_string());
+        printer.set_start_args(Arc::new(start_args));
+
+        let outcome = async {
+            printer
+                .load_config(&config)
+                .map_err(|err| err.to_string())?;
+            if tokio::time::timeout(std::time::Duration::from_secs(10), printer.bring_up())
+                .await
+                .is_err()
+            {
+                return Err("bring_up timed out".to_string());
+            }
+            if printer.get_state_message().category != PrinterState::Ready {
+                return Err(format!(
+                    "not ready: {}",
+                    printer.get_state_message().message
+                ));
+            }
+            let display = printer
+                .lookup_object_as::<PrinterLCD>("display")
+                .expect("the display sits under its section id");
+            Ok::<_, String>(display.sent_messages())
+        }
+        .await;
+
+        printer.teardown();
+        let messages = outcome.expect("the panel comes up");
+
+        // The eight power-up commands as one command frame (`st7920.py:63-73`).
+        assert_eq!(
+            messages[0],
+            frame(&[0x24, 0x40, 0x02, 0x26, 0x22, 0x02, 0x06, 0x0c], false)
+        );
+        // Then the first flush: the text page's start command, then the first
+        // sixteen blank cells as data (a space is 0x20, so every byte is `20
+        // 00` in the frame; the run batching caps a run at sixteen bytes,
+        // `st7920.py:43-49`).
+        assert_eq!(messages[1], frame(&[0x80], false));
+        assert_eq!(messages[2], frame(&[b' '; 16], true));
+        // A graphics row is selected in extended mode, so that switch rides in
+        // the frame (`st7920.py:236-240`).
+        assert!(
+            messages
+                .iter()
+                .any(|message| *message == frame(&[0x26, 0x80, 0x80], false)),
+            "no extended-mode graphics frame: {messages:?}"
+        );
+        // Every frame starts with its sync byte: commands 0xf8, data 0xfa.
+        for message in &messages {
+            let sync = if message.is_data {
+                SPI_DATA_SYNC
+            } else {
+                SPI_COMMAND_SYNC
+            };
+            assert_eq!(message.bytes[0], sync, "{message:?}");
+        }
+    }
 }

@@ -390,6 +390,64 @@ mod tests {
         assert_eq!(hex(&base.pages[7].data[72..80]), "0000000000000000");
     }
 
+    // -- the sh1106 geometry -------------------------------------------------
+
+    /// The `lcd_type: sh1106` shape: the same panel with 132 columns and the
+    /// character grid drawn two columns in (`uc1701.py:237-241`).
+    fn sh1106(options: &[(&str, &str)]) -> Result<Ssd1306, ConfigError> {
+        let printer = printer();
+        let mut section = vec![
+            ("lcd_type", "sh1106"),
+            ("reset_pin", "PE3"),
+            ("encoder_pins", "^PG1, ^PG0"),
+            ("click_pin", "^!PD2"),
+        ];
+        section.extend_from_slice(options);
+        Ssd1306::new_sh1106(&wrap(&display_section(&section)), &printer)
+    }
+
+    #[test]
+    fn test_the_sh1106_is_the_132_column_variant_drawn_at_the_x_offset() {
+        // `SH1106.__init__` (`uc1701.py:238-241`) hands 132 columns and
+        // `x_offset` to the SSD1306 constructor; `write_text` starts at
+        // `x * 8 + x_offset` (`uc1701.py:75-76`), and the flush still
+        // addresses each byte by its own position (`uc1701.py:34-52`).
+        let chip = sh1106(&[("x_offset", "2")]).expect("the panel loads");
+
+        assert_eq!(chip.get_dimensions(), (16, 4));
+        chip.write_text(0, 0, b"z");
+
+        let base = chip.base();
+        // Two bytes of RAM before the visible area, then entry 0x7a `z`.
+        assert_eq!(base.pages[0].data.len(), SH1106_COLUMNS);
+        assert_eq!(hex(&base.pages[0].data[..10]), "0000c0c04040c0c04000");
+        assert_eq!(hex(&base.pages[1].data[..10]), "0000080c0e0b090c0c00");
+        assert!(base.pages[0].data[10..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn test_the_sh1106_counts_columns_and_offset_from_the_ssd1306_defaults() {
+        // No option at all: the SH1106 still has 132 columns, at offset 0
+        // (`uc1701.py:239`).
+        let chip = sh1106(&[]).expect("the panel loads");
+        chip.write_text(0, 0, b"z");
+
+        let base = chip.base();
+        assert_eq!(base.pages[0].data.len(), SH1106_COLUMNS);
+        assert_eq!(hex(&base.pages[0].data[..8]), "c0c04040c0c04000");
+    }
+
+    #[test]
+    fn test_the_sh1106_x_offset_keeps_upstreams_bounds() {
+        // `config.getint('x_offset', 0, minval=0, maxval=3)`
+        // (`uc1701.py:239`).
+        let err = sh1106(&[("x_offset", "4")]).map(|_| ()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Option 'x_offset' in section 'display' must have maximum of 3"
+        );
+    }
+
     // -- the two buses -----------------------------------------------------
 
     #[test]

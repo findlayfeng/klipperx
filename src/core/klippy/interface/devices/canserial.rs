@@ -194,6 +194,22 @@ impl CanWire {
         }
     }
 
+    /// The wire whose kernel frame struct is `size` bytes, if either is — how a
+    /// read says which layout to parse.
+    ///
+    /// A link says which wire it is once, but a socket opened for CAN FD is not
+    /// restricted to FD frames: the bus also carries classical ones, and the
+    /// kernel delivers those in the sixteen byte `struct can_frame` rather than
+    /// padded out to the FD struct. So the *length* of a read, not the link's
+    /// configured wire, is what a frame's layout has to come from.
+    fn from_frame_size(size: usize) -> Option<Self> {
+        match size {
+            CAN_FRAME_SIZE => Some(Self::Classical),
+            CAN_FD_FRAME_SIZE => Some(Self::Fd),
+            _ => None,
+        }
+    }
+
     /// The wire's name, as logs and errors spell it.
     fn name(self) -> &'static str {
         match self {
@@ -800,9 +816,21 @@ impl CanSerialDevice {
                 self.id(),
                 describe_can_frame(can_frame.id(), can_frame.data())
             );
-            (&self.socket)
-                .write_all(can_frame.to_abi(self.wire)?.as_bytes())
-                .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))?;
+            let written = can_frame.to_abi(self.wire).and_then(|record| {
+                (&self.socket)
+                    .write_all(record.as_bytes())
+                    .map_err(|e| InterfaceError::SendError(format!("CAN write failed: {e}")))
+            });
+            if let Err(e) = written {
+                // A block goes onto the bus one frame at a time, so a failure
+                // part way through leaves a fragment no MCU can reassemble into a
+                // message — and whatever it did get is enough to knock the node's
+                // reassembly out of step with the byte stream. The link stops here
+                // rather than writing further blocks onto a bus already out of
+                // step.
+                self.stopped.store(true, Ordering::SeqCst);
+                return Err(e);
+            }
         }
         debug!(
             "sent {} bytes as {} CAN frame(s) to {:#x}",
@@ -949,8 +977,8 @@ impl Device for CanSerialDevice {
     }
 
     fn receive(&self) -> Option<Frame> {
-        // The largest datagram either wire delivers; a classical read fills the
-        // first sixteen bytes of it.
+        // The largest datagram either wire delivers; a classical frame fills the
+        // first sixteen bytes of it, whichever wire this link opened.
         let mut raw = [0u8; CAN_FD_FRAME_SIZE];
         loop {
             if self.stopped.load(Ordering::Relaxed) {
@@ -995,26 +1023,31 @@ impl Device for CanSerialDevice {
             }
 
             match (&self.socket).read(&mut raw) {
-                Ok(read) if read >= self.wire.frame_size() => {
-                    let can_frame = CanFrame::from_abi(self.wire, &raw);
-                    if self.link.lock().unwrap().accept(&can_frame) {
-                        // One CAN frame's worth of the block, as the bus carried
-                        // it; the assembled block is logged above, on its way out.
-                        trace!(
-                            "rx can frame [{}]: {}",
-                            self.id(),
-                            describe_can_frame(can_frame.id(), can_frame.data())
-                        );
-                        debug!("received CAN frame of {} bytes", can_frame.data().len());
-                        self.bytes_read
-                            .fetch_add(can_frame.data().len() as u64, Ordering::Relaxed);
-                    } else {
-                        debug!("ignoring CAN frame for id {:#x}", can_frame.id());
+                // One read is one whole frame, and its length names the layout:
+                // sixteen bytes is a classical frame, which an FD link receives
+                // too (the kernel does not widen it to the FD struct).
+                Ok(read) => match CanWire::from_frame_size(read) {
+                    Some(wire) => {
+                        let can_frame = CanFrame::from_abi(wire, &raw);
+                        if self.link.lock().unwrap().accept(&can_frame) {
+                            // One CAN frame's worth of the block, as the bus
+                            // carried it; the assembled block is logged above, on
+                            // its way out.
+                            trace!(
+                                "rx can frame [{}]: {}",
+                                self.id(),
+                                describe_can_frame(can_frame.id(), can_frame.data())
+                            );
+                            debug!("received CAN frame of {} bytes", can_frame.data().len());
+                            self.bytes_read
+                                .fetch_add(can_frame.data().len() as u64, Ordering::Relaxed);
+                        } else {
+                            debug!("ignoring CAN frame for id {:#x}", can_frame.id());
+                        }
                     }
-                }
-                // A short read cannot happen on a datagram socket; treat it as a
-                // frame from someone else rather than guessing.
-                Ok(read) => debug!("ignoring {read} byte CAN read"),
+                    // Neither struct's size: not a frame this link can read.
+                    None => debug!("ignoring {read} byte CAN read"),
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     warn!("CAN read on {} failed: {e}", self.interface);
@@ -1048,8 +1081,16 @@ impl CanSerialDevice {
     /// records, and its device reads the same.
     pub(crate) fn test_wire_on(nodeid: u32, wire: CanWire) -> (Self, UnixStream) {
         let (socket, reader) = UnixStream::pair().expect("a socket pair");
-        let device = Self {
-            socket: File::from(OwnedFd::from(socket)),
+        let device = Self::test_device_on(File::from(OwnedFd::from(socket)), nodeid, wire);
+        (device, reader)
+    }
+
+    /// The same device over `socket`, for a test that needs a bus whose capacity
+    /// it controls — a pipe, whose free room is exact to the byte, rather than a
+    /// socket pair.
+    fn test_device_on(socket: File, nodeid: u32, wire: CanWire) -> Self {
+        Self {
+            socket,
             interface: "test0".to_string(),
             uuid: [0; 6],
             nodeid,
@@ -1061,8 +1102,7 @@ impl CanSerialDevice {
             bytes_read: AtomicU64::new(0),
             bytes_write: AtomicU64::new(0),
             stopped: AtomicBool::new(false),
-        };
-        (device, reader)
+        }
     }
 }
 
@@ -1189,8 +1229,8 @@ impl AdminBus for CanbusAdminSocket {
     }
 
     fn receive(&mut self, wait: Duration) -> Result<Option<CanFrame>, InterfaceError> {
-        // The largest datagram either wire delivers; a classical read fills the
-        // first sixteen bytes of it.
+        // The largest datagram either wire delivers; a classical frame fills the
+        // first sixteen bytes of it, whichever wire this socket opened.
         let mut raw = [0u8; CAN_FD_FRAME_SIZE];
         loop {
             match wait_readable(self.socket.as_raw_fd(), wait) {
@@ -1203,13 +1243,14 @@ impl AdminBus for CanbusAdminSocket {
                 Wait::Closed => return Err(InterfaceError::ConnectionLost),
             }
             match (&self.socket).read(&mut raw) {
-                Ok(read) if read >= self.wire.frame_size() => {
-                    return Ok(Some(CanFrame::from_abi(self.wire, &raw)))
-                }
-                // A datagram socket delivers whole frames, and the filter keeps
-                // everything but the admin answers out; treat a short read as
-                // someone else's frame rather than guessing.
-                Ok(read) => debug!("ignoring {read} byte CAN read"),
+                // One read is one whole frame, and its length names the layout:
+                // sixteen bytes is a classical frame, which an FD socket receives
+                // too (the kernel does not widen it to the FD struct).
+                Ok(read) => match CanWire::from_frame_size(read) {
+                    Some(wire) => return Ok(Some(CanFrame::from_abi(wire, &raw))),
+                    // Neither struct's size: not a frame this socket can read.
+                    None => debug!("ignoring {read} byte CAN read"),
+                },
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     return Err(InterfaceError::Other(format!(
@@ -2436,6 +2477,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(device.receive(), Some(block));
+    }
+
+    #[test]
+    fn test_the_can_fd_wire_reads_a_classical_frame_in_sixteen_bytes() {
+        // A socket opened for CAN FD is not restricted to FD frames: the bus also
+        // carries classical ones, and the kernel delivers those in the sixteen
+        // byte `struct can_frame` — it does not widen them to the FD struct. So
+        // the *length* of a read says which layout to parse, and a link that went
+        // by its configured wire alone would drop this frame as a short read.
+        let (device, mut wire) = CanSerialDevice::test_wire_on(7, CanWire::Fd);
+        let block = message(3, &[0x11, 0x22, 0x33]);
+        assert_eq!(
+            block.raw_bytes().len(),
+            CAN_DATA_BYTES,
+            "the whole block is one classical frame's worth"
+        );
+
+        let record = CanFrame::new(device.rx_id(), &block.raw_bytes()).unwrap();
+        let abi = record.to_abi(CanWire::Classical).unwrap();
+        assert_eq!(abi.as_bytes().len(), CAN_FRAME_SIZE);
+        (&mut wire).write_all(abi.as_bytes()).unwrap();
+
+        assert_eq!(device.receive(), Some(block));
+        assert_eq!(device.bytes_read(), CAN_DATA_BYTES as u64);
+    }
+
+    /// A pipe of `room` free bytes, standing in for the socket: its free room is
+    /// exact to the byte, which is what makes a *particular* frame's write fail.
+    ///
+    /// The write end is non-blocking, so a write that cannot fit reports
+    /// `EAGAIN` instead of waiting for room that never comes. Returns the two ends
+    /// and the pipe's capacity, which is what is already in it once filled.
+    #[cfg(test)]
+    fn pipe_with_room_for(room: usize) -> (File, File, usize) {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `pipe2` writes two fds into an array of two.
+        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK) };
+        assert_eq!(rc, 0, "a pipe: {}", std::io::Error::last_os_error());
+        // SAFETY: both fds are fresh and owned here, each taken into a `File`
+        // exactly once.
+        let (read_end, write_end) =
+            unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        // The smallest pipe the kernel allows, so that filling it stays bounded.
+        // SAFETY: a plain (fd, command, argument) call on an fd owned above.
+        unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
+        // SAFETY: `F_GETPIPE_SZ` takes no argument and returns the capacity.
+        let capacity = unsafe { libc::fcntl(write_end.as_raw_fd(), libc::F_GETPIPE_SZ) };
+        assert!(capacity > 0, "the pipe's capacity is readable");
+        let capacity = capacity as usize;
+        assert!(
+            capacity >= 2 * room,
+            "a {capacity} byte pipe has room for a fill plus {room} bytes"
+        );
+        (&write_end)
+            .write_all(&vec![0u8; capacity - room])
+            .expect("filling the pipe up to `room` free bytes");
+        (read_end, write_end, capacity)
+    }
+
+    #[test]
+    fn test_a_block_whose_write_fails_part_way_stops_the_link() {
+        // A block goes onto the bus one frame at a time, so a write that fails
+        // half way leaves a fragment no MCU can reassemble — and the link must
+        // not go on writing more blocks onto it. Here the fake socket has room
+        // for exactly one sixteen byte record, so the block's first frame lands
+        // and its second one fails.
+        let (read_end, write_end, capacity) = pipe_with_room_for(CAN_FRAME_SIZE);
+        let device = CanSerialDevice::test_device_on(write_end, 7, CanWire::Classical);
+
+        // Eighteen bytes: two full frames and a two byte tail, three records.
+        let block = message(1, &[0u8; 13]);
+        assert_eq!(block.raw_bytes().len(), 18);
+
+        let err = device
+            .send(&block)
+            .expect_err("the second frame has nowhere to go");
+        assert!(matches!(err, InterfaceError::SendError(_)), "{err:?}");
+        assert!(
+            device.stopped.load(Ordering::Relaxed),
+            "a half written block stops the link"
+        );
+        assert_eq!(
+            device.bytes_write(),
+            0,
+            "the block is not counted as written"
+        );
+
+        // The pipe's filler, then exactly one record: the block's first frame and
+        // nothing of the two after it.
+        let mut wire = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match (&read_end).read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => wire.extend_from_slice(&chunk[..read]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("reading the fake bus failed: {e}"),
+            }
+        }
+        assert_eq!(
+            wire.len(),
+            capacity,
+            "the pipe holds its filler plus one record, so one frame was written"
+        );
+        let first_frame = CanFrame::new(
+            device.link.lock().unwrap().tx_id(),
+            &block.raw_bytes()[..CAN_DATA_BYTES],
+        )
+        .unwrap();
+        assert_eq!(
+            &wire[capacity - CAN_FRAME_SIZE..],
+            first_frame.to_abi(CanWire::Classical).unwrap().as_bytes(),
+            "the fragment is the block's first frame"
+        );
+
+        // The link is not used again: the next block is refused before a byte of
+        // it can join the fragment on the bus.
+        assert!(matches!(
+            device.send(&message(2, &[1, 2])),
+            Err(InterfaceError::ConnectionLost)
+        ));
     }
 
     #[test]

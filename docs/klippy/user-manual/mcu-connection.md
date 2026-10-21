@@ -34,7 +34,7 @@ CAN 这条走的是 klipper 的 **can serial** 链路（就像把串口协议搬
 
 **`canbus_fd` 把「链路层」拆出来**（本仓扩展，上游无对应）：它选链路（经典 8 B/帧 / CAN-FD 64 B/帧，一帧 64 B 直接装下上限 64 B 的 Klipper 消息），传输层仍是 Klipper 的 can-serial 字节流切片。不写它就是今天的经典 CAN，逐字节不变。
 
-节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。
+节点号到仲裁 ID 的映射也沿用 Klipper：`0x100 + 2 × nodeid`，主机写这个 ID、MCU 用下一个回；这个映射在主机侧单一定义于 `assign.rs`（CAN 与共享串口共用，`canserial.rs` 不再自带常量），打开 CAN 链路前会校验节点号落在 `1..=255`，越界即报错而不是拼出一个非法仲裁 ID。节点号由主机通过 admin ID `0x3f0` 的 `CMD_SET_NODEID` 报文指派，所以配置里 `uuid` 是必需的（节点号本身可由 `[mcu_ids]` 分配、不必写；历史拼写 `[canbus_ids]` 仍兼容）。**注意指派是 fire-and-forget**：主机发 `SET_NODEID` 后**不读回** `canbus_uuid` 校验（上游会读回、不符则重连），只用 3 × 200 ms 有界重发兜丢帧；“这条指派到底落在哪块板”的主机侧证据由随后的 identify 提供（`uuid` 已写在节里，不吻合则后续对话对不上）。
 
 节点号在本仓是 **MCU 层 id**：每个 `[mcu]`（不论接口）在装载期都被分配一个唯一 id（所有接口共用同一个序列，`mcu/ids.rs`），`connect` 打开传输层之前必须持有它——CAN 用它做节点寻址（admin 帧），**共享串口**用下节的帧头与**分配期握手**把 id 交给设备、并拿它做寻址，**独占串口不使用它**；`host_library` 与 `test:` **同样领到 id、只是暂不上线**（id 是每个 `[mcu]` 的属性——`connect` 没有它就不开传输层；判定为 **mux** 的 host 库路径**连接时就按 id 寻址**：装载期指派身份、`init` 前投递给库、`SET_NODEID` + 重确认握手、之后收发带帧头——只有 `test:` 恒不用这个号）。显式 `canbus_nodeid` 就是这个 id 的显式覆盖（**仅 CAN 节**——写到 `serial`/`host_library`/`test` 节上会被判为"第二个接口"而在装载期报错）：分配器
 在装载时预扫全配置、先把所有显式号保留下来（`reserve_explicit`），自动号取 `4` 起的

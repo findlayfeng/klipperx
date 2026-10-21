@@ -91,7 +91,7 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 | H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_*` 四型（开关/运动/hall/tsl1401cl）、`trigger_analog` 三件套、**固件按钮查询（2026-10-21）**均已落地；余项＝`query_adc`（模拟按键）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
 | H8 | LCD 显示与菜单（display/*）——**✅ 收官（2026-10-21）**：六个驱动全会画（`VGA_FONT` 已 vendor）、菜单引擎 + 渲染通路 + 菜单行绘制、`[display_data]`/`[display_glyph]` 主配置 factory；余项只剩 `emulated_st7920`/`sh1106` 两种面板类型（`lcd_type` 接受但报缺口），见 H8 节 | — |
 | H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`extruder_stepper` 宿主同步缝、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
+| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择 + `extruder_stepper` 宿主同步缝（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
 | H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
 | H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
 
@@ -418,8 +418,14 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       **余项**：自带回零（`STOP_ON_ENDSTOP` 仍明示拒绝——缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - [x] `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
       trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
-- [ ] `extruder_stepper.py`：**段已落地**（2026-09-24 批 #2），宿主 step 同步的 toolhead 缝仍缺
-      （不跟随 extruder 运动）。
+- [x] **`extruder_stepper.py` 的宿主 step 同步缝 —— 已落地（2026-10-21）**：照 `[extruder]` 的样板
+      （`take_stepper()` 交接），`ToolHead::connect` 在挤出机循环之后把每个 `[extruder_stepper]` 电机收到
+      它绑定的挤出机 trapq 上（未绑 ⇒ `set_trapq(None)`，生成器自动跳过）；运行期 `SYNC_EXTRUDER_MOTION`
+      经新增的 `ToolHeadObject::sync_stepper_to_trapq(name, trapq, position)` 重指（flush → 位置 → 队列 →
+      生成地平线一次到位），`SET_EXTRUDER_ROTATION_DISTANCE` 同步改步距。同批两处既有缺陷：
+      ① `ToolHead::set_position` 的跳过判据从「名字命中 extra_axes」改成 **`trapq_id() != Some(main_trapq)`**
+      （否则 `G28` 会把同步电机的 E=7 写成 −0.0039 ⇒ 零间隔 124 步 ⇒ `Invalid sequence`，语料 `extruders` 用例即此）；
+      ② `motion::Stepper` 的 `step_dist` 副本删掉，`step_dist()`/`mcu_position()` 直接读 `StepKinematics::step_dist`（同一状态只留一份）。
 - [x] **extra-axes 余项已于 2026-10-21 收官**：`MAX_AXES` 16、`G1_PARAMS` 补全、`reset_last_position` 尾巴——
       唯一登记处仍是 G4-2。
 - [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、

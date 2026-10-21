@@ -1001,7 +1001,7 @@ pins: PA1, my_alias
 | `extruder` | `extruder` | 绑定的挤出机名（connect 期校验，上游文案 `'<名>' is not a valid extruder.`） |
 | `pressure_advance` / `pressure_advance_smooth_time` | `0.` / `0.040` | 本步进**自有**的压力推进（不继承 `[extruder]`，依据上游 `kinematics/extruder.py:12-16`）；2026-10-21 起**真驱动自己的求解器**：装载时 `0` 时刻落表（对齐上游 `_handle_connect` 的 `espa(sk, 0., …)`），`SET_PRESSURE_ADVANCE` 与主挤出机共用同一条应用路径（改值→上报立即、落表排 lookahead；`smooth_time` 变更→flush + 从头重算）；`pa = 0` 走逐点名义位置 |
 
-段已落地（批 #2）；`SET_PRESSURE_ADVANCE [EXTRUDER=<段名>]` 按名挂值 ✓；宿主 step 同步待 toolhead 缝（H10），`SYNC_EXTRUDER_MOTION`/`SET_EXTRUDER_ROTATION_DISTANCE` 未注册。
+段已落地（批 #2）；`SET_PRESSURE_ADVANCE [EXTRUDER=<段名>]` 按名挂值 ✓；**宿主 step 同步 2026-10-21 落地**：`ToolHead::connect` 把本段电机收到绑定挤出机的 trapq 上（未绑 ⇒ 不挂在任何 trapq、生成器跳过），`SYNC_EXTRUDER_MOTION EXTRUDER=<挤出机> STEPPER=<本段> MOTION_QUEUE=<名|''>` 运行期重指/解绑，`SET_EXTRUDER_ROTATION_DISTANCE [EXTRUDER=<段名>]` 改步距后步数换算跟着变。
 
 ### [exclude_object]
 

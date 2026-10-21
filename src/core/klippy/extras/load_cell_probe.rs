@@ -1609,6 +1609,7 @@ pub fn load_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::klippy::api::test_support::RecordingTarget;
     use crate::core::klippy::cmd::clock::McuClock;
     use crate::core::klippy::config::{AccessTracking, Config, ConfigSection, ConfigValue};
     use crate::core::klippy::gcode::{GCodeDispatch, GCODE_OBJECT};
@@ -1914,6 +1915,186 @@ mod tests {
         assert!((z_contact - 0.25).abs() <= 0.01, "z_contact={z_contact}");
         assert!(below >= FIT_MIN_POINTS, "below={below}");
         assert!(above >= FIT_MIN_POINTS, "above={above}");
+    }
+
+    // ------------------------------------------------------------------
+    // The tap event (`load_cell_probe/dump_taps`)
+    // ------------------------------------------------------------------
+
+    /// The probe's `load_cell_probe/dump_taps` registration, out of the
+    /// initial load's pending list (`WebhooksStatus`).
+    fn tap_registration(machine: &Arc<Printer>) -> webhooks::MuxRegistration {
+        let webhooks = machine
+            .lookup_object_as::<webhooks::WebhooksStatus>(webhooks::WEBHOOKS_OBJECT)
+            .expect("the probe installs `webhooks`");
+        webhooks
+            .take_mux_endpoints()
+            .into_iter()
+            .find(|registration| registration.path == DUMP_TAPS_ENDPOINT)
+            .expect("the probe registers the tap endpoint")
+    }
+
+    /// One `load_cell_probe/dump_taps` request, as a client sends it.
+    async fn subscribe_taps(
+        handler: &Arc<dyn MuxEndpoint>,
+        target: Arc<RecordingTarget>,
+    ) -> Result<Value, ApiError> {
+        let api = crate::core::klippy::api::registry::Api::new();
+        let request = Request::parse(
+            br#"{"method":"load_cell_probe/dump_taps","params":{"load_cell_probe":"load_cell_probe"}}"#,
+        )
+        .expect("test body is a valid request");
+        let context = EndpointContext {
+            api: &api,
+            client: target as Arc<dyn PushTarget>,
+        };
+        handler.handle(&request, &context).await
+    }
+
+    /// `TappingMove.__init__`'s `add_mux_endpoint`: the instance is the
+    /// section's full name under the `load_cell_probe` key, and the greeting
+    /// carries the `probe_tap_event` header.
+    #[tokio::test]
+    async fn the_tap_endpoint_is_registered_for_the_probe_with_the_tap_header() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        assert_eq!(registration.key, DUMP_TAPS_KEY);
+        assert_eq!(registration.value.as_deref(), Some("load_cell_probe"));
+        // Nothing is pushed before the first tap: the stream only carries
+        // what a measurement produced (upstream sends in `run_tap`).
+        let target = RecordingTarget::new();
+        let reply = subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+        assert_eq!(reply, json!({ "header": ["probe_tap_event"] }));
+        assert_eq!(probe.tap_events.client_count(), 1);
+        assert!(target.pushes().is_empty(), "no tap has run yet");
+    }
+
+    /// Each tap pushes its own collected window as `{'tap': {'time',
+    /// 'force', 'is_valid'}}` (`TappingMove.run_tap` → `TapAnalysis`).
+    #[tokio::test]
+    async fn a_tap_pushes_its_window_as_time_and_force_columns() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        let target = RecordingTarget::new();
+        subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+
+        // Two taps, each with the `[time, force, counts]` rows a collector
+        // hands the analysis; the counts column is not part of the event.
+        let first = [
+            [10.0, 0.0, 1000.0],
+            [10.001, 74.5, 8450.0],
+            [10.002, 75.0, 8500.0],
+        ];
+        let second = [[10.2, 0.5, 1050.0], [10.201, 30.25, 4025.0]];
+        probe.send_tap(&first);
+        probe.send_tap(&second);
+
+        let pushes = target.pushes();
+        assert_eq!(pushes.len(), 2, "one event per tap, nothing coalesced");
+        assert_eq!(
+            pushes[0]["params"]["tap"],
+            json!({
+                "time": [10.0, 10.001, 10.002],
+                "force": [0.0, 74.5, 75.0],
+                "is_valid": true,
+            })
+        );
+        assert_eq!(
+            pushes[1]["params"]["tap"],
+            json!({
+                "time": [10.2, 10.201],
+                "force": [0.5, 30.25],
+                "is_valid": true,
+            })
+        );
+    }
+
+    /// `LOAD_CELL_TEST_TAP` is registered with upstream's help string and its
+    /// two parameters (`LoadCellProbeCommands`).
+    #[test]
+    fn the_load_cell_test_tap_command_is_registered() {
+        let (machine, _probe) = corpus_probe();
+        let gcode = machine
+            .lookup_object_as::<GCodeDispatch>(GCODE_OBJECT)
+            .unwrap();
+        assert_eq!(
+            gcode
+                .command_help()
+                .get("LOAD_CELL_TEST_TAP")
+                .map(String::as_str),
+            Some("Tap the load cell probe to verify operation")
+        );
+    }
+
+    /// No hardware: a tap that collected nothing is an empty event, not a
+    /// panic, and an endpoint whose probe is gone answers an error instead of
+    /// panicking.
+    #[tokio::test]
+    async fn an_empty_tap_and_a_dropped_probe_do_not_panic() {
+        let machine = printer();
+        let registration;
+        {
+            let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+            registration = tap_registration(&machine);
+            let target = RecordingTarget::new();
+            subscribe_taps(&registration.handler, Arc::clone(&target))
+                .await
+                .unwrap();
+            // A probe that was never sampled (no MCU, no sensor data).
+            probe.send_tap(&[]);
+            let pushes = target.pushes();
+            assert_eq!(pushes.len(), 1);
+            assert_eq!(
+                pushes[0]["params"]["tap"],
+                json!({ "time": [], "force": [], "is_valid": true })
+            );
+        }
+        // The configuration is gone (or was never wired): the registration
+        // outlives it, but the fan-out does not.
+        let target = RecordingTarget::new();
+        let err = subscribe_taps(&registration.handler, target)
+            .await
+            .expect_err("a probe that is gone takes no client");
+        assert_eq!(
+            err,
+            ApiError::Internal("the load cell probe is gone".to_string())
+        );
+    }
+
+    /// A dropped registration stops the fan-out and answers the unknown
+    /// instance afterwards, like the `load_cell/dump_force` instance does.
+    #[tokio::test]
+    async fn a_detached_tap_endpoint_stops_the_fan_out() {
+        let machine = printer();
+        let probe = LoadCellProbe::new(&wrap(None, &CORPUS), &machine).unwrap();
+        let registration = tap_registration(&machine);
+        let target = RecordingTarget::new();
+        subscribe_taps(&registration.handler, Arc::clone(&target))
+            .await
+            .unwrap();
+        assert_eq!(probe.tap_events.client_count(), 1);
+
+        registration.handler.detach();
+        assert_eq!(probe.tap_events.client_count(), 0);
+        probe.send_tap(&[[0.0, 1.0, 1000.0]]);
+        assert!(target.pushes().is_empty(), "a detached fan-out is silent");
+
+        let err = subscribe_taps(&registration.handler, RecordingTarget::new())
+            .await
+            .expect_err("a detached instance takes no client");
+        assert_eq!(
+            err,
+            ApiError::UnknownMuxValue {
+                key: DUMP_TAPS_KEY.to_string(),
+                value: "load_cell_probe".to_string(),
+            }
+        );
     }
 
     // ------------------------------------------------------------------

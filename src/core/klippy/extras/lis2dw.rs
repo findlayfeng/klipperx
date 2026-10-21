@@ -5,7 +5,7 @@
 //! | piece | upstream |
 //! |---|---|
 //! | [`Lis2dw`] — `cs_pin` selects SPI, its absence I2C; `axes_map`; the chip's fixed rate | `LIS2DW.__init__` |
-//! | [`chip_type_for_section`] / [`load_config_lis3dh`] | `lis3dh.py`'s `load_config` / `load_config_prefix` |
+//! | [`load_config_lis3dh`] / [`load_config_prefix_lis3dh`] | `lis3dh.py`'s `load_config` / `load_config_prefix` |
 //! | [`read_axes_map`] / [`AccelQueryHelper`] / [`AccelSample`] | `adxl345.read_axes_map` / `AccelQueryHelper` (reused, as upstream imports them) |
 //! | [`Lis2dw::start_internal_client`] | `LIS2DW.start_internal_client` |
 //! | [`convert_samples`] | `LIS2DW._convert_samples` |
@@ -20,6 +20,15 @@
 //! [`LisChipType`] the factory picks. The type decides the device id, the
 //! sample scale, the fixed output data rate, and the register/FIFO layout; the
 //! firmware gets it as `config_lis2dw`'s `lis_chip_type`.
+//!
+//! The section id is the only difference on the host side, and it stops at the
+//! mux endpoint: a `[lis3dh]` sensor also streams on `lis2dw/dump_lis2dw`, as
+//! upstream's single `add_mux_endpoint` call means it must.
+//!
+//! The G-Code commands upstream registers through `adxl345.AccelCommandHelper`
+//! (`ACCELEROMETER_MEASURE` / `ACCELEROMETER_QUERY` / `ACCELEROMETER_DEBUG_READ`
+//! / `ACCELEROMETER_DEBUG_WRITE`) are not registered by this section, exactly as
+//! `[adxl345]`/`[mpu9250]` leave them out.
 //!
 //! # The sample path
 //!

@@ -43,15 +43,6 @@ impl LisBusType {
             Self::I2c => 1,
         }
     }
-
-    /// The name upstream logs and passes as `bus_oid_type`
-    /// (`SPI_SERIAL_TYPE` / `I2C_SERIAL_TYPE`).
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Spi => "spi",
-            Self::I2c => "i2c",
-        }
-    }
 }
 
 /// Which chip the driver is talking to (`DECL_ENUMERATION("lis_chip_type", …)`).
@@ -76,8 +67,9 @@ impl LisChipType {
         }
     }
 
-    /// The section name that selects this chip, and the name upstream logs
-    /// (`lis2dw` / `lis3dh`).
+    /// The section name that selects this chip — also the driver's name in its
+    /// messages and log lines (`lis2dw` / `lis3dh`; upstream spells the same
+    /// chip types `LIS2DW`/`LIS3DH` in its log lines).
     pub fn name(self) -> &'static str {
         match self {
             Self::Lis2dw => "lis2dw",

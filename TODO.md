@@ -55,7 +55,7 @@
 | # | 事项 | 依赖 |
 |---|---|---|
 | H11 | 主机运行时与调试：两条 2026-10-22 运行时小件，见 [H11 节](#h11-主机运行时与调试) | — |
-| S2 | 文档补齐（非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审 | — |
+| S2 | 文档补齐（非新功能）：开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的陈旧行未逐条重审（本轮只修了与已删条目强相关的那些） | — |
 | S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
 | S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**）；R8 回放 | S3 |
 | S6 | 运行时临时产物收口（**暂缓，2026-10-19 登记**）：`/tmp` 侧有 `kx-start.log`（每次手动拉 klippy 重新生成）、活连接文件 `klippy_uds` 与 Moonraker 的 `moonraker_instance_ids`、harness 的 `pi-bash-*.log`；仓库侧 `.staging/tmp-2026-10-19/` 存着 13 项旧产物（7 个 `klipperx-log-*` 运行目录 + 6 份闸门/启动日志，3.1 MB，已 gitignore）。要做的：按已定路径约定把日志改道（`klippy` 已有 `--logfile` 落 `<data-path>/logs/`，手动启动的 stdout 也应落那里），并给 `.staging` 定一个清理时机。判据：`klippy_uds` / `moonraker_instance_ids` 是**活 IPC 与第三方状态——不迁移、不进释放链**；`pi-bash-*.log` 归 harness；清 `.staging` 前先确认里面的日志不再作任何结论的证据 | — |
@@ -64,9 +64,10 @@
 **零散待办**（无编号；细节见各节与各模块文档）
 
 - `canbus_stats`：总线错误计数/状态上报。上游 `canbus_stats.py`，本仓无对应模块；
-  参见 `H11` 节的 CAN 侧现状（`mcu/ids.rs` 只管 id 分配）。
+  CAN 侧现有能力是 id 分配器（`mcu/ids.rs`）与节点发现（`klipperx admin scan`），见
+  [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md)。
 - `heaters` 切到 `GCodeRequestQueue`（`output_pin`/`fan`/`servo`/`pwm_tool` 已接线，`heaters` 侧无队列化
-  消费者），见 [G2b 节](#g2b-用-gcode-控制-gpio剩余)。
+  消费者），见 [G2b 节](#g2b-用-gcode-控制-gpio现状与剩余)。
 - `manual_stepper` 自带回零：`STOP_ON_ENDSTOP` 仍明示拒绝（缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - `pwm_tool` 的 `maximum_mcu_duration` 中间更新：固件上限照常下发（`setup_max_duration`），上游的
   宿主侧重生成（`MCU_queued_pwm._gen_intermediate_updates`，`pwm_tool.py:119-135`）本仓无对应物，
@@ -127,7 +128,7 @@
       理由已写在 `extras/adxl345.rs` 的 `finish_measurements`（发送队列保序，所以不等 ack 也够）；
       只有将来真需要 ack 语义时才要补。
 
-## 上游事件对照清单（事件总线已就绪，逐项注册处理器）
+## 上游事件对照清单（34 个已声明，逐项核对发送点）
 
 上游 `Printer` 维护 `event_handlers` 字典（`klippy/klippy.py:36`），通过
 `register_event_handler(name, cb)` 注册、`send_event(name, *params)` 分发，共 35 个事件名。
@@ -312,13 +313,19 @@
       `crates/test-support/build.rs` 按 `KLIPPERX_ARCHES` / `KLIPPERX_ALL_ARCHES` 编字典；
       并顺带对齐配置解析（多行值 / `=` / 节头与 `;` 注释）、实现 `deprecate`；
       `linuxtest.test` 端到端通过（`kinematics: none` + `heaters` + `temperature_sensor` +
-      `ds18b20`）。后续推进见正文 **T**。
+      `ds18b20`）。
+- **上游 extras 消费者 H1–H12（按域）**：加热与温度、风扇与通用输出、宏与脚本、打印流程与 SD 卡、
+      TMC 六型、传感器与块状数据、输入与外设（含固件按钮查询与模拟按键）、LCD 与菜单引擎、
+      探测/调平/校准（含 `bed_mesh`/`skew_correction`/`z_thermal_adjust`/`tuning_tower`）、
+      运动相关 extras、主机运行时调试（`statistics`/`canbus_ids`/`SET_NODEID` 读回校验）、
+      核心工具——2026-10-22 全部收官；判为不做的项（板级三件、`get_heater`/`get_sensor`/
+      `get_pin_type`）登记在[与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)的「上游有、本仓不做」表。
 
 - **框架队列 FW1–FW9（全部完成）**：FW1 配置装载、FW2 对象模型、FW3 错误词汇、FW4 G-Code、
       FW5 运动（a–f）、FW6 资源与触发、FW7 MCU 与传输、FW8 主机层与重启、FW9 API；验收以
       「最小模块在 host 单测 + 假 MCU 上跑通」为准，真板项见 [`TESTING.md`](TESTING.md)。
-      两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见正文 G1b）、
-      `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随 H8 显示接）。
+      两个子项 `[~]` 暂缓：`GCodeIO`（不做 OctoPrint 串口仿真，见[与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)）、
+      `MCU_bus_digital_out` 包装（能力已由 `DigitalOut::queue_digital_out` 提供，随显示层接入）。
       分阶段细节见各 FW 的工作记录（已随收官清理，`git log --diff-filter=D -- docs/work-log/` 可找回）；
       已完结的几篇随收口清理（见目录 README 说明）。
 
@@ -327,7 +334,7 @@
       `MotionQueuing`/`ToolHead`/`McuStepper`、`Kinematics`+`cartesian`+`[stepper_*]`/`[printer]`+`G1`、
       `stepcompress` 完整压缩；`kinematics: none` 随 T1 补上。设计取舍与逐阶段验收见
       FW5 动工前调查（已完结清理）；回零协议的 `get_trigger_position` /
-      `set_stepper_adjustment` 随 `endstop_phase` 后置（H9）。
+      `set_stepper_adjustment` 随 `endstop_phase` 落地（已到）。
 
 - **重启循环与 `restart_method` 分派（D2 大部）**：`klippy_process` 就地重建
       （`Printer::reset_for_restart` + `load_config` + `bring_up`，同一个 `Arc<Printer>`），
@@ -335,7 +342,8 @@
       （`src/klippy.rs`、`mcu/object.rs`、`mcu/restart.rs`、`interface/usb.rs`）。
 
 - **GCODE 调度器（G1）**：命令表 / `register_mux_command` / `run_script` / 输出处理器 /
-      内置命令，`load_config` 里最先注册（`gcode.rs`）；剩余行为差异见 **G1b**。
+      内置命令，`load_config` 里最先注册（`gcode.rs`）；与上游的行为差异集中在
+      [与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)（`GCodeIO` 不做、`get_mutex` 无消费者）。
 
 - **pin 解析与 `pins`（F2）**：`PrinterPins` / `PinResolver` 的别名与保留，
       `RESERVE_PINS_*` 在 connect 预留；`pins` 注册但不可查询（`pins.rs`、`printer.rs`、

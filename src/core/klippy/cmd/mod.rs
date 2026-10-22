@@ -65,6 +65,7 @@ pub mod ads1220;
 pub mod ads131m0x;
 pub mod adxl345;
 pub mod allocate_oids;
+pub mod angle;
 pub mod bmi160;
 pub mod buttons;
 pub mod clock;

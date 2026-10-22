@@ -321,9 +321,9 @@ fn identity_demand(config: &McuConfig) -> IdentityDemand {
         Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => IdentityDemand::Can(*uuid),
         // A `uuid:` on an exclusive port is ignored (`Transport::open` sends no
         // assignment frame on one), so only a shared port has a board to confirm.
-        Transport::Serial { uuid: Some(uuid), .. } if config.shared_baud.is_some() => {
-            IdentityDemand::Mux(*uuid)
-        }
+        Transport::Serial {
+            uuid: Some(uuid), ..
+        } if config.shared_baud.is_some() => IdentityDemand::Mux(*uuid),
         Transport::Host {
             uuid: Some(uuid), ..
         } if config.host_mux.is_some() => IdentityDemand::Mux(*uuid),

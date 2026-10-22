@@ -105,10 +105,12 @@ pub trait Reactor: Send + Sync {
 
 ## 延迟度量
 
-串行的代价是“一个慢回调拖住所有人”，所以慢必须看得见。`Reactor::set_latency_notifier(latency, callback)` 就是这一点：一轮分发（dispatch round）从**最早的唤醒时间**算起忙过 `latency` 秒，就把这一轮的回调连名字、耗时、延迟一并交回（`LatencyReport`）：
+串行的代价是“一个慢回调拖住所有人”，所以慢必须看得见。`Reactor::set_latency_notifier(latency, callback)` 就是这一点：一轮分发（dispatch round）忙过 `latency` 秒，就把这一轮的回调连名字、耗时、延迟一并交回（`LatencyReport`）：
 
-- `busy`：从最早唤醒时间到本轮结束，所以**唤醒晚了**和**回调慢**算在同一条线上；
-- `CallbackRun { name, duration, lateness }`：每个回调的名字、自己跑了多久、比唤醒时间晚启动了多少。
+- `busy`：从本轮**最早能跑的时刻**到本轮结束——每个回调取「唤醒时间」与「它被武装的时刻」中较晚的那个；所以**唤醒晚了**和**回调慢**算在同一条线上；
+- `CallbackRun { name, duration, lateness }`：每个回调的名字、自己跑了多久、比唤醒时间晚启动了多少（同样以「唤醒时间」与「武装时刻」中较晚的为基准）。
+
+**「武装时刻」那一半是必须的**：上游 `idle_timeout` 每次归零都会把自己武装到**过去**——`update_timer(curtime + READY_TIMEOUT + print_time - est_print_time)`（`idle_timeout.py:98-105`），一旦排队的运动超过那个缓冲，算出来的时刻就已经过去了。这种定时器是「武装晚了」，不是「reactor 忙了」；按原始唤醒时间算 busy 会把每次归零变成一条 `Reactor busy for 6.353s` 假告警（真机 bench 实测：那个 6.35 s 正是 drip 喂进去的运动提前量）。
 
 名字在注册时给出（`register_timer_named`）——上游是反射出回调名（`get_function_owner`，`extras/garbage_collection.py:13`），Rust 闭包没有名字可读。`register_timer` 是无名版（报告里叫 `"<timer>"`）。
 

@@ -581,7 +581,7 @@ git config core.hooksPath .githooks
 | `thermocouple.rs` | 命令与固件格式一致；芯片类型号与固件枚举对齐；`thermocouple_result` 解码；整条经虚拟 MCU 的往返（等回调用 **1 s 有界轮询**，不再固定睡 20 ms——那个固定窗口在全量闸门满载下会被错过，让本来能过的测试假失败） |
 | `stepper.rs` | `config_stepper` / `queue_step` 的 `args()` 与固件参数序一致（编码后解码回同一组值） |
 | `endstop.rs` | `config_endstop` / `endstop_home` 的参数序与固件一致；`pull_up` 负值按字节编码；disable 全零；`home_wait` 的 32 位触发时钟以**本次 move 的 arm clock** 为纪元参考（打印时间远超 MCU 自报时钟时会差一整圈：2³²/16 MHz = 268.44 s）；时钟门控：`test_home_start_waits_for_its_reqclock_window`、`test_query_endstop_holds_until_its_minclock` |
-| `trsync.rs`（22 测，2026-10-18 重核） | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐；`raw_failure_classification` 覆盖 typed 与 trigger_analog 码（1-3 非失败、4 与 5-8 失败且 5-8 无 typed 变体）。**2026-10-18 新增/补强**：会话 `attach` 即装路由器（武装前就有处理器 → 陈旧报告不刷 WARN，去掉 attach 绑定即转红）、被替换会话在武装时重绑（去掉武装绑定即「报告被丢弃 + 等超时」转红）、`restart` 列表恰有 `trsync_start(oid,0,0,0)`（杀进程后重连即刻断流）、注册表按 oid 路由且**无主 oid 静默**、真实板字典（`stm32f446.dict`）能绑上 `trsync_state`；归零 5 s 兜底：丢报告时 dispatching 失败 + 收尾 + **机器仍可继续执行命令** |
+| `trsync.rs`（21 测，2026-10-22 重核） | `trsync_start` 参数序与固件一致；`trigger_reason` 枚举号与固件对齐；`raw_failure_classification` 覆盖 typed 与 trigger_analog 码（1-3 非失败、4 与 5-8 失败且 5-8 无 typed 变体）。**2026-10-18 新增/补强**：会话 `attach` 即装路由器（武装前就有处理器 → 陈旧报告不刷 WARN，去掉 attach 绑定即转红）、被替换会话在武装时重绑（去掉武装绑定即「报告被丢弃 + 等超时」转红）、`restart` 列表恰有 `trsync_start(oid,0,0,0)`（杀进程后重连即刻断流）、注册表按 oid 路由且**无主 oid 静默**、真实板字典（`stm32f446.dict`）能绑上 `trsync_state`；归零 5 s 兜底：丢报告时 dispatching 失败 + 收尾 + **机器仍可继续执行命令**；**兜底量的是「静默」而不是「从开始等」**（`test_a_report_that_lands_mid_wait_restarts_the_silence_clock`：上报在等待睡死时到达→截止时刻推远→不被已武装的旧计时提前判失败；去掉唤醒后重读即转红）。真机 2026-10-22：老实现下 `G28 X`（5 mm/s × 1.5×，行程 15.5 s）固件每 75 ms 上报 `can_trigger=1`，主机仍在第 5.0 s 报 `Communication timeout during homing`，固件侧 `PAST_END_TIME` 因此永远走不到 |
 | `trigger_analog.rs` | 5 命令逐字段对 `atmega2560.dict`、`trigger_analog_type` 枚举逐值一致（`abs_ge`/`gt`/`diff_peak_gt`）、home 载荷字节序与全零 disable、state 响应经字典格式串编解码往返 |
 | `trigger_analog.rs`（主机侧 design，M5b） | `to_fixed_32` 缩放与舍入（ties-to-even 同 Python）及上游溢出文案、`calc_frac_bits`（整数→0、|x|<1→31、按 bit_length 收窄（表 2.0→29）、舍入溢出回退一位 30→29）、SOS 表命中与三路 miss、tap 设计→表段→导数序、scipy 表外错误不改设计、定点系数 29 位精确值、col3≠1/超宽拒绝、静止态按起始值换算 |
 | `sos_filter.rs` | 5 条 SOS 命令逐字段对字典（含 `%i` 负数有符号）、`set_section` 5 系数顺序与负值编码 |
@@ -646,7 +646,7 @@ git config core.hooksPath .githooks
 
 | 模块 | 覆盖 |
 |------|------|
-| `reactor.rs` | 契约：回调返回值即下次唤醒时间（`Some` 续、`None` 退）、未到点不跑、`advance` 把钟拨到每个唤醒时间（回调看到的是被唤醒的时刻，不是终点；周期定时器一个周期跑一次）、同时到期按唤醒时间稳定排序、`NOW`（注册在过去）当前就跑、取消后不再跑且可重复取消；`ManualReactor`：从 0 起、`run_due` 不拨钟、回调里可再注册（不在锁下跑回调）、`call_later` 只跑一次；`TokioReactor`：到点才跑、按周期续跑、取消从长睡眠中立即返回且不再跑、已自退的定时器再取消也安全、丢句柄不取消；**串行 dispatcher**：同一时刻到期的按注册顺序一次跑一个（回调互不重叠）、回调里再注册不死锁；**延迟度量**（真时间）：慢回调被报出且带名字、快的一轮不报、被慢回调挡住的后继定时器 `lateness` 超阈 |
+| `reactor.rs` | 契约：回调返回值即下次唤醒时间（`Some` 续、`None` 退）、未到点不跑、`advance` 把钟拨到每个唤醒时间（回调看到的是被唤醒的时刻，不是终点；周期定时器一个周期跑一次）、同时到期按唤醒时间稳定排序、`NOW`（注册在过去）当前就跑、取消后不再跑且可重复取消；`ManualReactor`：从 0 起、`run_due` 不拨钟、回调里可再注册（不在锁下跑回调）、`call_later` 只跑一次；`TokioReactor`：到点才跑、按周期续跑、取消从长睡眠中立即返回且不再跑、已自退的定时器再取消也安全、丢句柄不取消；**串行 dispatcher**：同一时刻到期的按注册顺序一次跑一个（回调互不重叠）、回调里再注册不死锁；**延迟度量**（真时间）：慢回调被报出且带名字、快的一轮不报、被慢回调挡住的后继定时器 `lateness` 超阈、**武装到过去的定时器不算忙**（`test_a_timer_armed_in_the_past_is_not_a_busy_round`：唤醒时间比注册时刻早 6.35 s 不告警且 `busy_max` 不到阈——上游 `idle_timeout` 每次归零都这样武装，老口径会把它报成 `Reactor busy for 6.353s`） |
 
 ### `klippy`（主机编排）
 

@@ -64,7 +64,12 @@
 //! visible: it makes every later timer late. [`Reactor::set_latency_notifier`]
 //! is how that is seen — a callback can be told whenever a dispatch round takes
 //! longer than a threshold, along with the names and durations of the callbacks
-//! in it ([`LatencyReport`]). It is upstream's `set_latency_notifier`
+//! in it ([`LatencyReport`]). "Takes longer" is measured from the earliest
+//! moment the round could have run, which for each callback is the later of its
+//! wake time and when that wake time was armed: a timer armed with a wake time
+//! already in the past (upstream's `idle_timeout` does this on every homing
+//! move) was armed late, not delayed, and is not a busy reactor. It is
+//! upstream's `set_latency_notifier`
 //! (`klippy/reactor.py:316`), which `extras/garbage_collection.py` uses to log a
 //! `Reactor busy for …` warning; we have no garbage collector, so here it is
 //! purely a diagnostic. The default does nothing; [`TokioReactor`] implements it.
@@ -101,8 +106,10 @@ pub struct CallbackRun {
     pub name: &'static str,
     /// How long the callback ran, in seconds.
     pub duration: f64,
-    /// How late it started: its event time minus the wake time it was due at.
-    /// Non-zero means the dispatcher was already busy when the timer came due.
+    /// How late it started: its event time minus the time it was due **and
+    /// armed by** — whichever is later. Non-zero means the dispatcher was
+    /// already busy when the timer came due; a timer armed with a wake time
+    /// that had already passed is not late, it was armed late.
     pub lateness: f64,
 }
 
@@ -118,7 +125,17 @@ pub struct LatencyReport {
     /// The event time the report is dated with.
     pub eventtime: f64,
     /// How long the round was busy, in seconds — measured from the earliest
-    /// wake time in it, so a late wake counts the same as a slow callback.
+    /// time its callbacks could have run (each one's due time, but never
+    /// earlier than when it was armed), so a late wake counts the same as a
+    /// slow callback while a timer armed with a wake time already in the past
+    /// counts as neither.
+    ///
+    /// That last part matters: upstream arms `idle_timeout` that way on every
+    /// homing move (`check_time = READY_TIMEOUT + print_time - est_print_time`
+    /// goes negative once more than that much motion is queued,
+    /// `idle_timeout.py:98-105`), and measuring from the raw wake time turned
+    /// each such arming into a spurious "Reactor busy for 6.353s" warning on a
+    /// perfectly healthy machine.
     pub busy: f64,
     /// The callbacks that ran in the round, in order.
     pub callbacks: Vec<CallbackRun>,
@@ -487,6 +504,7 @@ impl Reactor for TokioReactor {
         let cancelled = Arc::new(AtomicBool::new(false));
         self.dispatcher.push(TimerEntry {
             waketime,
+            armed_at: self.monotonic(),
             seq: self.dispatcher.next_seq(),
             name,
             callback,
@@ -574,8 +592,9 @@ impl Dispatcher {
     /// `set_latency_notifier` (or do anything else) without deadlocking.
     fn report_if_late(&self, busy: f64, eventtime: f64, callbacks: Vec<CallbackRun>) {
         // A round's lateness is the summed lateness of its callbacks: each
-        // started late against its own due time, so the sum is how much
-        // dispatching the round actually delayed.
+        // started late against its own due time (or against when it was armed,
+        // if that is later), so the sum is how much dispatching the round
+        // actually delayed.
         let lateness: f64 = callbacks.iter().map(|run| run.lateness.max(0.0)).sum();
         self.stats.record_round(busy, lateness);
 
@@ -610,6 +629,13 @@ impl Dispatcher {
 /// One registered timer.
 struct TimerEntry {
     waketime: f64,
+    /// The reactor clock when this wake time was (re)armed.
+    ///
+    /// A wake time may be armed in the past — upstream's `idle_timeout` does
+    /// exactly that, as do callbacks that return a wake time that has already
+    /// passed — and such a timer is due immediately, not late. Lateness is
+    /// therefore measured against `waketime.max(armed_at)`.
+    armed_at: f64,
     /// Registration order, used to order timers due at the same moment.
     seq: u64,
     /// Shown in a [`LatencyReport`].
@@ -749,10 +775,12 @@ async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instan
         }
 
         // Run the round, recording each callback for a latency report. The
-        // round's busy time is measured from the earliest wake time in it, so a
-        // late wake shows up the same way a slow callback does.
-        let first_due = due.first().map(|entry| entry.waketime);
+        // round's busy time is measured from the earliest time one of its
+        // callbacks could have run, so a late wake shows up the same way a slow
+        // callback does — but a timer armed with a wake time already in the
+        // past (which is due immediately, not late) does not.
         let mut runs = Vec::with_capacity(due.len());
+        let mut earliest: Option<f64> = None;
         for mut entry in due {
             if entry.cancelled.load(Ordering::Acquire) {
                 continue;
@@ -761,9 +789,15 @@ async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instan
             // The time the callback is woken for, read per callback so a long
             // one is visible in the next callback's `eventtime`.
             let started = origin.elapsed().as_secs_f64();
-            let lateness = started - entry.waketime;
+            let due_at = entry.waketime.max(entry.armed_at);
+            let lateness = started - due_at;
+            earliest = Some(match earliest {
+                Some(earliest) => earliest.min(due_at),
+                None => due_at,
+            });
             if let Some(next) = run_timer_callback(name, &mut entry.callback, started) {
                 entry.waketime = next;
+                entry.armed_at = origin.elapsed().as_secs_f64();
                 entry.seq = dispatcher.next_seq();
                 dispatcher.push(entry);
             }
@@ -773,9 +807,9 @@ async fn run_dispatcher(dispatcher: Arc<Dispatcher>, origin: tokio::time::Instan
                 lateness,
             });
         }
-        if let Some(first_due) = first_due {
+        if let Some(earliest) = earliest {
             let eventtime = origin.elapsed().as_secs_f64();
-            dispatcher.report_if_late(eventtime - first_due, eventtime, runs);
+            dispatcher.report_if_late(eventtime - earliest, eventtime, runs);
         }
     }
 }
@@ -1356,6 +1390,47 @@ mod tests {
             .find(|run| run.name == "slow")
             .expect("the slow callback must be named");
         assert!(slow.duration >= 0.05, "duration was {}", slow.duration);
+    }
+
+    /// A timer armed with a wake time that has **already passed** is due
+    /// immediately, not late — so it must not be reported as a busy round.
+    ///
+    /// Upstream arms `idle_timeout` exactly that way on every homing move:
+    /// `update_timer(curtime + READY_TIMEOUT + print_time - est_print_time)`
+    /// (`idle_timeout.py:98-105`), where the estimate lags the raised print
+    /// time once enough motion is queued, so the wake time lands in the past.
+    /// Measuring the round from the raw wake time turned each such arming into
+    /// "Reactor busy for 6.353s" on a healthy machine (seen on the bench: 6.35 s
+    /// was how far ahead of the MCU the drip-fed homing move had been queued).
+    #[tokio::test]
+    async fn test_a_timer_armed_in_the_past_is_not_a_busy_round() {
+        let reactor = TokioReactor::new(tokio::runtime::Handle::current());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        reactor.set_latency_notifier(
+            0.05,
+            Arc::new(move |report| {
+                tx.send(report).ok();
+            }),
+        );
+        reactor.register_timer_named(
+            "armed_in_the_past",
+            Box::new(|_| None),
+            reactor.monotonic() - 6.35,
+        );
+
+        // Long enough for the dispatcher to run that round and decide not to
+        // report; an empty channel is the assertion.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a timer armed in the past was armed late; the reactor was not busy"
+        );
+        let totals = reactor.dispatch_stats().snapshot();
+        assert!(
+            totals.busy_max_ns < 50_000_000,
+            "busy_max_ns was {}: the round counts from when the timer was armed",
+            totals.busy_max_ns
+        );
     }
 
     #[tokio::test]

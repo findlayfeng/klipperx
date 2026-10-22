@@ -97,23 +97,49 @@ const REDRAW_TIME: f64 = 0.500;
 /// Minimum time between screen redraws (`display.py:14`).
 const REDRAW_MIN_TIME: f64 = 0.100;
 
-/// The panel names `lcd_type` accepts — upstream's `LCD_chips` keys
-/// (`display.py:16-22`).
+/// What builds one value of `lcd_type`: a panel driver's constructor, behind
+/// the framework's trait object.
+type PanelConstructor = fn(&ConfigWrapper, &Arc<Printer>) -> Result<Arc<dyn LcdChip>, ConfigError>;
+
+/// The panels `lcd_type` accepts, each with the constructor that builds it —
+/// upstream's `LCD_chips` table (`display.py:16-22`).
 ///
-/// The whole list is accepted even though only `st7920`, `hd44780`,
-/// `hd44780_spi`, `uc1701`, `ssd1306` and `aip31068_spi` have drivers here, so
-/// the choice error is upstream's wording and the names are not silently
-/// rejected.
-const LCD_TYPES: &[&str] = &[
-    "st7920",
-    "emulated_st7920",
-    "hd44780",
-    "uc1701",
-    "ssd1306",
-    "sh1106",
-    "hd44780_spi",
-    "aip31068_spi",
+/// One list rather than a name list plus a match: every accepted name has a
+/// driver here, so a name cannot be accepted without a panel behind it (the
+/// choice error is still upstream's wording, from
+/// [`ConfigWrapper::get_choice`]).
+const LCD_CHIPS: &[(&str, PanelConstructor)] = &[
+    ("st7920", |config, printer| {
+        Ok(Arc::new(ST7920::new(config, printer)?))
+    }),
+    ("emulated_st7920", |config, printer| {
+        Ok(Arc::new(ST7920::new_emulated(config, printer)?))
+    }),
+    ("hd44780", |config, printer| {
+        Ok(Arc::new(Hd44780::new(config, printer)?))
+    }),
+    ("uc1701", |config, printer| {
+        Ok(Arc::new(Uc1701::new(config, printer)?))
+    }),
+    ("ssd1306", |config, printer| {
+        Ok(Arc::new(Ssd1306::new(config, printer)?))
+    }),
+    ("sh1106", |config, printer| {
+        Ok(Arc::new(Ssd1306::new_sh1106(config, printer)?))
+    }),
+    ("hd44780_spi", |config, printer| {
+        Ok(Arc::new(Hd44780Spi::new(config, printer)?))
+    }),
+    ("aip31068_spi", |config, printer| {
+        Ok(Arc::new(Aip31068Spi::new(config, printer)?))
+    }),
 ];
+
+/// The names [`LCD_CHIPS`] offers, in the order upstream's table lists them:
+/// what `lcd_type` is validated against.
+fn lcd_type_names() -> Vec<&'static str> {
+    LCD_CHIPS.iter().map(|(name, _)| *name).collect()
+}
 
 /// The shipped layout (`klippy/extras/display/display.cfg`).
 ///
@@ -270,26 +296,17 @@ impl PrinterLCD {
     /// left out (module docs).
     ///
     /// # Errors
-    /// A missing or unknown `lcd_type`, an unimplemented panel, a missing
-    /// option in any of the sections the display reads, or an unknown
-    /// `display_group`.
+    /// A missing or unknown `lcd_type`, a missing option in any of the
+    /// sections the display reads, or an unknown `display_group`.
     fn new(config: &ConfigWrapper, printer: &Arc<Printer>) -> Result<Arc<Self>, ConfigError> {
         // The panel first: upstream builds it before anything else
         // (`display.py:181`), and its width decides the default group.
-        let lcd_type = config.get_choice("lcd_type", LCD_TYPES, None)?;
-        let lcd_chip: Arc<dyn LcdChip> = match lcd_type.as_str() {
-            "st7920" => Arc::new(ST7920::new(config, printer)?),
-            "hd44780" => Arc::new(Hd44780::new(config, printer)?),
-            "hd44780_spi" => Arc::new(Hd44780Spi::new(config, printer)?),
-            "uc1701" => Arc::new(Uc1701::new(config, printer)?),
-            "ssd1306" => Arc::new(Ssd1306::new(config, printer)?),
-            "aip31068_spi" => Arc::new(Aip31068Spi::new(config, printer)?),
-            other => {
-                return Err(ConfigError::new(format!(
-                    "lcd_type '{other}' is not implemented in this host"
-                )))
-            }
-        };
+        let lcd_type = config.get_choice("lcd_type", &lcd_type_names(), None)?;
+        let (_, build) = LCD_CHIPS
+            .iter()
+            .find(|(name, _)| *name == lcd_type)
+            .expect("`get_choice` only accepts a name from `LCD_CHIPS`");
+        let lcd_chip = build(config, printer)?;
 
         // The `[display]` section is the only section that registers a display
         // (`display.py:185-187`); the menu is therefore always built, and its
@@ -1549,9 +1566,9 @@ mod tests {
 
     #[test]
     fn test_a_panel_reports_its_missing_required_option() {
-        // The panels that have a driver stop in option validation when a
-        // required option is absent, instead of the old "not implemented"
-        // sentence — that wording now covers only the siblings below.
+        // Every panel has a driver, so a section that omits an option the
+        // driver needs stops in option validation rather than in the old "not
+        // implemented" sentence.
         let err = machine()
             .load_config(&display_config(
                 "lcd_type: uc1701\ncs_pin: PA3\nsclk_pin: PA1\nsid_pin: PC1\n",
@@ -1572,23 +1589,30 @@ mod tests {
             err.to_string(),
             "Option 'latch_pin' in section 'display' must be specified"
         );
-    }
 
-    #[test]
-    fn test_the_sibling_panels_that_still_have_no_driver_are_reported() {
-        // `sh1106` is the SSD1306's own variant (`uc1701.py:238-241`): the
-        // name is accepted by `lcd_type` and refused with the same sentence
-        // as every other gap. `aip31068_spi` left this list when its driver
-        // landed; it is now built like the others.
-        for lcd_type in ["sh1106", "emulated_st7920"] {
-            let err = machine()
-                .load_config(&display_config(&format!("lcd_type: {lcd_type}\n")))
-                .unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!("lcd_type '{lcd_type}' is not implemented in this host")
-            );
-        }
+        // `emulated_st7920`'s are its software SPI bus and its enable line
+        // (`st7920.py:211-222`).
+        let err = machine()
+            .load_config(&display_config("lcd_type: emulated_st7920\n"))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'spi_software_miso_pin' in section 'display' must be specified"
+        );
+        let err = machine()
+            .load_config(&display_config(
+                "lcd_type: emulated_st7920\n\
+                 spi_software_miso_pin: PB4\n\
+                 spi_software_mosi_pin: PB5\n\
+                 spi_software_sclk_pin: PB3\n",
+            ))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Option 'en_pin' in section 'display' must be specified"
+        );
     }
 
     /// The corpus's `lcd_type: uc1701` shape (`printer-creality-cr20-2018.cfg`),
@@ -1606,9 +1630,35 @@ mod tests {
                                   encoder_pins: ^PG1, ^PG0\n\
                                   click_pin: ^!PD2\n";
 
+    /// The `lcd_type: sh1106` shape: the SSD1306's 132-column sibling, whose
+    /// own option is `x_offset` (`uc1701.py:238-241`).
+    const SH1106_SECTION: &str = "lcd_type: sh1106\n\
+                                 x_offset: 2\n\
+                                 contrast: 128\n\
+                                 vcomh: 30\n\
+                                 invert: True\n\
+                                 encoder_pins: ^PG1, ^PG0\n\
+                                 click_pin: ^!PD2\n";
+
+    /// The `lcd_type: emulated_st7920` shape: a software SPI bus, the enable
+    /// line, and the clock (`st7920.py:211-227`).
+    const EMULATED_ST7920_SECTION: &str = "lcd_type: emulated_st7920\n\
+                                          spi_software_miso_pin: PB4\n\
+                                          spi_software_mosi_pin: PB5\n\
+                                          spi_software_sclk_pin: PB3\n\
+                                          spi_speed: 500000\n\
+                                          en_pin: PC4\n\
+                                          encoder_pins: ^PD2, ^PD3\n\
+                                          click_pin: ^!PC0\n";
+
     #[test]
-    fn test_the_two_new_panels_load_and_leave_no_option_unread() {
-        for section in [UC1701_SECTION, SSD1306_SECTION] {
+    fn test_each_panel_shape_loads_and_leaves_no_option_unread() {
+        for section in [
+            UC1701_SECTION,
+            SSD1306_SECTION,
+            SH1106_SECTION,
+            EMULATED_ST7920_SECTION,
+        ] {
             let printer = machine();
             printer
                 .load_config(&display_config(section))

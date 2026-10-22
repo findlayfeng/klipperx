@@ -100,14 +100,6 @@
       （要等窗口自己关），只能 SIGKILL。手册说的是「离开窗口就停宿主」，信号应当同样触发退出；
       现在 `request_exit` 置了旗，但 run loop 卡在 attachment 上。方向：attachment 的 await 与
       退出请求 `select`，收到请求即收窗口。
-- [ ] **`M400` 等待的两个后续单元**（等待本体与四条出口已落地：`motion/toolhead.rs` 的
-      `wait_moves_state()` 快照 + `extras/toolhead.rs` 的异步等待环；`can_pause = !is_fileoutput()`
-      时立即退出，所以语料对该特性零覆盖）：
-      ① fileoutput 形态下上游 `_flush_handler_debug` 的等价物未移植（上游在 `extras/motion_queuing.py`，
-      `motion/queuing.rs` 无对应分支）；
-      ② 上游 `send_wait_ack`（`klippy/mcu.py:125-127`，消费方是传感器芯片）本仓以普通 send 代替——
-      理由已写在 `extras/adxl345.rs` 的 `finish_measurements`（发送队列保序，所以不等 ack 也够）；
-      只有将来真需要 ack 语义时才要补。
 
 ## 上游事件对照清单（34 个已声明，逐项核对发送点）
 

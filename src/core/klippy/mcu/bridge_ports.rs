@@ -1019,6 +1019,54 @@ mod tests {
         Ok(printer)
     }
 
+    /// `count` UART port sections on the bridge `bridge`, in declaration order
+    /// — the order the loader numbers ports in.
+    fn uart_ports(count: u8) -> String {
+        (0..count)
+            .map(|i| format!("[uart_device uart{i}]\nuart_mcu: bridge\nuart_oid: uart{i}\n"))
+            .collect()
+    }
+
+    /// A bridge's firmware holds four downstream ports
+    /// (`BRIDGE_MAX_PORTS`, `third_party/klipper/src/bridge.c:65`), and the
+    /// config is where the fifth is refused: before anything is sent to a
+    /// firmware whose port table has no room for it, the load fails naming the
+    /// index the port would have had and the limit it ran into.
+    #[test]
+    fn a_fifth_port_on_one_bridge_is_refused_at_load() {
+        // Four is what the firmware's table holds: those load.
+        load(&format!(
+            "[mcu bridge]\nserial: /dev/not-opened\n{}",
+            uart_ports(4)
+        ))
+        .expect("four ports fit the firmware's table");
+
+        let err = load(&format!(
+            "[mcu bridge]\nserial: /dev/not-opened\n{}",
+            uart_ports(5)
+        ))
+        .err()
+        .expect("the fifth port has no room in the firmware's table");
+
+        let text = err.to_string();
+        assert!(
+            text.contains("Section 'uart_device uart4'"),
+            "the port is named: {text}"
+        );
+        assert!(
+            text.contains("cannot take port 4"),
+            "the slot it would have had is named: {text}"
+        );
+        assert!(
+            text.contains("4 downstream ports"),
+            "the limit is named: {text}"
+        );
+        assert!(
+            text.contains("0..=3") && text.contains("BRIDGE_MAX_PORTS"),
+            "the addressable range and its source are named: {text}"
+        );
+    }
+
     /// The `(slot, path)` pairs the `[mcu <name>]` bridge collected from its
     /// ports, in declaration order.
     fn host_port_paths(printer: &Arc<Printer>, name: &str) -> Vec<(u8, String)> {

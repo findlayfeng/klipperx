@@ -130,6 +130,20 @@ const CLOCK_POLL_INTERVAL: f64 = 1.0;
 /// `test:` poll fast).
 const FAKE_CLOCK_POLL_INTERVAL: f64 = 0.15;
 
+/// How many downstream ports one bridge's firmware holds.
+///
+/// The firmware's own `BRIDGE_MAX_PORTS` (`third_party/klipper/src/bridge.c:65`):
+/// the bridge's port table is a fixed array that size
+/// (`bridge_ports[BRIDGE_MAX_PORTS]`, `bridge.c:120`), so a port past it is one
+/// the firmware cannot route — `config_bridge_port` reads the index out of that
+/// array and the bridge shuts down. The firmware publishes no dictionary
+/// constant for the number, so it is mirrored here, **once**: a firmware that
+/// changes it has to change this line too
+/// (`third_party/klipper/src/bridge.c:65`, and the compile-time assertion at
+/// `:76-77` that a host-library build's `BRIDGE_MAX_PORTS` stays within
+/// `KLIPPER_HOST_PORT_SLOTS`).
+pub(crate) const BRIDGE_MAX_PORTS: u8 = 4;
+
 /// The printer object for one `[mcu]` / `[mcu <name>]` section.
 pub struct McuObject {
     /// The section as parsed, kept whole so the device is only opened at
@@ -361,21 +375,24 @@ impl McuObject {
     ///
     /// A port's index is its declaration order among the bridge's ports (see
     /// the field): the first port section on a bridge gets 0, the next 1, and
-    /// so on. The port-level `SET_PORT_NODEID` carries the index in one byte, so
-    /// a bridge can hold at most 256 ports; the 257th is refused here, naming
-    /// the port and the index it would have had, instead of wrapping onto an
-    /// existing port's route.
+    /// so on. The bridge's firmware holds [`BRIDGE_MAX_PORTS`] ports, so the
+    /// port past that is refused here — naming the index it would have had and
+    /// the limit — instead of travelling to a firmware whose port table has no
+    /// room for it and taking the whole bridge down.
     ///
     /// # Errors
-    /// [`ConfigError`] when this bridge already has every port a port command
-    /// can address.
+    /// [`ConfigError`] when this bridge already has every port its firmware
+    /// can hold.
     pub fn next_bridge_port_index(&self, port: &str) -> Result<u8, ConfigError> {
         let index = self.bridge_ports.fetch_add(1, Ordering::Relaxed);
-        if index > u16::from(u8::MAX) {
+        if index >= u16::from(BRIDGE_MAX_PORTS) {
             return Err(ConfigError::new(format!(
-                "Section '{port}': bridge '{}' already has the 256 ports a port command can \
-                 address; port {index} cannot be named (0..=255)",
-                self.name()
+                "Section '{port}': bridge '{}' cannot take port {index}: its firmware holds \
+                 {BRIDGE_MAX_PORTS} downstream ports (BRIDGE_MAX_PORTS, \
+                 third_party/klipper/src/bridge.c), so the port indices it can route are \
+                 0..={}",
+                self.name(),
+                BRIDGE_MAX_PORTS - 1
             )));
         }
         Ok(index as u8)
@@ -389,9 +406,10 @@ impl McuObject {
     /// number `config_uart` carries and the number the port's tty is registered
     /// under, both of which the firmware resolves a USART by.
     ///
-    /// The one-byte bound is the index counter's: every port takes an index
-    /// before its slot, so a bridge still inside the index range is inside this
-    /// one too.
+    /// The bound is the index counter's: every port takes an index before its
+    /// slot, and [`Self::next_bridge_port_index`] refuses the port past
+    /// [`BRIDGE_MAX_PORTS`], so this counter never runs past the firmware's
+    /// table either.
     pub fn next_bridge_uart_slot(&self) -> u8 {
         let slot = self.bridge_uart_slots.fetch_add(1, Ordering::Relaxed);
         debug_assert!(

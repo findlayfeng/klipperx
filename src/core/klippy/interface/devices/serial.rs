@@ -1882,9 +1882,20 @@ impl TunnelRegistry {
     }
 
     /// Route `arb`'s tunnel units to `sink` from now on; a second registration
-    /// under the same id replaces the first.
+    /// under the same id replaces the first, and says so.
+    ///
+    /// Two listeners for one id is a mistake in whoever registered second, not
+    /// a handover: replacing silently would leave the first one believing it
+    /// still hears its blocks. The replacement still happens — a caller that
+    /// re-registers after a session it abandoned has to be able to — but the
+    /// warning is what makes the overlap visible.
     pub(crate) fn register(&self, arb: u32, sink: TunnelSink) {
-        self.sinks.lock().unwrap().insert(arb, sink);
+        if self.sinks.lock().unwrap().insert(arb, sink).is_some() {
+            warn!(
+                "a tunnel listener for arb {arb:#x} was already registered; replacing it — \
+                 the earlier listener no longer gets this id's blocks"
+            );
+        }
     }
 
     /// Stop routing `arb`'s tunnel units; an unregistered id is a no-op.
@@ -1978,9 +1989,15 @@ impl UnitRegistry {
     }
 
     /// Route `arb`'s whole units to `sink` from now on; a second registration
-    /// under the same id replaces the first.
+    /// under the same id replaces the first, and says so
+    /// ([`TunnelRegistry::register`]'s reading of the overlap).
     pub(crate) fn register(&self, arb: u32, sink: UnitSink) {
-        self.sinks.lock().unwrap().insert(arb, sink);
+        if self.sinks.lock().unwrap().insert(arb, sink).is_some() {
+            warn!(
+                "a unit listener for arb {arb:#x} was already registered; replacing it — \
+                 the earlier listener no longer gets this id's units"
+            );
+        }
     }
 
     /// Stop routing `arb`'s whole units; an unregistered id is a no-op.
@@ -1998,15 +2015,33 @@ impl UnitRegistry {
     /// listens — including a listener whose receiver has been dropped, which is
     /// removed here so a later delivery does not try it again. A listener whose
     /// queue is full keeps its registration and loses the unit.
+    ///
+    /// Every `false` says why on the way out: a unit that reaches no listener
+    /// is a scan answer lost, and the reader calls this after seeing the id
+    /// registered ([`Self::has`]), so the two ways to lose one — the listener
+    /// left between the two calls, or its receiver is gone — are both worth a
+    /// warning naming the id.
     pub(crate) fn deliver(&self, arb: u32, unit: &[u8]) -> bool {
         let mut sinks = self.sinks.lock().unwrap();
         match sinks.get(&arb).map(|sink| sink.deliver(arb, unit)) {
             Some(true) => true,
             Some(false) => {
+                warn!(
+                    "unit listener for arb {arb:#x} has gone away (its receiver was dropped); \
+                     unregistering it and dropping its {}-byte unit",
+                    unit.len()
+                );
                 sinks.remove(&arb);
                 false
             }
-            None => false,
+            None => {
+                warn!(
+                    "no unit listener for arb {arb:#x} any more (it left between the check and \
+                     this delivery); dropping its {}-byte unit",
+                    unit.len()
+                );
+                false
+            }
         }
     }
 }
@@ -6830,6 +6865,145 @@ mod mux_tests {
                 Duration::from_secs(2)
             ),
             "the port keeps dispatching after a listener disappears"
+        );
+    }
+
+    /// Run `f`, returning whatever it logged at `WARN` and above.
+    ///
+    /// The two registry behaviours this file reports — a replaced listener and
+    /// a lost unit — are only observable in the log, so the tests have to hear
+    /// them.
+    fn capturing_warnings<T>(f: impl FnOnce() -> T) -> (T, String) {
+        use tracing_subscriber::prelude::*;
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let value = tracing::subscriber::with_default(subscriber, f);
+        (value, capture.text())
+    }
+
+    /// A byte sink for the fmt layer above (`mcu/serial_ports.rs`'s helper, same
+    /// contract): `with_default` keeps the capture off the process-wide
+    /// subscriber, so the tests stay independent of each other.
+    #[derive(Clone, Default)]
+    struct LogCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl LogCapture {
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .clone();
+            String::from_utf8(bytes).expect("tracing writes UTF-8")
+        }
+    }
+
+    impl Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("the capture lock is not poisoned")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+        type Writer = LogCapture;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// A second tunnel listener under one id replaces the first **and says
+    /// so**: the replaced listener stops hearing its blocks, so the overlap has
+    /// to be visible in the log instead of only in the silence that follows.
+    #[test]
+    fn registering_a_second_tunnel_sink_replaces_the_first_with_a_warning() {
+        let registry = TunnelRegistry::new();
+        let arb = assign::reply_arb_id(4).expect("a valid mcu id");
+        let (first, first_frames) = TunnelSink::channel();
+        let (second, second_frames) = TunnelSink::channel();
+
+        let ((), warnings) = capturing_warnings(|| {
+            registry.register(arb, first);
+            registry.register(arb, second);
+            assert!(
+                registry.deliver(arb, &TUNNEL_ACK),
+                "the newer listener is the one routed to"
+            );
+        });
+
+        assert_eq!(
+            second_frames
+                .recv_timeout(Duration::from_secs(1))
+                .expect("the newer listener takes the block"),
+            TUNNEL_ACK.to_vec()
+        );
+        assert!(
+            first_frames
+                .recv_timeout(Duration::from_millis(200))
+                .is_err(),
+            "the replaced listener gets nothing"
+        );
+        assert!(warnings.contains("already registered"), "{warnings}");
+        assert!(warnings.contains("replacing it"), "{warnings}");
+        assert!(
+            warnings.contains(&format!("{arb:#x}")),
+            "the id the two share is named: {warnings}"
+        );
+    }
+
+    /// A unit that reaches no listener is lost — a scan answer nobody sees —
+    /// and the loss is reported. Both ways the reader loses one are covered:
+    /// the listener left between its `has` check and the delivery, and the one
+    /// whose receiver was dropped.
+    #[test]
+    fn a_unit_with_no_live_listener_is_dropped_with_a_warning() {
+        let registry = UnitRegistry::new();
+        let arb = ADMIN_REPLY;
+        let unit = unit_for(arb, &Frame::new(4, b"answer".to_vec()));
+
+        // Nobody registered: the second half of the `has`/`deliver` race.
+        let (routed, warnings) = capturing_warnings(|| registry.deliver(arb, &unit));
+        assert!(!routed, "no listener, no delivery");
+        assert!(warnings.contains("no unit listener"), "{warnings}");
+        assert!(
+            warnings.contains(&format!("{arb:#x}")),
+            "the id is named: {warnings}"
+        );
+        assert!(
+            warnings.contains("dropping its"),
+            "the unit that was lost is accounted for: {warnings}"
+        );
+
+        // Registered, then its receiver goes away: the listener is
+        // unregistered, and the unit that found it gone is reported.
+        let (sink, units) = UnitSink::channel();
+        registry.register(arb, sink);
+        drop(units);
+        let (routed, warnings) = capturing_warnings(|| registry.deliver(arb, &unit));
+        assert!(!routed, "a dead listener is not delivered to");
+        assert!(warnings.contains("has gone away"), "{warnings}");
+        assert!(
+            warnings.contains(&format!("{arb:#x}")),
+            "the id is named: {warnings}"
+        );
+        assert!(
+            !registry.has(arb),
+            "the dead listener is gone from the table"
         );
     }
 

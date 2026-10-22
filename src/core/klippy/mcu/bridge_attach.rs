@@ -830,31 +830,69 @@ mod tests {
         assert_eq!(first.index(), Some(1), "the next gets index 1");
     }
 
-    /// A bridge's port count is what the declaration order can address: the
-    /// port index travels in one byte, so the 257th port is refused rather than
-    /// wrapping onto an existing port's route.
+    /// A bridge's port count is the firmware's table, not the width of the
+    /// index byte: the firmware holds
+    /// [`BRIDGE_MAX_PORTS`](crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS)
+    /// downstream ports, so the port past that is refused at configuration
+    /// time — naming the index it would have had and the limit — instead of
+    /// being sent to a firmware with no room for it.
     #[test]
-    fn a_port_past_the_index_range_is_refused() {
+    fn a_port_past_the_firmware_limit_is_refused() {
+        use crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS;
+
         let printer = printer_with("[mcu bridge]\nserial: /dev/a\n");
         let bridge = printer
             .lookup_object_as::<McuObject>("mcu bridge")
             .expect("the printer has [mcu bridge]");
 
-        for index in 0..=u8::MAX {
+        for index in 0..BRIDGE_MAX_PORTS {
             assert_eq!(
                 bridge.next_bridge_port_index("uart_device p").unwrap(),
                 index,
-                "indices 0..=255 are addressable"
+                "every port index the firmware's table holds is addressable"
             );
         }
         let err = bridge
             .next_bridge_port_index("uart_device p")
-            .expect_err("the 257th port has no address");
+            .expect_err("the port past the table has no room");
 
         let text = err.to_string();
         assert!(text.contains("uart_device p"), "{text}");
-        assert!(text.contains("256 ports"), "{text}");
-        assert!(text.contains("0..=255"), "{text}");
+        assert!(
+            text.contains("port 4"),
+            "the would-be index is named: {text}"
+        );
+        assert!(
+            text.contains("4 downstream ports"),
+            "the limit is named: {text}"
+        );
+        assert!(text.contains("0..=3"), "{text}");
+    }
+
+    /// The host's copy of the firmware's port count is the firmware's.
+    ///
+    /// `BRIDGE_MAX_PORTS` is not a dictionary constant, so the host mirrors it
+    /// (`mcu/object.rs`); a submodule that changes the firmware's number has to
+    /// fail here rather than leave the host validating against a count the
+    /// bridge no longer has.
+    #[test]
+    fn the_host_port_limit_is_the_firmwares() {
+        use crate::core::klippy::mcu::object::BRIDGE_MAX_PORTS;
+
+        let source =
+            std::fs::read_to_string(klipperx_test_support::klipper_dir().join("src/bridge.c"))
+                .expect("the klipper submodule's bridge.c is readable");
+        let declared: u8 = source
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("#define BRIDGE_MAX_PORTS "))
+            .expect("bridge.c defines BRIDGE_MAX_PORTS")
+            .trim()
+            .parse()
+            .expect("BRIDGE_MAX_PORTS is a number");
+        assert_eq!(
+            BRIDGE_MAX_PORTS, declared,
+            "the host's port limit is the firmware's (third_party/klipper/src/bridge.c:65)"
+        );
     }
 
     /// A `can:` device resolves like a named uart one: the CAN port section the

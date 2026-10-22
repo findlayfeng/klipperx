@@ -32,8 +32,9 @@
 //! Both runners give the case a **total budget** ([`case`], [`CASE_TIMEOUT`]):
 //! the body runs on a thread of its own, and a case that hangs is reported as
 //! `HW-TIMEOUT: <case>: still at "<phase>" …` rather than parking the run. A
-//! config that does not provide what the case declared is still a skip, printed
-//! as `HW-IGNORED: …`, and the body never runs.
+//! config that does not provide what the case declared **fails** the case
+//! unless strict mode is turned off ([`HW_STRICT_ENV`]), and the body never
+//! runs either way.
 //!
 //! The `#[ignore]` marker must be written out as a literal with exactly that
 //! wording — an attribute cannot name a constant. Run one like this:
@@ -184,8 +185,16 @@
 //!   said that hardware was there, so it was there to run. A [`HW_CONFIG_ENV`]
 //!   that is set but names a config that cannot be read or parsed is a failure
 //!   too ([`acquire`] panics): the variable said there was a config to test
-//!   against. Only an unmet [`Requires`] and an unset [`HW_CONFIG_ENV`] are
-//!   skips, and `bring_up` is never reached in either case.
+//!   against. An unmet [`Requires`] is a failure for the same reason, unless
+//!   [`HW_STRICT_ENV`] turns strict mode off; only an unset [`HW_CONFIG_ENV`] is
+//!   a skip in both modes, and `bring_up` is never reached in either case.
+//!
+//! The strictness is deliberately the default: a machine whose config cannot run
+//! a case is not a machine that has nothing to check, and a green `--ignored`
+//! run must not be readable as "this config was tested" when the case never
+//! ran. `set KLIPPERX_HW_STRICT=0` is the escape hatch for a config shared by
+//! several machines, where the cases it cannot run should be reported and
+//! passed over.
 //!
 //! # The live shape, not the corpus' file-output shape
 //!
@@ -257,11 +266,13 @@
 //! here is `#[ignore]`d. Asking for the ignored ones on a machine with no
 //! `KLIPPERX_HW_CONFIG` prints `HW-IGNORED: <test>: <why>` and **passes** —
 //! "this machine has no board for that" is a skip, and a green run must say so
-//! rather than test nothing quietly. The same line is printed when the config is
-//! there but does not provide what the test declared it needs. A config that is
-//! named but unreadable or unparsable is not a skip: it is a failure, because the
-//! variable promised a config. A config that is there and names a device which
-//! then refuses to open is a real failure too: it was there to run.
+//! rather than test nothing quietly. A config that **is** named and does not
+//! provide what the test declared it needs is not a skip: it is a failure, the
+//! same as a config that is named but unreadable or unparsable, because the
+//! variable promised a config and the test was meant to run against it.
+//! `KLIPPERX_HW_STRICT=0` asks for the old skip (`HW-IGNORED: …`) instead — see
+//! [`HW_STRICT_ENV`]. A config that is there and names a device which then
+//! refuses to open is a real failure too: it was there to run.
 //!
 //! # Serialised on the board
 //!
@@ -307,9 +318,20 @@ use crate::core::klippy::reactor::TokioReactor;
 
 /// The environment variable that names the printer config to test against.
 ///
-/// It is the only variable this mode reads; there is no way to name an
-/// interface directly, because the config already does.
+/// There is no way to name an interface directly, because the config already
+/// does. The one other variable this mode reads is [`HW_STRICT_ENV`], which
+/// decides what an unmet [`Requires`] means.
 pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
+
+/// The environment variable that turns strict mode off: `0`, `false` or `no`
+/// (any case, surrounding blanks ignored).
+///
+/// Strict is the default and the point of the mode: a named config that does
+/// not provide what a test declared it needs is a **failure**, so a run cannot
+/// report "nothing to test" for hardware the user asked for. The escape hatch
+/// is for the case where one config is used across several machines and the
+/// tests it cannot run should merely be reported — `HW-IGNORED: …` and pass.
+pub const HW_STRICT_ENV: &str = "KLIPPERX_HW_STRICT";
 
 /// How long [`Machine::bring_up`] gives the machine to connect every part.
 ///
@@ -1119,13 +1141,30 @@ fn run_line(test_name: &str) -> String {
     )
 }
 
+/// What [`HW_STRICT_ENV`] asks for: strict unless it says otherwise.
+///
+/// Unset, empty or anything else is strict (the default); only an explicit `0`,
+/// `false` or `no` is loose, so a typo in the escape hatch asks for the strict
+/// run rather than turning it off by accident. Pure: [`acquire`] reads the
+/// variable and hands the answer down.
+fn strict_from(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no"
+        ),
+    }
+}
+
 /// Hand `test_name` a machine for the configured board, or report it as skipped.
 ///
-/// The only reader of [`HW_CONFIG_ENV`]: it names the config, and [`acquire_at`]
-/// decides what it offers. Returns `None` — and prints one
-/// `HW-IGNORED: <test>: <why>` line — in the two skip cases: the variable is
-/// unset, or the config does not provide `requires`. A skipped test touches no
-/// device and takes no lock.
+/// The only reader of [`HW_CONFIG_ENV`] and [`HW_STRICT_ENV`]: the first names
+/// the config, the second decides what an unmet [`Requires`] means, and
+/// [`acquire_at`] decides what the config offers. Returns `None` — and prints
+/// one `HW-IGNORED: <test>: <why>` line — when the variable is unset, or when
+/// the config does not provide `requires` and [`HW_STRICT_ENV`] turns strict
+/// mode off. A skipped test touches no device and takes no lock.
 ///
 /// Returns `Some(machine)` with the board locked exclusively when everything is
 /// in place, printing the [`run_line`] first. The lock is held until the machine
@@ -1133,23 +1172,37 @@ fn run_line(test_name: &str) -> String {
 ///
 /// # Panics
 /// When the variable is set but names a config that cannot be used (missing
-/// file, parser error), or the board cannot be locked: the variable said the
-/// machine had a config, so "there was nothing to test" is a failure, not a
+/// file, parser error), when it names a config that does not provide `requires`
+/// and strict mode is on (the default; see [`HW_STRICT_ENV`] for the escape
+/// hatch), or when the board cannot be locked: the variable said the machine had
+/// a config to test against, so "there was nothing to test" is a failure, not a
 /// skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
-    acquire_at(path.as_deref().map(Path::new), test_name, requires)
+    let strict = strict_from(std::env::var(HW_STRICT_ENV).ok().as_deref());
+    acquire_at(path.as_deref().map(Path::new), test_name, requires, strict)
 }
 
-/// [`acquire`], on a path instead of the environment.
+/// [`acquire`], on a path and a strictness instead of the environment.
 ///
-/// The environment read is `acquire`'s alone; this is the rest of it, taking the
-/// path as an argument so the branches can be exercised without setting a
-/// variable (which no test can do without racing the others).
-fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Option<Machine> {
+/// The environment reads are `acquire`'s alone; this is the rest of it, taking
+/// the path and the strictness as arguments so the branches can be exercised
+/// without setting a variable (which no test can do without racing the others).
+fn acquire_at(
+    path: Option<&Path>,
+    test_name: &str,
+    requires: &Requires,
+    strict: bool,
+) -> Option<Machine> {
     match decide(path, requires) {
         Decision::NotSet => {
-            println!("HW-IGNORED: {test_name}: {HW_CONFIG_ENV} is not set");
+            // Unset is a skip in both modes: an ordinary `cargo test` runs these
+            // `#[ignore]`d tests on a machine that has no board, and what that
+            // must report is "no config", not a failure.
+            println!(
+                "HW-IGNORED: {test_name}: {HW_CONFIG_ENV} is not set \
+                 (set it to a printer config to run the hardware tests)"
+            );
             None
         }
         Decision::Unreadable(reason) => {
@@ -1162,7 +1215,24 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
         }
         Decision::Missing(missing) => {
             let reasons: Vec<String> = missing.iter().map(ToString::to_string).collect();
-            println!("HW-IGNORED: {test_name}: {}", reasons.join(", "));
+            let reasons = reasons.join(", ");
+            if strict {
+                // Same premise as the unreadable case, one step further in: the
+                // config was named and it parsed, so this test was meant to run
+                // against this machine and the config is simply short of what
+                // it declared. Skipping would hide that — a green run would say
+                // the hardware was tested when the test never ran.
+                let named = path.map_or_else(
+                    || HW_CONFIG_ENV.to_string(),
+                    |path| format!("{HW_CONFIG_ENV} ({})", path.display()),
+                );
+                panic!(
+                    "{test_name}: {named} does not provide what this test needs: {reasons}. \
+                     The config was named, so this is a failure rather than a skip; \
+                     set {HW_STRICT_ENV}=0 to skip instead"
+                );
+            }
+            println!("HW-IGNORED: {test_name}: {reasons}");
             None
         }
         Decision::Ready { path, config } => {
@@ -1214,8 +1284,10 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
 /// lock until it ends, which is why the next case's wait for the board is
 /// bounded too ([`LOCK_TIMEOUT`]) and says the board is still held.
 ///
-/// A case whose [`Requires`] the config does not provide is a skip, exactly as
-/// [`acquire`] alone reports it: `HW-IGNORED`, and this returns.
+/// A case whose [`Requires`] the config does not provide fails, exactly as
+/// [`acquire`] alone reports it — a panic with the missing items in it, unless
+/// [`HW_STRICT_ENV`] turns strict mode off, in which case it is `HW-IGNORED`
+/// and this returns.
 ///
 /// A panic in `body` — `expect` failing, an assertion — is re-raised here with
 /// the same message, so the case fails the ordinary way. The machine is dropped
@@ -1229,13 +1301,14 @@ fn acquire_at(path: Option<&Path>, test_name: &str, requires: &Requires) -> Opti
 ///
 /// # Panics
 /// When the case times out, when `body` panics, and when the machine cannot be
-/// built (a set [`HW_CONFIG_ENV`] naming a config that cannot be used, or a
-/// board that cannot be locked).
+/// built (a set [`HW_CONFIG_ENV`] naming a config that cannot be used, a config
+/// that does not provide `requires` under strict mode, or a board that cannot be
+/// locked).
 pub fn case<F>(test_name: &str, requires: &Requires, body: F)
 where
     F: FnOnce(Machine) + Send + 'static,
 {
-    run_case(None, test_name, requires, CASE_TIMEOUT, body);
+    run_case(None, false, test_name, requires, CASE_TIMEOUT, body);
 }
 
 /// [`case`] for a case whose body is `async` — an L1 case, which opens a
@@ -1252,13 +1325,20 @@ where
     F: FnOnce(Machine) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()>,
 {
-    run_case(None, test_name, requires, CASE_TIMEOUT, move |machine| {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("the case's runtime builds");
-        runtime.block_on(body(machine));
-    });
+    run_case(
+        None,
+        false,
+        test_name,
+        requires,
+        CASE_TIMEOUT,
+        move |machine| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the case's runtime builds");
+            runtime.block_on(body(machine));
+        },
+    );
 }
 
 /// The end of a case body, as the case thread reports it.
@@ -1274,9 +1354,13 @@ enum CaseOutcome {
 ///
 /// `path` is the config to run against; `None` reads [`HW_CONFIG_ENV`] inside
 /// the case thread, the way [`acquire`] does. The parameter is what lets a test
-/// exercise this without setting a variable.
+/// exercise this without setting a variable. `strict` is the caller's choice on
+/// that `Some` branch; on the `None` branch it is unused, because the strictness
+/// then comes from [`HW_STRICT_ENV`] inside [`acquire`] — the environment reads
+/// belong there.
 fn run_case<F>(
     path: Option<PathBuf>,
+    strict: bool,
     test_name: &str,
     requires: &Requires,
     budget: Duration,
@@ -1298,7 +1382,7 @@ fn run_case<F>(
             // runs here, before the outcome travels, on the panic path too.
             let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
                 let machine = match path {
-                    Some(path) => acquire_at(Some(&path), &name, &requires),
+                    Some(path) => acquire_at(Some(&path), &name, &requires, strict),
                     None => acquire(&name, &requires),
                 };
                 if let Some(mut machine) = machine {
@@ -2032,7 +2116,7 @@ mod tests {
         // test asked for hands back a machine, so `acquire_at` reached the run.
         let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
         assert!(
-            acquire_at(Some(fixture.path()), name, &Requires::new().mcu()).is_some(),
+            acquire_at(Some(fixture.path()), name, &Requires::new().mcu(), true).is_some(),
             "a satisfied config reaches the run, whose line is the one checked above"
         );
     }
@@ -2351,35 +2435,114 @@ mod tests {
         );
     }
 
-    /// The skip path is unchanged: an unmet [`Requires`] hands back `None` (the
-    /// caller sees `HW-IGNORED` and returns), no machine is built, and the board
-    /// is not locked — so the next test can have it.
+    /// The loose skip path, unchanged: with strict mode off (`KLIPPERX_HW_STRICT=0`,
+    /// here the `false` argument), an unmet [`Requires`] hands back `None` — the
+    /// caller sees `HW-IGNORED` and returns — and an unset variable does the same
+    /// in **both** modes. No machine is built and the board is not locked, so the
+    /// next test can have it.
     #[test]
     fn test_an_unmet_requirement_skips_without_a_machine() {
         let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
         let unmet = Requires::new().section("stepper_x");
 
         assert!(
-            acquire_at(Some(fixture.path()), "self-test", &unmet).is_none(),
-            "a config that does not provide what the test asked for is a skip"
+            acquire_at(Some(fixture.path()), "self-test", &unmet, false).is_none(),
+            "strict off: a config that does not provide what the test asked for is a skip"
         );
         assert!(
-            acquire_at(None, "self-test", &Requires::new()).is_none(),
-            "no config at all is the other skip"
+            acquire_at(None, "self-test", &Requires::new(), true).is_none(),
+            "strict on: no config at all is still the skip, or `cargo test` would go red"
+        );
+        assert!(
+            acquire_at(None, "self-test", &Requires::new(), false).is_none(),
+            "strict off: the same skip"
         );
         // A skipped test took no lock: the board is free for whoever comes next.
         let _board = lock_board(fixture.path(), "self-test").expect("a skip takes no lock");
     }
 
+    /// The change: a named config that does not provide what the test declared
+    /// is a **failure** under strict mode (the default), not a skip — a green
+    /// `--ignored` run must not be readable as "this config was tested".
+    #[test]
+    #[should_panic(expected = "missing [stepper_x]")]
+    fn test_an_unmet_requirement_fails_the_case_under_strict_mode() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let unmet = Requires::new()
+            .section("stepper_x")
+            .option("extruder", "nozzle_diameter");
+
+        let _ = acquire_at(Some(fixture.path()), "self-test", &unmet, true);
+    }
+
+    /// The strict failure carries everything needed to act on it: the test, the
+    /// config, **every** missing item, and the escape hatch.
+    #[test]
+    fn test_a_strict_failure_names_the_test_the_config_the_missing_items_and_the_way_out() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let unmet = Requires::new().section("stepper_x").section("heater_bed");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &unmet, true)
+        })) {
+            Ok(machine) => panic!(
+                "strict mode must fail an unmet requirement, not hand out {:?}",
+                machine.is_some()
+            ),
+            Err(payload) => payload,
+        };
+
+        let message = panic_text(payload.as_ref());
+        assert!(message.contains("self-test"), "{message}");
+        assert!(
+            message.contains(&fixture.path().display().to_string()),
+            "the message names the config: {message}"
+        );
+        assert!(
+            message.contains("missing [stepper_x], missing [heater_bed]"),
+            "every missing item travels, in declaration order: {message}"
+        );
+        assert!(
+            message.contains("set KLIPPERX_HW_STRICT=0 to skip instead"),
+            "the escape hatch is spelled out: {message}"
+        );
+    }
+
+    /// Strict mode is the default, and only an explicit `0`/`false`/`no` — in
+    /// any case, surrounding blanks ignored — turns it off. A typo therefore
+    /// asks for the strict run rather than silently skipping.
+    #[test]
+    fn test_strict_is_the_default_and_only_zero_false_no_turn_it_off() {
+        for value in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("true"),
+            Some("yes"),
+            Some("strict"),
+        ] {
+            assert!(strict_from(value), "{value:?} asks for the strict run");
+        }
+        for value in [
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some(" FALSE "),
+            Some("No"),
+        ] {
+            assert!(!strict_from(value), "{value:?} turns strict mode off");
+        }
+    }
+
     /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,
     /// not a skip: the variable said the machine had a config to test against.
-    /// Only an unset variable and an unmet [`Requires`] are skips.
+    /// The strictness does not enter into it — only an unset variable is a skip.
     #[test]
     fn test_a_named_config_that_does_not_parse_fails_instead_of_skipping() {
         let fixture = TempConfig::new("serial: /dev/ttyACM0\n");
 
         let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            acquire_at(Some(fixture.path()), "self-test", &Requires::new())
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new(), false)
         })) {
             Ok(_) => panic!("a config that does not parse is a failure, not a skip"),
             Err(payload) => payload,
@@ -2400,7 +2563,7 @@ mod tests {
         let absent = std::env::temp_dir().join("klipperx-hwtest-does-not-exist/printer.cfg");
 
         let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            acquire_at(Some(&absent), "self-test", &Requires::new())
+            acquire_at(Some(&absent), "self-test", &Requires::new(), false)
         })) {
             Ok(_) => panic!("a config path that does not exist is a failure, not a skip"),
             Err(payload) => payload,
@@ -2610,6 +2773,7 @@ mod tests {
         let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_case(
                 Some(fixture.path().to_path_buf()),
+                true,
                 "test_a_case_that_hangs",
                 &Requires::new().mcu(),
                 Duration::from_millis(100),
@@ -2648,6 +2812,7 @@ mod tests {
 
         run_case(
             Some(fixture.path().to_path_buf()),
+            true,
             "test_a_case_that_finishes",
             &Requires::new().mcu(),
             Duration::from_secs(30),
@@ -2678,6 +2843,7 @@ mod tests {
         let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_case(
                 Some(fixture.path().to_path_buf()),
+                true,
                 "test_a_case_that_panics",
                 &Requires::new().mcu(),
                 Duration::from_secs(30),
@@ -2694,9 +2860,12 @@ mod tests {
         );
     }
 
-    /// The skip path travels through the runner unchanged: a config that does
+    /// The loose skip path travels through the runner: with strict mode off
+    /// (`KLIPPERX_HW_STRICT=0`, here the `false` argument) a config that does
     /// not provide what the case asked for is `HW-IGNORED`, and the body never
-    /// runs.
+    /// runs. Under strict it is a failure instead, which is
+    /// [`test_an_unmet_requirement_fails_the_case_under_strict_mode`]'s case at
+    /// the `acquire_at` level.
     #[test]
     fn test_a_case_the_config_does_not_provide_is_skipped_by_the_runner() {
         let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
@@ -2705,6 +2874,7 @@ mod tests {
 
         run_case(
             Some(fixture.path().to_path_buf()),
+            false,
             "test_a_case_that_is_skipped",
             &Requires::new().section("stepper_x"),
             Duration::from_secs(30),

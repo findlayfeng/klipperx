@@ -108,17 +108,43 @@ impl Completion {
     /// Start the silence clock a dispatch's wait is bounded by: unless a report
     /// pushes it out first, the wait fails [`HOME_WAIT_TIMEOUT`] from now.
     pub fn arm_deadline(&self) {
-        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(Instant::now() + HOME_WAIT_TIMEOUT);
+        self.set_deadline(HOME_WAIT_TIMEOUT);
     }
 
     /// Push the clock out: called for every report the firmware makes, so the
     /// bound covers silence rather than the length of the move.
     pub fn refresh_deadline(&self) {
-        let mut deadline = self.deadline.lock().unwrap_or_else(|p| p.into_inner());
-        if deadline.is_some() {
-            *deadline = Some(Instant::now() + HOME_WAIT_TIMEOUT);
+        let armed = self
+            .deadline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some();
+        if armed {
+            self.set_deadline(HOME_WAIT_TIMEOUT);
         }
+    }
+
+    /// How far from now a wait gives up, or `None` when nothing bounds it.
+    fn set_deadline(&self, after: Duration) {
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + after);
+    }
+
+    /// Arm a silence clock shorter than [`HOME_WAIT_TIMEOUT`], for tests that
+    /// drive [`wait_raw`](Completion::wait_raw)'s re-arming directly.
+    #[cfg(test)]
+    pub(crate) fn arm_deadline_after(&self, after: Duration) {
+        self.set_deadline(after);
+    }
+
+    /// When a wait gives up, if anything bounds it.
+    fn deadline(&self) -> Option<Instant> {
+        *self.deadline.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Whether the silence clock has run out as of now.
+    fn expired(&self) -> bool {
+        self.deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
     }
 
     /// How long a wait may still sleep before it gives up.
@@ -172,7 +198,15 @@ impl Completion {
     /// silence: the wait then fails it with [`TriggerReason::CommsTimeout`],
     /// which is what a caller checking
     /// [`TriggerReason::is_failure`] reads as the upstream "Communication
-    /// timeout during homing".
+    /// timeout during homing". "Silence" is measured from the **last report**,
+    /// so the sleep below is re-read against the deadline on every wake: a
+    /// report that arrives while the wait is asleep pushes the deadline out
+    /// without waking it, and failing on the sleep's own (now stale) deadline
+    /// would cut a live dispatch short. On a bench whose homing move is longer
+    /// than the bound — an unloaded sensorless axis that never triggers, so the
+    /// firmware reports "still armed" every 75 ms for 15 s — that is the
+    /// difference between upstream's "No trigger on X after full movement"
+    /// and a wrong communication timeout.
     pub async fn wait_raw(&self) -> u8 {
         loop {
             let notified = self.notify.notified();
@@ -192,11 +226,18 @@ impl Completion {
             if let Some(raw) = self.raw() {
                 return raw;
             }
-            let Some(remaining) = self.remaining() else {
+            let Some(deadline) = self.deadline() else {
                 notified.await;
                 continue;
             };
-            if tokio::time::timeout(remaining, notified).await.is_ok() {
+            tokio::select! {
+                _ = notified => continue,
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+            // Woken by the deadline this loop armed for: it may have moved out
+            // since (a report rewrites the value without notifying), and the
+            // completion may have fired with it.
+            if self.raw().is_some() || !self.expired() {
                 continue;
             }
             // The firmware has not reported for `HOME_WAIT_TIMEOUT`: the
@@ -1252,6 +1293,44 @@ mod tests {
         assert!(
             names.iter().any(|name| name == "trsync_trigger"),
             "the firmware must be told to stop the group: {names:?}"
+        );
+    }
+
+    /// A report that lands **while the wait is asleep** restarts the silence
+    /// clock, and the wait is not cut short by the deadline it had already
+    /// armed.
+    ///
+    /// The shipped defect: `wait_raw` armed one `timeout(remaining, …)` per
+    /// wait, so the refresh a report wrote into the deadline was never applied
+    /// to the sleep already in flight. The first deadline then won regardless —
+    /// a homing move longer than the bound failed as a communication timeout
+    /// even though every report was arriving on time, which is what an unloaded
+    /// sensorless axis produces (reports "still armed" until the move ends).
+    #[tokio::test]
+    async fn test_a_report_that_lands_mid_wait_restarts_the_silence_clock() {
+        let completion = Completion::new();
+        completion.arm_deadline_after(Duration::from_millis(600));
+        // Start the wait **now**, so the deadline refresh below lands while it
+        // is asleep — which is how a real report arrives.
+        let waiter = Arc::clone(&completion);
+        let handle = tokio::spawn(async move { waiter.wait_raw().await });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        completion.arm_deadline_after(Duration::from_millis(600));
+
+        // Past the first bound (t=600 ms) the wait must still stand, and it
+        // gives up 600 ms after the report instead.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            !handle.is_finished(),
+            "a live report must restart the silence clock even mid-wait"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(1500), handle)
+                .await
+                .expect("the silence clock runs out")
+                .expect("the waiter task finished"),
+            TriggerReason::CommsTimeout as u8
         );
     }
 

@@ -62,7 +62,7 @@ katapult 专属的引导侧选项在 [`kconfig/katapult.kconfig`](../../../kconf
 |---|---|
 | 架构、处理器型号、外部晶振、通信接口（USB/串口/CAN 及引脚）、引导偏移、串口波特率、CAN 速率、启动引脚 `INITIAL_PINS`、USB VID/序列号 | **共享**，问一次，两份固件都拿到 |
 
-> `INITIAL_PINS` 直接来自上游 `src/Kconfig:488`（根 `Kconfig` 已 `source "src/Kconfig"`，所以 `make menuconfig` 里「Extra low-level configuration options」下就有）：逗号分隔的引脚名清单，**默认把引脚设为输出高电平**，名字前加 `!` 则设为低电平（例：`PA1,!PC13`）。固件在 `src/initial_pins.c` 的 `DECL_INIT` 里于**上电早期**（早于任何 klippy 通信）就把它们驱动到指定电平，用途是让加热器/风扇/SSR 的控制脚在主机接管之前就停在安全电平。宿主侧**不消费**它：没有命令、没有状态字段，纯粹编译进固件。
+> `INITIAL_PINS` 直接来自上游 `src/Kconfig:488`（根 `Kconfig` 已 `source "src/Kconfig"`，所以 `make menuconfig` 里「Extra low-level configuration options」下就有）：逗号分隔的引脚名清单，**默认把引脚设为输出高电平**，名字前加 `!` 则设为低电平（例：`PA1,!PC13`）。固件在 `src/initial_pins.c` 的 `DECL_INIT` 里于**上电早期**（早于任何 klippy 通信）就把它们驱动到指定电平，用途是让加热器/风扇/SSR 的控制脚在主机接管之前就停在安全电平。宿主侧**不消费**它：没有命令、没有 `get_status` 字段、没有配置校验，纯粹编译进固件。一个容易误读的细节：固件**确实**把它作为**字典常量**报给主机（`scripts/buildcommands.py:167-170` 的 `_DECL_CONSTANT_STR INITIAL_PINS …`，`klipper.elf` 里能 grep 到这个字符串，主机的 `dictionary.constants()` 会收到它），但本仓 `src/`、`crates/` 与上游 `klippy/**` 都**没有一处读它**（本仓唯一遍历常量的地方是 `mcu/object.rs` 的 `reserve_pins`，只认 `RESERVE_PINS_` 前缀）。所以「主机看不见它」不成立，「主机不用它」成立——将来若要做「配置与固件编进去的值是否一致」的校验，数据是现成的，不必改固件。
 | `MCU`、`CLOCK_FREQ`、`FLASH_SIZE`、`RAM_*`、`STACK_SIZE`、`HAVE_*` 能力位、katapult 的 `FLASH_START`/`BLOCK_SIZE` | **派生**，各自树的 Kconfig 从上面那些答案算出来 |
 | 应用基址 ↔ 引导跳转地址 | **派生**：klipper 的 `FLASH_APPLICATION_ADDRESS` 就是 katapult 的 `LAUNCH_APP_ADDRESS`（STM32 上还映射 `STM32_FLASH_START_*` → `STM32_APP_START_*`） |
 | `deployer.bin` | **派生**：应用基址 ≠ 引导基址时 katapult 才构建部署器 |

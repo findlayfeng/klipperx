@@ -314,7 +314,10 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       （上游那份），`config INITIAL_PINS` 在其 `src/Kconfig:488`，构建出的 `.config` 里有
       `CONFIG_INITIAL_PINS=""`，`firmware-build.md` 也已把它列为**共享**选项。固件侧在
       `src/initial_pins.c` 的 `DECL_INIT` 里按编译期清单驱动引脚（默认输出高电平，引脚名前加 `!` 为低）；
-      宿主不消费它，也没有 `get_status` 字段——本来就是纯编译期行为。手册已补语法说明。
+      宿主不消费它，也没有 `get_status` 字段——本来就是纯编译期行为。**补充口径**：固件**确实**把它作为
+      **字典常量**报给主机（`scripts/buildcommands.py:167-170` 的 `_DECL_CONSTANT_STR`），但 `src/`、`crates/`
+      与上游 `klippy/**` 都没有一处读它（本仓唯一遍历常量的 `reserve_pins` 只认 `RESERVE_PINS_` 前缀）
+      ⇒「主机不用它」成立，「主机看不见它」不成立。手册已补语法与这条区分。
 - [x] **特定板/芯片三项判定（2026-10-22 拍板：暂不实现）**：`samd_sercom.py`（SAMD 的 pad→SERCOM 分配器）、
       `replicape.py`（BeagleBone Replicape 扩展板）、`palette2.py`（Palette2 拼接器串口协议客户端）
       都绑定具体上游硬件/运行时，且无对应设备可验证；已登记进

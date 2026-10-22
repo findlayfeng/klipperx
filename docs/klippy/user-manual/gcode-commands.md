@@ -303,6 +303,11 @@ RESTORE_GCODE_STATE [NAME=<name>] [MOVE=0|1] [MOVE_SPEED=<mm/s>]
 `absolute_coordinates` / `absolute_extrude`、`homing_origin`、`position`（工具头坐标）、
 `gcode_position`（g-code 坐标）、`axis_map`（对象：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`，`toolhead:update_extra_axes` 到达后追加额外轴字母，如 `"A":4`）。
 
+额外轴的容量与补全（2026-10-21）：`MAX_AXES = 16`（`E` + 12 个字母轴 + `X`/`Y`/`Z`），超出容量重建
+`axis_map` 时一次性 `error!` 列出被丢弃的字母（不静默）；`G0`/`G1` 的 `G1_PARAMS` 收全部自由字母
+（`A`–`Z` 去 `X`/`Y`/`Z`/`E`/`F`/`N`），客户端内建参数表同步再生成（注册点计数 98 → 99）；
+`reset_last_position` 按 `base_position.len()` 一次重建全部轴（四轴 + 全部额外轴，截到 `MAX_AXES`）。
+
 ---
 
 ## 运动控制（`toolhead`，由 `[printer]` 装载）
@@ -883,6 +888,44 @@ SPI_SEND     DEVICE=flash DATA=04          // spi send ok
 `RETRIES`/`RETRY_TOLERANCE` + 探针透传组）。注意两个与上游一致的细节：段内 `horizontal_move_z`
 **不**被命令行 `HORIZONTAL_MOVE_Z` 覆盖；重试用的是**机架相对高度**而非原始探测 Z。
 
+### SKEW_PROFILE / SET_SKEW / CALC_MEASURED_SKEW / GET_CURRENT_SKEW — 三平面斜切校正（由 `[skew_correction]` 注册，2026-10-21）
+
+三个平面（XY/XZ/YZ）的斜切因子串进移动变换链，保持立方体件的直角。
+
+| 命令 | 参数 | 说明 |
+|------|------|------|
+| `GET_CURRENT_SKEW` | — | 打三行 `XY Skew: <v> radians, <deg> degrees`（XZ/YZ 同） |
+| `CALC_MEASURED_SKEW` | `AC` / `BD` / `AD`（均必填、`>0`） | 只报「打印件量出来的三条长度」隐含的斜切因子（`Calculated Skew: …`），**不改状态** |
+| `SET_SKEW` | `XY=` / `XZ=` / `YZ=`（各自三个逗号分隔长度 `AC,BD,AD`）或 `CLEAR=1` | 写对应平面因子；格式不对报 `skew_correction: improperly formatted entry for plane [XY]` + 命令行 |
+| `SKEW_PROFILE` | `LOAD=` / `SAVE=` / `REMOVE=`（取第一个出现的） | `LOAD` 未知名报 `skew_correction:  Load failed, unknown profile [<name>]`；`SAVE` 存成 `[skew_correction <name>]`（`xy_skew`/`xz_skew`/`yz_skew`）+ 提示跑 `SAVE_CONFIG`；`REMOVE` 无该 profile 报 `skew_correction: No profile named [<name>] to remove`；一个动词都没给报 `Invalid syntax '<命令行>'` |
+
+### TUNING_TOWER — 高度-参数调塔（随 `[printer]` 自动装载，无配置节）
+
+每跨过一个 band 就重发一次参数命令，值随当前 Z 线性变化（上游 `tuning_tower.py`）。
+
+| 参数 | 说明 |
+|------|------|
+| `COMMAND` / `PARAMETER` | **必填**：被调的命令与参数名 |
+| `START` / `FACTOR` / `BAND` | 起始值 / 每 mm 增量 / band 高度（默认均 0） |
+| `STEP_DELTA` / `STEP_HEIGHT` | 按台阶表达；两者**必须同时给**，且不得与 `FACTOR` 同用 |
+| `SKIP` | 开头忽略的 Z 距离（默认 0） |
+
+报错文案：`Cannot specify both FACTOR and STEP_DELTA/STEP_HEIGHT`、`Must specify both STEP_DELTA and STEP_HEIGHT`。
+发出的行按上游 `command_fmt`：传统命令拼成 `COMMAND PARAMETER<值>`、扩展命令拼成
+`COMMAND PARAMETER=<值>`，值保留 9 位小数。挤出移动的 Z 比上一次低超过 2 mm 即视为换一版打印，
+测试自行结束（`Ending tuning test mode`）。细节见[模块表](../developer-manual/README.md) 的 `tuning_tower.rs` 行。
+
+### SET_Z_THERMAL_ADJUST — 温度补偿 Z（由 `[z_thermal_adjust]` 注册，2026-10-21）
+
+| 参数 | 说明 |
+|------|------|
+| `ENABLE` | `0`/`1`：开/关补偿（切档时重锚 `gcode_move` 位置，因为 g-code 坐标带的 offset 变了） |
+| `TEMP_COEFF` | 每 °C 的 Z 修正（mm），范围 `-1`..`1` |
+| `REF_TEMP` | 参考温度（°C，下界 `KELVIN_TO_CELSIUS`） |
+
+不带任何参数时只报当前状态；带了哪个就改哪个。节内选项与 `get_status` 六键见 config.md 的
+`[z_thermal_adjust]` 节。
+
 ### SCREWS_TILT_CALCULATE — 螺丝调平计算（由 `[screws_tilt_adjust]` 注册）
 
 | 命令 | 参数 | 说明 |
@@ -1020,7 +1063,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `SET_DUAL_CARRIAGE` | `CARRIAGE=<名字或 0..1>`、`MODE=...` | 切换主/副滑架（**先按名字**如 `carriage_u`；`0/1` 仅在恰 2 滑架时回退，多滑架报 `Invalid CARRIAGE=…`，批 #12）；**现状=记账级**（未接 trapq 切换与限位，C1 缺口入档 idex 模块） |
+| `SET_DUAL_CARRIAGE` | `CARRIAGE=<名字或 0..1>`、`MODE=...` | 切换主/副滑架（**先按名字**如 `carriage_u`；`0/1` 仅在恰 2 滑架时回退，多滑架报 `Invalid CARRIAGE=…`，批 #12）；**现状**：坐标交接与两个滑架的步进都已接通（`ToolHead::connect` 收 `take_stepper()`），仍未移植上游 `updateLimits` 的限位重算（`idex_modes` 模块文档有登记） |
 | `SAVE_DUAL_CARRIAGE_STATE` | `NAME=<名>` | 保存当前滑架状态 |
 | `RESTORE_DUAL_CARRIAGE_STATE` | `NAME=<名>`、`MOVE=<0..1>` | 恢复（含恢复移动的完整语义未移植） |
 

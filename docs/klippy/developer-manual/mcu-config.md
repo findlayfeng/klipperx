@@ -219,7 +219,7 @@ void command_finalize_config(uint32_t *args) {
 | **CRC 不匹配时先 `check_restart_on_crc_mismatch()`：请求一次 `request_exit('firmware_restart')`、pause 2 s、然后才 raise** | `:678-685`、`:1057-1059` | 改成**优先真重启**：固件有 `reset` 就发 `reset` + 重连 + 重试握手（`McuObject::connect` 的循环）；只有没有 `reset` 时才 `emergency_stop` + `config_reset` 就地清；`rpi_usb` 的 CRC 不匹配由上一行的门先请求 firmware_restart |
 | pin 名在 `_finalize_config` 里改写；非法 pin 的错误到**发送时**才被 `_send_cfg_init_commands` 捕获并转成 config error | `:1009-1013`、`:1021-1032` | F2 会在**加入命令时**就改写/报错，编码在 build 时，错误也在 build 暴露 |
 | 发送后第二次 `get_config`：`fileoutput` 模式下跳过 `is_config` 断言 | `:1066-1068` | 总是断言 |
-| `move_count` 与预留槽：把 `move_count - reserved` 交给 `steppersync` | `:1070-1078` | 只校验 `move_count >= reserved`（无运动层，C1） |
+| `move_count` 与预留槽：把 `move_count - reserved` 交给 `steppersync` | `:1070-1078` | 只校验 `move_count >= reserved`（命令层不碰运动层） |
 | `_finalize_config` 不带重入保护（重复调用会插两次 `allocate_oids`、追加两次 `finalize_config`） | `:1004` | `build` 二次调用直接报错 |
 
 两边**相同**的部分也值得记下：都先 `get_config`，都**无论复用与否都算一次 CRC**（所以复用路径也要 build），都只在 `config` 列表上算、都排除 `restart`/`init`、都把 `allocate_oids` 计入、都把 `finalize_config` 排除。

@@ -264,7 +264,7 @@ connect_file(输出文件, 字典):
 - 在 `finalize_config crc=%u` 记下 CRC，之后把 `get_config` 报为已配置；
 - 用单调计数器回答 `get_clock` / `get_uptime`；
 - 对每个收到的块回一个同序号的空载荷 ack，推进主机的发送窗口；
-- 按 `config_stepper` / `queue_step` / `reset_step_clock` 维护 **per-oid 固件步进链**并做 `timer_is_before` u32 回绕判定：首拍落过去 → 以字典 `static_string_id` 发 `Timer too close` shutdown 帧（Q10/C5 的两会话复现，修复缺失 `reset_step_clock` 重锚的宿主在此转红）；**任何传感器的 `*_attach_trigger_analog`**（`ldc1612`/`ads1220`/`ads131m0x`/`hx71x`，以及起 `ldc1612` 芯片的 `config_ldc1612*`）都置上「固件本地喂样本」标志——这些芯片的样本由固件自己读、不过线，窗口只在采样真断时才过期。（先前只认 `ldc1612` 拼法，非 ldc 传感器的监控窗只能靠主机后续帧续命，`load_cell.test` 的 ads1220 窗仅约 6 ms，并行负载下主机批次一被调度延迟就被当成「采样断」而误报 MONITOR；已改为逐拼法识别。）
+- 按 `config_stepper` / `queue_step` / `reset_step_clock` 维护 **per-oid 固件步进链**并做 `timer_is_before` u32 回绕判定：首拍落过去 → 以字典 `static_string_id` 发 `Timer too close` shutdown 帧（两会话复现，修复缺失 `reset_step_clock` 重锚的宿主在此转红）；**任何传感器的 `*_attach_trigger_analog`**（`ldc1612`/`ads1220`/`ads131m0x`/`hx71x`，以及起 `ldc1612` 芯片的 `config_ldc1612*`）都置上「固件本地喂样本」标志——这些芯片的样本由固件自己读、不过线，窗口只在采样真断时才过期。（先前只认 `ldc1612` 拼法，非 ldc 传感器的监控窗只能靠主机后续帧续命，`load_cell.test` 的 ads1220 窗仅约 6 ms，并行负载下主机批次一被调度延迟就被当成「采样断」而误报 MONITOR；已改为逐拼法识别。）
 
 harness 把每个 `[mcu]` / `[mcu <name>]` 的传输键换成 `test: dict=<字典路径>`，主机因此走它的
 正常路径（identify、配置握手、时钟、消息序号），而不是一条生产不存在的分支。

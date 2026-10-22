@@ -833,9 +833,13 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       `move_clocks` 发送失败退回槽位、`TriggerDispatch::stop()` 保留原始失败理由（探针失败不再读成主机请求）、
       `trigger_analog` 的 arm 带 `reqclock` 且先停再清了、端停链路故障不再吞掉 `Communication timeout during homing`、
       `stress --task step` 加行程上界（`position_max × 0.5`）+ 三种出口（断线 exit 1）+ `shutdown_timeout` + 有界 `wait_for_idle`。
-- [ ] `pending::cancel` 已改为按 token 精确删（2026-10-21：`register` 返回 `PendingCallToken`，计数在登记表内 `Arc<AtomicU64>`、
-      随 clone 共享；三条清理路径都按自己那笔的 token 取消）；**剩下的一半**：`resolve` 对「有同名登记但 oid 不匹配」
-      仍返回 `true`（`mcu/pending.rs`）。
+- [x] **待答调用的两条语义 —— 均已落地（2026-10-21 / 2026-10-22）**：
+      ① `cancel` 按 token 精确删（`register` 返回 `PendingCallToken`，计数在登记表内 `Arc<AtomicU64>`、随 clone 共享；
+      三条清理路径都按自己那笔的 token 取消）；
+      ② `resolve` 对「有同名登记但 oid 不匹配」**不再返回 `true`**：不消费、返回 `false`，消息照常走
+      「绑定回调 / `Unhandled` 告警」那条路（对齐上游 `handle_default` 的可见性，此前只留一条 `debug!`）。
+      钉子：`test_an_answer_for_another_oid_is_reported_not_swallowed`（假 MCU：oid 8 的应答被报成
+      `Unhandled message resp` 且 call 仍在等 oid 7）。
 - [x] **`hardware_test` 的用例级总超时与 teardown 护栏 —— 已落地（2026-10-21）**：
       `hardware_test::case`/`async_case` 把用例体放自管线程、主线程 `recv_timeout(300 s)` 并打
       `HW-TIMEOUT: <用例>: still at <阶段> after <时长>`；板锁 `LOCK_EX|LOCK_NB` 轮询、`LOCK_TIMEOUT=600 s`

@@ -163,7 +163,7 @@ klipperx（bin，src/main.rs）
 | `resource/spi.rs` | `McuSpi`（上游 `MCU_SPI`）：`config_spi`（连片选一起装）与传输；**`transfer_with_preface`（2026-10-21）**：preface 走 `spi_send`、读走 `spi_transfer`，两条消息编码进**同一个 block**、只等一个 ack（`Mcu::call_two`，上游 `mcu.py:104-111`；固件仍每条消息各派发一次 ⇒ 两次片选）；`setup_shutdown_msg` 立即分配 handler oid 并在 config 包里发 `config_spi_shutdown`，build 后拒绝新调用 |
 | `resource/i2c.rs` | `McuI2c`（上游 `MCU_I2C`）：`config_i2c` 后配置为硬件或软件（bit-bang）总线，读写字节 |
 | `dictionary.rs` | `Dictionary`：解析固件字典、枚举展开、安装进 `Parser` |
-| `pending.rs` | `PendingCalls`：同步请求/响应记账；`register` 返回 `PendingCallToken`（登记表内 `Arc<AtomicU64>` 自增，随 clone 共享 ⇒ 跨句柄唯一），`cancel(token)` 只删自己那一笔，派发仍是 name+oid 先到先得；`abort_all` 清空全部在飞调用（丢弃 sender，等待方立刻返回，不等超时） |
+| `pending.rs` | `PendingCalls`：同步请求/响应记账；`register` 返回 `PendingCallToken`（登记表内 `Arc<AtomicU64>` 自增，随 clone 共享 ⇒ 跨句柄唯一），`cancel(token)` 只删自己那一笔，派发是 name+oid 先到先得；**同名但 oid 无人认领的应答不消费**（`resolve` 返回 `false`，消息落回回调/`Unhandled` 告警，对齐上游 `handle_default` 的可见性，2026-10-22）；`abort_all` 清空全部在飞调用（丢弃 sender，等待方立刻返回，不等超时） |
 | `events.rs` | 按消息 id 索引的入站回调表（`McuEvents`）：`bind` / `callback`，与 `Parser` 分开放——编解码表是纯字典，回调可能反向持有资源 |
 | `error.rs` | `McuError`（总括）、`McuCallError`（`call` 专用） |
 | `restart.rs` | 固件复位的物理分派：`command` / `arduino` / `cheetah` / `rpi_usb` 四种怎么把板子重置，含连接期门控（`restart_before_bringup`、`check_usb_power`）与 USB 端口切电（`interface/usb.rs`） |

@@ -4025,6 +4025,69 @@ mod tests {
         );
     }
 
+    /// An answer for another `oid` is **not** swallowed by a pending call that
+    /// shares its name: it takes the ordinary path, so the unhandled report
+    /// names it and the call is left waiting (2026-10-22).
+    ///
+    /// Upstream dispatches on `(name, oid)` and sends an unclaimed answer to
+    /// `handle_default`, which logs a warning (`klippy/serialhdl.py:59-62`,
+    /// `:311-312`); returning `false` from `PendingCalls::resolve` is how this
+    /// host reaches the same visibility instead of a `debug!` nobody reads.
+    #[tokio::test]
+    async fn test_an_answer_for_another_oid_is_reported_not_swallowed() {
+        let device = FrameMock::new(vec![MappingEntry {
+            input: make_frame(0, &[4]),
+            // The firmware answers `oid 8`, while the call below waits on 7.
+            outputs: vec![make_frame(1, &[20, 8, 42]), make_frame(1, &[21])],
+        }]);
+        let mcu = Mcu::for_test("test_mcu", Interface::new(device));
+        mcu.install_dictionary(
+            Dictionary::from_json(serde_json::json!({
+                "commands": {"get_uptime": 4},
+                "responses": {"resp oid=%c x=%u": 20, "done": 21},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (tx, mut rx) = oneshot::channel();
+        let _token = mcu
+            .pending_calls
+            .register("resp".to_string(), Some(7), tx)
+            .await;
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::LevelFilter::WARN)
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(capture.clone())
+                    .with_ansi(false),
+            );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        mcu.bind_callback("done", move |_| {
+            let _ = done_tx.send(());
+        })
+        .unwrap();
+        mcu.send_msg(&crate::core::klippy::cmd::uptime::GetUptime)
+            .unwrap();
+        let marker = tokio::time::timeout(Duration::from_secs(5), done_rx.recv()).await;
+        let logged = capture.text();
+        assert!(marker.is_ok(), "both frames must be dispatched: {logged}");
+        assert_eq!(
+            logged.matches("Unhandled message resp").count(),
+            1,
+            "the mismatched answer is reported, not swallowed: {logged}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the call is still waiting for its own oid"
+        );
+        assert_eq!(mcu.pending_call_count().await, 1);
+        mcu.abort_pending_calls();
+    }
+
     /// A byte sink for the fmt layer above; `set_default` keeps the capture off
     /// the process-wide subscriber, so tests stay independent of each other.
     #[derive(Clone, Default)]

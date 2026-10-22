@@ -101,11 +101,17 @@ impl PendingCalls {
     /// in registration order, so a plain call waiting alongside filtered ones
     /// takes the next message whatever its `oid`.
     ///
-    /// A message whose `oid` no waiting call claims is **dropped**: upstream
-    /// dispatches `oid`-registered callbacks by exact `oid`
-    /// (`serial.register_response(cb, name, oid)`), so an answer nobody on this
-    /// connection asked for is not handed to the next caller in line — that
-    /// would be another peripheral's data.
+    /// A message whose `oid` no waiting call claims is **not consumed**: the
+    /// registration that shares its name does not take it — handing it over
+    /// would be another peripheral's data — and this returns `false`, so the
+    /// receive loop lets the message take the ordinary path (a bound callback,
+    /// or the unhandled-message report) exactly as if nobody were waiting.
+    ///
+    /// Upstream dispatches on the `(name, oid)` pair and sends an unclaimed
+    /// answer to `handle_default`, which logs a warning
+    /// (`klippy/serialhdl.py:59-62`, `:311-312`). Returning `false` is how this
+    /// host reaches the same visibility: an answer nobody asked for is not
+    /// swallowed here, it is reported where every other unbound message is.
     ///
     /// A registration whose receiver is gone goes first: a [`Mcu::call`] whose
     /// future was dropped — the caller was cancelled, its task aborted — leaves
@@ -133,12 +139,15 @@ impl PendingCalls {
         }
         let Some(idx) = matched else {
             if waiting {
+                // Same name, different `oid`: not this call's answer, and not
+                // this registry's to keep (see the doc comment). `false` hands
+                // it back to the receive loop.
                 debug!(
-                    "Discarding '{response_name}' with oid {:?}: no pending call carries it",
+                    "Not the answer of any pending '{response_name}': oid {:?} is unclaimed",
                     params.first()
                 );
             }
-            return waiting;
+            return false;
         };
         let call = calls.remove(idx);
         // A send failure means the receiver is gone already; that is not an error.
@@ -444,9 +453,12 @@ mod tests {
 
         // oid 2's answer is nobody's on this connection. Handing it to the call
         // waiting for oid 1 would be the wrong peripheral's data, so the
-        // registration stays put and the answer is dropped.
+        // registration stays put — and the message is *not* consumed either:
+        // `false` sends it back to the receive loop, where it lands in the
+        // unhandled-message report instead of vanishing (upstream logs its own
+        // warning from `handle_default`).
         assert!(
-            calls
+            !calls
                 .resolve("tmc_uart_read_response", &tmc_response(2))
                 .await
         );
@@ -470,14 +482,16 @@ mod tests {
         let token = calls
             .register("tmc_uart_read_response".to_string(), Some(1), tx)
             .await;
+        // Nobody claims oid 2, so the message is not consumed (and not held
+        // here either): `false` hands it back to the receive loop.
         assert!(
-            calls
+            !calls
                 .resolve("tmc_uart_read_response", &tmc_response(2))
                 .await
         );
 
         // Only a mismatched answer ever arrived, so the call sits out its own
-        // deadline — the drop must not resolve it with the wrong data.
+        // deadline — it must not be resolved with the wrong data.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(20), rx)
                 .await
@@ -522,10 +536,10 @@ mod tests {
         calls.cancel(oid1).await;
 
         assert_eq!(calls.len().await, 1);
-        // oid 1's answer now has no claimant: it is dropped, and oid 2's call is
-        // left untouched by both the cancel and the drop.
+        // oid 1's answer now has no claimant: it is not consumed and not
+        // delivered, and oid 2's call is left untouched by the cancel.
         assert!(
-            calls
+            !calls
                 .resolve("tmc_uart_read_response", &tmc_response(1))
                 .await
         );

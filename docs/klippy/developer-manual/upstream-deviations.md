@@ -68,6 +68,7 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 上游无、本仓有 | 通用 `[i2c_device]` / `[spi_device]` 节与 `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` 调试命令、`KlipperX` 自有调试总线命令 —— 属**本仓扩展**，上游没有对应物 | [配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 
 ## 2. 行为偏移（同功能，两种表现）
+| 响应分派与「没人要的应答」 | 分派键是 `(消息名, oid)` 二元组；没有登记的 `(name, oid)` 落到 `handle_default`，打一条 `got {'#name': …, 'oid': …}` 的 **warning**（`klippy/serialhdl.py:59-62`、`:311-312`）；等待方的登记也是按 `(name, oid)` 精确匹配（`register_response(cb, name, oid)`） | 本仓的 `PendingCalls::resolve` 先按**名字**找待答，再按 oid 判是否属于它：**匹配到 ⇒ 消费并投递**；同名但 oid 无人认领 ⇒ **不消费**、返回 `false`，消息照常走「绑定的回调 / `Unhandled` 告警」那条路（等价于上游 `handle_default` 的可见性，只是文案与通道不同：我们进 `Unhandled message … discarding` 的去重计数）。另一处有意的宽松：**无 oid 的调用接受任意 oid** 的应答（上游的精确二元组会落到 `handle_default`），因为本仓的请求/响应消息里 oid 只是区分参数、不是身份 | [MCU 协议](mcu-protocol.md)、[模块表](README.md) |
 | 脚本执行与错误策略 | 行协议输入下错误不中断；`run_script` 持 `gcode` mutex 串行化 | 只有"报告 + 中止整段脚本"一种策略（`need_ack` 已删）；脚本在调用任务上跑完，不再有 mutex | [klippy-runtime](klippy-runtime.md)、`src/core/klippy/gcode.rs` 模块文档 |
 | `start_args` 字段 | 上游有 `debuginput`（`-i`）与每 MCU 字典路径（`-d`） | 本仓没有 `debug_input` 字段与字典路径（不实现文件输入 / batch mode）；`debug_output` 保留（语料 harness 的文件输出开关） | [klippy-runtime](klippy-runtime.md)、[回归测试](regression-tests.md) |
 | mux 命令的"值不合法"提示 | 按 dict 迭代序取最后一个匹配候选 | 对候选排序后取第一个（消息稳定） | [模块表](README.md) |

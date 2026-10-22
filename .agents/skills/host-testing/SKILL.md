@@ -79,8 +79,16 @@ description: 给本仓（Rust 宿主 + 上游语料）写测试与核闸门的�
 - 窄过滤跑局部（`cargo test -p klipperx --lib <过滤>`），合并前跑 `cargo test --workspace`。
 - **核总数**：`总数 = 上次基线 + 本批新增 fn test 数`。对不上就是漏跑/多跑（真实事故：某个
   「All green」的报告里 `changed tracked files: none`，提交根本不存在）。
-- 失败时**先把整次输出落文件再 grep** `^test .* FAILED`——只 grep `^test result:` 会丢掉用例名
-  （本批两次不可复现失败因此未能定位）。
+- **跑闸门一律用 `scripts/test-log.sh`**，不要裸 `cargo test | grep`：它把整次输出落到
+  `target/tmp/test-logs/<时间戳>-<标签>.log`（在 `target/` 里 ⇒ 不进仓库、不受重启影响），
+  失败时先按名字列出 `^test .* FAILED`、再贴 `failures:` 段，构建失败则贴尾部诊断，最后打印日志路径：
+  ```sh
+  scripts/test-log.sh -l gate --workspace
+  scripts/test-log.sh -l pending -p klipperx --lib mcu::pending -- --test-threads=1
+  TEST_LOG_KEEP=50 scripts/test-log.sh -l hunt -p klipperx --lib --no-fail-fast   # flake 追查
+  ```
+  目录默认只留最近 20 份（`TEST_LOG_DIR`/`TEST_LOG_KEEP` 可改）。只 grep `^test result:` 会丢掉用例名
+  ——本批两次不可复现失败就是因为这个没抓到名字。
 - 有界命令：`timeout 1200 cargo test … --no-fail-fast`；并发构建导致慢是正常的，别误判成挂死。
 - 判「挂死还是慢」：看测试二进制的 `CPU time` 与线程 `wchan`——**CPU≈0 + 全线程 `futex_wait` = 在等**；
   `rustc`/`cargo` 在跑 = 在编译，放过。
@@ -88,7 +96,8 @@ description: 给本仓（Rust 宿主 + 上游语料）写测试与核闸门的�
 ## 8. flake 追查流程（单次失败、随后不可复现）
 
 1. 记录**时间点与当时正在做什么**（合入哪个 lane、刚跑过什么）。
-2. `for i in …; do cargo test … --no-fail-fast | grep '^test .* FAILED'; done`，至少 6 轮。
+2. `for i in 1 2 3 4 5 6; do scripts/test-log.sh -l hunt-$i -p klipperx --lib --no-fail-fast; done`，
+   至少 6 轮（每轮的完整输出都留在 `target/tmp/test-logs/`，抓不到也只是没抓到，不会连名字一起丢）。
 3. 抓不到就换维度复跑：`RUST_TEST_THREADS=1` 对照（区分时序 vs 共享状态）、单独跑可疑模块、
    或加 `--test-threads=N`。
 4. 找到后用 §3/§5 的口径改掉断言形态，并在决策/台账里记一条；**没找到就如实记为未复现**，

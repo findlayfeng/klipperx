@@ -1037,7 +1037,7 @@ pins: PA1, my_alias
 | `i2c_*`（bus 选项组） | `pca9533`/`pca9632` | I2C 地址/速率等（`bus.py:302`）；`pca9632` 另有 `color_order` |
 | `text`、`param_*` | `display_template` | 模板文本与参数（惰性对象，`is_queryable=false`） |
 
-六段已落地（2026-09-24 批 #2）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（H3/H8），模板 `text` 不渲染（渲染引擎已在 `extras/template.rs`，缺的是 `SET_LED_TEMPLATE` 这条缝）。
+六段已落地（2026-09-24 批 #2）；`SET_LED`/`SET_LED_TEMPLATE` 未注册（未覆盖），模板 `text` 已能渲染（`extras/template.rs`），差的是 `SET_LED_TEMPLATE` 这条缝。
 
 ### [extruder_stepper <name>]
 
@@ -1070,7 +1070,7 @@ pins: PA1, my_alias
 | `primary_carriage`（generic 形态，**可选**） | 无它 = 该轴的**主动滑架**（`axis` 必填、无 `safe_distance`）；有它 = 从动滑架（`axis` 可选、仅作交叉校验，`safe_distance` 生效）。同主滑架的两个 dual 会报重（按**主滑架名**判，非按轴）；`[extra_carriage <name>]` 的 `primary_carriage` **仍必填**（批 #27） |
 | 电机组 | 经 `PrinterStepper`（同上游 `LookupMultiRail`） |
 
-cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进仍仅主轨（`updateLimits` 未移植，C1）。已转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
+cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CARRIAGE`/`SAVE_…_STATE`/`RESTORE_…_STATE`。**轨间坐标交接已实现**（批 #4，`toggle_active_dc_rail` 语义：切换/恢复携带 gcode 坐标）；步进链已接通（两个滑架都进主 trapq，2026-10-21），仍未移植上游 `updateLimits` 的限位重算。已转绿（2026-09-24）。**generic 形态**（批 #12）：`[carriage <name>]`/`[dual_carriage <name>]`/`[extra_carriage <name>]`/`[stepper <name>]` 由运动学注册同一对象与三命令（`dual_carriage` status 报 `active_carriage` + `carriages`），`[printer]` 的 `max_z_velocity/max_z_accel` 经 `carriage::build` 进入 generic 归零（原写死 0 为首因）。
 
 ### [servo <name>]
 

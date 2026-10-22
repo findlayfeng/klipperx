@@ -240,11 +240,11 @@ canbus_nodeid: 4        # stress 需要它；正式 printer.cfg 里可以省，�
 - 端到端：**假板上的 step ramp / comm ramp / `ResetRequired` 重连已有自动化用例**（2026-10-06，
   用 `test: dict=` 的 `SimulatorDevice`）；真板上只手工跑过单轴冒烟。**双板并发的真板验证项**：
   双 step ramp、双 comm ramp 的调度余量、`--all-mcus` 真实枚举、单板旧命令行回归、
-  一板连接失败另一板照常+退出码 1；未覆盖的还有 `--task motion` 的假板 e2e（假件
-  `stepper_get_position` 恒答 0，位置断言无法通过）。单测另覆盖段计算、引脚解析、命令编码与
+  一板连接失败另一板照常+退出码 1；`--task motion` 的假板 e2e 已于 2026-10-21 落地（假件按 oid 累积
+  有符号步进位置、断言读回步数 == 距离/`step_dist`）。单测另覆盖段计算、引脚解析、命令编码与
   多机选择/双假设备并发的帧隔离（见 [测试](testing.md)）。
 
-TODO 里记着这些剩余项（**S1**；2026-10-06 后仅剩 `--task motion` 的假板 e2e 与真板双机验证）。
+剩下的只有**真板双机并发验证**（双机压测与 `--all-mcus` 真实枚举）；条目记在 `TODO.md` 的零散待办里。
 
 ## 收尾：饱和之后板子不会自愈
 

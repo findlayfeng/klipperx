@@ -462,7 +462,7 @@ impl Printer {
 | 5 | `invoke_shutdown` 触发 `KlippyAnalyzeShutdown` | 3 | 已实现 |
 | 6 | 迁移 `gcode.rs`、`extras/output_pin.rs`、`api/endpoints/gcode.rs` 的调用点 | 3 | 已实现 |
 | 7 | 更新测试并删除 `PrinterEvent` | 6 | 已实现 |
-| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 进行中：34 个里 28 个已发出（逐项见 §2.2 表）。仍无发送方的 6 个：`stepper:sync_mcu_position`、`stepper:set_dir_inverted`、`menu:populate`/`init`/`begin`/`exit` |
+| 8 | 其余命名空间的事件在各自模块就位后逐步注册处理器 | 3 | 已完成：34 个里 32 个已在生产路径发出，只剩 `stepper:sync_mcu_position`、`stepper:set_dir_inverted` 两个无发送方（逐项见 §2.2 表与 `TODO.md` 的上游事件对照清单） |
 
 ## 6. 与上游的差异
 

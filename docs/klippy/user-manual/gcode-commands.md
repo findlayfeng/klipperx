@@ -1063,7 +1063,7 @@ SAVE_VARIABLE VARIABLE=<name> VALUE=<literal>
 
 | 命令 | 参数 | 说明 |
 |------|------|------|
-| `SET_DUAL_CARRIAGE` | `CARRIAGE=<名字或 0..1>`、`MODE=...` | 切换主/副滑架（**先按名字**如 `carriage_u`；`0/1` 仅在恰 2 滑架时回退，多滑架报 `Invalid CARRIAGE=…`，批 #12）；**现状=记账级**（未接 trapq 切换与限位，C1 缺口入档 idex 模块） |
+| `SET_DUAL_CARRIAGE` | `CARRIAGE=<名字或 0..1>`、`MODE=...` | 切换主/副滑架（**先按名字**如 `carriage_u`；`0/1` 仅在恰 2 滑架时回退，多滑架报 `Invalid CARRIAGE=…`，批 #12）；**现状**：坐标交接与两个滑架的步进都已接通（`ToolHead::connect` 收 `take_stepper()`），仍未移植上游 `updateLimits` 的限位重算（`idex_modes` 模块文档有登记） |
 | `SAVE_DUAL_CARRIAGE_STATE` | `NAME=<名>` | 保存当前滑架状态 |
 | `RESTORE_DUAL_CARRIAGE_STATE` | `NAME=<名>`、`MOVE=<0..1>` | 恢复（含恢复移动的完整语义未移植） |
 

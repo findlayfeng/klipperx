@@ -68,7 +68,7 @@ AI 写实现」：人类负责方向与取舍、任务拆解、验收判定、�
 
 1. **输入回放**：`virtual_sdcard` 的文件回放（`M20`–`M29`/`SDCARD_PRINT_FILE`）、`print_stats`、
    `pause_resume/{pause,resume,cancel}` 三个端点、`sdcard_loop` 的 `SDCARD_LOOP_BEGIN/END/DESIST` 与回放游标接缝
-   都已落地（见 [`TODO.md`](TODO.md) H4）。
+   都已落地（模块表见[开发手册](docs/klippy/developer-manual/README.md)）。
 2. **温度语义**：`M105` 的 gcode_id 表已接线（`heaters.rs:417` 的 `gcode_id_to_sensor`，
    没有登记传感器时才回 `T:0`）；`M190`/`M109` 按等待版本注册（`extruder.rs:263`、
    `heater_bed.rs:53`），会等到温度到位；`TEMPERATURE_WAIT` 亦可等待（2026-10-03，`a802cdc`）。

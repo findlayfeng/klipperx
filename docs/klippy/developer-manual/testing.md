@@ -94,7 +94,7 @@ cargo test --workspace -- --test-threads=1 2>&1 | scripts/test-timings.py
 
 已知基线与另三类看起来像挂死的情况（都不是测试自身）：① `cargo` 对同一 `target/` 的**构建锁排队**
 （第二个 cargo 安静排队、CPU 全空，见 `AGENTS.md` 的「常用命令」段；**用 `scripts/cargo-locked.sh …` 代替 `cargo` 就能看见**：它会报「谁占着 + 等了多久」）；② 需要真机/真总线的形态
-（例如 Q11：非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）；
+（例如非 `-o` 的活机会让假设备的阻塞读 park，已改成确定性失败并保留 `#[ignore]` 复现）；
 ③ **测试自己把假设备的阻塞读留到 runtime 关闭之后**（见下）。
 
 ③ 单列一节，因为它看起来像某条测试「偶发超时」，实际是**整个测试二进制挂住**：`Interface::receive()` 每次都在 `spawn_blocking` 里跑，而 `SimulatorDevice::receive()` 会一直 park 在

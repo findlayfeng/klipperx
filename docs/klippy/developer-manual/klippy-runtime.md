@@ -315,7 +315,7 @@ run() 返回 ──▶ res = firmware_restart│restart ──▶ 主循环下�
 另有一处 `start_reason` 表示差异：上游主循环每轮把它写回
 `start_args` 字典、`mcu.py` 从字典读（`klippy.py:368`、`mcu.py:682`/`:1060`）；本仓由
 `reset_for_restart` 更新在 `Printer::start_reason()` 上，MCU 读的正是它（语义一致），而
-`StartArgs.start_reason` 停在 `"startup"` 且当前无人读（见 `TODO.md` D1）。
+`StartArgs.start_reason` 停在 `"startup"` 且当前无人读。
 
 ## 客户端侧
 

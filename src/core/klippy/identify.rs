@@ -45,14 +45,17 @@
 //! zip-bomb style attacks where a tiny compressed payload expands to enormous data.
 
 use super::cmd::identify::{IdentifyChunk, IdentifyRequest};
+use super::cmd::{McuResponse, Params};
 use crate::core::klippy::interface::Interface;
 use crate::core::klippy::mcu::{Dictionary, Mcu, McuCallError, McuError};
 use crate::core::klippy::msg::parser::Parser;
 use flate2::read::ZlibDecoder;
+use std::future::Future;
 use std::io::Read;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::time::{sleep, Duration, Instant};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// The identify request/response message formats defined by the host.
 ///
@@ -402,6 +405,412 @@ impl Mcu {
         }
         Ok(installed)
     }
+}
+
+// ===========================================================================
+// The identity readback: which board is behind the link
+// ===========================================================================
+//
+// An id-addressed device — a CAN node, or a serial-mux carrier such as the host
+// library — is named by the host, not by its wire: the node id the config
+// assigns is written to the board with `SET_NODEID`, and nothing in that write
+// says whether the board that took it is the one the config meant. Upstream asks
+// instead (`serialhdl.py:143-152`): after the session is up it sends
+// `get_canbus_id` and compares the uuid the firmware reports with the one the
+// config named.
+//
+// The command answers on every id-addressed carrier the firmware builds — CAN's
+// `generic/canserial.c` and the serial mux's `mux.c` — with the same command
+// name and the same reply, which is what lets one readback serve both. The
+// command was renamed `get_canbus_id` → `get_mcu_id` and the firmware declares
+// **both**, so the name is chosen from the dictionary: a firmware this host
+// finds on a bench can be older than the rename.
+
+/// The identity command's name, as the current firmware declares it.
+pub const IDENTITY_COMMAND: &str = "get_mcu_id";
+
+/// The name the same command had before the rename: a firmware built then
+/// declares only this one, and answers the same reply.
+pub const IDENTITY_COMMAND_ALIAS: &str = "get_canbus_id";
+
+/// The reply both names answer with: `canbus_id canbus_uuid=%.*s
+/// canbus_nodeid=%u`.
+pub const IDENTITY_RESPONSE: &str = "canbus_id";
+
+/// How long one identity query may wait for its answer.
+///
+/// A healthy firmware answers a dictionary message in milliseconds; the window
+/// is what a board which took the node id and then went quiet costs before the
+/// call is retried.
+pub const IDENTITY_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How many times the identity query itself is repeated before the board is
+/// given up on.
+///
+/// A query is idempotent and carries no state, so a lost answer is worth asking
+/// again; a board that is genuinely not there has to fail inside a bounded
+/// number of windows rather than wait out a caller's whole budget.
+pub const IDENTITY_QUERY_ATTEMPTS: u32 = 3;
+
+/// How long the whole verified connect may take: upstream's 90 s
+/// (`klippy/serialhdl.py:133`).
+///
+/// The budget is the **round**, not one attempt in it: every reopen, identify
+/// and readback is carved out of it, so a bus that keeps answering with the
+/// wrong board still fails in a known time.
+pub const VERIFIED_CONNECT_BUDGET: Duration = Duration::from_secs(90);
+
+/// The pause between two rounds of a verified connect.
+///
+/// Long enough that a bus answering with the wrong board is not hammered, short
+/// enough that a round which does work is not delayed by it; the last round of a
+/// budget never waits past the deadline.
+const VERIFIED_CONNECT_PAUSE: Duration = Duration::from_millis(250);
+
+/// The identity an id-addressed device reports: the six-byte uuid it answers to
+/// and the node id it has adopted.
+///
+/// Both halves come from the same reply, and the uuid is what the config named —
+/// the node id is reported for the error text, not checked: a device that has
+/// not adopted an id yet reports `0` there, which is a legal answer (an
+/// unassigned board still knows which board it is).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceIdentity {
+    /// The uuid the board answers to, most significant byte first.
+    pub uuid: [u8; 6],
+    /// The node id it has adopted, or `0` while it has none.
+    pub node_id: u32,
+}
+
+impl DeviceIdentity {
+    /// The uuid as twelve hex digits, the way a config writes it.
+    pub fn uuid_hex(&self) -> String {
+        hex_uuid(&self.uuid)
+    }
+}
+
+impl std::fmt::Display for DeviceIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.uuid_hex())?;
+        match self.node_id {
+            0 => write!(f, " (no node id)"),
+            node => write!(f, " (node {node})"),
+        }
+    }
+}
+
+/// `McuResponse` for `canbus_id canbus_uuid=%.*s canbus_nodeid=%u`.
+impl McuResponse for DeviceIdentity {
+    const NAME: &'static str = IDENTITY_RESPONSE;
+
+    fn decode(params: &Params<'_>) -> Result<Self, McuError> {
+        let uuid: [u8; 6] = params
+            .get_bytes("canbus_uuid")?
+            .try_into()
+            .map_err(|bytes: Vec<u8>| {
+                McuError::Decode(format!(
+                    "canbus_uuid is {} bytes, not the six a uuid has",
+                    bytes.len()
+                ))
+            })?;
+        Ok(Self {
+            uuid,
+            node_id: params.get_u32("canbus_nodeid")?,
+        })
+    }
+}
+
+/// A uuid as twelve hex digits, most significant byte first — the spelling the
+/// config and Klipper's own tooling use.
+pub fn hex_uuid(uuid: &[u8; 6]) -> String {
+    uuid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// What went wrong with one identity readback (`verify_identity`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityFailure {
+    /// The firmware declares neither name: there is nothing to ask it. That is
+    /// not a mismatch — an exclusive tty addresses its one board by its wire,
+    /// and a firmware built before the command existed has no identity to give.
+    NotDeclared,
+    /// The query went unanswered (or failed): nothing said which board it is.
+    NoAnswer(String),
+    /// The board answered, and it is not the one the configuration names.
+    Mismatch {
+        /// The uuid the configuration named.
+        expected: [u8; 6],
+        /// What the board said it is.
+        found: DeviceIdentity,
+    },
+}
+
+impl std::fmt::Display for IdentityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotDeclared => write!(
+                f,
+                "the firmware declares neither '{IDENTITY_COMMAND}' nor \
+                 '{IDENTITY_COMMAND_ALIAS}', so it cannot say which board it is"
+            ),
+            Self::NoAnswer(last) => write!(
+                f,
+                "no answer to the identity query '{IDENTITY_COMMAND}' ({last})"
+            ),
+            Self::Mismatch { expected, found } => write!(
+                f,
+                "the board answered as uuid {found}, but the configuration names {}",
+                hex_uuid(expected)
+            ),
+        }
+    }
+}
+
+impl Mcu {
+    /// The name this firmware declares for the identity command, if either.
+    ///
+    /// A firmware built after the rename declares both (the old name stays as an
+    /// alias), so the new name wins where it is there and an older build is still
+    /// asked — the reply is the same either way, which is what keeps one parser
+    /// for both.
+    pub(crate) fn identity_command(&self) -> Option<&'static str> {
+        [IDENTITY_COMMAND, IDENTITY_COMMAND_ALIAS]
+            .into_iter()
+            .find(|name| self.require_message(name).is_ok())
+    }
+
+    /// Ask the firmware which board it is: its uuid and the node id it answers
+    /// on.
+    ///
+    /// The command name comes from the dictionary (`Mcu::identity_command`), the
+    /// reply is one format for both names.
+    ///
+    /// # Errors
+    /// [`McuError::UnknownMessage`] when the firmware declares neither name (or
+    /// the reply is missing from the dictionary), [`McuError::Call`] when the
+    /// query goes unanswered, and [`McuError::Decode`] when the reply does not
+    /// carry a six-byte uuid and a node id.
+    pub(crate) async fn query_identity(&self, timeout: Duration) -> Result<DeviceIdentity, McuError> {
+        let command = self.identity_command().ok_or_else(|| {
+            McuError::UnknownMessage(format!(
+                "{IDENTITY_COMMAND} / {IDENTITY_COMMAND_ALIAS}"
+            ))
+        })?;
+        let reply = self.require_message(IDENTITY_RESPONSE)?;
+        let values = self
+            .call(command, &[], IDENTITY_RESPONSE, timeout)
+            .await
+            .map_err(McuError::Call)?;
+        DeviceIdentity::decode(&Params::new(reply, &values))
+    }
+}
+
+/// Ask the identified `mcu` which board it is, and check that against
+/// `expected`.
+///
+/// This is one **round** of the readback, not the loop around it: the query is
+/// repeated [`IDENTITY_QUERY_ATTEMPTS`] times while it goes unanswered (a lost
+/// answer is worth asking again), and a board that answers with the wrong uuid
+/// fails at once — asking it a second time cannot change which board it is.
+///
+/// # Errors
+/// The [`IdentityFailure`] of the round: [`IdentityFailure::NotDeclared`] when
+/// there is nothing to ask, [`IdentityFailure::NoAnswer`] when the query never
+/// came back, and [`IdentityFailure::Mismatch`] when it did and named another
+/// board.
+pub(crate) async fn verify_identity(
+    mcu: &Mcu,
+    expected: [u8; 6],
+    timeout: Duration,
+) -> Result<DeviceIdentity, IdentityFailure> {
+    let mut last = String::new();
+    for attempt in 0..IDENTITY_QUERY_ATTEMPTS {
+        match mcu.query_identity(timeout).await {
+            Ok(found) if found.uuid == expected => return Ok(found),
+            Ok(found) => {
+                return Err(IdentityFailure::Mismatch {
+                    expected,
+                    found,
+                })
+            }
+            Err(McuError::UnknownMessage(_)) => return Err(IdentityFailure::NotDeclared),
+            Err(err) => {
+                last = err.to_string();
+                if attempt + 1 < IDENTITY_QUERY_ATTEMPTS {
+                    debug!(
+                        "MCU '{}': identity query attempt {} failed ({last}); asking again",
+                        mcu.name(),
+                        attempt + 1
+                    );
+                }
+            }
+        }
+    }
+    Err(IdentityFailure::NoAnswer(last))
+}
+
+/// Why a [`connect_verified`] round could not be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifiedConnectError {
+    /// The transport could not be opened, or the handshake failed: the last
+    /// error, as the transport reported it.
+    Open(String),
+    /// A board answered the identity query and is not the one the configuration
+    /// names — the failure a wrong node id on a busy bus produces.
+    Mismatch {
+        /// The uuid the configuration named.
+        expected: [u8; 6],
+        /// What the board said it is.
+        found: DeviceIdentity,
+    },
+    /// No board answered the identity query before the budget ran out.
+    NoAnswer(String),
+    /// An exit request ended the connect.
+    Aborted(String),
+}
+
+impl std::fmt::Display for VerifiedConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(last) => write!(f, "{last}"),
+            Self::Mismatch { expected, found } => write!(
+                f,
+                "the board behind the link answered as uuid {found}, but the configuration \
+                 names {}: the node id it was given belongs to another board",
+                hex_uuid(expected)
+            ),
+            Self::NoAnswer(last) => write!(
+                f,
+                "no board answered its identity query within the {VERIFIED_CONNECT_BUDGET:?} \
+                 connect window ({last})"
+            ),
+            Self::Aborted(last) => write!(
+                f,
+                "the connect was aborted by an exit request before the board was identified \
+                 ({last})"
+            ),
+        }
+    }
+}
+
+/// How a verified connect gets its transport: one boxed future per round.
+///
+/// A round needs the transport **reopened**, not merely the session restarted:
+/// the node id is written when the link opens (`SET_NODEID`), so a board that
+/// answered as somebody else is only re-named by a fresh open. Boxing keeps that
+/// caller's future (a `spawn_blocking` on the pool for a real transport) out of
+/// this module's signature.
+pub(crate) type OpenFuture<'a> = Pin<Box<dyn Future<Output = Result<Interface, String>> + Send + 'a>>;
+
+/// Bring up an id-addressed link and confirm the board behind it is `expected`,
+/// retrying the whole round until `deadline`.
+///
+/// This is upstream's CAN connect (`klippy/serialhdl.py:129-155`): open the bus,
+/// send `SET_NODEID`, identify, ask the firmware for its uuid, and — when the
+/// answer is another board, or no answer comes — disconnect and start the round
+/// again. Retrying is what a wrong answer is worth, because the wrong answer is
+/// a node id two boards share: a fresh `SET_NODEID` and identify is exactly what
+/// makes the intended board take it.
+///
+/// The whole loop is bounded by `deadline` (upstream's 90 s,
+/// [`VERIFIED_CONNECT_BUDGET`]), and an exit request between rounds ends it: a
+/// shutdown must not sit out the window.
+///
+/// # Errors
+/// [`VerifiedConnectError`]: which of the failures ended the loop is kept, so a
+/// caller can tell "nobody answered" from "another board answered".
+pub(crate) async fn connect_verified<'a, F, S>(
+    name: &str,
+    mut open: F,
+    mut should_stop: S,
+    expected: [u8; 6],
+    deadline: Instant,
+) -> Result<Arc<Mcu>, VerifiedConnectError>
+where
+    F: FnMut() -> OpenFuture<'a>,
+    S: FnMut() -> bool,
+{
+    let mut last = VerifiedConnectError::Open(format!(
+        "the transport was never opened within the {VERIFIED_CONNECT_BUDGET:?} connect window"
+    ));
+    loop {
+        if should_stop() {
+            return Err(VerifiedConnectError::Aborted(last.to_string()));
+        }
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
+            return Err(last);
+        }
+
+        // One round: the open writes `SET_NODEID`, so this is also what re-names
+        // the board the previous round found in the wrong place.
+        let opened = match open().await {
+            Ok(interface) => Mcu::connect(name, interface)
+                .await
+                .map_err(|err| err.to_string()),
+            Err(err) => Err(err),
+        };
+        let mcu = match opened {
+            Ok(mcu) => mcu,
+            Err(err) => {
+                last = VerifiedConnectError::Open(err);
+                if !pause_before_retry(deadline).await {
+                    return Err(last);
+                }
+                continue;
+            }
+        };
+
+        let window = IDENTITY_QUERY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        match verify_identity(&mcu, expected, window).await {
+            Ok(found) => {
+                info!(
+                    "MCU '{name}': node {} answered as uuid {}",
+                    found.node_id,
+                    found.uuid_hex()
+                );
+                return Ok(mcu);
+            }
+            Err(IdentityFailure::NotDeclared) => {
+                // Nothing to check against: a firmware this old has no identity
+                // to give, and refusing it would strand a working bench board.
+                warn!(
+                    "MCU '{name}': the firmware declares no identity command, so the node id \
+                     it took cannot be confirmed"
+                );
+                return Ok(mcu);
+            }
+            Err(IdentityFailure::Mismatch { expected, found }) => {
+                info!(
+                    "MCU '{name}': failed to match canbus_uuid (expected {}, got {}); \
+                     reopening and naming the node again",
+                    hex_uuid(&expected),
+                    found.uuid_hex()
+                );
+                mcu.close();
+                last = VerifiedConnectError::Mismatch { expected, found };
+            }
+            Err(failure @ IdentityFailure::NoAnswer(_)) => {
+                debug!("MCU '{name}': {failure}; reopening and naming the node again");
+                mcu.close();
+                last = VerifiedConnectError::NoAnswer(failure.to_string());
+            }
+        }
+        if !pause_before_retry(deadline).await {
+            return Err(last);
+        }
+    }
+}
+
+/// Sleep between two rounds of a verified connect, unless the budget is spent.
+///
+/// Returns whether another round fits: `false` ends the loop with the failure
+/// the last round found.
+async fn pause_before_retry(deadline: Instant) -> bool {
+    let pause = VERIFIED_CONNECT_PAUSE.min(deadline.saturating_duration_since(Instant::now()));
+    if pause.is_zero() {
+        return false;
+    }
+    sleep(pause).await;
+    true
 }
 
 /// The error a failed [`Mcu::connect`] reports.

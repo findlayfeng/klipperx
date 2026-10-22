@@ -66,8 +66,6 @@
 - `canbus_stats`：总线错误计数/状态上报。上游 `canbus_stats.py`，本仓无对应模块；
   CAN 侧现有能力是 id 分配器（`mcu/ids.rs`）与节点发现（`klipperx admin scan`），见
   [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md)。
-- `heaters` 切到 `GCodeRequestQueue`（`output_pin`/`fan`/`servo`/`pwm_tool` 已接线，`heaters` 侧无队列化
-  消费者），见 [G2b 节](#g2b-用-gcode-控制-gpio现状与剩余)。
 - `manual_stepper` 自带回零：`STOP_ON_ENDSTOP` 仍明示拒绝（缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - `pwm_tool` 的 `maximum_mcu_duration` 中间更新：固件上限照常下发（`setup_max_duration`），上游的
   宿主侧重生成（`MCU_queued_pwm._gen_intermediate_updates`，`pwm_tool.py:119-135`）本仓无对应物，
@@ -92,17 +90,6 @@
 > 判为**不适用**、不进待办的上游模块：`garbage_collection.py`（Python GC 调优）、
 > `aio_executor.py`（Python 线程池）、`parsedump.py`（离线开发工具）、
 > `debugcmds.c`（固件调试口）。理由见括注：都是 Python 侧调优或离线/调试工具，与本主机无关。
-
-### G2b 用 GCODE 控制 GPIO（现状与剩余）
-
-`[output_pin <name>]`（`extras/output_pin.rs`）与 PWM 两条链都已打通：`SET_PIN PIN=<name> VALUE=<0..1>`
-经 `GCodeRequestQueue`（`extras/gcode_request_queue.rs`）按打印时间生效，`output_pin`/`fan`/`servo`/
-`pwm_tool` 已接线；无 `[printer]` 或资源不可调度时保留立即路径（两条兜底与选项细节见
-`docs/klippy/developer-manual/README.md` 的 `output_pin.rs` 行与 `pwm_tool.rs` 模块文档）。
-剩下的只有一条：
-
-- [ ] **`heaters` 切到同一队列**：`heaters` 侧目前无队列化消费者（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7`
-      已于 2026-10-03 切换）。
 
 ### H11 主机运行时与调试
 

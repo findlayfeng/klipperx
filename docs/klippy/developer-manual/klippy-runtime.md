@@ -135,6 +135,19 @@ Printer.__init__          _connect（reactor 回调）                 对象图
 `/tmp/klipperx-<uid>` 释放到磁盘，供 `info` 的 `klipper_path` 上报；**配置了的路径不可写在这里就报错退出**，
 不会带病跑到 Moonraker 去弹 warning。
 
+**串口被另一个进程占着也在这一步就结束。** 装载完配置、注册/绑定 API 之前，`run()` 按
+`SerialPorts` 分好的 `serial:` 路径逐条问设备层（`serial.rs::check_held_by_another_process`）：拿不到那把
+`flock` 就以 `Unable to open serial port: serial port <路径> is already open in another process` 作为
+**启动失败**返回（形对齐上游 `serialhdl.py:199` 的同名警告），进程以非零码退出、点名端口与原因。这不是
+`_connect` 的失败：设备在 connect 期打不开属于「printer 进 `error` 态、宿主继续服务、`RESTART` 可再试」，
+而另一个进程占着端口不是任何 `RESTART` 能修的，所以它不进 `error` 态。两条容易踩的边界：tty **还不存在**
+（板子刚复位/枚举未完成）不算被占，交给连接期那次带 90 s 预算的重试打开；拿不到锁的环境（沙箱、
+`ENOLCK`）也不算，`flock` 是护栏不是前提。
+
+启动路径上**任何**失败都必须是一条普通 `Err`，不能在 async 上下文里 drop tokio runtime（那会 panic 成
+`Cannot drop a runtime in a context where blocking is not allowed`，把真因盖掉）：机器 runtime 归 `run()`
+自己的栈帧所有，驱动线程用 `Handle::block_on` 借用它——见 `src/klippy.rs` 里 runtime 构造处的注释。
+
 ## 配置装载与对象模型
 
 ```

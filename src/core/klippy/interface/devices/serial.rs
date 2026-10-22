@@ -113,6 +113,9 @@ pub struct SerialDevice {
     port: File,
     path: PathBuf,
     baud: u32,
+    /// The claim this device holds on the tty, released with it — the `flock`
+    /// itself goes with the descriptor.
+    _lock: PortLock,
     /// Bytes [`Device::receive`] took off the line since the port was opened.
     bytes_read: AtomicU64,
     /// Bytes [`Device::send`] put on it, framing included.
@@ -203,7 +206,7 @@ impl SerialDevice {
                     path.display()
                 ))
             })?;
-        lock_serial_port(&port, &path)?;
+        let lock = lock_serial_port(&port, &path, PortUse::Exclusive)?;
 
         set_raw_mode(&port, baud)?;
         clear_nonblocking(&port)?;
@@ -213,6 +216,7 @@ impl SerialDevice {
             port,
             path,
             baud,
+            _lock: lock,
             bytes_read: AtomicU64::new(0),
             bytes_write: AtomicU64::new(0),
             stream: Mutex::new(FrameStream::new()),
@@ -458,6 +462,8 @@ impl Device for SerialDevice {
 pub struct ModemLines {
     port: File,
     path: PathBuf,
+    /// The claim this handle holds on the tty, released with it.
+    _lock: PortLock,
 }
 
 impl ModemLines {
@@ -479,9 +485,13 @@ impl ModemLines {
                     path.display()
                 ))
             })?;
-        lock_serial_port(&port, &path)?;
+        let lock = lock_serial_port(&port, &path, PortUse::Reset)?;
         set_raw_mode(&port, baud)?;
-        Ok(Self { port, path })
+        Ok(Self {
+            port,
+            path,
+            _lock: lock,
+        })
     }
 
     /// Read and discard one pending byte.
@@ -613,23 +623,134 @@ pub(crate) fn clear_nonblocking(port: &File) -> Result<(), InterfaceError> {
 /// a sandbox that cannot lock at all is **not** a reason to refuse a board — the
 /// lock guards against another program, it is not a requirement — so a failure
 /// other than “someone else has it” is logged and the port is used anyway.
-fn lock_serial_port(port: &File, path: &Path) -> Result<(), InterfaceError> {
+fn lock_serial_port(
+    port: &File,
+    path: &Path,
+    purpose: PortUse,
+) -> Result<PortLock, InterfaceError> {
+    let key = tty_key(port);
+    if let Some(key) = key {
+        let mut locks = held_locks().lock().unwrap_or_else(|p| p.into_inner());
+        match locks.get_mut(&key) {
+            // Our own hold, for the same use: join it. A shared port reopens its
+            // tty while the previous descriptor may still be alive, and the
+            // `flock` a second descriptor would take is held by ours already.
+            Some(held) if held.purpose == purpose && purpose == PortUse::Shared => {
+                held.holds += 1;
+                return Ok(PortLock { key: Some(key) });
+            }
+            // Ours for something else: the same refusal another program's lock
+            // gets, because it is the same mistake — the device must be closed
+            // before the reset handle opens it.
+            Some(_) => return Err(already_open(path)),
+            None => {}
+        }
+    }
+
+    match try_exclusive_lock(port) {
+        Ok(()) => {
+            if let Some(key) = key {
+                held_locks()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(key, Held { purpose, holds: 1 });
+            }
+            Ok(PortLock { key })
+        }
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(already_open(path)),
+        Err(e) => {
+            warn!(
+                "could not take the exclusive lock on serial port {} ({e}); using it nonetheless",
+                path.display()
+            );
+            Ok(PortLock { key: None })
+        }
+    }
+}
+
+/// What an open takes the tty for.
+///
+/// Only a **shared** port may join a hold of its own: its reopen (the EIO path,
+/// a reset's re-enumeration) is the same use of the same tty while the previous
+/// descriptor may still be alive, and refusing that would make this process
+/// block itself. Every other pairing is the mistake it always was.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PortUse {
+    /// The muxed port several MCUs are on ([`SharedSerialPort`]).
+    Shared,
+    /// One device's own connection ([`SerialDevice`]).
+    Exclusive,
+    /// The short-lived handle a firmware reset opens the tty with
+    /// ([`ModemLines`]).
+    Reset,
+}
+
+/// The locks this process holds, by tty identity: `(st_dev, st_ino)`, not the
+/// path, because a `by-id` link is replaced while the node it names stays the
+/// same.
+///
+/// `flock` belongs to the open file description, so a second open **in this
+/// process** is refused by our own lock exactly as another program's open is.
+/// This table is what tells the two apart.
+fn held_locks() -> &'static Mutex<HashMap<(u64, u64), Held>> {
+    static LOCKS: OnceLock<Mutex<HashMap<(u64, u64), Held>>> = OnceLock::new();
+    LOCKS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// One tty's claim in [`held_locks`]: what it was taken for, and how many
+/// descriptors of ours are on it.
+struct Held {
+    purpose: PortUse,
+    holds: usize,
+}
+
+/// One descriptor's hold on a tty's lock.
+///
+/// The last one to drop forgets the tty, so the next open takes the lock again;
+/// the `flock` itself went with the descriptors, this only tracks the claim
+/// while a descriptor of ours may still be alive.
+struct PortLock {
+    /// The tty this holds, or `None` when the lock could not be taken at all (a
+    /// sandbox without `flock`) — nothing to track then.
+    key: Option<(u64, u64)>,
+}
+
+impl Drop for PortLock {
+    fn drop(&mut self) {
+        let Some(key) = self.key else { return };
+        let mut locks = held_locks().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(held) = locks.get_mut(&key) {
+            held.holds -= 1;
+            if held.holds == 0 {
+                locks.remove(&key);
+            }
+        }
+    }
+}
+
+/// The tty a descriptor is on, as [`held_locks`] keys them.
+fn tty_key(port: &File) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = port.metadata().ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// The refusal a held tty gets: another program's lock, or another use of ours.
+fn already_open(path: &Path) -> InterfaceError {
+    InterfaceError::Other(format!(
+        "serial port {} is already open in another process",
+        path.display()
+    ))
+}
+
+/// Take `LOCK_EX | LOCK_NB`; an `Err` is somebody else's lock, or no `flock` at
+/// all.
+fn try_exclusive_lock(port: &File) -> std::io::Result<()> {
     // SAFETY: `flock` takes only the descriptor and a flag word.
     if unsafe { libc::flock(port.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(());
     }
-    let e = std::io::Error::last_os_error();
-    if e.kind() == ErrorKind::WouldBlock {
-        return Err(InterfaceError::Other(format!(
-            "serial port {} is already open in another process",
-            path.display()
-        )));
-    }
-    warn!(
-        "could not take the exclusive lock on serial port {} ({e}); using it nonetheless",
-        path.display()
-    );
-    Ok(())
+    Err(std::io::Error::last_os_error())
 }
 
 /// Whether another process is holding `path`, asked by a host before it serves
@@ -641,11 +762,14 @@ fn lock_serial_port(port: &File, path: &Path) -> Result<(), InterfaceError> {
 /// frees a port another program holds. The start-up therefore asks the device
 /// layer first (`klippy::run`), and the run ends with the reason instead.
 ///
-/// The check is the open's own: take the same `flock` (`lock_serial_port`), then
-/// close — the lock belongs to the open file description, so a port nobody holds
-/// is free again at once. Nothing else is touched: no `termios` is written (that
-/// is `set_raw_mode`, which this does not call), so the holder's line settings
-/// and its lock are exactly as they were.
+/// The check is the open's own: take the same `flock` (`lock_serial_port`) on a
+/// throwaway descriptor, then close — the lock belongs to the open file
+/// description, so a port nobody others holds is free again at once. It runs
+/// before this process opens any transport (`klippy::run`'s order), so it asks
+/// the lock itself rather than [`held_locks`]: nothing of ours is on the tty yet.
+/// Nothing else is touched: no `termios` is written (that is `set_raw_mode`,
+/// which this does not call), so the holder's line settings and its lock are
+/// exactly as they were.
 ///
 /// Two failures are **not** refusals, because neither is this check's to report:
 /// a tty that cannot be opened at all (a board that has not enumerated yet is
@@ -668,7 +792,11 @@ pub fn check_held_by_another_process(path: &Path) -> Result<(), InterfaceError> 
         Ok(port) => port,
         Err(_) => return Ok(()),
     };
-    lock_serial_port(&port, path)
+    match try_exclusive_lock(&port) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::WouldBlock => Err(already_open(path)),
+        Err(_) => Ok(()),
+    }
 }
 
 /// Write `bytes` whole, waiting at most [`WRITE_STALL_BOUND`] for the port to
@@ -1037,6 +1165,88 @@ mod tests {
         assert!(!missing.exists(), "{missing:?} must not exist");
         check_held_by_another_process(missing)
             .expect("a node that is not there is not a port somebody holds");
+    }
+
+    /// Wait, bounded, for a tty to be free again.
+    ///
+    /// The descriptor, and with it the `flock`, is released by the port's
+    /// reader thread, which ends asynchronously after the last handle goes
+    /// ([`SharedSerialPort`]'s `Drop` joins it); polling keeps that out of the
+    /// assertions.
+    fn wait_until_a_port_is_free(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match check_held_by_another_process(path) {
+                Ok(()) => return,
+                Err(err) => {
+                    assert!(Instant::now() < deadline, "the tty stayed held: {err}");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    /// The shared (muxed) shape takes the lock too: one tty has one occupant,
+    /// however many MCUs are behind it.
+    ///
+    /// Without it a second host opened the same board and both read half of one
+    /// conversation — the start-up's check saw nothing to report, and the second
+    /// host sat in `error` state after an identify timeout instead of saying the
+    /// port was taken.
+    #[test]
+    fn test_a_shared_port_takes_the_lock_another_program_is_refused_by() {
+        let pty = Pty::new();
+        let port = port_for(&pty.path, DEFAULT_BAUD).expect("the shared port opens");
+
+        // A second *program* is another descriptor on the tty, which is exactly
+        // what the start-up's check opens.
+        let err = check_held_by_another_process(&pty.path)
+            .expect_err("a shared port holds the tty like any other");
+        assert!(
+            err.to_string().contains("already open in another process"),
+            "the refusal names the reason: {err}"
+        );
+        assert!(
+            err.to_string().contains(&pty.path.display().to_string()),
+            "the refusal names the port: {err}"
+        );
+
+        // Closing releases it, as for the exclusive shape.
+        drop(port);
+        wait_until_a_port_is_free(&pty.path);
+        let again = port_for(&pty.path, DEFAULT_BAUD).expect("the lock went with the port");
+        drop(again);
+    }
+
+    /// A shared port reopens its own tty without being refused by its own lock.
+    ///
+    /// `flock` belongs to the open file description, so the descriptor a reopen
+    /// takes conflicts with ours while the old one is still alive — and it stays
+    /// alive as long as any session holds the `Arc`. That is the EIO path (a
+    /// board that reset and re-enumerated) and a restart's re-attach, not a
+    /// second program, so the reopen joins the hold ("占住 → 关闭 → 再开" must not
+    /// deadlock on itself).
+    #[test]
+    fn test_a_shared_port_reopens_its_own_tty_after_it_stopped() {
+        let pty = Pty::new();
+        let first = port_for(&pty.path, DEFAULT_BAUD).expect("the tty opens");
+        first.stop();
+
+        // Same tty, new descriptor, while `first` is still alive: this is the
+        // release that would be refused if our own claim were not consulted.
+        let second = port_for(&pty.path, DEFAULT_BAUD)
+            .expect("a reopen of our own tty is not another program");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the stopped port is replaced"
+        );
+
+        // And both handles going away really does release the tty.
+        drop(first);
+        drop(second);
+        wait_until_a_port_is_free(&pty.path);
+        let third = port_for(&pty.path, DEFAULT_BAUD).expect("the lock went with the ports");
+        drop(third);
     }
 
     #[test]
@@ -2563,6 +2773,11 @@ pub struct SharedSerialPort {
     /// holding an `Arc<SharedSerialPort>` (which would keep the port from ever
     /// being dropped — see the reader).
     port: Arc<File>,
+    /// The claim this port holds on the tty: **every** shape locks, so a second
+    /// host on the same board is refused rather than reading half of this one's
+    /// conversation. Held with the reader thread, which is what keeps the
+    /// descriptor (and with it the `flock`) alive while it runs.
+    lock: Arc<PortLock>,
     /// One slot per attached MCU, keyed by the MCU id. A slot is registered by
     /// the attach that opens the id, and taken down again by
     /// [`SharedSerialHandle::unregister`] — a `shutdown`, the handle's last
@@ -2933,6 +3148,9 @@ impl SharedSerialPort {
                 ))
             })?;
 
+        // Before anything configures the line: another host on the same board is
+        // refused here, not after both have retuned it.
+        let lock = lock_serial_port(&port, path, PortUse::Shared)?;
         set_raw_mode(&port, baud)?;
         clear_nonblocking(&port)?;
 
@@ -2941,6 +3159,7 @@ impl SharedSerialPort {
             path: path.to_path_buf(),
             baud,
             port: Arc::new(port),
+            lock: Arc::new(lock),
             slots: Mutex::new(HashMap::new()),
             attach_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
@@ -2963,7 +3182,14 @@ impl SharedSerialPort {
     fn start_reader(self: &Arc<Self>) {
         let weak = Arc::downgrade(self);
         let file = Arc::clone(&self.port);
-        let handle = std::thread::spawn(move || reader_loop(weak, file));
+        // The claim and the descriptor it is on live exactly as long as the
+        // reader: the `flock` goes with the last descriptor, so this is what
+        // keeps the tty ours while the reader can still read it.
+        let lock = Arc::clone(&self.lock);
+        let handle = std::thread::spawn(move || {
+            reader_loop(weak, file);
+            drop(lock);
+        });
         *self.reader.lock().unwrap() = Some(handle);
     }
 

@@ -244,16 +244,37 @@ pub async fn run(target: ApiTarget) -> Result<(), TransportError> {
 /// # Errors
 /// Returns [`TransportError`] if the connection goes away. Dropping the future —
 /// the host shutting down under it, say — restores the terminal just the same,
-/// because the guard that does so is dropped with it.
+/// because the guard that does so is dropped with it; a host that wants the
+/// window closed **in order** closes it through [`run_session_until`] instead.
 pub async fn run_session(
     session: Session,
     host_log: Option<tokio::sync::mpsc::UnboundedReceiver<Entry>>,
 ) -> Result<(), TransportError> {
+    run_session_until(session, host_log, std::future::pending()).await
+}
+
+/// Show a window on an existing session until `stop` completes.
+///
+/// The same window as [`run_session`], with a second way to leave it: `stop` is
+/// awaited alongside the keys and the protocol traffic, and its completion ends
+/// the window the way `^C` does — the replies that are still owed are drained,
+/// the keyboard thread is joined, and the terminal is restored. That path is
+/// what a host needs when it is shutting down under the window: the loop has no
+/// reason of its own to stop, and dropping it instead would leave the keyboard
+/// thread reading a terminal that is being given back.
+pub async fn run_session_until<F>(
+    session: Session,
+    host_log: Option<tokio::sync::mpsc::UnboundedReceiver<Entry>>,
+    stop: F,
+) -> Result<(), TransportError>
+where
+    F: std::future::Future<Output = ()>,
+{
     // Taken before anything can fail: a panic inside the window, or the future
     // being dropped, must still give the terminal back.
     let _terminal = TerminalGuard::take();
     let terminal = ratatui::init();
-    let outcome = event_loop(session, terminal, host_log).await;
+    let outcome = event_loop(session, terminal, host_log, stop).await;
     outcome
 }
 
@@ -1170,12 +1191,17 @@ fn set_mouse_capture(captured: bool) {
 }
 
 /// Draw, read keys, read the socket, until one of them says stop.
-async fn event_loop(
+async fn event_loop<F>(
     mut session: Session,
     mut terminal: ratatui::DefaultTerminal,
     mut host_log: Option<tokio::sync::mpsc::UnboundedReceiver<Entry>>,
-) -> Result<(), TransportError> {
+    stop: F,
+) -> Result<(), TransportError>
+where
+    F: std::future::Future<Output = ()>,
+{
     let mut app = App::new();
+    tokio::pin!(stop);
 
     // A host that embedded this window logged things before it existed — config,
     // listeners, and so on. Those lines happened first, so they go first; they
@@ -1220,6 +1246,8 @@ async fn event_loop(
             HostLog(Option<Entry>),
             /// The `Esc` streak window closed: stop counting the gesture.
             EscapeWindow,
+            /// The host shut down under the window: close it.
+            Stop,
         }
         let escape_deadline = app.escape_deadline;
         let step = tokio::select! {
@@ -1238,11 +1266,17 @@ async fn event_loop(
                     None => std::future::pending().await,
                 }
             } => Step::EscapeWindow,
+            // A host that embedded this window can close it from outside; the
+            // arm is pending when nobody will.
+            _ = &mut stop => Step::Stop,
         };
 
         match step {
             // The keyboard thread is gone, which only happens on shutdown.
             Step::Key(None) => break Ok(()),
+            // The host is going down: leave the way `^C` leaves, so the drain,
+            // the final draw and the keyboard thread still happen.
+            Step::Stop => break Ok(()),
             Step::Key(Some(Event::Key(key))) => {
                 if key.kind != KeyEventKind::Press {
                     continue;

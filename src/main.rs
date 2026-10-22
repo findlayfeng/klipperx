@@ -300,7 +300,8 @@ fn run_host(args: HostArgs) -> Result<i32, Box<dyn std::error::Error>> {
     let (records, logs) = tokio::sync::mpsc::unbounded_channel();
     let window = Window {
         _redirect: logging::to_window(records),
-        logs: Some(logs),
+        logs: std::cell::RefCell::new(Some(logs)),
+        stop: Arc::new(tokio::sync::Notify::new()),
     };
     klippy::run(args.host, Some(Box::new(window)))
 }
@@ -310,12 +311,15 @@ struct Window {
     /// Keeps the host's records going to the window rather than to stdout.
     _redirect: logging::WindowGuard,
     /// The host's records, until the window takes them.
-    logs: Option<tokio::sync::mpsc::UnboundedReceiver<logging::Record>>,
+    logs: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<logging::Record>>>,
+    /// Set by [`klippy::Attachment::close`]: the window's own loop ends when it
+    /// is, the same way `^C` ends it.
+    stop: Arc<tokio::sync::Notify>,
 }
 
 impl klippy::Attachment for Window {
     fn run<'a>(
-        &'a mut self,
+        &'a self,
         api: Arc<klippy_api::Api>,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
         Box::pin(async move {
@@ -329,11 +333,20 @@ impl klippy::Attachment for Window {
             ));
             let session =
                 client::Session::from_transport(Box::new(client_side), "this host (in-process)");
-            let logs = self.logs.take().map(host_log);
-            client::tui::run_session(session, logs)
+            let logs = self.logs.borrow_mut().take().map(host_log);
+            // `close` (the host shutting down under the window) ends the window
+            // through the same path the user's own exit takes, so the terminal
+            // and the keyboard thread are given back properly.
+            let stop = Arc::clone(&self.stop);
+            client::tui::run_session_until(session, logs, async move { stop.notified().await })
                 .await
                 .map_err(|err| err.to_string())
         })
+    }
+
+    fn close(&self) {
+        // One permit, so a second call does nothing more.
+        self.stop.notify_one();
     }
 }
 

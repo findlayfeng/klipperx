@@ -69,8 +69,9 @@
 //!
 //! # Everything comes from the config file
 //!
-//! [`HW_CONFIG_ENV`] names the same config the printer reads, and nothing else is
-//! asked of the environment. The interface is derived from it (`[mcu]`'s
+//! [`HW_CONFIG_ENV`] names the same config the printer reads, and the only other
+//! thing asked of the environment is [`HW_STRICT_ENV`] — a mode, not an input.
+//! The interface is derived from the config (`[mcu]`'s
 //! `serial:` with its `baud:`, or `uuid:`), and so is every section and
 //! option a test names. What counts as "present" is decided by the real config
 //! parser ([`Config::from_file`]), so a commented-out `[stepper_x]` is simply
@@ -271,7 +272,10 @@
 //! same as a config that is named but unreadable or unparsable, because the
 //! variable promised a config and the test was meant to run against it.
 //! `KLIPPERX_HW_STRICT=0` asks for the old skip (`HW-IGNORED: …`) instead — see
-//! [`HW_STRICT_ENV`]. A config that is there and names a device which then
+//! [`HW_STRICT_ENV`]. Strict mode also fails a config that names an object this
+//! repository does not implement ([`NOT_IMPLEMENTED_SECTIONS`], the deferred
+//! `upstream-deviations.md` §1.2 modules), because no case here could run
+//! against it. A config that is there and names a device which then
 //! refuses to open is a real failure too: it was there to run.
 //!
 //! # Serialised on the board

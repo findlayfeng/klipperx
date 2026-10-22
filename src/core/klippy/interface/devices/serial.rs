@@ -43,9 +43,6 @@ use crate::core::klippy::frame::{
 };
 use crate::core::klippy::interface::error::InterfaceError;
 use crate::core::klippy::interface::{describe_frame, Device};
-// One spelling of a uuid for every error that has to name both sides of a
-// mismatch: the identity readback (`identify`) and the assignment here.
-use crate::core::klippy::identify::hex_uuid;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs::{File, OpenOptions};
@@ -1228,14 +1225,6 @@ pub(crate) const ASSIGN_ATTACH_ATTEMPTS: u32 = 3;
 /// assignment a caller asked for — one round trip on a bridge's wire is all it
 /// takes to hear an answer or stop waiting for one.
 pub const CAN_ASSIGN_CONFIRM_WINDOW: Duration = Duration::from_millis(300);
-
-/// How long the assignment diagnostic listens for the port's unassigned boards
-/// ([`SharedSerialHandle::scan_unassigned`]).
-///
-/// Only an **unanswered** assignment pays it: a board answers a discovery
-/// query in milliseconds, so the window is what a silent line costs before the
-/// failure is reported with evidence instead of alone.
-pub const ASSIGN_DISCOVERY_WINDOW: Duration = Duration::from_millis(300);
 
 /// How many bytes one `read` may bring in. Bounds the reader's stack buffer;
 /// larger reads simply take another turn.
@@ -2664,69 +2653,10 @@ pub fn attach(
                 std::thread::sleep(ATTACH_REOPEN_DELAY);
                 continue;
             }
-            return Err(match uuid {
-                Some(uuid) => assignment_failure(&handle, uuid, mcu_id, e),
-                None => e,
-            });
+            return Err(e);
         }
         return Ok(handle);
     }
-}
-
-/// The error an unanswered **uuid-named** assignment reports.
-///
-/// `SET_NODEID` names the board the id is for, and the mux firmware adopts it
-/// only when the identity matches (`mux.c`, `mux_admin_unit`: `memcmp` against
-/// `mux_identity`) — so a board that is not the one named answers **nothing**,
-/// and the handshake ends on a bare [`InterfaceError::Timeout`] that says
-/// neither which board was wanted nor which one was there.
-///
-/// The discovery query answers the second half: every board without a node id
-/// reports its uuid ([`SharedSerialHandle::scan_unassigned`]), which is what
-/// turns "no answer" into "the board that answered is `b`, not `a`". Nothing is
-/// scanned while the assignment **succeeds**, so the cost of this check is only
-/// ever paid by a failure.
-///
-/// A failure that is not a timeout is returned as it is: a dead port has a
-/// cause of its own, and a board's silence is not it.
-fn assignment_failure(
-    handle: &SharedSerialHandle,
-    uuid: [u8; 6],
-    mcu_id: u32,
-    err: InterfaceError,
-) -> InterfaceError {
-    if err != InterfaceError::Timeout {
-        return err;
-    }
-    let path = handle.port.path().display();
-    let expected = hex_uuid(&uuid);
-    let heard = match handle.scan_unassigned(ASSIGN_DISCOVERY_WINDOW) {
-        Ok(nodes) => nodes,
-        Err(scan) => {
-            return InterfaceError::Other(format!(
-                "{path}: no board adopted uuid {expected} as id {mcu_id} \
-                 ({ASSIGN_ATTACH_ATTEMPTS} attempts went unanswered), and the port's discovery \
-                 query failed too ({scan})"
-            ))
-        }
-    };
-    let evidence = match heard.is_empty() {
-        true => "no unassigned board answered the port's discovery query either (a board that \
-                 is already named answers neither)"
-            .to_string(),
-        false => format!(
-            "the port's unassigned board(s) answered as {}",
-            heard
-                .iter()
-                .map(|node| hex_uuid(&node.uuid))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-    InterfaceError::Other(format!(
-        "{path}: no board adopted uuid {expected} as id {mcu_id} \
-         ({ASSIGN_ATTACH_ATTEMPTS} attempts went unanswered); {evidence}"
-    ))
 }
 
 /// Register a **downstream** device on the shared serial port at `path`,
@@ -2865,40 +2795,6 @@ pub(crate) fn answers_for(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(false),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(InterfaceError::ConnectionLost)
-            }
-        }
-    }
-}
-
-/// Collect the boards that answered a discovery query, once each, for `window`.
-///
-/// The collecting other half of [`SharedSerialHandle::scan_unassigned`], and the
-/// shape [`answers_for`] reads one answer out of: units arrive on the port's
-/// [`ADMIN_REPLY`] listener, and a unit that is not an answer — or a second from a
-/// uuid already listed — adds nothing. A receiver that is **disconnected** is the
-/// port being taken down under the wait, not an empty window.
-pub(crate) fn collect_unassigned(
-    answers: &std::sync::mpsc::Receiver<Vec<u8>>,
-    window: Duration,
-) -> Result<Vec<UnassignedNode>, InterfaceError> {
-    let mut nodes: Vec<UnassignedNode> = Vec::new();
-    let deadline = Instant::now() + window;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(nodes);
-        }
-        match answers.recv_timeout(remaining) {
-            Ok(unit) => {
-                if let Some(node) = UnassignedNode::from_unit(&unit) {
-                    if !nodes.iter().any(|seen| seen.uuid == node.uuid) {
-                        nodes.push(node);
-                    }
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(nodes),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(InterfaceError::ConnectionLost)
             }
@@ -3608,47 +3504,6 @@ impl SharedSerialHandle {
         answered
     }
 
-    /// Ask every board on the port without a node id to identify itself, and
-    /// collect the answers for `window`.
-    ///
-    /// This is [`serial_query_unassigned`] on a port that already has a reader
-    /// thread: the tty's bytes are that reader's, so the answers are taken
-    /// through the listener a scan's units are routed to
-    /// ([`Self::set_unit_sink`]) rather than by reading the port here.
-    ///
-    /// It exists to say **who is there** after an assignment went unanswered
-    /// ([`assignment_failure`]): a device that is not the one an assignment
-    /// named stays quiet, and this is the one question it will still answer.
-    /// An answer from a device with no node id is legal and expected —
-    /// `mux_node_id()` is `0` until the device adopts one — so nothing here
-    /// reads `0` as an error.
-    ///
-    /// The port's attach lock is held for the whole window, exactly as
-    /// [`Self::name_can_device`] holds it, and the listener is removed before
-    /// this returns either way.
-    ///
-    /// # Errors
-    /// [`InterfaceError::ConnectionLost`] when the port or this handle has been
-    /// shut down, or the listener is taken down under the wait, and
-    /// [`InterfaceError::SendError`] when the query cannot be written. An empty
-    /// answer list is not an error: every board on the port may already be named.
-    pub fn scan_unassigned(&self, window: Duration) -> Result<Vec<UnassignedNode>, InterfaceError> {
-        let _attaching = self.port.attach_lock.lock().unwrap();
-        if self.stopped.load(Ordering::SeqCst) || self.port.stopped.load(Ordering::SeqCst) {
-            return Err(InterfaceError::ConnectionLost);
-        }
-        let query = discovery_query();
-        let (sink, answers) = UnitSink::channel();
-        self.set_unit_sink(ADMIN_REPLY, sink);
-        let written = self.send_admin(&query[HEADER_BYTES..]);
-        let heard = match written {
-            Ok(()) => collect_unassigned(&answers, window),
-            Err(e) => Err(e),
-        };
-        self.clear_unit_sink(ADMIN_REPLY);
-        heard
-    }
-
     /// Take this handle's slot out of the port's map — only when the entry
     /// there is still the slot **this** handle registered.
     ///
@@ -4008,63 +3863,6 @@ mod mux_tests {
         // attach on the same path completes a handshake.
         let handle = attach_with_reply(&pty, 4);
         assert!(handle.send(&Frame::new(1, vec![0xab])).is_ok());
-    }
-
-    /// Criterion ④, first half: an assignment is **named**, and a board that is
-    /// not the one named stays quiet (`mux.c` adopts only a matching identity).
-    /// The failure must say both sides: the uuid the config names, and the uuid of
-    /// the board that answered the discovery query instead.
-    #[test]
-    fn an_unanswered_uuid_assignment_names_both_uuids() {
-        let pty = Pty::new();
-        let path = pty.path.clone();
-        let expected = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
-        let heard = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
-        let mcu_id = 5;
-        let window = Duration::from_millis(50);
-
-        let attaching =
-            thread::spawn(move || attach(&path, DEFAULT_BAUD, mcu_id, window, Some(expected)));
-
-        // The assignment names the board, then asks it to confirm — three times,
-        // and nothing on the other end adopts it.
-        let set = set_node_id_for(expected, mcu_id).expect("a valid mcu id");
-        let request = assignment_request(mcu_id).expect("a valid mcu id");
-        let wire = read_n_within(
-            &pty.master,
-            set.len() + request.len() * ASSIGN_ATTACH_ATTEMPTS as usize,
-            Duration::from_secs(5),
-        );
-        assert_eq!(&wire[..set.len()], set.as_slice());
-        for chunk in wire[set.len()..].chunks(request.len()) {
-            assert_eq!(chunk, request.as_slice(), "one assignment attempt");
-        }
-
-        // Unanswered, so the attach asks the port who is there instead: the
-        // discovery query verbatim, answered by another board with no node id
-        // yet (which is a legal answer, `mux_node_id()` is 0 until it adopts one).
-        let query = discovery_query();
-        let seen = read_n_within(&pty.master, query.len(), Duration::from_secs(5));
-        assert_eq!(
-            seen, query,
-            "the diagnostic's query is the scan's, byte for byte"
-        );
-        master_write(&pty.master, &admin_answer(heard, None));
-
-        let err = attaching
-            .join()
-            .expect("attach thread")
-            .expect_err("no board adopted the assignment");
-        let text = err.to_string();
-        assert!(
-            text.contains(&hex_uuid(&expected)),
-            "the uuid the config names: {text}"
-        );
-        assert!(
-            text.contains(&hex_uuid(&heard)),
-            "the uuid that answered instead: {text}"
-        );
-        assert!(text.contains("no board adopted"), "{text}");
     }
 
     /// A port that stops while a handshake is waiting for its answer ends that

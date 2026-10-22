@@ -504,15 +504,16 @@ impl McuResponse for DeviceIdentity {
     const NAME: &'static str = IDENTITY_RESPONSE;
 
     fn decode(params: &Params<'_>) -> Result<Self, McuError> {
-        let uuid: [u8; 6] = params
-            .get_bytes("canbus_uuid")?
-            .try_into()
-            .map_err(|bytes: Vec<u8>| {
-                McuError::Decode(format!(
-                    "canbus_uuid is {} bytes, not the six a uuid has",
-                    bytes.len()
-                ))
-            })?;
+        let uuid: [u8; 6] =
+            params
+                .get_bytes("canbus_uuid")?
+                .try_into()
+                .map_err(|bytes: Vec<u8>| {
+                    McuError::Decode(format!(
+                        "canbus_uuid is {} bytes, not the six a uuid has",
+                        bytes.len()
+                    ))
+                })?;
         Ok(Self {
             uuid,
             node_id: params.get_u32("canbus_nodeid")?,
@@ -589,11 +590,12 @@ impl Mcu {
     /// the reply is missing from the dictionary), [`McuError::Call`] when the
     /// query goes unanswered, and [`McuError::Decode`] when the reply does not
     /// carry a six-byte uuid and a node id.
-    pub(crate) async fn query_identity(&self, timeout: Duration) -> Result<DeviceIdentity, McuError> {
+    pub(crate) async fn query_identity(
+        &self,
+        timeout: Duration,
+    ) -> Result<DeviceIdentity, McuError> {
         let command = self.identity_command().ok_or_else(|| {
-            McuError::UnknownMessage(format!(
-                "{IDENTITY_COMMAND} / {IDENTITY_COMMAND_ALIAS}"
-            ))
+            McuError::UnknownMessage(format!("{IDENTITY_COMMAND} / {IDENTITY_COMMAND_ALIAS}"))
         })?;
         let reply = self.require_message(IDENTITY_RESPONSE)?;
         let values = self
@@ -626,12 +628,7 @@ pub(crate) async fn verify_identity(
     for attempt in 0..IDENTITY_QUERY_ATTEMPTS {
         match mcu.query_identity(timeout).await {
             Ok(found) if found.uuid == expected => return Ok(found),
-            Ok(found) => {
-                return Err(IdentityFailure::Mismatch {
-                    expected,
-                    found,
-                })
-            }
+            Ok(found) => return Err(IdentityFailure::Mismatch { expected, found }),
             Err(McuError::UnknownMessage(_)) => return Err(IdentityFailure::NotDeclared),
             Err(err) => {
                 last = err.to_string();
@@ -699,7 +696,8 @@ impl std::fmt::Display for VerifiedConnectError {
 /// answered as somebody else is only re-named by a fresh open. Boxing keeps that
 /// caller's future (a `spawn_blocking` on the pool for a real transport) out of
 /// this module's signature.
-pub(crate) type OpenFuture<'a> = Pin<Box<dyn Future<Output = Result<Interface, String>> + Send + 'a>>;
+pub(crate) type OpenFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Interface, String>> + Send + 'a>>;
 
 /// Bring up an id-addressed link and confirm the board behind it is `expected`,
 /// retrying the whole round until `deadline`.
@@ -864,7 +862,9 @@ mod tests {
     use super::*;
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry, RecordingWire};
+    use crate::core::klippy::interface::devices::frame_mock::{
+        FrameMock, MappingEntry, RecordingWire,
+    };
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::{DeflateEncoder, ZlibEncoder};
@@ -1758,7 +1758,8 @@ mod tests {
     /// the old name is left alone — one reply format, one parser.
     #[tokio::test]
     async fn test_the_identity_command_is_get_mcu_id_when_the_dictionary_has_it() {
-        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID), ("get_canbus_id", ALIAS_ID)]);
+        let dictionary =
+            identity_dictionary(&[("get_mcu_id", NEW_ID), ("get_canbus_id", ALIAS_ID)]);
         let (wire, sent) = identity_wire(&dictionary, &[(NEW_ID, BOARD, 5)]);
 
         let mcu = Mcu::connect("test_mcu", Interface::recording(wire))
@@ -1879,7 +1880,10 @@ mod tests {
             "a board answered: {text}"
         );
         assert!(text.contains("11aa22bb33cc"), "the configured uuid: {text}");
-        assert!(text.contains("0a0b0c0d0e0f"), "the board that answered: {text}");
+        assert!(
+            text.contains("0a0b0c0d0e0f"),
+            "the board that answered: {text}"
+        );
         assert!(
             rounds.load(std::sync::atomic::Ordering::SeqCst) > 1,
             "the round is retried, not given up on: {text}"
@@ -1960,7 +1964,10 @@ mod tests {
         );
         assert!(text.contains("11aa22bb33cc"), "{text}");
         assert!(text.contains("0a0b0c0d0e0f"), "{text}");
-        assert!(text.contains("node 4"), "the node it took is reported: {text}");
+        assert!(
+            text.contains("node 4"),
+            "the node it took is reported: {text}"
+        );
         assert_eq!(
             identity_asks(&sent, NEW_ID),
             1,

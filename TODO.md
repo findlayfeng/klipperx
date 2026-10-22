@@ -113,83 +113,24 @@
 
 ## 未决问题
 
-- [x] **Q9 `wait_moves`（FW5d）节拍：宿主等待已落地（2026-10-06，`a23a92b`）；余项＝送出口径 / 真机验证**：
-      本仓 `M400` 现在真的等到 MCU 的**估计时钟**追上 `print_time`（`motion/toolhead.rs` 新增
-      `wait_moves_state()` 快照 + `extras/toolhead.rs` 的异步等待环，每轮短锁读数、解锁后 sleep；
-      四条有界出口：est 追上 / est 停滞 1s 报错 / shutdown / 不可暂停）。
-      **关键语义（上游同形）**：`can_pause = !printer.is_fileoutput()`，不可暂停时**立即退出等待**
-      （`toolhead.py:221-223` 与 `:425-429`）——所以语料（`-o` 形态）下不等待，**语料对该特性零覆盖**。
-      实测：无 `debug_output` 的 e2e 里 `gap_before=0.4247s → waited=0.5048s → gap_after=-0.0793s`；
-      反向对照（去掉闸）会让 file-output 测试实测睡了 500ms，闸由测试钉住。
-      **仍缺（后续单元）**：① `send_wait_ack`（`mcu/mod.rs:2639-2650` 自述只是 flush）；
-      ② fileoutput 形态下上游 `_flush_handler_debug` 的等价物。
-      **已消除的两个“缺口”**（2026-10-06 复核，不要当未完项再排）：
-      - **“送出口径会让 step 晚到 0.106–0.115 s”是假结论——该证据的唯一来源是假固件模型漏算首拍 `interval`**
-        （`simulator.rs` 的 running 分支，已修）；修后同样的真等待复现从 11 例红变 259/0 绿。
-        真机送出口径是否存在同类偏差**无任何证据**，已降为待验假设，由 R11 观察。
-      - `MIN_KIN_TIME`/`kin_flush_delay` 地板**已对齐上游**（`calc_print_time`），且 `kin_flush_delay` 现在是**运行期值**
-        （2026-10-21：`ToolHead::recompute_scan_windows` 取全部 stepper 的 pre/post 最大值；常量已改名为
-        `SDS_CHECK_TIME = 1e-3` 作为地板），但在本仓 `BUFFER_TIME_START = 0.250` 远大于
-        `MIN_KIN_TIME + kin_flush_delay`（常见 PA 下 `0.001 + 0.02`）的前提下
-        **行为等价（近似 no-op）**，不要把它当成“不晚到”的保障。
-      **真机未验证**：等待生效路径（无 `debug_output`）尚未上真板，见 TESTING.md 的 R11。
-
-- [x] **Q11 断环：已修（2026-10-06）** —— `VirtualSdCard` 与 `GCodeButton` 都持 `Arc<GCodeDispatch>`、
-      又把**捕获 `Arc<Self>`** 的 handler 注册回它的命令/mux 表，于是命令表反向钉住部件：
-      `teardown()` 后 `Mcu::Drop` 不跑 → `interface.shutdown()` 不被调用 → 收尾时那批 `spawn_blocking`
-      的阻塞读永远 park。修法照本仓已有约定（`delayed_gcode`/`idle_timeout` 同形、`gcode.rs` 的
-      「析构」段落已把它写成约定）：把注册进 dispatcher 的 handler 对自身的捕获改成 `Arc::downgrade`。
-      **实测**：撤掉修复 → 改敏感的探针失败并点名 cfg
-      `printer-biqu-bx-2021.cfg: … did not shut down within 5s (5.000556956s): a part was leaked`；
-      修复在位 → 同一探针 **0.50s** 通过；
-      `upstream` 过滤全量 422 条 69.7s、**最慢 0.83s**（此前两条各 5.25s）；`KLIPPERX_TRACE` 下这两条
-      现在会打 `MCU DROP`。
-      **顺带解决**：`firmware_restart` 时旧连接不再被命令表钉住（新增
-      `a_firmware_restart_releases_the_old_session` 钉住它）。
-      **前一轮的错误断言已更正**：我曾写「`-o`（fileoutput）下不 park、所以语料不受影响」——
-      实测在含 `[virtual_sdcard]`/`[gcode_button]` 的 cfg 上**不成立**（这两条语料就是代价）。
-      另：真机（非 `-o`）形态的 park 复现已**修好并转绿**：那条探针当时叫
-      `a_live_case_leaves_the_fake_devices_reader_parked`（`#[ignore]`），现改名 `a_live_case_runtime_shuts_down`
-      并**取消忽略**——它的 cfg 带 `[extruder]` 加热器，真正首因是下面那条 reactor 定时器环，
-      **不是**我当时归因的「整台机器从不说话」（已在源码 doc 订正）。
-      **环已断（2026-10-06，`2875ee7`）**：`verify_heater` 的 1s reactor 定时器回调强持 `Arc<Heater>`
-      （环 `reactor → 定时器堆 → Heater → McuPwm/chip → McuClock → reactor`）→ 改成 `Weak` + `upgrade()`；
-      同批修了 `virtual_sdcard::do_resume` 的一次性定时器强持 `Arc<Self>`。
-      实测：同一探针从 `5.000577767s: a part was leaked` → `MCU DROP mcu` + 收尾 **942µs**；
-      带加热器的重启用例 `a_live_heated_restart_releases_the_old_session` 收尾 **1.34ms**，
-      并断言旧会话的 `Arc<Mcu>` 强计数收敛到 1 后第二次会话才能重新 identify。
-      **全集清点**（1 2 处 `register_timer`）后的**最后一处同类环也已断（2026-10-21）**：
-      `api/endpoints/objects_subscribe.rs` 的刷新定时器回调改持 `Weak<Inner>`，钉子用例
-      `teardown_releases_the_printer_through_the_refresh_timer` 钉死。
-
-- [x] **Q10 模拟设备的步进时序模型（两会话固件链）——已完成（2026-09-27，`agents/feat-simulator-step-timing`）**：
-      `SimulatorDevice` 落 per-oid `StepChain`（`config_stepper` 归零、`queue_step` 空闲首拍/忙延展/
-      首拍过期三态、`reset_step_clock` 忙拒+重锚）、`timer_is_before` u32 回绕（含 2³¹ 假阳边界），
-      过期/忙拒经字典 `static_string_id` 发 shutdown 帧并置 `get_config is_shutdown`；5 条单测（两会话
-      红/绿对）+ 转红实证（剪过期判定恰红 2 条）。配套：宿主生成地上游 BGFLUSH 地平线（est+0.4/0.7 s
-      出生垫——同修语料两类 `Timer too close`：管线迟打戳与半回绕越界）、假件时钟定为纯墙钟（早先
-      跳钟方案撤销）、monitor 窗改由固件侧样本续命（`eddy.test`）。语料 `KLIPPERX_UPSTREAM_ALL=1`
-      237/0、workspace 2052+ 全绿。**原任务书**（存档）：C5 案暴露的测试缺口——当时假设备（FrameMock /
-      SimulatorDevice / 语料）都不维护 `next_step_time` 链、不做 `timer_is_before` 回绕，且语料每例全新
-      实例，复现不了「同一假固件跨两次宿主会话」；方案即上述最小时序模型 + 两会话单测（修复前代码转红），
-      原则：真机定案、假件固化。
-
-- [x] **Q8 GCodeIO（伪 tty / OctoPrint 串口仿真）补不补**：**结案（2026-10-05）：不做**（2026-09-21 曾定暂缓）。
-      `need_ack`/`ack` 机制已从 `src/core/klippy/gcode.rs` 删除；偏移登记在
-      [本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)。纯 API 主机（Moonraker）不需要它；
-      放弃的能力：`debuginput_exit`、`is_fileinput`/`error_exit`、`stats gcodein=`、`input_log`、`M112` 乱序。
-      需要 OctoPrint 串口主机或上游 batch mode 的场景请用上游 Klipper。若将来翻案，前置见 G1b 的 `GCodeIO`
-      条目（首要是 reactor 的 fd 事件层）。
+- [ ] **`M400` 等待的两个后续单元**（等待本体与四条出口已落地：`motion/toolhead.rs` 的
+      `wait_moves_state()` 快照 + `extras/toolhead.rs` 的异步等待环；`can_pause = !is_fileoutput()`
+      时立即退出，所以语料对该特性零覆盖）：
+      ① fileoutput 形态下上游 `_flush_handler_debug` 的等价物未移植（上游在 `extras/motion_queuing.py`，
+      `motion/queuing.rs` 无对应分支）；
+      ② 上游 `send_wait_ack`（`klippy/mcu.py:125-127`，消费方是传感器芯片）本仓以普通 send 代替——
+      理由已写在 `extras/adxl345.rs` 的 `finish_measurements`（发送队列保序，所以不等 ack 也够）；
+      只有将来真需要 ack 语义时才要补。
 
 ## 上游事件对照清单（事件总线已就绪，逐项注册处理器）
 
 上游 `Printer` 维护 `event_handlers` 字典（`klippy/klippy.py:36`），通过
 `register_event_handler(name, cb)` 注册、`send_event(name, *params)` 分发，共 35 个事件名。
 
-`KlippyEvent` 已声明全部 35 个名字，`Printer::register_event_handler` / `send_event` 按名
-注册与分发，处理器签名为 `Fn(&KlippyEvent)`。以下事件可按优先级逐个注册处理器；依赖
-关系标注在「实现依赖」列中，`—` 表示仅依赖事件总线，其他依赖的模块已标记为其他 TODO 条目。
-生命周期事件已触发，其余事件的触发点随对应模块落地（逐项状态 2026-10-04 复核，见各表）。
+`KlippyEvent` 已声明 34 个名字（上游 35 个里的 `gcode:debuginput_exit` **有意不声明**，见下表），
+`Printer::register_event_handler` / `send_event` 按名注册与分发，处理器签名为 `Fn(&KlippyEvent)`。
+「实现依赖」列记的是**现在还有没有发送点**：34 个已声明事件里 32 个已在生产路径发出，
+只剩 `stepper:sync_mcu_position` / `stepper:set_dir_inverted` 两个仍无发送点（逐项状态 2026-10-22 复核）。
 
 > **「参数」列的口径＝本仓载荷**：按 `src/core/klippy/event/decl/*.rs` 的 `event!` 声明写，
 > 裸声明一律写「无」，带字段的写 `{字段}`。上游 `send_event` 的实参（对象引用、位置参数等）
@@ -200,14 +141,14 @@
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `klippy:mcu_identify` | MCU identify 完成后 | 无 | `klippy/klippy.py:131` | — |
-| `klippy:connect` | 配置装载完成、打印机即将就绪 | 无 | `klippy/klippy.py:132` | — |
-| `klippy:ready` | 打印机进入 ready 状态 | 无 | `klippy/klippy.py:162` | — |
-| `klippy:shutdown` | 进入 shutdown 状态 | 无 | `klippy/klippy.py:211` | — |
-| `klippy:disconnect` | 运行结束/退出时 | 无 | `klippy/klippy.py:195` | — |
-| `klippy:firmware_restart` | firmware restart 前 | 无 | `klippy/klippy.py:194` | — |
-| `klippy:notify_mcu_error` | MCU 通信出错时 | `{msg, details}` | `klippy/klippy.py:144,151` | ✅ 已接入 |
-| `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `{msg, details}` | `klippy/klippy.py:216-220` | ✅ 已接入 |
+| `klippy:mcu_identify` | MCU identify 完成后 | 无 | `klippy/klippy.py:131` | ✅ 已触发（`printer.rs:1076`） |
+| `klippy:connect` | 配置装载完成、打印机即将就绪 | 无 | `klippy/klippy.py:132` | ✅ 已触发（`printer.rs:1104`） |
+| `klippy:ready` | 打印机进入 ready 状态 | 无 | `klippy/klippy.py:162` | ✅ 已触发（`printer.rs:1115`） |
+| `klippy:shutdown` | 进入 shutdown 状态 | 无 | `klippy/klippy.py:211` | ✅ 已触发（`printer.rs:885`、`mcu/object.rs:3274,3323`） |
+| `klippy:disconnect` | 运行结束/退出时 | 无 | `klippy/klippy.py:195` | ✅ 已触发（`printer.rs:976`） |
+| `klippy:firmware_restart` | firmware restart 前 | 无 | `klippy/klippy.py:194` | ✅ 已触发（`printer.rs:974`） |
+| `klippy:notify_mcu_error` | MCU 通信出错时 | `{msg, details}` | `klippy/klippy.py:144,151` | ✅ 已触发（`printer.rs:852`、`error_mcu.rs:364,390`） |
+| `klippy:analyze_shutdown` | 进入 shutdown 后分析 | `{msg, details}` | `klippy/klippy.py:216-220` | ✅ 已触发（`printer.rs:886`） |
 
 > **说明**：两个事件由带载荷的变体承载（`KlippyEvent::KlippyNotifyMcuError` /
 > `KlippyEvent::KlippyAnalyzeShutdown { msg, details }`）。`analyze_shutdown` 触发时
@@ -218,7 +159,7 @@
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `klippy:mcu_identify` | 每个 MCU identify 后 | 无 | `klippy/mcu.py:797,929,1001` | — |
+| `klippy:mcu_identify` | 每个 MCU identify 后 | 无 | 上游发送点 `klippy/klippy.py:131`（`mcu.py:797,929,1001` 是**注册**处） | ✅ 已触发（`printer.rs:1076`） |
 
 > 已由 MCU 层事件 `Starting` 覆盖部分语义，但上游的 `klippy:mcu_identify` 是
 > Printer 级事件，供 extras（probe、tmc、temperature_mcu 等）做初始化。
@@ -227,25 +168,24 @@
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `homing:home_rails_begin` | 回零开始 | 无 | `klippy/extras/homing.py:210` | ✅ 已触发（`extras/toolhead.rs:2316`，回零循环与各运动学路径多处） |
-| `homing:home_rails_end` | 回零结束 | `{axes, homing}` | `klippy/extras/homing.py:234` | ✅ 已触发（`extras/toolhead.rs:3236`） |
-| `homing:homing_move_begin` | 回零移动开始 | 无 | `klippy/extras/homing.py:80` | ✅ 已触发（`extras/toolhead.rs:2734` 等） |
-| `homing:homing_move_end` | 回零移动结束 | 无 | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:2806` 等） |
-| `stepper:sync_mcu_position` | stepper 位置同步 | 无 | `klippy/stepper.py:227` | C1 |
-| `stepper:set_dir_inverted` | 方向反转设置 | 无 | `klippy/stepper.py:153` | C1 |
-| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | 无 | `klippy/kinematics/idex_modes.py:383` | ✅ 已触发（`extras/idex_modes.rs` 滑车切换/恢复，锁外） |
+| `homing:home_rails_begin` | 回零开始 | 无 | `klippy/extras/homing.py:210` | ✅ 已触发（`extras/toolhead.rs:3441,3510,3538,3580,3612,3643,3667`，回零循环与各运动学路径多处） |
+| `homing:home_rails_end` | 回零结束 | `{axes, homing}` | `klippy/extras/homing.py:234` | ✅ 已触发（`extras/toolhead.rs:4860`、`gcode_move.rs:1433`、`z_thermal_adjust.rs:880`） |
+| `homing:homing_move_begin` | 回零移动开始 | 无 | `klippy/extras/homing.py:80` | ✅ 已触发（`extras/toolhead.rs:4045,4207,4334`、`homing_heaters.rs:377,397,416`） |
+| `homing:homing_move_end` | 回零移动结束 | 无 | `klippy/extras/homing.py:148` | ✅ 已触发（`extras/toolhead.rs:4150,4264,4288,4448` 等 8 处） |
+| `stepper:sync_mcu_position` | stepper 位置同步 | 无 | `klippy/stepper.py:227` | **未触发**：仅声明（`event/decl/stepper.rs:3`），生产路径无发送点 |
+| `stepper:set_dir_inverted` | 方向反转设置 | 无 | `klippy/stepper.py:153` | **未触发**：仅声明（`event/decl/stepper.rs:4`），生产路径无发送点 |
+| `dual_carriage:update_kinematics` | IDEx 双滑车运动学更新 | 无 | `klippy/kinematics/idex_modes.py:383` | ✅ 已触发（`idex_modes.rs:725`、`input_shaper.rs:718`，锁外） |
 
-> `homing:*` 四个已随 toolhead 产线触发（`extras/toolhead.rs:2316` `:3236` `:2734` `:2806`，
-> `G28` 路径；`homing_heaters` 也会发 move 对）；`stepper:sync_mcu_position`、`stepper:set_dir_inverted`
-> 仍无触发点，分别随 stepper 位置同步与目录反转变更。
+> `homing:*` 四个已随 toolhead 产线触发（`G28` 路径；`homing_heaters` 也会发 move 对）；
+> `stepper:*` 两个仍无触发点。
 
 ### idle_timeout 事件
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `idle_timeout:ready` | idle_timeout 模块就绪 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:95` | — |
-| `idle_timeout:idle` | 进入空闲状态 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:57` | — |
-| `idle_timeout:printing` | 开始打印（恢复活动） | `{print_time: f64}` | `klippy/extras/idle_timeout.py:106` | — |
+| `idle_timeout:ready` | idle_timeout 模块就绪 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:95` | ✅ 已触发（`idle_timeout.rs:467`） |
+| `idle_timeout:idle` | 进入空闲状态 | `{print_time: f64}` | `klippy/extras/idle_timeout.py:57` | ✅ 已触发（`idle_timeout.rs:602`） |
+| `idle_timeout:printing` | 开始打印（恢复活动） | `{print_time: f64}` | `klippy/extras/idle_timeout.py:106` | ✅ 已触发（`idle_timeout.rs:428,518`） |
 
 > 批 #21 已落地：`[idle_timeout]` 装载即注册，三个事件带 `{print_time: f64}` 载荷发出。
 
@@ -254,69 +194,66 @@
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
 | `toolhead:manual_move` | 手动移动前 | 无 | `klippy/toolhead.py:416` | ✅ 已触发（`safe_z_home` 的 `HomeOps::manual_move`，`extras/safe_z_home.rs:215`） |
-| `toolhead:set_position` | 设置位置（G92 等） | 无 | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:1752`，`SET_KINEMATIC_POSITION`） |
-| `toolhead:sync_print_time` | print_time 更新 | 无 | `klippy/toolhead.py:267` | **尚无发送点**（C1d 的回调已落地，但该事件没有触发方；`idle_timeout` 改为观察 `print_time` 前进） |
-| `toolhead:update_extra_axes` | 额外轴位置更新 | 无 | `klippy/toolhead.py:455` | ✅ 已触发（`ToolHeadObject::add_extra_axis` / `remove_extra_axis`，`extras/toolhead.rs:1876` / `:1892`，`manual_stepper` 调用） |
+| `toolhead:set_position` | 设置位置（G92 等） | 无 | `klippy/toolhead.py:390` | ✅ 已触发（`extras/toolhead.rs:2189,4796`、`gcode_move.rs:1267`、`gcode_arcs.rs:576`、`bed_tilt.rs:573`、`firmware_retraction.rs:472`、`z_thermal_adjust.rs:714`） |
+| `toolhead:sync_print_time` | print_time 更新 | `{curtime, est_print_time, print_time}` | `klippy/toolhead.py:267` | ✅ 已触发（`extras/toolhead.rs:2866-2873` 的 `flush_sync_print_time`，在 flush 循环内、锁外） |
+| `toolhead:update_extra_axes` | 额外轴位置更新 | 无 | `klippy/toolhead.py:455` | ✅ 已触发（`ToolHeadObject::add_extra_axis` / `remove_extra_axis`，`extras/toolhead.rs:2765` / `:2781`，`manual_stepper` 调用） |
 
-> `toolhead:set_position`（`gcode_move` 重置链之一）、`toolhead:manual_move`（`safe_z_home`）
-> 与 `toolhead:update_extra_axes`（`manual_stepper`）都已产线触发；只剩
-> `toolhead:sync_print_time` 无发送点（C1d 已收官）。
+> 四个 `toolhead:*` 事件均已在生产路径触发（`sync_print_time` 由 flush 任务在锁外发出，
+> 载荷三字段见 `event/decl/toolhead.rs:10`）。
 
 ### gcode 事件
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`process_line`） |
-| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **不做 `[x]`**（本仓不实现行协议输入；上游靠 `send_event` 收集返回值） |
-| `gcode:request_restart` | 请求重启 | `{print_time: f64}` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1357`，`get_last_move_time` 取 print time） |
+| `gcode:command_error` | gcode 命令错误 | 无 | `klippy/gcode.py:226` | ✅ 已触发（`gcode.rs:1087`，handler 的 `CommandError` 触发、panic 不触发） |
+| `gcode:debuginput_exit` | debuginput EOF | 无 | `klippy/gcode.py:433` | **不做（有意偏离）**：本仓不实现行协议输入，`event/decl/gcode.rs` 也没有这个名字；上游靠 `send_event` 收集返回值 |
+| `gcode:request_restart` | 请求重启 | `{print_time: f64}` | `klippy/gcode.py:358` | ✅ 已触发（`gcode.rs:1323`，先 `get_last_move_time` 再 dwell/wait） |
 
-> `gcode:command_error` 已接（handler 的 `CommandError` 触发，panic 不触发）；`gcode:request_restart`
-> 已在 `request_restart` 处理器里产线触发（`gcode.rs:1357`，先 `get_last_move_time` 再
-> dwell/wait）；`gcode:debuginput_exit` 随 `GCodeIO` **不做 `[x]`**（本仓不实现行协议输入），
-> 若将来翻案还要先让 `send_event` 收集 handler 返回值（上游 `all(...)`）。
+> `gcode:debuginput_exit` 随 `GCodeIO` 一并**不做**（本仓不实现行协议输入；若将来翻案，
+> 先要让 `send_event` 收集 handler 返回值，上游是 `all(...)`）。
 
 ### 工具/传感器事件
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `probe:update_results` | probe 测量完成 | `{results: ProbeResultsHandle}`（可原地改 Z，批 #36） | `klippy/extras/probe.py:366` | endstop |
-| `extruder:activate_extruder` | 切换 active extruder | 无 | `klippy/kinematics/extruder.py:289` | 尚无发送方（handler 已备，`gcode_move.rs:392`；`ACTIVATE_EXTRUDER` 不触发它） |
-| `stepper_enable:motor_off` | stepper 电机关闭 | 无 | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:351`） |
-| `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | sdcard |
-| `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:404` | ADC |
-| `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:406` | ADC |
+| `probe:update_results` | probe 测量完成 | `{results: ProbeResultsHandle}`（可原地改 Z，批 #36） | `klippy/extras/probe.py:366` | ✅ 已触发（`probe.rs:558`、`probe_eddy_current.rs:1455,1581`、`axis_twist_compensation.rs:1078`） |
+| `extruder:activate_extruder` | 切换 active extruder | 无 | `klippy/kinematics/extruder.py:289` | ✅ 已触发（`extruder.rs:369`，`ACTIVATE_EXTRUDER` 处理器内） |
+| `stepper_enable:motor_off` | stepper 电机关闭 | 无 | `klippy/extras/stepper_enable.py:120` | ✅ 已触发（`stepper_enable.rs:456`） |
+| `virtual_sdcard:reset_file` | VSD 文件重置 | 无 | `klippy/extras/virtual_sdcard.py:151` | ✅ 已触发（`virtual_sdcard.rs:404`） |
+| `load_cell:calibrate` | 称重传感器校准 | 无 | `klippy/extras/load_cell.py:404` | ✅ 已触发（`load_cell.rs:938`） |
+| `load_cell:tare` | 称重传感器归零 | 无 | `klippy/extras/load_cell.py:406` | ✅ 已触发（`load_cell.rs:856,941`） |
 
-> 依赖各自模块（endstop、sdcard、ADC 等），不阻塞运动。
+> 六条均已在生产路径触发（不再有“等 sdcard / ADC / endstop 落地”的依赖）。
 
 ### 显示/菜单事件（menu.py 内部）
 
 | 事件名 | 触发时机 | 参数 | 上游位置 | 实现依赖 |
 |---|---|---|---|---|
-| `menu:populate` | 菜单填充 | 无（上游传容器对象） | `klippy/extras/display/menu.py:346` | ✅ 已触发（`menu.rs` 容器 `populate` 末尾，锁外） |
-| `menu:init` | 菜单初始化 | 无（上游传 manager） | `klippy/extras/display/menu.py:722` | ✅ 已触发（`MenuManager::new` 末尾） |
-| `menu:begin` | 菜单开始 | 无（上游传 manager） | `klippy/extras/display/menu.py:754` | ✅ 已触发（`begin` 推根之前） |
-| `menu:exit` | 菜单退出 | 无（上游传 manager） | `klippy/extras/display/menu.py:913` | ✅ 已触发（`exit` 置 `running=false` 之前） |
+| `menu:populate` | 菜单填充 | 无（上游传容器对象） | `klippy/extras/display/menu.py:346` | ✅ 已触发（`display/menu.rs:798`，容器 `populate` 末尾，锁外） |
+| `menu:init` | 菜单初始化 | 无（上游传 manager） | `klippy/extras/display/menu.py:722` | ✅ 已触发（`display/menu.rs:1155`，`MenuManager` 构建末尾） |
+| `menu:begin` | 菜单开始 | 无（上游传 manager） | `klippy/extras/display/menu.py:754` | ✅ 已触发（`display/menu.rs:1586`，`begin` 推根之前） |
+| `menu:exit` | 菜单退出 | 无（上游传 manager） | `klippy/extras/display/menu.py:913` | ✅ 已触发（`display/menu.rs:1809`，`exit` 置 `running=false` 之前） |
 
 > 上游 `menu.send_event` 实际发 `"menu:" + <名>` 并附 `self` 作载荷；本仓四个事件无载荷，
-> 处理者按对象名 `menu` 查。四条发送点由 `test_the_lifecycle_raises_the_four_menu_events` 铉住
-> （`init` → `begin` → `populate` → `exit` 顺序）。
+> 处理者按对象名 `menu` 查。四条发送点由 `test_the_lifecycle_raises_the_four_menu_events` 钉住
+> （`init` → `begin` → `populate` → `exit` 顺序，`display/menu.rs:2771`）。
 
 ### 依赖关系总结
 
 ```
-事件总线（KlippyEvent，已就绪）
-├── klippy:* 生命周期事件（8个）—— 已触发（notify_mcu_error / analyze_shutdown 也已接入）
-├── stepper:* —— 依赖 C1（位置同步/目录反转，尚无触发点）
-├── homing:* —— 已触发（toolhead 回零路径）
-├── toolhead:* —— set_position 已触发；其余随 G4-2（C1d 已收官）
-├── idle_timeout:* —— 依赖 idle_timeout 对象
-├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 不做（本仓无行协议输入）
-├── probe:* —— 依赖 endstop
-├── extruder:* —— 依赖 C1（activate_extruder 尚无发送方）
+事件总线（KlippyEvent，34 个名字已声明）
+├── klippy:* 生命周期事件（8 个）—— 全部已触发
+├── stepper:* —— **未触发**（位置同步/目录反转变更尚无发送点）
+├── homing:* —— 已触发（toolhead 回零路径 + homing_heaters）
+├── toolhead:* —— 四个均已触发（含 sync_print_time，出 flush 任务）
+├── idle_timeout:* —— 已触发（三个都带 print_time 载荷）
+├── gcode:* —— command_error / request_restart 已触发；debuginput_exit 有意不声明
+├── probe:* —— 已触发（probe / eddy / axis_twist）
+├── extruder:* —— 已触发（ACTIVATE_EXTRUDER）
 ├── stepper_enable:* —— 已触发（motor_off）
-├── virtual_sdcard:* —— 依赖 sdcard
-├── load_cell:* —— 依赖 ADC
-└── menu:* —— 依赖 display
+├── virtual_sdcard:* —— 已触发（reset_file）
+├── load_cell:* —— 已触发（calibrate / tare）
+└── menu:* —— 已触发（四条，菜单引擎内）
 ```
 
 ## 证据索引（上游，供回头分析时查）

@@ -137,7 +137,7 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 或 `"MCU error during connect"`）与 `details`（原始错误信息）。与上游 `_connect` 中的
 `send_event("klippy:notify_mcu_error", msg, {"error": str(e)})` 一致。
 
-截至 2026-10-04，生产路径上**实际发出**的事件（按命名空间）：
+截至 2026-10-22，生产路径上**实际发出**的事件（按命名空间）：
 
 | 命名空间 | 已发出 | 尚未发出（模块/发送方未就位） |
 |----------|--------|------------------------------|
@@ -148,11 +148,11 @@ MCU 侧另有独立的 `event` 模块，以 `McuEvent` trait 表达固件主动�
 | `stepper_enable:` | `motor_off` | — |
 | `extruder:` | `activate_extruder`（`ACTIVATE_EXTRUDER` 切换成功后发出，无载荷） | — |
 | `stepper:` | — | `sync_mcu_position`、`set_dir_inverted`（依赖 stepper 资源的同步路径） |
-| `virtual_sdcard:` | `reset_file` | `_reset_file` 末尾发出（`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`/`M23` 重置时） |
+| `virtual_sdcard:` | `reset_file`（`_reset_file` 末尾，`SDCARD_RESET_FILE`/`SDCARD_PRINT_FILE`/`M23` 重置时） | — |
 | `idle_timeout:` | `ready`、`idle`、`printing`（批 #21） | — |
 | `probe:` | `update_results`（`probe`、`probe_eddy_current`、`axis_twist_compensation`；批 #36） | — |
 | `load_cell:` | `calibrate`、`tare`（批 #14） | — |
-| `menu:` / `dual_carriage:` | `dual_carriage:update_kinematics`（`idex_modes` 在滑车切换/恢复时**锁外**发出；`input_shaper` 收到后 flush 步进、按当前活跃轴重装脉冲并重扫窗口，对齐上游 `input_shaper.py:153-168`） | `menu:populate`/`init`/`begin`/`exit`（菜单引擎落地时才有发送方，H8） |
+| `menu:` / `dual_carriage:` | `dual_carriage:update_kinematics`（`idex_modes` 在滑车切换/恢复时**锁外**发出；`input_shaper` 收到后 flush 步进、按当前活跃轴重装脉冲并重扫窗口，对齐上游 `input_shaper.py:153-168`）与 `menu:populate`/`init`/`begin`/`exit`（菜单引擎内，四条发送点由 `test_the_lifecycle_raises_the_four_menu_events` 钉住） | — |
 
 事件名与变体已经就绪，处理器可先注册；上表右列的事件一旦模块落地，发送点直接用现成变体。
 

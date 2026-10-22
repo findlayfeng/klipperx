@@ -27,7 +27,7 @@
    `-d <dict>` 就是官方文档化的 **batch mode** —— 离线把 gcode 翻成 MCU 命令流，用于
    检视低层行为、对比改动前后的命令流、跑 host 性能基准。
 
-**本仓不做这两条**（决定见 [`TODO.md`](../../../TODO.md) 的 G1b / Q8）：
+**本仓不做这两条**（2026-10-05 结案：伪 tty / batch mode 都不做；`need_ack`/`ack` 机制已从 `gcode.rs` 删除）：
 
 - 输入通道只有 API（`-a` 的 unix socket / TCP，Moonraker 语义）与终端客户端
   （`klipperx console` / `--tui`）；`-I` / `-l` / `-i` / `-o` 这些开关**不存在**

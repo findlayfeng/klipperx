@@ -414,6 +414,27 @@ impl Mcu {
         Ok(())
     }
 
+    /// [`Mcu::send_msg`] followed by the wait for the firmware's acknowledgement
+    /// of the block that carried it — upstream's `CommandWrapper.send_wait_ack`
+    /// (`klippy/mcu.py:125-127`).
+    ///
+    /// The bulk-sensor drivers use it where upstream does: arming or halting a
+    /// stream is only ordered against the host's next step once the firmware has
+    /// taken the command, and the plain send says nothing about that.
+    ///
+    /// # Errors
+    /// As [`Mcu::send_msg`], plus [`McuError::Call`] when the acknowledgement
+    /// does not arrive within `timeout`.
+    pub(crate) async fn send_msg_wait_ack<C: McuCommand>(
+        &self,
+        cmd: &C,
+        timeout: Duration,
+    ) -> Result<(), McuError> {
+        self.require_dictionary()?;
+        self.require_message(C::NAME)?;
+        self.send_wait_ack(C::NAME, &cmd.args(), timeout).await
+    }
+
     /// [`Mcu::send_msg`] with scheduling gates ([`SendClocks`]).
     ///
     /// The gates are the homing paths' own: `endstop_home` carries upstream's

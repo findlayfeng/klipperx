@@ -66,7 +66,9 @@ use crate::core::klippy::extras::bulk_sensor::{
 };
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{ConfigBuilder, I2cMode, Mcu, McuError, McuI2c, McuObject, McuSpi};
+use crate::core::klippy::mcu::{
+    ConfigBuilder, I2cMode, Mcu, McuError, McuI2c, McuObject, McuSpi, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -690,14 +692,17 @@ impl Lis2dwState {
         let chip_name = self.chip.name();
         let (reg, value) = fifo_off_write();
         self.bus.set_reg(reg, value, chip_name).await?;
-        // Upstream's `send_wait_ack` blocks for the ack; the queued messages
-        // ahead of this one preserve the order, so the fire-and-forget send is
-        // enough here.
+        // Upstream's `send_wait_ack`: the host moves on (`note_end`) only once
+        // the firmware has taken the command that halts the stream.
         let mcu = self.connected_mcu()?;
-        mcu.send_msg(&QueryLis2dw {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        mcu.send_msg_wait_ack(
+            &QueryLis2dw {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(|err| err.to_string())?;
         self.ffreader.note_end();
         tracing::info!("{} finished '{}' measurements", chip_name, self.name);

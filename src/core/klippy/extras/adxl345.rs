@@ -57,7 +57,9 @@ use crate::core::klippy::extras::bulk_sensor::{
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
 use crate::core::klippy::extras::toolhead::ToolHeadObject;
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, McuObject, McuSpi};
+use crate::core::klippy::mcu::{
+    ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // Loaded after `[board_pins]` (order 30) so an alias or a software bus can name
@@ -808,14 +810,17 @@ impl Adxl345State {
     /// Halt the bulk stream (`_finish_measurements`).
     async fn finish_measurements(&self) -> Result<(), String> {
         self.set_reg(REG_POWER_CTL, 0x00).await?;
-        // Upstream's `send_wait_ack` blocks for the ack; the queued messages
-        // ahead of this one (including the register write above) preserve the
-        // order, so the fire-and-forget send is enough here.
+        // Upstream's `send_wait_ack`: the host moves on (`note_end`) only once
+        // the firmware has taken the command that halts the stream.
         let mcu = self.connected_mcu()?;
-        mcu.send_msg(&QueryAdxl345 {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        mcu.send_msg_wait_ack(
+            &QueryAdxl345 {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(|err| err.to_string())?;
         self.ffreader.note_end();
         tracing::info!("ADXL345 finished '{}' measurements", self.name);

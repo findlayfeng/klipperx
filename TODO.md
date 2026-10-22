@@ -66,8 +66,6 @@
 - `canbus_stats`：总线错误计数/状态上报。上游 `canbus_stats.py`，本仓无对应模块；
   CAN 侧现有能力是 id 分配器（`mcu/ids.rs`）与节点发现（`klipperx admin scan`），见
   [MCU 连接方式](docs/klippy/user-manual/mcu-connection.md)。
-- `heaters` 切到 `GCodeRequestQueue`（`output_pin`/`fan`/`servo`/`pwm_tool` 已接线，`heaters` 侧无队列化
-  消费者），见 `docs/klippy/developer-manual/README.md` 的 `gcode_request_queue.rs` 行。
 - `manual_stepper` 自带回零：`STOP_ON_ENDSTOP` 仍明示拒绝（缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
 - `pwm_tool` 的 `maximum_mcu_duration` 中间更新：固件上限照常下发（`setup_max_duration`），上游的
   宿主侧重生成（`MCU_queued_pwm._gen_intermediate_updates`，`pwm_tool.py:119-135`）本仓无对应物，

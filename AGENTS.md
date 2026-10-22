@@ -151,7 +151,7 @@ git config core.hooksPath .githooks
 ## 技能（skills）
 
 项目级 skill 放在 **`.agents/skills/<名>/SKILL.md`**（随仓库走，pi 从工作目录向上发现，到仓库根为止）；
-需要时用 `/skill:<名>` 显式加载。当前九份：
+需要时用 `/skill:<名>` 显式加载。当前十份：
 
 | skill | 何时用 |
 |-------|--------|
@@ -161,6 +161,7 @@ git config core.hooksPath .githooks
 | [`task-branch-flow`](.agents/skills/task-branch-flow/SKILL.md) | 开任务分支/worktree、子模组 worktree、`KLIPPERX_KLIPPER_DIR` 构建、ff vs `--no-ff` 判定、`abandoned/*` 归档、并发构建与收尾 |
 | [`doc-sync`](.agents/skills/doc-sync/SKILL.md) | 改完同步手册的**清单**：改动→手册映射表、写死数字重核、旧断言/已完成标号清理、删档案前分流 |
 | [`subagent-briefing`](.agents/skills/subagent-briefing/SKILL.md) | 写子代理任务书：六要素模板、纪律块、防超时三板斧、worker/scout/reviewer 分工与路由 |
+| [`host-testing`](.agents/skills/host-testing/SKILL.md) | 写/改测试与核闸门：断言形态阶梯（帧字节 → 数值 → 投递 → 日志）、负向对照、确定性纪律（禁裸 `await`/禁固定 sleep 断言/有界轮询）、日志捕获的线程局部陷阱、vendor 常量漂移守卫、flake 追查 |
 | [`python-tools`](.agents/skills/python-tools/SKILL.md) | 加/用 Python 工具的固定流程：没有 `venv/` 先 `python3 -m venv venv` → 用 `venv/bin/pip` 装 → 之后一切 Python 只写 `venv/bin/python`、`venv/bin/<工具>` 的**绝对路径** |
 | [`admin-cli`](.agents/skills/admin-cli/SKILL.md) | 用 `klipperx admin` 刷写/复位/准备桥：寻址、命令顺序（`reset --bridge` 先于 `bridge config`）、失败判据、刷后核验 |
 | [`stress-real-board`](.agents/skills/stress-real-board/SKILL.md) | 真机跑 `klipperx stress`：release 前置、目标/任务选择、`backlog`/`link gave out` 怎么读、饱和后 `admin reset --bridge` 收尾 |

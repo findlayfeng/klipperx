@@ -132,6 +132,11 @@ pub trait Reactor: Send + Sync {
 
 这条是**约定**，靠审查与注释守着；`set_latency_notifier` 只在被违反时把孩子报出来（见上），不是机制上的禁止。
 
+**确实有阻塞 I/O 要做的回调，把它拓到 blocking 池**：`call_later` 依旧用在“下一轮 reactor turn”，但那轮只派发。现有两处：
+
+- `TmcDriver::handle_stepper_enable`（`extras/tmc.rs`）——一次使能是整套寄存器往返（每写一个寄存器还要读 `IFCNT` 校验 + 回读），真机实测 **~150 ms**；现在 `Handle::try_current()` + `runtime_flavor() == MultiThread` 判过就 `spawn_blocking`，无 runtime / 手驱动的 reactor 仍同步执行。被拓走之前它每次固件重置后的第一次归零都会打一条 `Reactor busy for 0.148s`，把它后面的时钟同步、加热统计、`objects/subscribe` 全部拖住。
+- `TmcErrorCheck` 的周期检查走 `handle.spawn`（不阻塞，但同样不在 dispatcher 上等 UART）。
+
 ## 还没有的
 
 - **周期性任务的"武装/解除"**：上游用 `register_timer(cb, NEVER)` 注册、`update_timer` 择机武装。我们没有 `update_timer`，因为当前没有消费者；`objects/subscribe` 在无订阅时直接 `unregister_timer`（上游 `webhooks.py` 也是这么收尾的），不需要它。

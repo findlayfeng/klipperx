@@ -2154,6 +2154,11 @@ pub struct TmcDriver {
     /// The `toff` the driver was configured with, when the enable is not a pin
     /// but a register write (`toff`); `None` on a dedicated enable pin.
     toff: Mutex<Option<i64>>,
+    /// Serializes the enable/disable work that runs off the reactor's
+    /// dispatcher ([`TmcDriver::handle_stepper_enable`]): the dispatcher used to
+    /// run one transition at a time, and two register bursts must not
+    /// interleave on the bus.
+    enable_transition: tokio::sync::Mutex<()>,
     /// A weak handle to itself, for the deferred enable/disable work.
     self_ref: Weak<TmcDriver>,
     /// Previous field values the virtual-endstop homing stashed, for restore.
@@ -2223,6 +2228,7 @@ impl TmcDriver {
             stepper: Mutex::new(None),
             enable_line: Mutex::new(None),
             toff: Mutex::new(None),
+            enable_transition: tokio::sync::Mutex::new(()),
             self_ref: self_ref.clone(),
             virtual_prev_state: Mutex::new(Vec::new()),
             virtual_dirty: Mutex::new(Vec::new()),
@@ -2596,7 +2602,8 @@ impl TmcDriver {
     }
 
     /// Hand an enable/disable transition to the reactor
-    /// (`_handle_stepper_enable`).
+    /// (`_handle_stepper_enable`), and the transition itself off the reactor's
+    /// dispatcher.
     ///
     /// `stepper_enable` delivers the callback **in place**, while it holds the
     /// global enable-lines lock and this stepper's tracking lock; a
@@ -2604,6 +2611,18 @@ impl TmcDriver {
     /// and writes registers) is deferred to the next reactor turn instead of run
     /// here. `toff` and the dedicated-enable decision are therefore taken at
     /// registration time, not in the callback.
+    ///
+    /// That reactor turn only **dispatches** the work. `do_enable`/`do_disable`
+    /// are the whole register burst over the bus — measured on the bench, ~150 ms
+    /// for one enable after a firmware reset — and the dispatcher runs one
+    /// callback at a time, so the burst is handed to the blocking pool
+    /// ([`TmcDriver::apply_stepper_enable`]) and the callback returns. The
+    /// transition lock keeps the ordering the dispatcher used to give: one burst
+    /// at a time, in the order the transitions were delivered.
+    ///
+    /// A hand-driven test reactor has no dispatcher to protect, and no runtime
+    /// (or only a current-thread one) to take the work, so there it runs inline
+    /// and a test can assert on the result.
     fn handle_stepper_enable(&self, is_enable: bool) {
         let (Some(driver), Some(printer)) = (self.self_ref.upgrade(), self.printer.upgrade())
         else {
@@ -2612,18 +2631,47 @@ impl TmcDriver {
         printer.reactor().call_later(
             0.0,
             Box::new(move |_eventtime: f64| {
-                let result = if is_enable {
-                    driver.do_enable()
-                } else {
-                    driver.do_disable()
-                };
-                if let Err(err) = result {
-                    if let Some(printer) = driver.printer.upgrade() {
-                        printer.invoke_shutdown(&err.to_string());
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        handle.spawn(async move {
+                            let _turn = driver.enable_transition.lock().await;
+                            let this = Arc::clone(&driver);
+                            let applied = tokio::task::spawn_blocking(move || {
+                                this.apply_stepper_enable(is_enable)
+                            });
+                            // The burst has nowhere to report a panic; a
+                            // `do_enable` that unwound leaves the driver in an
+                            // unknown state, so say so.
+                            if let Err(err) = applied.await {
+                                tracing::error!(
+                                    "tmc {} enable transition did not finish: {err}",
+                                    driver.stepper_name
+                                );
+                            }
+                        });
                     }
+                    _ => driver.apply_stepper_enable(is_enable),
                 }
             }),
         );
+    }
+
+    /// Turn the driver on or off, and shut the printer down if it failed
+    /// (`_handle_stepper_enable`'s body, off the reactor).
+    fn apply_stepper_enable(&self, is_enable: bool) {
+        let result = if is_enable {
+            self.do_enable()
+        } else {
+            self.do_disable()
+        };
+        if let Err(err) = result {
+            if let Some(printer) = self.printer.upgrade() {
+                printer.invoke_shutdown(&err.to_string());
+            }
+        }
     }
 
     fn cmd_init_tmc(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {
@@ -3193,8 +3241,9 @@ mod tests {
     use crate::core::klippy::motion::queuing::MotionQueuing;
     use crate::core::klippy::motion::stepper::Stepper;
     use crate::core::klippy::printer::PrinterState;
-    use crate::core::klippy::reactor::{ManualReactor, Reactor};
+    use crate::core::klippy::reactor::{LatencyReport, ManualReactor, Reactor, TokioReactor};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     /// A transport that records what it was asked to read and write, and answers
     /// every read with 0 like the file-output short-circuit does (unless a test
@@ -3211,6 +3260,9 @@ mod tests {
         read_errors: Mutex<Vec<String>>,
         /// The print time every answer carries (`#receive_time`).
         read_time: Mutex<f64>,
+        /// How long a register write spends on the bus, for a burst that is as
+        /// slow as a real UART exchange.
+        write_delay: Mutex<Duration>,
     }
 
     impl RecordingTransport {
@@ -3249,6 +3301,11 @@ mod tests {
         fn set_read_time(&self, time: f64) {
             *self.read_time.lock().unwrap() = time;
         }
+
+        /// Make every register write take `delay` (a slow bus).
+        fn set_write_delay(&self, delay: Duration) {
+            *self.write_delay.lock().unwrap() = delay;
+        }
     }
 
     impl TmcTransport for RecordingTransport {
@@ -3279,6 +3336,10 @@ mod tests {
             val: u32,
             _print_time: Option<f64>,
         ) -> Result<(), McuError> {
+            let delay = *self.write_delay.lock().unwrap();
+            if !delay.is_zero() {
+                std::thread::sleep(delay);
+            }
             self.writes
                 .lock()
                 .unwrap()
@@ -3856,21 +3917,29 @@ position_max: 200
 homing_speed: 50
 ";
 
-    /// A loaded machine with the soft-enable stepper, and the config carrying
-    /// the `[tmc2209 stepper_x]` section the driver is built from.
+    /// A loaded machine with the soft-enable stepper on `reactor`, and the
+    /// config carrying the `[tmc2209 stepper_x]` section the driver is built
+    /// from.
     ///
     /// Only the stepper is loaded: the loader would register a driver of its own
     /// for the tmc section, and a second `SET_TMC_FIELD` registration is a
     /// duplicate command.
-    fn soft_enable_machine() -> (Arc<Printer>, Arc<ManualReactor>, Config) {
-        let (printer, reactor) = clocked_machine();
+    fn soft_enable_machine_on(reactor: Arc<dyn Reactor>) -> (Arc<Printer>, Config) {
+        let printer = Arc::new(Printer::new(reactor));
         let (loaded, _) = Config::from_text(SOFT_ENABLE_STEPPER).unwrap();
         printer.load_config(&loaded).unwrap();
         let (full, _) = Config::from_text(&format!(
             "{SOFT_ENABLE_STEPPER}[tmc2209 stepper_x]\nrun_current: 0.5\n"
         ))
         .unwrap();
-        (printer, reactor, full)
+        (printer, full)
+    }
+
+    /// [`soft_enable_machine_on`] on a reactor the test steps by hand.
+    fn soft_enable_machine() -> (Arc<Printer>, Arc<ManualReactor>, Config) {
+        let reactor = Arc::new(ManualReactor::new());
+        let (printer, config) = soft_enable_machine_on(Arc::clone(&reactor) as Arc<dyn Reactor>);
+        (printer, reactor, config)
     }
 
     /// The `[tmc2209 stepper_x]` driver of [`soft_enable_machine`], over a
@@ -4115,6 +4184,57 @@ homing_speed: 50
         assert!(!driver.echeck.is_running());
         assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(0));
         assert_eq!(driver.get_status(0.0)["drv_status"], Value::Null);
+    }
+
+    /// The enable's register burst is blocking bus I/O — one write per cached
+    /// register, plus the check's reads — and the dispatcher runs one callback
+    /// at a time: inline, it holds every other timer for the whole burst (on the
+    /// bench a single enable after a firmware reset took ~150 ms and the reactor
+    /// logged `Reactor busy for 0.148s`). The burst therefore runs off the
+    /// dispatcher, and no dispatch round comes near the 50 ms warning threshold
+    /// while it does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_slow_enable_burst_does_not_hold_the_reactor_dispatcher() {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let reactor = Arc::new(TokioReactor::new(tokio::runtime::Handle::current()));
+            let reports: Arc<Mutex<Vec<LatencyReport>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&reports);
+            reactor.set_latency_notifier(
+                0.05,
+                Arc::new(move |report: LatencyReport| sink.lock().unwrap().push(report)),
+            );
+            let (printer, config) =
+                soft_enable_machine_on(Arc::clone(&reactor) as Arc<dyn Reactor>);
+            let (driver, recording) = soft_enable_driver(&printer, &config);
+            // Every register write spends 120 ms on the bus, so the burst is
+            // several times the notifier's 50 ms threshold.
+            recording.set_write_delay(std::time::Duration::from_millis(120));
+            driver.fields().set_field("toff", 3, None, None);
+            driver.handle_connect().unwrap();
+
+            enable_stepper(&printer, true);
+
+            // Bounded wait for the burst itself: `toff` is back and the check
+            // runs only once it has finished.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !driver.echeck.is_running() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the enable burst did not finish: {:?}",
+                    recording.reads()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(recording.written("CHOPCONF").map(|val| val & 0x0f), Some(3));
+
+            let reports = reports.lock().unwrap();
+            assert!(
+                reports.is_empty(),
+                "the enable burst held the dispatcher: {reports:?}"
+            );
+        })
+        .await
+        .expect("the test must finish inside its budget");
     }
 
     /// The enable path pairs the driver's phase counter with the solver's step

@@ -522,6 +522,26 @@ CAN 口的速率是 `canhw_set_rate(bitrate)`（进初始化模式改 BTR、再�
   `uart_restart_method`（只认 `arduino`/`cheetah`）声明，主机只发 `RESET_PORT [0x04][index]`
   （桥自己消费、做线脉冲，**不下发**）。两条都无回执 ⇒ 确认靠「复位后能否重新握手/identify」。
 
+## 身份证据：一条命令、两个名字、所有 id 寻址设备同语义（2026-10-22）
+
+「发出去的 `SET_NODEID` 到底落在哪块板」需要设备自己回答。命令是 **`get_mcu_id`**，应答沿用
+`canbus_id`（`canbus_uuid` 六字节 + `canbus_nodeid`）：
+
+| 载体 | 固件落点 | 名字 |
+|---|---|---|
+| CAN 节点（`CANSERIAL`/`USBCANBUS`） | `src/generic/canserial.c` 的 `command_get_mcu_id` | `get_mcu_id` **与** `get_canbus_id`（别名，同一 handler、同一应答） |
+| 串口/USB CDC/host 库等 mux 载体（`CONFIG_MUX && !CONFIG_MUX_CAN`） | `src/mux.c` 的 `command_get_mcu_id`（`mux_uuid()` + `mux_node_id()`） | 同上两个名字 |
+
+- **两个名字**是为兼容：上游只有 `get_canbus_id`，旧主机照旧能问；新主机在 **identify 拿到字典之后**
+  判断——字典里有 `get_mcu_id` 就发它，否则回退别名，应答解析只有一份。
+- **为什么不在分配期做前置扫描**：mux 固件对**已被命名**的设备是沉默的（已命名设备不回应 discovery，
+  uuid 不匹配就静默忽略 `SET_NODEID`）。所以「目标 uuid 没出现在 discovery 答案里」既可能是板不在/在别的口，
+  也可能是它**已经被命名过**（主机重启的常见情形）——按它硬报错会误杀正常启动。**身份证据因此只在
+  分配后的读回**：读到 uuid 不等于配置里的 ⇒ 报错点名两侧；读不到/超时 ⇒ 另一条文案（不写成
+  「不是那块板」）。分配前 `mux_node_id() == 0` 是合法的，不是错误。
+- **与 katapult 的 `GET_CANBUS_ID` 无关**：刷写链路里那个是**引导器协议**的帧命令（`src/flash/session.rs`），
+  不是 klipper 字典消息，两者只是名字相近。
+
 ## 与 CAN 的关系
 
 CAN 不需要这套东西：总线自带仲裁 id 与硬件过滤，每颗 MCU 各开一个 socket、各装一个只收

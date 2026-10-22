@@ -68,9 +68,6 @@ OctoPrint 只走 pty，与本条取舍无关。
 | 上游无、本仓有 | 通用 `[i2c_device]` / `[spi_device]` 节与 `IIC_WRITE` / `IIC_READ` / `SPI_TRANSFER` / `SPI_SEND` 调试命令、`KlipperX` 自有调试总线命令 —— 属**本仓扩展**，上游没有对应物 | [配置手册](../user-manual/config.md)、[G-Code 命令参考](../user-manual/gcode-commands.md) |
 
 ## 2. 行为偏移（同功能，两种表现）
-
-| 项 | 上游 | 本仓 | 详情 |
-|---|---|---|---|
 | 脚本执行与错误策略 | 行协议输入下错误不中断；`run_script` 持 `gcode` mutex 串行化 | 只有"报告 + 中止整段脚本"一种策略（`need_ack` 已删）；脚本在调用任务上跑完，不再有 mutex | [klippy-runtime](klippy-runtime.md)、`src/core/klippy/gcode.rs` 模块文档 |
 | `start_args` 字段 | 上游有 `debuginput`（`-i`）与每 MCU 字典路径（`-d`） | 本仓没有 `debug_input` 字段与字典路径（不实现文件输入 / batch mode）；`debug_output` 保留（语料 harness 的文件输出开关） | [klippy-runtime](klippy-runtime.md)、[回归测试](regression-tests.md) |
 | mux 命令的"值不合法"提示 | 按 dict 迭代序取最后一个匹配候选 | 对候选排序后取第一个（消息稳定） | [模块表](README.md) |
@@ -134,6 +131,12 @@ OctoPrint 只走 pty，与本条取舍无关。
 这一节反过来：**上游没有、本仓自己加的**内容。做第三方兼容性判断时（比如「某个客户端会不会
 看到多余的东西」）要知道它们存在。
 
+| 项 | 上游 | 本仓 | 详情 |
+|---|---|---|---|
+| 身份查询命令 `get_mcu_id`（`get_canbus_id` 为别名） | 上游只有 CAN 的 `get_canbus_id`（`klippy/serialhdl.py:158-167` 在 identify 之后比对 uuid），串口/mux 侧**没有任何身份查询** | 本仓把它改名成 `get_mcu_id` 并**两个名字都声明**（CAN 与 mux 载体同一 handler、同一 `canbus_id` 应答），把同一语义扩展到**所有 id 寻址设备**；主机在 identify 拿到字典后选名（有 `get_mcu_id` 就用它，否则回退别名）。旧主机仍能问 `get_canbus_id`。只在分配后读回做一次比对：分配期扫描对「已被命名的设备沉默」这一固件行为无法区分「不在」与「已命名」，会误杀正常启动 | [串口复用协议](serial-mux-protocol.md#身份证据一条命令两个名字所有-id-寻址设备同语义2026-10-22) |
+
+
+
 ### 4.1 配置节与命令
 
 | 项 | 位置 | 干什么 | 上游对应物 |
@@ -175,9 +178,6 @@ OctoPrint 只走 pty，与本条取舍无关。
 
 这三项都是**固件**侧的东西（`third_party/klipper` 与 `third_party/katapult` 子模组）；上游既没有桥也没有
 单元格式，所以它们不存在「上游对应物」一列可写，也不属于 §3 的未实现清单——它们已经落地。
-
-| 项 | 上游 | 本仓 | 详情 |
-|---|---|---|---|
 | 桥的三个端口后端与 `BRIDGE_UART_COUNT` | 上游没有桥，也没有「一个 UART 对象该接到哪条流」这一层 | 固件里四个后端各自实现 `port_backend_open`/`port_backend_port_ops`：`src/stm32/bridge_serial.c`（总开关 `CONFIG_STM32_BRIDGE_SERIAL` 下**多选** USART1/2/3、UART4/5，勾几个就有几个口，槽序 = 选中的 USART 按编号升序）、`src/linux/bridge.c`（`KLIPPER_BRIDGE_PORT_0` 一条静态流）、`src/host/bridge.c`（每槽一路流，`KLIPPER_HOST_PORT_SLOTS` = 4）。四个后端（含 `generic/bridge_can.c`：一个 bxCAN 控制器当口，槽排在 USART 之后，`RESERVE_PINS_bridge_can`；端口型 build **不是 CAN 节点**，所以 `CANBUS` 保持 n、`CANBUS_FREQUENCY` 常量不声明，驱动由 `BRIDGE_PORT_CAN` 的 Makefile 行拉入，速率由 `config_can` 经 `canhw_set_rate` 运行期设）各自 `DECL_CONSTANT("BRIDGE_UART_COUNT", …)`（选中个数 + CAN 槽 / 1 / 4），主机据此列 `--port`——固件不再报端口表；stm32 还逐个 USART/CAN 报 `RESERVE_PINS_bridge_serial*` / `RESERVE_PINS_bridge_can`（`RX,TX`；CAN 那对由 `src/stm32/can.c` 在 `CONFIG_BRIDGE_PORT_CAN` 下声明，`generic/bridge_can.c` 不再声明——一个引脚只能有一个 owner），`admin bridge config` 的槽名就来自它。另外两件事上游也没有：**端口表只在桥的 RAM 里**（复位即空，每条命令都得重新声明），以及 `config_uart`/`config_can`/`config_bridge_port` **打开即生效、无 finalize**（`src/port.c`） | [串口复用协议](serial-mux-protocol.md)、[MCU 连接方式](../user-manual/mcu-connection.md) |
 | 口形态（UNITS/legacy）与隧道上行 | 上游的串口只有一个线格式 | 口形态是**主机每次命令的选择**（`SET_PORT_NODEID` 的 `flags` bit0 `MUX_PORT_UNITS`），不是编译期事实；隧道模式（`0x06`）与它正交。**UNITS 口也能上行隧道块**：`SET_PORT_NODEID` 无论 `flags` 都记 `node_id`，所以 `bridge_port_tunnel_up` 在两种口上都能给块加应答头（此前只在 legacy 口记 id，UNITS 口的隧道上行静默丢；2026-10-17 修） | [串口复用协议](serial-mux-protocol.md) |
 | **katapult fork 的 mux 构建**（`MUX_SERIAL`） | 上游 katapult 的串口控制台只会说裸帧，因此只能直连刷写 | 本仓的 katapult 子模组新增 `src/mux.c` / `src/mux.h` / `src/generic/mux_chipid.c`，把**引导加载程序自身**接进同一套单元：单元头、`KXID` admin 信道（`0x00`/`0x01`/`0x02`/`0x05`）、自己的帧出线时加 `reply_arb_id` 应答头（无 id 时不加）、身份 = `fasthash64(芯片 UID, 0xA16231A7)` 低 6 字节（与 klipper/CAN 同派生）。**默认 n**（`src/Kconfig`，`depends on SERIAL && HAVE_CHIPID`），帮助文本自己声明与上游 flashtool 不兼容——它只服务「经桥寻址的部署」。根构建在串口目标上把 klipper 的 `MUX_SERIAL` 同步给它（`make menuconfig`） | [串口复用协议](serial-mux-protocol.md)、[TESTING.md](../../../TESTING.md) |

@@ -26,11 +26,12 @@
 //!
 //! # Known gaps
 //!
-//! * The `query_ads131m0x` halts in `_start_measurements` / `_finish_measurements`
+//! * Upstream's `spi_transfer` `minclock`, which holds the reset
+//!   acknowledgement past `T_REGACQ`, has no counterpart in this port's
+//!   `spi_send` / `spi_transfer` pair. The halts themselves are not a gap: the
+//!   `query_ads131m0x` writes in `_start_measurements` / `_finish_measurements`
 //!   wait for the firmware's acknowledgement like upstream's `send_wait_ack`
-//!   (`Mcu::send_msg_wait_ack`); the `spi_transfer` `minclock` that holds the
-//!   reset acknowledgement past `T_REGACQ` has no counterpart in this port's
-//!   `spi_send` / `spi_transfer` pair.
+//!   (`Mcu::send_msg_wait_ack`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

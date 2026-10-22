@@ -98,35 +98,6 @@
 - [ ] **`heaters` 切到同一队列**：`heaters` 侧目前无队列化消费者（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7`
       已于 2026-10-03 切换）。
 
-### H10 运动相关 extras
-
-- [x] **同轨兄弟电机一起被该轨端停刹车（2026-10-18）**：`Rail::lookup` 把 `[stepper_z1]`/`[stepper_z2]`
-      等不带自己 `endstop_pin` 的兄弟注册进轨道端停的 `TriggerDispatch`（上游 `stepper.py:433-445`），
-      `McuTrsync::add_stepper` 改幂等（上游 `mcu.py:183-186`）。此前 Trident 的 `G28 Z` 只有
-      `stepper_z` 会立刻停，z1/z2 跑完约 50 ms 队列 ⇒ gantry 隐斜且 `set_position` 记账错误。
-
-- [x] `gcode_arcs.py`：**已落地**（2026-10-21）——`G2`/`G3` 按上游 `planArc` 分段（圆心/角度归一化、整圆、螺旋轴、最后一段取目标点），
-      `G17`/`G18`/`G19` 选平面；`R` 按上游拒绍（`does not support R moves`）、`P` 不解析、`G91` 下拒绍。
-      每段经 `gcode_move` 的 `G1` 缝发出（不自拼 trapq），因此坐标变换/`G92`/因子均生效。18 测 + `gcode_arcs.test` 在真命令下绿。
-- [x] `manual_stepper.py` **已落地**（section + 命令；**2026-10-18 补齐自有 trapq**：首次需要时装进运动队列、`MOVE=`/`G1 A…` 真出步、`SET_POSITION` 先 flush 再摆 solver）。
-      **余项**：自带回零（`STOP_ON_ENDSTOP` 仍明示拒绝——缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
-- [x] `force_move.py` **主体已落地**（2026-10-04：`FORCE_MOVE`/`STEPPER_BUZZ` + 整段 force-move 时序，motion 侧按 handle 的
-      trapq 原语；`SET_KINEMATIC_POSITION` 一直在 `toolhead`）。
-- [x] **`extruder_stepper.py` 的宿主 step 同步缝 —— 已落地（2026-10-21）**：照 `[extruder]` 的样板
-      （`take_stepper()` 交接），`ToolHead::connect` 在挤出机循环之后把每个 `[extruder_stepper]` 电机收到
-      它绑定的挤出机 trapq 上（未绑 ⇒ `set_trapq(None)`，生成器自动跳过）；运行期 `SYNC_EXTRUDER_MOTION`
-      经新增的 `ToolHeadObject::sync_stepper_to_trapq(name, trapq, position)` 重指（flush → 位置 → 队列 →
-      生成地平线一次到位），`SET_EXTRUDER_ROTATION_DISTANCE` 同步改步距。同批两处既有缺陷：
-      ① `ToolHead::set_position` 的跳过判据从「名字命中 extra_axes」改成 **`trapq_id() != Some(main_trapq)`**
-      （否则 `G28` 会把同步电机的 E=7 写成 −0.0039 ⇒ 零间隔 124 步 ⇒ `Invalid sequence`，语料 `extruders` 用例即此）；
-      ② `motion::Stepper` 的 `step_dist` 副本删掉，`step_dist()`/`mcu_position()` 直接读 `StepKinematics::step_dist`（同一状态只留一份）。
-- [x] **extra-axes 余项已于 2026-10-21 收官**：`MAX_AXES` 16、`G1_PARAMS` 补全、`reset_last_position` 尾巴——
-      唯一登记处仍是 G4-2。
-- [x] `idle_timeout.py`（批 #21：节 + `SET_IDLE_TIMEOUT` + 三个事件带载荷）、
-      `motion_report.py`（`dump_trapq`/`dump_stepper` 端点，见 **B4**）。
-      （`motion_queuing.py` ✅ 已由 `motion/queuing.rs` 落地并归档。）
-- 依赖 C1（toolhead/kinematics）；`gcode_move` 已随 G4-1 落地（见 G4 节），不再是 H10 的前置。
-
 ### H11 主机运行时与调试
 
 - [ ] **共享串口被占用时启动 panic（2026-10-22 真机旁证）**：另一个 `klipperx` 已经占着同一个 tty
@@ -139,65 +110,6 @@
       （要等窗口自己关），只能 SIGKILL。手册说的是「离开窗口就停宿主」，信号应当同样触发退出；
       现在 `request_exit` 置了旗，但 run loop 卡在 attachment 上。方向：attachment 的 await 与
       退出请求 `select`，收到请求即收窗口。
-
-- [x] **MCU 失联检测与连接期串口重试（2026-10-18）**：`mcu_clock_poll` 现在按上游判据（未答查询 > 4，`clocksync.py:156-157`）报 `Lost communication with MCU '<name>'` 并停机，每 MCU 一次、file-output 不判；独占串口的连接期打开按 5 s × 90 s 预算重试（只包打开，重试在阻塞池上跑，退出请求可打断）。
-- [x] **日志轮转与 rollover 配置块 —— 已修（2026-10-18）**：`--logfile` 现在照上游 `bglogger` 的
-      `TimedRotatingFileHandler(when='midnight', backupCount=5)` 轮转（本地午夜后第一条日志触发，
-      `klippy.log.YYYY-MM-DD`、保留 5 份），新文件开头写 `rollover_info`（`versions` + `config` 块，
-      形状照 `configfile.py:482-487`）。**修正旧断言**：上游**不是**「2 MB × 5」，全仓没有 `maxBytes`。
-- [x] **余项判定（2026-10-22 拍板：与上游保持一致，不改缺省行为）**：`--logfile` 缺省仍不落盘——
-      上游 `bglogger` 同样要求显式给，改缺省就是刻意偏离，不做；仓内不带 systemd unit 文件同理
-      （部署形态由使用者决定，本仓只提供 `klipperx` 二进制）；按天切不按大小切是上游 `TimedRotatingFileHandler`
-      的原语义，保留。刷屏会话单日文件可能很大的**缓解**写在日志手册里（`grep`/`journalctl` 用法与
-      `log_config` 的轮转说明），不在代码里加大小上限。
-- [x] **定时器回调 panic 无兜底 —— 已修（2026-10-18）**：定时器、latency notifier、运动队列的
-      flush/active 回调全部 `catch_unwind`；panic 记 `error!`（带回调名与 panic 文本）后丢弃那个定时器，
-      其余照常调度（详见 `docs/klippy/developer-manual/architecture.md`）。
-
-- [x] **`statistics.py` 的 `PrinterStats` 半 —— 已落地（2026-10-21）**：`PrinterObject` 新增
-      `stats() -> Option<(bool, String)>`（默认 `None`），新模块 `extras/printer_stats.rs` 在 `klippy:ready`
-      收集各部件、按 `Weak` 捕获装 1 Hz 定时器、`max(first)` 为真才打 `Stats <eventtime>: <key=value…>`
-      （`debugoutput` 下不装定时器，对齐上游）；`DEFAULT_MODULES` 现在是 `["idle_timeout", "printer_stats"]`。
-      `system_stats` 与 `temperature_probe` 已改为 trait 实现。
-- （`error_mcu.py` ✅ 已落地并归档：`extras/error_mcu.rs`，消费 `klippy:notify_mcu_error` /
-  `klippy:analyze_shutdown`，由 `[mcu]` 工厂 ensure。）
-- [x] **`canbus_ids` 与 CAN 节点发现——已落地（2026-10-06）**：`extras/canbus_ids.rs`（现迁移至
-      `mcu/ids.rs`，并已泛化为全接口共用的 MCU 层 id 分配器）按
-      `[mcu]` 声明顺序发号（`NODEID_FIRST = 4`、步长 1、`new_id = len(ids) + 4`），`[mcu]` 的
-      `canbus_nodeid` 因此变为**可选**（写了就用、且占号位；与自增号撞车时**装载期报错**——
-      本仓有意偏离：上游靠固件 `can_id_conflict` 兜底）；**2026-10-11 修订**：自动号已改为
-      `4` 起**最小空位**（上界 255），并改为装载时**预扫全配置**保留全部显式 `canbus_nodeid`
-      （`reserve_explicit`）——显式号写在哪个位置都生效、发号与声明顺序无关，自动号不再撞显式
-      号，装载期只在两个显式号互撞或号段占满时报错（上面的 `new_id = len(ids) + 4` 游标已不再
-      使用）；发现侧新增 `klipperx canbus-scan
-      [--interface can0] [--timeout 2]`（广播 `0x3f0/[0x00]`，收 `0x3f1` 的 `RESP_NEED_NODEID`，
-      输出可粘进配置的 uuid）——**都不写回配置文件**（与上游 pinned 版一致）。
-      **未做**：`canbus_stats.py`（总线错误计数/状态上报）；真总线上的行为未验证（见 testing.md）。
-- [x] **`SET_NODEID` 的身份校验 —— 已落地（2026-10-22）**：照上游 `serialhdl.py:129-155` 的
-      「开总线 → 发 SET_NODEID → identify → 读回 uuid 比对 → 不吻合 `disconnect()` 重来，整轮 90 s」
-      落到 `identify.rs::connect_verified`：每轮 `open()`（写 SET_NODEID）→ `Mcu::connect`（identify）→
-      读回，不吻合/无应答 ⇒ `mcu.close()` + 250 ms 间隔继续，`VERIFIED_CONNECT_BUDGET = 90 s`，且每轮
-      之间检查退出请求（关停不被 90 s 拖累）。
-      **命令名**：正名 `get_mcu_id`，`get_canbus_id` 作**别名**（固件同时声明两个名字）；主机按**字典**选名
-      （有 `get_mcu_id` 就发它，否则回退别名），两个名字共一份应答解析（`DeviceIdentity`）。两者都没声明 ⇒
-      不误拒（`NotDeclared`，兼容旧固件/独占串口）。
-      **两种可区分文案**：应答了但不是那块板 ⇒ 点名两侧 uuid；没应答 ⇒ 明说「这不能判是哪块板——可能不在线，
-      也可能仍在旧会话里」。
-      **mux 侧**：分配后同样读回比对（`mux_uuid()` + `mux_node_id()`）；**不做分配期前置扫描**——mux 固件对
-      已被命名的设备沉默，「目标 uuid 不在 discovery 答案里」无法区分「板不在」与「已命名」（主机重启常态），
-      硬报错会误杀正常启动，理由已写进源码注释与 `serial-mux-protocol.md`。
-- 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
-  离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
-
-### H12 核心工具补齐
-
-- [x] **便捷 helper 判定（2026-10-22 拍板：不实现，等上游引用更新）**：`get_heater` / `get_sensor` 在
-      语料钉定的上游 `third_party/klipper/klippy/util.py` 里**不存在**（更新版上游才有），本仓无参照可依。
-      按 AGENTS「一切对照读 `third_party/klipper`、语料是最终仲裁」：**不实现**，等子模组更新到含这两个
-      函数的版本后再评估。现有能力已足够：前缀式 `lookup_objects`、`statuses`、`get_status -> serde_json::Value`。
-- [x] **`pins.get_pin_type` 判定（2026-10-22 拍板：不实现，等上游引用更新）**：语料钉定的上游 `pins.py`
-      没有该函数；本仓以 typed 入口（`setup_digital_out`/`setup_pwm`/`setup_adc`）代替上游的
-      `setup_pin(type, desc)`，`PinType` 与 `lookup_pin` 已有。同上：等子模组更新后再评估。
 
 ## 未决问题
 

@@ -239,6 +239,14 @@ pub trait PrinterObject: Any + Send + Sync {
     }
 }
 
+/// Whether a requested exit rebuilds the machine rather than ending the process.
+///
+/// `"exit"` / `"error_exit"` end the process; these two rebuild the machine
+/// (upstream's `klippy/klippy.py:355-370`).
+pub fn is_restart(result: &str) -> bool {
+    matches!(result, "restart" | "firmware_restart")
+}
+
 /// The machine a host runs: its lifecycle, the state it reports, and the parts
 /// that can report status of their own.
 ///
@@ -249,6 +257,13 @@ pub struct Printer {
     inner: Mutex<Inner>,
     /// Paired with `inner`, to wake the run loop when an exit is requested.
     exit_requested: Condvar,
+    /// The same wakeup, for an asynchronous observer of an exit request
+    /// ([`Printer::wait_for_process_exit`]).
+    ///
+    /// A request that finds nobody waiting leaves a permit here, so a wait
+    /// started after the request is not left asleep: the two ways the host ends
+    /// a `--tui` run can arrive in either order.
+    exit_notified: tokio::sync::Notify,
     /// What status queries are dated from, and what timers are scheduled on.
     ///
     /// The machine is handed this rather than building one: a printer does not
@@ -391,6 +406,7 @@ impl Printer {
                 start_args: None,
             }),
             exit_requested: Condvar::new(),
+            exit_notified: tokio::sync::Notify::new(),
             reactor,
             objects: Mutex::new(Vec::new()),
             config_overrides: Mutex::new(HashMap::new()),
@@ -931,6 +947,10 @@ impl Printer {
     /// The `result` decides what happens once the loop ends:
     /// - `"exit"` / `"error_exit"`: the host process terminates
     /// - `"firmware_restart"`: the host starts the printer again
+    ///
+    /// Both waits on it are woken — the blocking run loop ([`Printer::run`]) and
+    /// the asynchronous one ([`Printer::wait_for_process_exit`]) — and the first
+    /// result stands, so a second request cannot change what the loop returns.
     pub fn request_exit(&self, result: &str) {
         {
             let mut inner = self.lock();
@@ -941,6 +961,38 @@ impl Printer {
         // Wake the run loop, whether or not this call is the one that set the
         // result: a second request must not find the loop asleep on it.
         self.exit_requested.notify_all();
+        // …and whatever is waiting on the request asynchronously. One permit is
+        // all a waiter needs: it re-reads the state on every wakeup.
+        self.exit_notified.notify_one();
+    }
+
+    /// Wait until an exit that ends the process is requested, and return it.
+    ///
+    /// The asynchronous observer of the condition [`Printer::run`] blocks on:
+    /// a host that is waiting for something alongside the machine — an attached
+    /// window — waits here instead, so that being asked to exit ends that wait
+    /// rather than the wait ending the host.
+    ///
+    /// A restart is a request too, and [`Printer::reset_for_restart`] clears it
+    /// again: this passes over it, so a `RESTART` rebuilds the machine and
+    /// leaves the wait running.
+    ///
+    /// A request made before the wait started is found immediately, so an exit
+    /// asked for between starting the attachment and waiting on it is not lost.
+    pub async fn wait_for_process_exit(&self) -> String {
+        loop {
+            // Interest is registered before the state is read, so a request that
+            // arrives between the two leaves a permit this wait still sees.
+            let notified = self.exit_notified.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let requested = self.lock().run_result.clone();
+            match requested {
+                Some(result) if !is_restart(&result) => return result,
+                _ => notified.await,
+            }
+        }
     }
 
     /// Whether [`Printer::request_exit`] has already been called.
@@ -1427,6 +1479,73 @@ mod tests {
         printer.request_exit("error_exit");
 
         assert_eq!(printer.run(), "error_exit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_process_exit_finds_a_request_made_before_it_waited() {
+        // The host starts the attachment and then waits; an exit asked for in
+        // between must not be lost. The request stands already, so the wait
+        // returns on its first poll and the timeout is only the bound that says
+        // so.
+        let printer = new_printer();
+        printer.request_exit("exit");
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            printer.wait_for_process_exit(),
+        )
+        .await
+        .expect("a request that already stands ends the wait at once");
+
+        assert_eq!(result, "exit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_process_exit_is_woken_by_a_later_request() {
+        // The wakeup itself, not just the state check: the wait is parked when
+        // the request arrives.
+        let printer = Arc::new(new_printer());
+        let mut waiting = {
+            let printer = Arc::clone(&printer);
+            tokio::spawn(async move { printer.wait_for_process_exit().await })
+        };
+        // Let the spawned wait reach its await before the request, so that a
+        // wait which only ever reads the state would not pass this.
+        tokio::task::yield_now().await;
+
+        printer.request_exit("error_exit");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), &mut waiting)
+            .await
+            .expect("the request wakes the wait");
+        assert_eq!(result.unwrap(), "error_exit");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_wait_for_process_exit_passes_over_a_restart() {
+        // A restart is a request too, and the run loop clears it again: what is
+        // waiting for the host to end has to stay waiting through it, or a
+        // `RESTART` would close an attached window.
+        let printer = new_printer();
+        printer.request_exit("restart");
+
+        let mut waiting = std::pin::pin!(printer.wait_for_process_exit());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(40), waiting.as_mut())
+                .await
+                .is_err(),
+            "a restart does not end the process"
+        );
+
+        // What the run loop does with the restart it took, and then the exit
+        // that really is the end.
+        printer.reset_for_restart("restart");
+        printer.request_exit("exit");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), waiting)
+            .await
+            .expect("the exit after the restart wakes the wait");
+        assert_eq!(result, "exit");
     }
 
     #[tokio::test]

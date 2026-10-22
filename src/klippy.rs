@@ -15,7 +15,7 @@ use crate::core::klippy::config::Config;
 use crate::core::klippy::extras::system_stats;
 use crate::core::klippy::interface::devices::serial;
 use crate::core::klippy::mcu::serial_ports::{SerialPorts, SERIAL_PORTS_OBJECT};
-use crate::core::klippy::printer::Printer;
+use crate::core::klippy::printer::{is_restart, Printer};
 use crate::core::klippy::reactor::TokioReactor;
 use crate::logging;
 
@@ -76,14 +76,6 @@ const RESTART_DELAY: std::time::Duration = std::time::Duration::from_millis(1000
 /// is the only periodic callback and normally takes well under a millisecond,
 /// so a round this long means something blocked the reactor.
 const LATENCY_WARNING: f64 = 0.05;
-
-/// Whether a run result asks for the printer to be built again.
-///
-/// `"exit"` / `"error_exit"` end the process; these two rebuild the machine
-/// (upstream's `klippy/klippy.py:355-370`).
-fn is_restart(result: &str) -> bool {
-    matches!(result, "restart" | "firmware_restart")
-}
 
 /// The `versions` rollover block: what a bug report needs first.
 ///
@@ -251,10 +243,64 @@ pub trait Attachment {
     /// the invocation that asked for it. The endpoint table is the host's, so an
     /// attachment that wants to talk to it can serve one end of its own pipe
     /// with it (`klippy_api::server::serve`).
-    fn run<'a>(
-        &'a mut self,
-        api: Arc<Api>,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+    ///
+    /// The host's own shutdown ends this future instead: [`Attachment::close`]
+    /// is called, and the future is then awaited to its end so that whatever it
+    /// holds — a terminal, an input loop — is given back before the process
+    /// goes. `&self` rather than `&mut self` because of that: the host keeps the
+    /// future while it closes what produced it.
+    fn run<'a>(&'a self, api: Arc<Api>) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>>;
+
+    /// Close the attachment's window: give the terminal back, leave the
+    /// alternate screen, and end the loop that reads input.
+    ///
+    /// Called when the host is asked to stop under an attachment — a `SIGTERM`,
+    /// a machine part asking for an exit — so that the window comes down rather
+    /// than being waited out. The host calls it once, and idempotence is still
+    /// the contract: a second call must do nothing more.
+    fn close(&self);
+}
+
+/// Run an attachment alongside the printer until one of them ends the run.
+///
+/// Two ways to end, and whichever comes first decides:
+///
+/// - the attachment finishes (the user quit the window): the host is done with
+///   the invocation, so the printer is asked to exit and its machine comes down;
+/// - the host is asked to stop (`SIGTERM`, a machine part calling
+///   `request_exit`): the attachment is closed and given the moment it needs to
+///   finish, rather than the host waiting on a window nobody is going to leave.
+///
+/// The second is what makes `kill` end a `--tui` host at all: the window's own
+/// loop has no reason to stop when the machine does.
+///
+/// # Errors
+/// An attachment that failed **on its own** is the run's failure. One the host
+/// closed is not: the operator asked for the exit, so what the window reports
+/// while it closes is a warning, not an error the process exits non-zero on.
+async fn run_attachment(
+    printer: &Printer,
+    attachment: &dyn Attachment,
+    api: Arc<Api>,
+) -> Result<(), String> {
+    let outcome = attachment.run(api);
+    tokio::pin!(outcome);
+    let requested = tokio::select! {
+        outcome = &mut outcome => {
+            // Asking the printer to exit is what lets its run loop return in
+            // order, rather than dropping a loop that still holds the machine.
+            printer.request_exit("exit");
+            return outcome;
+        }
+        requested = printer.wait_for_process_exit() => requested,
+    };
+
+    debug!("the host was asked to exit ({requested}); closing the attachment");
+    attachment.close();
+    if let Err(err) = outcome.await {
+        warn!("the attachment did not close cleanly: {err}");
+    }
+    Ok(())
 }
 
 /// Worker threads for a runtime whose work is other people's requests.
@@ -558,12 +604,11 @@ pub fn run(
             // Whatever is attached to this host is the user interface of the
             // invocation that asked for it, so when it is done the host is too
             // — and the host's own shutdown conditions end the attachment
-            // instead. Asking the printer to exit is what lets its run loop
-            // return in order, rather than dropping a loop that still holds the
-            // machine.
-            Some(mut attachment) => {
-                let outcome = attachment.run(Arc::clone(&api)).await;
-                printer.request_exit("exit");
+            // instead (see [`run_attachment`]). Either way an exit has been
+            // asked for by the time this returns, so the machine comes down in
+            // order.
+            Some(attachment) => {
+                let outcome = run_attachment(&printer, attachment.as_ref(), Arc::clone(&api)).await;
                 let result = machine_thread
                     .join()
                     .unwrap_or_else(|_| "error_exit".to_string());
@@ -624,6 +669,18 @@ mod tests {
     /// reported by the join below, which is what makes a `run` that dies with
     /// tokio's `Cannot drop a runtime …` fail instead of passing.
     fn start_host(args: AppArgs) -> Result<i32, String> {
+        start_host_with(args, || None)
+    }
+
+    /// The same, with something attached to the host.
+    ///
+    /// The attachment is **built on the worker thread** rather than passed in:
+    /// the host runs on a thread of its own here, and an [`Attachment`] need not
+    /// be `Send` (the real one holds a terminal).
+    fn start_host_with<F>(args: AppArgs, attachment: F) -> Result<i32, String>
+    where
+        F: FnOnce() -> Option<Box<dyn Attachment>> + Send + 'static,
+    {
         const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
 
         let _turn = STARTUP_LOCK
@@ -631,7 +688,7 @@ mod tests {
             .unwrap_or_else(|poison| poison.into_inner());
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _ = tx.send(run(args, None).map_err(|err| err.to_string()));
+            let _ = tx.send(run(args, attachment()).map_err(|err| err.to_string()));
         });
         match rx.recv_timeout(WATCHDOG) {
             Ok(outcome) => {
@@ -825,6 +882,191 @@ mod tests {
             "the refusal names the reason: {error}"
         );
         assert!(!error.contains("panicked"), "{error}");
+    }
+
+    /// How long a test gives a host to react before it calls the wait a hang.
+    ///
+    /// Every wait in these tests is bounded by it, so a host that stops
+    /// noticing its exit request fails rather than hanging the harness.
+    const ATTACHMENT_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// An attachment that records how often it was closed, and stays up until it
+    /// is — the way a window nobody has quit does.
+    ///
+    /// It reports when it has started, so that a test can ask for an exit while
+    /// the host is waiting rather than before it waits.
+    struct RecordingAttachment {
+        started: Arc<tokio::sync::Notify>,
+        closed: Arc<tokio::sync::Notify>,
+        closes: Arc<AtomicUsize>,
+        /// What `run` returns by itself; `None` runs until the host closes it.
+        outcome: Option<Result<(), String>>,
+    }
+
+    impl Attachment for RecordingAttachment {
+        fn run<'a>(
+            &'a self,
+            _api: Arc<Api>,
+        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                match &self.outcome {
+                    Some(outcome) => outcome.clone(),
+                    None => {
+                        self.closed.notified().await;
+                        Ok(())
+                    }
+                }
+            })
+        }
+
+        fn close(&self) {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            self.closed.notify_one();
+        }
+    }
+
+    /// The pieces of a [`RecordingAttachment`] a test keeps hold of: the close
+    /// count, and the signal that `run` has started.
+    fn recording_attachment(
+        outcome: Option<Result<(), String>>,
+    ) -> (
+        RecordingAttachment,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+    ) {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let closes = Arc::new(AtomicUsize::new(0));
+        let attachment = RecordingAttachment {
+            started: Arc::clone(&started),
+            closed: Arc::new(tokio::sync::Notify::new()),
+            closes: Arc::clone(&closes),
+            outcome,
+        };
+        (attachment, closes, started)
+    }
+
+    #[tokio::test]
+    async fn test_an_exit_request_closes_the_attachment_and_ends_the_wait() {
+        // What a `SIGTERM` under `--tui` has to do: the host's own exit request
+        // ends the wait the window is in, and the window is closed on the way
+        // out. Without it the host sits on a window nobody is going to leave,
+        // and `kill -TERM` did nothing at all.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (attachment, closes, started) = recording_attachment(None);
+
+        let asking = {
+            let printer = Arc::clone(&printer);
+            tokio::spawn(async move {
+                started.notified().await;
+                printer.request_exit("exit");
+            })
+        };
+        let outcome = tokio::time::timeout(
+            ATTACHMENT_WATCHDOG,
+            run_attachment(printer.as_ref(), &attachment, Arc::new(Api::new())),
+        )
+        .await
+        .expect("an exit request ends the host's wait, in bounded time");
+        asking.await.expect("the requester finished");
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(closes.load(Ordering::SeqCst), 1, "closed exactly once");
+    }
+
+    #[tokio::test]
+    async fn test_repeated_exit_requests_close_the_attachment_once() {
+        // A `SIGTERM`, then a part asking for an exit, then the signal again:
+        // the first request ends the wait and the window is closed once, not
+        // once per request.
+        let printer = Arc::new(Printer::new(ManualReactor::shared()));
+        let (attachment, closes, started) = recording_attachment(None);
+
+        let asking = {
+            let printer = Arc::clone(&printer);
+            tokio::spawn(async move {
+                started.notified().await;
+                for _ in 0..3 {
+                    printer.request_exit("exit");
+                }
+            })
+        };
+        let outcome = tokio::time::timeout(
+            ATTACHMENT_WATCHDOG,
+            run_attachment(printer.as_ref(), &attachment, Arc::new(Api::new())),
+        )
+        .await
+        .expect("the requests end the host's wait, in bounded time");
+        asking.await.expect("the requester finished");
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            1,
+            "closed once, not once per request"
+        );
+    }
+
+    #[test]
+    fn test_an_attachment_that_finishes_on_its_own_ends_the_host() {
+        // What a host with a window has always done, and what the exit-request
+        // path must not change: leaving the window is leaving the host, with a
+        // normal exit code — and an attachment that left is not "closed".
+        let config_file = write_temp_config(
+            "attachment-finished",
+            "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let args = AppArgs {
+            // No API server: the attachment is handed its own pipe.
+            api_server: String::new(),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+        let closes = Arc::new(AtomicUsize::new(0));
+
+        let outcome = start_host_with(args, {
+            let closes = Arc::clone(&closes);
+            move || {
+                Some(Box::new(RecordingAttachment {
+                    started: Arc::new(tokio::sync::Notify::new()),
+                    closed: Arc::new(tokio::sync::Notify::new()),
+                    closes,
+                    outcome: Some(Ok(())),
+                }) as Box<dyn Attachment>)
+            }
+        });
+        let _ = std::fs::remove_file(&config_file);
+
+        assert_eq!(outcome, Ok(0), "leaving the window ends the host normally");
+        assert_eq!(
+            closes.load(Ordering::SeqCst),
+            0,
+            "an attachment that finished on its own was not closed"
+        );
+    }
+
+    #[test]
+    fn test_an_attachment_that_fails_ends_the_host_with_its_error() {
+        // The window's own failure is the run's failure, as it was before the
+        // host learned to close one: a client that loses the host reports why.
+        let config_file = write_temp_config(
+            "attachment-failed",
+            "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let args = AppArgs {
+            api_server: String::new(),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+
+        let outcome = start_host_with(args, || {
+            let (attachment, _, _) = recording_attachment(Some(Err("the window broke".into())));
+            Some(Box::new(attachment) as Box<dyn Attachment>)
+        });
+        let _ = std::fs::remove_file(&config_file);
+
+        let error = outcome.expect_err("a window that failed is the run's failure");
+        assert!(error.contains("the window broke"), "{error}");
     }
 
     /// A host part that asks for a restart the first time it connects, and for

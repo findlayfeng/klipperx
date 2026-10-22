@@ -448,6 +448,16 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 ### H11 主机运行时与调试
 
+- [ ] **共享串口被占用时启动 panic（2026-10-22 真机旁证）**：另一个 `klipperx` 已经占着同一个 tty
+      时再起一个宿主，进程以 `thread 'main' panicked at … tokio/runtime/blocking/shutdown.rs:51:
+      Cannot drop a runtime in a context where blocking is not allowed` 结束，而不是一条「串口被占」
+      的干净错误。复现：`klipperx klippy <cfg>` 跑着时再起同一条命令。方向：失败路径上的 runtime
+      在 async 上下文里被 drop，改成干净的 `Err` 返回（上游 `serialhdl` 报 `Unable to open serial
+      port`）。
+- [ ] **`--tui` 下 SIGTERM 不结束宿主（2026-10-22 实测）**：`kill -TERM <pid>` 后进程仍活 ≥30 s
+      （要等窗口自己关），只能 SIGKILL。手册说的是「离开窗口就停宿主」，信号应当同样触发退出；
+      现在 `request_exit` 置了旗，但 run loop 卡在 attachment 上。方向：attachment 的 await 与
+      退出请求 `select`，收到请求即收窗口。
 
 - [x] **MCU 失联检测与连接期串口重试（2026-10-18）**：`mcu_clock_poll` 现在按上游判据（未答查询 > 4，`clocksync.py:156-157`）报 `Lost communication with MCU '<name>'` 并停机，每 MCU 一次、file-output 不判；独占串口的连接期打开按 5 s × 90 s 预算重试（只包打开，重试在阻塞池上跑，退出请求可打断）。
 - [x] **日志轮转与 rollover 配置块 —— 已修（2026-10-18）**：`--logfile` 现在照上游 `bglogger` 的

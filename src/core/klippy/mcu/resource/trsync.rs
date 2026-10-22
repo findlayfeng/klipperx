@@ -148,6 +148,10 @@ impl Completion {
     }
 
     /// How long a wait may still sleep before it gives up.
+    ///
+    /// Only the tests read it (the wait itself sleeps until the deadline and
+    /// re-reads it, see [`wait_raw`](Completion::wait_raw)).
+    #[cfg(test)]
     fn remaining(&self) -> Option<Duration> {
         self.deadline
             .lock()

@@ -1705,50 +1705,6 @@ impl MenuManager {
         }
     }
 
-    // -- the key buttons ----------------------------------------------------
-
-    /// An `analog_range_<key>` turns that key into an analog band on its pin
-    /// (`menu_keys.py:58-61`): the analog registration, not the pin query, and
-    /// the input is named in `query_adc` (`buttons.py:113-114`).
-    #[test]
-    fn test_an_analog_key_registers_an_adc_button() {
-        let printer = load(
-            "up_pin: PA0\nanalog_range_up_pin: 100, 1000\nanalog_pullup_resistor: 4700\n",
-            "",
-        );
-        let buttons = printer
-            .lookup_object_as::<PrinterButtons>(
-                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
-            )
-            .expect("the menu registers its keys through buttons");
-        assert_eq!(buttons.registered_adc_pins(), vec!["PA0".to_string()]);
-        assert_eq!(
-            buttons.registration_count(),
-            0,
-            "an analog key is not a pin query"
-        );
-        let query_adc = printer
-            .lookup_object_as::<crate::core::klippy::extras::query_adc::QueryAdc>(
-                crate::core::klippy::extras::query_adc::QUERY_ADC_OBJECT,
-            )
-            .expect("buttons loaded query_adc");
-        assert_eq!(query_adc.names(), vec!["adc_button:PA0".to_string()]);
-    }
-
-    /// A key without an `analog_range_*` stays a digital pin query
-    /// (`menu_keys.py:50-57`).
-    #[test]
-    fn test_a_key_without_an_analog_range_is_a_digital_button() {
-        let printer = load("up_pin: PA0\n", "");
-        let buttons = printer
-            .lookup_object_as::<PrinterButtons>(
-                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
-            )
-            .expect("the menu registers its keys through buttons");
-        assert_eq!(buttons.registered_pins(), vec![vec!["PA0".to_string()]]);
-        assert_eq!(buttons.adc_registration_count(), 0);
-    }
-
     // -- navigation ---------------------------------------------------------
 
     /// `up` (`menu.py:848-860`), or a `dec_value` on an input being edited.
@@ -2384,6 +2340,50 @@ mod tests {
 
     /// A click opens the menu; the arrows move the selection; a click on a
     /// container opens it, on a command runs it, on `..` steps back out.
+    // -- the key buttons ----------------------------------------------------
+
+    /// An `analog_range_<key>` turns that key into an analog band on its pin
+    /// (`menu_keys.py:58-61`): the analog registration, not the pin query, and
+    /// the input is named in `query_adc` (`buttons.py:113-114`).
+    #[test]
+    fn test_an_analog_key_registers_an_adc_button() {
+        let printer = load(
+            "up_pin: PA0\nanalog_range_up_pin: 100, 1000\nanalog_pullup_resistor: 4700\n",
+            "",
+        );
+        let buttons = printer
+            .lookup_object_as::<PrinterButtons>(
+                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
+            )
+            .expect("the menu registers its keys through buttons");
+        assert_eq!(buttons.registered_adc_pins(), vec!["PA0".to_string()]);
+        assert_eq!(
+            buttons.registration_count(),
+            0,
+            "an analog key is not a pin query"
+        );
+        let query_adc = printer
+            .lookup_object_as::<crate::core::klippy::extras::query_adc::QueryAdc>(
+                crate::core::klippy::extras::query_adc::QUERY_ADC_OBJECT,
+            )
+            .expect("buttons loaded query_adc");
+        assert_eq!(query_adc.names(), vec!["adc_button:PA0".to_string()]);
+    }
+
+    /// A key without an `analog_range_*` stays a digital pin query
+    /// (`menu_keys.py:50-57`).
+    #[test]
+    fn test_a_key_without_an_analog_range_is_a_digital_button() {
+        let printer = load("up_pin: PA0\n", "");
+        let buttons = printer
+            .lookup_object_as::<PrinterButtons>(
+                crate::core::klippy::extras::buttons::BUTTONS_OBJECT,
+            )
+            .expect("the menu registers its keys through buttons");
+        assert_eq!(buttons.registered_pins(), vec![vec!["PA0".to_string()]]);
+        assert_eq!(buttons.adc_registration_count(), 0);
+    }
+
     #[test]
     fn test_the_keys_open_move_and_press() {
         let printer = load("menu_root: __test\n", TEST_TREE);

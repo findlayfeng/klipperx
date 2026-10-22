@@ -583,6 +583,7 @@ mod tests {
                 "display_template",
                 "dotstar",
                 "i2c_device",
+                "icm20948",
                 "led",
                 "load_cell",
                 "load_cell_probe",

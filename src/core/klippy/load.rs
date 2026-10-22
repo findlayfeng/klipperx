@@ -578,6 +578,7 @@ mod tests {
                 "static_pwm_clock",
                 "ad5206",
                 "adxl345",
+                "angle",
                 "bmi160",
                 "dac084S085",
                 "display_template",

@@ -48,6 +48,10 @@ use crate::core::klippy::config::{AccessTracking, ConfigSection, ConfigWrapper};
 use crate::core::klippy::error::{ConfigError, KlippyError};
 use crate::core::klippy::event::stats::{register_stats, LastStats};
 use crate::core::klippy::event::{IsShutdown, KlippyEvent, McuEvent, Shutdown, Starting};
+use crate::core::klippy::identify::{
+    connect_verified, verify_identity, IdentityFailure, IDENTITY_QUERY_TIMEOUT,
+    VERIFIED_CONNECT_BUDGET,
+};
 use crate::core::klippy::interface::{HostMux, Interface};
 use crate::core::klippy::mcu::{
     BuiltConfig, ConfigBuilder, Configured, Dictionary, I2cMode, Mcu, McuChip, McuError, McuI2c,
@@ -288,6 +292,43 @@ pub struct McuObject {
     /// printer's registry owns this object: a strong handle would be a cycle
     /// that keeps the printer (and its device) alive forever.
     printer: Weak<Printer>,
+}
+
+/// What the identity readback asks of a transport, and what a wrong answer
+/// costs.
+///
+/// The transport decides it, because the cost is the transport's: re-naming a
+/// board means writing `SET_NODEID` again, and only a link that can be
+/// reopened without disturbing anything else may do that.
+enum IdentityDemand {
+    /// Nothing to ask: an exclusive tty addresses its one board by its wire, and
+    /// a bare host library is that file's own device.
+    None,
+    /// A CAN link: `SET_NODEID` goes out when the link opens, so a fresh open is
+    /// what names the board again — upstream's round (`serialhdl.py:129-155`).
+    Can([u8; 6]),
+    /// A mux carrier — a shared serial port, or a host library reached through a
+    /// mux: the port is opened **once** for every MCU on it, so tearing it down
+    /// to re-name one board would disturb the others. The mismatch is reported
+    /// after the readback's own retries instead.
+    Mux([u8; 6]),
+}
+
+/// Which identity, if any, the board behind `config`'s transport has to
+/// confirm.
+fn identity_demand(config: &McuConfig) -> IdentityDemand {
+    match &config.transport {
+        Transport::Can { uuid, .. } | Transport::CanFd { uuid, .. } => IdentityDemand::Can(*uuid),
+        // A `uuid:` on an exclusive port is ignored (`Transport::open` sends no
+        // assignment frame on one), so only a shared port has a board to confirm.
+        Transport::Serial {
+            uuid: Some(uuid), ..
+        } if config.shared_baud.is_some() => IdentityDemand::Mux(*uuid),
+        Transport::Host {
+            uuid: Some(uuid), ..
+        } if config.host_mux.is_some() => IdentityDemand::Mux(*uuid),
+        _ => IdentityDemand::None,
+    }
 }
 
 impl McuObject {
@@ -959,6 +1000,118 @@ impl McuObject {
         .map_err(KlippyError::Connection)
     }
 
+    /// Open `config`'s transport, identify the firmware, and confirm the board
+    /// behind it is the one the configuration names.
+    ///
+    /// An id-addressed transport is **named**, not identified: the node id is
+    /// written to whichever board takes it, so a board that already answers on
+    /// that id — or one whose uuid the host has never seen — would be talked to
+    /// as if it were the configured one. The firmware says which board it is in
+    /// its `get_mcu_id` reply (upstream's `get_canbus_id`, `serialhdl.py:143`),
+    /// and that is what the readback compares (`mcu/identify.rs`).
+    ///
+    /// What a wrong answer costs is the transport's own business
+    /// ([`IdentityDemand`]): a CAN link is reopened per round (`SET_NODEID` is
+    /// what re-names the board), while a mux carrier is opened once for every MCU
+    /// on it and reports the mismatch after the query retries.
+    ///
+    /// # Errors
+    /// [`KlippyError::Connection`] for a port that will not open, a handshake
+    /// that fails, and a board that is not the configured one.
+    async fn connect_transport(
+        &self,
+        config: &McuConfig,
+        retrying: bool,
+    ) -> Result<Arc<Mcu>, KlippyError> {
+        match identity_demand(config) {
+            IdentityDemand::Can(uuid) => self
+                .connect_can(config, retrying, uuid)
+                .await
+                .map_err(|err| KlippyError::Connection(format!("MCU '{}': {err}", config.name))),
+            IdentityDemand::Mux(uuid) => {
+                let interface = self.open_interface(config, retrying).await?;
+                let mcu = Mcu::connect(&config.name, interface)
+                    .await
+                    .map_err(|err| KlippyError::Connection(err.to_string()))?;
+                match verify_identity(&mcu, uuid, IDENTITY_QUERY_TIMEOUT).await {
+                    Ok(found) => {
+                        info!(
+                            "MCU '{}': node {} answered as uuid {}",
+                            config.name,
+                            found.node_id,
+                            found.uuid_hex()
+                        );
+                        Ok(mcu)
+                    }
+                    // A firmware built before the command existed has no
+                    // identity to give; the id it took cannot be confirmed, and
+                    // refusing it would strand a working board.
+                    Err(IdentityFailure::NotDeclared) => {
+                        warn!(
+                            "MCU '{}': the firmware declares no identity command, so the node id \
+                             it took cannot be confirmed",
+                            config.name
+                        );
+                        Ok(mcu)
+                    }
+                    Err(failure) => {
+                        mcu.close();
+                        Err(KlippyError::Connection(format!(
+                            "MCU '{}': {failure}",
+                            config.name
+                        )))
+                    }
+                }
+            }
+            IdentityDemand::None => {
+                let interface = self.open_interface(config, retrying).await?;
+                Mcu::connect(&config.name, interface)
+                    .await
+                    .map_err(|err| KlippyError::Connection(err.to_string()))
+            }
+        }
+    }
+
+    /// Open `config`'s CAN link and confirm the board behind it is `uuid`,
+    /// reopening the link per round until the budget runs out.
+    ///
+    /// The round is upstream's (`klippy/serialhdl.py:129-155`): open the bus,
+    /// which writes `SET_NODEID`, identify, ask for the uuid, and start over when
+    /// the answer is another board or no answer comes. The whole loop is bounded
+    /// by [`VERIFIED_CONNECT_BUDGET`] and by an exit request, which is what keeps
+    /// a shutdown from sitting out the window.
+    ///
+    /// # Errors
+    /// The [`VerifiedConnectError`](crate::core::klippy::identify::VerifiedConnectError)
+    /// text, without the MCU name: both callers compose their own sentence.
+    async fn connect_can(
+        &self,
+        config: &McuConfig,
+        retrying: bool,
+        uuid: [u8; 6],
+    ) -> Result<Arc<Mcu>, String> {
+        let printer = self.printer.clone();
+        connect_verified(
+            &config.name,
+            || {
+                Box::pin(async move {
+                    self.open_interface(config, retrying)
+                        .await
+                        .map_err(|err| err.to_string())
+                })
+            },
+            || {
+                printer
+                    .upgrade()
+                    .is_none_or(|printer| printer.exit_requested())
+            },
+            uuid,
+            tokio::time::Instant::now() + VERIFIED_CONNECT_BUDGET,
+        )
+        .await
+        .map_err(|err| err.to_string())
+    }
+
     /// Open the port and identify the firmware, retrying while a rebooted board
     /// comes back.
     ///
@@ -974,7 +1127,22 @@ impl McuObject {
     /// [`RECONNECT_DELAY`] suggests. An exit request is therefore polled after
     /// every sleep — the same test `open_interface(config, true)` gives its own
     /// retry — and ends the loop with a failure that says so.
+    ///
+    /// A CAN board is the one exception: [`connect_verified`] below **is** that
+    /// loop for it — every round reopens the link, which is what writes
+    /// `SET_NODEID` again — and it runs under a single 90 s window
+    /// ([`VERIFIED_CONNECT_BUDGET`]). Running it inside the rounds here would
+    /// multiply that window by [`RECONNECT_ATTEMPTS`].
     async fn open_and_connect(&self, config: &McuConfig) -> Result<Arc<Mcu>, KlippyError> {
+        if let IdentityDemand::Can(uuid) = identity_demand(config) {
+            return match self.connect_can(config, false, uuid).await {
+                Ok(mcu) => Ok(mcu),
+                Err(last) => Err(KlippyError::Connection(format!(
+                    "MCU '{}' did not come back after a reset: {last}",
+                    config.name
+                ))),
+            };
+        }
         let mut last = String::new();
         let mut aborted = false;
         for _ in 0..RECONNECT_ATTEMPTS {
@@ -987,14 +1155,7 @@ impl McuObject {
                 aborted = true;
                 break;
             }
-            let interface = match self.open_interface(config, false).await {
-                Ok(interface) => interface,
-                Err(err) => {
-                    last = err.to_string();
-                    continue;
-                }
-            };
-            match Mcu::connect(&config.name, interface).await {
+            match self.connect_transport(config, false).await {
                 Ok(mcu) => return Ok(mcu),
                 Err(err) => last = err.to_string(),
             }
@@ -1810,17 +1971,13 @@ impl PrinterObject for McuObject {
                     }
                 }
             } else {
-                let interface = match self.open_interface(&config, true).await {
-                    Ok(interface) => interface,
-                    Err(err) => return Err(self.recover_lost_child_port(&config, err).await),
-                };
-                match Mcu::connect(&config.name, interface).await {
+                match self.connect_transport(&config, true).await {
                     Ok(mcu) => mcu,
                     Err(err) => {
                         if usb_reset {
                             self.usb_reset_unusable(&config, &err.to_string());
                         }
-                        let err = self.connect_failure(KlippyError::Connection(err.to_string()));
+                        let err = self.connect_failure(err);
                         return Err(self.recover_lost_child_port(&config, err).await);
                     }
                 }

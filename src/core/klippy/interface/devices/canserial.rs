@@ -123,9 +123,11 @@ const SEND_TIMEOUT: Duration = Duration::from_millis(100);
 /// A CAN device adopts `SET_NODEID` **in silence** (`generic/canserial.c`,
 /// `can_process_set_klipper_nodeid`: it arms its filter and says nothing), so
 /// there is no answer to wait for here, and nothing this open can read the id
-/// back with: `get_canbus_id` — the command that names the uuid — is a
-/// dictionary message, and the dictionary is what `identify` delivers long after
-/// this open ([`CanSerialDevice::open_with_wire`]). What is left is to make a
+/// back with: `get_mcu_id` — the command that names the uuid, declared as
+/// `get_canbus_id` too so a host that predates the rename still gets an answer
+/// — is a dictionary message, and the dictionary is what `identify` delivers
+/// long after this open ([`CanSerialDevice::open_with_wire`], and
+/// `mcu/identify.rs` for the readback itself). What is left is to make a
 /// frame lost on a busy bus recoverable: the assignment is idempotent (same
 /// uuid, same id), so it goes out [`NODEID_ASSIGN_ATTEMPTS`] times,
 /// [`NODEID_ASSIGN_INTERVAL`] apart — under a second in all, the same retry
@@ -708,8 +710,9 @@ impl CanSerialDevice {
     /// [`NODEID_ASSIGN_ATTEMPTS`] times and this returns once one of them has
     /// been written. Whether the node is up — and whether it is *this* uuid's
     /// board — is the identify handshake's to establish: the readback that names
-    /// the uuid (`get_canbus_id`) is a dictionary message, and the dictionary is
-    /// what identify delivers after this open.
+    /// the uuid (`get_mcu_id`, or `get_canbus_id` on a firmware built before the
+    /// rename) is a dictionary message, and the dictionary is what identify
+    /// delivers after this open.
     ///
     /// # Errors
     /// Returns [`InterfaceError`] when the node id is outside `1..=MAX_MCU_ID`

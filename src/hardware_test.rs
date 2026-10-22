@@ -275,7 +275,11 @@
 //! [`HW_STRICT_ENV`]. Strict mode also fails a config that names an object this
 //! repository does not implement ([`NOT_IMPLEMENTED_SECTIONS`], the deferred
 //! `upstream-deviations.md` §1.2 modules), because no case here could run
-//! against it. A config that is there and names a device which then
+//! against it. Both kinds of mismatch are **one** failure, not two: a config
+//! that is short a declaration *and* names a deferred module lists everything in
+//! the same panic ([`strict_failure`]), because the premise is that the config is
+//! what it should be, and every way it is not is worth seeing at once rather
+//! than one per run. A config that is there and names a device which then
 //! refuses to open is a real failure too: it was there to run.
 //!
 //! # Serialised on the board
@@ -582,6 +586,57 @@ fn named_config(path: Option<&Path>) -> String {
         || HW_CONFIG_ENV.to_string(),
         |path| format!("{HW_CONFIG_ENV} ({})", path.display()),
     )
+}
+
+/// The message strict mode fails a parsed config with: **every** way it is not
+/// what the test needs, in one line — the items `requires` did not find, and the
+/// deferred modules it names ([`NOT_IMPLEMENTED_SECTIONS`]).
+///
+/// One message rather than one failure per run: a config that is short a
+/// declaration *and* names a §1.2 module would otherwise take two runs to
+/// straighten out, and the premise of the mode is that the config is already
+/// what it should be, so seeing all of it at once is the useful answer. A class
+/// that is empty contributes no clause; the escape hatch always ends the line.
+fn strict_failure(
+    test_name: &str,
+    path: Option<&Path>,
+    missing: &[Missing],
+    deferred: &[String],
+) -> String {
+    let mut reasons = Vec::new();
+    if !missing.is_empty() {
+        let items: Vec<String> = missing.iter().map(ToString::to_string).collect();
+        reasons.push(format!(
+            "does not provide what this test needs: {}",
+            items.join(", ")
+        ));
+    }
+    if !deferred.is_empty() {
+        reasons.push(format!(
+            "names objects this repository does not implement: {} (the modules \
+             `upstream-deviations.md` §1.2 defers, so no case here can run against \
+             this config)",
+            deferred.join(", ")
+        ));
+    }
+    format!(
+        "{test_name}: {} {}. The config was named, so this is a failure rather than \
+         a skip; set {HW_STRICT_ENV}=0 to skip instead",
+        named_config(path),
+        reasons.join("; ")
+    )
+}
+
+/// The §1.2 sections the config at `path` names, for the strict failure that has
+/// to list them next to the missing items.
+///
+/// [`Decision::Missing`] does not carry the parsed config, so the file is read
+/// once more here — on a path that is about to fail, which is the only caller. A
+/// read that fails now adds nothing: [`decide`] read the same file a moment ago,
+/// and its own message is the one about an unreadable config.
+fn deferred_sections(path: Option<&Path>) -> Vec<String> {
+    path.and_then(|path| load(path).ok())
+        .map_or_else(Vec::new, |config| not_implemented_sections(&config))
 }
 
 /// What [`acquire`] makes of the configured file, before anything is printed.
@@ -1229,11 +1284,14 @@ pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
 /// the path and the strictness as arguments so the branches can be exercised
 /// without setting a variable (which no test can do without racing the others).
 ///
-/// Under `strict`, two things fail that would otherwise run or skip: a config
-/// that does not provide `requires`, and a config that names an object this
-/// repository does not implement ([`NOT_IMPLEMENTED_SECTIONS`]). Both are the
-/// same premise — the config was named, so it is the machine this test was meant
-/// to run against — and both point at [`HW_STRICT_ENV`] for the way out.
+/// Under `strict`, one failure covers both things that would otherwise run or
+/// skip: a config that does not provide `requires`, and a config that names an
+/// object this repository does not implement ([`NOT_IMPLEMENTED_SECTIONS`]).
+/// Both are the same premise — the config was named, so it is the machine this
+/// test was meant to run against — and a config with both mismatches reports
+/// both at once ([`strict_failure`]), pointing at [`HW_STRICT_ENV`] for the way
+/// out. A config that does not parse is still reported as such, and first: it
+/// has no section table to ask about anything else.
 fn acquire_at(
     path: Option<&Path>,
     test_name: &str,
@@ -1260,22 +1318,14 @@ fn acquire_at(
             panic!("{test_name}: {HW_CONFIG_ENV} is set but its config cannot be used: {reason}")
         }
         Decision::Missing(missing) => {
-            let reasons: Vec<String> = missing.iter().map(ToString::to_string).collect();
-            let reasons = reasons.join(", ");
             if strict {
-                // Same premise as the unreadable case, one step further in: the
-                // config was named and it parsed, so this test was meant to run
-                // against this machine and the config is simply short of what
-                // it declared. Skipping would hide that — a green run would say
-                // the hardware was tested when the test never ran.
-                let named = named_config(path);
                 panic!(
-                    "{test_name}: {named} does not provide what this test needs: {reasons}. \
-                     The config was named, so this is a failure rather than a skip; \
-                     set {HW_STRICT_ENV}=0 to skip instead"
+                    "{}",
+                    strict_failure(test_name, path, &missing, &deferred_sections(path))
                 );
             }
-            println!("HW-IGNORED: {test_name}: {reasons}");
+            let reasons: Vec<String> = missing.iter().map(ToString::to_string).collect();
+            println!("HW-IGNORED: {test_name}: {}", reasons.join(", "));
             None
         }
         Decision::Ready { path, config } => {
@@ -1284,16 +1334,16 @@ fn acquire_at(
             // honestly test against: the host would refuse it at start-up, so
             // the case would fail deep in `bring_up` for a reason that has
             // nothing to do with the module under test. Say so up front, under
-            // the same strictness as an unmet `Requires`.
+            // the same strictness as an unmet `Requires`, and in the same
+            // message: a config can be short of a declaration *and* name a
+            // deferred module, and both are one answer to "is this config what
+            // it should be?".
             if strict {
                 let unimplemented = not_implemented_sections(&config);
                 if !unimplemented.is_empty() {
                     panic!(
-                        "{test_name}: {} names objects this repository does not implement: {}. \
-                         These are the modules `upstream-deviations.md` §1.2 defers, so no case \
-                         here can run against this config; set {HW_STRICT_ENV}=0 to skip instead",
-                        named_config(Some(&path)),
-                        unimplemented.join(", "),
+                        "{}",
+                        strict_failure(test_name, Some(&path), &[], &unimplemented)
                     );
                 }
             }
@@ -2641,6 +2691,110 @@ mod tests {
         assert!(
             message.contains("set KLIPPERX_HW_STRICT=0 to skip instead"),
             "the escape hatch is spelled out: {message}"
+        );
+    }
+
+    /// One failure, not two: a config that is short a declaration **and** names a
+    /// deferred module fails strict mode, so the case does not run.
+    #[test]
+    #[should_panic(expected = "palette2")]
+    fn test_a_short_config_that_also_names_a_deferred_module_fails_strict_mode() {
+        let fixture =
+            TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n[palette2]\nuart: /dev/ttyAMA0\n");
+        let unmet = Requires::new().section("stepper_x");
+
+        let _ = acquire_at(Some(fixture.path()), "self-test", &unmet, true);
+    }
+
+    /// And that one message carries **both** halves: the declaration the test did
+    /// not find and the deferred module the config names, so one edit cycle fixes
+    /// everything one run reported instead of two runs finding one each.
+    /// `#[should_panic(expected = …)]` pins a single fragment, so this case takes
+    /// the payload instead.
+    #[test]
+    fn test_a_short_config_that_also_names_a_deferred_module_reports_both_at_once() {
+        let fixture =
+            TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n[palette2]\nuart: /dev/ttyAMA0\n");
+        let unmet = Requires::new().section("stepper_x");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &unmet, true)
+        })) {
+            Ok(machine) => panic!(
+                "strict mode must fail a config that is both short and deferred, not hand out {:?}",
+                machine.is_some()
+            ),
+            Err(payload) => payload,
+        };
+
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("does not provide what this test needs: missing [stepper_x]"),
+            "the declaration the config is short of is named: {message}"
+        );
+        assert!(
+            message.contains("names objects this repository does not implement: palette2"),
+            "so is the deferred module it names: {message}"
+        );
+        assert!(
+            message.contains("set KLIPPERX_HW_STRICT=0 to skip instead"),
+            "the escape hatch is spelled out: {message}"
+        );
+    }
+
+    /// A config with only missing declarations says nothing about deferred
+    /// modules: an empty class contributes no clause.
+    #[test]
+    fn test_a_strict_failure_over_missing_items_alone_says_nothing_about_deferred_ones() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n");
+        let unmet = Requires::new().section("stepper_x");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &unmet, true)
+        })) {
+            Ok(machine) => panic!(
+                "strict mode must fail, not hand out {:?}",
+                machine.is_some()
+            ),
+            Err(payload) => payload,
+        };
+
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("does not provide what this test needs: missing [stepper_x]"),
+            "the missing item is named: {message}"
+        );
+        assert!(
+            !message.contains("does not implement"),
+            "no deferred module was found, so that clause stays out: {message}"
+        );
+    }
+
+    /// And the mirror: a config that provides everything the test asked for and
+    /// names a deferred module says nothing about missing declarations.
+    #[test]
+    fn test_a_strict_failure_over_deferred_modules_alone_says_nothing_about_missing_ones() {
+        let fixture =
+            TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n[palette2]\nuart: /dev/ttyAMA0\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new(), true)
+        })) {
+            Ok(machine) => panic!(
+                "strict mode must fail, not hand out {:?}",
+                machine.is_some()
+            ),
+            Err(payload) => payload,
+        };
+
+        let message = panic_text(payload.as_ref());
+        assert!(
+            message.contains("names objects this repository does not implement: palette2"),
+            "the deferred module is named: {message}"
+        );
+        assert!(
+            !message.contains("does not provide"),
+            "nothing was declared missing, so that clause stays out: {message}"
         );
     }
 

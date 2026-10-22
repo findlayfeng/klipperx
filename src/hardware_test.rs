@@ -333,6 +333,18 @@ pub const HW_CONFIG_ENV: &str = "KLIPPERX_HW_CONFIG";
 /// tests it cannot run should merely be reported — `HW-IGNORED: …` and pass.
 pub const HW_STRICT_ENV: &str = "KLIPPERX_HW_STRICT";
 
+/// The config sections whose upstream objects this repository does not
+/// implement.
+///
+/// The three deferred modules of
+/// `docs/klippy/developer-manual/upstream-deviations.md` §1.2 (decided
+/// 2026-10-22): each is bound to specific upstream hardware or a specific
+/// runtime, so nothing here can be verified against a board and the code is not
+/// written. A config that names one is not a config this mode can test — the
+/// host would refuse it at start-up — so strict mode fails the case rather than
+/// run against a config whose objects are missing.
+const NOT_IMPLEMENTED_SECTIONS: &[&str] = &["samd_sercom", "replicape", "palette2"];
+
 /// How long [`Machine::bring_up`] gives the machine to connect every part.
 ///
 /// The host itself has no such bound — a board that is slow to answer identify
@@ -543,6 +555,29 @@ fn push_unique(missing: &mut Vec<Missing>, item: Missing) {
     if !missing.contains(&item) {
         missing.push(item);
     }
+}
+
+/// The sections of `config` whose objects this repository does not implement,
+/// in the config's own order.
+///
+/// Read off the parsed section table rather than by grepping the file: a
+/// commented-out header is absent, and an `[include …]`d one is present, exactly
+/// as for every other question this module asks of a config.
+fn not_implemented_sections(config: &Config) -> Vec<String> {
+    config
+        .sections()
+        .map(ConfigSection::identifier)
+        .filter(|identifier| NOT_IMPLEMENTED_SECTIONS.contains(&identifier.as_str()))
+        .collect()
+}
+
+/// How a strict-mode panic names the config it is about: `[`HW_CONFIG_ENV`]
+/// with the path it holds.
+fn named_config(path: Option<&Path>) -> String {
+    path.map_or_else(
+        || HW_CONFIG_ENV.to_string(),
+        |path| format!("{HW_CONFIG_ENV} ({})", path.display()),
+    )
 }
 
 /// What [`acquire`] makes of the configured file, before anything is printed.
@@ -1173,10 +1208,11 @@ fn strict_from(value: Option<&str>) -> bool {
 /// # Panics
 /// When the variable is set but names a config that cannot be used (missing
 /// file, parser error), when it names a config that does not provide `requires`
-/// and strict mode is on (the default; see [`HW_STRICT_ENV`] for the escape
-/// hatch), or when the board cannot be locked: the variable said the machine had
-/// a config to test against, so "there was nothing to test" is a failure, not a
-/// skip.
+/// **or** that names an object this repository does not implement
+/// ([`NOT_IMPLEMENTED_SECTIONS`]) while strict mode is on (the default; see
+/// [`HW_STRICT_ENV`] for the escape hatch), or when the board cannot be locked:
+/// the variable said the machine had a config to test against, so "there was
+/// nothing to test" is a failure, not a skip.
 pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
     let path = std::env::var(HW_CONFIG_ENV).ok();
     let strict = strict_from(std::env::var(HW_STRICT_ENV).ok().as_deref());
@@ -1188,6 +1224,12 @@ pub fn acquire(test_name: &str, requires: &Requires) -> Option<Machine> {
 /// The environment reads are `acquire`'s alone; this is the rest of it, taking
 /// the path and the strictness as arguments so the branches can be exercised
 /// without setting a variable (which no test can do without racing the others).
+///
+/// Under `strict`, two things fail that would otherwise run or skip: a config
+/// that does not provide `requires`, and a config that names an object this
+/// repository does not implement ([`NOT_IMPLEMENTED_SECTIONS`]). Both are the
+/// same premise — the config was named, so it is the machine this test was meant
+/// to run against — and both point at [`HW_STRICT_ENV`] for the way out.
 fn acquire_at(
     path: Option<&Path>,
     test_name: &str,
@@ -1222,10 +1264,7 @@ fn acquire_at(
                 // against this machine and the config is simply short of what
                 // it declared. Skipping would hide that — a green run would say
                 // the hardware was tested when the test never ran.
-                let named = path.map_or_else(
-                    || HW_CONFIG_ENV.to_string(),
-                    |path| format!("{HW_CONFIG_ENV} ({})", path.display()),
-                );
+                let named = named_config(path);
                 panic!(
                     "{test_name}: {named} does not provide what this test needs: {reasons}. \
                      The config was named, so this is a failure rather than a skip; \
@@ -1236,6 +1275,24 @@ fn acquire_at(
             None
         }
         Decision::Ready { path, config } => {
+            // The config provides what this test asked for — but an object the
+            // repository does not implement makes it a config this mode cannot
+            // honestly test against: the host would refuse it at start-up, so
+            // the case would fail deep in `bring_up` for a reason that has
+            // nothing to do with the module under test. Say so up front, under
+            // the same strictness as an unmet `Requires`.
+            if strict {
+                let unimplemented = not_implemented_sections(&config);
+                if !unimplemented.is_empty() {
+                    panic!(
+                        "{test_name}: {} names objects this repository does not implement: {}. \
+                         These are the modules `upstream-deviations.md` §1.2 defers, so no case \
+                         here can run against this config; set {HW_STRICT_ENV}=0 to skip instead",
+                        named_config(Some(&path)),
+                        unimplemented.join(", "),
+                    );
+                }
+            }
             // Take the lock **before** the test runs: the board can only carry
             // one session, so a test that is about to run must own it. A config
             // that parsed a moment ago but cannot be opened for locking is the
@@ -2532,6 +2589,90 @@ mod tests {
         ] {
             assert!(!strict_from(value), "{value:?} turns strict mode off");
         }
+    }
+
+    /// A config that names an object the repository does not implement is a
+    /// **failure** under strict mode: no case here can run against it (the host
+    /// would refuse it at start-up), and the run must say so instead of failing
+    /// later inside a case for an unrelated-looking reason.
+    #[test]
+    #[should_panic(expected = "palette2")]
+    fn test_a_not_implemented_section_fails_the_case_under_strict_mode() {
+        let fixture = TempConfig::new("[palette2]\nuart: /dev/ttyAMA0\n");
+
+        let _ = acquire_at(Some(fixture.path()), "self-test", &Requires::new(), true);
+    }
+
+    /// And it carries what the reader needs to act: the test, the config, the
+    /// sections it found, what they are, and the escape hatch.
+    #[test]
+    fn test_a_not_implemented_section_is_named_with_its_config_and_the_way_out() {
+        let fixture =
+            TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n[replicape]\n[palette2]\nha: 5\n");
+
+        let payload = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new(), true)
+        })) {
+            Ok(machine) => panic!(
+                "strict mode must fail a not-implemented section, not hand out {:?}",
+                machine.is_some()
+            ),
+            Err(payload) => payload,
+        };
+
+        let message = panic_text(payload.as_ref());
+        assert!(message.contains("self-test"), "{message}");
+        assert!(
+            message.contains(&fixture.path().display().to_string()),
+            "the message names the config: {message}"
+        );
+        assert!(
+            message.contains("replicape, palette2"),
+            "every section found is listed, in config order: {message}"
+        );
+        assert!(
+            message.contains("§1.2 defers"),
+            "the message says what these are: {message}"
+        );
+        assert!(
+            message.contains("set KLIPPERX_HW_STRICT=0 to skip instead"),
+            "the escape hatch is spelled out: {message}"
+        );
+    }
+
+    /// The other half: strict off adds nothing for these sections. Such a config
+    /// is handed out as before, and an unmet [`Requires`] is still `HW-IGNORED`
+    /// — the check is strict mode's, not a new rule of its own.
+    #[test]
+    fn test_a_not_implemented_section_is_not_a_failure_when_strict_is_off() {
+        let fixture = TempConfig::new("[mcu]\nserial: /dev/ttyACM0\n[palette2]\nha: 5\n");
+
+        assert!(
+            acquire_at(Some(fixture.path()), "self-test", &Requires::new(), false).is_some(),
+            "strict off: the section alone does not stop the test"
+        );
+        assert!(
+            acquire_at(
+                Some(fixture.path()),
+                "self-test",
+                &Requires::new().section("stepper_x"),
+                false,
+            )
+            .is_none(),
+            "strict off: an unmet requirement is still the skip it was"
+        );
+    }
+
+    /// The deferred list is pinned: it is the three modules of
+    /// `upstream-deviations.md` §1.2 and nothing else, so a silent addition or
+    /// removal cannot ride along with another change.
+    #[test]
+    fn test_the_not_implemented_list_is_the_three_deferred_modules() {
+        assert_eq!(
+            NOT_IMPLEMENTED_SECTIONS,
+            &["samd_sercom", "replicape", "palette2"],
+            "the list is §1.2's three deferred modules"
+        );
     }
 
     /// `KLIPPERX_HW_CONFIG` set to a config that does not parse is a **failure**,

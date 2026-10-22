@@ -220,6 +220,14 @@ impl SerialPorts {
     pub fn effective_baud(&self, path: &str) -> Option<u32> {
         self.by_path.get(path).map(|group| group.baud)
     }
+
+    /// Every `serial:` path the config names, each once, in path order.
+    ///
+    /// The start-up walks this to check the ports before it serves anything
+    /// (`klippy::run`); the grouping's own users ask about one path at a time.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.by_path.keys().map(String::as_str)
+    }
 }
 
 impl PrinterObject for SerialPorts {

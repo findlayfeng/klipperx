@@ -1024,10 +1024,14 @@ mod tests {
             .await
             .expect("the session runs");
 
-        // The declaration is 3 pairs of commands and the port half 2 units, so
-        // both are in hand once the tunnel is on the wire.
+        // The port half is three admin units — the target's reset, its naming and
+        // its tunnel — and the tunnel is the last of them, so seeing all **three**
+        // is what "the port half is on the wire" means. Waiting for two was not:
+        // the predicate fires as soon as it holds, and a run under load returned
+        // with the first two in hand and the tunnel still unread, which the
+        // assertion below then reported as a missing message.
         let units = read_units(&pty.master, Duration::from_secs(2), |units| {
-            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 2
+            units.iter().filter(|(arb, _)| *arb == ADMIN_LISTEN).count() >= 3
         });
         let parser = mux_parser();
         let observed: Vec<Step> = steps(&parser, &units)

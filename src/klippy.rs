@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -12,6 +13,8 @@ use crate::core::klippy::api::{
 use crate::core::klippy::config::build_config_string;
 use crate::core::klippy::config::Config;
 use crate::core::klippy::extras::system_stats;
+use crate::core::klippy::interface::devices::serial;
+use crate::core::klippy::mcu::serial_ports::{SerialPorts, SERIAL_PORTS_OBJECT};
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
 use crate::logging;
@@ -348,6 +351,17 @@ pub fn run(
     // Two workers for the machine, not more: the device's blocking reads run on
     // the blocking pool (see `Interface`), so the workers only carry the
     // reactor dispatcher, the MCU send and receive tasks, and bring-up/restart.
+    //
+    // The runtime is **owned here, by `run`'s own frame**, and everything below
+    // reaches it through [`machine_handle`]: dropping a runtime inside an
+    // asynchronous context panics (`Cannot drop a runtime in a context where
+    // blocking is not allowed`), so a start-up that fails — a serial port
+    // another process holds, an API address already bound — must be able to
+    // return `Err` from the block below without the runtime's last reference
+    // being one the block owns. The driver thread therefore borrows the handle
+    // rather than taking the runtime (`Handle::block_on` drives the same
+    // runtime; only `Runtime::block_on` on a *current-thread* runtime would
+    // have to own it).
     let machine_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("klippy-mcu")
@@ -431,6 +445,27 @@ pub fn run(
             }
         }
 
+        // A `serial:` port another program is holding cannot be opened, and no
+        // `RESTART` of this host frees it — the connect below would report it as
+        // the printer's `error` state, i.e. a host serving a machine that never
+        // came up. The ports are therefore checked here, after the loader has
+        // grouped them ([`SerialPorts`]) and before any transport opens, before
+        // the API is registered and before the listener is bound, so the run ends
+        // with the reason (upstream's `Unable to open serial port: …`,
+        // `klippy/serialhdl.py:199`) and a non-zero exit instead.
+        //
+        // The check names the port, so it is asked per path rather than for the
+        // config as a whole; a path that is merely not there yet is not a
+        // failure here (the connect-time open owns that wait).
+        let serial_paths: Vec<String> = printer
+            .lookup_object_as::<SerialPorts>(SERIAL_PORTS_OBJECT)
+            .map(|ports| ports.paths().map(str::to_string).collect())
+            .unwrap_or_default();
+        for path in serial_paths {
+            serial::check_held_by_another_process(Path::new(&path))
+                .map_err(|err| format!("Unable to open serial port: {err}"))?;
+        }
+
         // The API table comes after the config, so that the mux endpoints the
         // modules registered on `webhooks` are part of it before any client can
         // send a request. Everything is registered before the listener is
@@ -505,6 +540,10 @@ pub fn run(
         // `block_on` cannot be nested, so the API runtime cannot drive it. Its
         // driver thread parks in `block_on` for the whole run, which is fine —
         // the machine's tasks run on that runtime's workers, not on this thread.
+        //
+        // The thread drives the runtime through the handle, not by owning it:
+        // see where the runtime is built. A `?` on this spawn failing must not be
+        // able to hand the runtime to this block's drop glue.
         let machine_printer = Arc::clone(&printer);
         // The run loop re-reads this file on every restart, so it is handed the
         // path rather than the parse above.
@@ -512,7 +551,7 @@ pub fn run(
         let machine_thread = std::thread::Builder::new()
             .name("klippy-machine".into())
             .spawn(move || {
-                machine_runtime.block_on(klippy_process(machine_printer, machine_config_file))
+                machine_handle.block_on(klippy_process(machine_printer, machine_config_file))
             })?;
 
         let exit_code = match attachment {
@@ -562,11 +601,49 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::printer::{ConnectFuture, PrinterObject, PrinterState};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, Weak};
+
+    /// One host at a time, for the tests that start a whole [`run`].
+    ///
+    /// They release the shared asset tree before anything else
+    /// (`assets::release`), and its staging directory is named after the
+    /// **process**, so two of them in one test process would write over each
+    /// other.
+    static STARTUP_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run [`run`] on a thread of its own and return what it decided.
+    ///
+    /// `run` blocks for as long as a host runs, so the wait is bounded: a
+    /// start-up that never comes back fails the test rather than hanging it.
+    /// A panic is that same failure — it disconnects the sender here and is
+    /// reported by the join below, which is what makes a `run` that dies with
+    /// tokio's `Cannot drop a runtime …` fail instead of passing.
+    fn start_host(args: AppArgs) -> Result<i32, String> {
+        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+        let _turn = STARTUP_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run(args, None).map_err(|err| err.to_string()));
+        });
+        match rx.recv_timeout(WATCHDOG) {
+            Ok(outcome) => {
+                worker.join().expect("the start-up must not panic");
+                outcome
+            }
+            Err(err) => {
+                worker.join().expect("the start-up must not panic");
+                panic!("the start-up did not return: {err}");
+            }
+        }
+    }
 
     /// Write a config file for one test and return its path.
     ///
@@ -662,6 +739,92 @@ mod tests {
         assert_eq!(exit_code("error_exit"), -1);
         assert_eq!(exit_code("exit"), 0);
         assert_eq!(exit_code("restart"), 0);
+    }
+
+    /// A start-up that fails returns the error, and does not drop a runtime on
+    /// the way out.
+    ///
+    /// [`run`] serves from an `api_runtime` block and builds the machine's own
+    /// runtime before it; a failure that leaves that block early (here: the API
+    /// address is already bound, which is what a second host started without
+    /// `-a` hits) used to drop the machine runtime **inside** the asynchronous
+    /// block, and tokio panicked with `Cannot drop a runtime in a context where
+    /// blocking is not allowed` — the real reason was lost behind that panic.
+    /// The runtime now belongs to `run`'s own frame, so the early return is an
+    /// ordinary `Err`; the config names no MCU, so no board is needed and the
+    /// bind is the only thing that can fail.
+    #[test]
+    fn test_a_startup_failure_returns_the_error_instead_of_dropping_a_runtime() {
+        // Somebody else on the port the host is told to serve.
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = holder.local_addr().expect("the bound address").port();
+        let config_file = write_temp_config(
+            "startup-bind-failure",
+            "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let args = AppArgs {
+            api_server: format!("tcp:127.0.0.1:{port}"),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+
+        let outcome = start_host(args);
+        let _ = std::fs::remove_file(&config_file);
+
+        let error = outcome.expect_err("a port that is already bound is a start-up failure");
+        assert!(error.contains("cannot bind tcp"), "{error}");
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+        drop(holder);
+    }
+
+    /// A tty another process holds ends the start-up with the reason, instead of
+    /// a host serving a machine that never came up.
+    ///
+    /// The holder is a `SerialDevice` of this test: a pty is a real tty, and the
+    /// `flock` a second klipperx finds on the same path is the one its open
+    /// takes. Before the start-up asked, a second host opened the same tty and
+    /// sat in `error` state after the identify timeout — the "busy port" was
+    /// never named — and a start-up that failed earlier still panicked on the
+    /// way out (see the bind case above).
+    #[test]
+    fn test_a_serial_port_someone_holds_ends_the_startup_with_the_reason() {
+        let pty = Pty::new();
+        let held = serial::SerialDevice::open(&pty.path, serial::DEFAULT_BAUD)
+            .expect("the test takes the port the way another host would");
+        let config_file = write_temp_config(
+            "serial-port-held",
+            &format!(
+                "[mcu]\nserial: {}\n\n[printer]\nkinematics: none\nmax_velocity: 300\n\
+                 max_accel: 3000\n",
+                pty.path.display()
+            ),
+        );
+        let args = AppArgs {
+            // No API server: the port check is what is under test, and an empty
+            // target keeps a listener out of the picture.
+            api_server: String::new(),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+
+        let outcome = start_host(args);
+        let _ = std::fs::remove_file(&config_file);
+        drop(held);
+
+        let error = outcome.expect_err("a port another process holds is a start-up failure");
+        assert!(
+            error.starts_with("Unable to open serial port: "),
+            "the refusal opens with upstream's wording: {error}"
+        );
+        assert!(
+            error.contains(&pty.path.display().to_string()),
+            "the refusal names the port: {error}"
+        );
+        assert!(
+            error.contains("already open in another process"),
+            "the refusal names the reason: {error}"
+        );
+        assert!(!error.contains("panicked"), "{error}");
     }
 
     /// A host part that asks for a restart the first time it connects, and for

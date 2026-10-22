@@ -33,9 +33,6 @@
 //!   error from the batch helper's start callback, so the failure is logged and
 //!   the stream stays down — same "the chip did not answer as expected" signal,
 //!   without taking the host with it.
-//! * `_finish_measurements` upstream waits for the firmware's ack
-//!   (`send_wait_ack`); this port sends the same `query_ads1220 … rest_ticks=0`
-//!   without waiting, as the other bulk sensors here do.
 //!
 //! # Known gaps
 //!

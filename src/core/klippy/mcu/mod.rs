@@ -1977,19 +1977,19 @@ impl Mcu {
         let board_for_recv = board.clone();
         let send_handle = handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
-            // What the two gates hold back: messages not released yet, and
-            // flush barriers queued behind them (`Parked`).
+            // What the two gates hold back: messages not released yet, plus the
+            // flush barriers and ack waits queued behind them (`Parked`).
             let mut parked: VecDeque<Parked> = VecDeque::new();
             let gates_open = Arc::clone(&gates_open_for_task);
             'outer: loop {
+                // Set when this batch carries a message whose block the caller
+                // waits to see acknowledged (`Mcu::send_wait_ack`).
+                let mut carried_ack: Option<oneshot::Sender<()>> = None;
                 // Wait for the first message the gates release — or for the
                 // firmware's counter to move, which is what asks for a block to
                 // go out again. A flush with nothing queued before it is
                 // already satisfied; a flush behind parked messages waits with
                 // them.
-                // Set when this batch carries a message whose block the caller
-                // waits to see acknowledged (`Mcu::send_wait_ack`).
-                let mut carried_ack: Option<oneshot::Sender<()>> = None;
                 let mut payload = loop {
                     if let Some(first) = take_released(
                         &mut parked,
@@ -5343,6 +5343,117 @@ mod tests {
             recorder.frames().is_empty(),
             "nothing reached the transport"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_wait_ack: the firmware's acknowledgement of the block
+    // -----------------------------------------------------------------------
+
+    /// The commands the two `send_wait_ack` tests use: one message each, so a
+    /// block's bytes name the message that is in it.
+    fn ack_test_mcu(interface: Interface) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", interface);
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5, "get_uptime": 6}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+        mcu
+    }
+
+    /// [`Mcu::send_wait_ack`] returns once the firmware has taken the block, and
+    /// the command goes out behind what was queued before it, in a block of its
+    /// own — the ack it waits for is that block's and no older one's.
+    #[tokio::test]
+    async fn test_send_wait_ack_returns_when_the_firmware_takes_the_block() {
+        let wire = RecordingWire::new();
+        let handle = wire.clone();
+        let sent = handle.sent();
+        let mcu = ack_test_mcu(Interface::recording(wire));
+
+        // A plain send first: the ack waits for the block carrying *it*, so the
+        // two messages must not end up in one frame and the first must go out
+        // first.
+        mcu.send("get_uptime", &[]).expect("the command queues");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_clock", &[], Duration::from_millis(500)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect("the wire acks every block");
+
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || sent.lock().unwrap().len() == 2,
+            "both messages reach the wire, in two blocks",
+        )
+        .await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![vec![6], vec![5]],
+            "the queued message first, the acked one in its own block behind it"
+        );
+    }
+
+    /// A firmware that never acknowledges the block reports a bounded timeout,
+    /// and the send path is still usable afterwards: the abandoned wait leaves
+    /// nothing behind in the queue.
+    #[tokio::test]
+    async fn test_send_wait_ack_times_out_and_a_later_send_still_goes() {
+        let wire = RecordingWire::new();
+        let handle = wire.clone();
+        let sent = handle.sent();
+        let mcu = ack_test_mcu(Interface::recording(wire));
+
+        handle.silence_acks();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_clock", &[], Duration::from_millis(100)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect_err("no ack ever comes back");
+        assert!(
+            matches!(error, McuError::Call(McuCallError::Timeout(_))),
+            "reports the timeout: {error}"
+        );
+
+        // The block did reach the wire — the timeout says nothing was
+        // acknowledged, not that nothing was sent. The unanswered block is
+        // retransmitted while it waits, so the record may hold it more than once.
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|payload| *payload == vec![5]),
+            "only the unanswered block went out: {:?}",
+            sent.lock().unwrap()
+        );
+        assert!(!sent.lock().unwrap().is_empty());
+
+        // The connection still works: the next wait is answered as usual.
+        handle.resume_acks();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_uptime", &[], Duration::from_secs(2)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect("the firmware answers again");
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|payload| *payload == vec![6])
+            },
+            "the second message reaches the wire too",
+        )
+        .await;
     }
 
     /// A retransmit the transport refuses keeps its block: the firmware is still

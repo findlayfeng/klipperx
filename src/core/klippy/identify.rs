@@ -535,6 +535,9 @@ pub enum IdentityFailure {
     /// and a firmware built before the command existed has no identity to give.
     NotDeclared,
     /// The query went unanswered (or failed): nothing said which board it is.
+    ///
+    /// Silence is **not** evidence of a wrong board: a device can be absent, on
+    /// another link, or still answering on an earlier session.
     NoAnswer(String),
     /// The board answered, and it is not the one the configuration names.
     Mismatch {
@@ -555,7 +558,9 @@ impl std::fmt::Display for IdentityFailure {
             ),
             Self::NoAnswer(last) => write!(
                 f,
-                "no answer to the identity query '{IDENTITY_COMMAND}' ({last})"
+                "no answer to the identity query '{IDENTITY_COMMAND}' ({last}), so nothing said \
+                 which board is there: it may not be on the link, or it may still be answering \
+                 on an earlier session"
             ),
             Self::Mismatch { expected, found } => write!(
                 f,
@@ -678,7 +683,8 @@ impl std::fmt::Display for VerifiedConnectError {
             Self::NoAnswer(last) => write!(
                 f,
                 "no board answered its identity query within the {VERIFIED_CONNECT_BUDGET:?} \
-                 connect window ({last})"
+                 connect window ({last}): that is not a verdict on which board is wired, since a \
+                 board can be absent or still answering on an earlier session"
             ),
             Self::Aborted(last) => write!(
                 f,
@@ -1934,6 +1940,11 @@ mod tests {
         assert!(
             text.contains("no board answered its identity query"),
             "{text}"
+        );
+        assert!(
+            text.contains("earlier session") && text.contains("may not be on the link"),
+            "silence says nothing about which board is wired: it may be absent or still in an \
+             earlier session: {text}"
         );
         assert!(
             !text.contains("but the configuration names"),

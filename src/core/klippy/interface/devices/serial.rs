@@ -1195,6 +1195,29 @@ mod tests {
 // [`shared::resource_for`]; everything here is serial wire logic. The wire
 // format is specified in the developer manual's *serial-mux-protocol* page, and
 // the grouping that decides exclusive vs. shared is `mcu/serial_ports.rs`.
+//
+// # Why the assignment is not preceded by a discovery scan
+//
+// The uuid a shared port's section writes could in principle be confirmed
+// **before** the id is written: ask the port who is unassigned
+// (`serial_query_unassigned`) and check that the board the config names is among
+// the answers. It is deliberately not done here, and the reason is the firmware's
+// own behaviour. A device that already has a node id stays **silent** on the
+// discovery broadcast (`third_party/klipper/src/mux.c`, `mux_admin_unit`:
+// `if (mux_assigned) return;`), and a device whose identity does not match an
+// assignment ignores it without a word (the `memcmp` against `mux_identity` in the
+// same function). So "the uuid we want did not answer the scan" cannot be told
+// apart from the ordinary, healthy case of a host that restarted against a board
+// that is still named from the previous session — and a check that fires on the
+// commonest benign situation is not a check.
+//
+// What *does* say which board took the id is the firmware's own identity command
+// (`get_mcu_id`, `mux.c`'s `command_get_mcu_id`), asked **after** the session is
+// up, because `identify` is what delivers the dictionary that declares it:
+// `McuObject::connect_transport` (`mcu/object.rs`) compares the uuid it reports
+// with the configured one and names both sides when they differ
+// (`mcu/identify.rs`). One identity readback, at one point, of the board that is
+// actually answering on the assigned id.
 
 pub const ASSIGN_ATTACH_TIMEOUT: Duration = Duration::from_millis(500);
 

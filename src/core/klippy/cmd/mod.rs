@@ -78,6 +78,7 @@ pub mod i2c;
 pub mod icm20948;
 pub mod identify;
 pub mod ldc1612;
+pub mod lis2dw;
 pub mod mpu9250;
 pub mod pwm;
 pub mod shutdown;
@@ -105,6 +106,10 @@ pub use icm20948::{ConfigIcm20948, QueryIcm20948, QUERY_ICM20948_STATUS};
 pub use ldc1612::{
     ConfigLdc1612, ConfigLdc1612WithIntb, Ldc1612AttachTriggerAnalog, QueryLdc1612,
     QueryStatusLdc1612, SensorBulkData, SensorBulkStatus,
+};
+pub use lis2dw::{
+    ConfigLis2dw, LisBusType, LisChipType, QueryLis2dw, QueryLis2dwStatus,
+    QUERY_LIS2DW_STATUS_MSGFORMAT,
 };
 pub use mpu9250::{ConfigMpu9250, QueryMpu9250, QUERY_MPU9250_STATUS};
 pub use pwm::{ConfigPwmOut, QueuePwmOut};

@@ -585,6 +585,7 @@ mod tests {
                 "i2c_device",
                 "icm20948",
                 "led",
+                "lis2dw",
                 "load_cell",
                 "load_cell_probe",
                 "mcp4018",
@@ -599,6 +600,7 @@ mod tests {
                 "tmc2240",
                 "tmc2660",
                 "tmc5160",
+                "lis3dh",
                 // The display framework, after the `display_template` registry
                 // it reads (40) and before the bus consumers (50), with the two
                 // layout sections it assembles (`display_data`/`display_glyph`)

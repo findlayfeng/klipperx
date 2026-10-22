@@ -36,7 +36,7 @@
 //! | `register_remote_method` | done ([`register_remote_method`]) |
 //! | `pause_resume/{pause,resume,cancel}` | done ([`pause_resume`]) |
 //! | `bed_mesh/dump_mesh` | done ([`bed_mesh_dump`]) |
-//! | the `*/dump_*` mux endpoints | mechanism ready ([`WebhooksStatus::register_mux_endpoint`](super::webhooks::WebhooksStatus::register_mux_endpoint); instances are re-registered per config load and detached on the way out); `ldc1612` / `adxl345` / `mpu9250` / `load_cell` consumed; the rest arrive with their extras |
+//! | the `*/dump_*` mux endpoints | mechanism ready ([`WebhooksStatus::register_mux_endpoint`](super::webhooks::WebhooksStatus::register_mux_endpoint); instances are re-registered per config load and detached on the way out); `ldc1612` / `adxl345` / `mpu9250` / `lis2dw` / `load_cell` consumed; the rest arrive with their extras |
 
 /// Declare that this module installs its endpoints. Expands to nothing;
 /// `build.rs` scans it and lists the named function in the generated table.

@@ -475,6 +475,7 @@ impl Printer {
 | 禁止阻塞 | `assert_no_pause()` 强制 | 沿用 `reactor` 回调约定，不强制校验 |
 | 未知事件 | 静默忽略 | 记录警告 |
 | 错误事件 | `klippy:notify_mcu_error` 在 MCU 错误路径发出 | 已接入 `bring_up` 中 MCU 连接失败路径 |
+| 处理器执行顺序 | 按注册序（即配置序）执行 | 同样按注册序；但 `klippy:shutdown` 的 MCU 处理器体不各停各的，而是**统一走一遍对象表、按载体链深度降序**停（`stop_all_mcus`/`shutdown_walk`，`mcu/object.rs`）——桥下游的设备只经桥的链路才够得着固件，所以顺序是拓扑的，不是配置文件的 |
 
 禁止阻塞一项不引入强制机制：`reactor` 已对回调约定「不等待、不做重活」，重复引入运行时
 校验的收益有限，且 `catch_unwind` 已覆盖处理器崩溃这一主要风险。本页列到的偏移统一登记在

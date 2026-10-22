@@ -190,6 +190,14 @@ pub struct McuObject {
     /// back by `connect`, exactly as [`McuObject::id`] is: it is what tells the
     /// transport layer to open the shared port instead of a private device.
     shared_baud: Mutex<Option<u32>>,
+    /// The `[mcu]` whose link this one's frames travel, when it hangs on a
+    /// bridge downstream port, or `None` for a board with a link of its own.
+    ///
+    /// Stamped at load from the port section's `uart_mcu`/`can_mcu`
+    /// (`mcu/bridge_ports.rs`), and read back by the shutdown fan-out
+    /// ([`McuShutdownOrder`]), which needs it to stop a board behind a bridge
+    /// **before** the bridge that carries it.
+    carrier: Mutex<Option<String>>,
     /// What this MCU's `host_library:` path attaches with when the config calls
     /// it muxed, or `None` for a path that is not muxed (and for every other
     /// transport).
@@ -358,6 +366,7 @@ impl McuObject {
             status: Mutex::new(json!({})),
             id: Mutex::new(None),
             shared_baud: Mutex::new(None),
+            carrier: Mutex::new(None),
             host_mux: Mutex::new(None),
             host_port_paths: Mutex::new(Vec::new()),
             restart_method: Mutex::new(McuRestartMethod::Command),
@@ -390,6 +399,23 @@ impl McuObject {
     /// Record the id the loader assigned this `[mcu]` (`mcu/ids.rs`).
     pub fn set_id(&self, id: u32) {
         *self.id.lock().unwrap_or_else(|poison| poison.into_inner()) = Some(id);
+    }
+
+    /// The `[mcu]` this one's frames travel through, if it does not carry its
+    /// own link (see [`McuObject::carrier`]).
+    pub fn carrier(&self) -> Option<String> {
+        self.carrier
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Record the `[mcu]` whose link this one hangs off (`load_config`).
+    pub fn set_carrier(&self, carrier: Option<String>) {
+        *self
+            .carrier
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = carrier;
     }
 
     /// The baud this MCU shares its serial port at, if it is on a shared one.
@@ -2375,25 +2401,28 @@ pub fn load_config(
     if matches!(parsed.transport, Transport::BridgePort { .. }) {
         port_grouping::ensure(printer, config)?;
     }
+    // Which `[mcu]`'s link this one's frames travel, when it hangs on a bridge
+    // downstream port: the port section's own `uart_mcu`/`can_mcu`
+    // (`mcu/bridge_ports.rs`). Read from the raw option text like every
+    // pre-scan here, so it records no access. A board with a link of its own —
+    // a tty, a host library, a CAN interface — carries no carrier.
+    let carrier = match &parsed.transport {
+        Transport::BridgePort { port, kind, .. } => carrier_of_port(config, port, *kind),
+        _ => None,
+    };
+    object.set_carrier(carrier);
     // Keep the parse for `connect`: the load-time stamps are part of what the
     // connection will use, so they are covered back onto it here too.
     parsed.id = Some(id);
     parsed.shared_baud = shared_baud;
     parsed.host_mux = host_mux;
     object.set_parsed_config(parsed);
-    // A host shutdown stops the firmware too (upstream registers the same
-    // handler in `MCU.__init__`, `klippy/mcu.py:800`). Registered here
-    // rather than in `connect` because the handler is `'static` and needs a
-    // handle to the object the registry owns; a `Weak` avoids keeping it alive.
-    let weak = Arc::downgrade(&object);
-    printer.register_event_handler(
-        KlippyEvent::KlippyShutdown,
-        Box::new(move |_| {
-            if let Some(object) = weak.upgrade() {
-                object.on_host_shutdown();
-            }
-        }),
-    );
+    // A host shutdown stops the firmware too (upstream registers a handler in
+    // `MCU.__init__`, `klippy/mcu.py:800`). Every `[mcu]` registers the same
+    // one, and it stops all of them in the order the tunnel needs — a board on
+    // a bridge port only reaches the wire through its bridge, so it goes first
+    // (`stop_all_mcus`).
+    register_shutdown_handler(printer);
     Ok(object)
 }
 
@@ -2407,6 +2436,130 @@ pub fn load_config_prefix(
     printer: &Arc<Printer>,
 ) -> Result<Arc<dyn PrinterObject>, ConfigError> {
     load_config(config, printer)
+}
+
+// ===========================================================================
+// Shutdown order
+// ===========================================================================
+
+/// Stop every MCU this host shutdown has, deepest-first.
+///
+/// A device on a bridge downstream port only reaches the wire **through** its
+/// bridge: the host writes its messages as frames the bridge forwards onto the
+/// port, and what comes back travels the same link. Stopping the bridge first
+/// therefore hands the order's safety to the bridge's own build — it works only
+/// while the mux layer keeps forwarding after the firmware has stopped, which
+/// is below the firmware's command gate today (`src/mux.c` routes on the serial
+/// path, and `src/command.c:357` gates only command handlers) but is not a
+/// promise this host may lean on. Walking them deepest-first is what makes the
+/// order the tunnel's own instead: a board behind a bridge is stopped while its
+/// carrier is still forwarding, whatever the carrier does about being stopped
+/// afterwards.
+///
+/// [`McuObject::on_host_shutdown`] sends at most one stop per board, so every
+/// `[mcu]` may register this same handler and the later ones are no-ops — which
+/// is how upstream gets a stop to each of its MCUs too (`klippy/mcu.py:800`,
+/// one handler per MCU; there it needs no order, each owning a link of its own).
+///
+/// The order is all this fixes. Both boards were reached either way on the bench
+/// (F446 bridge + CAN downstream, `M112`, 2026-10-22: `[mcu]` and `[downstream]`
+/// both received `emergency_stop` and both reported `shutdown`, before and
+/// after) — so this is a fix for the invariant, not a repair of a stop that was
+/// going missing.
+fn stop_all_mcus(printer: &Arc<Printer>) {
+    for mcu in shutdown_walk(printer) {
+        mcu.on_host_shutdown();
+    }
+}
+
+/// Put the host-shutdown fan-out on `printer` — called by `load_config`, once
+/// per `[mcu]` section, and harmless to call again: the walk stops each board
+/// at most once (`McuObject::on_host_shutdown`).
+fn register_shutdown_handler(printer: &Arc<Printer>) {
+    let weak_printer = Arc::downgrade(printer);
+    printer.register_event_handler(
+        KlippyEvent::KlippyShutdown,
+        Box::new(move |_| {
+            if let Some(printer) = weak_printer.upgrade() {
+                stop_all_mcus(&printer);
+            }
+        }),
+    );
+}
+
+/// The boards [`stop_all_mcus`] walks, in the order it walks them.
+///
+/// The walk reads the printer's own object table rather than a registry beside
+/// it: a board that is not in the table is not connected, so it has nothing to
+/// stop, and an order kept apart from the table could go stale against it.
+fn shutdown_walk(printer: &Printer) -> Vec<Arc<McuObject>> {
+    let mcus: Vec<Arc<McuObject>> = printer
+        .objects()
+        .iter()
+        .filter_map(|name| printer.lookup_object_as::<McuObject>(name))
+        .collect();
+    let carriers: HashMap<String, Option<String>> = mcus
+        .iter()
+        .map(|mcu| (mcu.name().to_string(), mcu.carrier()))
+        .collect();
+    let mut ordered: Vec<(u32, Arc<McuObject>)> = mcus
+        .into_iter()
+        .map(|mcu| (depth(&carriers, mcu.name()), mcu))
+        .collect();
+    // Deepest first. `sort_by` is stable, so boards at one depth keep the order
+    // the config loaded them in.
+    ordered.sort_by(|a, b| b.0.cmp(&a.0));
+    ordered.into_iter().map(|(_, mcu)| mcu).collect()
+}
+
+/// The names [`shutdown_walk`] visits, for a test to pin the order without a
+/// wire to watch.
+#[cfg(test)]
+fn shutdown_walk_order(printer: &Printer) -> Vec<String> {
+    shutdown_walk(printer)
+        .into_iter()
+        .map(|mcu| mcu.name().to_string())
+        .collect()
+}
+
+/// How many carriers `name` stands on, following `carriers` at most once each.
+fn depth(carriers: &HashMap<String, Option<String>>, name: &str) -> u32 {
+    let mut seen: Vec<String> = vec![name.to_string()];
+    let mut depth = 0;
+    let mut next = name.to_string();
+    while let Some(Some(carrier)) = carriers.get(&next).cloned() {
+        if seen.contains(&carrier) {
+            // A loop in the config's own references. Stop here rather than walk
+            // it: the boards involved still get their stop, which is the point.
+            break;
+        }
+        seen.push(carrier.clone());
+        depth += 1;
+        next = carrier;
+    }
+    depth
+}
+
+/// The `[mcu]` a bridge port sits on: its section's `uart_mcu`/`can_mcu`.
+///
+/// Read from the raw option text, like every pre-scan here
+/// (`section().get_text`, never a tracked getter), so it records no access and
+/// does not exempt an option from `check_unused` on its own account. A port
+/// section the config never declares, or one that names no `*_mcu`, is the port
+/// factory's own error to report (`mcu/bridge_ports.rs`); here it is simply no
+/// carrier.
+fn carrier_of_port(config: &ConfigWrapper, port: &str, kind: PortKind) -> Option<String> {
+    let (prefix, option) = match kind {
+        PortKind::Uart => ("uart_device", "uart_mcu"),
+        PortKind::Can => ("can_device", "can_mcu"),
+    };
+    config
+        .sibling_prefix_sections(prefix)
+        .into_iter()
+        .find(|section| section.identifier() == port)
+        .and_then(|section| section.section().get_text(option))
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
 }
 
 // ===========================================================================
@@ -2443,6 +2596,14 @@ mod tests {
             .add_object(PINS_OBJECT, Arc::new(PrinterPins::new()))
             .unwrap();
         printer
+    }
+
+    /// Put an MCU in the printer's object table, the way the loader does — the
+    /// table is what the shutdown walk reads (`shutdown_walk`).
+    fn put_mcu(printer: &Arc<Printer>, mcu: &Arc<McuObject>) {
+        printer
+            .add_object(mcu.name(), Arc::clone(mcu) as Arc<dyn PrinterObject>)
+            .unwrap();
     }
 
     /// An MCU attached to `object`'s chip, with `reset` in its dictionary.
@@ -3114,6 +3275,113 @@ mod tests {
         mcu.flush(Duration::from_secs(1)).await.unwrap();
 
         assert_eq!(recorder.frames().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_the_shutdown_walk_stops_the_board_behind_a_bridge_first() {
+        // The order is the tunnel's own: a device on a bridge port only reaches
+        // the wire through its bridge, so it has to be told to stop while the
+        // bridge is still forwarding. Two bridges deep is the case neither end
+        // could special-case, and the walk is what covers it.
+        let printer = printer();
+        let bridge = Arc::new(McuObject::new(section(None), &printer).unwrap());
+        let downstream = Arc::new(McuObject::new(section(Some("downstream")), &printer).unwrap());
+        let far = Arc::new(McuObject::new(section(Some("far")), &printer).unwrap());
+        downstream.set_carrier(Some(bridge.name().to_string()));
+        far.set_carrier(Some(downstream.name().to_string()));
+        put_mcu(&printer, &bridge);
+        put_mcu(&printer, &downstream);
+        put_mcu(&printer, &far);
+
+        assert_eq!(
+            shutdown_walk_order(&printer),
+            vec![
+                far.name().to_string(),
+                downstream.name().to_string(),
+                bridge.name().to_string()
+            ],
+            "the board behind two bridges stops before both of them"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_host_shutdown_stops_every_registered_mcu() {
+        // One handler walks them now, so the first thing to pin is that it
+        // still reaches every board: a fan-out that missed one would leave it
+        // running queued work with the host gone.
+        let printer = printer();
+        let bridge = Arc::new(McuObject::new(section(None), &printer).unwrap());
+        let downstream = Arc::new(McuObject::new(section(Some("downstream")), &printer).unwrap());
+        downstream.set_carrier(Some(bridge.name().to_string()));
+        put_mcu(&printer, &bridge);
+        put_mcu(&printer, &downstream);
+        register_shutdown_handler(&printer);
+
+        let (bridge_mcu, bridge_wire) = attached_with_estop(&bridge, estop_mapping());
+        let (downstream_mcu, downstream_wire) = attached_with_estop(&downstream, estop_mapping());
+
+        printer.send_event(&KlippyEvent::KlippyShutdown);
+        bridge_mcu.flush(Duration::from_secs(1)).await.unwrap();
+        downstream_mcu.flush(Duration::from_secs(1)).await.unwrap();
+
+        assert_eq!(
+            downstream_wire.frames().len(),
+            1,
+            "the downstream was stopped"
+        );
+        assert_eq!(bridge_wire.frames().len(), 1, "the bridge was stopped");
+    }
+
+    #[tokio::test]
+    async fn test_a_carrier_chain_that_loops_still_walks_every_board() {
+        // A config whose two ports name each other's MCU cannot be walked to
+        // the bottom. It still gets its stops, rather than a machine that
+        // hangs in its own shutdown.
+        let printer = printer();
+        let a = Arc::new(McuObject::new(section(None), &printer).unwrap());
+        let b = Arc::new(McuObject::new(section(Some("b")), &printer).unwrap());
+        a.set_carrier(Some(b.name().to_string()));
+        b.set_carrier(Some(a.name().to_string()));
+        put_mcu(&printer, &a);
+        put_mcu(&printer, &b);
+
+        let mut walked = shutdown_walk_order(&printer);
+        walked.sort();
+        let mut expected = vec![a.name().to_string(), b.name().to_string()];
+        expected.sort();
+        assert_eq!(walked, expected, "both boards are walked exactly once");
+    }
+
+    #[test]
+    fn test_a_can_port_member_names_the_bridge_it_sits_on() {
+        // The topology the shutdown order walks comes from the port section's
+        // own `can_mcu`, not from anything the device's section says: the
+        // device names a port, and the port names the bridge.
+        let config = crate::core::klippy::config::Config::from_text(
+            "[mcu]\nserial: /dev/a\n\n\
+             [can_device can_bridge0]\ncan_mcu: mcu\ncan_oid: can0\n",
+        )
+        .expect("the test config parses")
+        .0;
+        let section = config.get_section("mcu").expect("the config has [mcu]");
+        let wrapper = ConfigWrapper::with_config(section, AccessTracking::shared(), None, &config);
+
+        // `port` is the section identifier the transport stores — the whole
+        // `can_device can_bridge0`, not the sub alone (`config/mcu.rs`, where
+        // the error names both).
+        assert_eq!(
+            carrier_of_port(&wrapper, "can_device can_bridge0", PortKind::Can),
+            Some("mcu".to_string())
+        );
+        assert_eq!(
+            carrier_of_port(&wrapper, "can_bridge0", PortKind::Can),
+            None,
+            "a sub name is not a section identifier"
+        );
+        assert_eq!(
+            carrier_of_port(&wrapper, "no-such-port", PortKind::Can),
+            None
+        );
     }
 
     #[test]

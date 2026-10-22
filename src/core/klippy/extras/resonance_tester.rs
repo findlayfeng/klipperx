@@ -56,6 +56,9 @@ use serde_json::{json, Value};
 use crate::core::klippy::config::{ConfigError, ConfigWrapper};
 use crate::core::klippy::event::KlippyEvent;
 use crate::core::klippy::extras::adxl345::Adxl345;
+use crate::core::klippy::extras::bmi160::Bmi160;
+use crate::core::klippy::extras::icm20948::Icm20948;
+use crate::core::klippy::extras::lis2dw::Lis2dw;
 use crate::core::klippy::extras::mpu9250::Mpu9250;
 use crate::core::klippy::gcode::{
     parse_float, sync, CommandError, CommandHandler, GCodeDispatch, GcodeCommand, GCODE_OBJECT,
@@ -207,6 +210,20 @@ impl ResonanceTester {
     ///
     /// The first failure sets the printer's error state and stops, as upstream
     /// raises on the first one.
+    /// Whether `name` is one of the accelerometer types that carry upstream's
+    /// `start_internal_client` (`resonance_tester.py:222-228` reads that attribute
+    /// off whatever `[resonance_tester]` names).
+    ///
+    /// One place for the list: a new accelerometer driver is added here, not in
+    /// each caller.
+    fn accelerometer_object(printer: &Arc<Printer>, name: &str) -> bool {
+        printer.lookup_object_as::<Adxl345>(name).is_some()
+            || printer.lookup_object_as::<Mpu9250>(name).is_some()
+            || printer.lookup_object_as::<Lis2dw>(name).is_some()
+            || printer.lookup_object_as::<Icm20948>(name).is_some()
+            || printer.lookup_object_as::<Bmi160>(name).is_some()
+    }
+
     fn connect(&self) {
         let Some(printer) = self.printer.upgrade() else {
             return;
@@ -219,10 +236,10 @@ impl ResonanceTester {
                 printer.set_error_state(&format!("Unknown config object '{chip_name}'"));
                 return;
             }
-            // Upstream checks `hasattr(chip, 'start_internal_client')`; the two
-            // accelerometer types are what carry that client here.
-            let is_accelerometer = printer.lookup_object_as::<Adxl345>(chip_name).is_some()
-                || printer.lookup_object_as::<Mpu9250>(chip_name).is_some();
+            // Upstream checks `hasattr(chip, 'start_internal_client')`; here
+            // every accelerometer type that carries that client is listed
+            // ([`accelerometer_object`]).
+            let is_accelerometer = Self::accelerometer_object(&printer, chip_name);
             if !is_accelerometer {
                 printer.set_error_state(&format!("'{chip_name}' is not an accelerometer"));
                 return;
@@ -248,8 +265,7 @@ impl ResonanceTester {
                     "Name '{chip_name}' is not valid for CHIPS parameter"
                 )));
             }
-            let is_accelerometer = printer.lookup_object_as::<Adxl345>(name).is_some()
-                || printer.lookup_object_as::<Mpu9250>(name).is_some();
+            let is_accelerometer = Self::accelerometer_object(&printer, name);
             if !is_accelerometer {
                 return Err(CommandError::new(format!(
                     "'{chip_name}' is not an accelerometer"

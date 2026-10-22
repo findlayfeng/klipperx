@@ -1488,6 +1488,9 @@ mod tests {
                 // registers itself (`menu.py:713-721`) — all before the display
                 // it belongs to.
                 "gcode_macro",
+                // The menu's key buttons bring `buttons`, which preloads
+                // `query_adc` (`buttons.py:287`) for the analog keys.
+                "query_adc",
                 "buttons",
                 "menu",
                 "display",

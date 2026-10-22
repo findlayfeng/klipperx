@@ -2154,6 +2154,11 @@ pub struct TmcDriver {
     /// The `toff` the driver was configured with, when the enable is not a pin
     /// but a register write (`toff`); `None` on a dedicated enable pin.
     toff: Mutex<Option<i64>>,
+    /// Serializes the enable/disable work that runs off the reactor's
+    /// dispatcher ([`TmcDriver::handle_stepper_enable`]): the dispatcher used to
+    /// run one transition at a time, and two register bursts must not
+    /// interleave on the bus.
+    enable_transition: tokio::sync::Mutex<()>,
     /// A weak handle to itself, for the deferred enable/disable work.
     self_ref: Weak<TmcDriver>,
     /// Previous field values the virtual-endstop homing stashed, for restore.
@@ -2223,6 +2228,7 @@ impl TmcDriver {
             stepper: Mutex::new(None),
             enable_line: Mutex::new(None),
             toff: Mutex::new(None),
+            enable_transition: tokio::sync::Mutex::new(()),
             self_ref: self_ref.clone(),
             virtual_prev_state: Mutex::new(Vec::new()),
             virtual_dirty: Mutex::new(Vec::new()),
@@ -2596,7 +2602,8 @@ impl TmcDriver {
     }
 
     /// Hand an enable/disable transition to the reactor
-    /// (`_handle_stepper_enable`).
+    /// (`_handle_stepper_enable`), and the transition itself off the reactor's
+    /// dispatcher.
     ///
     /// `stepper_enable` delivers the callback **in place**, while it holds the
     /// global enable-lines lock and this stepper's tracking lock; a
@@ -2604,6 +2611,18 @@ impl TmcDriver {
     /// and writes registers) is deferred to the next reactor turn instead of run
     /// here. `toff` and the dedicated-enable decision are therefore taken at
     /// registration time, not in the callback.
+    ///
+    /// That reactor turn only **dispatches** the work. `do_enable`/`do_disable`
+    /// are the whole register burst over the bus — measured on the bench, ~150 ms
+    /// for one enable after a firmware reset — and the dispatcher runs one
+    /// callback at a time, so the burst is handed to the blocking pool
+    /// ([`TmcDriver::apply_stepper_enable`]) and the callback returns. The
+    /// transition lock keeps the ordering the dispatcher used to give: one burst
+    /// at a time, in the order the transitions were delivered.
+    ///
+    /// A hand-driven test reactor has no dispatcher to protect, and no runtime
+    /// (or only a current-thread one) to take the work, so there it runs inline
+    /// and a test can assert on the result.
     fn handle_stepper_enable(&self, is_enable: bool) {
         let (Some(driver), Some(printer)) = (self.self_ref.upgrade(), self.printer.upgrade())
         else {
@@ -2612,18 +2631,47 @@ impl TmcDriver {
         printer.reactor().call_later(
             0.0,
             Box::new(move |_eventtime: f64| {
-                let result = if is_enable {
-                    driver.do_enable()
-                } else {
-                    driver.do_disable()
-                };
-                if let Err(err) = result {
-                    if let Some(printer) = driver.printer.upgrade() {
-                        printer.invoke_shutdown(&err.to_string());
+                match tokio::runtime::Handle::try_current() {
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        handle.spawn(async move {
+                            let _turn = driver.enable_transition.lock().await;
+                            let this = Arc::clone(&driver);
+                            let applied = tokio::task::spawn_blocking(move || {
+                                this.apply_stepper_enable(is_enable)
+                            });
+                            // The burst has nowhere to report a panic; a
+                            // `do_enable` that unwound leaves the driver in an
+                            // unknown state, so say so.
+                            if let Err(err) = applied.await {
+                                tracing::error!(
+                                    "tmc {} enable transition did not finish: {err}",
+                                    driver.stepper_name
+                                );
+                            }
+                        });
                     }
+                    _ => driver.apply_stepper_enable(is_enable),
                 }
             }),
         );
+    }
+
+    /// Turn the driver on or off, and shut the printer down if it failed
+    /// (`_handle_stepper_enable`'s body, off the reactor).
+    fn apply_stepper_enable(&self, is_enable: bool) {
+        let result = if is_enable {
+            self.do_enable()
+        } else {
+            self.do_disable()
+        };
+        if let Err(err) = result {
+            if let Some(printer) = self.printer.upgrade() {
+                printer.invoke_shutdown(&err.to_string());
+            }
+        }
     }
 
     fn cmd_init_tmc(&self, _gcmd: &GcodeCommand) -> Result<(), CommandError> {

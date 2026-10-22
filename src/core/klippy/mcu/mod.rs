@@ -4026,15 +4026,19 @@ mod tests {
     }
 
     /// An answer for another `oid` is **not** swallowed by a pending call that
-    /// shares its name: it takes the ordinary path, so the unhandled report
-    /// names it and the call is left waiting (2026-10-22).
+    /// shares its name: it takes the ordinary path — here the callback bound to
+    /// that message — and the call is left waiting (2026-10-22).
     ///
     /// Upstream dispatches on `(name, oid)` and sends an unclaimed answer to
     /// `handle_default`, which logs a warning (`klippy/serialhdl.py:59-62`,
     /// `:311-312`); returning `false` from `PendingCalls::resolve` is how this
     /// host reaches the same visibility instead of a `debug!` nobody reads.
+    ///
+    /// The bound callback, not the log, is the evidence on purpose: a log line
+    /// would depend on which thread the receive task runs on, and this test must
+    /// not be able to pass or fail on that.
     #[tokio::test]
-    async fn test_an_answer_for_another_oid_is_reported_not_swallowed() {
+    async fn test_an_answer_for_another_oid_is_not_swallowed() {
         let device = FrameMock::new(vec![MappingEntry {
             input: make_frame(0, &[4]),
             // The firmware answers `oid 8`, while the call below waits on 7.
@@ -4056,16 +4060,14 @@ mod tests {
             .register("resp".to_string(), Some(7), tx)
             .await;
 
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::registry()
-            .with(tracing_subscriber::filter::LevelFilter::WARN)
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(capture.clone())
-                    .with_ansi(false),
-            );
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Whatever nobody waits for is delivered here, as every unbound message
+        // is: the callback proves the answer kept travelling.
+        let (seen_tx, mut seen_rx) = mpsc::unbounded_channel();
         let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+        mcu.bind_callback("resp", move |_| {
+            let _ = seen_tx.send(());
+        })
+        .unwrap();
         mcu.bind_callback("done", move |_| {
             let _ = done_tx.send(());
         })
@@ -4073,12 +4075,12 @@ mod tests {
         mcu.send_msg(&crate::core::klippy::cmd::uptime::GetUptime)
             .unwrap();
         let marker = tokio::time::timeout(Duration::from_secs(5), done_rx.recv()).await;
-        let logged = capture.text();
-        assert!(marker.is_ok(), "both frames must be dispatched: {logged}");
+        assert!(marker.is_ok(), "both frames must be dispatched");
         assert_eq!(
-            logged.matches("Unhandled message resp").count(),
-            1,
-            "the mismatched answer is reported, not swallowed: {logged}"
+            tokio::time::timeout(Duration::from_secs(5), seen_rx.recv())
+                .await
+                .expect("the mismatched answer was dispatched, not swallowed"),
+            Some(()),
         );
         assert!(
             rx.try_recv().is_err(),

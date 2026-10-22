@@ -863,6 +863,52 @@ pins: PA1, my_alias
 | `retries` / `retry_tolerance` | `0` / `0.0` | 重试（错误信息附 `Possibly Z motor numbering is wrong`） |
 | `max_adjust` | `4.0` | 单电机调整量上限（`>0`），超过即中止 |
 
+### `[bed_mesh]` — 网格床面补偿（`BED_MESH_*`）
+
+探测一张网格、按算法插值，并把 Z 补偿作用到每次移动（上游 `bed_mesh.py`）。命令见
+[G-Code 参考](gcode-commands.md) 的 `BED_MESH_CALIBRATE / PROFILE / OUTPUT / MAP / OFFSET` 节。
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `mesh_min` / `mesh_max` | 矩形床**必需** | 网格首末点 `x,y`；`max` 两轴都必须大于 `min`，否则报 `bed_mesh: invalid min/max points` |
+| `probe_count` | `3,3` | 两轴点数（每轴 `>=3`） |
+| `mesh_pps` | `2,2` | 每段插值细分数。网格边长 `(count-1)*(mesh_pps+1)+1`——**`mesh_pps: 1` 仍插值**；只有两轴全 `0` 才把算法改写成 `direct`（`mesh_matrix` 等于 probed 矩阵） |
+| `algorithm` | `lagrange` | `lagrange` / `bicubic` / `direct`（大小写不敏感） |
+| `bicubic_tension` | `0.2` | `bicubic` 的张力，范围 `0`–`2` |
+| `speed` | `50.0` | 点间移动速度 |
+| `horizontal_move_z` | `5.0` | 点间抬升 |
+| `fade_start` / `fade_end` / `fade_target` | `1.0` / `0.0` / 网格均值 | Z 淡出区间；`fade_target` 的合法性看**网格 Z 范围**、取 `0` 时免检，`fade_dist` 另有上界 |
+| `move_check_distance` | `5.0` | 移动拆分检查的最小距离，**下界 `3.`** |
+| `split_delta_z` | `0.025` | 触发拆分的 Z 差阈值，**下界 `0.01`** |
+| `mesh_radius` / `round_probe_count` / `mesh_origin` | — / `5` / `0,0` | 圆床：`mesh_radius`（向下取到 0.1 mm）取代 `mesh_min`/`mesh_max`，点数取 `round_probe_count`（`>=3` 且**必须为奇数**，否则报 `bed_mesh: probe_count must be odd for round beds`） |
+| `faulty_regions` | — | 坏区替换：候选点、反向行首尾对调、越界与圆床过滤、读数取平均写回原点 |
+
+`BED_MESH_CLEAR` **不撤销**变换注册：上游只注册一次，clear 就是 `set_mesh(None)`，无网格时 `move()`
+直通 `toolhead.move`。网格以 `force=false` 注册为 `MoveTarget`，所以与 `[bed_tilt]`/`[exclude_object]`
+的变换可链式共存（后注册者顶替、注销时交还）。`[bed_mesh <name>]` 是 `BED_MESH_PROFILE SAVE=` 的落盘形态
+（`version` / `points` / 网格参数），启动时读回但**不自动装载**。
+
+### `[z_thermal_adjust]` — 按温度补偿 Z（`SET_Z_THERMAL_ADJUST`）
+
+| 选项 | 默认 | 说明 |
+|------|------|------|
+| `temp_coeff` | `0.0` | 每 °C 的 Z 修正（mm），范围 `-1`–`1`；`0` 即不补偿 |
+| `min_temp` / `max_temp` | **必需** | 传感器量程（°C），`max_temp` 须 `>= min_temp`；传感器选项（`sensor_type`/`sensor_pin` …）照常写在同一节 |
+| `smooth_time` | `2.0` | 一阶平滑时间常数（s，`>0`） |
+| `z_adjust_off_above` | 无穷 | Z 高于此值后不再补偿 |
+| `max_z_adjustment` | 无穷 | 单次修正量上限（mm） |
+
+传感器会注册进 `heaters`（`M105`/`TEMPERATURE_WAIT` 可用），修正量经变换链作用在 Z 上；
+`homing:home_rails_end` 带 Z 时重锚参考温度。`get_status` 六键：`temperature` / `measured_min_temp` /
+`measured_max_temp` / `current_z_adjust` / `z_adjust_ref_temperature` / `enabled`。
+
+### `[skew_correction]` — 三平面斜切校正
+
+零选项段：装载即注册 `GET_CURRENT_SKEW` / `CALC_MEASURED_SKEW` / `SET_SKEW` / `SKEW_PROFILE` 四条命令，
+并把 XY/XZ/YZ 三个平面矩阵串进移动变换链。`SKEW_PROFILE LOAD/SAVE/REMOVE` 存于 `[skew_correction <name>]`
+（`xy_skew`/`xz_skew`/`yz_skew`）并由 `SAVE_CONFIG` 写回；`get_status` 只报当前 profile 名。
+命令参数与文案见 [G-Code 参考](gcode-commands.md) 的斜切校正节。
+
 ### `[bltouch]` — BLTouch 探针（替代 `[probe]` 的物理实现）
 
 | 选项 | 默认 | 说明 |

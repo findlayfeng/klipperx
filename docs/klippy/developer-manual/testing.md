@@ -307,7 +307,8 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
 ### 本套用例的两条设计准则
 
 1. **单一设备**：每条只依赖**一块 MCU** 与它自己声明的那点外设/接线——不要求第二块板、不要求额外外设。
-   需要的部分在声明里写全（`.mcu()` / `.section(..)` / `.option(section, key)`），不满足就按 `HW-IGNORED` 跳过。
+   需要的部分在声明里写全（`.mcu()` / `.section(..)` / `.option(section, key)`），不满足时**默认判失败**
+   （`KLIPPERX_HW_STRICT=0` 才退回 `HW-IGNORED` 跳过）。
 2. **尽量安全**：只做声明的动作，不顺手多做。运动类默认只动**一个轴**、距离/速率写成常量并给出上界；
    加热类不自动升温（除非该用例的目的就是验证加热）；会重启固件/会快速移动/会开加热的用例，
    doc 里必须写明后果与前置（例如「先跑 R3 确认端停极性」）。
@@ -320,10 +321,14 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
    再用 `machine.open_mcu_named("zboard")` 打开——`Mcu::connect` 的名字必须与节名一致（`"mcu"` / `"zboard"`）。
 2. **检查**：`hwtest::acquire("<用例名>", &needs)` 用仓库自己的 config 解析器读 `KLIPPERX_HW_CONFIG`，
    逐项核对——**被注释掉的节或选项算不存在**。
-3. **有则跑、无则报告忽略**：
+3. **有则跑、无则报错（默认）**：
    - 齐备 → 打 `HW-RUN: <用例名>  (the config is assumed correct; this checks the host module, not your config)`（那行把本模式的前提一并带出来，形状由 `run_line` 固定，可 grep），返回带独占锁的机器句柄；
-   - 不齐（变量未设 / 文件不存在 / 解析失败 / 缺项）→ 打
-     `HW-IGNORED: <用例名>: <原因>`（缺项会逐项列出），**返回 `None` 并跳过，不失败**。
+   - 变量未设 → 打 `HW-IGNORED: <用例名>: KLIPPERX_HW_CONFIG is not set`，**返回 `None` 并跳过**（普通 `cargo test` 不能因此变红；两种模式都这样）；
+   - 文件不存在 / 解析失败 → **panic**（配置说要跑但打不开 = 真失败）；
+   - 文件能读、但**不提供该用例声明的东西** → **panic**，消息带用例名、配置路径、逐项缺什么，以及 `set KLIPPERX_HW_STRICT=0 to skip instead`；
+   - 文件能读、但里面写了本仓**暂不实现**的对象（`samd_sercom` / `replicape` / `palette2`，即 `upstream-deviations.md` §1.2 的延期三项）→ 同样 **panic**。
+
+**严格模式是默认值**：`KLIPPERX_HW_STRICT` 未设 = 严格；只有 `0` / `false` / `no`（大小写、前后空白不敏感）关掉它。关掉后回到旧行为：缺项打一行 `HW-IGNORED: <用例名>: <原因>`（缺项逐项列出）后**通过**。所以拿一份只支持部分特性的配置跑整条 lane 会红一批——那是故意的，按用例名过滤或显式关掉严格模式。
 
 ```rust
 #[tokio::test]
@@ -348,9 +353,10 @@ async fn test_endstop_trigger_on_a_real_board() {
 
 1. **默认不执行。** 真机用例以 `#[ignore]` 标注，设备地址不写进仓库任何文件；`cargo test` 与
    `cargo test --workspace` 在没有硬件的机器上必须全部通过且**不得打开串口或 USB 设备**。
-2. **被显式请求时要么真跑、要么响亮地报忽略。** 以 `--ignored` 请求而未提供 `KLIPPERX_HW_CONFIG`
-   （或配置不满足声明）时，用例打印 `HW-IGNORED` 后**通过**——这是本模式的设计：让「没接板」与
-   「配置不齐」都看得见，而不是混成一个沉默的 `#[ignore]`。（旧约定是「缺变量就失败」，已作废。）
+2. **被显式请求时要么真跑、要么响亮地告诉你跑不了。** 以 `--ignored` 请求而未提供 `KLIPPERX_HW_CONFIG`
+   时，用例打印 `HW-IGNORED` 后**通过**（「没接板」不算失败）；一旦给了配置，它要么真跑，要么按
+   严格模式**失败并说清缺什么**（缺声明项，或含有 §1.2 暂不实现的对象）。要旧行为就
+   `KLIPPERX_HW_STRICT=0`。
 
 ### 串行：一块板只有一个会话
 
@@ -381,8 +387,11 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 别名后接的名字就是 libtest 的过滤器。
 
 ```bash
-# 跑全部真机用例（不满足声明的会逐条报 HW-IGNORED）
+# 跑全部真机用例（默认严格：配置撑不起哪条用例，那条就失败）
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest
+
+# 配置只支持一部分特性、只想看哪些能跑：关掉严格模式退回 HW-IGNORED
+KLIPPERX_HW_STRICT=0 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest
 
 # 或只跑某一条
 KLIPPERX_HW_CONFIG=~/printer.cfg cargo hwtest \
@@ -424,7 +433,7 @@ KLIPPERX_HW_CONFIG=~/printer.cfg \
 （限 2 次重试、每次打日志与耗时）。
 
 > **跑真机套件的前提**：板子不能被真实打印主机占着（端口只有一个）。那种情况是**真失败**（打不开串口）
-> 而不是 `HW-IGNORED`——这正是框架有意的语义（配置说要跑但打不开 = 真失败）。
+> 而不是跳过——这正是框架有意的语义（配置说要跑但打不开 = 真失败）。
 
 ### 两层能力：L1 传输 / L2 起机器
 

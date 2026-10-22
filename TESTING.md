@@ -34,7 +34,10 @@
 
 > **已有可跑（自动化）的真机用例**（`KLIPPERX_HW_CONFIG=<你的 printer.cfg> cargo hwtest`——仓库根
 > `.cargo/config.toml` 的别名，只跑真机 lane；跑法与两层能力见
-> [开发手册 → 测试 → 真机测试](docs/klippy/developer-manual/testing.md#真机测试)）：
+> [开发手册 → 测试 → 真机测试](docs/klippy/developer-manual/testing.md#真机测试)）。
+> 别名跑**全部**真机用例，而严格模式是默认值：你那份配置撑不起的用例会**逐条失败**并说清缺什么。
+> 只想先看哪些能跑：`KLIPPERX_HW_STRICT=0 KLIPPERX_HW_CONFIG=<cfg> cargo hwtest`（退回打
+> `HW-IGNORED` 后通过）。
 > R1 帧序 `test_frame_sequence_sync_against_a_real_board`、R2 重启三轮
 > `test_firmware_reset_comes_back_three_times_on_a_real_board`、R3 端停电平
 > `test_endstop_level_reads_open_and_shorted_on_a_real_board`、R5 单轴位移

@@ -253,6 +253,7 @@ systemd-run --user --scope -p CPUQuota=25% -p AllowedCPUs=0-3 ...      # 限总�
 | ⑮ 运动地基与调平余项（6 lane，2026-10-21） | 扫描窗记账（`kin_flush_delay` 运行期化）、`input_shaper` 真驱动步进（`motion/shaper.rs`）、`skew_correction`、`z_thermal_adjust`、`tuning_tower`（+46 个 `fn test_`） | **46.9 s** | 3800 |
 | ⑯ 设备层小件批（5 lane，2026-10-21） | `smooth_time`/shaper 安装前 flush、`find_past_position`、`seconds_to_clock` 拒绝负值、`move_clocks` 退回槽位、`TriggerDispatch::stop()` 保留理由、`trigger_analog` 带 `reqclock`、端停文案、`stress` 行程上界与三种出口、`hardware_test` 用例级超时与 teardown 护栏（+31 个 `fn test_`） | **46.9 s** | 3800 |
 | ⑰ 算法层收口批（11 lane，2026-10-21） | extra-axes 容量 8→16 + `G1_PARAMS` 补全 + `reset_last_position` 尾巴；IDEX 第二滑车进主 trapq 真出步；`PrinterStats` 1 Hz 汇总行 + `PrinterObject::stats`；PA 改值走 lookahead 回调；滑车切换发 `dual_carriage:update_kinematics` 并重装整形层；加速度计样本通路泛化（adxl345/mpu9250）；both-edge 判定链；`pending` 按 token 取消；二级 MCU 时钟样本闸门；`load_cell_probe/dump_taps` + `LOAD_CELL_TEST_TAP`；模板 `printer.objects` 反射（+48 个 `fn test_`） | **47.0 s** | 3952 |
+| ⑱ 显示/传感器/身份收口批（19 lane + 暂停续跑，2026-10-22） | `sh1106`/`emulated_st7920` 两面板、`[display_data]`/`[display_glyph]` 主配置 factory、六驱动画字（`VGA_FONT` vendor）、菜单行写入面板、`query_adc` 与模拟按键、`[lis2dw]`/`[lis3dh]`/`[icm20948]`/`[bmi160]`/`[angle]` 五个驱动 + 各自 dump、`[extruder_stepper]` step 同步缝与 `set_position` 判据修正、桥端口上限与静默顶替、身份查询改名 `get_mcu_id`（别名 `get_canbus_id`）与 identify 后读回比对（+99 个 `fn test_`） | **47.0 s** | 4051 |
 
 两句实话：**稳定化那一步一秒都没省**（它的目标是假失败与挂死，不是墙钟）；省下来的全部来自
 「让测试不要去等真时间」与「让测试彼此不排队」。

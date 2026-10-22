@@ -1100,9 +1100,20 @@ cartesian 在 late 阶段认领；注册 `dual_carriage` 对象与 `SET_DUAL_CAR
 宽度出窗与断料走 `RunoutHelper`；tsl1401cl 用线性 CCD 读数换算 + `_process_measurement`。命令面：
 `M404`（设定名义线宽/日志）、`M405`/`M406`（开/关）、`M407`（报告当前直径）、`QUERY_FILAMENT_WIDTH`。
 
+### `[lis2dw]` / `[lis3dh]` / `[icm20948]` / `[bmi160]` / `[angle]` — 其余传感器（2026-10-22）
+
+| 段 | 传输 | 关键默认 | 说明 |
+|----|------|----------|------|
+| `[lis2dw]` / `[lis3dh]` | `cs_pin` 有则 SPI（mode 3、5 MHz），否则 I2C（`0x19`/400 kHz，支持软件 I2C） | `axes_map: x,y,z`；`lis3dh` 复用 `lis2dw.py` 的类型分支（上游 `Kconfig` 也把两者合在一个选项） | 样本 6 B（`<hhh`，3×LE i16）、8 样本/报文（对齐固件 `BYTES_PER_BLOCK 48`）；`_convert_samples` 按量程缩放 + 6 位取整；dump 端点 `lis2dw/dump_lis2dw`（key `sensor`） |
+| `[icm20948]` | I2C（`0x69`/400 kHz，`i2c_mcu`/`i2c_address`/`i2c_speed`、软件 I2C 引脚对） | `rate`/`axes_map` | 加速度计路径 + 寄存器 setup + dump `icm20948/dump_icm20948`（key `sensor`）；陀螺仪没有上游路径，本仓同样不提供 |
+| `[bmi160]` | I2C（`0x69`/400 kHz） | `data_rate` 固定 1600（上游**没有** `rate` 选项） | 6 B/样本、8 样本/报文；`SCALE = FREEFALL_ACCEL/2048`；dump `bmi160/dump_bmi160`（key `sensor`） |
+| `[angle <chip>]` | SPI（`cs_pin`/`spi_speed` 等按芯片） | `sensor_type` 选芯片；`stepper` 拒绝；`sample_period` 有界 | **支持 `a1333`/`as5047d`/`mt6816`**；`tle5012b`/`mt6826s` 选中即报配置错并点名缺什么（CRC-8/J1850 寄存器流、时钟估计、`ANGLE_CHIP_CALIBRATE` 换型）。`get_status` 只有 `temperature`（本仓这份上游树如此；无温度通道的芯片返回 `null` 并已登记该偏差）。dump `angle/dump_angle`（key `sensor`，表头 `time,angle`） |
+
+四个加速度计都接进了 `[resonance_tester]` 的加速度计判定（`Adxl345`/`Mpu9250`/`Lis2dw`/`Icm20948`/`Bmi160`）。
+
 ### `[buttons]` — 按钮/编码器注册表（wave-2，2026-10-21 补齐固件查询）
 
-`[buttons]` 无配置节，是被 `[filament_switch_sensor]`/`[filament_motion_sensor]`/`[gcode_button]` 用 `load_object` 拉起的注册表（`register_debounce_button` / `register_buttons`）。**固件查询 2026-10-21 落地**：`config_buttons`/`buttons_add`/`buttons_query`/`buttons_ack` 四条命令 + `buttons_state` 应答，每 **8 个引脚**一个固件对象（`src/buttons.c:76-78`），查询周期 `QUERY_TIME=2 ms`、`RETRANSMIT_COUNT=50`；`pull_up` 由引脚上的 `~` 决定（线上为 `0xff`）、`invert` 取反电平，宿主侧去抖按 `debounce_delay`。回调在 reactor 上触发（同上游 `register_async_callback`），所以真板上的引脚变化会真的驱动 filament/`gcode_button` 回调。**余项**：`analog_range`（模拟按键）仍缺 `query_adc` 模块，`[gcode_button]` 照旧读后拒绝；`register_buttons` 的失败目前只 `error!` 记录、不是上游的配置错。
+`[buttons]` 无配置节，是被 `[filament_switch_sensor]`/`[filament_motion_sensor]`/`[gcode_button]` 用 `load_object` 拉起的注册表（`register_debounce_button` / `register_buttons`）。**固件查询 2026-10-21 落地**：`config_buttons`/`buttons_add`/`buttons_query`/`buttons_ack` 四条命令 + `buttons_state` 应答，每 **8 个引脚**一个固件对象（`src/buttons.c:76-78`），查询周期 `QUERY_TIME=2 ms`、`RETRANSMIT_COUNT=50`；`pull_up` 由引脚上的 `~` 决定（线上为 `0xff`）、`invert` 取反电平，宿主侧去抖按 `debounce_delay`。回调在 reactor 上触发（同上游 `register_async_callback`），所以真板上的引脚变化会真的驱动 filament/`gcode_button` 回调。**`query_adc` 与模拟按键 2026-10-22 落地**：新模块 `extras/query_adc.rs`（`QUERY_ADC [NAME=] [PULLUP=]`，名字缺失/未知时列可用名字），`[buttons]` 的 `analog_range_*`/`analog_pullup_resistor` 走 `register_adc_button`（采样 `0.010/0.001/6/5`、pullup 分压、外层带含边界/内层带严格、`ADC_DEBOUNCE_TIME=0.025` 按采样时间计、回调经 reactor 延后），所以**模拟按键现在真的能用**；`register_buttons` 的失败已改为配置错（`button pins must be on same mcu` 等）。
 
 ### `[pause_resume]` — 暂停/恢复（批 #15）
 
@@ -1164,7 +1175,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 
 | 选项 | 默认 | 说明 |
 |------|------|------|
-| `lcd_type` | —（必填） | 已实现 `st7920`/`hd44780`/`hd44780_spi`/`uc1701`/`ssd1306`/`aip31068_spi`；其余（`sh1106`/`emulated_st7920`/…）报 `lcd_type '<x>' is not implemented in this host` |
+| `lcd_type` | —（必填） | 八种全部可用：`st7920`/`hd44780`/`hd44780_spi`/`uc1701`/`ssd1306`/`aip31068_spi` + **`sh1106`（132 列变体，列偏移 0..=3）** + **`emulated_st7920`（并口 ST7920 命令转发到软 SPI 屏，`cs_pin`/`sclk_pin`/`sid_pin` + 可选 `enable_pin`/`spi_speed`）**（后两者 2026-10-22）；其它名字仍在 `get_choice` 处被拒 |
 | `cs_pin` / `sclk_pin` / `sid_pin` | — | st7920 三线（同 MCU，否则 `st7920 all pins must be on same mcu`） |
 | `rs_pin`/`e_pin`/`d4_pin`…`d7_pin` | — | hd44780 4-bit 并行六线（同 MCU，否则 `hd44780 all pins must be on same mcu`）；`hd44780_protocol_init`（默认 True）、`line_length`（16\|20，默认 20，非法值 choice 文案） |
 | `uc1701`/`ssd1306` 面板选项 | — | `a0_pin`(uc1701 必填)/`dc_pin`、`contrast`/`vcomh`/`invert`(ssd1306)、`rst_pin`/`reset_pin`；SPI 走 `McuSpi::send` 只入队（真传输在假 MCU 不可用，已知约束） |
@@ -1245,7 +1256,7 @@ Z 端停来源：`[stepper_z]`，否则 `[carriage <名>]` 中 axis 为 z 者；
 | `pin` | —（必填） | 按钮引脚 | 
 | `press_gcode` / `release_gcode` | — / 空 | 按下/释放时渲染并执行的宏体 |
 | `debounce_delay` | `0` | 去抖（秒，`minval=0`） |
-| `analog_range` | — | **本仓不支持**：读取后明确报错（上游走 `query_adc`，本仓无该基建） |
+| `analog_range` | — | **已支持（2026-10-22）**：走 `buttons.register_debounce_adc_button` + `query_adc`，`analog_pullup_resistor` 同时生效（此前是「读后拒绝」） |
 
 `QUERY_BUTTON BUTTON=<name>` 查询状态；`get_status` 报 `PRESSED`/`RELEASED`。gap：**固件侧按钮查询未接**（回调已登记，假固件不会触发）。
 

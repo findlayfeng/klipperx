@@ -220,7 +220,9 @@ toolhead / 开放事件）一起补，一部分是现在就独立可补的小行
 `api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
 对象先存在：
 
-- [ ] **dump 端点家族残余**（mux 机制已就绪，实例随各自 extras 落地）。已落地：
+- [x] **dump 端点家族 —— 已收官（2026-10-22）**：`icm20948`/`bmi160`/`lis2dw`/`angle` 四个端点随各自驱动落地，
+      连同既有的 `bed_mesh`/`motion_report`/加速度计族/`load_cell`/`load_cell_probe`/`tmc` 全部就位。
+      （原条留作历史：**mux 机制已就绪，实例随各自 extras 落地**。已落地：
       `bed_mesh/dump_mesh`、`motion_report/dump_trapq` 与 `dump_stepper`、`adxl345`/`ldc1612`/`mpu9250`
       （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`load_cell_probe/dump_taps`（2026-10-21）、
       `tmc/stallguard_dump`；**`icm20948`/`bmi160`/`lis2dw`/`angle` 四个 dump 于 2026-10-22 随各自驱动落地**。
@@ -477,14 +479,19 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
       [--interface can0] [--timeout 2]`（广播 `0x3f0/[0x00]`，收 `0x3f1` 的 `RESP_NEED_NODEID`，
       输出可粘进配置的 uuid）——**都不写回配置文件**（与上游 pinned 版一致）。
       **未做**：`canbus_stats.py`（总线错误计数/状态上报）；真总线上的行为未验证（见 testing.md）。
-- [ ] **CAN 的 `SET_NODEID` 没有身份校验（2026-10-20 评审发现，未修）**：上游发完 `SET_NODEID` 就调
-      `get_canbus_id` 把被测板的 uuid 读回来比对（`serialhdl.py:158-167`，不等就 `disconnect()` 重来，
-      90 s 预算）；`get_canbus_id` 是**字典消息**，而字典由 `identify` 交付，所以 open 阶段（那时只有
-      `0x3f0` 的 admin 帧、没有 msgid）拿不到应答语义。本仓现在只做**有界重发**兜丢帧：
-      `NODEID_ASSIGN_ATTEMPTS = 3`、`NODEID_ASSIGN_INTERVAL = 200 ms`（合计 ≤1 s），发完即开链路，
-      身份是否吻合留给 identify（`interface/devices/canserial.rs` 的 `open_with_wire` 自述）。
-      **后续项**：在 identify 拿到字典之后补一次 `get_canbus_id` 比对 + 不匹配则重连（上游同一判据），
-      届时「发出去的 `SET_NODEID` 到底落在哪块板」才有主机侧证据。
+- [x] **`SET_NODEID` 的身份校验 —— 已落地（2026-10-22）**：照上游 `serialhdl.py:129-155` 的
+      「开总线 → 发 SET_NODEID → identify → 读回 uuid 比对 → 不吻合 `disconnect()` 重来，整轮 90 s」
+      落到 `identify.rs::connect_verified`：每轮 `open()`（写 SET_NODEID）→ `Mcu::connect`（identify）→
+      读回，不吻合/无应答 ⇒ `mcu.close()` + 250 ms 间隔继续，`VERIFIED_CONNECT_BUDGET = 90 s`，且每轮
+      之间检查退出请求（关停不被 90 s 拖累）。
+      **命令名**：正名 `get_mcu_id`，`get_canbus_id` 作**别名**（固件同时声明两个名字）；主机按**字典**选名
+      （有 `get_mcu_id` 就发它，否则回退别名），两个名字共一份应答解析（`DeviceIdentity`）。两者都没声明 ⇒
+      不误拒（`NotDeclared`，兼容旧固件/独占串口）。
+      **两种可区分文案**：应答了但不是那块板 ⇒ 点名两侧 uuid；没应答 ⇒ 明说「这不能判是哪块板——可能不在线，
+      也可能仍在旧会话里」。
+      **mux 侧**：分配后同样读回比对（`mux_uuid()` + `mux_node_id()`）；**不做分配期前置扫描**——mux 固件对
+      已被命名的设备沉默，「目标 uuid 不在 discovery 答案里」无法区分「板不在」与「已命名」（主机重启常态），
+      硬报错会误杀正常启动，理由已写进源码注释与 `serial-mux-protocol.md`。
 - 判为不适用：`garbage_collection.py`、`aio_executor.py`、`parsedump.py`（Python 侧调优/
   离线工具，与本主机无关；完整清单见「待办」表后的不适用段）。
 
@@ -811,12 +818,14 @@ endstop 资源（`mcu/resource/endstop.rs`，含 `minclock` 门控与 `home_wait
 
 - [x] **`same_file` / 重复 attach / 重开轮次 / 停端口握手 / `answers_for` / reader panic / scan 读窗口 / 排他打开 / 无界 channel —— 均已修（2026-10-21）**：
       共 9 条，按本节的修法方向全部落地（`serial.rs` + `frame.rs`），每条带改前必红的用例。
-- [ ] `TunnelRegistry::register` 静默顶替同 id，且生产代码从不 `clear_tunnel_sink`（**后者是有意设计**：
-      `bridge_flash.rs` 靠 drop receiver 隐式退订，注释已写明）；`UnitRegistry::has`/`deliver` 之间的
-      TOCTOU 会丢单元（失败分支现在有 `debug!`，但没有 warn）。
-- [ ] 桥端口数上限与固件不符：主机允许 256、固件 `BRIDGE_MAX_PORTS 4`（`bridge_ports.rs` / `third_party/klipper/src/bridge.c`），
-      超限只靠固件 shutdown 兜住且报错不点名额；固件把「槽号越界」与「tty 打不开」折叠成同一句 `config_uart: … could not be opened`，
-      主机侧当成瞬时丢 tty 去走 10 s 恢复。
+- [x] **隧道的静默顶替与丢单元 —— 已修（2026-10-22）**：`TunnelRegistry::register` 与 `UnitRegistry::register`
+      同 id 顶替现在都 `warn!`（带 arb）；`UnitRegistry` 的丢单元两条失败臂（receiver 已掉 / `has`→`deliver` 之间离开）
+      也 `warn!`（带 arb、原因、单元字节数）。**顶替语义本身保留**（既有契约用例钉着它，改 `Result` 会波及三条链路的
+      setter）；`clear_tunnel_sink` 的「从不调用」仍是有意设计（`bridge_flash.rs` 靠 drop receiver 隐式退订）。
+- [x] **桥端口数上限对齐固件 —— 已修（2026-10-22）**：`mcu/object.rs` 新增 `BRIDGE_MAX_PORTS = 4`
+      （固件没有字典常量，故主机常量 + 注释指回 `third_party/klipper/src/bridge.c:65`，并注明 `:76-77` 的编译期断言），
+      `next_bridge_port_index` 超限即报错并**点名槽号与上限**（此前主机允许 256、只靠固件 shutdown 兜住）。
+      钉子：配置期第 5 口报错 / 4 口可载 / 主机常量与固件 `#define` 防漂移。
 - [x] **设备层小件批 —— 已落地（2026-10-21）**：`seconds_to_clock` 拒绝负值/NaN/∞（钳位下移到 `step_pulse_duration` 一处）、
       `move_clocks` 发送失败退回槽位、`TriggerDispatch::stop()` 保留原始失败理由（探针失败不再读成主机请求）、
       `trigger_analog` 的 arm 带 `reqclock` 且先停再清了、端停链路故障不再吞掉 `Communication timeout during homing`、

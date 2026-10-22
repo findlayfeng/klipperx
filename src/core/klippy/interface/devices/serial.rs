@@ -632,6 +632,45 @@ fn lock_serial_port(port: &File, path: &Path) -> Result<(), InterfaceError> {
     Ok(())
 }
 
+/// Whether another process is holding `path`, asked by a host before it serves
+/// anything.
+///
+/// The connect-time open reports a held port as a **connect failure**, and a host
+/// that never came up keeps serving that `error` state — which is right for
+/// everything a `RESTART` can fix, and wrong for this: no restart of this host
+/// frees a port another program holds. The start-up therefore asks the device
+/// layer first (`klippy::run`), and the run ends with the reason instead.
+///
+/// The check is the open's own: take the same `flock` (`lock_serial_port`), then
+/// close — the lock belongs to the open file description, so a port nobody holds
+/// is free again at once. Nothing else is touched: no `termios` is written (that
+/// is `set_raw_mode`, which this does not call), so the holder's line settings
+/// and its lock are exactly as they were.
+///
+/// Two failures are **not** refusals, because neither is this check's to report:
+/// a tty that cannot be opened at all (a board that has not enumerated yet is
+/// what the open's retry budget is for, `SerialDevice::open_retrying`) and a
+/// sandbox that cannot lock (`lock_serial_port` warns and goes on). Both answer
+/// `Ok(())`, leaving the port to the open that knows what to do with it.
+///
+/// # Errors
+/// [`InterfaceError::Other`] naming `path`: `serial port <path> is already open
+/// in another process`.
+pub fn check_held_by_another_process(path: &Path) -> Result<(), InterfaceError> {
+    let port = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        // As the open: no controlling terminal, and no blocking inside `open` on
+        // a port without carrier detect.
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(port) => port,
+        Err(_) => return Ok(()),
+    };
+    lock_serial_port(&port, path)
+}
+
 /// Write `bytes` whole, waiting at most [`WRITE_STALL_BOUND`] for the port to
 /// take them.
 ///
@@ -956,6 +995,48 @@ mod tests {
         again
             .send(&Frame::new(2, vec![0xcd]))
             .expect("it is usable");
+    }
+
+    /// What a host asks before it serves: is somebody else on this port?
+    ///
+    /// The answer is the open's own lock, so it is the same port the open
+    /// refuses — and the check lets go of it again, leaving the holder's lock
+    /// alone.
+    #[test]
+    fn test_a_port_another_process_holds_is_reported_before_a_host_starts() {
+        let pty = Pty::new();
+        check_held_by_another_process(&pty.path).expect("a port nobody holds is free");
+
+        let held = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("the port opens");
+        let err = check_held_by_another_process(&pty.path)
+            .expect_err("a held port is reported, not opened again");
+        assert!(
+            err.to_string().contains("already open in another process"),
+            "the refusal names the reason: {err}"
+        );
+        assert!(
+            err.to_string().contains(&pty.path.display().to_string()),
+            "the refusal names the port: {err}"
+        );
+
+        // The check took the lock and gave it back: the holder still has it, so
+        // a second device is still refused (the check did not steal or release
+        // it), and once the holder goes the port is free for both.
+        assert!(check_held_by_another_process(&pty.path).is_err());
+        drop(held);
+        check_held_by_another_process(&pty.path).expect("the lock went with the port");
+        SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("and the port opens again");
+    }
+
+    /// A port that cannot be opened at all is not this check's failure to
+    /// report: a board that has not enumerated yet is what the connect-time
+    /// open's retry budget is for.
+    #[test]
+    fn test_a_port_that_cannot_be_opened_is_left_to_the_open_that_retries() {
+        let missing = Path::new("/dev/klipperx-test-no-such-tty");
+        assert!(!missing.exists(), "{missing:?} must not exist");
+        check_held_by_another_process(missing)
+            .expect("a node that is not there is not a port somebody holds");
     }
 
     #[test]

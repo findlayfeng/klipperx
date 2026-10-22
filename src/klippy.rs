@@ -1,5 +1,6 @@
 use clap::Parser;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
@@ -12,6 +13,8 @@ use crate::core::klippy::api::{
 use crate::core::klippy::config::build_config_string;
 use crate::core::klippy::config::Config;
 use crate::core::klippy::extras::system_stats;
+use crate::core::klippy::interface::devices::serial;
+use crate::core::klippy::mcu::serial_ports::{SerialPorts, SERIAL_PORTS_OBJECT};
 use crate::core::klippy::printer::Printer;
 use crate::core::klippy::reactor::TokioReactor;
 use crate::logging;
@@ -442,6 +445,27 @@ pub fn run(
             }
         }
 
+        // A `serial:` port another program is holding cannot be opened, and no
+        // `RESTART` of this host frees it — the connect below would report it as
+        // the printer's `error` state, i.e. a host serving a machine that never
+        // came up. The ports are therefore checked here, after the loader has
+        // grouped them ([`SerialPorts`]) and before any transport opens, before
+        // the API is registered and before the listener is bound, so the run ends
+        // with the reason (upstream's `Unable to open serial port: …`,
+        // `klippy/serialhdl.py:199`) and a non-zero exit instead.
+        //
+        // The check names the port, so it is asked per path rather than for the
+        // config as a whole; a path that is merely not there yet is not a
+        // failure here (the connect-time open owns that wait).
+        let serial_paths: Vec<String> = printer
+            .lookup_object_as::<SerialPorts>(SERIAL_PORTS_OBJECT)
+            .map(|ports| ports.paths().map(str::to_string).collect())
+            .unwrap_or_default();
+        for path in serial_paths {
+            serial::check_held_by_another_process(Path::new(&path))
+                .map_err(|err| format!("Unable to open serial port: {err}"))?;
+        }
+
         // The API table comes after the config, so that the mux endpoints the
         // modules registered on `webhooks` are part of it before any client can
         // send a request. Everything is registered before the listener is
@@ -577,11 +601,49 @@ mod tests {
     use super::*;
     use crate::core::klippy::config::object::{PrinterConfig, CONFIGFILE_OBJECT};
     use crate::core::klippy::config::Config;
+    use crate::core::klippy::interface::pty::Pty;
     use crate::core::klippy::printer::{ConnectFuture, PrinterObject, PrinterState};
     use crate::core::klippy::reactor::ManualReactor;
     use serde_json::Value;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Mutex, Weak};
+
+    /// One host at a time, for the tests that start a whole [`run`].
+    ///
+    /// They release the shared asset tree before anything else
+    /// (`assets::release`), and its staging directory is named after the
+    /// **process**, so two of them in one test process would write over each
+    /// other.
+    static STARTUP_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Run [`run`] on a thread of its own and return what it decided.
+    ///
+    /// `run` blocks for as long as a host runs, so the wait is bounded: a
+    /// start-up that never comes back fails the test rather than hanging it.
+    /// A panic is that same failure — it disconnects the sender here and is
+    /// reported by the join below, which is what makes a `run` that dies with
+    /// tokio's `Cannot drop a runtime …` fail instead of passing.
+    fn start_host(args: AppArgs) -> Result<i32, String> {
+        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+        let _turn = STARTUP_LOCK
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run(args, None).map_err(|err| err.to_string()));
+        });
+        match rx.recv_timeout(WATCHDOG) {
+            Ok(outcome) => {
+                worker.join().expect("the start-up must not panic");
+                outcome
+            }
+            Err(err) => {
+                worker.join().expect("the start-up must not panic");
+                panic!("the start-up did not return: {err}");
+            }
+        }
+    }
 
     /// Write a config file for one test and return its path.
     ///
@@ -693,8 +755,6 @@ mod tests {
     /// bind is the only thing that can fail.
     #[test]
     fn test_a_startup_failure_returns_the_error_instead_of_dropping_a_runtime() {
-        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
-
         // Somebody else on the port the host is told to serve.
         let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
         let port = holder.local_addr().expect("the bound address").port();
@@ -708,24 +768,63 @@ mod tests {
             log_file: None,
         };
 
-        // `run` blocks the calling thread for as long as a host runs, so it gets
-        // a thread of its own and a bounded wait: a start-up that never comes
-        // back fails this test instead of hanging it, and a panic (the old
-        // behaviour) drops the sender, which is that same failure.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _ = tx.send(run(args, None).map_err(|err| err.to_string()));
-        });
-        let outcome = rx
-            .recv_timeout(WATCHDOG)
-            .expect("the failed start-up returns");
-        worker.join().expect("the failed start-up must not panic");
+        let outcome = start_host(args);
         let _ = std::fs::remove_file(&config_file);
 
         let error = outcome.expect_err("a port that is already bound is a start-up failure");
         assert!(error.contains("cannot bind tcp"), "{error}");
         assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
         drop(holder);
+    }
+
+    /// A tty another process holds ends the start-up with the reason, instead of
+    /// a host serving a machine that never came up.
+    ///
+    /// The holder is a `SerialDevice` of this test: a pty is a real tty, and the
+    /// `flock` a second klipperx finds on the same path is the one its open
+    /// takes. Before the start-up asked, a second host opened the same tty and
+    /// sat in `error` state after the identify timeout — the "busy port" was
+    /// never named — and a start-up that failed earlier still panicked on the
+    /// way out (see the bind case above).
+    #[test]
+    fn test_a_serial_port_someone_holds_ends_the_startup_with_the_reason() {
+        let pty = Pty::new();
+        let held = serial::SerialDevice::open(&pty.path, serial::DEFAULT_BAUD)
+            .expect("the test takes the port the way another host would");
+        let config_file = write_temp_config(
+            "serial-port-held",
+            &format!(
+                "[mcu]\nserial: {}\n\n[printer]\nkinematics: none\nmax_velocity: 300\n\
+                 max_accel: 3000\n",
+                pty.path.display()
+            ),
+        );
+        let args = AppArgs {
+            // No API server: the port check is what is under test, and an empty
+            // target keeps a listener out of the picture.
+            api_server: String::new(),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+
+        let outcome = start_host(args);
+        let _ = std::fs::remove_file(&config_file);
+        drop(held);
+
+        let error = outcome.expect_err("a port another process holds is a start-up failure");
+        assert!(
+            error.starts_with("Unable to open serial port: "),
+            "the refusal opens with upstream's wording: {error}"
+        );
+        assert!(
+            error.contains(&pty.path.display().to_string()),
+            "the refusal names the port: {error}"
+        );
+        assert!(
+            error.contains("already open in another process"),
+            "the refusal names the reason: {error}"
+        );
+        assert!(!error.contains("panicked"), "{error}");
     }
 
     /// A host part that asks for a restart the first time it connects, and for

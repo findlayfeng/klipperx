@@ -17,7 +17,7 @@
 2. **完成即彻底删除**：条目做完后从正文**删除**，不保留打勾行（历史在 git；**大项索引留在文末「已完成（留档）」**，细项不留）删除前确认三件事已随同一提交落地：受影响手册已同步、
    回归/守卫数字已实测重核、旧断言（「尚未实现/待办」类）已一并清掉——即 AGENTS「改完必须同步
    手册」与三条硬要求的自查都做完了，才允许删。
-3. **归档只留大项**：`docs/work-log/` 的「已完成条目归档」只保留**子系统/框架队列/里程碑级**的
+3. **归档只留大项**：本文件的「已完成（留档）」只保留**子系统/框架队列/里程碑级**的
    大项（框架队列 FW*、MCU 配置构建层 F1、pins F2、G-Code 调度器 G1、语料框架与首个转绿、
    toolhead/kinematics、runtime 拆分、重启循环这类能独立命名的能力）；收尾、单命令/单端点/单验证、
    文案对齐、小修等**细项不进归档**，随「完成即删除」直接消失（需要时查 git 历史）。
@@ -75,6 +75,11 @@
 - 真板验证：`S1` 的双机并发压测（`stress.md` 已有单板数据）与 `M2` 的极性与保持。
 - TMC 的 SPI 「写 + 回读」切到 `McuSpi::transfer_with_preface`（入口已具备、TMC 未切；收敛判据是
   片选次数不变，见 `docs/klippy/developer-manual/README.md` 的 `tmc_spi.rs` 行与模块文档）。
+- CAN 帧的仲裁 id 未校验范围：`CanFrame::new` 只查长度（`interface/devices/canserial.rs:258-275`），
+  `to_abi` 直接把 `self.id` 写进内核布局；只有 `from_abi` 侧用 `CAN_SFF_MASK` 掩码。
+  写入路径应拒 `id > 0x7ff`（与上游 `canlib` 的行为对齐）。
+- ADC 样本时刻的相位：上游 `mcu.py:635,644` 的「每样本时刻比 report 周期晚一拍」是否等价，
+  本仓 `mcu/resource/adc.rs` 未逐行对过——待核（不影响当前语料）。
 
 **串口复用 / 桥（跨主机与固件）**
 
@@ -270,22 +275,22 @@
 | `emergency_stop` / `register_remote_method` / mux | `klippy/webhooks.py:319-340` |
 | gcode 调度器（命令表 / `run_script` / 输出） | `klippy/gcode.py:105-388` |
 | `GCodeIO`（伪 tty / 文件输入、`ack` 协议；**本仓不做**，`ack`/`need_ack` 已删） | `klippy/gcode.py:390-494` |
-| `output_pin`（`SET_PIN` / `GCodeRequestQueue` / 模板） | `klippy/extras/output_pin.py:13-269` |
+| `output_pin`（`SET_PIN` / `GCodeRequestQueue` / 模板） | `klippy/extras/output_pin.py:14-270` |
 | section 校验用注册表 | `klippy/configfile.py:425-445` |
 | mcu 作为 printer object、它的 status | `klippy/mcu.py:1147-1170`、`:1235`、`:938-975` |
 | stats 累计与 shutdown 处理 | `klippy/mcu.py:801-802`、`:883`、`:912`、`:974-975` |
 | 固件停机/重启事件 | `src/sched.c:310` `:318` `:351`、`klippy/mcu.py:813-835` `:880-881` |
-| `config_reset` 与 restart helper | `src/basecmd.c:262-272`、`klippy/mcu.py:756-770` |
+| `config_reset` 与 restart helper | `src/basecmd.c:262-272`、`klippy/mcu.py:754-766` |
 | reactor 定时器 / 回调 / 时钟 | `klippy/reactor.py:111` `:145` `:187` |
-| reactor latency 钩子 | `klippy/reactor.py:316`、`klippy/extras/garbage_collection.py:20` |
+| reactor latency 钩子 | `klippy/reactor.py:316`、`klippy/extras/garbage_collection.py:45`（`klippy:ready` 注册）/ `:70-74`（latency notifier） |
 | kinematics 的装载与接缝 | `klippy/toolhead.py:235-252`、`:389` `:400` `:482` `:507` `:522` |
 | 各 kinematics 的差异 | `klippy/kinematics/*.py`（`home` / `check_move` / `calc_position` / `get_status`） |
-| 通用回零驱动 | `klippy/extras/homing.py:165-300` |
+| 通用回零驱动 | `klippy/extras/homing.py:45-161`（`HomingMove`）/ `:164-300`（`Homing` 状态跟踪） |
 | IDEX / 双滑车 | `klippy/kinematics/idex_modes.py`、`klippy/kinematics/cartesian.py:19-30` |
 | step 生成层的运动学 | `klippy/kinematics/kinematic_stepper.py`、`rail.setup_itersolve(...)` |
 | 惰性装载 | `klippy/extras/adc_temperature.py:51` `load_object(config, 'query_adc')` |
 | SPI / I2C 总线 | `klippy/extras/bus.py:9-336`、`src/spicmds.c`、`src/i2ccmds.c` |
-| endstop / trsync 触发 | `klippy/mcu.py:155-407`、`src/endstop.c:72-120`、`src/trsync.c` |
+| endstop / trsync 触发 | `klippy/mcu.py:155-407`、`src/endstop.c:72-115`、`src/trsync.c` |
 | 加热器框架与温度传感器 | `klippy/extras/heaters.py`、`thermistor.py`、`temperature_sensor.py` |
 | G-Code 宏 / 变量 / 定时 | `klippy/extras/gcode_macro.py:41`、`save_variables.py`、`delayed_gcode.py` |
 | 打印流程与 SD 卡 | `klippy/extras/virtual_sdcard.py`、`print_stats.py`、`pause_resume.py:27-31` |
@@ -348,46 +353,9 @@
       runtime 尚在）→ 机器线程 drop runtime → join → abort 监听与 server（`src/klippy.rs`；
       `docs/klippy/developer-manual/runtime.md`）。
 
-- **主机层串起来**：`klippy_process`（建机器 → `api::register` → bind → `load_config`，
-      失败即 `invoke_shutdown` → `bring_up` → `run`）、`info` 端点、`StartArgs`
-      （`src/klippy.rs`、`api/endpoints/info.rs`、`api/start_args.rs`）。
+- **主机装配与启动参数**（子系统级）：`klippy_process` 的建机 → `api::register` → bind →
+      `load_config` → `bring_up` → `run` 顺序，`[mcu]`-only 与 `[printer]` 两种形态的装载段
+      （`DEFAULT_MODULES`/`TOOLHEAD_MODULES`），以及 `StartArgs`
+      （`src/klippy.rs`、`api/start_args.rs`、`load.rs`）。
 
-- **配置驱动装载**：静态工厂表、两段式构造顺序、section 级合法性校验（`load.rs`）。
-
-## 设备操作层剩余 P2（2026-10-20 评审留档，未修）
-
-来源：出真机前的 20 lane 设备代码评审（报告口径与证据见评审会话的 `.staging/device-review/REPORT.md`，不入库）。
-每条都复核过 file:line；**均不阻塞真机**，撞上了按这里直接改。
-
-- [x] **`same_file` / 重复 attach / 重开轮次 / 停端口握手 / `answers_for` / reader panic / scan 读窗口 / 排他打开 / 无界 channel —— 均已修（2026-10-21）**：
-      共 9 条，按本节的修法方向全部落地（`serial.rs` + `frame.rs`），每条带改前必红的用例。
-- [x] **隧道的静默顶替与丢单元 —— 已修（2026-10-22）**：`TunnelRegistry::register` 与 `UnitRegistry::register`
-      同 id 顶替现在都 `warn!`（带 arb）；`UnitRegistry` 的丢单元两条失败臂（receiver 已掉 / `has`→`deliver` 之间离开）
-      也 `warn!`（带 arb、原因、单元字节数）。**顶替语义本身保留**（既有契约用例钉着它，改 `Result` 会波及三条链路的
-      setter）；`clear_tunnel_sink` 的「从不调用」仍是有意设计（`bridge_flash.rs` 靠 drop receiver 隐式退订）。
-- [x] **桥端口数上限对齐固件 —— 已修（2026-10-22）**：`mcu/object.rs` 新增 `BRIDGE_MAX_PORTS = 4`
-      （固件没有字典常量，故主机常量 + 注释指回 `third_party/klipper/src/bridge.c:65`，并注明 `:76-77` 的编译期断言），
-      `next_bridge_port_index` 超限即报错并**点名槽号与上限**（此前主机允许 256、只靠固件 shutdown 兜住）。
-      钉子：配置期第 5 口报错 / 4 口可载 / 主机常量与固件 `#define` 防漂移。
-- [x] **设备层小件批 —— 已落地（2026-10-21）**：`seconds_to_clock` 拒绝负值/NaN/∞（钳位下移到 `step_pulse_duration` 一处）、
-      `move_clocks` 发送失败退回槽位、`TriggerDispatch::stop()` 保留原始失败理由（探针失败不再读成主机请求）、
-      `trigger_analog` 的 arm 带 `reqclock` 且先停再清了、端停链路故障不再吞掉 `Communication timeout during homing`、
-      `stress --task step` 加行程上界（`position_max × 0.5`）+ 三种出口（断线 exit 1）+ `shutdown_timeout` + 有界 `wait_for_idle`。
-- [x] **待答调用的两条语义 —— 均已落地（2026-10-21 / 2026-10-22）**：
-      ① `cancel` 按 token 精确删（`register` 返回 `PendingCallToken`，计数在登记表内 `Arc<AtomicU64>`、随 clone 共享；
-      三条清理路径都按自己那笔的 token 取消）；
-      ② `resolve` 对「有同名登记但 oid 不匹配」**不再返回 `true`**：不消费、返回 `false`，消息照常走
-      「绑定回调 / `Unhandled` 告警」那条路（对齐上游 `handle_default` 的可见性，此前只留一条 `debug!`）。
-      钉子：`test_an_answer_for_another_oid_is_not_swallowed`（假 MCU：oid 8 的应答被投递给该消息上绑定的
-      回调、call 仍在等 oid 7；用回调而不是日志做证据，避免依赖接收任务跑在哪个线程）。
-- [x] **`hardware_test` 的用例级总超时与 teardown 护栏 —— 已落地（2026-10-21）**：
-      `hardware_test::case`/`async_case` 把用例体放自管线程、主线程 `recv_timeout(300 s)` 并打
-      `HW-TIMEOUT: <用例>: still at <阶段> after <时长>`；板锁 `LOCK_EX|LOCK_NB` 轮询、`LOCK_TIMEOUT=600 s`
-      （大于用例预算，慢前驱不误报）；teardown 先关加热/输出再拆机器；`apply_id_addressed_transport`
-      补齐 `host_mux`/`host_port_paths`。
-- [x] **注释/文档与实现不符的存量 —— 已修（2026-10-22）**：`mcu/ids.rs` 的「串口 id 无人消费」改成实情
-      （它落进 `McuConfig.id`，是传输层开链的前置条件，且与 CAN node id 共用一条序列）；`MoveSlots` 的
-      move-class 名单去掉 `set_next_step_dir`（固件 `stepper.c:294-301` 只置标志、不 `move_alloc`，
-      本仓也确实走普通发送路径）；`resource/stepper.rs` 的「`step_pulse_duration=0` 让固件自己挑」按
-      上游 `stepper.py:108-110` 的实情写成「老 MCU 的 both-edge 模式靠零脉宽开启」。
 

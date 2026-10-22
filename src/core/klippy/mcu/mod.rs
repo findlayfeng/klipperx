@@ -156,6 +156,15 @@ const SYNC_SEND_POLL_START: Duration = Duration::from_micros(50);
 /// `capacity()`.
 const SYNC_SEND_POLL_MAX: Duration = Duration::from_millis(10);
 
+/// How long [`Mcu::send_wait_ack`] waits for the firmware's acknowledgement of
+/// the block it sent — the bound the sensor drivers pass.
+///
+/// Upstream's `RetryAsyncCommand.TIMEOUT_TIME` (`klippy/mcu.py:42`), the bound it
+/// puts on the very wait its query commands sit in (`:60-72`). The ack of a
+/// block normally lands within one round trip (tens of milliseconds), so this is
+/// the "the firmware has stopped answering" case, not a latency budget.
+pub(crate) const SEND_WAIT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
+
 use crate::core::klippy::load::section;
 
 // The `[mcu]` / `[mcu <name>]` sections. The factories are re-exported from
@@ -209,6 +218,9 @@ enum SendItem {
     /// Adopt the sequence the firmware last reported and signal completion
     /// (see [`Mcu::renumber_to_firmware`]).
     Renumber(oneshot::Sender<()>),
+    /// A message to send in a block of its own, then signal completion once the
+    /// firmware acknowledges that block (see [`Mcu::send_wait_ack`]).
+    Ack(Payload, oneshot::Sender<()>),
 }
 
 /// The scheduling gates a message carries: upstream's `min_clock`/`req_clock`,
@@ -292,16 +304,23 @@ enum Parked {
     /// barrier includes the parked messages, so the barrier waits with them.
     /// The `Instant` is when the barrier was queued (how long it waited).
     Flush(oneshot::Sender<()>, Instant),
+    /// [`Mcu::send_wait_ack`] behind parked messages: its block must not jump
+    /// the messages queued ahead of it, and it must be a block of its own — the
+    /// wait is registered against **that** block's sequence.
+    Ack(ParkedMsg, oneshot::Sender<()>),
 }
 
 impl Parked {
-    fn is_flush(&self) -> bool {
-        matches!(self, Self::Flush(..))
+    /// Whether this item ends the run of messages a batch may take (only the
+    /// messages ahead of it are eligible), and therefore has to be handled by
+    /// the send task itself rather than merged into a batch.
+    fn is_boundary(&self) -> bool {
+        matches!(self, Self::Flush(..) | Self::Ack(..))
     }
 
     fn clocks(&self) -> SendClocks {
         match self {
-            Self::Payload(msg) => msg.clocks,
+            Self::Payload(msg) | Self::Ack(msg, _) => msg.clocks,
             Self::Flush(..) => SendClocks::default(),
         }
     }
@@ -443,7 +462,7 @@ fn take_released(
 ) -> Option<Payload> {
     // Only the run before the first barrier may be picked; a barrier is a
     // boundary for everything queued behind it.
-    let selectable = parked.iter().take_while(|item| !item.is_flush()).count();
+    let selectable = parked.iter().take_while(|item| !item.is_boundary()).count();
     let (index, _) = parked
         .iter()
         .enumerate()
@@ -474,6 +493,10 @@ fn take_released(
         // Unreachable: `index` came from the prefix before any barrier.
         Some(Parked::Flush(done, queued_at)) => {
             parked.insert(index, Parked::Flush(done, queued_at));
+            None
+        }
+        Some(Parked::Ack(msg, done)) => {
+            parked.insert(index, Parked::Ack(msg, done));
             None
         }
         None => None,
@@ -521,6 +544,35 @@ fn park_flush(parked: &mut VecDeque<Parked>, done: oneshot::Sender<()>, board: &
         parked.len()
     );
     parked.push_back(Parked::Flush(done, Instant::now()));
+}
+
+/// Queue a message whose block the caller waits to see acknowledged
+/// ([`Mcu::send_wait_ack`]).
+///
+/// It is parked like the messages ahead of it rather than sent around them: the
+/// command has to reach the firmware in the order it was queued, or the ack
+/// would prove the wrong thing. The message itself is ungated — upstream queues
+/// it with the plain send's clocks — so nothing holds it back once the messages
+/// before it are out.
+fn park_ack(
+    parked: &mut VecDeque<Parked>,
+    payload: Payload,
+    done: oneshot::Sender<()>,
+    board: &str,
+) {
+    debug!(
+        "[{board}] ack wait queued behind {} parked message(s)",
+        parked.len()
+    );
+    parked.push_back(Parked::Ack(
+        ParkedMsg {
+            payload,
+            clocks: SendClocks::default(),
+            parked_at: Instant::now(),
+            held_by: "none",
+        },
+        done,
+    ));
 }
 
 /// When the send task should next look at the parked gates: the earliest
@@ -1438,6 +1490,13 @@ struct Sender {
     /// none. The send task's `select!` arms on it, so a block the firmware never
     /// answered does not wait for the firmware to speak first.
     retransmit_at: Option<tokio::time::Instant>,
+    /// Blocks a caller waits to see acknowledged, each with the signal that
+    /// releases it ([`Mcu::send_wait_ack`]). Upstream keeps the same list in its
+    /// serial queue (`serialqueue.c:498-506`, `notify_queue`): a block is
+    /// acknowledged when the firmware's counter passes it, and the caller is
+    /// released then. A waiter whose receiver is gone (it timed out) is dropped
+    /// on the next ack.
+    ack_waiters: Vec<(u64, oneshot::Sender<()>)>,
 }
 
 impl Sender {
@@ -1452,7 +1511,43 @@ impl Sender {
             retransmitted: None,
             rto: MIN_RTO,
             retransmit_at: None,
+            ack_waiters: Vec::new(),
         }
+    }
+
+    /// Register a caller waiting for the acknowledgement of the block that was
+    /// **just written** ([`Sender::send_block`] returns only once it is out).
+    ///
+    /// The block's own sequence, not "everything sent so far": a later block
+    /// being acknowledged implies this one was too (the firmware acks blocks in
+    /// order), so keying on it is what upstream's notify list does with the
+    /// sequence the message went out under (`serialqueue.c:500-503`).
+    fn wait_for_last_block_ack(&mut self, done: oneshot::Sender<()>) {
+        let seq = self.wire.next.load(Ordering::Relaxed).saturating_sub(1);
+        debug!("Waiting for the ack of block {seq}");
+        self.ack_waiters.push((seq, done));
+    }
+
+    /// Release every caller whose block the firmware's counter has passed —
+    /// `seen` is where that counter is, so everything below it was taken.
+    ///
+    /// Called with the same number that pops the acknowledged blocks
+    /// ([`Sender::settle`]), so a wait cannot outlive the proof it waits for. A
+    /// waiter that is no longer listening (its caller timed out and dropped the
+    /// receiver) goes without a signal.
+    fn resolve_acks(&mut self, seen: u64) {
+        let mut waiting = Vec::with_capacity(self.ack_waiters.len());
+        for (seq, done) in std::mem::take(&mut self.ack_waiters) {
+            if seq < seen {
+                debug!("Ack: block {seq} taken by the firmware, releasing its waiter");
+                let _ = done.send(());
+            } else if done.is_closed() {
+                debug!("Ack: the caller waiting for block {seq} gave up");
+            } else {
+                waiting.push((seq, done));
+            }
+        }
+        self.ack_waiters = waiting;
     }
 
     /// When the unacknowledged blocks should be sent again, if any are.
@@ -1698,6 +1793,12 @@ impl Sender {
             self.wire.next.store(seen, Ordering::Relaxed);
             self.acked = None;
             self.retransmitted = None;
+            // The waiters were keyed to the numbers of a window that is being
+            // abandoned, and the blocks under them go out again renumbered, so
+            // nothing that arrives from now on can answer them. Dropping the
+            // receivers reports the wait as abandoned; the caller's own timeout
+            // is what bounds it either way.
+            self.ack_waiters.clear();
             // The pinned sample belongs to the window being abandoned; the blocks
             // go out again under the adopted numbers, and the first of those
             // writes pins the next one.
@@ -1726,6 +1827,9 @@ impl Sender {
             debug!("Block {} acknowledged", block.seq);
             acked_tx = Some(block.sent_at);
         }
+        // The same number that proves the blocks above were taken answers the
+        // callers waiting for one of them (`Mcu::send_wait_ack`).
+        self.resolve_acks(seen);
         if self.in_flight.is_empty() {
             // Everything is answered, so there is nothing to retransmit, and
             // the wait starts over at the estimate — the floor only while no
@@ -1807,6 +1911,9 @@ impl Sender {
         // arrives (`place_frame`), so it cannot outlive this renumber.
         self.wire.connection_init.store(true, Ordering::Relaxed);
         self.in_flight.clear();
+        // Waits keyed to the abandoned numbering cannot be answered any more
+        // (`Sender::settle`, same reason).
+        self.ack_waiters.clear();
         self.retransmit_at = None;
         self.acked = None;
         self.retransmitted = None;
@@ -1870,11 +1977,14 @@ impl Mcu {
         let board_for_recv = board.clone();
         let send_handle = handle.spawn(async move {
             let mut sender = Sender::new(Arc::clone(&wire_for_send));
-            // What the two gates hold back: messages not released yet, and
-            // flush barriers queued behind them (`Parked`).
+            // What the two gates hold back: messages not released yet, plus the
+            // flush barriers and ack waits queued behind them (`Parked`).
             let mut parked: VecDeque<Parked> = VecDeque::new();
             let gates_open = Arc::clone(&gates_open_for_task);
             'outer: loop {
+                // Set when this batch carries a message whose block the caller
+                // waits to see acknowledged (`Mcu::send_wait_ack`).
+                let mut carried_ack: Option<oneshot::Sender<()>> = None;
                 // Wait for the first message the gates release — or for the
                 // firmware's counter to move, which is what asks for a block to
                 // go out again. A flush with nothing queued before it is
@@ -1897,6 +2007,16 @@ impl Mcu {
                                 queued_at.elapsed().as_secs_f64() * 1000.
                             );
                             let _ = done.send(());
+                        }
+                        continue;
+                    }
+                    // A message waiting for its block's acknowledgement, with
+                    // nothing ahead of it: it goes out as a block of its own so
+                    // that the ack it waits for is that block's (`carried_ack`).
+                    if matches!(parked.front(), Some(Parked::Ack(..))) {
+                        if let Some(Parked::Ack(msg, done)) = parked.pop_front() {
+                            carried_ack = Some(done);
+                            break msg.payload;
                         }
                         continue;
                     }
@@ -1939,6 +2059,12 @@ impl Mcu {
                                 sender.renumber_to_firmware();
                                 let _ = applied.send(());
                             }
+                            // Queued behind whatever the gates are holding:
+                            // its block must not jump the messages ahead of it
+                            // (`park_ack`).
+                            Some(SendItem::Ack(p, done)) => {
+                                park_ack(&mut parked, p, done, &board);
+                            }
                             None => break 'outer, // channel closed
                         },
                         changed = acks_rx.changed() => {
@@ -1960,11 +2086,14 @@ impl Mcu {
                 };
 
                 // Coalesce more payloads until the batch is full, a flush asks
-                // for a boundary, or the line goes idle.
+                // for a boundary, or the line goes idle. A batch carrying an ack
+                // wait takes nothing more: the wait is registered against the
+                // block this batch becomes, and a message queued after it
+                // belongs in a block of its own.
                 let mut flush_done = None;
                 loop {
                     // Check if buffer is sufficiently full
-                    if payload.len() >= MESSAGE_PAYLOAD_MAX * 2 / 3 {
+                    if payload.len() >= MESSAGE_PAYLOAD_MAX * 2 / 3 || carried_ack.is_some() {
                         break;
                     }
 
@@ -2049,6 +2178,12 @@ impl Mcu {
                                     sender.renumber_to_firmware();
                                     let _ = applied.send(());
                                 }
+                                // Behind this batch: its own block follows, and
+                                // the wait is registered against that one
+                                // (`park_ack`).
+                                Some(SendItem::Ack(next_payload, done)) => {
+                                    park_ack(&mut parked, next_payload, done, &board);
+                                }
                                 None => {
                                     // Channel closed
                                     break;
@@ -2094,6 +2229,15 @@ impl Mcu {
                 let written = sender
                     .send_block(&interface_for_send, payload.into_raw())
                     .await;
+                if let Some(done) = carried_ack {
+                    // The wait belongs to the block just written; one that never
+                    // reached the wire cannot be acknowledged, and dropping the
+                    // sender is how the caller hears it (the same way a flush
+                    // barrier fails, see below).
+                    if written {
+                        sender.wait_for_last_block_ack(done);
+                    }
+                }
                 if let Some((done, queued_at)) = flush_done {
                     // A batch that never reached the wire is no boundary: the
                     // barrier fails with the connection instead of telling the
@@ -2982,6 +3126,88 @@ impl Mcu {
             }
             Err(_) => {
                 Err(McuCallError::Timeout(format!("flush not reached within {timeout:?}")).into())
+            }
+        }
+    }
+
+    /// Send a command and wait until the firmware has **taken** the block that
+    /// carried it.
+    ///
+    /// Upstream's `CommandWrapper.send_wait_ack` (`klippy/mcu.py:125-127`):
+    /// [`Mcu::send`] only hands the bytes to the send task's queue, so the
+    /// firmware may not have read the command yet, while a chip driver that
+    /// arms or halts a stream needs it to have reached the board before the
+    /// host moves on. What is waited for is the firmware's acknowledgement of
+    /// the wire block (its empty ack frame,
+    /// `serialqueue.c:271-287`); upstream's `raw_send_wait_ack` waits for the
+    /// same thing through its notify list (`klippy/serialhdl.py:254-263`).
+    ///
+    /// The message queues like any other, so the order is the order it was
+    /// queued in, and it goes out as a block of its own — a batch already being
+    /// coalesced ahead of it is written first, and messages queued after it
+    /// wait for the next block. That is what makes the wait mean this block:
+    /// an older block's ack cannot satisfy it.
+    ///
+    /// `timeout` bounds the **whole** call, queueing included: a send task that
+    /// stopped draining, or a firmware that never answers, reports
+    /// [`McuCallError::Timeout`] instead of holding the caller — the same
+    /// bounded wait upstream's `RetryAsyncCommand` puts on an unanswered query
+    /// (`klippy/mcu.py:41-42`, `TIMEOUT_TIME`). Nothing else is left behind: the
+    /// wait is dropped, and the queue keeps sending.
+    ///
+    /// # Errors
+    /// Returns [`McuError::Msg`] if the arguments do not match the firmware's
+    /// format string, and [`McuError::Call`] if the connection is closed, the
+    /// send task is gone, or the acknowledgement did not arrive within
+    /// `timeout`.
+    pub(crate) async fn send_wait_ack(
+        &self,
+        name: &str,
+        args: &[ArgValue],
+        timeout: Duration,
+    ) -> Result<(), McuError> {
+        let payload = self.parser.encode(name, args)?;
+        let describe = self.describe_command(name, args);
+        if self.is_closed() {
+            return Err(
+                McuCallError::SendFailed(format!("{describe}: the connection is closed")).into(),
+            );
+        }
+        let deadline = tokio::time::Instant::now() + timeout;
+        let (done_tx, done_rx) = oneshot::channel();
+        debug!("[{}] send {describe} (waiting for the ack)", self.name);
+        match tokio::time::timeout_at(
+            deadline,
+            self.send_buf_tx.send(SendItem::Ack(payload, done_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(McuError::Call(McuCallError::SendFailed(e.to_string())));
+            }
+            Err(_) => {
+                return Err(McuCallError::Timeout(format!(
+                    "{describe} not queued within {timeout:?}"
+                ))
+                .into());
+            }
+        }
+        match tokio::time::timeout_at(deadline, done_rx).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(McuCallError::SendFailed(format!(
+                "the ack wait for {describe} was dropped"
+            ))
+            .into()),
+            Err(_) => {
+                warn!(
+                    "[{}] Timeout on wait for the ack of '{describe}'",
+                    self.name
+                );
+                Err(
+                    McuCallError::Timeout(format!("no ack for {describe} within {timeout:?}"))
+                        .into(),
+                )
             }
         }
     }
@@ -5117,6 +5343,117 @@ mod tests {
             recorder.frames().is_empty(),
             "nothing reached the transport"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // send_wait_ack: the firmware's acknowledgement of the block
+    // -----------------------------------------------------------------------
+
+    /// The commands the two `send_wait_ack` tests use: one message each, so a
+    /// block's bytes name the message that is in it.
+    fn ack_test_mcu(interface: Interface) -> Mcu {
+        let mcu = Mcu::for_test("test_mcu", interface);
+        let dictionary = Dictionary::from_json(serde_json::json!({
+            "commands": {"get_clock": 5, "get_uptime": 6}
+        }))
+        .unwrap();
+        mcu.install_dictionary(dictionary).unwrap();
+        mcu
+    }
+
+    /// [`Mcu::send_wait_ack`] returns once the firmware has taken the block, and
+    /// the command goes out behind what was queued before it, in a block of its
+    /// own — the ack it waits for is that block's and no older one's.
+    #[tokio::test]
+    async fn test_send_wait_ack_returns_when_the_firmware_takes_the_block() {
+        let wire = RecordingWire::new();
+        let handle = wire.clone();
+        let sent = handle.sent();
+        let mcu = ack_test_mcu(Interface::recording(wire));
+
+        // A plain send first: the ack waits for the block carrying *it*, so the
+        // two messages must not end up in one frame and the first must go out
+        // first.
+        mcu.send("get_uptime", &[]).expect("the command queues");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_clock", &[], Duration::from_millis(500)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect("the wire acks every block");
+
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || sent.lock().unwrap().len() == 2,
+            "both messages reach the wire, in two blocks",
+        )
+        .await;
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![vec![6], vec![5]],
+            "the queued message first, the acked one in its own block behind it"
+        );
+    }
+
+    /// A firmware that never acknowledges the block reports a bounded timeout,
+    /// and the send path is still usable afterwards: the abandoned wait leaves
+    /// nothing behind in the queue.
+    #[tokio::test]
+    async fn test_send_wait_ack_times_out_and_a_later_send_still_goes() {
+        let wire = RecordingWire::new();
+        let handle = wire.clone();
+        let sent = handle.sent();
+        let mcu = ack_test_mcu(Interface::recording(wire));
+
+        handle.silence_acks();
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_clock", &[], Duration::from_millis(100)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect_err("no ack ever comes back");
+        assert!(
+            matches!(error, McuError::Call(McuCallError::Timeout(_))),
+            "reports the timeout: {error}"
+        );
+
+        // The block did reach the wire — the timeout says nothing was
+        // acknowledged, not that nothing was sent. The unanswered block is
+        // retransmitted while it waits, so the record may hold it more than once.
+        assert!(
+            sent.lock()
+                .unwrap()
+                .iter()
+                .all(|payload| *payload == vec![5]),
+            "only the unanswered block went out: {:?}",
+            sent.lock().unwrap()
+        );
+        assert!(!sent.lock().unwrap().is_empty());
+
+        // The connection still works: the next wait is answered as usual.
+        handle.resume_acks();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            mcu.send_wait_ack("get_uptime", &[], Duration::from_secs(2)),
+        )
+        .await
+        .expect("the wait is bounded")
+        .expect("the firmware answers again");
+        wait_until(
+            Duration::from_secs(2),
+            Duration::from_millis(5),
+            || {
+                sent.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|payload| *payload == vec![6])
+            },
+            "the second message reaches the wire too",
+        )
+        .await;
     }
 
     /// A retransmit the transport refuses keeps its block: the firmware is still

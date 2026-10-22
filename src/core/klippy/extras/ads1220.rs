@@ -33,9 +33,6 @@
 //!   error from the batch helper's start callback, so the failure is logged and
 //!   the stream stays down — same "the chip did not answer as expected" signal,
 //!   without taking the host with it.
-//! * `_finish_measurements` upstream waits for the firmware's ack
-//!   (`send_wait_ack`); this port sends the same `query_ads1220 … rest_ticks=0`
-//!   without waiting, as the other bulk sensors here do.
 //!
 //! # Known gaps
 //!
@@ -54,7 +51,9 @@ use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, ClientCb, FixedFreqReader, LifecycleCb, Sample, MAX_BULK_MSG_SIZE,
 };
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
-use crate::core::klippy::mcu::{pin_number, ConfigBuilder, Mcu, McuError, McuObject, McuSpi};
+use crate::core::klippy::mcu::{
+    pin_number, ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::Printer;
 
@@ -800,10 +799,16 @@ impl Ads1220State {
             return Ok(());
         }
         let mcu = self.connected_mcu().map_err(to_string)?;
-        mcu.send_msg(&QueryAds1220 {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        // Upstream's `send_wait_ack`: the host moves on (`note_end`) only once
+        // the firmware has taken the command that halts the stream.
+        mcu.send_msg_wait_ack(
+            &QueryAds1220 {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(to_string)?;
         self.ffreader.note_end();
         tracing::info!("ADS1220 finished '{}' measurements", self.name);

@@ -85,7 +85,9 @@ impl FrameMock {
 /// recorded (no input validation — the gate tests assert *when* something goes
 /// out, and the derived command bytes are not worth predicting), each block is
 /// acked with `seq + 1`, and every scripted request is answered with a canned
-/// response so a `call` round trip can complete.
+/// response so a `call` round trip can complete. [`RecordingWire::silence_acks`]
+/// turns the first two off for the tests that need a firmware which stopped
+/// answering.
 ///
 /// Cloneable: each clone is a new **view** of the wire — its own place in the
 /// receive queue and its own lifetime — while the record, the scripted
@@ -116,6 +118,10 @@ struct RecordingWireInner {
     sent: Arc<Mutex<Vec<Vec<u8>>>>,
     replies: Mutex<Vec<(Vec<u8>, Vec<u8>)>>,
     tx: Mutex<Option<Sender<Frame>>>,
+    /// Set by [`RecordingWire::silence_acks`]: every block is taken and
+    /// recorded, and nothing at all is sent back — what a firmware that stopped
+    /// answering looks like to the send task.
+    acks_silent: AtomicBool,
 }
 
 impl Clone for RecordingWire {
@@ -136,6 +142,7 @@ impl RecordingWire {
                 sent: Arc::new(Mutex::new(Vec::new())),
                 replies: Mutex::new(Vec::new()),
                 tx: Mutex::new(Some(tx)),
+                acks_silent: AtomicBool::new(false),
             }),
             rx,
             closed: Arc::new(AtomicBool::new(false)),
@@ -168,6 +175,20 @@ impl RecordingWire {
     pub fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
+
+    /// Stop answering: every block is still taken and recorded, but no ack and
+    /// no scripted reply comes back — the firmware that went quiet under a
+    /// caller waiting for its acknowledgement ([`Mcu::send_wait_ack`]).
+    ///
+    /// [`Mcu::send_wait_ack`]: crate::core::klippy::mcu::Mcu::send_wait_ack
+    pub fn silence_acks(&self) {
+        self.inner.acks_silent.store(true, Ordering::SeqCst);
+    }
+
+    /// Answer again, ending [`RecordingWire::silence_acks`].
+    pub fn resume_acks(&self) {
+        self.inner.acks_silent.store(false, Ordering::SeqCst);
+    }
 }
 
 impl std::fmt::Debug for RecordingWire {
@@ -182,6 +203,11 @@ impl Device for RecordingWire {
     fn send(&self, frame: &Frame) -> Result<(), InterfaceError> {
         let payload = frame.payload().to_vec();
         self.inner.sent.lock().unwrap().push(payload.clone());
+        // A silent wire takes the block and says nothing back: no ack, no
+        // scripted answer (`RecordingWire::silence_acks`).
+        if self.inner.acks_silent.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         let tx = self.inner.tx.lock().unwrap().clone();
         let Some(tx) = tx else {
             return Ok(());

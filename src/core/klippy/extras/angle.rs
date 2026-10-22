@@ -63,7 +63,9 @@ use crate::core::klippy::extras::bulk_sensor::{
 };
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SendClocks};
+use crate::core::klippy::mcu::{
+    ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SendClocks, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
 // Loaded after `[board_pins]` (order 40) so an alias or a software bus can name
@@ -642,15 +644,18 @@ impl AngleState {
     /// Halt the bulk stream (`_finish_measurements`).
     async fn finish_measurements(&self) -> Result<(), String> {
         let mcu = self.connected_mcu()?;
-        // Upstream's `send_wait_ack` blocks for the ack; the queued messages
-        // ahead of this one preserve the order, so the fire-and-forget send is
-        // enough here.
-        mcu.send_msg(&QuerySpiAngle {
-            oid: self.oid,
-            clock: 0,
-            rest_ticks: 0,
-            time_shift: 0,
-        })
+        // Upstream's `send_wait_ack`: the queue is cleared only once the
+        // firmware has taken the command that halts the stream.
+        mcu.send_msg_wait_ack(
+            &QuerySpiAngle {
+                oid: self.oid,
+                clock: 0,
+                rest_ticks: 0,
+                time_shift: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(|err| err.to_string())?;
         self.queue.clear_queue();
         tracing::info!("Stopped angle '{}' measurements", self.name);

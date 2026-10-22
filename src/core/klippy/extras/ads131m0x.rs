@@ -26,10 +26,12 @@
 //!
 //! # Known gaps
 //!
-//! * The `query_ads131m0x` halts in `_start_measurements` / `_finish_measurements`
-//!   are plain sends: upstream's `send_wait_ack` (and the `spi_transfer`
-//!   `minclock` that holds the reset acknowledgement past `T_REGACQ`) have no
-//!   counterpart in this port's `spi_send` / `spi_transfer` pair.
+//! * Upstream's `spi_transfer` `minclock`, which holds the reset
+//!   acknowledgement past `T_REGACQ`, has no counterpart in this port's
+//!   `spi_send` / `spi_transfer` pair. The halts themselves are not a gap: the
+//!   `query_ads131m0x` writes in `_start_measurements` / `_finish_measurements`
+//!   wait for the firmware's acknowledgement like upstream's `send_wait_ack`
+//!   (`Mcu::send_msg_wait_ack`).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
@@ -44,7 +46,9 @@ use crate::core::klippy::extras::bulk_sensor::{
     BatchBulkHelper, BatchCb, ClientCb, FixedFreqReader, LifecycleCb, Sample, BATCH_INTERVAL,
 };
 use crate::core::klippy::extras::spi_device::{mcu_object_name, mcu_spi_from_config};
-use crate::core::klippy::mcu::{pin_number, ConfigBuilder, Mcu, McuError, McuObject, McuSpi};
+use crate::core::klippy::mcu::{
+    pin_number, ConfigBuilder, Mcu, McuError, McuObject, McuSpi, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::Printer;
 
@@ -913,12 +917,17 @@ impl Ads131M0xState {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = 0;
         let mcu = self.connected_mcu().map_err(to_string)?;
-        // Be sure to halt bulk reading before resetting (upstream uses
-        // `send_wait_ack` here; this port has no acknowledgement to wait for).
-        mcu.send_msg(&QueryAds131M0x {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        // Be sure to halt bulk reading before resetting: upstream waits for the
+        // firmware to take this command (`send_wait_ack`) before it touches the
+        // chip.
+        mcu.send_msg_wait_ack(
+            &QueryAds131M0x {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(to_string)?;
         self.reset_chip().await?;
         self.setup_chip().await?;
@@ -941,10 +950,16 @@ impl Ads131M0xState {
             return Ok(());
         }
         let mcu = self.connected_mcu().map_err(to_string)?;
-        mcu.send_msg(&QueryAds131M0x {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        // Upstream's `send_wait_ack`: the host moves on (`note_end`) only once
+        // the firmware has taken the command that halts the stream.
+        mcu.send_msg_wait_ack(
+            &QueryAds131M0x {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(to_string)?;
         self.ffreader.note_end();
         tracing::info!("{} finished '{}' measurements", self.sensor_type, self.name);

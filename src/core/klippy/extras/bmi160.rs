@@ -58,7 +58,9 @@ use crate::core::klippy::extras::mpu9250::{
     convert_samples, read_axes_map, AccelQueryHelper, AxesMap,
 };
 use crate::core::klippy::load::section;
-use crate::core::klippy::mcu::{ConfigBuilder, I2cMode, Mcu, McuError, McuI2c, McuObject};
+use crate::core::klippy::mcu::{
+    ConfigBuilder, I2cMode, Mcu, McuError, McuI2c, McuObject, SEND_WAIT_ACK_TIMEOUT,
+};
 use crate::core::klippy::pins::{PrinterPins, PINS_OBJECT};
 use crate::core::klippy::printer::{Printer, PrinterObject};
 
@@ -578,14 +580,17 @@ impl Bmi160State {
     /// (`_finish_measurements`).
     async fn finish_measurements(&self) -> Result<(), String> {
         self.set_reg(REG_CMD, CMD_ACC_PM_SUSPEND).await?;
-        // Upstream's `send_wait_ack` blocks for the ack; the queued messages
-        // ahead of this one (including the register write above) preserve the
-        // order, so the fire-and-forget send is enough here.
+        // Upstream's `send_wait_ack`: the host moves on (`note_end`) only once
+        // the firmware has taken the command that halts the stream.
         let mcu = self.connected_mcu()?;
-        mcu.send_msg(&QueryBmi160 {
-            oid: self.oid,
-            rest_ticks: 0,
-        })
+        mcu.send_msg_wait_ack(
+            &QueryBmi160 {
+                oid: self.oid,
+                rest_ticks: 0,
+            },
+            SEND_WAIT_ACK_TIMEOUT,
+        )
+        .await
         .map_err(|err| err.to_string())?;
         self.ffreader.note_end();
         tracing::info!("BMI160 finished '{}' measurements", self.name);

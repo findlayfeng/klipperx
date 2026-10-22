@@ -161,7 +161,8 @@ KLIPPERX_HW_CONFIG=~/printer.cfg cargo test -p klipperx --lib hardware_test::pla
 | `KLIPPERX_UPSTREAM_FILTER` | 未设置 | 只跑名字匹配的语料用例（迭代加速用；**不设置 = 237 全量原样**，默认路径零变化）。 |
 | `KLIPPERX_KEEP_GATES` | 未设置 | 设成任意值后，`test:` fake 传输也**不放行**两道时钟闸——复现「闸×语料」交互用（如 iqex 的 `Invalid sequence` 配方），默认 fake 放行。 |
 | `KLIPPERX_TRACE` | 未设置（关闭） | 非 `0` 值打开诊断 trace：模拟器与 MCU 拆除打的 `SIM-DIAG: …` / `MCU DROP …` 行（追挂起用，平时是噪声）。 |
-| `KLIPPERX_HW_CONFIG` | 未设置 | 真机用例要读的**用户 printer 配置**路径：接口（`[mcu]` 的 `serial`/`uuid`）与「哪些模块存在」都从它推导。未设置（或配置不满足该用例的声明）时，`--ignored` 显式请求也会打 `HW-IGNORED: <用例>: <原因>` 并**通过**（跳过而不是失败）；不带 `--ignored` 不执行。 |
+| `KLIPPERX_HW_CONFIG` | 未设置 | 真机用例要读的**用户 printer 配置**路径：接口（`[mcu]` 的 `serial`/`uuid`）与「哪些模块存在」都从它推导。未设置时，`--ignored` 显式请求只会打一行 `HW-IGNORED: <用例>: KLIPPERX_HW_CONFIG is not set` 并跳过（「没接板」不算失败）；不带 `--ignored` 不执行。一旦给了路径，配置撑不起某条用例就按下一行的严格模式判失败。 |
+| `KLIPPERX_HW_STRICT` | 未设置（= 严格） | 真板 lane 的严格模式开关。默认开：配置**不提供该用例声明的东西**（`.mcu()` / `.section()` / `.option()`），或里面写了本仓**暂不实现**的对象（`samd_sercom` / `replicape` / `palette2`，见 [`upstream-deviations.md`](docs/klippy/developer-manual/upstream-deviations.md) §1.2），该用例**失败**并说清缺什么。置 `0` / `false` / `no` 退回旧行为（打 `HW-IGNORED` 后通过）。 |
 | `KLIPPERX_USB_IDS` | `1d50:614e 1d50:606f` | `scripts/klipperx-usb-udev.sh` 按空格分隔的 `vendor:product` 找 Klipper 设备；自编固件改了 USB id 时用。 |
 | `RUST_LOG` | `info` | 宿主与客户端的日志过滤器；与 `--verbose` 取更详细者（`--verbose` 保底 `debug`），解析不了则忽略。 |
 

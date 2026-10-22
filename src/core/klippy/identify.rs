@@ -864,7 +864,7 @@ mod tests {
     use super::*;
     use crate::core::klippy::cmd::identify::IDENTIFY_CHUNK_SIZE;
     use crate::core::klippy::frame::Frame;
-    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry};
+    use crate::core::klippy::interface::devices::frame_mock::{FrameMock, MappingEntry, RecordingWire};
     use crate::core::klippy::interface::Interface;
     use crate::core::klippy::msg::proto::Payload;
     use flate2::write::{DeflateEncoder, ZlibEncoder};
@@ -1657,5 +1657,357 @@ mod tests {
 
         assert!(matches!(err, McuError::Call(_)), "{err:?}");
         assert!(!mcu.is_identified());
+    }
+
+    // -----------------------------------------------------------------------
+    // The identity readback: name chosen by dictionary, uuid compared
+    // -----------------------------------------------------------------------
+
+    // The two names a carrier declares for the identity question, and the reply
+    // both answer with (`generic/canserial.c`, `mux.c`). The ids are the test
+    // dictionary's own; what has to hold is that the *declared* name goes out.
+    const NEW_ID: i16 = 20;
+    const ALIAS_ID: i16 = 22;
+    const REPLY_ID: i16 = 21;
+
+    /// The dictionary a firmware hands over: the identify pair, the identity
+    /// command under `names` (each with the id this test gives it), and the one
+    /// reply they share.
+    fn identity_dictionary(names: &[(&str, i16)]) -> String {
+        let mut commands = vec!["\"identify offset=%u count=%c\": 1".to_string()];
+        commands.extend(names.iter().map(|(name, id)| format!("\"{name}\": {id}")));
+        format!(
+            r#"{{
+                "app": "Klipper",
+                "version": "v0.12.0-1-g1234567",
+                "commands": {{
+                    {}
+                }},
+                "responses": {{
+                    "identify_response offset=%u data=%.*s": 0,
+                    "canbus_id canbus_uuid=%.*s canbus_nodeid=%u": {REPLY_ID}
+                }}
+            }}"#,
+            commands.join(", ")
+        )
+    }
+
+    /// Payload of a command with no arguments: its id as the i16 every block
+    /// starts with.
+    fn command_payload(id: i16) -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(id).unwrap();
+        payload.into_raw()
+    }
+
+    /// Payload of the `canbus_id` reply: the uuid the board reports and the node
+    /// id it has adopted.
+    fn identity_payload(uuid: [u8; 6], node_id: u32) -> Vec<u8> {
+        let mut payload = Payload::new();
+        payload.push_i16(REPLY_ID).unwrap();
+        payload.push_bytes(&uuid).unwrap();
+        payload.push_u32(node_id).unwrap();
+        payload.into_raw()
+    }
+
+    /// A wire that answers the identify handshake with `dictionary`, and the
+    /// identity commands `answer` lists with the uuid they report.
+    ///
+    /// The same wire can serve several sessions: each round of a verified connect
+    /// asks the same questions, and the wire records every block it was sent.
+    fn identity_wire(
+        dictionary: &str,
+        answer: &[(i16, [u8; 6], u32)],
+    ) -> (RecordingWire, Arc<std::sync::Mutex<Vec<Vec<u8>>>>) {
+        let wire = RecordingWire::new();
+        let compressed = compress(dictionary.as_bytes());
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + IDENTIFY_CHUNK_SIZE as usize).min(compressed.len());
+            let data = &compressed[offset..end];
+            wire.reply_to(
+                request_payload(offset as u32),
+                response_payload(offset as u32, data),
+            );
+            if data.is_empty() {
+                break;
+            }
+            offset = end;
+        }
+        for (command, uuid, node_id) in answer {
+            wire.reply_to(command_payload(*command), identity_payload(*uuid, *node_id));
+        }
+        let sent = wire.sent();
+        (wire, sent)
+    }
+
+    /// How many of `sent` are the identity command with `id`.
+    fn identity_asks(sent: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>, id: i16) -> usize {
+        let wanted = command_payload(id);
+        sent.lock()
+            .unwrap()
+            .iter()
+            .filter(|payload| **payload == wanted)
+            .count()
+    }
+
+    const BOARD: [u8; 6] = [0x11, 0xaa, 0x22, 0xbb, 0x33, 0xcc];
+    const OTHER_BOARD: [u8; 6] = [0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+
+    /// Criterion ①: a firmware that declares the new name is asked with it, and
+    /// the old name is left alone — one reply format, one parser.
+    #[tokio::test]
+    async fn test_the_identity_command_is_get_mcu_id_when_the_dictionary_has_it() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID), ("get_canbus_id", ALIAS_ID)]);
+        let (wire, sent) = identity_wire(&dictionary, &[(NEW_ID, BOARD, 5)]);
+
+        let mcu = Mcu::connect("test_mcu", Interface::recording(wire))
+            .await
+            .expect("identify completes");
+        assert_eq!(mcu.identity_command(), Some(IDENTITY_COMMAND));
+
+        let found = mcu
+            .query_identity(Duration::from_millis(500))
+            .await
+            .expect("the board answers");
+
+        assert_eq!(found.uuid, BOARD);
+        assert_eq!(found.node_id, 5);
+        assert_eq!(identity_asks(&sent, NEW_ID), 1, "the new name is sent");
+        assert_eq!(
+            identity_asks(&sent, ALIAS_ID),
+            0,
+            "the alias is not sent while the new name is declared"
+        );
+    }
+
+    /// Criterion ①: a firmware built before the rename declares only the old
+    /// name, and that is the one it is asked with — the same reply either way.
+    #[tokio::test]
+    async fn test_the_identity_command_is_get_canbus_id_for_a_firmware_with_only_the_alias() {
+        let dictionary = identity_dictionary(&[("get_canbus_id", ALIAS_ID)]);
+        let (wire, sent) = identity_wire(&dictionary, &[(ALIAS_ID, BOARD, 5)]);
+
+        let mcu = Mcu::connect("test_mcu", Interface::recording(wire))
+            .await
+            .expect("identify completes");
+        assert_eq!(mcu.identity_command(), Some(IDENTITY_COMMAND_ALIAS));
+
+        let found = mcu
+            .query_identity(Duration::from_millis(500))
+            .await
+            .expect("the board answers");
+
+        assert_eq!(found.uuid, BOARD);
+        assert_eq!(identity_asks(&sent, ALIAS_ID), 1, "the alias is sent");
+        assert_eq!(identity_asks(&sent, NEW_ID), 0);
+    }
+
+    /// Criterion ③: the board that answers as the configured uuid is the one
+    /// the link is handed back with — one round, no reopen.
+    #[tokio::test]
+    async fn test_a_matching_uuid_enters_the_session_on_the_first_round() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID)]);
+        let (wire, sent) = identity_wire(&dictionary, &[(NEW_ID, BOARD, 5)]);
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&rounds);
+
+        let opens = {
+            let wire = wire.clone();
+            move || -> OpenFuture<'static> {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let interface = Interface::recording(wire.clone());
+                Box::pin(async move { Ok(interface) })
+            }
+        };
+
+        let mcu = connect_verified(
+            "test_mcu",
+            opens,
+            || false,
+            BOARD,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .expect("the board is the configured one");
+
+        assert!(mcu.is_identified());
+        assert_eq!(
+            rounds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one round: the first answer was the right board"
+        );
+        assert_eq!(identity_asks(&sent, NEW_ID), 1);
+        mcu.close();
+    }
+
+    /// Criterion ②, first half: a board that answers as another uuid is **not**
+    /// entered — the link is reopened and re-named (`SET_NODEID` again) until the
+    /// budget runs out — and the failure says which board answered.
+    #[tokio::test]
+    async fn test_a_wrong_uuid_is_reopened_and_reported_as_the_board_that_answered() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID)]);
+        // Every round the same wrong board answers: no amount of naming makes it
+        // the configured one, so the loop has to give up inside its budget.
+        let (wire, sent) = identity_wire(&dictionary, &[(NEW_ID, OTHER_BOARD, 7)]);
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&rounds);
+
+        let opens = {
+            let wire = wire.clone();
+            move || -> OpenFuture<'static> {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let interface = Interface::recording(wire.clone());
+                Box::pin(async move { Ok(interface) })
+            }
+        };
+
+        let err = connect_verified(
+            "test_mcu",
+            opens,
+            || false,
+            BOARD,
+            Instant::now() + Duration::from_millis(400),
+        )
+        .await
+        .err()
+        .expect("the board that answered is not the configured one");
+
+        let text = err.to_string();
+        assert!(
+            matches!(err, VerifiedConnectError::Mismatch { .. }),
+            "a board answered: {text}"
+        );
+        assert!(text.contains("11aa22bb33cc"), "the configured uuid: {text}");
+        assert!(text.contains("0a0b0c0d0e0f"), "the board that answered: {text}");
+        assert!(
+            rounds.load(std::sync::atomic::Ordering::SeqCst) > 1,
+            "the round is retried, not given up on: {text}"
+        );
+        assert_eq!(
+            identity_asks(&sent, NEW_ID) as usize,
+            rounds.load(std::sync::atomic::Ordering::SeqCst),
+            "every round asks again, so a fresh SET_NODEID + identify went out each time"
+        );
+    }
+
+    /// Criterion ②, second half: a board that never answers the identity query
+    /// fails as **unanswered**, not as a mismatch — the two are different
+    /// failures and the error text has to say which.
+    #[tokio::test]
+    async fn test_silence_on_the_identity_query_is_reported_as_no_answer() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID)]);
+        // The dictionary declares the command; nothing answers it.
+        let (wire, _sent) = identity_wire(&dictionary, &[]);
+        let rounds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&rounds);
+
+        let opens = {
+            let wire = wire.clone();
+            move || -> OpenFuture<'static> {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let interface = Interface::recording(wire.clone());
+                Box::pin(async move { Ok(interface) })
+            }
+        };
+
+        let err = connect_verified(
+            "test_mcu",
+            opens,
+            || false,
+            BOARD,
+            Instant::now() + Duration::from_millis(400),
+        )
+        .await
+        .err()
+        .expect("nothing answered, so nothing can be entered");
+
+        let text = err.to_string();
+        assert!(
+            matches!(err, VerifiedConnectError::NoAnswer(_)),
+            "nothing answered: {text}"
+        );
+        assert!(
+            text.contains("no board answered its identity query"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("but the configuration names"),
+            "silence is not a mismatch: {text}"
+        );
+    }
+
+    /// Criterion ④, second half: on a mux carrier the readback is a single round
+    /// (the port is shared, so it is not torn down), and a mismatch names **both**
+    /// uuids.
+    #[tokio::test]
+    async fn test_a_mux_readback_naming_another_board_reports_both_uuids() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID)]);
+        let (wire, sent) = identity_wire(&dictionary, &[(NEW_ID, OTHER_BOARD, 4)]);
+        let mcu = Mcu::connect("host_library test", Interface::recording(wire))
+            .await
+            .expect("identify completes");
+
+        let failure = verify_identity(&mcu, BOARD, Duration::from_millis(100))
+            .await
+            .err()
+            .expect("the board is not the configured one");
+
+        let text = failure.to_string();
+        assert!(
+            matches!(failure, IdentityFailure::Mismatch { .. }),
+            "{text}"
+        );
+        assert!(text.contains("11aa22bb33cc"), "{text}");
+        assert!(text.contains("0a0b0c0d0e0f"), "{text}");
+        assert!(text.contains("node 4"), "the node it took is reported: {text}");
+        assert_eq!(
+            identity_asks(&sent, NEW_ID),
+            1,
+            "a board that answered is not asked again: asking cannot change which board it is"
+        );
+        mcu.close();
+    }
+
+    /// Criterion ⑤: a device that has not adopted a node id yet — `mux_node_id()`
+    /// is `0` before the assignment — still knows which board it is, and its
+    /// uuid is what the readback compares. A `0` there is a legal answer, not a
+    /// failure.
+    #[tokio::test]
+    async fn test_a_device_without_a_node_id_yet_still_confirms_its_uuid() {
+        let dictionary = identity_dictionary(&[("get_mcu_id", NEW_ID)]);
+        let (wire, _sent) = identity_wire(&dictionary, &[(NEW_ID, BOARD, 0)]);
+        let mcu = Mcu::connect("host_library test", Interface::recording(wire))
+            .await
+            .expect("identify completes");
+
+        let found = verify_identity(&mcu, BOARD, Duration::from_millis(100))
+            .await
+            .expect("an unassigned device is still the board the config names");
+
+        assert_eq!(found.node_id, 0);
+        assert_eq!(found.uuid_hex(), "11aa22bb33cc");
+        mcu.close();
+    }
+
+    /// A firmware that declares neither name has no identity to give: the
+    /// readback says so instead of reporting a mismatch against a board nothing
+    /// was asked of.
+    #[tokio::test]
+    async fn test_a_firmware_with_neither_identity_name_is_not_a_mismatch() {
+        let dictionary = identity_dictionary(&[]);
+        let (wire, _sent) = identity_wire(&dictionary, &[]);
+        let mcu = Mcu::connect("test_mcu", Interface::recording(wire))
+            .await
+            .expect("identify completes");
+
+        assert_eq!(mcu.identity_command(), None);
+        assert_eq!(
+            verify_identity(&mcu, BOARD, Duration::from_millis(100))
+                .await
+                .err(),
+            Some(IdentityFailure::NotDeclared)
+        );
+        mcu.close();
     }
 }

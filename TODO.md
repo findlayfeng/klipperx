@@ -93,19 +93,13 @@
 
 ### H11 主机运行时与调试
 
-- [ ] **共享串口被占用时启动 panic（2026-10-22 真机旁证）**：另一个 `klipperx` 已经占着同一个 tty
-      时再起一个宿主，进程以 `thread 'main' panicked at … tokio/runtime/blocking/shutdown.rs:51:
-      Cannot drop a runtime in a context where blocking is not allowed` 结束，而不是一条「串口被占」
-      的干净错误。复现：`klipperx klippy <cfg>` 跑着时再起同一条命令。方向：失败路径上的 runtime
-      在 async 上下文里被 drop，改成干净的 `Err` 返回（上游 `serialhdl` 报 `Unable to open serial
-      port`）。
+
+## 未决问题
+
 - [ ] **`--tui` 下 SIGTERM 不结束宿主（2026-10-22 实测）**：`kill -TERM <pid>` 后进程仍活 ≥30 s
       （要等窗口自己关），只能 SIGKILL。手册说的是「离开窗口就停宿主」，信号应当同样触发退出；
       现在 `request_exit` 置了旗，但 run loop 卡在 attachment 上。方向：attachment 的 await 与
       退出请求 `select`，收到请求即收窗口。
-
-## 未决问题
-
 - [ ] **`M400` 等待的两个后续单元**（等待本体与四条出口已落地：`motion/toolhead.rs` 的
       `wait_moves_state()` 快照 + `extras/toolhead.rs` 的异步等待环；`can_pause = !is_fileoutput()`
       时立即退出，所以语料对该特性零覆盖）：

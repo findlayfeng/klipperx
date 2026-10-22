@@ -1249,6 +1249,35 @@ mod tests {
         drop(third);
     }
 
+    /// The exclusive shape reopens its own tty once the previous device is
+    /// closed — the sequence `klipperx admin flash --device <tty>` runs, and the
+    /// one a board that reset forces.
+    ///
+    /// Its descriptors are not shared the way a muxed port's are: dropping the
+    /// device closes the tty, so the claim goes with it (the `flock` itself goes
+    /// with the descriptor), and the next open takes the lock fresh. What must
+    /// **not** happen is the claim outliving the descriptor — that would make
+    /// this process refuse itself, which is the self-lock the shared port's
+    /// exemption exists for.
+    #[test]
+    fn test_an_exclusive_port_reopens_after_its_device_was_closed() {
+        let pty = Pty::new();
+        let first = SerialDevice::open(&pty.path, DEFAULT_BAUD).expect("the tty opens");
+        assert!(
+            check_held_by_another_process(&pty.path).is_err(),
+            "the open device holds the tty"
+        );
+
+        drop(first);
+        wait_until_a_port_is_free(&pty.path);
+
+        let second = SerialDevice::open(&pty.path, DEFAULT_BAUD)
+            .expect("a closed device does not leave a claim behind");
+        // ...and the reopened device holds it just as the first one did.
+        assert!(check_held_by_another_process(&pty.path).is_err());
+        drop(second);
+    }
+
     #[test]
     fn test_send_writes_the_encoded_frame() {
         let pty = Pty::new();

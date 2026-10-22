@@ -47,64 +47,34 @@
 ## 待办
 
 依赖列的是**工具性前置**，不是自然顺序。下表是索引，逐条细节在后面的小节里；
-框架队列（FW1–FW9）已完成，索引见文末「已完成（留档）」；本表不再区分级别。
-H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点的结果）。
-**2026-10-06 复核**：本表与各节已按源码实测重新对账——2026-10-02~05 的大批落地此前未回写
-（TMC 六型、传感器族、断料传感器、面板驱动、`delayed_gcode` 等），现已改为现状。核对口径是
-「`section!` 声明 + `load.rs` 工厂表 + 命令/事件注册点」，条目里凡写「已落地」均指这三处实测命中。
+框架队列（FW1–FW9）与上游 extras 消费者（H1–H12）均已完成，索引见文末「已完成（留档）」。
+零散待办（无编号）紧跟索引表，细节见各节或各模块文档。
 
-**核心与架构**
+**索引**
 
 | # | 事项 | 依赖 |
 |---|---|---|
-| C1 | 运动层收尾：轴/stepper 抽象 + 多轴（C1a）、extruder 运动（C1b）、运动学族（C1c：delta/polar/generic_cartesian/rotary_delta/winch/deltesian 全落地）、print-time 回调（C1d）——**✅ 收官** | — |
-| C2 | 配置装载：框架部分 ✅（FW1，含 choice/range 文案与 `deprecate` 警告）；autosave/`SAVE_CONFIG` 写回 ✅（2026-10-02，详见下） | — |
-| D1 | 主机层 start args / rollover / `--logfile` ✅（FW8）；`debuginput`/`debugoutput` 的命令行接线与每 MCU 字典路径**不做**（随 GCodeIO 决策，2026-10-05 结案；`debug_input` 字段与 `debuginput_exit` 事件已随死代码删除） | — |
-
-**MCU 资源与总线**
-
-| # | 事项 | 依赖 |
-|---|---|---|
-| F6 | SPI 总线 —— **✅ 收官（2026-10-21）**：`spi_transfer_with_preface`（一次 block 两条消息、一个 ack）与 `setup_shutdown_msg` 均落地 | — |
-| F8 | endstop / trsync ✅（FW6）；测试侧「响应器式多实例假 MCU」✅（2026-10-03，`330c212`） | F1、F2、C1 |
-| F9 | 固件资源剩余：buttons / trigger_analog / initial_pins / sdcard / lcd / tmcuart 等（已接：`cmd/thermocouple.rs` + `spi_temperature`；pulse_counter 批 #8 落地）。宿主侧已建：`extras/led.rs` 的 `led`/`neopixel`/`dotstar`/`pca9533`/`pca9632`、`extras/buttons.rs`（固件查询未接）、`cmd/trigger_analog.rs` 资源层（宿主节未建） | F1–F7 |
-
-**G-Code 与端点**
-
-| # | 事项 | 依赖 |
-|---|---|---|
-| G1b | gcode 调度器与上游的行为差异（`get_mutex` 等价物等；`GCodeIO` **不做**（2026-10-05 结案，`need_ack` 机制已删）；参数访问器与 `M115`/`Coord`/`request_restart` 已完成并归档） | C1 |
-| G2b | 用 GCODE 控制 GPIO：数字/PWM 驱动与 `SET_PIN` **已落地**；「随打印时间生效的请求队列」（上游 `GCodeRequestQueue`）**已移植并接入 `output_pin`**；`pwm_cycle_time` 的 `SET_PIN` 已通过 `register_lookahead_callback` + `min_schedule_time` 自间隔调度（2026-10-03，`8a45d25`）；余项＝`output_pin` 的 `static_value`/`template`，以及 `heaters` 切到同一队列（`fan`/`servo`/`pwm_tool` 2026-10-03 已切换） | —（C1 已收官，不再是前置） |
-| G4 | 运动命令（G0/G1/G28…） | G1、C1 |
-| B4 | 其余端点（`*/dump_*` / …；estop、remote method、`pause_resume/*` 与 `bed_mesh/dump_mesh` 已落地） | G3、H4、H9 |
-
-**上游 extras 消费者**（详见「上游 extras 覆盖盘点」）
-
-| # | 事项 | 依赖 |
-|---|---|---|
-| H1 | 加热与温度（heaters / heater_bed / heater_generic / pid_calibrate / verify_heater / temperature_*）——**✅ 收官**（传感器族、`M105` gcode-id 表、`TEMPERATURE_WAIT`、`M109`/`M190` 等待、eddy 校准工具均已落地，见 H1 节） | — |
-| H2 | 风扇与通用输出（fan / fan_generic / heater_fan / controller_fan / pwm_tool / static_* / multi_pin / servo / led / neopixel / dotstar / 电位器与 LED 驱动）——主体已落地；余项＝`replicape` 与 `pwm_tool` 的 `maximum_mcu_duration` 中间更新（见 H2 节） | F3、F4、F6、F7 |
-| H3 | G-Code 宏与脚本（gcode_macro / delayed_gcode / respond）——**✅ 收官**（三者主体均已落地且含单测；`rename_existing` 连接期换名（2026-10-06，`5ba2356`）；`printer.objects` 的可枚举反射 2026-10-21 落地，见 H3 节） | — |
-| H4 | 打印流程与 SD 卡（virtual_sdcard / print_stats / display_status / pause_resume / exclude_object / sdcard_loop / firmware_retraction）——**均已落地**（`sdcard_loop` 的三条命令与 `SdCardFile` 接缝 2026-10-21），见 H4 节 | F9、C1 |
-| H5 | TMC 步进驱动（tmc / tmc_uart / tmc2130…tmc5160）——六型（2130/2208/2209/2240/2660/5160）与 UART 框架均已落地；**活线与运行期链路 2026-10-18 补齐**（UART/SPI 读写、`tmc/stallguard_dump`、使能链路、相位跟踪、周期 `DRV_STATUS` 检查）；both-edge 已按上游判定链启用（2026-10-21），余项＝两条传输层行为偏移，见 H5 节 | F6、F7、C1 |
-| H6 | 传感器与块状数据（bulk_sensor / 加速度计 / angle / ldc1612 / hx71x / ads* / load_cell / input_shaper / resonance）——`bulk_sensor` 框架、`adxl345`/`mpu9250`、`ldc1612`、`hx71x`、`ads1220`/`ads131m0x`、`load_cell`(+`_probe`)、`input_shaper`/`resonance_tester` 均已落地；余项＝`angle`、其余加速度计（lis2dw/lis3dh/icm20948/bmi160）、`ads1x1x`、`adxl345` 寄存器 setup+缩放，以及压力提前与 `input_shaper` 各自的几条小余项（两者均已驱动运动），见 H6 节 | F5、F6、F7、C1 |
-| H7 | 输入与外设（buttons / gcode_button / pulse_counter / trigger_analog / 断料与线宽传感器 / GPIO 扩展 / DAC）——`gcode_button`、`pulse_counter`、`filament_*` 四型（开关/运动/hall/tsl1401cl）、`trigger_analog` 三件套、**固件按钮查询（2026-10-21）**均已落地；余项＝`query_adc`（模拟按键）、`initial_pins`、板级模块（samd_sercom/replicape/palette2），见 H7 节 | F3、F5、F9 |
-| H8 | LCD 显示与菜单（display/*）——**✅ 收官（2026-10-21）**：六个驱动全会画（`VGA_FONT` 已 vendor）、菜单引擎 + 渲染通路 + 菜单行绘制、`[display_data]`/`[display_glyph]` 主配置 factory；余项只剩 `emulated_st7920`/`sh1106` 两种面板类型（`lcd_type` 接受但报缺口），见 H8 节 | — |
-| H9 | 探测 / 调平 / 校准（probe / bltouch / bed_mesh / z_tilt / quad_gantry_level / bed_screws / …）——探针与其校准命令族、末端位置接口（`virtual_endstop_position`）、z_tilt/qgl/bed_tilt/screws_tilt/axis_twist/delta_calibrate、**bed_mesh 的 profile 命令族与探针触发时刻精度（2026-10-19）** 均已落地；余项＝不适用/已收官（`skew_correction`、`z_thermal_adjust`、`tuning_tower` 与 `bed_mesh` 的 faulty/`ZERO_REFERENCE` 均已 2026-10-21 落地），见 H9 节 | C1、F8 |
-| H10 | 运动相关 extras（gcode_arcs / manual_stepper / idle_timeout / motion_report / …；gcode_move、stepper_enable、motion_queuing、force_move、idle_timeout、GET_POSITION、动态 `axis_map`、`manual_stepper` 自有 trapq 出步、`motion_report` 两端点、**G2/G3 弧与 G17–G19 平面选择 + `extruder_stepper` 宿主同步缝（2026-10-21）**已落地）——余项＝`manual_stepper` 回零、`motion_report` 的 `get_status`/shutdown 诊断，见 H10 节 | C1 |
-| H11 | 主机运行时与调试（statistics / canbus_stats；`canbus_ids` 与 CAN 扫描已落地） | — |
-| H12 | 核心工具补齐（mathutil / util 反射 / clocksync / pins 消费侧） | C1 |
-
-**工具与文档**
-
-| # | 事项 | 依赖 |
-|---|---|---|
-| S1 | 压力测试工具（`klipperx stress`）：**已收官**——真资源/别名/假板 e2e（含 `--task motion`，2026-10-21）均已落地；余项仅真板双机并发验证 | — |
-| S2 | 文档补齐（2026-10-06 对账发现，非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）、`gcode-commands.md` 缺 `BED_MESH_*` 命令；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审（本轮只修了与已落地改动强相关的那些） | — |
+| H11 | 主机运行时与调试：两条 2026-10-22 运行时小件，见 [H11 节](#h11-主机运行时与调试) | — |
+| S2 | 文档补齐（非新功能）：`config.md` 缺 **`[bed_mesh]` 整节**（约 20 个选项，含 `split_delta_z` / `move_check_distance`）；开发手册「模块表 / `testing.md` 覆盖行 / `regression-tests.md`」的其余陈旧行未重审 | — |
 | S3 | 真机用例：把 `configure_taking_over`（“连接 ≠ 配置”，遇 `ResetRequired` 则 `reset` + 重开 + 重握手一次）**上提到 `hardware_test`**——现在三份需求（R3/R5/R11）共用一个局部实现（`mcu/resource/endstop.rs` 测试里 + `stress.rs` 自己的），上提后只留一份；同时把 L2（`Machine::bring_up`）已落地这件事写进框架 doc 的模板 | — |
-| S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**）；R8 回放 | S3、Q11 |
+| S4 | 真机用例继续铺（框架两层都已就绪）：R4 归零（无加热，建议先做）→ R9 收尾 / R7 挤出 / R6 温度 / R10 急停（**带加热的最后**）；R8 回放 | S3 |
 | S6 | 运行时临时产物收口（**暂缓，2026-10-19 登记**）：`/tmp` 侧有 `kx-start.log`（每次手动拉 klippy 重新生成）、活连接文件 `klippy_uds` 与 Moonraker 的 `moonraker_instance_ids`、harness 的 `pi-bash-*.log`；仓库侧 `.staging/tmp-2026-10-19/` 存着 13 项旧产物（7 个 `klipperx-log-*` 运行目录 + 6 份闸门/启动日志，3.1 MB，已 gitignore）。要做的：按已定路径约定把日志改道（`klippy` 已有 `--logfile` 落 `<data-path>/logs/`，手动启动的 stdout 也应落那里），并给 `.staging` 定一个清理时机。判据：`klippy_uds` / `moonraker_instance_ids` 是**活 IPC 与第三方状态——不迁移、不进释放链**；`pi-bash-*.log` 归 harness；清 `.staging` 前先确认里面的日志不再作任何结论的证据 | — |
 | E2 | `python_path` 的取消 | 外部项目 |
+
+**零散待办**（无编号；细节见各节与各模块文档）
+
+- `canbus_stats`：总线错误计数/状态上报。上游 `canbus_stats.py`，本仓无对应模块；
+  参见 `H11` 节的 CAN 侧现状（`mcu/ids.rs` 只管 id 分配）。
+- `heaters` 切到 `GCodeRequestQueue`（`output_pin`/`fan`/`servo`/`pwm_tool` 已接线，`heaters` 侧无队列化
+  消费者），见 [G2b 节](#g2b-用-gcode-控制-gpio剩余)。
+- `manual_stepper` 自带回零：`STOP_ON_ENDSTOP` 仍明示拒绝（缺 `drip_update_time`，`drip_move` 只灌主 trapq）。
+- `pwm_tool` 的 `maximum_mcu_duration` 中间更新：固件上限照常下发（`setup_max_duration`），上游的
+  宿主侧重生成（`MCU_queued_pwm._gen_intermediate_updates`，`pwm_tool.py:119-135`）本仓无对应物，
+  见 `extras/pwm_tool.rs` 的模块文档。
+- `BED_MESH_OUTPUT PGP=` 补上游的 `(Substitute)` 列（`docs/klippy/developer-manual/README.md` 的 bed_mesh 行尾也记着这条）。
+- 真板验证：`S1` 的双机并发压测（`stress.md` 已有单板数据）与 `M2` 的极性与保持。
+- TMC 的 SPI 「写 + 回读」切到 `McuSpi::transfer_with_preface`（入口已具备、TMC 未切；收敛判据是
+  片选次数不变，见 `docs/klippy/developer-manual/README.md` 的 `tmc_spi.rs` 行与模块文档）。
 
 **串口复用 / 桥（跨主机与固件）**
 
@@ -119,137 +89,14 @@ H1–H12 是上游 extras 里按域归并的消费者（2026-09-21 全量盘点�
 
 ### G2b 用 GCODE 控制 GPIO（现状与剩余）
 
-数字与 PWM 两条链都已打通（见文末索引）：`[output_pin <name>]`
-（`extras/output_pin.rs`）读 `pin` / `value` / `shutdown_value`（PWM 另加 `pwm` /
-`cycle_time` / `hardware_pwm`），经 `PrinterPins::setup_digital_out` / `setup_pwm`
-（`pins.rs`）建出 `McuDigitalOut` / `McuPwm`，并注册 mux 命令
-`SET_PIN PIN=<name> VALUE=<0..1>`；运行时经 `GCodeRequestQueue` 按打印时间生效（`output_pin`/`fan`/`pwm_tool`/`servo` 已接线，`heaters` 侧无队列化消费者；两条兕底见下）。剩下的是：
+`[output_pin <name>]`（`extras/output_pin.rs`）与 PWM 两条链都已打通：`SET_PIN PIN=<name> VALUE=<0..1>`
+经 `GCodeRequestQueue`（`extras/gcode_request_queue.rs`）按打印时间生效，`output_pin`/`fan`/`servo`/
+`pwm_tool` 已接线；无 `[printer]` 或资源不可调度时保留立即路径（两条兜底与选项细节见
+`docs/klippy/developer-manual/README.md` 的 `output_pin.rs` 行与 `pwm_tool.rs` 模块文档）。
+剩下的只有一条：
 
-- [x] **与运动 / 打印时间同步的 `SET_PIN`**（上游 `GCodeRequestQueue`，
-      `klippy/extras/output_pin.py:13-85` `:249-269`）：**已落地**——队列本体
-      `extras/gcode_request_queue.rs`（覆盖压缩、`next_min_flush_time` 按
-      `min_schedule_time` 对齐、`discard`/`reschedule`/`repeat`、sink 回调在锁外、12 测），
-      接线在 `output_pin`：`cmd_set_pin` 经 `register_lookahead_callback` 把请求钉到
-      前瞻时刻，flush 回调由 `MotionQueuing::generate` 消化，digital 走
-      `queue_digital_out(clock)`、软 PWM 先 `next_aligned_clock` 再 `set_pwm`；
-      **两条兜底**——没有 `[printer]`（lookup 不到 `toolhead`）或资源不可调度
-      （`min_schedule_time()` 为 `None`）时保留立即路径（`update_digital_out`/`update_pwm`）。
-      **余项**：`heaters` 无队列化消费者待切（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7` 已于 2026-10-03 切换）。
-
-### S1 压力测试工具（`klipperx stress`）剩余
-
-**是什么**：`klipperx stress <config> [mcu]` 给一块 MCU 逐步加大负载到它出错。两个任务：
-`--task step`（默认）压步进生成（`queue_step`，到固件 `shutdown`：`Stepper too far in past` /
-`Timer too close` / `Move queue overflow`），`--task comm` 压主机↔MCU 链路（`get_clock` 往返速率）。
-设计与失败形态见 `docs/klippy/developer-manual/stress.md`。
-
-**已做**：连接 / identify、从 `[stepper_*]` 借 step/dir 引脚并解析（`PA0` / `mcu:PA0` / 尾随
-`!`）、用 `ConfigBuilder` 配置一个压力 stepper（**无 `config_reset` 的固件走 `reset` + 重连 +
-重试握手**）、按 `--rate-step` 几何 ramp、检测 `is_shutdown` 并报出原因（绑 `shutdown` /
-`is_shutdown` 的 `static_string_id`）；`--task comm` 按墙钟配速发 `get_clock`、用 `clock` 回调计数、
-以积压/达不到目标速率判定；`cmd/stepper.rs` 补了 typed 命令（`config_stepper` / `queue_step` /
-`reset_step_clock` / `set_next_step_dir` / `stepper_get_position`）。
-
-**真板实测**：STM32F103（72 MHz）上 `--task step --rate-step 1.1` 得到 339 623 步/秒存活、
-375 000 步/秒 shutdown（`Stepper too far in past`）；`--task comm` 稳定扛住约 3.5k 往返/秒，
-4441 req/s 时响应积压被判定为链路顶不住。
-
-- [x] **stepper 资源（2026-10-06，`5ada3ce`）**：已改成复用真资源——每个压力 stepper 经
-      `PrinterPins::setup_stepper` 建出正式 `McuStepper`（一次建一个 `PrinterPins` 注册表，
-      每块 `[mcu]` 一个 `McuChip` + 自己的 `ConfigBuilder`），所以固件 `config_stepper` 带的是
-      该节自己的 `invert_step`（步进脚前导 `!`）与 `step_pulse_ticks`（`step_pulse_duration`，
-      默认 2 µs）；`--task motion` 的步距由 `microsteps`/`rotation_distance` /
-      `full_steps_per_rotation`/`gear_ratio` 算出（无几何时退 0.01 mm）；本板自己的 `enable_pin`
-      会被读出并置使能（共用线去重）。
-- [x] **`[board_pins]` 别名（同上）**：别名经 F2 的正式装载器（`BoardPins` + `PrinterPins::parse_pin`/
-      `resolve_pin`）解析；取反是**前导** `!`（`!PA0` / `!mcu:alias`；`mcu:!PA0` 是非法描述）。
-- [x] **端到端测试（同上）**：假板（`test: dict=` 的 `SimulatorDevice`）上的 step ramp、comm ramp、
-      `ResetRequired` 重连各有用例；另加一条解码线上 `config_stepper` 的用例（验 `invert_step`/
-      `step_pulse_ticks` 真从节里来）。**假板 `--task motion` e2e 已落地（2026-10-21）**：假件按 oid 累积有符号步进位置
-      （`set_next_step_dir` 换向、`queue_step` 累加、`reset_step_clock` 不清零，对齐 `stepper.c` 的
-      `stepper_get_position` 语义），`a_motion_smoke_runs_end_to_end_against_a_fake_board` 断言读回步数 ==
-      距离/`step_dist`（回退成恒答 0 即红）。**剩余真板项**：双机并发压测。
-
-### G1b gcode 调度器与上游的行为差异（框架部分 FW4）
-
-**为什么单列一条**：G1 的骨架（命令表 / `run_script` / 输出处理器 / 内置命令 / mux）已按
-`klippy/gcode.py` 落地，逐行对照后还剩一批**行为差异**。一部分只能随前置模块（GCodeIO /
-toolhead / 开放事件）一起补，一部分是现在就独立可补的小行为。命令表本身够通用，G4 运动
-命令不必等这条。上游行号以 `third_party/klipper/klippy/gcode.py` 为准。
-
-**随前置一起补（GCodeIO / toolhead / 事件）**
-
-- [x] **`GCodeIO` 不移植（2026-09-21 暂缓 → 2026-10-05 结案：不做）**：伪 tty / 文件输入整块
-      缺失——fd 读取与 `partial_input`、`pending_commands` 批量与 20 条阈值、`M112` 乱序检测
-      （`m112_r` = `^(?:[nN][0-9]+)?\s*[mM]112(?:\s|$)`）、`input_log`、debuginput EOF 退出、
-      `stats gcodein=`（`:390-494`）。现在输入由 API 层的 `gcode/script` 承担，客户端契约走
-      Moonraker API；**结论：不做**（`need_ack`/`ack` 机制已于 2026-10-05 从 `gcode.rs` 删除；偏移登记在
-      [本项目与上游的偏移](docs/klippy/developer-manual/upstream-deviations.md)）。
-      以下为若要翻案时的最小路径与前置（存档）：① 先给 reactor 补 **fd 事件层**（本仓库只有定时器，无
-      `register_fd`/`poll` 对应物），这是最贵的一块；② `util.create_pty`（`openpty` +
-      `symlink` 到 `/tmp/printer` + 关 `ECHO` + 非阻塞）与 `GCodeIO` 对象；③ `is_fileinput`
-      决定 `request_restart` / `_handle_shutdown` 是否退 `error_exit`（`:355` `:429`）；
-      ④ `gcode:debuginput_exit` 需要 `send_event` 收集 handler 返回值（上游 `all(...)`）。
-      tty 与 debuginput 共用同一套 `_process_data`，应一起做。
-- [x] **`gcode:debuginput_exit` 触发（随 `GCodeIO` 结案：不做）**：上游 `_do_debuginput_exit`
-      轮询 `all(send_event('gcode:debuginput_exit'))`（`:432-435`），依赖 handler 的返回值；
-      本仓库 `Printer::send_event` 丢弃返回值（上游 `klippy/klippy.py:226-227` 是
-      `return [cb(...)]`）。要与 `GCodeIO` 一起做（见上一条）。
-**可独立补的小行为差异**
-
-（`request_restart` 的停机前动作、`Coord`、`M115` 版本号来源三项已完成并归档，
-分别见 `gcode.rs:1186-1193`、`mathutil.rs:36`、`gcode.rs:747-767`。）
-- [x] **`get_mutex` 等价物**（原先未列）：上游 `gcode.get_mutex()`（`klippy/gcode.py:242-243`）被
-      `bed_mesh`（`:307`）与 `idle_timeout`（`:70` `:90`）用来判断「是否有脚本在跑」。
-      **结论：不做**——C1 与那两个模块都已落地：`bed_mesh` 不需要该判据（仓内无对应代码路径），
-      `idle_timeout` 明示删掉它（模块文档「What is not here」，见 `idle_timeout.rs:57-58`），
-      至今没有消费者需要。
-
-### G4 运动命令（G0/G1/G28/G92/M114…）
-
-- [x] **G4-2 外围（2026-10-21 收官）**：extra-axes 的 `axis_map`（`gcode_move` 随 `toolhead:update_extra_axes` 重建，`G1 A…` 按字母寻址并进入规划器）、
-      额外轴出步（`manual_stepper` 自有 trapq，`MOVE=` 与 `G1 A…` 都真出步）、**容量与补全**均已落地：
-      `MAX_AXES` 8 → 16（E + 12 个字母轴），超容量重建 `axis_map` 时一次性 `tracing::error!` 列出被丢弃的字母
-      （不再静默）、`G0`/`G1` 的 `G1_PARAMS` 补齐 20 个自由字母（A–Z 去 X/Y/Z/E/F/N，客户端内建参数表随之再生成，
-      注册点计数 98 → 99）、`reset_last_position` 按 `base_position.len()` 一次重建全部轴（四轴 + 全部额外轴，截到 `MAX_AXES`），
-      不再靠后续 `resize` 补尾巴。另有 `toolhead:manual_move`（`safe_z_home`）、`toolhead:update_extra_axes`（`ToolHeadObject`）、
-      `extruder:activate_extruder`（`ACTIVATE_EXTRUDER`）三个发送方与 `bed_mesh` 的 `set_move_transform`（`bed_tilt` / `exclude_object` 在用）。
-
-### B4 其余端点（机制部分 FW9）
-
-`api-reference.md` 有、`endpoints/mod.rs` 的表里标「not started」的其余部分，各自等它读的
-对象先存在：
-
-- [x] **dump 端点家族 —— 已收官（2026-10-22）**：`icm20948`/`bmi160`/`lis2dw`/`angle` 四个端点随各自驱动落地，
-      连同既有的 `bed_mesh`/`motion_report`/加速度计族/`load_cell`/`load_cell_probe`/`tmc` 全部就位。
-      （原条留作历史：**mux 机制已就绪，实例随各自 extras 落地**。已落地：
-      `bed_mesh/dump_mesh`、`motion_report/dump_trapq` 与 `dump_stepper`、`adxl345`/`ldc1612`/`mpu9250`
-      （经 `bulk_sensor` 的 `add_mux_endpoint`）、`load_cell/dump_force`、`load_cell_probe/dump_taps`（2026-10-21）、
-      `tmc/stallguard_dump`；**`icm20948`/`bmi160`/`lis2dw`/`angle` 四个 dump 于 2026-10-22 随各自驱动落地**。
-      **口径更正（2026-10-22）**：本条曾写「`motion_report` 的 `get_status` 现返回 `{}`、shutdown 诊断缺失」，
-      那是**过期断言** —— `extras/motion_report.rs` 早已有 `live_position`/`live_velocity`/
-      `live_extruder_velocity` 与 `steppers`，并在 `klippy:analyze_shutdown` 转储 queue/trapq 窗口。
-
-### F MCU 基础资源（F6、F8、F9）
-上游把这些叫 printer objects 下面的「资源」：主机用一个 **oid** 和一个 **pin 描述**
-建立资源对象，把 `config_*` 命令攒起来，在 `finalize_config` 之前算一个 CRC 一次性下发，
-之后用 `queue_*` / `set_*` / `*_transfer` 命令驱动。命令层（`allocate_oids` / `get_config` /
-`finalize_config` / `get_uptime` / `emergency_stop` / `get_clock`）已就位，配置构建层（F1）
-与 pin 解析（F2）也已完成，数字输出、PWM（F4）与 ADC（F5）三个 `config_*` 资源已落地
-（见文末索引），SPI/I2C 总线（F6/F7）也已落地（细节已归档），剩下的缺口是 endstop/trsync（F8，另有
-一条测试侧待办）与其余固件资源（F9）；`MCU_bus_digital_out`（F3）能力已具备，不另做包装。
-
-#### F5 ADC 采样时间（余项）
-
-样本时间已于 2026-10-19 统一到 print time（资源层换算，与上游 `mcu.py:636-646` 同形）：
-
-- [x] **二级 MCU 没有 `get_uptime` 样本时 `recalibrate` 会发布垃圾 offset —— 已修（2026-10-21）**：
-      首因是 `ClockEstimator::new` 把三个字段清零，未 seed 时 `get_clock()` 返回 0，于是
-      `adjusted_freq = (0 - sync1_clock)/4 s` 为负、`set_mapping` 发出错的 offset。现闸门放在
-      **`McuObject::recalibrate`**（`SecondarySync::calibrate` 的唯一周期调用点、也是唯一发布方）：
-      `ClockEstimator::is_seeded()` 为假时只 `debug!` 跳过，`SecondarySync` 与 chip 映射**两者都不改写**；
-      `calibrate` 仍是纯数学，文档里补了「`secondary` 必须已 seed」的前置条件。有样本时逐字节不变。
-      （`cmd/clock.rs` 的 `seeded` 显式标志，`mcu/object.rs` 的两个用例分别钉住跳过与发布。）
+- [ ] **`heaters` 切到同一队列**：`heaters` 侧目前无队列化消费者（`fan` `f2d9844`、`servo`/`pwm_tool` `e3b12a7`
+      已于 2026-10-03 切换）。
 
 #### F6 SPI 总线
 

@@ -303,6 +303,11 @@ RESTORE_GCODE_STATE [NAME=<name>] [MOVE=0|1] [MOVE_SPEED=<mm/s>]
 `absolute_coordinates` / `absolute_extrude`、`homing_origin`、`position`（工具头坐标）、
 `gcode_position`（g-code 坐标）、`axis_map`（对象：轴字母 → 位置数组下标，初始 `{"X":0,"Y":1,"Z":2,"E":3}`，`toolhead:update_extra_axes` 到达后追加额外轴字母，如 `"A":4`）。
 
+额外轴的容量与补全（2026-10-21）：`MAX_AXES = 16`（`E` + 12 个字母轴 + `X`/`Y`/`Z`），超出容量重建
+`axis_map` 时一次性 `error!` 列出被丢弃的字母（不静默）；`G0`/`G1` 的 `G1_PARAMS` 收全部自由字母
+（`A`–`Z` 去 `X`/`Y`/`Z`/`E`/`F`/`N`），客户端内建参数表同步再生成（注册点计数 98 → 99）；
+`reset_last_position` 按 `base_position.len()` 一次重建全部轴（四轴 + 全部额外轴，截到 `MAX_AXES`）。
+
 ---
 
 ## 运动控制（`toolhead`，由 `[printer]` 装载）

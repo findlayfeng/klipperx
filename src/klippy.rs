@@ -348,6 +348,17 @@ pub fn run(
     // Two workers for the machine, not more: the device's blocking reads run on
     // the blocking pool (see `Interface`), so the workers only carry the
     // reactor dispatcher, the MCU send and receive tasks, and bring-up/restart.
+    //
+    // The runtime is **owned here, by `run`'s own frame**, and everything below
+    // reaches it through [`machine_handle`]: dropping a runtime inside an
+    // asynchronous context panics (`Cannot drop a runtime in a context where
+    // blocking is not allowed`), so a start-up that fails — a serial port
+    // another process holds, an API address already bound — must be able to
+    // return `Err` from the block below without the runtime's last reference
+    // being one the block owns. The driver thread therefore borrows the handle
+    // rather than taking the runtime (`Handle::block_on` drives the same
+    // runtime; only `Runtime::block_on` on a *current-thread* runtime would
+    // have to own it).
     let machine_runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("klippy-mcu")
@@ -505,6 +516,10 @@ pub fn run(
         // `block_on` cannot be nested, so the API runtime cannot drive it. Its
         // driver thread parks in `block_on` for the whole run, which is fine —
         // the machine's tasks run on that runtime's workers, not on this thread.
+        //
+        // The thread drives the runtime through the handle, not by owning it:
+        // see where the runtime is built. A `?` on this spawn failing must not be
+        // able to hand the runtime to this block's drop glue.
         let machine_printer = Arc::clone(&printer);
         // The run loop re-reads this file on every restart, so it is handed the
         // path rather than the parse above.
@@ -512,7 +527,7 @@ pub fn run(
         let machine_thread = std::thread::Builder::new()
             .name("klippy-machine".into())
             .spawn(move || {
-                machine_runtime.block_on(klippy_process(machine_printer, machine_config_file))
+                machine_handle.block_on(klippy_process(machine_printer, machine_config_file))
             })?;
 
         let exit_code = match attachment {
@@ -662,6 +677,55 @@ mod tests {
         assert_eq!(exit_code("error_exit"), -1);
         assert_eq!(exit_code("exit"), 0);
         assert_eq!(exit_code("restart"), 0);
+    }
+
+    /// A start-up that fails returns the error, and does not drop a runtime on
+    /// the way out.
+    ///
+    /// [`run`] serves from an `api_runtime` block and builds the machine's own
+    /// runtime before it; a failure that leaves that block early (here: the API
+    /// address is already bound, which is what a second host started without
+    /// `-a` hits) used to drop the machine runtime **inside** the asynchronous
+    /// block, and tokio panicked with `Cannot drop a runtime in a context where
+    /// blocking is not allowed` — the real reason was lost behind that panic.
+    /// The runtime now belongs to `run`'s own frame, so the early return is an
+    /// ordinary `Err`; the config names no MCU, so no board is needed and the
+    /// bind is the only thing that can fail.
+    #[test]
+    fn test_a_startup_failure_returns_the_error_instead_of_dropping_a_runtime() {
+        const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(120);
+
+        // Somebody else on the port the host is told to serve.
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = holder.local_addr().expect("the bound address").port();
+        let config_file = write_temp_config(
+            "startup-bind-failure",
+            "[printer]\nkinematics: none\nmax_velocity: 300\nmax_accel: 3000\n",
+        );
+        let args = AppArgs {
+            api_server: format!("tcp:127.0.0.1:{port}"),
+            config_file: Some(config_file.clone()),
+            log_file: None,
+        };
+
+        // `run` blocks the calling thread for as long as a host runs, so it gets
+        // a thread of its own and a bounded wait: a start-up that never comes
+        // back fails this test instead of hanging it, and a panic (the old
+        // behaviour) drops the sender, which is that same failure.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(run(args, None).map_err(|err| err.to_string()));
+        });
+        let outcome = rx
+            .recv_timeout(WATCHDOG)
+            .expect("the failed start-up returns");
+        worker.join().expect("the failed start-up must not panic");
+        let _ = std::fs::remove_file(&config_file);
+
+        let error = outcome.expect_err("a port that is already bound is a start-up failure");
+        assert!(error.contains("cannot bind tcp"), "{error}");
+        assert!(error.contains(&format!("127.0.0.1:{port}")), "{error}");
+        drop(holder);
     }
 
     /// A host part that asks for a restart the first time it connects, and for
